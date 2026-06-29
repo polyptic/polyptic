@@ -9,6 +9,7 @@
 import type { EnrollmentStatus } from "@polyptic/protocol";
 import type {
   PersistedContent,
+  PersistedContentSource,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
@@ -31,6 +32,8 @@ export class MemoryStore implements Store {
   private readonly placements = new Map<string, PersistedPlacement>();
   /** Keyed by wall id — combined surfaces (Phase 3b). */
   private readonly videoWalls = new Map<string, PersistedVideoWall>();
+  /** Keyed by source id — the content library (Phase 3c). */
+  private readonly contentSources = new Map<string, PersistedContentSource>();
   private revision = 0;
 
   async migrate(): Promise<void> {
@@ -46,6 +49,7 @@ export class MemoryStore implements Store {
       murals: [...this.murals.values()].map(clone),
       placements: [...this.placements.values()].map(clone),
       videoWalls: [...this.videoWalls.values()].map(clone),
+      contentSources: [...this.contentSources.values()].map(clone),
     };
   }
 
@@ -116,6 +120,28 @@ export class MemoryStore implements Store {
 
   async listVideoWalls(): Promise<PersistedVideoWall[]> {
     return [...this.videoWalls.values()].map(clone);
+  }
+
+  // ── Content library (Phase 3c) ──────────────────────────────────────────────
+
+  async upsertContentSource(source: PersistedContentSource): Promise<void> {
+    this.contentSources.set(source.id, clone(source));
+  }
+
+  async deleteContentSource(id: string): Promise<void> {
+    this.contentSources.delete(id);
+    // Clear the assignment off any content/wall rows that referenced it (the control plane also
+    // clears each in-use assignment individually so memory + broadcasts stay correct).
+    for (const content of this.content.values()) {
+      if (content.sourceId === id) content.sourceId = null;
+    }
+    for (const wall of this.videoWalls.values()) {
+      if (wall.contentSourceId === id) wall.contentSourceId = null;
+    }
+  }
+
+  async listContentSources(): Promise<PersistedContentSource[]> {
+    return [...this.contentSources.values()].map(clone);
   }
 
   async close(): Promise<void> {

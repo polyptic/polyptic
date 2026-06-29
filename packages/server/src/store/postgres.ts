@@ -16,10 +16,18 @@
  */
 import postgres from "postgres";
 
-import { DisplayBackend, EnrollmentStatus, Geometry, Output, Surface } from "@polyptic/protocol";
+import {
+  ContentKind,
+  DisplayBackend,
+  EnrollmentStatus,
+  Geometry,
+  Output,
+  Surface,
+} from "@polyptic/protocol";
 
 import type {
   PersistedContent,
+  PersistedContentSource,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
@@ -53,6 +61,7 @@ interface ContentRow {
   screen_id: string;
   canvas: unknown;
   surfaces: unknown;
+  source_id: string | null;
 }
 
 interface MetaRow {
@@ -77,6 +86,14 @@ interface VideoWallRow {
   id: string;
   mural_id: string;
   member_screen_ids: unknown;
+  content_source_id: string | null;
+}
+
+interface ContentSourceRow {
+  id: string;
+  name: string;
+  kind: string;
+  url: string;
 }
 
 export class PostgresStore implements Store {
@@ -120,9 +137,13 @@ export class PostgresStore implements Store {
       CREATE TABLE IF NOT EXISTS screen_content (
         screen_id text PRIMARY KEY,
         canvas    jsonb NOT NULL,
-        surfaces  jsonb NOT NULL DEFAULT '[]'::jsonb
+        surfaces  jsonb NOT NULL DEFAULT '[]'::jsonb,
+        source_id text
       )
     `;
+    // Idempotent migration for databases created before Phase 3c: the column tracks which library
+    // source (if any) a screen currently shows, so source edits can re-resolve + re-push it.
+    await sql`ALTER TABLE screen_content ADD COLUMN IF NOT EXISTS source_id text`;
     await sql`
       CREATE TABLE IF NOT EXISTS meta (
         id       int PRIMARY KEY DEFAULT 1,
@@ -155,23 +176,45 @@ export class PostgresStore implements Store {
       CREATE TABLE IF NOT EXISTS video_walls (
         id                text PRIMARY KEY,
         mural_id          text NOT NULL,
-        member_screen_ids jsonb NOT NULL DEFAULT '[]'::jsonb
+        member_screen_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+        content_source_id text
+      )
+    `;
+    // Idempotent migration for databases created before Phase 3c: tracks which library source (if any)
+    // a wall currently spans, so source edits re-resolve + re-push every member's span slice.
+    await sql`ALTER TABLE video_walls ADD COLUMN IF NOT EXISTS content_source_id text`;
+    // Content library (Phase 3c). A reusable, named source resolved to surface(s) on assignment.
+    await sql`
+      CREATE TABLE IF NOT EXISTS content_sources (
+        id   text PRIMARY KEY,
+        name text NOT NULL,
+        kind text NOT NULL,
+        url  text NOT NULL
       )
     `;
   }
 
   async load(): Promise<PersistedState> {
     const sql = this.sql;
-    const [machineRows, screenRows, contentRows, metaRows, muralRows, placementRows, videoWallRows] =
-      await Promise.all([
-        sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
-        sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
-        sql<ContentRow[]>`SELECT screen_id, canvas, surfaces FROM screen_content`,
-        sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
-        sql<MuralRow[]>`SELECT id, name FROM murals`,
-        sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
-        sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids FROM video_walls`,
-      ]);
+    const [
+      machineRows,
+      screenRows,
+      contentRows,
+      metaRows,
+      muralRows,
+      placementRows,
+      videoWallRows,
+      contentSourceRows,
+    ] = await Promise.all([
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
+      sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
+      sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
+      sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
+      sql<MuralRow[]>`SELECT id, name FROM murals`,
+      sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
+      sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, content_source_id FROM video_walls`,
+      sql<ContentSourceRow[]>`SELECT id, name, kind, url FROM content_sources`,
+    ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
       const outputs = Output.array().safeParse(row.outputs);
@@ -204,6 +247,7 @@ export class PostgresStore implements Store {
         screenId: row.screen_id,
         canvas: canvas.success ? canvas.data : { ...DEFAULT_CANVAS },
         surfaces: surfaces.success ? surfaces.data : [],
+        sourceId: row.source_id ?? null,
       };
     });
 
@@ -228,11 +272,19 @@ export class PostgresStore implements Store {
       memberScreenIds: Array.isArray(row.member_screen_ids)
         ? row.member_screen_ids.filter((v): v is string => typeof v === "string")
         : [],
+      contentSourceId: row.content_source_id ?? null,
     }));
+
+    const contentSources: PersistedContentSource[] = contentSourceRows.flatMap((row) => {
+      const kind = ContentKind.safeParse(row.kind);
+      // Drop a row with an unrecognised kind rather than crash the boot.
+      if (!kind.success) return [];
+      return [{ id: row.id, name: row.name, kind: kind.data, url: row.url }];
+    });
 
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
 
-    return { revision, machines, screens, content, murals, placements, videoWalls };
+    return { revision, machines, screens, content, murals, placements, videoWalls, contentSources };
   }
 
   async upsertMachine(machine: PersistedMachine): Promise<void> {
@@ -280,11 +332,17 @@ export class PostgresStore implements Store {
   async upsertContent(content: PersistedContent): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO screen_content (screen_id, canvas, surfaces)
-      VALUES (${content.screenId}, ${sql.json(content.canvas)}, ${sql.json(content.surfaces)})
+      INSERT INTO screen_content (screen_id, canvas, surfaces, source_id)
+      VALUES (
+        ${content.screenId},
+        ${sql.json(content.canvas)},
+        ${sql.json(content.surfaces)},
+        ${content.sourceId ?? null}
+      )
       ON CONFLICT (screen_id) DO UPDATE SET
-        canvas   = EXCLUDED.canvas,
-        surfaces = EXCLUDED.surfaces
+        canvas    = EXCLUDED.canvas,
+        surfaces  = EXCLUDED.surfaces,
+        source_id = EXCLUDED.source_id
     `;
   }
 
@@ -365,11 +423,17 @@ export class PostgresStore implements Store {
   async upsertVideoWall(wall: PersistedVideoWall): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO video_walls (id, mural_id, member_screen_ids)
-      VALUES (${wall.id}, ${wall.muralId}, ${sql.json(wall.memberScreenIds)})
+      INSERT INTO video_walls (id, mural_id, member_screen_ids, content_source_id)
+      VALUES (
+        ${wall.id},
+        ${wall.muralId},
+        ${sql.json(wall.memberScreenIds)},
+        ${wall.contentSourceId ?? null}
+      )
       ON CONFLICT (id) DO UPDATE SET
         mural_id          = EXCLUDED.mural_id,
-        member_screen_ids = EXCLUDED.member_screen_ids
+        member_screen_ids = EXCLUDED.member_screen_ids,
+        content_source_id = EXCLUDED.content_source_id
     `;
   }
 
@@ -380,14 +444,48 @@ export class PostgresStore implements Store {
 
   async listVideoWalls(): Promise<PersistedVideoWall[]> {
     const sql = this.sql;
-    const rows = await sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids FROM video_walls`;
+    const rows = await sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, content_source_id FROM video_walls`;
     return rows.map((row) => ({
       id: row.id,
       muralId: row.mural_id,
       memberScreenIds: Array.isArray(row.member_screen_ids)
         ? row.member_screen_ids.filter((v): v is string => typeof v === "string")
         : [],
+      contentSourceId: row.content_source_id ?? null,
     }));
+  }
+
+  // ── Content library (Phase 3c) ──────────────────────────────────────────────
+
+  async upsertContentSource(source: PersistedContentSource): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO content_sources (id, name, kind, url)
+      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url})
+      ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        kind = EXCLUDED.kind,
+        url  = EXCLUDED.url
+    `;
+  }
+
+  async deleteContentSource(id: string): Promise<void> {
+    const sql = this.sql;
+    // Clear the assignment off any rows that referenced this source (defensive — the control plane
+    // also clears each in-use assignment individually so memory + broadcasts stay correct).
+    await sql`UPDATE screen_content SET source_id = NULL WHERE source_id = ${id}`;
+    await sql`UPDATE video_walls SET content_source_id = NULL WHERE content_source_id = ${id}`;
+    await sql`DELETE FROM content_sources WHERE id = ${id}`;
+  }
+
+  async listContentSources(): Promise<PersistedContentSource[]> {
+    const sql = this.sql;
+    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url FROM content_sources`;
+    return rows.flatMap((row) => {
+      const kind = ContentKind.safeParse(row.kind);
+      if (!kind.success) return [];
+      return [{ id: row.id, name: row.name, kind: kind.data, url: row.url }];
+    });
   }
 
   async close(): Promise<void> {

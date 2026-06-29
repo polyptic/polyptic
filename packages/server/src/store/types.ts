@@ -13,7 +13,14 @@
  * so values flow between storage and the wire without translation, but they are declared here
  * explicitly to keep storage decoupled from the message layer.
  */
-import type { DisplayBackend, EnrollmentStatus, Geometry, Output, Surface } from "@polyptic/protocol";
+import type {
+  ContentKind,
+  DisplayBackend,
+  EnrollmentStatus,
+  Geometry,
+  Output,
+  Surface,
+} from "@polyptic/protocol";
 
 /** A machine row: device plumbing + the outputs it last reported. */
 export interface PersistedMachine {
@@ -46,6 +53,23 @@ export interface PersistedContent {
   screenId: string;
   canvas: Geometry;
   surfaces: Surface[];
+  /**
+   * Phase 3c — the library source this screen currently shows, if any. `null`/undefined means the
+   * content is ad-hoc (an ad-hoc URL or cleared content), so a library edit never re-resolves it.
+   * Editing the referenced source re-resolves + re-pushes this screen's surface.
+   */
+  sourceId?: string | null;
+}
+
+/**
+ * Phase 3c — a content LIBRARY entry. A reusable, named source ({id, name, kind, url}) that a screen
+ * or video wall is assigned by id; the control plane resolves it to the surface(s) it renders.
+ */
+export interface PersistedContentSource {
+  id: string;
+  name: string;
+  kind: ContentKind;
+  url: string;
 }
 
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
@@ -75,6 +99,12 @@ export interface PersistedVideoWall {
   id: string;
   muralId: string;
   memberScreenIds: string[];
+  /**
+   * Phase 3c — the library source this wall currently spans, if any. `null`/undefined means the wall
+   * shows ad-hoc content (an ad-hoc URL or none). Editing the referenced source re-resolves + re-pushes
+   * every member's span slice.
+   */
+  contentSourceId?: string | null;
 }
 
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
@@ -88,6 +118,8 @@ export interface PersistedState {
   placements: PersistedPlacement[];
   /** Phase 3b — combined surfaces (video walls). */
   videoWalls: PersistedVideoWall[];
+  /** Phase 3c — the content library. */
+  contentSources: PersistedContentSource[];
 }
 
 /**
@@ -131,6 +163,14 @@ export interface Store {
   deleteVideoWall(id: string): Promise<void>;
   /** All persisted video walls. */
   listVideoWalls(): Promise<PersistedVideoWall[]>;
+
+  // ── Content library (Phase 3c) ─────────────────────────────────────────────
+  /** Insert-or-update a content-source row (id + name + kind + url). */
+  upsertContentSource(source: PersistedContentSource): Promise<void>;
+  /** Delete a content-source row. No-op if absent. */
+  deleteContentSource(id: string): Promise<void>;
+  /** All persisted content sources. */
+  listContentSources(): Promise<PersistedContentSource[]>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

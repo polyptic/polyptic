@@ -14,6 +14,7 @@
 import { computed } from "vue";
 import { useConsoleStore } from "../stores/console";
 import { useIdent } from "../components/canvas/useIdent";
+import { kindGlyph, kindLabel, kindColorVar } from "../content";
 import MuralSwitcher from "../components/canvas/MuralSwitcher.vue";
 import WallCanvas from "../components/canvas/WallCanvas.vue";
 import Inspector from "../components/canvas/Inspector.vue";
@@ -23,6 +24,15 @@ const { ident } = useIdent();
 
 const unplaced = computed(() => store.unplacedScreens);
 const screenCount = computed(() => store.screens.length);
+
+// ── content library (left panel) ───────────────────────────────────────────
+const librarySources = computed(() => store.sources);
+const pickedSourceId = computed(() => store.pickedSourceId);
+
+/** Arm a library source for click-to-assign: click it, then click a screen/wall on the canvas. */
+function pickSource(id: string) {
+  store.pickSource(id);
+}
 
 const alerts = computed(() => store.screens.filter((s) => !s.online).length);
 const alertText = computed(() =>
@@ -67,9 +77,42 @@ function place(id: string) {
 
     <!-- ── body ────────────────────────────────────────────────────────── -->
     <div class="body">
-      <!-- Unplaced tray -->
+      <!-- Unplaced tray + content library -->
       <aside class="tray">
-        <div class="tray-head">Unplaced screens</div>
+        <!-- Content library -->
+        <div class="lib-head">
+          <span class="tray-head flush">Content library</span>
+          <router-link class="manage-link" :to="{ name: 'content' }">Manage →</router-link>
+        </div>
+
+        <div v-if="librarySources.length" class="lib-list">
+          <div
+            v-for="s in librarySources"
+            :key="s.id"
+            class="lib-item"
+            :class="{ armed: pickedSourceId === s.id }"
+            :title="s.url"
+            @click="pickSource(s.id)"
+          >
+            <span class="lib-glyph" :style="{ color: `var(${kindColorVar(s.kind)})` }">
+              {{ kindGlyph(s.kind) }}
+            </span>
+            <span class="lib-meta">
+              <span class="lib-name">{{ s.name }}</span>
+              <span class="lib-kind">{{ kindLabel(s.kind) }}</span>
+            </span>
+          </div>
+        </div>
+        <div v-else class="lib-empty">
+          No sources yet. <router-link class="manage-link" :to="{ name: 'content' }">Add one →</router-link>
+        </div>
+
+        <div v-if="pickedSourceId" class="lib-armed-hint">
+          Click a screen or surface on the canvas to assign it.
+          <button class="lib-cancel" @click="store.clearPickedSource()">Cancel</button>
+        </div>
+
+        <div class="tray-head section-gap">Unplaced screens</div>
 
         <div v-if="unplaced.length" class="tray-list">
           <div
@@ -191,6 +234,114 @@ function place(id: string) {
   font-weight: 600;
   color: var(--muted);
   margin-bottom: 12px;
+}
+.tray-head.flush {
+  margin-bottom: 0;
+}
+.tray-head.section-gap {
+  margin-top: 20px;
+}
+
+/* content library */
+.lib-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.manage-link {
+  font-size: 11px;
+  color: var(--accent-fg);
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+}
+.manage-link:hover {
+  text-decoration: underline;
+}
+.lib-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.lib-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 9px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  user-select: none;
+}
+.lib-item:hover {
+  background: var(--muted-bg);
+  border-color: var(--line);
+}
+.lib-item.armed {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.lib-glyph {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: var(--muted-bg);
+  font-size: 12px;
+  font-weight: 700;
+}
+.lib-meta {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+  min-width: 0;
+}
+.lib-name {
+  font-size: 12.5px;
+  color: var(--fg2);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lib-kind {
+  font-size: 10.5px;
+  color: var(--muted2);
+}
+.lib-empty {
+  font-size: 11px;
+  color: var(--muted2);
+  line-height: 1.55;
+  padding: 2px 0;
+}
+.lib-armed-hint {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--accent-fg);
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  line-height: 1.5;
+}
+.lib-cancel {
+  display: block;
+  margin-top: 6px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-line);
+  background: transparent;
+  color: var(--accent-fg);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+}
+.lib-cancel:hover {
+  background: var(--surface);
 }
 .tray-list {
   display: flex;

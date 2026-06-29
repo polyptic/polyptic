@@ -13,9 +13,13 @@
 import { ref, computed, watch } from "vue";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
+import { kindLabel } from "../../content";
 
 const store = useConsoleStore();
 const { ident, identMany, flash, isIdenting } = useIdent();
+
+// The content library, for the "Assign from library" pickers (single screen + combined surface).
+const librarySources = computed(() => store.sources);
 
 const selectedIds = computed(() => store.selectedScreenIds);
 const count = computed(() => selectedIds.value.length);
@@ -52,8 +56,10 @@ const wallSurfaceText = computed(() => {
 });
 
 const wallUrlDraft = ref("");
+const wallSourcePick = ref("");
 watch(wall, () => {
   wallUrlDraft.value = "";
+  wallSourcePick.value = "";
 });
 // A just-combined wall carries a temp id until the authoritative admin/state re-points it; spanning
 // content against the temp id would 404, so the Span control is disabled until the real wall arrives.
@@ -62,8 +68,15 @@ function submitWallUrl() {
   if (!wall.value || wallPending.value) return;
   const u = wallUrlDraft.value.trim();
   if (!u) return;
-  store.setWallContent(wall.value.id, u);
+  store.setWallContent(wall.value.id, { url: u });
   wallUrlDraft.value = "";
+}
+function assignWallSource() {
+  if (!wall.value || wallPending.value) return;
+  const id = wallSourcePick.value;
+  if (!id) return;
+  store.setWallContent(wall.value.id, { sourceId: id });
+  wallSourcePick.value = "";
 }
 function identWall() {
   if (!wall.value) return;
@@ -98,18 +111,28 @@ function commitName() {
   else nameDraft.value = s.friendlyName;
 }
 
-// ── content URL ────────────────────────────────────────────────────────────
+// ── content: library source + ad-hoc URL ────────────────────────────────────
 const urlDraft = ref("");
+const sourcePick = ref("");
 watch(single, () => {
   urlDraft.value = "";
+  sourcePick.value = "";
 });
 function submitUrl() {
   const s = single.value;
   if (!s) return;
   const u = urlDraft.value.trim();
   if (!u) return;
-  store.setScreenContent(s.id, u);
+  store.setScreenContent(s.id, { url: u });
   urlDraft.value = "";
+}
+function assignSource() {
+  const s = single.value;
+  if (!s) return;
+  const id = sourcePick.value;
+  if (!id) return;
+  store.setScreenContent(s.id, { sourceId: id });
+  sourcePick.value = "";
 }
 
 // ── derived single-screen view ─────────────────────────────────────────────
@@ -191,6 +214,24 @@ function selectOne(id: string) {
       </div>
       <div v-else class="content-empty">No content yet — spans across</div>
 
+      <div v-if="librarySources.length" class="lib-pick">
+        <select
+          v-model="wallSourcePick"
+          class="lib-select"
+          :disabled="wallPending"
+          @change="assignWallSource"
+        >
+          <option value="" disabled>Assign from library…</option>
+          <option v-for="s in librarySources" :key="s.id" :value="s.id">
+            {{ kindLabel(s.kind) }} · {{ s.name }}
+          </option>
+        </select>
+      </div>
+      <div v-else class="lib-empty">
+        No saved sources.
+        <router-link class="lib-link" :to="{ name: 'content' }">Manage library →</router-link>
+      </div>
+
       <div class="url-field">
         <input
           v-model="wallUrlDraft"
@@ -203,7 +244,9 @@ function selectOne(id: string) {
           Span
         </button>
       </div>
-      <div class="hint">Content spans across every panel, with bezel seams shown.</div>
+      <div class="hint">
+        A library source (or ad-hoc URL) spans across every panel, with bezel seams shown.
+      </div>
 
       <div class="panels-head">
         <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
@@ -250,6 +293,19 @@ function selectOne(id: string) {
       </div>
       <div v-else class="content-empty">No content yet</div>
 
+      <div v-if="librarySources.length" class="lib-pick">
+        <select v-model="sourcePick" class="lib-select" @change="assignSource">
+          <option value="" disabled>Assign from library…</option>
+          <option v-for="s in librarySources" :key="s.id" :value="s.id">
+            {{ kindLabel(s.kind) }} · {{ s.name }}
+          </option>
+        </select>
+      </div>
+      <div v-else class="lib-empty">
+        No saved sources.
+        <router-link class="lib-link" :to="{ name: 'content' }">Manage library →</router-link>
+      </div>
+
       <div class="url-field">
         <input
           v-model="urlDraft"
@@ -259,7 +315,7 @@ function selectOne(id: string) {
         />
         <button class="url-btn" :disabled="!urlDraft.trim()" @click="submitUrl">Show</button>
       </div>
-      <div class="hint">Type a URL to display it on this screen.</div>
+      <div class="hint">Pick a library source above, or paste an ad-hoc URL to show it here.</div>
 
       <div class="section-label gap-top">Layout</div>
       <div class="layout-grid">
@@ -486,6 +542,44 @@ function selectOne(id: string) {
 }
 .url-btn:not(:disabled):hover {
   opacity: 0.92;
+}
+
+/* library source picker */
+.lib-pick {
+  margin-top: 10px;
+}
+.lib-select {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 12.5px;
+  color: var(--fg);
+  outline: none;
+  font-family: inherit;
+  cursor: pointer;
+}
+.lib-select:focus {
+  border-color: var(--accent);
+}
+.lib-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.lib-empty {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--muted2);
+  line-height: 1.5;
+}
+.lib-link {
+  color: var(--accent-fg);
+  font-weight: 600;
+  text-decoration: none;
+}
+.lib-link:hover {
+  text-decoration: underline;
 }
 
 .hint {

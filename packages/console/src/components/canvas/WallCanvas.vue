@@ -244,6 +244,20 @@ onNodeDragStop((p: any) => {
 
 onNodeClick((p: any) => {
   const node = p.node;
+  // Click-to-assign: when a library source is armed in the left panel, clicking a screen or surface
+  // assigns it (the server resolves the source to a surface of its kind) and disarms — no select.
+  if (store.pickedSourceId) {
+    if (node?.type === "wall") {
+      const wid = node.data.wallId as string;
+      store.assignPickedToWall(wid);
+      store.selectWall(wid);
+    } else {
+      const sid = node.id as string;
+      store.assignPickedToScreen(sid);
+      store.select([sid]);
+    }
+    return;
+  }
   // Clicking a combined surface selects the whole wall.
   if (node?.type === "wall") {
     store.selectWall(node.data.wallId as string);

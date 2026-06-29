@@ -16,6 +16,13 @@
  * Together these let two agents on one box present distinct machine + screen identities,
  * so the persistent registry and the Admin UI have multiple machines to show.
  *
+ * Phase 3c — multiple outputs from one agent (local video-wall demo):
+ *   - `POLYPTIC_OUTPUTS` (comma-separated connector names, e.g. "HDMI-1,HDMI-2,HDMI-3") makes a
+ *     single agent advertise one 1920×1080 output per connector, so one `bun run dev` yields ≥2
+ *     screens to drag into a wall. Blanks are trimmed/skipped and duplicates de-duped. When unset,
+ *     the agent advertises the single default output (POLYPTIC_CONNECTOR or the default connector),
+ *     exactly as before.
+ *
  * Phase 2b — enrollment + durable credential (app-level identity; mTLS is a later layer):
  *   - `POLYPTIC_BOOTSTRAP_TOKEN` (if set) is sent on `agent/hello` for first-contact enrollment.
  *   - A durable per-machine `credential` is persisted locally (see ./credential.ts) and presented
@@ -102,9 +109,29 @@ function resolveConnector(): string {
   return override && override.length > 0 ? override : DEFAULT_CONNECTOR;
 }
 
-/** This machine's outputs. Phase 2a is a single fixed 1080p output on the resolved connector. */
-function resolveOutputs(connector: string): Output[] {
-  return [{ connector, width: 1920, height: 1080 }];
+/**
+ * This machine's outputs.
+ *
+ * Phase 3c: if `POLYPTIC_OUTPUTS` is set (comma-separated connector names) this agent advertises
+ * one 1920×1080 output per connector — so a single `bun run dev` can yield ≥2 screens for a local
+ * video-wall demo. Blank entries are trimmed/skipped and duplicates de-duped (first wins). If the
+ * variable is unset or yields no usable connector, fall back to the single default output on the
+ * resolved connector — Phase 1/2a behaviour, unchanged.
+ */
+function resolveOutputs(defaultConnector: string): Output[] {
+  const raw = process.env.POLYPTIC_OUTPUTS;
+  if (raw !== undefined) {
+    const seen = new Set<string>();
+    const outputs: Output[] = [];
+    for (const part of raw.split(",")) {
+      const connector = part.trim();
+      if (connector.length === 0 || seen.has(connector)) continue;
+      seen.add(connector);
+      outputs.push({ connector, width: 1920, height: 1080 });
+    }
+    if (outputs.length > 0) return outputs;
+  }
+  return [{ connector: defaultConnector, width: 1920, height: 1080 }];
 }
 
 /** The operator-configured enrollment secret, if any (server GATED mode). */
@@ -485,7 +512,9 @@ function main(): void {
   const credential = loadCredential(machineId);
 
   log(
-    `polyptic-agent v${agentVersion} · machineId=${machineId} · connector=${connector} · backend=${backend.id}`,
+    `polyptic-agent v${agentVersion} · machineId=${machineId} · outputs=${outputs
+      .map((o) => o.connector)
+      .join(",")} · backend=${backend.id}`,
   );
   log(
     `enrollment: ${credential ? "stored credential found" : "no stored credential"}${

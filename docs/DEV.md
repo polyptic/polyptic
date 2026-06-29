@@ -141,6 +141,35 @@ machine goes grey. Screen ids stay globally sequential and stable per `(machineI
 
 ---
 
+## A local video wall from one agent (`POLYPTIC_OUTPUTS`)
+
+The multi-machine demo above runs **two agents** to get two screens. For a quick local
+**video-wall** demo you instead want **one** agent advertising **multiple outputs**, so a
+single `bun run dev` gives you ≥2 screens to drag into a wall on the Console (`:5175`).
+
+Set **`POLYPTIC_OUTPUTS`** to a comma-separated list of connector names. The agent advertises
+one **1920×1080** output per connector (blanks are trimmed/skipped, duplicates de-duped):
+
+```sh
+# one machine (dev-mac) with two outputs → two screens, ready to combine into a wall
+POLYPTIC_OUTPUTS="HDMI-1,HDMI-2" bun run dev
+```
+
+or run the agent on its own against an already-running server:
+
+```sh
+cd packages/agent && POLYPTIC_OUTPUTS="HDMI-1,HDMI-2,HDMI-3" bun run dev
+```
+
+The server hands each output the next sequential `screen-N` id (stable per
+`(machineId, connector)`, as always), so the new screens appear in the Console's **Unplaced
+screens** tray — drag them onto a mural and combine them into a spanning video wall.
+
+When `POLYPTIC_OUTPUTS` is **unset** the agent advertises its single default output
+(`POLYPTIC_CONNECTOR`, else `HDMI-1`) — exactly as before.
+
+---
+
 ## The persistence check — survives a restart
 
 This is the Phase 2a Definition of Done.
@@ -409,6 +438,7 @@ open "http://localhost:5173/?screen=screen-1"   # Linux: xdg-open, or paste into
 | `PLAYER_BASE_URL`       | `http://localhost:5173`                                       | base the server uses to build each `playerUrl`                 |
 | `POLYPTIC_MACHINE_ID`  | `/etc/machine-id` if present, else `dev-mac`                  | the agent's machine identity (used for the multi-machine demo) |
 | `POLYPTIC_CONNECTOR`   | `HDMI-1`                                                       | the agent's output connector (used for the multi-machine demo) |
+| `POLYPTIC_OUTPUTS`     | _(unset → single output on `POLYPTIC_CONNECTOR`)_             | **agent.** Comma-separated connector names (e.g. `HDMI-1,HDMI-2`) → one 1920×1080 output each, so one agent yields ≥2 screens for a local video-wall demo. Blanks trimmed/skipped, duplicates de-duped. |
 | `POLYPTIC_BACKEND`     | _(auto → `dev-open`)_                                          | force the agent's display backend                              |
 | `POLYPTIC_STATE_DIR`   | `~/.polyptic`                                                | **agent.** Directory where the agent persists its durable credential, as `credential-<machineId>` |
 

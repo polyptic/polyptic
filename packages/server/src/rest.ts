@@ -21,6 +21,7 @@ import { z } from "zod";
 
 import {
   CombineScreensBody,
+  CreateContentSourceBody,
   CreateMuralBody,
   IdentBody,
   PlaceScreenBody,
@@ -32,6 +33,7 @@ import {
   ServerToPlayerRender,
   SetContentBody,
   Surface,
+  UpdateContentSourceBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
@@ -45,6 +47,7 @@ const MachineParams = z.object({ machineId: z.string().min(1) });
 const MuralParams = z.object({ id: z.string().min(1) });
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
+const ContentSourceParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
 const DemoWebBody = z.object({ screenId: z.string().min(1), url: z.string().url() });
 const RejectBody = z.object({ reason: z.string().optional() });
@@ -559,9 +562,11 @@ export function registerRestRoutes(
       return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
     }
 
-    const result = await control.setWallContent(params.data.wallId, body.data.url);
+    const result = await control.setWallContent(params.data.wallId, body.data);
     if (!result.ok) {
-      const status = result.error === "unknown-wall" ? 404 : 409;
+      // unknown-wall / unknown-source → 404; no-placements → 409.
+      const status =
+        result.error === "unknown-wall" || result.error === "unknown-source" ? 404 : 409;
       return reply.code(status).send({ error: result.error, wallId: params.data.wallId });
     }
 
@@ -571,6 +576,7 @@ export function registerRestRoutes(
       {
         event: "wall.content",
         wallId: params.data.wallId,
+        sourceId: body.data.sourceId,
         url: body.data.url,
         screens: result.slices.map((s) => s.screenId),
         revision: control.state.revision,
@@ -597,13 +603,16 @@ export function registerRestRoutes(
       return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
     }
 
-    const result = await control.setScreenContent(params.data.screenId, body.data.url);
+    const result = await control.setScreenContent(params.data.screenId, body.data);
     if (!result.ok) {
       if (result.error === "wall-member") {
         return reply.code(409).send({
           error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; set content on the wall`,
           wallId: result.wallId,
         });
+      }
+      if (result.error === "unknown-source") {
+        return reply.code(404).send({ error: `unknown content source: ${body.data.sourceId}` });
       }
       return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
     }
@@ -612,6 +621,7 @@ export function registerRestRoutes(
       {
         event: "screen.content",
         screenId: params.data.screenId,
+        sourceId: body.data.sourceId,
         url: body.data.url,
         revision: control.state.revision,
       },
@@ -652,5 +662,92 @@ export function registerRestRoutes(
       screens: members.map((s) => s.id),
       delivered,
     };
+  });
+
+  // ── Phase 3c routes (content library) ─────────────────────────────────────────
+  //
+  // CRUD over the reusable library of content sources ({id, name, kind, url}). Create/rename a source
+  // is registry metadata → it only broadcasts a fresh admin/state (which now carries contentSources[]).
+  // Editing or deleting an IN-USE source re-resolves (or clears) every screen/wall showing it, so those
+  // routes ALSO push `server/render` to each affected member's player (the instant path).
+
+  // GET /api/v1/content-sources -> ContentSource[]
+  fastify.get("/api/v1/content-sources", async () => control.getContentSources());
+
+  // POST /api/v1/content-sources  { name, kind, url }  -> ContentSource (201)
+  fastify.post("/api/v1/content-sources", async (request, reply) => {
+    const body = CreateContentSourceBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const source = await control.createContentSource(body.data);
+    fastify.log.info(
+      { event: "content-source.create", sourceId: source.id, kind: source.kind, name: source.name },
+      "content source created",
+    );
+    broadcaster.broadcast();
+    return reply.code(201).send({ ok: true, source });
+  });
+
+  // PATCH /api/v1/content-sources/:id  { name?, kind?, url? }  -> re-resolve + push in-use renders
+  fastify.patch("/api/v1/content-sources/:id", async (request, reply) => {
+    const params = ContentSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = UpdateContentSourceBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.updateContentSource(params.data.id, body.data);
+    if (!result) {
+      return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+    }
+
+    // Re-resolved every screen/wall showing this source — push the new render to each affected player.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "content-source.update",
+        sourceId: result.source.id,
+        kind: result.source.kind,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "content source updated",
+    );
+    broadcaster.broadcast();
+    return { ok: true, source: result.source, screens: result.slices.map((s) => s.screenId) };
+  });
+
+  // DELETE /api/v1/content-sources/:id  -> clear in-use assignments (empty render) + push
+  fastify.delete("/api/v1/content-sources/:id", async (request, reply) => {
+    const params = ContentSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.deleteContentSource(params.data.id);
+    if (!result) {
+      return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+    }
+
+    // Cleared every screen/wall that was showing this source — push the (now empty) slice to each.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "content-source.delete",
+        sourceId: params.data.id,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "content source deleted",
+    );
+    broadcaster.broadcast();
+    return { ok: true, sourceId: params.data.id, screens: result.slices.map((s) => s.screenId) };
   });
 }

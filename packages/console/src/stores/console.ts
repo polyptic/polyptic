@@ -11,9 +11,23 @@
  */
 import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
-import type { MachineView, Mural, Placement, ScreenView, VideoWall } from "@polyptic/protocol";
+import type {
+  ContentKind,
+  ContentSource,
+  CreateContentSourceBody,
+  MachineView,
+  Mural,
+  Placement,
+  ScreenView,
+  UpdateContentSourceBody,
+  VideoWall,
+} from "@polyptic/protocol";
 
 import * as api from "../api";
+
+/** Assigning content takes EITHER a library source by id OR an ad-hoc URL — exactly one (the
+ *  contract's SetContentBody refinement). The ad-hoc URL path is the Phase-3b behaviour. */
+export type ContentAssignment = { sourceId: string } | { url: string };
 
 const ADMIN_WS_URL = "ws://localhost:8080/admin";
 const RECONNECT_MIN_MS = 500;
@@ -43,6 +57,16 @@ function sameMembers(a: readonly string[], b: readonly string[]): boolean {
   return b.every((id) => set.has(id));
 }
 
+/** Normalise a content assignment for the wire: pass a `sourceId` straight through, but trim a `url`
+ *  and drop it if blank. Returns null when there's nothing to send. */
+function normalizeAssignment(content: ContentAssignment): ContentAssignment | null {
+  if ("sourceId" in content) {
+    return content.sourceId ? { sourceId: content.sourceId } : null;
+  }
+  const trimmed = content.url.trim();
+  return trimmed ? { url: trimmed } : null;
+}
+
 function initialTheme(): "light" | "dark" {
   try {
     const saved = localStorage.getItem(THEME_KEY);
@@ -60,10 +84,15 @@ export interface ConsoleState {
   murals: Mural[];
   placements: Placement[];
   videoWalls: VideoWall[];
+  /** The content LIBRARY (Phase 3c) — reusable named sources, mirrored from admin/state. */
+  contentSources: ContentSource[];
   activeMuralId: string | null;
   selectedScreenIds: string[];
   /** A combined surface selected on the canvas (mutually exclusive with selectedScreenIds). */
   selectedWallId: string | null;
+  /** A library source "armed" in the Wall's left library: click it, then click a screen/wall on the
+   *  canvas to assign it (client-only UI state). Null = nothing armed. */
+  pickedSourceId: string | null;
   theme: "light" | "dark";
 }
 
@@ -78,9 +107,11 @@ export const useConsoleStore = defineStore("console", {
     murals: [],
     placements: [],
     videoWalls: [],
+    contentSources: [],
     activeMuralId: null,
     selectedScreenIds: [],
     selectedWallId: null,
+    pickedSourceId: null,
     theme: initialTheme(),
   }),
 
@@ -207,6 +238,36 @@ export const useConsoleStore = defineStore("console", {
         ? state.videoWalls.find((w) => w.id === state.selectedWallId)
         : undefined;
     },
+
+    // ── Content library (Phase 3c) ───────────────────────────────────────────
+
+    /** Every library source, in the order the server keeps them. */
+    sources(state): ContentSource[] {
+      return state.contentSources;
+    },
+
+    /** Library sources bucketed by kind (web/dashboard/image/video) — every kind key present. */
+    sourcesByKind(state): Record<ContentKind, ContentSource[]> {
+      const buckets: Record<ContentKind, ContentSource[]> = {
+        web: [],
+        dashboard: [],
+        image: [],
+        video: [],
+      };
+      for (const s of state.contentSources) buckets[s.kind].push(s);
+      return buckets;
+    },
+
+    sourceById(): (id: string) => ContentSource | undefined {
+      return (id: string) => this.contentSources.find((s) => s.id === id);
+    },
+
+    /** The library source currently armed for click-to-assign on the canvas, if any. */
+    pickedSource(state): ContentSource | undefined {
+      return state.pickedSourceId
+        ? state.contentSources.find((s) => s.id === state.pickedSourceId)
+        : undefined;
+    },
   },
 
   actions: {
@@ -297,6 +358,12 @@ export const useConsoleStore = defineStore("console", {
         this.murals = msg.murals;
         this.placements = msg.placements;
         this.videoWalls = msg.videoWalls;
+        this.contentSources = msg.contentSources;
+
+        // Disarm a click-to-assign pick whose source the server no longer knows (e.g. deleted).
+        if (this.pickedSourceId && !this.contentSources.some((s) => s.id === this.pickedSourceId)) {
+          this.pickedSourceId = null;
+        }
 
         // Keep the active mural valid (default to the first mural the server knows about).
         if (!this.activeMuralId || !this.murals.some((m) => m.id === this.activeMuralId)) {
@@ -474,12 +541,16 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Point a single screen at a URL (a single full-canvas web surface). */
-    async setScreenContent(screenId: string, url: string): Promise<void> {
-      const trimmed = url.trim();
-      if (!trimmed) return;
+    /**
+     * Point a single screen at content: either a library source (`{ sourceId }`) — the server
+     * resolves it to a surface of that source's kind — or an ad-hoc `{ url }` (a single full-canvas
+     * web surface, the Phase-3b behaviour). A whitespace-only URL is ignored.
+     */
+    async setScreenContent(screenId: string, content: ContentAssignment): Promise<void> {
+      const body = normalizeAssignment(content);
+      if (!body) return;
       try {
-        await api.setScreenContent(screenId, trimmed);
+        await api.setScreenContent(screenId, body);
       } catch (err) {
         console.error("[console] setScreenContent failed", err);
       }
@@ -529,15 +600,19 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Assign content (a URL) that spans across the whole combined surface. */
-    async setWallContent(wallId: string, url: string): Promise<void> {
-      const trimmed = url.trim();
-      if (!trimmed) return;
+    /**
+     * Assign content that spans across the whole combined surface: a library source (`{ sourceId }`,
+     * which spans as a surface of that source's kind) or an ad-hoc `{ url }` (a spanning web surface,
+     * the Phase-3b path the walls e2e exercises).
+     */
+    async setWallContent(wallId: string, content: ContentAssignment): Promise<void> {
+      const body = normalizeAssignment(content);
+      if (!body) return;
       // A freshly-combined wall is optimistic until the authoritative admin/state arrives with its real
       // id; sending content against the temp id would 404 (and be swallowed). Wait for the real wall.
       if (wallId.startsWith("wall-pending")) return;
       try {
-        await api.setWallContent(wallId, trimmed);
+        await api.setWallContent(wallId, body);
       } catch (err) {
         console.error("[console] setWallContent failed", err);
       }
@@ -550,6 +625,75 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] identWall failed", err);
       }
+    },
+
+    // ── Content library (Phase 3c) ──────────────────────────────────────────────
+
+    /** Create a library source. The authoritative admin/state broadcast adds it to contentSources. */
+    async createSource(body: CreateContentSourceBody): Promise<boolean> {
+      try {
+        await api.createContentSource(body);
+        return true;
+      } catch (err) {
+        console.error("[console] createSource failed", err);
+        return false;
+      }
+    },
+
+    /**
+     * Update a library source (partial). The server re-resolves and re-pushes to every screen + wall
+     * currently showing it — that "live library" re-render is the server's job; here we just optimistically
+     * patch local state so the Content view feels instant until the authoritative broadcast lands.
+     */
+    async updateSource(id: string, body: UpdateContentSourceBody): Promise<boolean> {
+      const existing = this.contentSources.find((s) => s.id === id);
+      if (existing) Object.assign(existing, body); // optimistic
+      try {
+        await api.updateContentSource(id, body);
+        return true;
+      } catch (err) {
+        console.error("[console] updateSource failed", err);
+        return false;
+      }
+    },
+
+    /** Delete a library source. The server clears any screen/wall assignment that referenced it. */
+    async deleteSource(id: string): Promise<boolean> {
+      this.contentSources = this.contentSources.filter((s) => s.id !== id); // optimistic
+      if (this.pickedSourceId === id) this.pickedSourceId = null;
+      try {
+        await api.deleteContentSource(id);
+        return true;
+      } catch (err) {
+        console.error("[console] deleteSource failed", err);
+        return false;
+      }
+    },
+
+    /** Arm a library source for click-to-assign (toggles off if it's already armed). */
+    pickSource(id: string): void {
+      this.pickedSourceId = this.pickedSourceId === id ? null : id;
+    },
+
+    /** Disarm any click-to-assign source. */
+    clearPickedSource(): void {
+      this.pickedSourceId = null;
+    },
+
+    /** Assign the armed source to a screen, then disarm. No-op if nothing is armed. */
+    assignPickedToScreen(screenId: string): void {
+      const id = this.pickedSourceId;
+      if (!id) return;
+      this.setScreenContent(screenId, { sourceId: id });
+      this.pickedSourceId = null;
+    },
+
+    /** Assign the armed source to a combined surface (spans across it), then disarm. */
+    assignPickedToWall(wallId: string): void {
+      const id = this.pickedSourceId;
+      if (!id) return;
+      this.setWallContent(wallId, { sourceId: id });
+      this.pickedSourceId = null;
     },
 
     // ── Selection & theme ───────────────────────────────────────────────────────

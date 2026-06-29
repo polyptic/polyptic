@@ -21,10 +21,20 @@
  * registration/approval order. The mapping is stable per (machineId, connector): a reconnecting
  * machine reuses its existing screen ids, and the counter resumes past the highest persisted id.
  */
-import { VideoWall, WebSurface } from "@polyptic/protocol";
+import {
+  ContentSource,
+  DashboardSurface,
+  ImageSurface,
+  VideoSurface,
+  VideoWall,
+  WebSurface,
+} from "@polyptic/protocol";
 import type {
+  ContentKind,
+  CreateContentSourceBody,
   DesiredState,
   DisplayBackend,
+  Geometry,
   Machine,
   Mural,
   Output,
@@ -32,6 +42,7 @@ import type {
   Screen,
   ScreenSlice,
   Surface,
+  UpdateContentSourceBody,
 } from "@polyptic/protocol";
 
 import type { PersistedMachine, Store } from "./store/types";
@@ -89,12 +100,35 @@ export type CombineScreensResult =
 /** Result of `setWallContent`: the per-member slices to render, or why it could not be computed. */
 export type SetWallContentResult =
   | { ok: true; slices: ScreenSlice[] }
-  | { ok: false; error: "unknown-wall" | "no-placements" };
+  | { ok: false; error: "unknown-wall" | "no-placements" | "unknown-source" };
 
 /** Result of `setScreenContent`: the new slice, or why the single-screen content was rejected. */
 export type SetScreenContentResult =
   | { ok: true; slice: ScreenSlice }
-  | { ok: false; error: "unknown-screen" | "wall-member"; wallId?: string };
+  | { ok: false; error: "unknown-screen" | "wall-member" | "unknown-source"; wallId?: string };
+
+/**
+ * An assignment of content to a screen or wall (Phase 3c): EITHER a library source (`sourceId`) OR an
+ * ad-hoc link (`url`). Exactly one is set (the REST edge validates this via `SetContentBody`).
+ */
+export interface ContentAssignment {
+  sourceId?: string;
+  url?: string;
+}
+
+/** A resolved content spec: the kind to build and the URL to point it at. */
+interface ResolvedSpec {
+  kind: ContentKind;
+  url: string;
+}
+
+/** Phase 3b spanning descriptor (a sub-rectangle of contentW×contentH at an offset). */
+interface Span {
+  contentW: number;
+  contentH: number;
+  offsetX: number;
+  offsetY: number;
+}
 
 /** Internal result of ensuring a Screen (+ slice) exists for each of a machine's outputs. */
 interface EnsureScreensResult {
@@ -127,6 +161,14 @@ export class ControlPlane {
   /** Phase 3b — combined surfaces (video walls), keyed by wall id. */
   private readonly videoWalls = new Map<string, VideoWall>();
   private wallCounter = 0;
+
+  /** Phase 3c — the content library, keyed by source id. */
+  private readonly contentSources = new Map<string, ContentSource>();
+  private sourceCounter = 0;
+  /** screenId → the library source it currently shows (only present for library-assigned screens). */
+  private readonly screenSourceIds = new Map<string, string>();
+  /** wallId → the library source it currently spans (only present for library-assigned walls). */
+  private readonly wallSourceIds = new Map<string, string>();
 
   constructor(private readonly store: Store) {}
 
@@ -182,6 +224,9 @@ export class ControlPlane {
         canvas: c.canvas,
         surfaces: c.surfaces,
       };
+      // Phase 3c — remember which library source (if any) this screen is showing, so a source edit
+      // re-resolves + re-pushes it.
+      if (c.sourceId) this.screenSourceIds.set(c.screenId, c.sourceId);
     }
 
     // Resume the global counter past the highest persisted "screen-N" so new ids stay unique.
@@ -240,7 +285,11 @@ export class ControlPlane {
         muralId: w.muralId,
         memberScreenIds: w.memberScreenIds,
       });
-      if (parsed.success) this.videoWalls.set(parsed.data.id, parsed.data);
+      if (parsed.success) {
+        this.videoWalls.set(parsed.data.id, parsed.data);
+        // Phase 3c — remember which library source (if any) this wall is spanning.
+        if (w.contentSourceId) this.wallSourceIds.set(parsed.data.id, w.contentSourceId);
+      }
     }
     // Resume the wall counter past the highest persisted "wall-N" so new ids stay unique.
     let maxWall = 0;
@@ -252,6 +301,30 @@ export class ControlPlane {
       }
     }
     this.wallCounter = maxWall;
+
+    // ── Content library (Phase 3c) ────────────────────────────────────────────
+    for (const cs of persisted.contentSources) {
+      // Re-validate at the edge; drop a malformed/legacy row rather than crash the boot.
+      const parsed = ContentSource.safeParse(cs);
+      if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
+    }
+    // Resume the source counter past the highest persisted "source-N" so new ids stay unique.
+    let maxSource = 0;
+    for (const s of this.contentSources.values()) {
+      const match = /^source-(\d+)$/.exec(s.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxSource = Math.max(maxSource, n);
+      }
+    }
+    this.sourceCounter = maxSource;
+    // Drop any dangling assignment whose source no longer exists (defensive against manual edits).
+    for (const [screenId, sid] of this.screenSourceIds) {
+      if (!this.contentSources.has(sid)) this.screenSourceIds.delete(screenId);
+    }
+    for (const [wallId, sid] of this.wallSourceIds) {
+      if (!this.contentSources.has(sid)) this.wallSourceIds.delete(wallId);
+    }
 
     // Seed a default mural the first time a deployment boots, so the Wall view always has a canvas.
     if (this.murals.size === 0) {
@@ -524,12 +597,15 @@ export class ControlPlane {
     if (slice === undefined) return null;
     const next: ScreenSlice = { ...slice, surfaces };
     this.state.slices[screenId] = next;
+    // Replacing surfaces wholesale drops any library-source assignment this screen carried.
+    this.setScreenSourceAssignment(screenId, null);
     this.bumpRevision();
 
     await this.store.upsertContent({
       screenId,
       canvas: next.canvas,
       surfaces: next.surfaces,
+      sourceId: null,
     });
     await this.store.setRevision(this.state.revision);
     return next;
@@ -554,12 +630,15 @@ export class ControlPlane {
     });
     const next: ScreenSlice = { ...slice, surfaces: [surface] };
     this.state.slices[screenId] = next;
+    // The demo push is an ad-hoc web surface — drop any library-source assignment.
+    this.setScreenSourceAssignment(screenId, null);
     this.bumpRevision();
 
     await this.store.upsertContent({
       screenId,
       canvas: next.canvas,
       surfaces: next.surfaces,
+      sourceId: null,
     });
     await this.store.setRevision(this.state.revision);
     return next;
@@ -642,6 +721,7 @@ export class ControlPlane {
     const memberIds: string[] = [];
     for (const w of wallsHere) {
       this.videoWalls.delete(w.id);
+      this.wallSourceIds.delete(w.id);
       await this.store.deleteVideoWall(w.id);
       memberIds.push(...w.memberScreenIds);
     }
@@ -718,6 +798,7 @@ export class ControlPlane {
     if (wall === undefined) return { slices: [] };
 
     this.videoWalls.delete(wall.id);
+    this.wallSourceIds.delete(wall.id);
     await this.store.deleteVideoWall(wall.id);
     const slices = this.clearSlices(wall.memberScreenIds); // includes the just-unplaced screen
     this.bumpRevision();
@@ -762,10 +843,15 @@ export class ControlPlane {
     return `wall-${this.wallCounter}`;
   }
 
-  /** Clear (empty the surfaces of) each given screen's slice in memory; return the touched slices. */
+  /**
+   * Clear (empty the surfaces of) each given screen's slice in memory; return the touched slices.
+   * Clearing a screen's content also drops any library-source assignment it carried (the slice no
+   * longer shows that source), so a later source edit won't try to re-resolve a now-empty screen.
+   */
   private clearSlices(screenIds: string[]): ScreenSlice[] {
     const touched: ScreenSlice[] = [];
     for (const screenId of screenIds) {
+      this.screenSourceIds.delete(screenId);
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
       const next: ScreenSlice = { ...slice, surfaces: [] };
@@ -773,6 +859,120 @@ export class ControlPlane {
       touched.push(next);
     }
     return touched;
+  }
+
+  // ── Content library: resolution helpers (Phase 3c) ──────────────────────────
+
+  /**
+   * Build the renderable surface for a resolved spec. The kind decides the surface type (web/dashboard
+   * → URL-bearing; image/video → src-bearing); zod fills the type-specific defaults. `span` (when set)
+   * makes the surface render only its slice of a larger spanning content (video walls). The surface id
+   * is caller-supplied and STABLE so consecutive pushes reconcile to the same keyed tile (in-place swap,
+   * the INSTANT property — D5).
+   */
+  private buildSurface(spec: ResolvedSpec, id: string, region: Geometry, span?: Span): Surface {
+    const base = span ? { id, region, span } : { id, region };
+    switch (spec.kind) {
+      case "web":
+        return WebSurface.parse({
+          ...base,
+          type: "web",
+          url: spec.url,
+          placement: "iframe",
+          interactive: false,
+        });
+      case "dashboard":
+        return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url });
+      case "image":
+        return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
+      case "video":
+        return VideoSurface.parse({ ...base, type: "video", src: spec.url, loop: true, muted: true });
+    }
+  }
+
+  /**
+   * Resolve a content assignment to a concrete spec + the sourceId to record (null for ad-hoc). An
+   * ad-hoc `url` becomes a web spec (exactly the Phase 3b behaviour); a `sourceId` is looked up in the
+   * library and resolved to its kind+url (error if unknown).
+   */
+  private resolveSpec(
+    a: ContentAssignment,
+  ): { spec: ResolvedSpec; sourceId: string | null } | { error: "unknown-source" } {
+    if (a.url !== undefined) {
+      return { spec: { kind: "web", url: a.url }, sourceId: null };
+    }
+    const source = a.sourceId !== undefined ? this.contentSources.get(a.sourceId) : undefined;
+    if (!source) return { error: "unknown-source" };
+    return { spec: { kind: source.kind, url: source.url }, sourceId: source.id };
+  }
+
+  /** Record (or clear) the library source a screen currently shows. */
+  private setScreenSourceAssignment(screenId: string, sourceId: string | null): void {
+    if (sourceId) this.screenSourceIds.set(screenId, sourceId);
+    else this.screenSourceIds.delete(screenId);
+  }
+
+  /** Record (or clear) the library source a wall currently spans, writing the wall row through. */
+  private async setWallSourceAssignment(wall: VideoWall, sourceId: string | null): Promise<void> {
+    if (sourceId) this.wallSourceIds.set(wall.id, sourceId);
+    else this.wallSourceIds.delete(wall.id);
+    await this.store.upsertVideoWall({
+      id: wall.id,
+      muralId: wall.muralId,
+      memberScreenIds: wall.memberScreenIds,
+      contentSourceId: sourceId,
+    });
+  }
+
+  /**
+   * Recompute every member's span slice for a wall showing `spec` and apply it in memory. Reuses the
+   * Phase 3b union-bbox span math (works for ANY surface kind). Returns the touched member slices (empty
+   * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
+   */
+  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec): ScreenSlice[] {
+    const members: { screenId: string; placement: Placement }[] = [];
+    for (const screenId of wall.memberScreenIds) {
+      const placement = this.placements.get(screenId);
+      if (placement && placement.muralId === wall.muralId) members.push({ screenId, placement });
+    }
+    if (members.length === 0) return [];
+
+    // Union bounding box of the member placements (canvas pixels).
+    let unionMinX = Infinity;
+    let unionMinY = Infinity;
+    let unionMaxX = -Infinity;
+    let unionMaxY = -Infinity;
+    for (const { placement } of members) {
+      unionMinX = Math.min(unionMinX, placement.x);
+      unionMinY = Math.min(unionMinY, placement.y);
+      unionMaxX = Math.max(unionMaxX, placement.x + placement.w);
+      unionMaxY = Math.max(unionMaxY, placement.y + placement.h);
+    }
+    const contentW = unionMaxX - unionMinX;
+    const contentH = unionMaxY - unionMinY;
+
+    const slices: ScreenSlice[] = [];
+    for (const { screenId, placement } of members) {
+      const slice = this.state.slices[screenId];
+      if (slice === undefined) continue;
+      const surface = this.buildSurface(
+        spec,
+        // Stable per-wall id: consecutive content pushes reconcile to the SAME keyed surface, so the
+        // player mutates the existing element in place (no remount) — INSTANT (D5).
+        `wall:${wall.id}`,
+        { x: 0, y: 0, w: placement.w, h: placement.h },
+        {
+          contentW,
+          contentH,
+          offsetX: placement.x - unionMinX,
+          offsetY: placement.y - unionMinY,
+        },
+      );
+      const next: ScreenSlice = { ...slice, surfaces: [surface] };
+      this.state.slices[screenId] = next;
+      slices.push(next);
+    }
+    return slices;
   }
 
   /**
@@ -840,6 +1040,7 @@ export class ControlPlane {
     if (wall === undefined) return null;
 
     this.videoWalls.delete(wallId);
+    this.wallSourceIds.delete(wallId);
     await this.store.deleteVideoWall(wallId);
 
     const slices = this.clearSlices(wall.memberScreenIds);
@@ -865,57 +1066,19 @@ export class ControlPlane {
    * through. Returns the per-member slices (the caller pushes a `server/render` to each), or an error
    * if the wall is unknown / none of its members are placed.
    */
-  async setWallContent(wallId: string, url: string): Promise<SetWallContentResult> {
+  async setWallContent(wallId: string, a: ContentAssignment): Promise<SetWallContentResult> {
     const wall = this.videoWalls.get(wallId);
     if (wall === undefined) return { ok: false, error: "unknown-wall" };
 
-    // Gather the members still placed on this wall's mural (defensive against later layout edits).
-    const members: { screenId: string; placement: Placement }[] = [];
-    for (const screenId of wall.memberScreenIds) {
-      const placement = this.placements.get(screenId);
-      if (placement && placement.muralId === wall.muralId) members.push({ screenId, placement });
-    }
-    if (members.length === 0) return { ok: false, error: "no-placements" };
+    const resolved = this.resolveSpec(a);
+    if ("error" in resolved) return { ok: false, error: resolved.error };
 
-    // Union bounding box of the member placements (canvas pixels).
-    let unionMinX = Infinity;
-    let unionMinY = Infinity;
-    let unionMaxX = -Infinity;
-    let unionMaxY = -Infinity;
-    for (const { placement } of members) {
-      unionMinX = Math.min(unionMinX, placement.x);
-      unionMinY = Math.min(unionMinY, placement.y);
-      unionMaxX = Math.max(unionMaxX, placement.x + placement.w);
-      unionMaxY = Math.max(unionMaxY, placement.y + placement.h);
-    }
-    const contentW = unionMaxX - unionMinX;
-    const contentH = unionMaxY - unionMinY;
-
-    const slices: ScreenSlice[] = [];
-    for (const { screenId, placement } of members) {
-      const slice = this.state.slices[screenId];
-      if (slice === undefined) continue;
-      const surface = WebSurface.parse({
-        // Stable per-wall id: consecutive content pushes reconcile to the SAME keyed surface, so the
-        // player mutates the existing <iframe> src/transform in place (no remount) — INSTANT (D5).
-        id: `wall:${wall.id}`,
-        type: "web",
-        region: { x: 0, y: 0, w: placement.w, h: placement.h },
-        url,
-        placement: "iframe",
-        interactive: false,
-        span: {
-          contentW,
-          contentH,
-          offsetX: placement.x - unionMinX,
-          offsetY: placement.y - unionMinY,
-        },
-      });
-      const next: ScreenSlice = { ...slice, surfaces: [surface] };
-      this.state.slices[screenId] = next;
-      slices.push(next);
-    }
+    // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
+    const slices = this.computeWallSlices(wall, resolved.spec);
     if (slices.length === 0) return { ok: false, error: "no-placements" };
+
+    // Record which library source (if any) this wall now spans, persisting the wall row.
+    await this.setWallSourceAssignment(wall, resolved.sourceId);
 
     this.bumpRevision();
     for (const slice of slices) {
@@ -923,6 +1086,7 @@ export class ControlPlane {
         screenId: slice.screenId,
         canvas: slice.canvas,
         surfaces: slice.surfaces,
+        sourceId: resolved.sourceId,
       });
     }
     await this.store.setRevision(this.state.revision);
@@ -936,7 +1100,7 @@ export class ControlPlane {
    * surface id is stable so repeated assignments patch the player's iframe in place (INSTANT, D5).
    * Bumps the revision and writes through. Returns the new slice, or an error result.
    */
-  async setScreenContent(screenId: string, url: string): Promise<SetScreenContentResult> {
+  async setScreenContent(screenId: string, a: ContentAssignment): Promise<SetScreenContentResult> {
     const screen = this.getScreen(screenId);
     if (screen === undefined) return { ok: false, error: "unknown-screen" };
 
@@ -946,26 +1110,185 @@ export class ControlPlane {
     const slice = this.state.slices[screenId];
     if (slice === undefined) return { ok: false, error: "unknown-screen" };
 
-    const surface = WebSurface.parse({
-      id: "content-web",
-      type: "web",
-      region: { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
-      url,
-      placement: "iframe",
-      interactive: false,
+    const resolved = this.resolveSpec(a);
+    if ("error" in resolved) return { ok: false, error: resolved.error };
+
+    // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
+    const surface = this.buildSurface(resolved.spec, "content-web", {
+      x: 0,
+      y: 0,
+      w: slice.canvas.w,
+      h: slice.canvas.h,
     });
     const next: ScreenSlice = { ...slice, surfaces: [surface] };
     this.state.slices[screenId] = next;
+    this.setScreenSourceAssignment(screenId, resolved.sourceId);
     this.bumpRevision();
 
     await this.store.upsertContent({
       screenId,
       canvas: next.canvas,
       surfaces: next.surfaces,
+      sourceId: resolved.sourceId,
     });
     await this.store.setRevision(this.state.revision);
 
     return { ok: true, slice: next };
+  }
+
+  // ── Content library (Phase 3c) ──────────────────────────────────────────────
+  //
+  // A ContentSource is a reusable, named library entry ({id, name, kind, url}). Screens/walls are
+  // assigned a source by id and the server resolves it to the surface(s) it renders. The library CRUD
+  // is registry metadata — creating/renaming a source does not by itself change any render — EXCEPT
+  // that editing or deleting an IN-USE source re-resolves (or clears) every screen/wall showing it and
+  // returns those slices for the caller to push.
+
+  getContentSources(): ContentSource[] {
+    return [...this.contentSources.values()];
+  }
+
+  getContentSource(id: string): ContentSource | undefined {
+    return this.contentSources.get(id);
+  }
+
+  private nextSourceId(): string {
+    this.sourceCounter += 1;
+    return `source-${this.sourceCounter}`;
+  }
+
+  /** Create a new library source with a server-assigned id. Write-through. */
+  async createContentSource(body: CreateContentSourceBody): Promise<ContentSource> {
+    const id = this.nextSourceId();
+    const source = ContentSource.parse({ id, name: body.name, kind: body.kind, url: body.url });
+    this.contentSources.set(id, source);
+    await this.store.upsertContentSource({
+      id: source.id,
+      name: source.name,
+      kind: source.kind,
+      url: source.url,
+    });
+    return source;
+  }
+
+  /**
+   * Update a library source (any subset of name/kind/url). If the source is currently assigned to any
+   * screen(s) or wall(s), each is RE-RESOLVED against the new kind/url and the touched slices are
+   * returned (one revision bump, write-through) for the caller to push live. Returns null if unknown.
+   */
+  async updateContentSource(
+    id: string,
+    patch: UpdateContentSourceBody,
+  ): Promise<{ source: ContentSource; slices: ScreenSlice[] } | null> {
+    const existing = this.contentSources.get(id);
+    if (existing === undefined) return null;
+
+    const source = ContentSource.parse({
+      id: existing.id,
+      name: patch.name ?? existing.name,
+      kind: patch.kind ?? existing.kind,
+      url: patch.url ?? existing.url,
+    });
+    this.contentSources.set(id, source);
+    await this.store.upsertContentSource({
+      id: source.id,
+      name: source.name,
+      kind: source.kind,
+      url: source.url,
+    });
+
+    // Re-resolve every screen + wall currently showing this source.
+    const spec: ResolvedSpec = { kind: source.kind, url: source.url };
+    const byScreen = new Map<string, ScreenSlice>();
+
+    for (const [screenId, sid] of this.screenSourceIds) {
+      if (sid !== id) continue;
+      const slice = this.state.slices[screenId];
+      if (slice === undefined) continue;
+      const surface = this.buildSurface(spec, "content-web", {
+        x: 0,
+        y: 0,
+        w: slice.canvas.w,
+        h: slice.canvas.h,
+      });
+      const next: ScreenSlice = { ...slice, surfaces: [surface] };
+      this.state.slices[screenId] = next;
+      byScreen.set(screenId, next);
+    }
+
+    for (const [wallId, sid] of this.wallSourceIds) {
+      if (sid !== id) continue;
+      const wall = this.videoWalls.get(wallId);
+      if (wall === undefined) continue;
+      for (const next of this.computeWallSlices(wall, spec)) byScreen.set(next.screenId, next);
+    }
+
+    const slices = [...byScreen.values()];
+    if (slices.length > 0) {
+      this.bumpRevision();
+      for (const slice of slices) {
+        await this.store.upsertContent({
+          screenId: slice.screenId,
+          canvas: slice.canvas,
+          surfaces: slice.surfaces,
+          sourceId: id,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+
+    return { source, slices };
+  }
+
+  /**
+   * Delete a library source. Any screen(s)/wall(s) currently showing it have their content CLEARED
+   * (empty slices — the assignment is gone), and those cleared slices are returned (one revision bump,
+   * write-through) for the caller to push. A cleared wall keeps its combined structure but spans no
+   * content until reassigned. Returns null if the source is unknown.
+   */
+  async deleteContentSource(id: string): Promise<{ slices: ScreenSlice[] } | null> {
+    if (!this.contentSources.has(id)) return null;
+
+    const byScreen = new Map<string, ScreenSlice>();
+
+    // Screens directly assigned this source → clear their slice (also drops the assignment).
+    const screenIds = [...this.screenSourceIds.entries()]
+      .filter(([, sid]) => sid === id)
+      .map(([screenId]) => screenId);
+    for (const next of this.clearSlices(screenIds)) byScreen.set(next.screenId, next);
+
+    // Walls spanning this source → clear every member's slice and drop the wall's assignment.
+    const wallIds = [...this.wallSourceIds.entries()]
+      .filter(([, sid]) => sid === id)
+      .map(([wallId]) => wallId);
+    for (const wallId of wallIds) {
+      const wall = this.videoWalls.get(wallId);
+      if (wall === undefined) {
+        this.wallSourceIds.delete(wallId);
+        continue;
+      }
+      for (const next of this.clearSlices(wall.memberScreenIds)) byScreen.set(next.screenId, next);
+      await this.setWallSourceAssignment(wall, null);
+    }
+
+    this.contentSources.delete(id);
+    await this.store.deleteContentSource(id);
+
+    const slices = [...byScreen.values()];
+    if (slices.length > 0) {
+      this.bumpRevision();
+      for (const slice of slices) {
+        await this.store.upsertContent({
+          screenId: slice.screenId,
+          canvas: slice.canvas,
+          surfaces: slice.surfaces,
+          sourceId: null,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+
+    return { slices };
   }
 
   /**

@@ -8,13 +8,16 @@
  */
 import {
   CombineScreensBody,
+  CreateContentSourceBody,
   CreateMuralBody,
   IdentBody,
   PlaceScreenBody,
   RenameMuralBody,
   RenameScreenBody,
   SetContentBody,
+  UpdateContentSourceBody,
 } from "@polyptic/protocol";
+import type { ContentSource } from "@polyptic/protocol";
 
 const BASE = "http://localhost:8080/api/v1";
 
@@ -97,12 +100,16 @@ export function identScreen(screenId: string, body: IdentBody): Promise<unknown>
   return send("POST", `/screens/${encodeURIComponent(screenId)}/ident`, IdentBody.parse(body));
 }
 
-/** PUT /api/v1/screens/:screenId/content { url } — point one screen at a single full-canvas web surface. */
-export function setScreenContent(screenId: string, url: string): Promise<unknown> {
+/**
+ * PUT /api/v1/screens/:screenId/content — point one screen at content. The body is EITHER a library
+ * source (`{ sourceId }`) or an ad-hoc link (`{ url }`, an ad-hoc web surface, the Phase-3b path).
+ * Exactly one of the two (enforced by SetContentBody's refinement).
+ */
+export function setScreenContent(screenId: string, body: SetContentBody): Promise<unknown> {
   return send(
     "PUT",
     `/screens/${encodeURIComponent(screenId)}/content`,
-    SetContentBody.parse({ url }),
+    SetContentBody.parse(body),
   );
 }
 
@@ -122,16 +129,44 @@ export function splitWall(wallId: string): Promise<unknown> {
   return send("DELETE", `/walls/${encodeURIComponent(wallId)}`);
 }
 
-/** PUT /api/v1/walls/:wallId/content { url } — assign content that spans across the whole surface. */
-export function setWallContent(wallId: string, url: string): Promise<unknown> {
+/**
+ * PUT /api/v1/walls/:wallId/content — assign content that spans across the whole combined surface.
+ * The body is EITHER a library source (`{ sourceId }`) or an ad-hoc link (`{ url }`, the Phase-3b
+ * spanning-web path that the 3b walls e2e exercises). Exactly one of the two.
+ */
+export function setWallContent(wallId: string, body: SetContentBody): Promise<unknown> {
   return send(
     "PUT",
     `/walls/${encodeURIComponent(wallId)}/content`,
-    SetContentBody.parse({ url }),
+    SetContentBody.parse(body),
   );
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */
 export function identWall(wallId: string, body: IdentBody): Promise<unknown> {
   return send("POST", `/walls/${encodeURIComponent(wallId)}/ident`, IdentBody.parse(body));
+}
+
+// ── Content library (Phase 3c) ───────────────────────────────────────────────
+
+/** POST /api/v1/content-sources { name, kind, url } — create a reusable library source. */
+export function createContentSource(body: CreateContentSourceBody): Promise<ContentSource> {
+  return send("POST", "/content-sources", CreateContentSourceBody.parse(body));
+}
+
+/** PATCH /api/v1/content-sources/:sourceId { name?, kind?, url? } — partial update of a source. */
+export function updateContentSource(
+  sourceId: string,
+  body: UpdateContentSourceBody,
+): Promise<ContentSource> {
+  return send(
+    "PATCH",
+    `/content-sources/${encodeURIComponent(sourceId)}`,
+    UpdateContentSourceBody.parse(body),
+  );
+}
+
+/** DELETE /api/v1/content-sources/:sourceId — remove a source from the library. */
+export function deleteContentSource(sourceId: string): Promise<unknown> {
+  return send("DELETE", `/content-sources/${encodeURIComponent(sourceId)}`);
 }
