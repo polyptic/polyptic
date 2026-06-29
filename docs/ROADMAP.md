@@ -26,9 +26,17 @@ Real Machine/Output/Screen/Scene registry in **PostgreSQL** (dev via `deploy/doc
 Outbound-WSS **enrollment**: agent dials with a one-time bootstrap token → appears **pending** → operator **approves** in the Admin UI → durable per-machine **credential** (server stores only sha256; agent keeps the raw secret). Dev default is open-enrollment (auto-approve, with a boot warning); setting `POLYPTYCH_BOOTSTRAP_TOKEN` switches on gating. **mTLS transport is deferred** to the deploy/hardening layer (D12) — the credential model is the app-level seam mTLS client-certs drop into.
 **DoD met:** a fresh machine shows pending; approving admits its screens (live `server/apply`); an unknown/wrong-token/unapproved machine is rejected + disconnected. Verified by e2e (10 gated tests) + a Postgres restart capstone.
 
-## Phase 3 — Murals (spatial canvas) + layout, scenes, adapters, instant fan-out
-**Murals (D20):** the Admin UI's primary workspace is a canvas where operators **drag + snap screens** (independent of host machine) into spatial arrangements. A Screen gains a position/size; introduce a **Mural/Wall** entity = a named, positioned set of screens. Content can **span adjacent screens**. Then: **Typed surfaces** + **content adapters** (web, dashboard/Grafana, image, video), named versioned **Scenes** capturing a whole composition, an **Admin UI** layout/scene editor, and atomic scene fan-out across all screens.
-**DoD:** compose a mural by snapping screens together; assign content (incl. spanning screens); save a scene; switch scenes → all screens flip together, instantly.
+## Phase 3 — Murals (spatial canvas), surfaces, content library, scenes
+The big UI phase. Model adopted from the **Console v2** design (D20–D25):
+- **Murals (D21):** several named, switchable canvases. A Screen is **unplaced** (tray) or **placed** on one mural at `{x,y,w,h}` — operators drag/snap screens to compose a wall.
+- **Combined surfaces / video walls (D22):** combine adjacent screens into one `Surface`; content **spans** it (bezel seams shown); split to undo; "ident all".
+- **Content library (D23):** reusable `ContentSource` items (web/dashboard/image/video + auth strategy) dragged onto a screen or surface.
+- **Scenes (D24):** save the whole composition (content + layout + grouping) per mural; switch → atomic fan-out across all screens, instantly.
+- **Activity feed (D25):** live event stream in the console.
+- Contract gains: Mural, Surface, ContentSource, Scene, screen placement (position/size), + the WS/REST to drive them. **Admin UI** rebuilt as the canvas console (per the chosen Claude Design direction).
+**DoD:** compose a mural by snapping/combining screens; assign content from the library (incl. spanning a surface); save a scene; switch scenes → all screens flip together, instantly.
+
+> **Missing operator flows** (not in Console v2; queued for the design agent → then build): cold-start (nothing connected), the **enrollment/approval** UI (2b's bouncer), first-time *ident→name→place* mapping, a **fleet/machines** view, **content-source** add/edit, **scene management**, and console **settings/sign-in** (admin OIDC, Phase 6).
 
 ## Phase 4 — Real device stack + zero-click boot
 Ubuntu image: greetd autologin → compositor → systemd-supervised agent + Chromium per output. `DisplayBackend` (`wayland-sway` default, `x11-i3` fallback). Agent as single-file `.deb`. Declarative provisioning (cloud-init/Ansible/image). Crash/restore hardening.

@@ -143,3 +143,21 @@ Polyptych depends on none of this; recorded because AMRC is the first deployment
 - ACS Visualiser = `acs-visualiser` Node/Express (live MQTT traffic view); **no explicit frame headers found** — confirm iframability at runtime, else render as a top-level `web-window`.
 - `i3X-Explorer` (`~/code/i3X-Explorer`) is a separate Electron app — *not* the wall visualiser.
 - For the AMRC deployment, host `polyptych-server` on the existing cluster behind Traefik and point its admin OIDC at Keycloak; that's an integration choice, not a product requirement.
+
+---
+
+## Update 2026-06-29 — Console v2 model (adopted from the design exploration)
+
+The external UI exploration ("Polyptych Console v2") settled the operator-console model. We adopt it wholesale (decisions D21–D25). This reshapes **Phase 3**; the contract/code don't change until that build.
+
+**Entities (the Phase 3 data model):**
+- **Mural** — a named, switchable canvas (e.g. "Reception", "Atrium"). A deployment has several. Top-bar switcher selects the active one.
+- **Screen placement** — a Screen is **unplaced** (lives in a tray) or **placed** on exactly one mural at `{x, y, w, h}`. Enrolment (2b) ≠ placement: an approved screen still has to be dragged onto a mural. (Screens stay independent of their host machine — the machine is only shown as secondary "driven by" metadata, which the v2 design confirmed.)
+- **Surface (combined / video wall)** — adjacent placed screens combined into one logical screen. Content **spans** the surface with bezel seams shown; it has a combined resolution, one content assignment, and "ident all". **Combine** (multi-select adjacent → combine) / **Split** (back to individual screens).
+- **ContentSource** — a reusable library item: `{ name, kind: web|dashboard|image|video, address/config, authStrategy }`. Dragged from the **Content Library** onto a screen or surface. (Promotes the old "content adapters" idea into managed entities; `authStrategy` is the Bucket-A strategy from the auth model.)
+- **Scene** — snapshots a mural's whole composition: each screen/surface's content **and** every screen's position/size **and** which screens are combined. Switching a scene restores it atomically (instant fan-out). Save = "save current wall as scene".
+- **Activity event** — server-emitted event (`machine unreachable`, `content changed`, `scene activated`, `screen approved`…) surfaced as the console's **live activity feed**.
+
+**The console (v2) shape:** top bar (mural switcher · scene switcher + save · live/alerts · theme); left = Content Library + Unplaced-screens tray; centre = zoomable canvas of screens + combined surfaces with a floating selection toolbar; right = context inspector (single screen / combined surface / multi-select pre-combine / empty); a live activity feed. Machines appear only as secondary metadata.
+
+**What v2 did NOT cover — missing operator flows** (queued for the design agent, then build): cold-start (nothing connected yet); the **enrolment/approval** UI (Phase 2b's pending → approve/reject "bouncer"); the first-time **ident → name → place** mapping flow; a **fleet/machines** management view (health, enrolment status, reject/revoke, bootstrap-token setting); **content-source** add/edit (incl. auth strategy); **scene management** (list/rename/delete/duplicate/schedule); and console **settings/sign-in** (admin OIDC — Bucket B/Phase 6). Optionally: real **live preview** thumbnails on the canvas (Phase 5) rather than content *names*.
