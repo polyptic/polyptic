@@ -133,16 +133,8 @@ export const ScreenSlice = z.object({
 });
 export type ScreenSlice = z.infer<typeof ScreenSlice>;
 
-/** A named, versioned preset: which surfaces sit on which screens. */
-export const Scene = z.object({
-  id: z.string(),
-  name: z.string(),
-  version: z.number().int().nonnegative(),
-  placements: z.array(z.object({ screenId: z.string(), surfaces: z.array(Surface) })),
-});
-export type Scene = z.infer<typeof Scene>;
-
-/** The control plane's desired state. `revision` increments on every change; agents/players reconcile to it. */
+/** The control plane's desired state. `revision` increments on every change; agents/players reconcile to it.
+ *  (The full Scene snapshot model lives below, near the other Phase-3 console types.) */
 export const DesiredState = z.object({
   revision: z.number().int().nonnegative(),
   activeSceneId: z.string().nullable(),
@@ -362,6 +354,46 @@ export const ContentSource = z.object({
 });
 export type ContentSource = z.infer<typeof ContentSource>;
 
+// ── Scenes (Phase 3d) ────────────────────────────────────────────────────────
+// A Scene is a named SNAPSHOT of a mural's whole wall — its layout (placements), grouping (video
+// walls) and content (per screen + per wall) — re-appliable in one click. Content is captured as the
+// assignment (a library sourceId or an ad-hoc url), so applying re-resolves a source to its CURRENT url.
+
+/** A content assignment captured in a scene: a library source, an ad-hoc url, or nothing (null). */
+export const SceneContent = z
+  .object({ sourceId: z.string().optional(), url: z.string().url().optional() })
+  .nullable();
+export type SceneContent = z.infer<typeof SceneContent>;
+
+export const ScenePlacement = z.object({
+  screenId: z.string(),
+  x: z.number(),
+  y: z.number(),
+  w: z.number().positive(),
+  h: z.number().positive(),
+});
+
+export const SceneWall = z.object({
+  memberScreenIds: z.array(z.string()).min(2),
+  content: SceneContent,
+});
+
+export const SceneScreen = z.object({
+  screenId: z.string(),
+  content: SceneContent,
+});
+
+export const Scene = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(120),
+  muralId: z.string(),
+  placements: z.array(ScenePlacement), // layout
+  walls: z.array(SceneWall), // grouping + each wall's content
+  screens: z.array(SceneScreen), // content for placed, non-walled screens
+  scheduleAt: z.string().optional(), // "HH:MM" — illustrative; stored, not fired
+});
+export type Scene = z.infer<typeof Scene>;
+
 export const AdminHello = z.object({
   t: z.literal("admin/hello"),
   protocol: z.literal(PROTOCOL_VERSION),
@@ -378,6 +410,7 @@ export const ServerToAdminState = z.object({
   placements: z.array(Placement), // Phase 3 — which screen sits where on which mural
   videoWalls: z.array(VideoWall), // Phase 3b — combined surfaces
   contentSources: z.array(ContentSource), // Phase 3c — the content library
+  scenes: z.array(Scene), // Phase 3d — saved wall snapshots
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -444,6 +477,22 @@ export const UpdateContentSourceBody = z.object({
   url: z.string().url().optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
+
+// REST bodies — scenes (Phase 3d)
+/** Save the CURRENT state of a mural as a new scene — the server snapshots placements + walls +
+ *  content itself; the client only names it. */
+export const CreateSceneBody = z.object({
+  name: z.string().min(1).max(120),
+  muralId: z.string(),
+});
+export type CreateSceneBody = z.infer<typeof CreateSceneBody>;
+
+/** Rename a scene and/or set its illustrative schedule time (null clears it). */
+export const UpdateSceneBody = z.object({
+  name: z.string().min(1).max(120).optional(),
+  scheduleAt: z.string().nullable().optional(),
+});
+export type UpdateSceneBody = z.infer<typeof UpdateSceneBody>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
