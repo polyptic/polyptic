@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; }
+  input{ font-family:inherit; }
+  ::-webkit-scrollbar{ width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb{ background:var(--line2); border-radius:6px; border:3px solid transparent; background-clip:content-box; }
+  :root{
+    --bg:#fafafa; --surface:#ffffff; --card:#ffffff; --muted-bg:#f4f4f5;
+    --line:#e4e4e7; --line2:#d4d4d8;
+    --fg:#09090b; --fg2:#27272a; --muted:#71717a; --muted2:#a1a1aa;
+    --primary:#18181b; --primary-fg:#fafafa;
+    --accent:#2563eb; --accent-soft:rgba(37,99,235,.09); --accent-line:rgba(37,99,235,.40); --accent-fg:#1d4ed8;
+    --ok:#16a34a; --ok-soft:rgba(22,163,74,.10); --warn:#d97706; --warn-soft:rgba(217,119,6,.12); --bad:#dc2626; --bad-soft:rgba(220,38,38,.10);
+    --scr-live:linear-gradient(135deg,#eef4ff,#e3ecfb); --scr-neutral:#f4f4f5;
+    --scr-bad-bg:#fef2f2; --scr-bad-line:#fecaca;
+    --scr-empty-bg:#fafafa; --scr-empty-line:#d4d4d8; --scr-off-bg:#f1f1f2;
+    --seam:rgba(2,6,23,.14); --label-bg:rgba(255,255,255,.9); --dot:#e4e4e7;
+    --shadow-sm:0 1px 2px rgba(16,24,40,.06); --shadow:0 4px 16px rgba(16,24,40,.10); --shadow-lg:0 16px 40px rgba(16,24,40,.16);
+  }
+  [data-theme="dark"]{
+    --bg:#09090b; --surface:#0d0d10; --card:#18181b; --muted-bg:#18181b;
+    --line:#27272a; --line2:#3f3f46;
+    --fg:#fafafa; --fg2:#e4e4e7; --muted:#a1a1aa; --muted2:#71717a;
+    --primary:#fafafa; --primary-fg:#18181b;
+    --accent:#3b82f6; --accent-soft:rgba(59,130,246,.16); --accent-line:rgba(59,130,246,.45); --accent-fg:#93c5fd;
+    --ok:#22c55e; --ok-soft:rgba(34,197,94,.15); --warn:#f59e0b; --warn-soft:rgba(245,158,11,.15); --bad:#ef4444; --bad-soft:rgba(239,68,68,.15);
+    --scr-live:linear-gradient(135deg,#172134,#141b2c); --scr-neutral:#1c1c20;
+    --scr-bad-bg:#1f1416; --scr-bad-line:rgba(239,68,68,.4);
+    --scr-empty-bg:#111114; --scr-empty-line:#3f3f46; --scr-off-bg:#141417;
+    --seam:rgba(0,0,0,.5); --label-bg:rgba(9,9,11,.6); --dot:#1d1d21;
+    --shadow-sm:0 1px 2px rgba(0,0,0,.5); --shadow:0 4px 16px rgba(0,0,0,.55); --shadow-lg:0 16px 40px rgba(0,0,0,.62);
+  }
+  @keyframes ppulse{ 0%,100%{opacity:1} 50%{opacity:.3} }
+  @keyframes pflash{ 0%,100%{box-shadow:0 0 0 2px var(--accent),0 0 26px rgba(59,130,246,.55)} 50%{box-shadow:0 0 0 2px rgba(59,130,246,.25)} }
+  @keyframes pin{ from{opacity:0;transform:translate(-50%,-6px)} to{opacity:1;transform:translate(-50%,0)} }
+  @keyframes spin{ to{transform:rotate(360deg)} }
+  @keyframes fadein{ from{opacity:0} to{opacity:1} }
+</style>
+</helmet>
+
+<div data-theme="{{ theme }}" style="height:100vh;min-height:640px;background:var(--bg);font-family:'Geist',system-ui,sans-serif;color:var(--fg);overflow:hidden;-webkit-font-smoothing:antialiased">
+
+<!-- ================= SIGN-IN ================= -->
+<sc-if value="{{ isSignin }}" hint-placeholder-val="{{ false }}">
+  <div style="height:100%;display:flex;align-items:center;justify-content:center;background:var(--bg)">
+    <div style="width:380px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:30px 28px;box-shadow:var(--shadow-lg);animation:fadein .3s ease">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:22px">
+        <div style="width:30px;height:30px;border-radius:8px;background:var(--primary);display:flex;align-items:center;justify-content:center;color:var(--primary-fg);font-size:16px;font-weight:700">P</div>
+        <span style="font-size:18px;font-weight:600;letter-spacing:-.02em">Polyptych</span>
+      </div>
+      <div style="font-size:16px;font-weight:600;margin-bottom:4px">Sign in to the console</div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:22px">Operator access to your display fleet.</div>
+      <div style="font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:6px">Email</div>
+      <input value="{{ signinEmail }}" onInput="{{ onSigninEmail }}" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:11px 13px;font-size:14px;color:var(--fg);outline:none;margin-bottom:14px" style-focus="border-color:var(--accent)" />
+      <div style="font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:6px">Password</div>
+      <input value="{{ signinPass }}" onInput="{{ onSigninPass }}" type="password" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:11px 13px;font-size:14px;color:var(--fg);outline:none;margin-bottom:14px" style-focus="border-color:var(--accent)" />
+      <sc-if value="{{ signinErr }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--bad);background:var(--bad-soft);border-radius:8px;padding:9px 11px;margin-bottom:14px">⚠ Incorrect email or password.</div>
+      </sc-if>
+      <div onClick="{{ onSignIn }}" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:11px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:13.5px;font-weight:600;cursor:pointer;margin-bottom:8px" style-hover="opacity:.92">
+        <sc-if value="{{ signinLoading }}" hint-placeholder-val="{{ false }}"><span style="width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span></sc-if>
+        {{ signinBtn }}
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px"><span style="font-size:11.5px;color:var(--muted2)">Self-hosted · v2.3</span><span onClick="{{ onTheme }}" style="font-size:13px;color:var(--muted);cursor:pointer">{{ themeIcon }}</span></div>
+    </div>
+  </div>
+</sc-if>
+
+<!-- ================= APP ================= -->
+<sc-if value="{{ isApp }}" hint-placeholder-val="{{ true }}">
+<div style="height:100%;display:flex">
+
+  <!-- ===== LEFT NAV RAIL ===== -->
+  <div style="width:74px;flex:0 0 74px;border-right:1px solid var(--line);background:var(--surface);display:flex;flex-direction:column;align-items:center;padding:14px 0;gap:6px">
+    <div style="width:34px;height:34px;border-radius:9px;background:var(--primary);display:flex;align-items:center;justify-content:center;color:var(--primary-fg);font-size:17px;font-weight:700;margin-bottom:8px">P</div>
+    <div onClick="{{ goWall }}" style="{{ navWall }}" title="Wall">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></svg>
+      <span style="font-size:9.5px;font-weight:500">Wall</span>
+    </div>
+    <div onClick="{{ goMachines }}" style="{{ navMachines }}" title="Machines">
+      <div style="position:relative;display:flex">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><circle cx="7" cy="7.5" r=".7" fill="currentColor" stroke="none"/><circle cx="7" cy="16.5" r=".7" fill="currentColor" stroke="none"/></svg>
+        <sc-if value="{{ pendingShow }}" hint-placeholder-val="{{ true }}"><span style="position:absolute;top:-5px;right:-7px;min-width:15px;height:15px;padding:0 3px;border-radius:8px;background:var(--warn);color:#fff;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center">{{ pendingCount }}</span></sc-if>
+      </div>
+      <span style="font-size:9.5px;font-weight:500">Machines</span>
+    </div>
+    <div onClick="{{ goContent }}" style="{{ navContent }}" title="Content">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 9l10 6 10-6-10-6Z"/><path d="m2 15 10 6 10-6"/></svg>
+      <span style="font-size:9.5px;font-weight:500">Content</span>
+    </div>
+    <div onClick="{{ goScenes }}" style="{{ navScenes }}" title="Scenes">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M10 9l4 2.5-4 2.5z" fill="currentColor" stroke="none"/><path d="M8 21h8"/></svg>
+      <span style="font-size:9.5px;font-weight:500">Scenes</span>
+    </div>
+    <div style="flex:1"></div>
+    <div onClick="{{ onTheme }}" style="width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--muted);font-size:15px" style-hover="background:var(--muted-bg)">{{ themeIcon }}</div>
+    <div onClick="{{ goSettings }}" style="{{ navSettings }}" title="Settings">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg>
+      <span style="font-size:9.5px;font-weight:500">Settings</span>
+    </div>
+    <div onClick="{{ goSettings }}" style="width:32px;height:32px;border-radius:50%;background:var(--muted-bg);border:1px solid var(--line);margin-top:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:var(--muted)">OP</div>
+  </div>
+
+  <!-- ===== MAIN COLUMN ===== -->
+  <div style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0">
+
+  <!-- ---------- WALL VIEW ---------- -->
+  <sc-if value="{{ isWall }}" hint-placeholder-val="{{ true }}">
+  <div style="display:flex;align-items:center;gap:14px;height:56px;flex:0 0 56px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--surface)">
+    <div style="display:flex;align-items:center;gap:7px;font-size:14px;color:var(--fg);font-weight:600">Reception Mural <span style="color:var(--muted2);font-size:10px">▾</span></div>
+    <div style="flex:1"></div>
+    <span style="font-size:12.5px;color:var(--muted);font-weight:500">Scene</span>
+    <div style="display:inline-flex;background:var(--muted-bg);border-radius:9px;padding:3px;gap:2px">
+      <sc-for list="{{ scenesV }}" as="sc" hint-placeholder-count="3">
+        <div onClick="{{ sc.onClick }}" style="{{ sc.pill }}">{{ sc.name }}</div>
+      </sc-for>
+    </div>
+    <div onClick="{{ onSaveOpen }}" style="display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:8px;background:var(--surface);border:1px solid var(--line);font-size:12.5px;color:var(--fg2);font-weight:500;cursor:pointer;box-shadow:var(--shadow-sm)" style-hover="background:var(--muted-bg)">Save scene</div>
+    <div style="width:1px;height:18px;background:var(--line)"></div>
+    <div style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);font-weight:500"><span style="width:7px;height:7px;border-radius:50%;background:var(--ok);animation:ppulse 2s infinite"></span>Live</div>
+    <div style="display:flex;align-items:center;gap:7px;padding:5px 10px;border-radius:8px;background:var(--muted-bg);font-size:12px;color:var(--fg2);font-weight:500">{{ screensCount }} screens <span style="{{ alertStyle }}">{{ alertText }}</span></div>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+    <!-- LEFT LIBRARY -->
+    <div style="width:222px;flex:0 0 222px;border-right:1px solid var(--line);background:var(--surface);padding:18px 14px;overflow-y:auto">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px"><span style="font-size:12px;font-weight:600;color:var(--muted)">Content library</span><span onClick="{{ goContent }}" style="font-size:11px;color:var(--accent-fg);font-weight:500;cursor:pointer">Manage →</span></div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <sc-for list="{{ libV }}" as="it" hint-placeholder-count="7">
+          <div onMouseDown="{{ it.onDown }}" style="display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:9px;border:1px solid transparent;cursor:grab;user-select:none" style-hover="background:var(--muted-bg);border-color:var(--line)">
+            <span style="{{ it.icon }}">{{ it.glyph }}</span>
+            <span style="display:flex;flex-direction:column;line-height:1.3"><span style="font-size:12.5px;color:var(--fg2);font-weight:500">{{ it.name }}</span><span style="font-size:10.5px;color:var(--muted2)">{{ it.kind }}</span></span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="font-size:12px;font-weight:600;color:var(--muted);margin:20px 0 10px">Unplaced screens</div>
+      <sc-if value="{{ hasUnplaced }}" hint-placeholder-val="{{ true }}">
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <sc-for list="{{ unplacedV }}" as="u" hint-placeholder-count="2">
+            <div style="border:1px dashed var(--line2);border-radius:9px;padding:8px 8px 8px 9px;background:var(--surface)">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px"><span style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span><input value="{{ u.name }}" onInput="{{ u.onRename }}" style="flex:1;min-width:0;background:transparent;border:none;font-size:12.5px;color:var(--fg2);font-weight:600;outline:none;padding:0" /></div>
+              <div style="display:flex;align-items:center;gap:6px">
+                <div onClick="{{ u.onIdent }}" style="display:flex;align-items:center;gap:5px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);font-size:11px;color:var(--fg2);font-weight:500;cursor:pointer" style-hover="background:var(--muted-bg)"><span style="width:5px;height:5px;border-radius:50%;background:var(--accent)"></span>Ident</div>
+                <span style="flex:1"></span>
+                <div onMouseDown="{{ u.onDown }}" style="display:flex;align-items:center;gap:5px;padding:4px 8px;border-radius:6px;background:var(--muted-bg);font-size:11px;color:var(--muted);font-weight:500;cursor:grab">⠿ Place</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+      <sc-if value="{{ noUnplaced }}" hint-placeholder-val="{{ false }}">
+        <div style="font-size:11px;color:var(--muted2);line-height:1.55;padding:4px 0">No unplaced screens. Approve a machine in <b onClick="{{ goMachines }}" style="color:var(--accent-fg);font-weight:600;cursor:pointer">Machines</b> to add more.</div>
+      </sc-if>
+      <div style="margin-top:14px;font-size:11px;color:var(--muted2);line-height:1.55">Shift-click adjacent screens, then <b style="color:var(--muted);font-weight:600">Combine</b> them into one surface.</div>
+    </div>
+
+    <!-- CANVAS -->
+    <div style="flex:1;position:relative;min-width:0;background:var(--bg);overflow:hidden">
+      <div ref="{{ canvasRef }}" onMouseDown="{{ onCanvasDown }}" style="position:absolute;inset:0;background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:24px 24px;transform:scale({{ zoom }});transform-origin:0 0">
+        <sc-for list="{{ surfaces }}" as="g" hint-placeholder-count="1">
+          <div onMouseDown="{{ g.onDown }}" style="{{ g.box }}">
+            <sc-for list="{{ g.seams }}" as="ln" hint-placeholder-count="3"><div style="{{ ln }}"></div></sc-for>
+            <div style="position:absolute;top:7px;left:8px;display:flex;align-items:center;gap:6px;background:var(--label-bg);padding:3px 8px;border-radius:6px;z-index:5;backdrop-filter:blur(3px)"><span style="{{ g.dot }}"></span><span style="font-size:10.5px;font-weight:600;color:var(--fg)">▦ {{ g.name }}</span></div>
+            <sc-if value="{{ g.hasContent }}" hint-placeholder-val="{{ true }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:3px;z-index:4"><span style="font-size:9px;letter-spacing:.06em;color:var(--accent-fg);font-weight:600">SPANS {{ g.count }} SCREENS</span><span style="font-size:18px;font-weight:600;letter-spacing:-.01em;color:var(--fg)">{{ g.contentName }}</span><span style="font-size:10px;color:var(--muted);font-weight:500">{{ g.kindLabel }}</span></div></sc-if>
+            <sc-if value="{{ g.isEmpty }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;z-index:4"><span style="font-size:16px;color:var(--accent);font-weight:300">+</span><span style="font-size:10.5px;color:var(--muted);font-weight:500">Drop content to span {{ g.count }} screens</span></div></sc-if>
+            <sc-if value="{{ g.isIdenting }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:3px;background:rgba(37,99,235,.16);z-index:6"><span style="font-size:9px;letter-spacing:.12em;color:var(--accent-fg);font-weight:600">IDENT</span><span style="font-size:16px;font-weight:600;color:var(--fg)">{{ g.name }}</span><span style="font-size:9.5px;color:var(--accent-fg)">flashing all {{ g.count }} panels…</span></div></sc-if>
+            <sc-if value="{{ g.handles }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;left:-4px;top:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:7"></div><div style="position:absolute;right:-4px;top:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:7"></div><div style="position:absolute;left:-4px;bottom:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:7"></div><div style="position:absolute;right:-4px;bottom:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:7"></div>
+            </sc-if>
+          </div>
+        </sc-for>
+
+        <sc-for list="{{ screens }}" as="s" hint-placeholder-count="5">
+          <div onMouseDown="{{ s.onDown }}" style="{{ s.box }}">
+            <div style="position:absolute;top:7px;left:8px;display:flex;align-items:center;gap:6px;background:var(--label-bg);padding:3px 8px;border-radius:6px;z-index:4;backdrop-filter:blur(3px)"><span style="{{ s.dot }}"></span><span style="font-size:10.5px;font-weight:600;color:var(--fg)">{{ s.name }}</span></div>
+            <sc-if value="{{ s.isLivePlain }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:0 10px"><span style="font-size:11.5px;color:var(--fg2);font-weight:500;text-align:center">{{ s.contentName }}</span></div><span style="position:absolute;bottom:7px;left:8px;font-size:9.5px;color:var(--muted);font-weight:500">{{ s.kindLabel }}</span></sc-if>
+            <sc-if value="{{ s.isError }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px"><span style="font-size:15px;color:var(--bad)">⚠</span><span style="font-size:10px;color:var(--bad);font-weight:500;text-align:center;line-height:1.45">Content failed to load<br>retrying…</span></div></sc-if>
+            <sc-if value="{{ s.isEmpty }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px"><span style="font-size:16px;color:var(--accent);font-weight:300">+</span><span style="font-size:10px;color:var(--muted);font-weight:500">Drop content</span></div></sc-if>
+            <sc-if value="{{ s.isOffline }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:4px"><span style="font-size:10px;color:var(--muted);font-weight:500">Screen dark</span><span style="font-size:9.5px;color:var(--bad);font-weight:500">Machine unreachable</span></div></sc-if>
+            <sc-if value="{{ s.isIdenting }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:3px;background:rgba(37,99,235,.16)"><span style="font-size:9px;letter-spacing:.12em;color:var(--accent-fg);font-weight:600">IDENT</span><span style="font-size:15px;font-weight:600;color:var(--fg)">{{ s.name }}</span><span style="font-size:9.5px;color:var(--accent-fg)">flashing on wall…</span></div></sc-if>
+            <sc-if value="{{ s.handles }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;left:-4px;top:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:6"></div><div style="position:absolute;right:-4px;top:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:6"></div><div style="position:absolute;left:-4px;bottom:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:6"></div><div style="position:absolute;right:-4px;bottom:-4px;width:8px;height:8px;background:var(--surface);border:1.5px solid var(--accent);border-radius:2px;z-index:6"></div>
+            </sc-if>
+          </div>
+        </sc-for>
+
+        <sc-if value="{{ selBarShow }}" hint-placeholder-val="{{ false }}">
+          <div onMouseDown="{{ stop }}" style="position:absolute;left:{{ selBarX }}px;top:{{ selBarY }}px;display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:6px 6px 6px 12px;box-shadow:var(--shadow-lg);z-index:90">
+            <span style="font-size:12px;color:var(--fg2);font-weight:500;white-space:nowrap">{{ selBarLabel }}</span>
+            <div onClick="{{ onIdent }}" style="display:flex;align-items:center;gap:6px;padding:6px 10px;border-radius:7px;border:1px solid var(--line);font-size:12px;color:var(--fg2);font-weight:500;cursor:pointer" style-hover="background:var(--muted-bg)"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></span>Ident</div>
+            <div onClick="{{ onGroupAction }}" style="{{ selBarBtn }}">{{ selBarAction }}</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ guideShowX }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;left:{{ guideX }}px;top:0;width:0;height:100%;border-left:1.5px dashed var(--accent);z-index:80"></div></sc-if>
+        <sc-if value="{{ guideShowY }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;left:0;top:{{ guideY }}px;width:100%;height:0;border-top:1.5px dashed var(--accent);z-index:80"></div></sc-if>
+      </div>
+
+      <sc-if value="{{ applyingShow }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;left:50%;top:18px;display:flex;align-items:center;gap:8px;background:var(--primary);color:var(--primary-fg);padding:9px 15px;border-radius:9px;font-size:12.5px;font-weight:500;box-shadow:var(--shadow-lg);animation:pin .2s ease;z-index:95">Applying scene · {{ applyingName }}</div></sc-if>
+
+      <div style="position:absolute;right:14px;bottom:14px;display:flex;align-items:center;border:1px solid var(--line);border-radius:9px;overflow:hidden;font-size:13px;background:var(--surface);box-shadow:var(--shadow-sm)">
+        <span onClick="{{ onZoomOut }}" style="padding:7px 12px;color:var(--muted);cursor:pointer" style-hover="background:var(--muted-bg)">−</span>
+        <span style="padding:7px 10px;color:var(--fg2);border-left:1px solid var(--line);border-right:1px solid var(--line);font-variant-numeric:tabular-nums;min-width:48px;text-align:center">{{ zoomPct }}</span>
+        <span onClick="{{ onZoomIn }}" style="padding:7px 12px;color:var(--muted);cursor:pointer" style-hover="background:var(--muted-bg)">+</span>
+      </div>
+    </div>
+
+    <!-- RIGHT: INSPECTOR + FEED -->
+    <div style="width:272px;flex:0 0 272px;border-left:1px solid var(--line);background:var(--surface);display:flex;flex-direction:column;min-height:0">
+      <div style="padding:18px 16px;border-bottom:1px solid var(--line);overflow-y:auto">
+        <sc-if value="{{ insSingle }}" hint-placeholder-val="{{ true }}">
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:11px">Screen</div>
+          <input value="{{ selName }}" onInput="{{ onRename }}" onBlur="{{ onRenameCommit }}" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600;color:var(--fg);outline:none;margin-bottom:12px" style-focus="border-color:var(--accent)" />
+          <div onClick="{{ onIdent }}" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:10px;border-radius:8px;border:1px solid var(--line2);background:var(--surface);color:var(--fg);font-size:13px;font-weight:500;cursor:pointer;margin-bottom:18px;box-shadow:var(--shadow-sm)" style-hover="background:var(--muted-bg)"><span style="width:7px;height:7px;border-radius:50%;background:var(--accent)"></span>Ident — flash on wall</div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="{{ selDot }}"></span><span style="font-size:12.5px;color:var(--fg2);font-weight:500">{{ selStatus }}</span></div>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:18px">Driven by {{ selMachine }}</div>
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:10px">Content</div>
+          <sc-if value="{{ selHasContent }}" hint-placeholder-val="{{ true }}"><div style="display:flex;align-items:center;gap:10px;padding:9px;border-radius:9px;border:1px solid var(--line);margin-bottom:18px"><span style="width:44px;height:26px;border-radius:5px;background:var(--scr-live);flex:0 0 auto"></span><span style="display:flex;flex-direction:column;line-height:1.35"><span style="font-size:12.5px;color:var(--fg2);font-weight:500">{{ selContentName }}</span><span style="font-size:10.5px;color:var(--muted2)">{{ selContentKind }}</span></span></div></sc-if>
+          <sc-if value="{{ selNoContent }}" hint-placeholder-val="{{ false }}"><div style="display:flex;align-items:center;justify-content:center;gap:7px;padding:14px;border:1.5px dashed var(--line2);border-radius:9px;font-size:12px;color:var(--muted);margin-bottom:18px">Drag content here</div></sc-if>
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:10px">Layout</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums"><div style="background:var(--muted-bg);border-radius:7px;padding:7px 9px">{{ selPos }}</div><div style="background:var(--muted-bg);border-radius:7px;padding:7px 9px">{{ selSize }}</div></div>
+        </sc-if>
+        <sc-if value="{{ insGroup }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--accent-fg);margin-bottom:11px">▦ Combined surface</div>
+          <input value="{{ grpName }}" onInput="{{ onGroupRename }}" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600;color:var(--fg);outline:none;margin-bottom:12px" style-focus="border-color:var(--accent)" />
+          <div style="display:flex;gap:8px;margin-bottom:18px">
+            <div onClick="{{ onIdent }}" style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px;border-radius:8px;border:1px solid var(--line2);background:var(--surface);color:var(--fg);font-size:12.5px;font-weight:500;cursor:pointer;box-shadow:var(--shadow-sm)" style-hover="background:var(--muted-bg)"><span style="width:7px;height:7px;border-radius:50%;background:var(--accent)"></span>Ident all</div>
+            <div onClick="{{ onGroupAction }}" style="display:flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:8px;border:1px solid var(--line2);background:var(--surface);color:var(--bad);font-size:12.5px;font-weight:500;cursor:pointer;box-shadow:var(--shadow-sm)" style-hover="background:var(--muted-bg)">Split</div>
+          </div>
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:10px">Content · spans whole surface</div>
+          <sc-if value="{{ grpHasContent }}" hint-placeholder-val="{{ true }}"><div style="display:flex;align-items:center;gap:10px;padding:9px;border-radius:9px;border:1px solid var(--line);margin-bottom:18px"><span style="width:44px;height:26px;border-radius:5px;background:var(--scr-live);flex:0 0 auto;position:relative;overflow:hidden"><span style="position:absolute;left:33%;top:0;width:1px;height:100%;background:var(--seam)"></span><span style="position:absolute;left:66%;top:0;width:1px;height:100%;background:var(--seam)"></span><span style="position:absolute;left:0;top:50%;width:100%;height:1px;background:var(--seam)"></span></span><span style="display:flex;flex-direction:column;line-height:1.35"><span style="font-size:12.5px;color:var(--fg2);font-weight:500">{{ grpContentName }}</span><span style="font-size:10.5px;color:var(--muted2)">{{ grpContentKind }}</span></span></div></sc-if>
+          <sc-if value="{{ grpNoContent }}" hint-placeholder-val="{{ false }}"><div style="display:flex;align-items:center;justify-content:center;gap:7px;padding:14px;border:1.5px dashed var(--line2);border-radius:9px;font-size:12px;color:var(--muted);margin-bottom:18px">Drag content to span across</div></sc-if>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px"><span style="font-size:12px;font-weight:600;color:var(--muted)">{{ grpCount }} panels</span><span style="font-size:11px;color:var(--muted2);font-variant-numeric:tabular-nums">{{ grpRes }}</span></div>
+          <div style="display:flex;flex-direction:column;gap:5px"><sc-for list="{{ grpMembers }}" as="m" hint-placeholder-count="2"><div style="display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:8px;border:1px solid var(--line)"><span style="{{ m.dot }}"></span><span style="font-size:12px;color:var(--fg2);font-weight:500">{{ m.name }}</span><span style="flex:1"></span><span style="font-size:10.5px;color:var(--muted2)">{{ m.kind }}</span></div></sc-for></div>
+        </sc-if>
+        <sc-if value="{{ insMulti }}" hint-placeholder-val="{{ false }}">
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:11px">Selection</div>
+          <div style="font-size:15px;font-weight:600;color:var(--fg);margin-bottom:14px">{{ selCount }} screens selected</div>
+          <div style="display:flex;gap:8px;margin-bottom:16px"><div onClick="{{ onGroupAction }}" style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px;border-radius:8px;background:var(--primary);color:var(--primary-fg);font-size:12.5px;font-weight:600;cursor:pointer" style-hover="opacity:.92">▦ Combine into surface</div><div onClick="{{ onIdent }}" style="display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 13px;border-radius:8px;border:1px solid var(--line2);background:var(--surface);color:var(--fg);font-size:12.5px;font-weight:500;cursor:pointer;box-shadow:var(--shadow-sm)" style-hover="background:var(--muted-bg)">Ident</div></div>
+          <div style="display:flex;flex-direction:column;gap:5px"><sc-for list="{{ selList }}" as="m" hint-placeholder-count="2"><div onClick="{{ m.onClick }}" style="display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:8px;border:1px solid var(--line);cursor:pointer" style-hover="background:var(--muted-bg)"><span style="{{ m.dot }}"></span><span style="font-size:12.5px;color:var(--fg2);font-weight:500">{{ m.name }}</span></div></sc-for></div>
+          <div style="margin-top:14px;font-size:11px;color:var(--muted2);line-height:1.55">Combining treats these panels as one screen — content spans across all of them, with bezel seams shown.</div>
+        </sc-if>
+        <sc-if value="{{ insEmpty }}" hint-placeholder-val="{{ false }}">
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:11px">Screen</div>
+          <div style="display:flex;align-items:center;justify-content:center;flex-direction:column;gap:9px;padding:34px 12px;border:1.5px dashed var(--line2);border-radius:11px;text-align:center"><span style="font-size:20px;color:var(--muted2)">◫</span><span style="font-size:12.5px;color:var(--muted);font-weight:500">Select a screen on the canvas</span><span style="font-size:11px;color:var(--muted2);line-height:1.5">Click to rename &amp; ident · shift-click<br>several, then combine into a surface</span></div>
+        </sc-if>
+      </div>
+      <div style="flex:1;padding:18px 16px;overflow-y:auto;min-height:0">
+        <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:15px">Live activity</div>
+        <div style="display:flex;flex-direction:column;gap:15px"><sc-for list="{{ feedV }}" as="f" hint-placeholder-count="5"><div style="display:flex;gap:11px"><span style="font-size:10.5px;color:var(--muted2);padding-top:1px;white-space:nowrap;min-width:24px;font-variant-numeric:tabular-nums">{{ f.time }}</span><div style="font-size:12.5px;color:var(--fg2);line-height:1.45"><b style="{{ f.headStyle }}">{{ f.head }}</b>{{ f.tail }}</div></div></sc-for></div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- ---------- MACHINES VIEW ---------- -->
+  <sc-if value="{{ isMachines }}" hint-placeholder-val="{{ false }}">
+  <div style="flex:1;overflow-y:auto;min-height:0">
+    <div style="max-width:840px;margin:0 auto;padding:30px 32px 60px">
+      <div style="font-size:21px;font-weight:600;letter-spacing:-.02em;margin-bottom:4px">Machines</div>
+      <div style="font-size:13.5px;color:var(--muted);margin-bottom:24px">The physical PCs driving your screens. New machines must be approved before they can show anything.</div>
+
+      <div style="border:1px solid var(--line);border-radius:13px;padding:16px 18px;background:var(--card);box-shadow:var(--shadow-sm);margin-bottom:26px;display:flex;align-items:center;gap:16px">
+        <div style="flex:1"><div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px">Enrolment token</div><div style="font-family:'Geist',monospace;font-size:15px;font-weight:600;letter-spacing:.04em;font-variant-numeric:tabular-nums">{{ enrolToken }}</div><div style="font-size:11.5px;color:var(--muted2);margin-top:5px">New machines must present this token to dial in.</div></div>
+        <div onClick="{{ onCopyToken }}" style="padding:8px 13px;border-radius:8px;border:1px solid var(--line);font-size:12.5px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Copy</div>
+        <div onClick="{{ onRegenToken }}" style="padding:8px 13px;border-radius:8px;border:1px solid var(--line);font-size:12.5px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Regenerate</div>
+      </div>
+
+      <sc-if value="{{ pendingShow }}" hint-placeholder-val="{{ true }}">
+        <div style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;margin-bottom:12px">Pending approval <span style="background:var(--warn-soft);color:var(--warn);font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px">{{ pendingCount }}</span></div>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:28px">
+          <sc-for list="{{ pendingV }}" as="m" hint-placeholder-count="1">
+            <div style="border:1px solid var(--warn-soft);border-left:3px solid var(--warn);border-radius:12px;padding:16px 18px;background:var(--card);box-shadow:var(--shadow-sm)">
+              <div style="display:flex;align-items:center;gap:12px">
+                <div style="flex:1"><div style="display:flex;align-items:center;gap:9px;margin-bottom:3px"><span style="width:8px;height:8px;border-radius:50%;background:var(--ok)"></span><span style="font-size:14.5px;font-weight:600">{{ m.label }}</span><span style="font-size:11px;color:var(--muted2)">{{ m.id }}</span></div><div style="font-size:12.5px;color:var(--muted)">Online · reports {{ m.outputs }} screens · {{ m.lastSeen }}</div></div>
+                <div onClick="{{ m.onReject }}" style="padding:9px 15px;border-radius:9px;border:1px solid var(--line2);font-size:13px;font-weight:500;color:var(--bad);cursor:pointer" style-hover="background:var(--bad-soft)">Reject</div>
+                <div onClick="{{ m.onApprove }}" style="padding:9px 17px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:13px;font-weight:600;cursor:pointer" style-hover="opacity:.92">Approve</div>
+              </div>
+              <div style="margin-top:11px;font-size:12px;color:var(--warn);background:var(--warn-soft);padding:8px 11px;border-radius:8px">Not yet admitted — shows nothing until you approve it. Its {{ m.outputs }} screens will land in the Unplaced tray.</div>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <div style="font-size:13px;font-weight:600;margin-bottom:12px">Approved <span style="color:var(--muted2);font-weight:500">· {{ approvedCount }}</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <sc-for list="{{ approvedV }}" as="m" hint-placeholder-count="4">
+          <div style="border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--card);box-shadow:var(--shadow-sm);display:flex;align-items:center;gap:14px">
+            <span style="{{ m.dot }}"></span>
+            <div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:9px"><span style="font-size:14px;font-weight:600">{{ m.label }}</span><span style="font-size:11px;color:var(--muted2)">{{ m.id }}</span></div><div style="font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Drives {{ m.screenList }}</div></div>
+            <span style="{{ m.badge }}">{{ m.badgeText }}</span>
+            <span style="font-size:11.5px;color:var(--muted2);white-space:nowrap">{{ m.lastSeen }}</span>
+            <div onClick="{{ m.onRevoke }}" style="padding:7px 12px;border-radius:8px;border:1px solid var(--line);font-size:12px;font-weight:500;color:var(--muted);cursor:pointer" style-hover="background:var(--bad-soft);color:var(--bad)">Revoke</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- ---------- CONTENT VIEW ---------- -->
+  <sc-if value="{{ isContent }}" hint-placeholder-val="{{ false }}">
+  <div style="flex:1;overflow-y:auto;min-height:0">
+    <div style="max-width:840px;margin:0 auto;padding:30px 32px 60px">
+      <div style="display:flex;align-items:flex-start;gap:16px;margin-bottom:24px">
+        <div style="flex:1"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em;margin-bottom:4px">Content sources</div><div style="font-size:13.5px;color:var(--muted)">What your screens can display. Each source has an address and tells the wall how to authenticate.</div></div>
+        <div onClick="{{ onAddSource }}" style="padding:9px 16px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap" style-hover="opacity:.92">+ Add source</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <sc-for list="{{ sourcesV }}" as="c" hint-placeholder-count="6">
+          <div style="border:1px solid var(--line);border-radius:12px;padding:13px 15px;background:var(--card);box-shadow:var(--shadow-sm);display:flex;align-items:center;gap:13px">
+            <span style="{{ c.icon }}">{{ c.glyph }}</span>
+            <div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:600">{{ c.name }}</div><div style="font-size:11.5px;color:var(--muted2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.kind }} · {{ c.address }}</div></div>
+            <span style="{{ c.authBadge }}">{{ c.authText }}</span>
+            <div onClick="{{ c.onEdit }}" style="padding:7px 12px;border-radius:8px;border:1px solid var(--line);font-size:12px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Edit</div>
+            <div onClick="{{ c.onDelete }}" style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid var(--line);font-size:13px;color:var(--muted);cursor:pointer" style-hover="background:var(--bad-soft);color:var(--bad)">✕</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- ---------- SCENES VIEW ---------- -->
+  <sc-if value="{{ isScenes }}" hint-placeholder-val="{{ false }}">
+  <div style="flex:1;overflow-y:auto;min-height:0">
+    <div style="max-width:840px;margin:0 auto;padding:30px 32px 60px">
+      <div style="display:flex;align-items:flex-start;gap:16px;margin-bottom:24px">
+        <div style="flex:1"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em;margin-bottom:4px">Scenes</div><div style="font-size:13.5px;color:var(--muted)">Saved presets of the whole wall. Apply one in a click, or schedule it to activate at a time of day.</div></div>
+        <div onClick="{{ onSaveOpen }}" style="padding:9px 16px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap" style-hover="opacity:.92">+ Save current wall</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <sc-for list="{{ scenesManageV }}" as="s" hint-placeholder-count="3">
+          <div style="border:1px solid var(--line);border-radius:12px;padding:13px 15px;background:var(--card);box-shadow:var(--shadow-sm);display:flex;align-items:center;gap:12px">
+            <span style="{{ s.dot }}"></span>
+            <input value="{{ s.name }}" onInput="{{ s.onRename }}" style="flex:1;min-width:0;background:transparent;border:1px solid transparent;border-radius:7px;padding:6px 8px;font-size:13.5px;font-weight:600;color:var(--fg);outline:none" style-hover="border-color:var(--line)" style-focus="border-color:var(--accent);background:var(--surface)" />
+            <sc-if value="{{ s.isActive }}" hint-placeholder-val="{{ false }}"><span style="background:var(--ok-soft);color:var(--ok);font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px">Active</span></sc-if>
+            <div style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)">at <input value="{{ s.schedule }}" onInput="{{ s.onSchedule }}" type="time" style="background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:5px 7px;font-size:11.5px;color:var(--fg2);outline:none;font-family:inherit" /></div>
+            <div onClick="{{ s.onApply }}" style="padding:7px 13px;border-radius:8px;border:1px solid var(--line2);font-size:12px;font-weight:500;color:var(--fg);cursor:pointer" style-hover="background:var(--muted-bg)">Apply</div>
+            <div onClick="{{ s.onDup }}" style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid var(--line);font-size:13px;color:var(--muted);cursor:pointer" style-hover="background:var(--muted-bg)" title="Duplicate">⧉</div>
+            <div onClick="{{ s.onDel }}" style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid var(--line);font-size:13px;color:var(--muted);cursor:pointer" style-hover="background:var(--bad-soft);color:var(--bad)" title="Delete">✕</div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="margin-top:14px;font-size:11.5px;color:var(--muted2)">Scheduling is illustrative in this prototype — times are stored but not fired.</div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- ---------- SETTINGS VIEW ---------- -->
+  <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+  <div style="flex:1;overflow-y:auto;min-height:0">
+    <div style="max-width:680px;margin:0 auto;padding:30px 32px 60px">
+      <div style="font-size:21px;font-weight:600;letter-spacing:-.02em;margin-bottom:24px">Settings</div>
+
+      <div style="border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:var(--shadow-sm);padding:18px 20px;margin-bottom:16px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:3px">Appearance</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">Theme for the console.</div>
+        <div style="display:inline-flex;background:var(--muted-bg);border-radius:9px;padding:3px;gap:2px">
+          <div onClick="{{ onLight }}" style="{{ lightPill }}">☼ Light</div>
+          <div onClick="{{ onDark }}" style="{{ darkPill }}">☾ Dark</div>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:var(--shadow-sm);padding:18px 20px;margin-bottom:16px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:3px">Enrolment token</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">The shared secret new machines present when they dial in.</div>
+        <div style="display:flex;align-items:center;gap:12px"><div style="flex:1;font-family:'Geist',monospace;font-size:15px;font-weight:600;letter-spacing:.04em;background:var(--muted-bg);padding:10px 13px;border-radius:9px">{{ enrolToken }}</div><div onClick="{{ onCopyToken }}" style="padding:9px 14px;border-radius:9px;border:1px solid var(--line);font-size:12.5px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Copy</div><div onClick="{{ onRegenToken }}" style="padding:9px 14px;border-radius:9px;border:1px solid var(--line);font-size:12.5px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Regenerate</div></div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:var(--shadow-sm);padding:18px 20px;margin-bottom:16px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:3px">First-run setup</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">Replay the guided flow for getting a brand-new machine onto the wall.</div>
+        <div onClick="{{ onColdStart }}" style="display:inline-flex;padding:9px 15px;border-radius:9px;border:1px solid var(--line2);font-size:12.5px;font-weight:500;color:var(--fg);cursor:pointer" style-hover="background:var(--muted-bg)">Replay first-run setup →</div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:var(--shadow-sm);padding:18px 20px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px">Account</div>
+        <div style="display:flex;align-items:center;gap:12px"><div style="width:38px;height:38px;border-radius:50%;background:var(--muted-bg);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:var(--muted)">OP</div><div style="flex:1"><div style="font-size:13.5px;font-weight:600">Operator</div><div style="font-size:12px;color:var(--muted)">operator@accent.co</div></div><div onClick="{{ onSignOut }}" style="padding:9px 15px;border-radius:9px;border:1px solid var(--line);font-size:12.5px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Sign out</div></div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <!-- ---------- COLD START WIZARD ---------- -->
+  <sc-if value="{{ isColdStart }}" hint-placeholder-val="{{ false }}">
+  <div style="flex:1;overflow-y:auto;min-height:0;display:flex;align-items:flex-start;justify-content:center">
+    <div style="width:560px;padding:48px 24px 60px">
+      <div style="text-align:center;margin-bottom:8px;font-size:11.5px;font-weight:600;letter-spacing:.08em;color:var(--accent-fg);text-transform:uppercase">First-run setup</div>
+      <div style="text-align:center;font-size:23px;font-weight:600;letter-spacing:-.02em;margin-bottom:6px">{{ csTitle }}</div>
+      <div style="text-align:center;font-size:13.5px;color:var(--muted);margin-bottom:26px">{{ csSub }}</div>
+
+      <!-- STEP 1: connect -->
+      <sc-if value="{{ csStep1 }}" hint-placeholder-val="{{ true }}">
+        <div style="border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shadow);padding:22px 22px">
+          <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:8px">Enrolment token</div>
+          <div style="font-family:'Geist',monospace;font-size:17px;font-weight:600;letter-spacing:.05em;background:var(--muted-bg);padding:12px 14px;border-radius:10px;text-align:center;margin-bottom:18px">{{ enrolToken }}</div>
+          <div style="display:flex;flex-direction:column;gap:11px;margin-bottom:20px">
+            <div style="display:flex;gap:11px;align-items:flex-start"><span style="width:20px;height:20px;border-radius:50%;background:var(--muted-bg);color:var(--fg2);font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center;flex:0 0 auto">1</span><span style="font-size:13px;color:var(--fg2);line-height:1.5">Install the Polyptych player on a PC behind your screens.</span></div>
+            <div style="display:flex;gap:11px;align-items:flex-start"><span style="width:20px;height:20px;border-radius:50%;background:var(--muted-bg);color:var(--fg2);font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center;flex:0 0 auto">2</span><span style="font-size:13px;color:var(--fg2);line-height:1.5">Enter this token — it dials in to this console automatically.</span></div>
+            <div style="display:flex;gap:11px;align-items:flex-start"><span style="width:20px;height:20px;border-radius:50%;background:var(--muted-bg);color:var(--fg2);font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center;flex:0 0 auto">3</span><span style="font-size:13px;color:var(--fg2);line-height:1.5">Approve it below, then name and place its screens.</span></div>
+          </div>
+          <sc-if value="{{ csWaiting }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px;border:1.5px dashed var(--line2);border-radius:11px">
+              <span style="width:22px;height:22px;border:2.5px solid var(--line2);border-right-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></span>
+              <span style="font-size:12.5px;color:var(--muted)">Waiting for your first machine to dial in…</span>
+              <div onClick="{{ csSimulate }}" style="padding:8px 14px;border-radius:8px;border:1px solid var(--line2);font-size:12px;font-weight:500;color:var(--fg);cursor:pointer" style-hover="background:var(--muted-bg)">Simulate a machine dialing in</div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ csArrived }}" hint-placeholder-val="{{ false }}">
+            <div style="border:1px solid var(--warn-soft);border-left:3px solid var(--warn);border-radius:11px;padding:15px;background:var(--surface);animation:fadein .25s ease">
+              <div style="display:flex;align-items:center;gap:9px;margin-bottom:4px"><span style="width:8px;height:8px;border-radius:50%;background:var(--ok)"></span><span style="font-size:14px;font-weight:600">New NUC</span><span style="font-size:11px;color:var(--muted2)">requesting access</span></div>
+              <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">Online · reports 2 screens · just now</div>
+              <div style="display:flex;gap:9px"><div onClick="{{ csReject }}" style="flex:1;text-align:center;padding:9px;border-radius:9px;border:1px solid var(--line2);font-size:12.5px;font-weight:500;color:var(--bad);cursor:pointer" style-hover="background:var(--bad-soft)">Reject</div><div onClick="{{ csApprove }}" style="flex:2;text-align:center;padding:9px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:12.5px;font-weight:600;cursor:pointer" style-hover="opacity:.92">Approve machine</div></div>
+            </div>
+          </sc-if>
+        </div>
+      </sc-if>
+
+      <!-- STEP 2: map screens -->
+      <sc-if value="{{ csStep2 }}" hint-placeholder-val="{{ false }}">
+        <div style="border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shadow);padding:20px 22px">
+          <div style="font-size:12.5px;color:var(--muted);margin-bottom:16px;line-height:1.5">For each screen: <b style="color:var(--fg2);font-weight:600">Ident</b> to see which physical panel flashes, give it a memorable name, then place it.</div>
+          <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:18px">
+            <sc-for list="{{ csScreensV }}" as="s" hint-placeholder-count="2">
+              <div style="{{ s.row }}">
+                <div style="display:flex;align-items:center;gap:10px">
+                  <span style="width:26px;height:26px;border-radius:7px;background:var(--muted-bg);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:var(--muted);flex:0 0 auto">{{ s.idx }}</span>
+                  <input value="{{ s.name }}" onInput="{{ s.onName }}" placeholder="Name this screen…" style="flex:1;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:13px;font-weight:500;color:var(--fg);outline:none" style-focus="border-color:var(--accent)" />
+                  <div onClick="{{ s.onIdent }}" style="{{ s.identBtn }}"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></span>{{ s.identLabel }}</div>
+                  <div onClick="{{ s.onPlace }}" style="{{ s.placeBtn }}">{{ s.placeLabel }}</div>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+          <div onClick="{{ csFinish }}" style="{{ csFinishBtn }}">{{ csFinishLabel }}</div>
+        </div>
+      </sc-if>
+    </div>
+  </div>
+  </sc-if>
+
+  </div>
+
+  <!-- ===== APP-LEVEL OVERLAYS ===== -->
+  <sc-if value="{{ ghostShow }}" hint-placeholder-val="{{ false }}"><div style="position:fixed;left:{{ ghostX }}px;top:{{ ghostY }}px;transform:translate(-50%,-50%);pointer-events:none;z-index:200;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--accent-line);border-radius:9px;padding:8px 12px;box-shadow:var(--shadow-lg)"><span style="width:7px;height:7px;border-radius:50%;background:var(--accent)"></span><span style="font-size:12.5px;color:var(--fg);font-weight:500">{{ ghostLabel }}</span></div></sc-if>
+
+  <sc-if value="{{ toastShow }}" hint-placeholder-val="{{ false }}"><div style="position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:250;background:var(--primary);color:var(--primary-fg);padding:10px 17px;border-radius:10px;font-size:12.5px;font-weight:500;box-shadow:var(--shadow-lg);animation:pin .2s ease">{{ toastMsg }}</div></sc-if>
+
+  <sc-if value="{{ saveOpen }}" hint-placeholder-val="{{ false }}">
+    <div onMouseDown="{{ onSaveClose }}" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:300;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)">
+      <div onMouseDown="{{ stop }}" style="width:360px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;box-shadow:var(--shadow-lg)">
+        <div style="font-size:15.5px;font-weight:600;letter-spacing:-.01em;margin-bottom:6px">Save current wall as scene</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:16px;line-height:1.5">Captures every screen &amp; surface's content and layout. Switch back in one click.</div>
+        <input value="{{ sceneName }}" onInput="{{ onSceneNameInput }}" placeholder="Scene name…" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:11px 13px;font-size:14px;color:var(--fg);outline:none;margin-bottom:16px" style-focus="border-color:var(--accent)" />
+        <div style="display:flex;gap:9px;justify-content:flex-end"><div onClick="{{ onSaveClose }}" style="padding:9px 16px;border-radius:9px;border:1px solid var(--line);font-size:13px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Cancel</div><div onClick="{{ onSaveConfirm }}" style="padding:9px 18px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:13px;font-weight:600;cursor:pointer" style-hover="opacity:.92">Save scene</div></div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ sourceOpen }}" hint-placeholder-val="{{ false }}">
+    <div onMouseDown="{{ onSourceClose }}" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:300;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)">
+      <div onMouseDown="{{ stop }}" style="width:440px;background:var(--card);border:1px solid var(--line);border-radius:15px;padding:24px;box-shadow:var(--shadow-lg);max-height:88vh;overflow-y:auto">
+        <div style="font-size:16px;font-weight:600;letter-spacing:-.01em;margin-bottom:18px">{{ sourceTitle }}</div>
+        <div style="font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:6px">Name</div>
+        <input value="{{ srcName }}" onInput="{{ onSrcName }}" placeholder="e.g. Lobby Dashboard" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font-size:13.5px;color:var(--fg);outline:none;margin-bottom:16px" style-focus="border-color:var(--accent)" />
+        <div style="font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:6px">Type</div>
+        <div style="display:flex;gap:6px;margin-bottom:16px">
+          <sc-for list="{{ srcTypeBtns }}" as="b" hint-placeholder-count="4"><div onClick="{{ b.onClick }}" style="{{ b.style }}">{{ b.label }}</div></sc-for>
+        </div>
+        <div style="font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:6px">Address</div>
+        <input value="{{ srcAddress }}" onInput="{{ onSrcAddress }}" placeholder="https://…" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font-size:13.5px;color:var(--fg);outline:none;margin-bottom:16px;font-variant-numeric:tabular-nums" style-focus="border-color:var(--accent)" />
+        <div style="font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:8px">Authentication</div>
+        <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:20px">
+          <sc-for list="{{ srcAuthRows }}" as="a" hint-placeholder-count="4">
+            <div onClick="{{ a.onClick }}" style="{{ a.style }}"><span style="{{ a.radio }}"></span><div style="flex:1"><div style="font-size:12.5px;font-weight:500;color:var(--fg)">{{ a.label }}</div><div style="font-size:11px;color:var(--muted2)">{{ a.desc }}</div></div></div>
+          </sc-for>
+        </div>
+        <div style="display:flex;gap:9px;justify-content:flex-end"><div onClick="{{ onSourceClose }}" style="padding:9px 16px;border-radius:9px;border:1px solid var(--line);font-size:13px;font-weight:500;color:var(--fg2);cursor:pointer" style-hover="background:var(--muted-bg)">Cancel</div><div onClick="{{ onSaveSource }}" style="padding:9px 18px;border-radius:9px;background:var(--primary);color:var(--primary-fg);font-size:13px;font-weight:600;cursor:pointer" style-hover="opacity:.92">{{ sourceSaveLabel }}</div></div>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = {
+    theme: 'light',
+    authed: false,
+    view: 'wall',
+    signinEmail: 'operator@accent.co', signinPass: 'polyptych', signinErr: false, signinLoading: false,
+    enrolToken: 'POLY-7F3A-9KQ2-D8M1',
+    toast: null,
+    sourceModal: null,
+    cs: { step: 1, arrived: false, screens: [], identing: null },
+
+    selectedIds: ['reception-left'],
+    zoom: 1,
+    guideX: null, guideY: null,
+    ghost: null,
+    saveOpen: false, sceneName: '',
+    applying: null,
+    activeScene: 'morning',
+    scenes: [
+      { id:'morning', name:'Morning', schedule:'08:00' },
+      { id:'visitor', name:'Visitor Tour', schedule:'' },
+      { id:'night', name:'Night', schedule:'20:00' },
+    ],
+    machines: [
+      { id:'reception-pc', label:'Reception PC', enrol:'approved', online:true, lastSeen:'just now' },
+      { id:'atrium-nuc', label:'Atrium NUC', enrol:'approved', online:true, lastSeen:'just now' },
+      { id:'boardroom-pc', label:'Boardroom PC', enrol:'approved', online:true, lastSeen:'just now' },
+      { id:'cafe-mini', label:'Café Mini', enrol:'approved', online:false, lastSeen:'4m ago' },
+      { id:'loading-dock-nuc', label:'Loading-Dock NUC', enrol:'pending', online:true, lastSeen:'just now', pending:[{name:'Loading-Dock 1'},{name:'Loading-Dock 2'}] },
+    ],
+    sources: [
+      { id:'c-kpi', name:'KPI Wall', type:'dashboard', address:'grafana.local/d/kpi-wall', auth:'proxy' },
+      { id:'c-lobby', name:'Lobby Dashboard', type:'dashboard', address:'grafana.local/d/lobby', auth:'proxy' },
+      { id:'c-welcome', name:'Welcome reel', type:'video', address:'cdn.accent.co/welcome.mp4', auth:'public' },
+      { id:'c-agenda', name:"Today's Agenda", type:'web', address:'intranet.accent.co/agenda', auth:'signin' },
+      { id:'c-map', name:'Visitor Map', type:'web', address:'maps.accent.co/visitor', auth:'public' },
+      { id:'c-menu', name:'Café Menu', type:'image', address:'cdn.accent.co/menu.png', auth:'public' },
+      { id:'c-clock', name:'Night Clock', type:'image', address:'cdn.accent.co/clock', auth:'none' },
+    ],
+    groups: [ { id:'g-atrium', name:'Atrium Wall', content:{type:'dashboard',name:'KPI Wall'}, st:null } ],
+    screens: [
+      { id:'at1', name:'Atrium 1', x:36,  y:32, w:116, h:62, group:'g-atrium', status:'connected', machine:'atrium-nuc', output:'1' },
+      { id:'at2', name:'Atrium 2', x:152, y:32, w:116, h:62, group:'g-atrium', status:'connected', machine:'atrium-nuc', output:'2' },
+      { id:'at3', name:'Atrium 3', x:268, y:32, w:116, h:62, group:'g-atrium', status:'connected', machine:'atrium-nuc', output:'3' },
+      { id:'at4', name:'Atrium 4', x:36,  y:94, w:116, h:62, group:'g-atrium', status:'connected', machine:'atrium-nuc', output:'4' },
+      { id:'at5', name:'Atrium 5', x:152, y:94, w:116, h:62, group:'g-atrium', status:'connected', machine:'atrium-nuc', output:'5' },
+      { id:'at6', name:'Atrium 6', x:268, y:94, w:116, h:62, group:'g-atrium', status:'connected', machine:'atrium-nuc', output:'6' },
+      { id:'reception-left', name:'Reception-Left', x:36, y:196, w:168, h:96, status:'connected', st:'live', content:{type:'dashboard',name:'Lobby Dashboard'}, machine:'reception-pc', output:'1' },
+      { id:'reception-right', name:'Reception-Right', x:216, y:196, w:168, h:96, status:'connected', st:'error', content:{type:'video',name:'Welcome reel'}, machine:'reception-pc', output:'2' },
+      { id:'boardroom', name:'Boardroom', x:36, y:324, w:112, h:84, status:'connected', st:'live', content:{type:'web',name:"Today's Agenda"}, machine:'boardroom-pc', output:'1' },
+      { id:'atrium-side', name:'Atrium-Side', x:160, y:324, w:112, h:84, status:'connected', st:'empty', content:null, machine:'atrium-nuc', output:'7' },
+      { id:'cafe', name:'Café-Menu', x:284, y:324, w:100, h:84, status:'offline', st:'offline', content:{type:'image',name:'Café Menu'}, machine:'cafe-mini', output:'1' },
+    ],
+    unplaced: [
+      { id:'lobby-side', name:'Lobby-Side', machine:'reception-pc' },
+      { id:'stairwell', name:'Stairwell', machine:'reception-pc' },
+    ],
+    feed: [
+      { id:'f1', time:'now', head:'Café Mini', tail:' went unreachable', kind:'bad' },
+      { id:'f2', time:'1m', head:'Atrium Wall', tail:' → KPI Wall', kind:'accent' },
+      { id:'f3', time:'4m', head:'Atrium Wall', tail:' combined · 6 panels', kind:'accent' },
+      { id:'f4', time:'7m', head:'Reception-Left', tail:' renamed', kind:'muted' },
+      { id:'f5', time:'12m', head:'Boardroom PC', tail:' connected', kind:'ok' },
+    ],
+  };
+
+  PRESETS = {
+    morning: { 'g-atrium':{type:'dashboard',name:'KPI Wall'}, 'reception-left':{type:'dashboard',name:'Lobby Dashboard'}, 'reception-right':{type:'video',name:'Welcome reel'}, boardroom:{type:'web',name:"Today's Agenda"}, 'atrium-side':null },
+    visitor: { 'g-atrium':{type:'video',name:'Welcome reel'}, 'reception-left':{type:'web',name:'Visitor Map'}, 'reception-right':{type:'video',name:'Welcome reel'}, boardroom:{type:'web',name:'Visitor Map'}, 'atrium-side':{type:'video',name:'Welcome reel'} },
+    night: { 'g-atrium':{type:'image',name:'Night Clock'}, 'reception-left':{type:'image',name:'Night Clock'}, 'reception-right':{type:'image',name:'Night Clock'}, boardroom:{type:'image',name:'Night Clock'}, 'atrium-side':{type:'image',name:'Night Clock'} },
+  };
+
+  componentDidMount() {
+    this._move = (e) => this.onMove(e);
+    this._up = (e) => this.onUp(e);
+    window.addEventListener('mousemove', this._move);
+    window.addEventListener('mouseup', this._up);
+    this._prev = {}; this._prevG = {};
+    this._tick = 0;
+    this._timer = setInterval(() => this.realtime(), 4800);
+  }
+  componentWillUnmount() {
+    window.removeEventListener('mousemove', this._move);
+    window.removeEventListener('mouseup', this._up);
+    clearInterval(this._timer);
+  }
+
+  kindName(t){ return ({web:'Web page', dashboard:'Dashboard', video:'Video', image:'Image'})[t] || 'Content'; }
+  glyph(t){ return ({web:'W', dashboard:'D', video:'▷', image:'▦'})[t] || '·'; }
+  iconVar(t){ return ({web:'--accent', dashboard:'--ok', video:'--warn', image:'--accent-fg'})[t] || '--muted'; }
+
+  showToast(msg){ this.setState({ toast: msg }); clearTimeout(this._toastT); this._toastT = setTimeout(() => this.setState({ toast:null }), 2200); }
+
+  realtime() {
+    if(!this.state.authed) return;
+    const seq = [
+      () => { this.patch('cafe', s => ({...s, status:'connected', st:'live', content:{type:'image',name:'Café Menu'}})); this.patchMachine('cafe-mini', m => ({...m, online:true, lastSeen:'just now'})); this.addFeed('Café-Menu', ' reconnected', 'ok'); },
+      () => { this.patch('reception-right', s => ({...s, st:'live'})); this.addFeed('Reception-Right', ' content recovered', 'ok'); },
+      () => { this.patch('cafe', s => ({...s, status:'offline', st:'offline'})); this.patchMachine('cafe-mini', m => ({...m, online:false, lastSeen:'just now'})); this.addFeed('Café Mini', ' went unreachable', 'bad'); },
+      () => { this.patch('reception-right', s => ({...s, st:'error'})); this.addFeed('Reception-Right', ' content failed to load', 'bad'); },
+    ];
+    seq[this._tick % seq.length]();
+    this._tick++;
+  }
+  patch(id, fn){ this.setState(st => ({ screens: st.screens.map(s => s.id === id ? fn(s) : s) })); }
+  patchGroup(id, fn){ this.setState(st => ({ groups: st.groups.map(g => g.id === id ? fn(g) : g) })); }
+  patchMachine(id, fn){ this.setState(st => ({ machines: st.machines.map(m => m.id === id ? fn(m) : m) })); }
+  addFeed(head, tail, kind){
+    const labels = ['now','1m','3m','6m','11m','18m'];
+    this.setState(st => {
+      const next = [{ id:'f'+Date.now()+Math.random(), time:'now', head, tail, kind }, ...st.feed].slice(0,6).map((f,i) => ({ ...f, time:labels[i] }));
+      return { feed: next };
+    });
+  }
+
+  // ---------- navigation / auth ----------
+  go(v){ this.setState({ view: v }); }
+  onSignIn(){
+    if(this.state.signinLoading) return;
+    if(!this.state.signinEmail.trim() || !this.state.signinPass.trim()){ this.setState({ signinErr:true }); return; }
+    this.setState({ signinLoading:true, signinErr:false });
+    setTimeout(() => this.setState({ authed:true, signinLoading:false, view:'wall' }), 750);
+  }
+  signOut(){ this.setState({ authed:false, view:'wall' }); }
+
+  // ---------- machines ----------
+  approve(id){
+    const m = this.state.machines.find(x => x.id === id); if(!m) return;
+    const newScreens = (m.pending || []).map((p,i) => ({ id:'u'+Date.now()+i, name:p.name, machine:id }));
+    this.setState(st => ({
+      machines: st.machines.map(x => x.id === id ? {...x, enrol:'approved', pending:undefined} : x),
+      unplaced: [...st.unplaced, ...newScreens],
+    }));
+    this.addFeed(m.label, ' approved · ' + newScreens.length + ' screens available', 'ok');
+    this.showToast(m.label + ' approved — ' + newScreens.length + ' screens added to Unplaced');
+  }
+  reject(id){ const m = this.state.machines.find(x => x.id === id); this.patchMachine(id, x => ({...x, enrol:'rejected', pending:undefined, online:false})); if(m) this.addFeed(m.label, ' rejected', 'muted'); this.showToast((m?m.label:'Machine') + ' rejected'); }
+  revoke(id){ const m = this.state.machines.find(x => x.id === id); this.patchMachine(id, x => ({...x, enrol:'rejected', online:false})); if(m) this.addFeed(m.label, ' access revoked', 'bad'); this.showToast((m?m.label:'Machine') + ' revoked'); }
+  regenToken(){ const r = () => Math.random().toString(36).slice(2,6).toUpperCase(); this.setState({ enrolToken:'POLY-'+r()+'-'+r()+'-'+r() }); this.showToast('New enrolment token generated'); }
+  copyToken(){ try{ navigator.clipboard && navigator.clipboard.writeText(this.state.enrolToken); }catch(e){} this.showToast('Token copied to clipboard'); }
+
+  machineScreenNames(id){
+    const placed = this.state.screens.filter(s => s.machine === id).map(s => s.name);
+    const unpl = this.state.unplaced.filter(s => s.machine === id).map(s => s.name + ' (unplaced)');
+    return placed.concat(unpl);
+  }
+
+  // ---------- content sources ----------
+  openAddSource(){ this.setState({ sourceModal:{ mode:'add', id:null, name:'', type:'web', address:'', auth:'none' } }); }
+  openEditSource(id){ const c = this.state.sources.find(x => x.id === id); if(c) this.setState({ sourceModal:{ mode:'edit', id:c.id, name:c.name, type:c.type, address:c.address, auth:c.auth } }); }
+  closeSource(){ this.setState({ sourceModal:null }); }
+  setSrc(patch){ this.setState(st => ({ sourceModal:{...st.sourceModal, ...patch} })); }
+  saveSource(){
+    const m = this.state.sourceModal; if(!m) return;
+    const name = (m.name || '').trim() || 'Untitled source';
+    if(m.mode === 'add'){
+      const ns = { id:'c'+Date.now(), name, type:m.type, address:m.address || '—', auth:m.auth };
+      this.setState(st => ({ sources:[...st.sources, ns], sourceModal:null }));
+      this.addFeed(name, ' added to content', 'accent');
+    } else {
+      this.setState(st => ({ sources: st.sources.map(c => c.id === m.id ? {...c, name, type:m.type, address:m.address, auth:m.auth} : c), sourceModal:null }));
+      this.addFeed(name, ' updated', 'muted');
+    }
+    this.showToast('Content source saved');
+  }
+  deleteSource(id){ const c = this.state.sources.find(x => x.id === id); this.setState(st => ({ sources: st.sources.filter(x => x.id !== id) })); if(c) this.showToast(c.name + ' deleted'); }
+
+  // ---------- scenes ----------
+  snapshot(){
+    const t = this.state;
+    return {
+      groups: Object.fromEntries(t.groups.map(g => [g.id, g.content || null])),
+      screens: Object.fromEntries(t.screens.filter(s => !s.group).map(s => [s.id, { content:s.content || null, st:s.st }])),
+    };
+  }
+  applyScene(id){
+    const sc = this.state.scenes.find(s => s.id === id); if(!sc) return;
+    const preset = this.PRESETS[id];
+    const snap = sc.snapshot;
+    this.setState(st => ({
+      activeScene:id, applying: sc.name,
+      groups: st.groups.map(g => {
+        if(preset && (g.id in preset)) return {...g, content:preset[g.id]};
+        if(snap && (g.id in snap.groups)) return {...g, content:snap.groups[g.id]};
+        return g;
+      }),
+      screens: st.screens.map(s => {
+        if(s.group || s.id === 'cafe') return s;
+        if(preset && (s.id in preset)){ const c = preset[s.id]; let stt = c ? 'live' : 'empty'; if(id==='morning' && s.id==='reception-right') stt='error'; return {...s, content:c, st:stt}; }
+        if(snap && (s.id in snap.screens)){ const e = snap.screens[s.id]; return {...s, content:e.content, st:e.st}; }
+        return s;
+      }),
+    }));
+    this.addFeed(sc.name, ' scene applied', 'accent');
+    setTimeout(() => this.setState({ applying:null }), 1300);
+  }
+  saveConfirm(){
+    const name = (this.state.sceneName || '').trim() || ('Scene ' + (this.state.scenes.length + 1));
+    const id = 'sc' + Date.now();
+    const snap = this.snapshot();
+    this.setState(st => ({ scenes:[...st.scenes, {id, name, schedule:'', snapshot:snap}], activeScene:id, saveOpen:false, sceneName:'' }));
+    this.addFeed(name, ' saved', 'ok'); this.showToast('Scene saved');
+  }
+  renameScene(id, e){ const v = e.target.value; this.setState(st => ({ scenes: st.scenes.map(s => s.id === id ? {...s, name:v} : s) })); }
+  scheduleScene(id, e){ const v = e.target.value; this.setState(st => ({ scenes: st.scenes.map(s => s.id === id ? {...s, schedule:v} : s) })); }
+  dupScene(id){ const s = this.state.scenes.find(x => x.id === id); if(!s) return; const ns = {...s, id:'sc'+Date.now(), name:s.name+' copy'}; this.setState(st => ({ scenes:[...st.scenes, ns] })); this.showToast('Scene duplicated'); }
+  deleteScene(id){ const s = this.state.scenes.find(x => x.id === id); this.setState(st => { const rest = st.scenes.filter(x => x.id !== id); return { scenes:rest, activeScene: st.activeScene === id ? (rest[0] ? rest[0].id : null) : st.activeScene }; }); if(s) this.showToast(s.name + ' deleted'); }
+
+  // ---------- cold-start wizard ----------
+  csReset(){ this.setState({ view:'coldstart', cs:{ step:1, arrived:false, screens:[], identing:null } }); }
+  csSimulate(){ this.setState(st => ({ cs:{...st.cs, arrived:true} })); this.addFeed('New NUC', ' is requesting access', 'accent'); }
+  csApprove(){ this.setState(st => ({ cs:{...st.cs, step:2, screens:[{key:'a', name:'', placed:false},{key:'b', name:'', placed:false}]} })); this.showToast('New NUC approved'); }
+  csReject(){ this.setState(st => ({ cs:{...st.cs, arrived:false} })); this.showToast('Machine rejected'); }
+  csIdent(key){
+    this.setState(st => ({ cs:{...st.cs, identing:key} }));
+    const s = this.state.cs.screens.find(x => x.key === key);
+    this.showToast('Identing ' + (s && s.name ? s.name : 'screen') + ' — look for it flashing on the wall');
+    setTimeout(() => this.setState(st => ({ cs:{...st.cs, identing: st.cs.identing === key ? null : st.cs.identing} })), 2000);
+  }
+  csName(key, e){ const v = e.target.value; this.setState(st => ({ cs:{...st.cs, screens: st.cs.screens.map(s => s.key === key ? {...s, name:v} : s)} })); }
+  csPlace(key){ this.setState(st => ({ cs:{...st.cs, screens: st.cs.screens.map(s => s.key === key ? {...s, placed:true} : s)} })); }
+  csFinish(){
+    const scr = this.state.cs.screens;
+    if(!scr.every(s => s.placed)) return;
+    const base = Date.now();
+    const newScreens = scr.map((s,i) => ({ id:'cs'+base+i, name:s.name || ('New Screen '+(i+1)), x:420, y:196 + i*120, w:168, h:96, status:'connected', st:'empty', content:null, machine:'new-nuc', output:String(i+1) }));
+    this.setState(st => ({
+      screens:[...st.screens, ...newScreens],
+      machines: st.machines.find(m => m.id === 'new-nuc') ? st.machines : [...st.machines, { id:'new-nuc', label:'New NUC', enrol:'approved', online:true, lastSeen:'just now' }],
+      view:'wall',
+      selectedIds:[newScreens[0].id],
+    }));
+    this.addFeed('New NUC', ' set up · ' + newScreens.length + ' screens placed', 'ok');
+    this.showToast('Your wall is set up');
+  }
+
+  // ---------- selection ----------
+  groupSet(id){ const s = this.state.screens.find(x => x.id === id); if(s && s.group) return this.state.screens.filter(x => x.group === s.group).map(x => x.id); return [id]; }
+  selById(id){ this.setState({ selectedIds: this.groupSet(id) }); }
+  sel(){ return this.state.screens.filter(s => this.state.selectedIds.includes(s.id)); }
+  currentGroupId(){
+    const sel = this.sel(); if(sel.length < 2) return null;
+    const g = sel[0].group;
+    if(g && sel.every(s => s.group === g)){ const members = this.state.screens.filter(s => s.group === g); if(members.length === sel.length) return g; }
+    return null;
+  }
+  groupBBox(gid){ const m = this.state.screens.filter(s => s.group === gid); return { minX:Math.min(...m.map(s=>s.x)), minY:Math.min(...m.map(s=>s.y)), maxX:Math.max(...m.map(s=>s.x+s.w)), maxY:Math.max(...m.map(s=>s.y+s.h)), members:m }; }
+
+  onRenameInput(e){ const v = e.target.value; this.patch(this.state.selectedIds[0], s => ({...s, name:v})); }
+  onRenameCommit(){ const s = this.sel()[0]; if(s) this.addFeed(s.name, ' renamed', 'muted'); }
+  onGroupRename(e){ const v = e.target.value; const g = this.currentGroupId(); if(g) this.patchGroup(g, x => ({...x, name:v})); }
+  identUnplaced(id){ const u = this.state.unplaced.find(x => x.id === id); if(u){ this.showToast('Identing ' + u.name + ' — look for it flashing on the wall'); this.addFeed(u.name, ' identing on wall', 'accent'); } }
+  renameUnplaced(id, e){ const v = e.target.value; this.setState(st => ({ unplaced: st.unplaced.map(u => u.id === id ? {...u, name:v} : u) })); }
+  ident(){
+    const gid = this.currentGroupId();
+    if(gid){
+      if(this._prevG[gid]) return;
+      const gr = this.state.groups.find(x => x.id === gid);
+      this._prevG[gid] = true; this.patchGroup(gid, g => ({...g, st:'identing'}));
+      this.addFeed(gr ? gr.name : 'Surface', ' identing — all panels flashing', 'accent');
+      setTimeout(() => { delete this._prevG[gid]; this.patchGroup(gid, g => ({...g, st:null})); }, 3200);
+      return;
+    }
+    const ids = [...this.state.selectedIds]; if(!ids.length) return;
+    ids.forEach(id => {
+      const s = this.state.screens.find(x => x.id === id); if(!s || s.group || this._prev[id]) return;
+      this._prev[id] = s.st; this.patch(id, x => ({...x, st:'identing'}));
+      setTimeout(() => { const prev = this._prev[id]; delete this._prev[id]; this.patch(id, x => ({...x, st: prev || (x.content ? 'live' : 'empty')})); }, 3200);
+    });
+    if(ids.length === 1){ const s = this.state.screens.find(x => x.id === ids[0]); this.addFeed(s ? s.name : '', ' identing on wall', 'accent'); }
+    else this.addFeed(ids.length + ' screens', ' identing on wall', 'accent');
+  }
+
+  doGroup(){
+    const ids = [...this.state.selectedIds]; if(ids.length < 2) return;
+    const gid = 'g' + Date.now(); const name = 'Wall ' + (this.state.groups.length + 1);
+    const withContent = this.state.screens.find(s => ids.includes(s.id) && s.content);
+    const content = withContent ? withContent.content : null;
+    this.setState(st => ({ groups:[...st.groups, { id:gid, name, content, st:null }], screens: st.screens.map(s => ids.includes(s.id) ? {...s, group:gid, content:undefined, st:undefined} : s) }));
+    this.addFeed(name, ' combined · ' + ids.length + ' panels', 'accent');
+  }
+  doUngroup(){
+    const gid = this.currentGroupId(); if(!gid) return;
+    const gr = this.state.groups.find(x => x.id === gid);
+    this.setState(st => ({ groups: st.groups.filter(x => x.id !== gid), screens: st.screens.map(s => s.group === gid ? {...s, group:undefined, st:'empty', content:null} : s) }));
+    this.addFeed(gr ? gr.name : 'Surface', ' split into separate screens', 'muted');
+  }
+
+  startScreenDrag(id, e){
+    e.preventDefault(); e.stopPropagation();
+    const gset = this.groupSet(id);
+    let movingIds;
+    if(e.shiftKey){
+      const cur = new Set(this.state.selectedIds);
+      const allIn = gset.every(x => cur.has(x));
+      gset.forEach(x => allIn ? cur.delete(x) : cur.add(x));
+      this.setState({ selectedIds:[...cur] });
+      return;
+    }
+    if(this.state.selectedIds.includes(id) && this.state.selectedIds.length > 1 && this.allSelectedContains(gset)){ movingIds = this.state.selectedIds; }
+    else { movingIds = gset; this.setState({ selectedIds: gset }); }
+    const r = this.canvasEl.getBoundingClientRect(); const z = this.state.zoom;
+    const px = (e.clientX - r.left)/z, py = (e.clientY - r.top)/z;
+    const members = this.state.screens.filter(s => movingIds.includes(s.id));
+    const minX = Math.min(...members.map(s => s.x)), minY = Math.min(...members.map(s => s.y));
+    const maxX = Math.max(...members.map(s => s.x + s.w)), maxY = Math.max(...members.map(s => s.y + s.h));
+    this.drag = { type:'screen', ids:movingIds, offx:px - minX, offy:py - minY, bw:maxX - minX, bh:maxY - minY, baseMinX:minX, baseMinY:minY, orig:Object.fromEntries(members.map(s => [s.id, {x:s.x, y:s.y}])) };
+  }
+  allSelectedContains(gset){ return gset.every(x => this.state.selectedIds.includes(x)); }
+  startLibDrag(item, e){ e.preventDefault(); this.drag = { type:'lib', item }; this.setState({ ghost:{ x:e.clientX, y:e.clientY, label:item.name } }); }
+  startNewScreenDrag(item, e){ e.preventDefault(); e.stopPropagation(); this.drag = { type:'newscreen', item }; this.setState({ ghost:{ x:e.clientX, y:e.clientY, label:item.name } }); }
+
+  onMove(e){
+    if(!this.drag) return;
+    if(this.drag.type === 'screen'){
+      const r = this.canvasEl.getBoundingClientRect(); const z = this.state.zoom; const d = this.drag;
+      let nMinX = (e.clientX - r.left)/z - d.offx;
+      let nMinY = (e.clientY - r.top)/z - d.offy;
+      let gx = null, gy = null; const TH = 8;
+      for(const o of this.state.screens){
+        if(d.ids.includes(o.id)) continue;
+        for(const c of [o.x, o.x + o.w]){ if(Math.abs(nMinX - c) < TH){ nMinX = c; gx = c; } if(Math.abs((nMinX + d.bw) - c) < TH){ nMinX = c - d.bw; gx = c; } }
+        for(const c of [o.y, o.y + o.h]){ if(Math.abs(nMinY - c) < TH){ nMinY = c; gy = c; } if(Math.abs((nMinY + d.bh) - c) < TH){ nMinY = c - d.bh; gy = c; } }
+      }
+      nMinX = Math.max(0, nMinX); nMinY = Math.max(0, nMinY);
+      const dx = nMinX - d.baseMinX, dy = nMinY - d.baseMinY;
+      this.setState(st => ({ screens: st.screens.map(s => d.ids.includes(s.id) ? {...s, x:d.orig[s.id].x + dx, y:d.orig[s.id].y + dy} : s), guideX:gx, guideY:gy }));
+    } else if(this.drag.type === 'lib' || this.drag.type === 'newscreen'){
+      this.setState({ ghost:{ x:e.clientX, y:e.clientY, label:this.drag.item.name } });
+    }
+  }
+  onUp(e){
+    if(!this.drag) return;
+    const d = this.drag; this.drag = null;
+    if(d.type === 'screen'){ this.setState({ guideX:null, guideY:null }); return; }
+    if(!this.canvasEl){ this.setState({ ghost:null }); return; }
+    const r = this.canvasEl.getBoundingClientRect(); const z = this.state.zoom;
+    const px = (e.clientX - r.left)/z, py = (e.clientY - r.top)/z;
+    if(d.type === 'lib'){
+      let hitGroup = null;
+      for(const g of this.state.groups){ const b = this.groupBBox(g.id); if(px>=b.minX && px<=b.maxX && py>=b.minY && py<=b.maxY){ hitGroup = g; break; } }
+      if(hitGroup){
+        this.patchGroup(hitGroup.id, g => ({...g, content:{type:d.item.type, name:d.item.name}}));
+        this.addFeed(hitGroup.name, ' → ' + d.item.name, 'accent');
+        this.setState({ selectedIds: this.state.screens.filter(s => s.group === hitGroup.id).map(s => s.id) });
+      } else {
+        const hit = [...this.state.screens].filter(s => !s.group).reverse().find(s => px>=s.x && px<=s.x+s.w && py>=s.y && py<=s.y+s.h);
+        if(hit){ this.patch(hit.id, s => ({...s, content:{type:d.item.type, name:d.item.name}, st: s.status==='offline' ? 'offline' : 'live'})); this.addFeed(hit.name, ' → ' + d.item.name, 'accent'); this.setState({ selectedIds:[hit.id] }); }
+      }
+      this.setState({ ghost:null });
+    } else if(d.type === 'newscreen'){
+      const nx = Math.max(0, px - 84), ny = Math.max(0, py - 48);
+      const ns = { id:d.item.id, name:d.item.name, x:nx, y:ny, w:168, h:94, status:'connected', st:'empty', content:null, machine:d.item.machine, output:'—' };
+      this.setState(st => ({ screens:[...st.screens, ns], unplaced: st.unplaced.filter(u => u.id !== d.item.id), ghost:null, selectedIds:[ns.id] }));
+      this.addFeed(d.item.name, ' placed on canvas', 'accent');
+    }
+  }
+
+  dotStyle(v, size){ return 'width:'+size+'px;height:'+size+'px;border-radius:50%;background:var('+v+');flex:0 0 auto;'; }
+  screenDotVar(s){ return s.status === 'offline' ? '--bad' : (s.st === 'error' ? '--warn' : '--ok'); }
+
+  buildScreen(s){
+    const t = this.state;
+    const inSel = t.selectedIds.includes(s.id);
+    const single = t.selectedIds.length === 1 && inSel;
+    let bg = '', border = '';
+    if(s.st === 'offline'){ bg = 'background:var(--scr-off-bg);'; border = 'border:1px solid var(--line);'; }
+    else if(s.st === 'error'){ bg = 'background:var(--scr-bad-bg);'; border = 'border:1px solid var(--scr-bad-line);'; }
+    else if(s.st === 'empty'){ bg = 'background:var(--scr-empty-bg);'; border = 'border:1.5px dashed var(--scr-empty-line);'; }
+    else { bg = 'background:var(--scr-live);'; border = 'border:1px solid var(--line);'; }
+    let ring;
+    if(s.st === 'identing') ring = 'animation:pflash 1.4s infinite;z-index:55;';
+    else if(single) ring = 'box-shadow:0 0 0 2px var(--accent),var(--shadow-lg);z-index:50;';
+    else if(inSel) ring = 'box-shadow:0 0 0 1.5px var(--accent-line),var(--shadow);z-index:40;';
+    else ring = 'box-shadow:var(--shadow-sm);z-index:10;';
+    const box = 'position:absolute;left:'+s.x+'px;top:'+s.y+'px;width:'+s.w+'px;height:'+s.h+'px;border-radius:9px;overflow:hidden;cursor:grab;user-select:none;' + bg + border + ring;
+    return {
+      id:s.id, name:s.name, box, dot:this.dotStyle(this.screenDotVar(s), 6),
+      isLivePlain: s.st === 'live', isError: s.st === 'error', isEmpty: s.st === 'empty', isOffline: s.st === 'offline', isIdenting: s.st === 'identing',
+      handles: single && s.st !== 'identing',
+      contentName: s.content ? s.content.name : '', kindLabel: s.content ? this.kindName(s.content.type) : '',
+      onDown:(e) => this.startScreenDrag(s.id, e),
+    };
+  }
+  buildSurface(g){
+    const t = this.state;
+    const b = this.groupBBox(g.id); const m = b.members;
+    const W = b.maxX - b.minX, H = b.maxY - b.minY;
+    const selSet = new Set(t.selectedIds);
+    const selected = m.length > 0 && m.every(s => selSet.has(s.id)) && t.selectedIds.length === m.length;
+    const anyOffline = m.some(s => s.status === 'offline');
+    const identing = g.st === 'identing';
+    const xs = [...new Set(m.flatMap(s => [s.x, s.x + s.w]))].filter(v => v > b.minX && v < b.maxX).sort((a,c)=>a-c);
+    const ys = [...new Set(m.flatMap(s => [s.y, s.y + s.h]))].filter(v => v > b.minY && v < b.maxY).sort((a,c)=>a-c);
+    const seams = [];
+    xs.forEach(x => seams.push('position:absolute;left:'+(x-b.minX)+'px;top:0;width:2px;height:100%;background:var(--seam);z-index:3;'));
+    ys.forEach(y => seams.push('position:absolute;left:0;top:'+(y-b.minY)+'px;width:100%;height:2px;background:var(--seam);z-index:3;'));
+    const hasContent = !!g.content && !identing;
+    let bg = g.content ? 'background:var(--scr-live);' : 'background:var(--scr-empty-bg);';
+    let border = g.content ? 'border:1px solid var(--line);' : 'border:1.5px dashed var(--scr-empty-line);';
+    let ring;
+    if(identing) ring = 'animation:pflash 1.4s infinite;z-index:55;';
+    else if(selected) ring = 'box-shadow:0 0 0 2px var(--accent),var(--shadow-lg);z-index:50;';
+    else ring = 'box-shadow:var(--shadow);z-index:8;';
+    const box = 'position:absolute;left:'+b.minX+'px;top:'+b.minY+'px;width:'+W+'px;height:'+H+'px;border-radius:9px;overflow:hidden;cursor:grab;user-select:none;' + bg + border + ring;
+    return { id:g.id, name:g.name, box, seams, dot:this.dotStyle(anyOffline ? '--bad' : '--ok', 6), hasContent, isEmpty: !g.content && !identing, isIdenting: identing, contentName: g.content ? g.content.name : '', kindLabel: g.content ? this.kindName(g.content.type) : '', count: m.length, handles: selected && !identing, onDown:(e) => this.startScreenDrag(m[0].id, e) };
+  }
+  gridRes(gid){ const m = this.state.screens.filter(s => s.group === gid); const cols = new Set(m.map(s => s.x)).size, rows = new Set(m.map(s => s.y)).size; return (cols*1920) + ' × ' + (rows*1080); }
+
+  navStyle(v){ const a = this.state.view === v; return 'display:flex;flex-direction:column;align-items:center;justify-content:center;width:56px;height:52px;border-radius:11px;cursor:pointer;gap:3px;' + (a ? 'background:var(--muted-bg);color:var(--fg);' : 'color:var(--muted);'); }
+  authMeta(a){ return ({ none:{t:'No auth', d:'Open content, no credentials', c:'--muted'}, public:{t:'Public', d:'Anonymous public URL', c:'--ok'}, proxy:{t:'Via proxy', d:'Reached through an auth proxy', c:'--accent'}, signin:{t:'Sign-in', d:'Player signs in to view', c:'--warn'} })[a] || {t:a,d:'',c:'--muted'}; }
+  authBadgeStyle(a){ const c = this.authMeta(a).c; return 'font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;white-space:nowrap;color:var('+c+');background:color-mix(in srgb, var('+c+') 12%, transparent);'; }
+
+  renderVals(){
+    const t = this.state;
+    const sel = this.sel();
+    const groupId = this.currentGroupId();
+    const isGroup = !!groupId;
+    const isMulti = sel.length > 1 && !isGroup;
+    const isSingle = sel.length === 1;
+    const isEmptySel = sel.length === 0;
+    const one = sel[0];
+    const alerts = t.screens.filter(x => x.status === 'offline' || x.st === 'error').length;
+    const headColor = { ok:'var(--ok)', bad:'var(--bad)', accent:'var(--accent-fg)', muted:'var(--fg2)' };
+
+    let selBarShow = false, selBarX = 0, selBarY = 0;
+    if(sel.length > 1){ const minX = Math.min(...sel.map(s => s.x)), minY = Math.min(...sel.map(s => s.y)); selBarShow = true; selBarX = minX - 10; selBarY = Math.max(2, minY - 46); }
+    const grp = isGroup ? t.groups.find(x => x.id === groupId) : null;
+
+    const pendingMachines = t.machines.filter(m => m.enrol === 'pending');
+    const approvedMachines = t.machines.filter(m => m.enrol === 'approved');
+    const cs = t.cs;
+    const sm = t.sourceModal;
+
+    return {
+      theme:t.theme, themeIcon: t.theme === 'dark' ? '☀' : '☾',
+      onTheme: () => this.setState(st => ({ theme: st.theme === 'dark' ? 'light' : 'dark' })),
+
+      // ---- routing ----
+      isSignin: !t.authed, isApp: t.authed,
+      isWall: t.view === 'wall', isMachines: t.view === 'machines', isContent: t.view === 'content', isScenes: t.view === 'scenes', isSettings: t.view === 'settings', isColdStart: t.view === 'coldstart',
+      navWall:this.navStyle('wall'), navMachines:this.navStyle('machines'), navContent:this.navStyle('content'), navScenes:this.navStyle('scenes'), navSettings:this.navStyle('settings'),
+      goWall:() => this.go('wall'), goMachines:() => this.go('machines'), goContent:() => this.go('content'), goScenes:() => this.go('scenes'), goSettings:() => this.go('settings'),
+      pendingCount: pendingMachines.length, pendingShow: pendingMachines.length > 0,
+
+      // ---- sign in ----
+      signinEmail:t.signinEmail, signinPass:t.signinPass, signinErr:t.signinErr, signinLoading:t.signinLoading,
+      signinBtn: t.signinLoading ? 'Signing in…' : 'Sign in',
+      onSigninEmail:(e) => this.setState({ signinEmail:e.target.value }), onSigninPass:(e) => this.setState({ signinPass:e.target.value }),
+      onSignIn:() => this.onSignIn(), onSignOut:() => this.signOut(),
+
+      // ---- machines ----
+      enrolToken:t.enrolToken, onCopyToken:() => this.copyToken(), onRegenToken:() => this.regenToken(),
+      pendingV: pendingMachines.map(m => ({ id:m.id, label:m.label, outputs:(m.pending||[]).length, lastSeen:m.lastSeen, onApprove:() => this.approve(m.id), onReject:() => this.reject(m.id) })),
+      approvedCount: approvedMachines.length,
+      approvedV: approvedMachines.map(m => {
+        const names = this.machineScreenNames(m.id);
+        const badge = m.online ? 'font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:var(--ok);background:var(--ok-soft)' : 'font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:var(--bad);background:var(--bad-soft)';
+        return { id:m.id, label:m.label, dot:this.dotStyle(m.online ? '--ok' : '--bad', 8), screenList: names.length ? names.join(', ') : 'no screens', badge, badgeText: m.online ? 'Online' : 'Offline', lastSeen:m.lastSeen, onRevoke:() => this.revoke(m.id) };
+      }),
+
+      // ---- content sources ----
+      libV: t.sources.map(it => ({ id:it.id, name:it.name, kind:this.kindName(it.type), glyph:this.glyph(it.type), icon:'width:24px;height:24px;border-radius:6px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:var('+this.iconVar(it.type)+');background:color-mix(in srgb, var('+this.iconVar(it.type)+') 13%, transparent);', onDown:(e) => this.startLibDrag({type:it.type, name:it.name}, e) })),
+      sourcesV: t.sources.map(c => ({ id:c.id, name:c.name, kind:this.kindName(c.type), glyph:this.glyph(c.type), address:c.address, icon:'width:30px;height:30px;border-radius:7px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:var('+this.iconVar(c.type)+');background:color-mix(in srgb, var('+this.iconVar(c.type)+') 13%, transparent);', authBadge:this.authBadgeStyle(c.auth), authText:this.authMeta(c.auth).t, onEdit:() => this.openEditSource(c.id), onDelete:() => this.deleteSource(c.id) })),
+      onAddSource:() => this.openAddSource(),
+      sourceOpen: !!sm, sourceTitle: sm && sm.mode === 'edit' ? 'Edit content source' : 'Add content source', sourceSaveLabel: sm && sm.mode === 'edit' ? 'Save changes' : 'Add source',
+      onSourceClose:() => this.closeSource(), onSaveSource:() => this.saveSource(),
+      srcName: sm ? sm.name : '', srcAddress: sm ? sm.address : '',
+      onSrcName:(e) => this.setSrc({ name:e.target.value }), onSrcAddress:(e) => this.setSrc({ address:e.target.value }),
+      srcTypeBtns: ['web','dashboard','image','video'].map(ty => ({ label:this.kindName(ty), onClick:() => this.setSrc({ type:ty }), style:'flex:1;text-align:center;padding:8px 4px;border-radius:8px;font-size:11.5px;font-weight:500;cursor:pointer;border:1px solid ' + (sm && sm.type===ty ? 'var(--accent)' : 'var(--line)') + ';color:' + (sm && sm.type===ty ? 'var(--accent-fg)' : 'var(--muted)') + ';background:' + (sm && sm.type===ty ? 'var(--accent-soft)' : 'transparent') + ';' })),
+      srcAuthRows: ['none','public','proxy','signin'].map(au => { const meta = this.authMeta(au); const on = sm && sm.auth===au; return { label:meta.t, desc:meta.d, onClick:() => this.setSrc({ auth:au }), style:'display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:9px;cursor:pointer;border:1px solid ' + (on ? 'var(--accent)' : 'var(--line)') + ';background:' + (on ? 'var(--accent-soft)' : 'transparent') + ';', radio:'width:15px;height:15px;border-radius:50%;flex:0 0 auto;border:2px solid ' + (on ? 'var(--accent)' : 'var(--line2)') + ';background:' + (on ? 'radial-gradient(circle, var(--accent) 0 4px, transparent 5px)' : 'transparent') + ';' }; }),
+
+      // ---- scenes management ----
+      scenesManageV: t.scenes.map(s => ({ id:s.id, name:s.name, schedule:s.schedule || '', isActive: s.id === t.activeScene, dot:this.dotStyle(s.id === t.activeScene ? '--ok' : '--muted2', 8), onRename:(e) => this.renameScene(s.id, e), onSchedule:(e) => this.scheduleScene(s.id, e), onApply:() => this.applyScene(s.id), onDup:() => this.dupScene(s.id), onDel:() => this.deleteScene(s.id) })),
+
+      // ---- settings ----
+      lightPill: 'padding:7px 14px;border-radius:7px;font-size:12.5px;font-weight:500;cursor:pointer;' + (t.theme==='light' ? 'background:var(--surface);color:var(--fg);box-shadow:var(--shadow-sm)' : 'color:var(--muted)'),
+      darkPill: 'padding:7px 14px;border-radius:7px;font-size:12.5px;font-weight:500;cursor:pointer;' + (t.theme==='dark' ? 'background:var(--surface);color:var(--fg);box-shadow:var(--shadow-sm)' : 'color:var(--muted)'),
+      onLight:() => this.setState({ theme:'light' }), onDark:() => this.setState({ theme:'dark' }),
+      onColdStart:() => this.csReset(),
+
+      // ---- cold start wizard ----
+      csStep1: cs.step === 1, csStep2: cs.step === 2, csWaiting: cs.step === 1 && !cs.arrived, csArrived: cs.step === 1 && cs.arrived,
+      csTitle: cs.step === 2 ? 'Name & place your screens' : 'Connect your first machine',
+      csSub: cs.step === 2 ? 'These two screens are live but anonymous. Map each to the physical wall.' : 'No machines are on the wall yet. Bring one online to get started.',
+      csSimulate:() => this.csSimulate(), csApprove:() => this.csApprove(), csReject:() => this.csReject(), csFinish:() => this.csFinish(),
+      csScreensV: cs.screens.map((s,i) => ({ key:s.key, idx:String(i+1), name:s.name, onName:(e) => this.csName(s.key, e), onIdent:() => this.csIdent(s.key), onPlace:() => this.csPlace(s.key),
+        row:'border:1px solid ' + (s.placed ? 'var(--accent-line)' : 'var(--line)') + ';border-radius:11px;padding:11px 12px;background:' + (s.placed ? 'var(--accent-soft)' : 'var(--surface)') + ';',
+        identLabel: cs.identing === s.key ? 'Flashing…' : 'Ident',
+        identBtn:'display:flex;align-items:center;gap:6px;padding:8px 11px;border-radius:8px;border:1px solid var(--line2);font-size:12px;font-weight:500;color:var(--fg2);cursor:pointer;white-space:nowrap;background:var(--surface)',
+        placeLabel: s.placed ? '✓ Placed' : 'Place',
+        placeBtn:'padding:8px 13px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;' + (s.placed ? 'background:transparent;color:var(--ok);border:1px solid var(--ok)' : 'background:var(--primary);color:var(--primary-fg)'),
+      })),
+      csFinishLabel: cs.screens.every(s => s.placed) && cs.screens.length ? 'Finish setup — open the wall →' : 'Place both screens to finish',
+      csFinishBtn: 'text-align:center;padding:11px;border-radius:10px;font-size:13px;font-weight:600;margin-top:4px;' + (cs.screens.every(s => s.placed) && cs.screens.length ? 'background:var(--primary);color:var(--primary-fg);cursor:pointer' : 'background:var(--muted-bg);color:var(--muted2);cursor:not-allowed'),
+
+      // ---- toast ----
+      toastShow: !!t.toast, toastMsg: t.toast || '',
+
+      // ---- wall: scenes tabs ----
+      screensCount:t.screens.length,
+      alertText: alerts > 0 ? ('· ' + alerts + (alerts === 1 ? ' alert' : ' alerts')) : '· healthy',
+      alertStyle: 'margin-left:5px;font-weight:600;color:' + (alerts > 0 ? 'var(--warn)' : 'var(--ok)'),
+      scenesV: t.scenes.map(sc => ({ id:sc.id, name:sc.name, pill: sc.id === t.activeScene ? 'padding:5px 12px;border-radius:7px;background:var(--surface);color:var(--fg);font-size:12.5px;font-weight:500;cursor:pointer;box-shadow:var(--shadow-sm)' : 'padding:5px 12px;border-radius:7px;color:var(--muted);font-size:12.5px;font-weight:500;cursor:pointer', onClick:() => this.applyScene(sc.id) })),
+
+      // ---- wall: library / unplaced ----
+      hasUnplaced: t.unplaced.length > 0, noUnplaced: t.unplaced.length === 0,
+      unplacedV: t.unplaced.map(u => ({ id:u.id, name:u.name, onRename:(e) => this.renameUnplaced(u.id, e), onIdent:() => this.identUnplaced(u.id), onDown:(e) => this.startNewScreenDrag(u, e) })),
+
+      // ---- wall: canvas ----
+      surfaces: t.groups.map(g => this.buildSurface(g)),
+      screens: t.screens.filter(s => !s.group).map(s => this.buildScreen(s)),
+      zoom:t.zoom, zoomPct: Math.round(t.zoom * 100) + '%',
+      onZoomIn: () => this.setState(st => ({ zoom: Math.min(1.4, +(st.zoom + 0.1).toFixed(2)) })),
+      onZoomOut: () => this.setState(st => ({ zoom: Math.max(0.6, +(st.zoom - 0.1).toFixed(2)) })),
+      canvasRef:(el) => { this.canvasEl = el; },
+      onCanvasDown: () => this.setState({ selectedIds:[] }),
+      guideShowX:t.guideX != null, guideX:t.guideX, guideShowY:t.guideY != null, guideY:t.guideY,
+      ghostShow:!!t.ghost, ghostX:t.ghost ? t.ghost.x : 0, ghostY:t.ghost ? t.ghost.y : 0, ghostLabel:t.ghost ? t.ghost.label : '',
+      applyingShow:!!t.applying, applyingName:t.applying || '',
+      selBarShow, selBarX, selBarY,
+      selBarLabel: isGroup ? (grp ? grp.name : 'Surface') : (sel.length + ' selected'),
+      selBarAction: isGroup ? 'Split' : 'Combine',
+      selBarBtn: isGroup ? 'display:flex;align-items:center;padding:6px 11px;border-radius:7px;border:1px solid var(--line);color:var(--bad);font-size:12px;font-weight:500;cursor:pointer' : 'display:flex;align-items:center;gap:5px;padding:6px 11px;border-radius:7px;background:var(--primary);color:var(--primary-fg);font-size:12px;font-weight:600;cursor:pointer',
+      onGroupAction: () => isGroup ? this.doUngroup() : this.doGroup(),
+      onIdent: () => this.ident(),
+
+      // ---- wall: inspector ----
+      insSingle:isSingle, insGroup:isGroup, insMulti:isMulti, insEmpty:isEmptySel,
+      selName: one ? one.name : '', onRename:(e) => this.onRenameInput(e), onRenameCommit: () => this.onRenameCommit(),
+      selDot: one ? this.dotStyle(this.screenDotVar(one), 7) : '',
+      selStatus: one ? (one.status === 'offline' ? 'Unreachable' : (one.st === 'identing' ? 'Identing…' : (one.st === 'error' ? 'Content error' : 'Connected'))) : '',
+      selMachine: one ? (one.machine + ' · out ' + one.output) : '',
+      selHasContent: !!(one && one.content), selNoContent: !!(one && !one.content),
+      selContentName: one && one.content ? one.content.name : '', selContentKind: one && one.content ? this.kindName(one.content.type) : '',
+      selPos: one ? ('x ' + Math.round(one.x) + '  y ' + Math.round(one.y)) : '', selSize: one ? (one.w + ' × ' + one.h) : '',
+      grpName: grp ? grp.name : '', onGroupRename:(e) => this.onGroupRename(e),
+      grpHasContent: !!(grp && grp.content), grpNoContent: !!(grp && !grp.content),
+      grpContentName: grp && grp.content ? grp.content.name : '', grpContentKind: grp && grp.content ? this.kindName(grp.content.type) : '',
+      grpCount: sel.length, grpRes: groupId ? this.gridRes(groupId) : '',
+      grpMembers: sel.map(m => ({ id:m.id, name:m.name, dot:this.dotStyle(this.screenDotVar(m), 7), kind:(m.machine + ' · out ' + m.output) })),
+      selCount: sel.length, selList: sel.map(m => ({ id:m.id, name:m.name, dot:this.dotStyle(this.screenDotVar(m), 7), onClick: () => this.selById(m.id) })),
+      feedV: t.feed.map(f => ({ id:f.id, time:f.time, head:f.head, tail:f.tail, headStyle:'color:' + (headColor[f.kind] || 'var(--fg2)') })),
+
+      // ---- save scene modal ----
+      saveOpen:t.saveOpen, onSaveOpen: () => this.setState({ saveOpen:true, sceneName:'' }), onSaveClose: () => this.setState({ saveOpen:false }),
+      onSceneNameInput:(e) => this.setState({ sceneName:e.target.value }), sceneName:t.sceneName, onSaveConfirm: () => this.saveConfirm(),
+      stop:(e) => e.stopPropagation(),
+    };
+  }
+}
+</script>
+</body>
+</html>
