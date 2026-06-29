@@ -1,0 +1,46 @@
+# sway configuration for a Polyptych kiosk.  ->  installed to /home/kiosk/.config/sway/config
+#
+# Source-of-truth note: `polyptych-agent setup` writes the LIVE file from this template; it replaces
+# the @POLYPTYCH_OUTPUTS@ marker with one `output ...` line per detected connector
+# (swaymsg -t get_outputs). This copy ships to /usr/share/polyptych/templates/ as setup's input.
+# Minimal by design: pin outputs, never blank, hand control to the agent.
+
+### -- Outputs -------------------------------------------------------------------------------------
+# `setup` replaces the marker below with one
+#     output <connector> position <x> <y> resolution <w>x<h>
+# line per detected output, so connector->screen identities stay stable across reboots. Example of
+# what setup generates for a two-panel box:
+#     output DP-1     position 0    0 resolution 1920x1080
+#     output HDMI-A-1 position 1920 0 resolution 1920x1080
+@POLYPTYCH_OUTPUTS@
+
+# Never sleep, blank, or DPMS-off — a wall is always on (power is the smart plug's job, D-stack).
+output * dpms on
+# Plain black background (no default sway grey/wallpaper flash before Chromium paints).
+output * background #000000 solid_color
+# NB: NO swayidle is started anywhere. Do not add one — it would blank the wall.
+
+### -- Kiosk chrome --------------------------------------------------------------------------------
+# No window decorations, gaps, or borders: each Chromium fills its output edge-to-edge.
+default_border none
+default_floating_border none
+hide_edge_borders none
+gaps inner 0
+gaps outer 0
+# Hide the pointer when idle (a kiosk has no mouse user).
+seat * hide_cursor 8000
+# Keep XWayland available: the agent can force Chromium under XWayland with a distinct --class to
+# disambiguate multiple windows that otherwise share app_id="chromium" (ARCHITECTURE -> Gotchas).
+xwayland enable
+
+### -- Session + agent -----------------------------------------------------------------------------
+# Export the Wayland session environment into the systemd --user and D-Bus activation environments
+# (so the agent — a --user service — and its Chromium children inherit WAYLAND_DISPLAY /
+# XDG_RUNTIME_DIR), then start the supervised reconciler. Chained with && so the steps run in order
+# rather than racing (sway `exec` lines otherwise fire concurrently).
+exec systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE && \
+     dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE && \
+     systemctl --user start polyptych-agent.service
+
+# The agent owns its Chromium children (Model A); its --user unit has Restart=always, so the agent
+# (and the Chromium it launches per output) is respawned on crash without sway involvement.

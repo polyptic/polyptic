@@ -1,0 +1,36 @@
+# polyptych-agent.service — the supervised kiosk reconciler.  (systemd --user unit)
+#   ->  installed to /usr/lib/systemd/user/polyptych-agent.service
+#
+# Started by the sway config (`systemctl --user start polyptych-agent.service`) once the Wayland
+# session env has been imported. Runs as the kiosk user INSIDE the sway session so it inherits
+# WAYLAND_DISPLAY and can drive placement via swaymsg + launch a kiosk Chromium per output.
+#
+# Model A: the agent OWNS its Chromium children; systemd supervises the agent (Restart=always),
+# the agent supervises Chromium. Package-owned (fixed content); `setup` only enables/starts it.
+
+[Unit]
+Description=Polyptych kiosk agent (reconciler + Chromium-per-output)
+Documentation=https://github.com/polyptych/polyptych/blob/main/docs/DEPLOY.md
+# Tie the agent's lifetime to the graphical (sway) session.
+PartOf=graphical-session.target
+After=graphical-session.target
+# Never give up restarting — an unattended wall must always come back (no rate-limit window).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Per-box config (control-plane URL + bootstrap token + backend). The binary reads
+# /etc/polyptych/agent.toml; the optional env file bridges the POLYPTYCH_* surface and is written
+# by `polyptych-agent setup` from that same agent.toml (single source of truth). The '-' makes the
+# env file optional so the unit still starts before setup has generated it.
+Environment=POLYPTYCH_STATE_DIR=/var/lib/polyptych
+EnvironmentFile=-/etc/polyptych/agent.env
+ExecStart=/usr/bin/polyptych-agent
+Restart=always
+RestartSec=2
+# Kill the whole cgroup on stop/restart so a respawn never leaves orphaned kiosk Chromium behind.
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

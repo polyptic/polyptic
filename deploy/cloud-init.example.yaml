@@ -1,0 +1,53 @@
+#cloud-config
+# Polyptych agent — declarative provisioning (D26: cloud-init is an OPTIONAL wrapper around the same
+# .deb/.rpm + `polyptych-agent setup`, for fleets you image/provision rather than `apt install` by
+# hand). This file drops the per-box config and installs the package; the package's postinstall +
+# first-boot oneshot do the rest (greetd autologin -> sway -> systemd-supervised agent ->
+# Chromium-per-output). The apt path is shown; the dnf path is in the trailing comment block.
+#
+# Copy to a new file, fill in the server URL + bootstrap token + artifact URL, and hand it to
+# cloud-init (e.g. an Ubuntu autoinstall `user-data`, a cloud image, or `cloud-init devel schema`).
+
+package_update: true
+
+write_files:
+  # Per-box config: the ONLY thing unique to this machine (plus the one-time bootstrap token). The
+  # agent reads it at startup; `setup` mirrors it into /etc/polyptych/agent.env for the systemd unit.
+  - path: /etc/polyptych/agent.toml
+    permissions: '0640'
+    owner: root:root
+    content: |
+      [server]
+      url = "wss://polyptych.example.com/agent"
+      [enrolment]
+      bootstrap_token = "REPLACE-WITH-A-LONG-RANDOM-ENROLMENT-SECRET"
+      [machine]
+      id = ""
+      [display]
+      backend = "wayland-sway"
+      [agent]
+      state_dir = "/var/lib/polyptych"
+
+runcmd:
+  # 1. Fetch + install the agent package. Replace the URL with your published artifact, or use a
+  #    private apt repo and `apt-get install -y polyptych-agent`. `apt-get install ./file.deb` pulls
+  #    the declared deps (greetd, sway, grim, wayvnc, fonts) automatically.
+  - [ sh, -c, "curl -fsSL https://downloads.example.com/polyptych-agent_latest_amd64.deb -o /tmp/polyptych-agent.deb" ]
+  - [ sh, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/polyptych-agent.deb" ]
+  # 2. Complete the package-manager half of setup now — the postinstall deferred it because the dpkg
+  #    lock was held during install. This installs the real .deb Chromium (NOT the snap, D27) and
+  #    enables greetd. Idempotent; equivalent to what the first-boot oneshot would do on reboot.
+  - [ sh, -c, "polyptych-agent setup || true" ]
+
+power_state:
+  mode: reboot
+  message: "Polyptych agent provisioned — rebooting into the kiosk"
+  timeout: 30
+  condition: true
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# RPM / dnf hosts (Fedora, RHEL, openSUSE): swap the apt runcmd lines for, e.g.:
+#   - [ sh, -c, "curl -fsSL https://downloads.example.com/polyptych-agent-latest.x86_64.rpm -o /tmp/polyptych-agent.rpm" ]
+#   - [ sh, -c, "dnf install -y /tmp/polyptych-agent.rpm" ]
+#   - [ sh, -c, "polyptych-agent setup || true" ]
+# `polyptych-agent setup` is distro-aware (apt/dnf/pacman), so only the install command differs.

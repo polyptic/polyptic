@@ -42,10 +42,17 @@ import { fileURLToPath } from "node:url";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import { applyConfigFileToEnv } from "./setup/config";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Seed process.env DEFAULTS from /etc/polyptych/agent.toml (written by `polyptych-agent setup`)
+// BEFORE any config is read below. Real env vars (and the systemd unit's Environment=) always win,
+// and an absent file is a no-op — so a dev box with no agent.toml behaves exactly as before. This
+// is what makes the on-box config file take effect without changing how the agent reads its config.
+applyConfigFileToEnv();
 
 const SERVER_URL = process.env.POLYPTYCH_SERVER_URL ?? "ws://localhost:8080/agent";
 const HEARTBEAT_MS = 10_000;
@@ -454,6 +461,21 @@ class Agent {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function main(): void {
+  // Subcommand dispatch: `polyptych-agent setup …` provisions/tears down the on-device stack
+  // (greetd autologin → sway → systemd-supervised agent → Chromium-per-output). The setup CLI and
+  // its (heavier) provisioning machinery are loaded lazily so the normal agent boot path never pays
+  // for them. Anything other than `setup` runs the existing reconciler loop below, unchanged.
+  if (process.argv[2] === "setup") {
+    void import("./setup/index")
+      .then(({ runSetupCli }) => runSetupCli(process.argv.slice(3)))
+      .then((code) => process.exit(code))
+      .catch((err) => {
+        console.error(`[setup] fatal: ${(err as Error).message}`);
+        process.exit(1);
+      });
+    return;
+  }
+
   const machineId = readMachineId();
   const connector = resolveConnector();
   const outputs = resolveOutputs(connector);

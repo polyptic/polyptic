@@ -1,0 +1,42 @@
+# /etc/polyptych/agent.toml — per-box Polyptych agent configuration.
+#
+# This is the EXAMPLE/seed (shipped to /etc/polyptych/agent.toml.example). The LIVE file is
+# /etc/polyptych/agent.toml, created by `polyptych-agent setup` (from its flags) or by copying
+# this file and editing it. Only this file (plus a one-time bootstrap token) is unique per box —
+# everything else is provisioned identically by `setup`.
+#
+# The agent reads this TOML at startup. `polyptych-agent setup` also mirrors these values into
+# /etc/polyptych/agent.env (POLYPTYCH_* variables) which the systemd unit sources, so the same
+# settings reach both the TOML-native and the environment-variable code paths. Keep ONE source of
+# truth: edit the TOML, then re-run `polyptych-agent setup` to regenerate agent.env.
+
+[server]
+# Control-plane AGENT WebSocket endpoint. Production is outbound wss:// only (D12).
+#   env: POLYPTYCH_SERVER_URL
+url = "wss://polyptych.example.com/agent"
+
+[enrolment]
+# One-time bootstrap token for the server's GATED mode (Phase 2b). After first contact the agent
+# persists a durable credential under [agent].state_dir and no longer needs this token. Leave it
+# empty only if the control plane runs in OPEN mode (dev).
+#   env: POLYPTYCH_BOOTSTRAP_TOKEN
+bootstrap_token = ""
+
+[machine]
+# Optional explicit machine id. Empty -> /etc/machine-id (recommended; stable per box).
+#   env: POLYPTYCH_MACHINE_ID
+id = ""
+
+[display]
+# Display backend:
+#   "wayland-sway" — default; Intel/AMD; placement via swaymsg, capture via grim.
+#   "x11-i3"       — fallback for NVIDIA / wlroots-unfriendly GPUs (D9).
+#   "dev-open"     — dev only (opens the host browser; no compositor).
+#   env: POLYPTYCH_BACKEND
+backend = "wayland-sway"
+
+[agent]
+# Durable per-machine state (the enrolment credential lives here). Created and owned by the kiosk
+# user during `setup`.
+#   env: POLYPTYCH_STATE_DIR
+state_dir = "/var/lib/polyptych"

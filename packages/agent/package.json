@@ -5,9 +5,14 @@
   "type": "module",
   "description": "Polyptych per-client agent — dumb reconciler that registers a machine's outputs and points a player at each screen.",
   "main": "./src/index.ts",
+  "bin": {
+    "polyptych-agent": "./src/index.ts"
+  },
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
+    "setup": "bun src/index.ts setup",
+    "setup:dry": "bun src/index.ts setup --dry-run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json --noEmit"
   },

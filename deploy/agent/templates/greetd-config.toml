@@ -1,0 +1,19 @@
+# greetd configuration for a Polyptych kiosk.  ->  installed to /etc/greetd/config.toml
+#
+# Source-of-truth note: `polyptych-agent setup` (D26) writes the LIVE file from this template
+# (substituting the kiosk user name if changed). This copy ships to /usr/share/polyptych/templates/
+# so the wiring is reviewable and so setup has a stable input — keep edits here, not in two places.
+#
+# Behaviour: ZERO-CLICK perpetual autologin (CLAUDE.md non-negotiable #4). greetd starts the kiosk
+# user's sway session directly — there is NO greeter (the box is unattended). If the session ever
+# exits (compositor crash, power cut), greetd relaunches it, so the wall always returns to content.
+
+[terminal]
+# Pin the kiosk to VT 1.
+vt = 1
+
+[default_session]
+# The session greetd runs. For an unattended wall this IS the autologin target (not a text greeter),
+# so the box boots straight into sway with no prompt and no typed password.
+command = "sway"
+user = "kiosk"
