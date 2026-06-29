@@ -19,6 +19,7 @@ import type {
   EnrollmentStatus,
   Geometry,
   Output,
+  Scene,
   Surface,
 } from "@polyptic/protocol";
 
@@ -107,6 +108,20 @@ export interface PersistedVideoWall {
   contentSourceId?: string | null;
 }
 
+/**
+ * Phase 3d — a SCENE row: a named SNAPSHOT of a mural's whole wall. The layout (placements),
+ * grouping (video walls) and content (per screen + per wall) live together in the `snapshot` jsonb,
+ * mirroring the protocol `Scene`'s {placements, walls, screens}. `scheduleAt` is the illustrative
+ * "HH:MM" time — STORED, NOT FIRED — and is null/undefined when unscheduled.
+ */
+export interface PersistedScene {
+  id: string;
+  name: string;
+  muralId: string;
+  snapshot: Pick<Scene, "placements" | "walls" | "screens">;
+  scheduleAt?: string | null;
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -120,6 +135,8 @@ export interface PersistedState {
   videoWalls: PersistedVideoWall[];
   /** Phase 3c — the content library. */
   contentSources: PersistedContentSource[];
+  /** Phase 3d — saved wall snapshots (scenes). */
+  scenes: PersistedScene[];
 }
 
 /**
@@ -171,6 +188,14 @@ export interface Store {
   deleteContentSource(id: string): Promise<void>;
   /** All persisted content sources. */
   listContentSources(): Promise<PersistedContentSource[]>;
+
+  // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
+  /** Insert-or-update a scene row (id + name + mural + snapshot jsonb + schedule_at). */
+  upsertScene(scene: PersistedScene): Promise<void>;
+  /** Delete a scene row. No-op if absent. */
+  deleteScene(id: string): Promise<void>;
+  /** All persisted scenes. */
+  listScenes(): Promise<PersistedScene[]>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

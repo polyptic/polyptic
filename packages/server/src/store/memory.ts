@@ -13,6 +13,7 @@ import type {
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
+  PersistedScene,
   PersistedScreen,
   PersistedState,
   PersistedVideoWall,
@@ -34,6 +35,8 @@ export class MemoryStore implements Store {
   private readonly videoWalls = new Map<string, PersistedVideoWall>();
   /** Keyed by source id — the content library (Phase 3c). */
   private readonly contentSources = new Map<string, PersistedContentSource>();
+  /** Keyed by scene id — saved wall snapshots (Phase 3d). */
+  private readonly scenes = new Map<string, PersistedScene>();
   private revision = 0;
 
   async migrate(): Promise<void> {
@@ -50,6 +53,7 @@ export class MemoryStore implements Store {
       placements: [...this.placements.values()].map(clone),
       videoWalls: [...this.videoWalls.values()].map(clone),
       contentSources: [...this.contentSources.values()].map(clone),
+      scenes: [...this.scenes.values()].map(clone),
     };
   }
 
@@ -142,6 +146,20 @@ export class MemoryStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     return [...this.contentSources.values()].map(clone);
+  }
+
+  // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────
+
+  async upsertScene(scene: PersistedScene): Promise<void> {
+    this.scenes.set(scene.id, clone(scene));
+  }
+
+  async deleteScene(id: string): Promise<void> {
+    this.scenes.delete(id);
+  }
+
+  async listScenes(): Promise<PersistedScene[]> {
+    return [...this.scenes.values()].map(clone);
   }
 
   async close(): Promise<void> {

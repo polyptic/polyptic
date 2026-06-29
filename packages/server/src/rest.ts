@@ -23,6 +23,7 @@ import {
   CombineScreensBody,
   CreateContentSourceBody,
   CreateMuralBody,
+  CreateSceneBody,
   IdentBody,
   PlaceScreenBody,
   RenameMuralBody,
@@ -34,6 +35,7 @@ import {
   SetContentBody,
   Surface,
   UpdateContentSourceBody,
+  UpdateSceneBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
@@ -48,6 +50,7 @@ const MuralParams = z.object({ id: z.string().min(1) });
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
 const ContentSourceParams = z.object({ id: z.string().min(1) });
+const SceneParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
 const DemoWebBody = z.object({ screenId: z.string().min(1), url: z.string().url() });
 const RejectBody = z.object({ reason: z.string().optional() });
@@ -749,5 +752,119 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return { ok: true, sourceId: params.data.id, screens: result.slices.map((s) => s.screenId) };
+  });
+
+  // ── Phase 3d routes (scenes) ──────────────────────────────────────────────────
+  //
+  // A scene is a named SNAPSHOT of a mural's whole wall. Saving/renaming/scheduling/deleting a scene is
+  // registry metadata → those routes broadcast a fresh admin/state (which now carries scenes[]). APPLY
+  // re-lays the wall (split/place/move + combine + content), so it ALSO pushes `server/render` to every
+  // affected member's player (the instant path). The schedule time is illustrative — STORED, NOT FIRED.
+
+  // GET /api/v1/scenes -> Scene[]
+  fastify.get("/api/v1/scenes", async () => control.getScenes());
+
+  // POST /api/v1/scenes  { name, muralId }  -> snapshot the mural's CURRENT wall as a new Scene (201)
+  fastify.post("/api/v1/scenes", async (request, reply) => {
+    const body = CreateSceneBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const scene = await control.snapshotScene(body.data.name, body.data.muralId);
+    if (!scene) {
+      return reply.code(404).send({ error: `unknown mural: ${body.data.muralId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "scene.create",
+        sceneId: scene.id,
+        muralId: scene.muralId,
+        placements: scene.placements.length,
+        walls: scene.walls.length,
+        screens: scene.screens.length,
+      },
+      "scene saved",
+    );
+    broadcaster.broadcast();
+    // Convention: { ok, <resource> } (like murals/walls/sources). api.createScene reads body.scene.
+    return reply.code(201).send({ ok: true, scene });
+  });
+
+  // POST /api/v1/scenes/:id/apply  -> re-apply the scene to its mural; push render to every member
+  fastify.post("/api/v1/scenes/:id/apply", async (request, reply) => {
+    const params = SceneParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.applyScene(params.data.id);
+    if (!result) {
+      return reply.code(404).send({ error: `unknown scene: ${params.data.id}` });
+    }
+
+    // Apply re-laid the wall (split/place/move + combine + content) — push the new slices live.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "scene.apply",
+        sceneId: result.scene.id,
+        muralId: result.scene.muralId,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "scene applied",
+    );
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      sceneId: result.scene.id,
+      revision: control.state.revision,
+      screens: result.slices.map((s) => s.screenId),
+    };
+  });
+
+  // PATCH /api/v1/scenes/:id  { name?, scheduleAt? }  -> rename and/or set illustrative schedule time
+  fastify.patch("/api/v1/scenes/:id", async (request, reply) => {
+    const params = SceneParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = UpdateSceneBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const scene = await control.updateScene(params.data.id, body.data);
+    if (!scene) {
+      return reply.code(404).send({ error: `unknown scene: ${params.data.id}` });
+    }
+
+    fastify.log.info(
+      { event: "scene.update", sceneId: scene.id, name: scene.name, scheduleAt: scene.scheduleAt ?? null },
+      "scene updated",
+    );
+    broadcaster.broadcast();
+    // Convention: { ok, <resource> }. api.updateScene reads body.scene.
+    return reply.send({ ok: true, scene });
+  });
+
+  // DELETE /api/v1/scenes/:id  -> delete a saved scene (does not touch the live wall)
+  fastify.delete("/api/v1/scenes/:id", async (request, reply) => {
+    const params = SceneParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const ok = await control.deleteScene(params.data.id);
+    if (!ok) {
+      return reply.code(404).send({ error: `unknown scene: ${params.data.id}` });
+    }
+
+    fastify.log.info({ event: "scene.delete", sceneId: params.data.id }, "scene deleted");
+    broadcaster.broadcast();
+    return { ok: true, sceneId: params.data.id };
   });
 }

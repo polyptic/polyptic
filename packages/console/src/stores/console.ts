@@ -18,8 +18,10 @@ import type {
   MachineView,
   Mural,
   Placement,
+  Scene,
   ScreenView,
   UpdateContentSourceBody,
+  UpdateSceneBody,
   VideoWall,
 } from "@polyptic/protocol";
 
@@ -86,6 +88,12 @@ export interface ConsoleState {
   videoWalls: VideoWall[];
   /** The content LIBRARY (Phase 3c) — reusable named sources, mirrored from admin/state. */
   contentSources: ContentSource[];
+  /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
+  scenes: Scene[];
+  /** The scene most recently applied this session. The admin/state snapshot does not surface the
+   *  server's DesiredState.activeSceneId, so we track it client-side: set optimistically on apply,
+   *  cleared when its scene is deleted. */
+  activeSceneId: string | null;
   activeMuralId: string | null;
   selectedScreenIds: string[];
   /** A combined surface selected on the canvas (mutually exclusive with selectedScreenIds). */
@@ -108,6 +116,8 @@ export const useConsoleStore = defineStore("console", {
     placements: [],
     videoWalls: [],
     contentSources: [],
+    scenes: [],
+    activeSceneId: null,
     activeMuralId: null,
     selectedScreenIds: [],
     selectedWallId: null,
@@ -268,6 +278,44 @@ export const useConsoleStore = defineStore("console", {
         ? state.contentSources.find((s) => s.id === state.pickedSourceId)
         : undefined;
     },
+
+    // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
+
+    /** The saved scenes belonging to a given mural (a scene is a snapshot of one mural's wall). */
+    scenesForMural(state): (muralId: string) => Scene[] {
+      return (muralId: string) => state.scenes.filter((sc) => sc.muralId === muralId);
+    },
+
+    /** The saved scenes for the currently switched-to mural — what the wall strip & Scenes view show. */
+    activeMuralScenes(state): Scene[] {
+      return state.activeMuralId
+        ? state.scenes.filter((sc) => sc.muralId === state.activeMuralId)
+        : [];
+    },
+
+    sceneById(): (id: string) => Scene | undefined {
+      return (id: string) => this.scenes.find((sc) => sc.id === id);
+    },
+
+    /** The scene most recently applied this session (if it still exists), else undefined. */
+    activeScene(state): Scene | undefined {
+      return state.activeSceneId
+        ? state.scenes.find((sc) => sc.id === state.activeSceneId)
+        : undefined;
+    },
+
+    /** A short "N screens · M walls" summary of what a scene captures, for the list rows. */
+    sceneSummary(): (id: string) => string {
+      return (id: string) => {
+        const scene = this.scenes.find((sc) => sc.id === id);
+        if (!scene) return "";
+        const screenCount = scene.placements.length;
+        const wallCount = scene.walls.length;
+        const parts = [`${screenCount} ${screenCount === 1 ? "screen" : "screens"}`];
+        if (wallCount > 0) parts.push(`${wallCount} ${wallCount === 1 ? "wall" : "walls"}`);
+        return parts.join(" · ");
+      };
+    },
   },
 
   actions: {
@@ -359,6 +407,12 @@ export const useConsoleStore = defineStore("console", {
         this.placements = msg.placements;
         this.videoWalls = msg.videoWalls;
         this.contentSources = msg.contentSources;
+        this.scenes = msg.scenes;
+
+        // Forget an active-scene marker whose scene the server no longer knows (e.g. deleted).
+        if (this.activeSceneId && !this.scenes.some((sc) => sc.id === this.activeSceneId)) {
+          this.activeSceneId = null;
+        }
 
         // Disarm a click-to-assign pick whose source the server no longer knows (e.g. deleted).
         if (this.pickedSourceId && !this.contentSources.some((s) => s.id === this.pickedSourceId)) {
@@ -694,6 +748,91 @@ export const useConsoleStore = defineStore("console", {
       if (!id) return;
       this.setWallContent(wallId, { sourceId: id });
       this.pickedSourceId = null;
+    },
+
+    // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────
+
+    /**
+     * Save the CURRENT wall of a mural as a named scene. The server snapshots the mural's placements,
+     * walls and per-screen/per-wall content; the authoritative admin/state broadcast adds the new
+     * scene to `scenes`. Returns false (without throwing) if the name is blank or the POST fails.
+     */
+    async saveScene(name: string, muralId: string): Promise<boolean> {
+      const trimmed = name.trim();
+      if (!trimmed || !muralId) return false;
+      try {
+        const scene = await api.createScene({ name: trimmed, muralId });
+        // Optimistically mark the freshly-saved scene active until the broadcast lands.
+        if (scene && typeof scene.id === "string") this.activeSceneId = scene.id;
+        return true;
+      } catch (err) {
+        console.error("[console] saveScene failed", err);
+        return false;
+      }
+    },
+
+    /**
+     * Re-apply a saved scene to its mural in one click: the server re-lays the wall (split/place/move),
+     * re-groups the video walls and re-assigns content, then pushes the new slices live (the instant
+     * path — content rides the existing stable-id render path, so an unchanged scene refreshes in
+     * place). We optimistically mark it active; the next admin/state reflects the re-laid wall.
+     */
+    async applyScene(id: string): Promise<void> {
+      const scene = this.scenes.find((sc) => sc.id === id);
+      if (!scene) return;
+      this.activeSceneId = id; // optimistic
+      // Switch the canvas to the scene's mural so the operator watches it re-lay live.
+      if (this.murals.some((m) => m.id === scene.muralId)) this.activeMuralId = scene.muralId;
+      try {
+        await api.applyScene(id);
+      } catch (err) {
+        console.error("[console] applyScene failed", err);
+      }
+    },
+
+    /**
+     * Update a saved scene: rename it and/or set its illustrative schedule time (`scheduleAt` is
+     * "HH:MM", or null to clear). The schedule is STORED, NOT FIRED — it's illustrative only (D24);
+     * nothing in the console or server activates a scene at that time.
+     */
+    async updateScene(id: string, body: UpdateSceneBody): Promise<void> {
+      const scene = this.scenes.find((sc) => sc.id === id);
+      if (scene) {
+        // optimistic patch
+        if (body.name !== undefined) scene.name = body.name;
+        if (body.scheduleAt !== undefined) {
+          scene.scheduleAt = body.scheduleAt === null ? undefined : body.scheduleAt;
+        }
+      }
+      try {
+        await api.updateScene(id, body);
+      } catch (err) {
+        console.error("[console] updateScene failed", err);
+      }
+    },
+
+    /** Convenience: rename a scene (a thin wrapper over updateScene). Ignores a blank name. */
+    async renameSceneTo(id: string, name: string): Promise<void> {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      await this.updateScene(id, { name: trimmed });
+    },
+
+    /** Convenience: set (or clear, with "") a scene's illustrative schedule time. */
+    async scheduleScene(id: string, scheduleAt: string): Promise<void> {
+      const trimmed = scheduleAt.trim();
+      await this.updateScene(id, { scheduleAt: trimmed === "" ? null : trimmed });
+    },
+
+    /** Delete a saved scene. */
+    async deleteScene(id: string): Promise<void> {
+      this.scenes = this.scenes.filter((sc) => sc.id !== id); // optimistic
+      if (this.activeSceneId === id) this.activeSceneId = null;
+      try {
+        await api.deleteScene(id);
+      } catch (err) {
+        console.error("[console] deleteScene failed", err);
+      }
     },
 
     // ── Selection & theme ───────────────────────────────────────────────────────

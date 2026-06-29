@@ -10,14 +10,16 @@ import {
   CombineScreensBody,
   CreateContentSourceBody,
   CreateMuralBody,
+  CreateSceneBody,
   IdentBody,
   PlaceScreenBody,
   RenameMuralBody,
   RenameScreenBody,
   SetContentBody,
   UpdateContentSourceBody,
+  UpdateSceneBody,
 } from "@polyptic/protocol";
-import type { ContentSource } from "@polyptic/protocol";
+import type { ContentSource, Scene } from "@polyptic/protocol";
 
 const BASE = "http://localhost:8080/api/v1";
 
@@ -169,4 +171,37 @@ export function updateContentSource(
 /** DELETE /api/v1/content-sources/:sourceId — remove a source from the library. */
 export function deleteContentSource(sourceId: string): Promise<unknown> {
   return send("DELETE", `/content-sources/${encodeURIComponent(sourceId)}`);
+}
+
+// ── Scenes (Phase 3d) ─────────────────────────────────────────────────────────
+
+/**
+ * POST /api/v1/scenes { name, muralId } — save the CURRENT state of a mural as a new scene. The
+ * server snapshots placements + walls + per-screen/per-wall content itself; the client only names it.
+ */
+export async function createScene(body: CreateSceneBody): Promise<Scene> {
+  const res = await send<{ scene: Scene }>("POST", "/scenes", CreateSceneBody.parse(body));
+  return res.scene;
+}
+
+/**
+ * POST /api/v1/scenes/:sceneId/apply — re-apply a saved scene to its mural (re-lays the wall,
+ * re-groups walls, re-assigns content, sets it active). The server pushes the new slices live.
+ */
+export function applyScene(sceneId: string): Promise<unknown> {
+  return send("POST", `/scenes/${encodeURIComponent(sceneId)}/apply`);
+}
+
+/**
+ * PATCH /api/v1/scenes/:sceneId { name?, scheduleAt? } — rename a scene and/or set its illustrative
+ * schedule time (HH:MM, or null to clear). The time is stored, not fired (illustrative only).
+ */
+export async function updateScene(sceneId: string, body: UpdateSceneBody): Promise<Scene> {
+  const res = await send<{ scene: Scene }>("PATCH", `/scenes/${encodeURIComponent(sceneId)}`, UpdateSceneBody.parse(body));
+  return res.scene;
+}
+
+/** DELETE /api/v1/scenes/:sceneId — delete a saved scene. */
+export function deleteScene(sceneId: string): Promise<unknown> {
+  return send("DELETE", `/scenes/${encodeURIComponent(sceneId)}`);
 }

@@ -16,6 +16,7 @@ import { useConsoleStore } from "../stores/console";
 import { useIdent } from "../components/canvas/useIdent";
 import { kindGlyph, kindLabel, kindColorVar } from "../content";
 import MuralSwitcher from "../components/canvas/MuralSwitcher.vue";
+import SceneStrip from "../components/canvas/SceneStrip.vue";
 import WallCanvas from "../components/canvas/WallCanvas.vue";
 import Inspector from "../components/canvas/Inspector.vue";
 
@@ -64,6 +65,9 @@ function place(id: string) {
   <div class="wall">
     <!-- ── top bar ─────────────────────────────────────────────────────── -->
     <header class="topbar">
+      <!-- Scenes on the LEFT (design v4): apply a saved scene in one click, or save the current wall. -->
+      <SceneStrip />
+      <div class="topbar-divider"></div>
       <MuralSwitcher />
       <div class="spacer"></div>
       <div class="live" :class="{ off: !store.connected }">
@@ -178,6 +182,12 @@ function place(id: string) {
 }
 .spacer {
   flex: 1;
+}
+.topbar-divider {
+  width: 1px;
+  height: 22px;
+  flex: 0 0 auto;
+  background: var(--line);
 }
 .live {
   display: flex;

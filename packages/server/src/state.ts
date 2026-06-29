@@ -25,6 +25,7 @@ import {
   ContentSource,
   DashboardSurface,
   ImageSurface,
+  Scene,
   VideoSurface,
   VideoWall,
   WebSurface,
@@ -39,13 +40,15 @@ import type {
   Mural,
   Output,
   Placement,
+  SceneContent,
   Screen,
   ScreenSlice,
   Surface,
   UpdateContentSourceBody,
+  UpdateSceneBody,
 } from "@polyptic/protocol";
 
-import type { PersistedMachine, Store } from "./store/types";
+import type { PersistedMachine, PersistedScene, Store } from "./store/types";
 
 /** Where players live. The agent points each output's Chromium/browser at this base + ?screen=<id>. */
 const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
@@ -170,7 +173,26 @@ export class ControlPlane {
   /** wallId → the library source it currently spans (only present for library-assigned walls). */
   private readonly wallSourceIds = new Map<string, string>();
 
+  /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
+  private readonly scenes = new Map<string, Scene>();
+  private sceneCounter = 0;
+
   constructor(private readonly store: Store) {}
+
+  /** Project an in-memory Scene onto the storage DTO (layout + grouping + content → `snapshot` jsonb). */
+  private toPersistedScene(scene: Scene): PersistedScene {
+    return {
+      id: scene.id,
+      name: scene.name,
+      muralId: scene.muralId,
+      snapshot: {
+        placements: scene.placements,
+        walls: scene.walls,
+        screens: scene.screens,
+      },
+      scheduleAt: scene.scheduleAt ?? null,
+    };
+  }
 
   /** Project the in-memory machine (+ its side-mapped credential hash) onto the storage DTO. */
   private toPersistedMachine(machine: Machine): PersistedMachine {
@@ -325,6 +347,31 @@ export class ControlPlane {
     for (const [wallId, sid] of this.wallSourceIds) {
       if (!this.contentSources.has(sid)) this.wallSourceIds.delete(wallId);
     }
+
+    // ── Scenes (Phase 3d) ─────────────────────────────────────────────────────
+    for (const ps of persisted.scenes) {
+      // Re-validate at the edge; drop a malformed/legacy row rather than crash the boot.
+      const parsed = Scene.safeParse({
+        id: ps.id,
+        name: ps.name,
+        muralId: ps.muralId,
+        placements: ps.snapshot.placements ?? [],
+        walls: ps.snapshot.walls ?? [],
+        screens: ps.snapshot.screens ?? [],
+        ...(ps.scheduleAt ? { scheduleAt: ps.scheduleAt } : {}),
+      });
+      if (parsed.success) this.scenes.set(parsed.data.id, parsed.data);
+    }
+    // Resume the scene counter past the highest persisted "scene-N" so new ids stay unique.
+    let maxScene = 0;
+    for (const s of this.scenes.values()) {
+      const match = /^scene-(\d+)$/.exec(s.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxScene = Math.max(maxScene, n);
+      }
+    }
+    this.sceneCounter = maxScene;
 
     // Seed a default mural the first time a deployment boots, so the Wall view always has a canvas.
     if (this.murals.size === 0) {
@@ -1304,5 +1351,250 @@ export class ControlPlane {
       if (screen) screens.push(screen);
     }
     return screens;
+  }
+
+  // ── Scenes (Phase 3d) ─────────────────────────────────────────────────────────
+  //
+  // A Scene is a named SNAPSHOT of a mural's WHOLE wall — its layout (placements), grouping (video
+  // walls) and content (per screen + per wall) — re-appliable in one click. It composes the existing
+  // placement / combine / content primitives, so the INSTANT property (stable-id render paths, D5) is
+  // preserved on apply. Content is captured as the ASSIGNMENT (a library `sourceId` or an ad-hoc
+  // `url`), never the resolved surface — so applying a scene re-resolves each source to its CURRENT
+  // url. `scheduleAt` ("HH:MM") is ILLUSTRATIVE: it is stored, NOT fired (D24) — nothing here activates
+  // a scene at that time.
+
+  getScenes(): Scene[] {
+    return [...this.scenes.values()];
+  }
+
+  getScene(id: string): Scene | undefined {
+    return this.scenes.get(id);
+  }
+
+  private nextSceneId(): string {
+    this.sceneCounter += 1;
+    return `scene-${this.sceneCounter}`;
+  }
+
+  /** The renderable URL a surface points at (web/dashboard → `url`, image/video → `src`), if any. */
+  private surfaceUrl(surface: Surface): string | undefined {
+    switch (surface.type) {
+      case "web":
+      case "dashboard":
+        return surface.url;
+      case "image":
+      case "video":
+        return surface.src;
+    }
+  }
+
+  /**
+   * Derive the SceneContent for a single (placed, non-walled) screen from its CURRENT assignment: a
+   * library source → `{sourceId}`; an ad-hoc url (read off its surface) → `{url}`; nothing on air → null.
+   */
+  private deriveScreenContent(screenId: string): SceneContent {
+    const sourceId = this.screenSourceIds.get(screenId);
+    if (sourceId) return { sourceId };
+    const surface = this.state.slices[screenId]?.surfaces[0];
+    if (surface) {
+      const url = this.surfaceUrl(surface);
+      if (url) return { url };
+    }
+    return null;
+  }
+
+  /**
+   * Derive the SceneContent a video wall currently spans: a library source → `{sourceId}`; otherwise
+   * the ad-hoc url read off any member's span surface → `{url}`; nothing on air → null.
+   */
+  private deriveWallContent(wall: VideoWall): SceneContent {
+    const sourceId = this.wallSourceIds.get(wall.id);
+    if (sourceId) return { sourceId };
+    for (const screenId of wall.memberScreenIds) {
+      const surface = this.state.slices[screenId]?.surfaces[0];
+      if (surface) {
+        const url = this.surfaceUrl(surface);
+        if (url) return { url };
+      }
+    }
+    return null;
+  }
+
+  /** Turn a captured SceneContent into a ContentAssignment to feed setScreenContent/setWallContent. */
+  private assignmentFor(content: SceneContent): ContentAssignment | null {
+    if (!content) return null;
+    if (content.sourceId !== undefined) return { sourceId: content.sourceId };
+    if (content.url !== undefined) return { url: content.url };
+    return null;
+  }
+
+  /**
+   * Save the CURRENT state of a mural as a new scene. Captures: every placement on the mural
+   * (layout); every video wall on it with its CURRENT assignment (grouping + content); and every
+   * placed-but-NOT-walled screen with its CURRENT assignment. Write-through. Returns the new scene,
+   * or null if the mural is unknown. Does NOT bump the revision — a scene is registry metadata, not a
+   * render change (the admin/state broadcast carries scenes[]).
+   */
+  async snapshotScene(name: string, muralId: string): Promise<Scene | null> {
+    if (!this.murals.has(muralId)) return null;
+
+    const placementsHere = [...this.placements.values()].filter((p) => p.muralId === muralId);
+    const wallsHere = [...this.videoWalls.values()].filter((w) => w.muralId === muralId);
+    const walledScreenIds = new Set(wallsHere.flatMap((w) => w.memberScreenIds));
+
+    const scenePlacements = placementsHere.map((p) => ({
+      screenId: p.screenId,
+      x: p.x,
+      y: p.y,
+      w: p.w,
+      h: p.h,
+    }));
+
+    const sceneWalls = wallsHere.map((w) => ({
+      memberScreenIds: [...w.memberScreenIds],
+      content: this.deriveWallContent(w),
+    }));
+
+    const sceneScreens = placementsHere
+      .filter((p) => !walledScreenIds.has(p.screenId))
+      .map((p) => ({ screenId: p.screenId, content: this.deriveScreenContent(p.screenId) }));
+
+    const id = this.nextSceneId();
+    const scene = Scene.parse({
+      id,
+      name,
+      muralId,
+      placements: scenePlacements,
+      walls: sceneWalls,
+      screens: sceneScreens,
+    });
+    this.scenes.set(id, scene);
+    await this.store.upsertScene(this.toPersistedScene(scene));
+    return scene;
+  }
+
+  /**
+   * Re-apply a saved scene to its mural in one click, composing existing primitives:
+   *   1. split every existing wall on the mural (back to individual screens);
+   *   2. unplace any screen currently on the mural that the scene does NOT include, then place/move
+   *      every scene placement (a screen that no longer exists is skipped);
+   *   3. recreate the scene's video walls (combineScreens);
+   *   4. assign content — each wall's via setWallContent, each non-walled screen's via setScreenContent
+   *      (a `{sourceId}` whose source was deleted resolves to nothing → leave that target EMPTY rather
+   *      than crash); a captured `null` clears the target so apply is deterministic;
+   *   5. set DesiredState.activeSceneId = scene.id.
+   * Returns the scene + the affected screen slices for the caller to push `server/render` to. Idempotent:
+   * re-applying the active scene is a no-op-ish refresh (content rides the stable-id paths, so unchanged
+   * tiles patch in place). Returns null if the scene — or its mural — is unknown.
+   */
+  async applyScene(sceneId: string): Promise<{ scene: Scene; slices: ScreenSlice[] } | null> {
+    const scene = this.scenes.get(sceneId);
+    if (scene === undefined) return null;
+    const muralId = scene.muralId;
+    if (!this.murals.has(muralId)) return null;
+
+    const touched = new Map<string, ScreenSlice>();
+    const accumulate = (slices: ScreenSlice[]): void => {
+      for (const slice of slices) touched.set(slice.screenId, slice);
+    };
+
+    // 1. Split every existing wall on the mural (clears its members' slices).
+    for (const wall of [...this.videoWalls.values()].filter((w) => w.muralId === muralId)) {
+      const result = await this.splitWall(wall.id);
+      if (result) accumulate(result.slices);
+    }
+
+    // 2. Reconcile placements: unplace screens on the mural the scene omits, then place/move the rest.
+    const wanted = new Set(scene.placements.map((p) => p.screenId));
+    for (const placement of [...this.placements.values()].filter((p) => p.muralId === muralId)) {
+      if (!wanted.has(placement.screenId)) {
+        const result = await this.unplaceScreen(placement.screenId);
+        if (result !== false) accumulate(result.slices);
+      }
+    }
+    for (const sp of scene.placements) {
+      if (!this.getScreen(sp.screenId)) continue; // a screen that no longer exists — skip it
+      await this.placeScreen(sp.screenId, muralId, sp.x, sp.y, sp.w, sp.h);
+    }
+
+    // 3 + 4a. Recreate each wall, then assign its content (skip a wall whose members no longer hold).
+    for (const sceneWall of scene.walls) {
+      const members = sceneWall.memberScreenIds.filter(
+        (id) => this.getScreen(id) && this.placements.get(id)?.muralId === muralId,
+      );
+      if (members.length < 2) continue; // not enough surviving members to re-form the wall
+      const combined = await this.combineScreens(muralId, members);
+      if (!combined.ok) continue;
+      accumulate(combined.slices); // combine clears the members' slices
+
+      const assignment = this.assignmentFor(sceneWall.content);
+      if (assignment) {
+        const result = await this.setWallContent(combined.wall.id, assignment);
+        // A deleted source (unknown-source) / no placements → leave the wall cleared (don't crash).
+        if (result.ok) accumulate(result.slices);
+      }
+    }
+
+    // 4b. Assign each non-walled screen's content (or clear it when the scene captured nothing).
+    for (const sceneScreen of scene.screens) {
+      const screenId = sceneScreen.screenId;
+      if (!this.getScreen(screenId)) continue;
+      if (this.getWallForScreen(screenId)) continue; // ended up a wall member — wall owns its content
+
+      const assignment = this.assignmentFor(sceneScreen.content);
+      if (assignment) {
+        const result = await this.setScreenContent(screenId, assignment);
+        if (result.ok) {
+          accumulate([result.slice]);
+        } else {
+          // A deleted source (or any rejection) → clear the screen so a stale tile never lingers.
+          const cleared = await this.setScreenSurfaces(screenId, []);
+          if (cleared) accumulate([cleared]);
+        }
+      } else {
+        // Captured "nothing on air" — ensure the screen is empty (deterministic apply).
+        const cleared = await this.setScreenSurfaces(screenId, []);
+        if (cleared) accumulate([cleared]);
+      }
+    }
+
+    // 5. Mark the scene active (in-memory desired-state; the console mirrors this on its side).
+    this.state.activeSceneId = scene.id;
+
+    return { scene, slices: [...touched.values()] };
+  }
+
+  /**
+   * Update a saved scene: rename it and/or set its ILLUSTRATIVE schedule time (`scheduleAt` is "HH:MM";
+   * null clears it — STORED, NOT FIRED, D24). Write-through. Does NOT bump the revision (registry
+   * metadata). Returns the updated scene, or null if unknown.
+   */
+  async updateScene(id: string, patch: UpdateSceneBody): Promise<Scene | null> {
+    const existing = this.scenes.get(id);
+    if (existing === undefined) return null;
+
+    const next: Scene = { ...existing };
+    if (patch.name !== undefined) next.name = patch.name;
+    if (patch.scheduleAt !== undefined) {
+      if (patch.scheduleAt === null) delete next.scheduleAt;
+      else next.scheduleAt = patch.scheduleAt;
+    }
+
+    const scene = Scene.parse(next);
+    this.scenes.set(id, scene);
+    await this.store.upsertScene(this.toPersistedScene(scene));
+    return scene;
+  }
+
+  /**
+   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId. Write-through.
+   * Does NOT touch the live wall (a scene is just a saved snapshot). Returns false if unknown.
+   */
+  async deleteScene(id: string): Promise<boolean> {
+    if (!this.scenes.has(id)) return false;
+    this.scenes.delete(id);
+    if (this.state.activeSceneId === id) this.state.activeSceneId = null;
+    await this.store.deleteScene(id);
+    return true;
   }
 }

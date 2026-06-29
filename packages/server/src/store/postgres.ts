@@ -31,6 +31,7 @@ import type {
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
+  PersistedScene,
   PersistedScreen,
   PersistedState,
   PersistedVideoWall,
@@ -94,6 +95,14 @@ interface ContentSourceRow {
   name: string;
   kind: string;
   url: string;
+}
+
+interface SceneRow {
+  id: string;
+  name: string;
+  mural_id: string;
+  snapshot: unknown;
+  schedule_at: string | null;
 }
 
 export class PostgresStore implements Store {
@@ -192,6 +201,17 @@ export class PostgresStore implements Store {
         url  text NOT NULL
       )
     `;
+    // Scenes (Phase 3d). A named SNAPSHOT of a mural's whole wall — layout + grouping + content live
+    // in the `snapshot` jsonb. `schedule_at` is the illustrative "HH:MM" time (stored, NOT fired).
+    await sql`
+      CREATE TABLE IF NOT EXISTS scenes (
+        id          text PRIMARY KEY,
+        name        text NOT NULL,
+        mural_id    text NOT NULL,
+        snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb,
+        schedule_at text
+      )
+    `;
   }
 
   async load(): Promise<PersistedState> {
@@ -205,6 +225,7 @@ export class PostgresStore implements Store {
       placementRows,
       videoWallRows,
       contentSourceRows,
+      sceneRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
@@ -214,6 +235,7 @@ export class PostgresStore implements Store {
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, content_source_id FROM video_walls`,
       sql<ContentSourceRow[]>`SELECT id, name, kind, url FROM content_sources`,
+      sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -282,9 +304,36 @@ export class PostgresStore implements Store {
       return [{ id: row.id, name: row.name, kind: kind.data, url: row.url }];
     });
 
+    const scenes: PersistedScene[] = sceneRows.map((row) => {
+      // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
+      const raw =
+        row.snapshot && typeof row.snapshot === "object" ? (row.snapshot as Record<string, unknown>) : {};
+      return {
+        id: row.id,
+        name: row.name,
+        muralId: row.mural_id,
+        snapshot: {
+          placements: Array.isArray(raw.placements) ? (raw.placements as PersistedScene["snapshot"]["placements"]) : [],
+          walls: Array.isArray(raw.walls) ? (raw.walls as PersistedScene["snapshot"]["walls"]) : [],
+          screens: Array.isArray(raw.screens) ? (raw.screens as PersistedScene["snapshot"]["screens"]) : [],
+        },
+        scheduleAt: row.schedule_at ?? null,
+      };
+    });
+
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
 
-    return { revision, machines, screens, content, murals, placements, videoWalls, contentSources };
+    return {
+      revision,
+      machines,
+      screens,
+      content,
+      murals,
+      placements,
+      videoWalls,
+      contentSources,
+      scenes,
+    };
   }
 
   async upsertMachine(machine: PersistedMachine): Promise<void> {
@@ -485,6 +534,52 @@ export class PostgresStore implements Store {
       const kind = ContentKind.safeParse(row.kind);
       if (!kind.success) return [];
       return [{ id: row.id, name: row.name, kind: kind.data, url: row.url }];
+    });
+  }
+
+  // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────
+
+  async upsertScene(scene: PersistedScene): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO scenes (id, name, mural_id, snapshot, schedule_at)
+      VALUES (
+        ${scene.id},
+        ${scene.name},
+        ${scene.muralId},
+        ${sql.json(scene.snapshot)},
+        ${scene.scheduleAt ?? null}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        name        = EXCLUDED.name,
+        mural_id    = EXCLUDED.mural_id,
+        snapshot    = EXCLUDED.snapshot,
+        schedule_at = EXCLUDED.schedule_at
+    `;
+  }
+
+  async deleteScene(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM scenes WHERE id = ${id}`;
+  }
+
+  async listScenes(): Promise<PersistedScene[]> {
+    const sql = this.sql;
+    const rows = await sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`;
+    return rows.map((row) => {
+      const raw =
+        row.snapshot && typeof row.snapshot === "object" ? (row.snapshot as Record<string, unknown>) : {};
+      return {
+        id: row.id,
+        name: row.name,
+        muralId: row.mural_id,
+        snapshot: {
+          placements: Array.isArray(raw.placements) ? (raw.placements as PersistedScene["snapshot"]["placements"]) : [],
+          walls: Array.isArray(raw.walls) ? (raw.walls as PersistedScene["snapshot"]["walls"]) : [],
+          screens: Array.isArray(raw.screens) ? (raw.screens as PersistedScene["snapshot"]["screens"]) : [],
+        },
+        scheduleAt: row.schedule_at ?? null,
+      };
     });
   }
 
