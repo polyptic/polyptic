@@ -494,6 +494,35 @@ export const UpdateSceneBody = z.object({
 });
 export type UpdateSceneBody = z.infer<typeof UpdateSceneBody>;
 
+// ── Auth + settings (Phase 3f) ───────────────────────────────────────────────
+// Local operator accounts (D29): argon2id password hashing, HTTP-only secure session cookies,
+// login rate-limit/lockout, no plaintext anywhere. OIDC is a later add-on on the same seam.
+
+export const LoginBody = z.object({
+  email: z.string().email(),
+  password: z.string().min(1).max(200),
+});
+export type LoginBody = z.infer<typeof LoginBody>;
+
+/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). */
+export const AuthUser = z.object({ id: z.string(), email: z.string().email() });
+export type AuthUser = z.infer<typeof AuthUser>;
+
+/** Change the current operator's password. */
+export const ChangePasswordBody = z.object({
+  currentPassword: z.string().min(1).max(200),
+  newPassword: z.string().min(8).max(200),
+});
+export type ChangePasswordBody = z.infer<typeof ChangePasswordBody>;
+
+/** Enrollment-token visibility for Settings + the cold-start wizard. `open` mode auto-approves with
+ *  no token; `gated` mode requires the bootstrap token (shown only to a signed-in operator). */
+export const EnrollmentInfo = z.object({
+  mode: z.enum(["open", "gated"]),
+  token: z.string().nullable(),
+});
+export type EnrollmentInfo = z.infer<typeof EnrollmentInfo>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
