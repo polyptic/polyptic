@@ -1,0 +1,19 @@
+{
+  "name": "polyptych",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Generic, self-hostable orchestration for walls of screens and fleets of display kiosks.",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "pnpm -r --filter \"./packages/**\" run build",
+    "typecheck": "pnpm -r --filter \"./packages/**\" run typecheck",
+    "dev": "echo \"see docs/ROADMAP.md — Phase 1 wires this up\" && exit 1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
