@@ -237,6 +237,60 @@ export const ServerToPlayerMessage = z.discriminatedUnion("t", [
 export type ServerToPlayerMessage = z.infer<typeof ServerToPlayerMessage>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Admin channel  (admin UI ↔ server) — registry views + live status
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const ConnectionState = z.enum(["online", "offline"]);
+export type ConnectionState = z.infer<typeof ConnectionState>;
+
+/** A screen plus its live status, denormalized for the admin UI. */
+export const ScreenView = Screen.extend({
+  online: z.boolean(), // is a player currently connected for this screen?
+  revision: z.number().int().nonnegative(), // last revision this screen's player observed
+  surfaceCount: z.number().int().nonnegative(),
+});
+export type ScreenView = z.infer<typeof ScreenView>;
+
+/** A machine plus its screens and live status, denormalized for the admin UI. */
+export const MachineView = z.object({
+  id: z.string(),
+  label: z.string(),
+  agentVersion: z.string().optional(),
+  backend: DisplayBackend.optional(),
+  online: z.boolean(), // is the agent's WS currently connected?
+  lastSeen: z.string().datetime().optional(),
+  screens: z.array(ScreenView),
+});
+export type MachineView = z.infer<typeof MachineView>;
+
+export const AdminHello = z.object({
+  t: z.literal("admin/hello"),
+  protocol: z.literal(PROTOCOL_VERSION),
+});
+export const AdminMessage = z.discriminatedUnion("t", [AdminHello]);
+export type AdminMessage = z.infer<typeof AdminMessage>;
+
+/** Full registry snapshot, pushed to admin clients on connect and on every change. */
+export const ServerToAdminState = z.object({
+  t: z.literal("admin/state"),
+  revision: z.number().int().nonnegative(),
+  machines: z.array(MachineView),
+});
+export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
+export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
+
+// REST bodies — admin actions
+export const RenameScreenBody = z.object({ friendlyName: z.string().min(1).max(64) });
+export type RenameScreenBody = z.infer<typeof RenameScreenBody>;
+
+/** Ident pulse request: flash a screen's friendly name so an operator can map physical panels. */
+export const IdentBody = z.object({
+  on: z.boolean(),
+  ttlMs: z.number().int().positive().optional(), // optional auto-off, for fire-and-forget pulses
+});
+export type IdentBody = z.infer<typeof IdentBody>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 

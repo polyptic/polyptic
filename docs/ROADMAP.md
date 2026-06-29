@@ -2,7 +2,7 @@
 
 The remembered path. Fixed direction, flexible detail. Update the **CURRENT** marker as we go. Phases are sequenced by dependency, not by calendar.
 
-> **CURRENT: Phase 1 ✅ done → entering Phase 2.** Vertical slice runs on bun: change a screen's content via REST → player render pushed in ~4ms over WS, stable-id in-place swap, no reload (verified by an e2e harness, 8/8). Next is the screens-first registry + enrollment + ident.
+> **CURRENT: Phase 1 ✅ done → building Phase 2a.** Vertical slice runs on bun (REST→player render ~4ms over WS, stable-id in-place swap, no reload; e2e 8/8). Now building Phase 2a: a persistent **Postgres** registry + multiple machines + a minimal **Admin UI** + **ident mode**.
 
 ---
 
@@ -18,9 +18,13 @@ The thinnest end-to-end thing that proves the spine and the **instant** property
 - `deploy`: docker-compose Postgres (Phase 2+, unused by the slice); run everything with `bun run dev`.
 **DoD met:** REST change → player render in **~4ms** over WS, **stable-id in-place swap**, no reload. Verified by `scratchpad/harness.ts` (8/8) + typecheck + Vite build. See `docs/DEV.md`. Built in parallel against the locked contract, then cross-reviewed + fixed.
 
-## Phase 2 — Screens-first registry + enrollment + ident
-Real Machine/Output/Screen registry in Postgres. Outbound WSS **enrollment** (bootstrap token → claim → mTLS cert). **Ident mode** (flash friendly name on each output). Multiple screens across multiple machines.
-**DoD:** image-and-enroll a 2nd machine; name its screens via ident; address screens by name.
+## Phase 2a — Registry (Postgres) + multi-machine + Admin UI + ident ◀ CURRENT
+Real Machine/Output/Screen/Scene registry in **PostgreSQL** (dev via `deploy/docker-compose.yml`), behind a `Store` interface (`PostgresStore` default; `MemoryStore` test double). Multiple machines × screens. A minimal **Admin UI** (`packages/admin`): live machines→screens list with connection status, **rename**, and an **ident** button. **Ident mode** flashes a screen's friendly name (the player overlay is already built). Promote the e2e harness into committed `bun test`.
+**DoD:** bring up Postgres + the stack; connect 2 machines; see both machines' screens in the Admin UI; click ident → the player flashes the name; rename a screen → persists across a server restart.
+
+## Phase 2b — Enrollment/claim + mTLS identity
+Outbound-WSS **enrollment**: agent dials with a one-time bootstrap token → appears **pending** → operator **claims/approves** in the Admin UI → durable identity. Harden agent↔server identity to **mTLS** client certs keyed to `/etc/machine-id` (D12).
+**DoD:** a fresh machine shows as pending; approving it admits its screens; an unknown/unapproved machine is rejected.
 
 ## Phase 3 — Layout, scenes, adapters, instant fan-out
 Global virtual-canvas **Layout** (arbitrary regions). Named, versioned **Scenes**. **Admin UI** layout editor + scene switcher. **Typed surfaces** + **content adapters** (web, dashboard/Grafana, image, video). Atomic scene fan-out across all screens.
