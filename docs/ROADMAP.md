@@ -2,7 +2,7 @@
 
 The remembered path. Fixed direction, flexible detail. Update the **CURRENT** marker as we go. Phases are sequenced by dependency, not by calendar.
 
-> **CURRENT: Phase 3a ✅ done → Phase 3b next (Phase 4 building in parallel).** The Vue console (`packages/console`: Vue 3 + Vite + Vue Router + Pinia + **Vue Flow**) + its Wall murals canvas + server murals/placement are built + verified (typecheck green, e2e **28/28**). Console on **:5175** (old SolidJS admin stays on :5174 until 3e). Sub-phases left: **3b** combined surfaces → 3c content library → 3d scenes → 3e machines view + cold-start → 3f sign-in + settings. **Phase 4** (device stack: real sway/x11 backends + `apt install` packaging) is building **in parallel** (independent files) — code-complete pending the UTM-VM visual cold-boot test.
+> **CURRENT: Phase 3b next.** Project **renamed Polyptych → Polyptic** (folder `~/code/polyptic`, `@polyptic/*`, `POLYPTIC_*`, all paths/brand). **Phase 3a ✅** — the Vue console (`packages/console`: Vue 3 + Vite + Vue Router + Pinia + **Vue Flow**) + Wall murals canvas + server murals/placement + the **Polyptic logo**, on **:5175** (old SolidJS admin :5174 until 3e). **Phase 4 ✅ committed (code-complete, pending the UTM-VM visual cold-boot test)** — real sway/x11 backends + `apt install` packaging. Verified: full typecheck green, e2e **28/28**. Sub-phases left: **3b** combined surfaces (player → Vue) → 3c content library → 3d scenes (incl. scenes-left layout) → 3e machines view + cold-start → 3f sign-in (local auth) + settings. Then 5 preview/health/Helm · 6 OIDC · 7 media.
 
 ---
 
