@@ -76,6 +76,18 @@ export type Screen = z.infer<typeof Screen>;
 const SurfaceBase = z.object({
   id: z.string(),
   region: Geometry, // position within the screen
+  /** Video-wall spanning (Phase 3b): when set, this surface shows the sub-rectangle at
+   *  (offsetX,offsetY) of a contentW×contentH content. The player sizes the content to
+   *  contentW×contentH and translates it by -(offsetX,offsetY) so this screen renders only its
+   *  slice of the spanning content. Unset = an ordinary single-screen tile. */
+  span: z
+    .object({
+      contentW: z.number().positive(),
+      contentH: z.number().positive(),
+      offsetX: z.number(),
+      offsetY: z.number(),
+    })
+    .optional(),
 });
 
 export const WebSurface = SurfaceBase.extend({
@@ -325,6 +337,16 @@ export const Placement = z.object({
 });
 export type Placement = z.infer<typeof Placement>;
 
+/** A "combined surface" (video wall): adjacent placed screens combined so one piece of content
+ *  spans across all of them. The combined geometry is the union of the members' placements; each
+ *  member shows its slice (see Surface.span). Split returns them to individual screens. */
+export const VideoWall = z.object({
+  id: z.string(),
+  muralId: z.string(),
+  memberScreenIds: z.array(z.string()).min(2),
+});
+export type VideoWall = z.infer<typeof VideoWall>;
+
 export const AdminHello = z.object({
   t: z.literal("admin/hello"),
   protocol: z.literal(PROTOCOL_VERSION),
@@ -339,6 +361,7 @@ export const ServerToAdminState = z.object({
   machines: z.array(MachineView),
   murals: z.array(Mural), // Phase 3
   placements: z.array(Placement), // Phase 3 — which screen sits where on which mural
+  videoWalls: z.array(VideoWall), // Phase 3b — combined surfaces
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -370,6 +393,18 @@ export const PlaceScreenBody = z.object({
   h: z.number().positive().optional(),
 });
 export type PlaceScreenBody = z.infer<typeof PlaceScreenBody>;
+
+// REST bodies — combined surfaces (Phase 3b)
+export const CombineScreensBody = z.object({
+  muralId: z.string(),
+  memberScreenIds: z.array(z.string()).min(2),
+});
+export type CombineScreensBody = z.infer<typeof CombineScreensBody>;
+
+/** Assign content to a single screen OR a video wall (it spans across members). Ad-hoc web URL for
+ *  now; the reusable content library lands in 3c. */
+export const SetContentBody = z.object({ url: z.string().url() });
+export type SetContentBody = z.infer<typeof SetContentBody>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
