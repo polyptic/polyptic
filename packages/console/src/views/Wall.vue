@@ -100,8 +100,8 @@ function place(id: string) {
         </div>
 
         <div class="tray-hint">
-          Drag a screen onto the canvas, or hit <b>Place</b>. Shift-click several to
-          multi-select.
+          Drag a screen onto the canvas, or hit <b>Place</b>. Shift-click adjacent
+          screens, then <b>Combine</b> them into one surface.
         </div>
       </aside>
 

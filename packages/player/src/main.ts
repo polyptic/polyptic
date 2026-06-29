@@ -1,6 +1,6 @@
-/// <reference types="vite/client" />
-import { render } from "solid-js/web";
-import { Player } from "./Player";
+import { createApp } from "vue";
+
+import App from "./App.vue";
 import "./styles.css";
 
 const root = document.getElementById("root");
@@ -8,4 +8,4 @@ if (!root) {
   throw new Error("Polyptic player: missing #root element");
 }
 
-render(() => <Player />, root);
+createApp(App).mount(root);

@@ -6,13 +6,10 @@
  * backoff + jitter so a control-plane blip or laptop sleep self-heals with no human in the loop.
  *
  * Every inbound frame is parsed at the edge against the shared contract; malformed frames are
- * dropped, never trusted.
+ * dropped, never trusted. This module is framework-agnostic (no Vue) on purpose — the renderer
+ * just feeds its callbacks into reactive state.
  */
-import {
-  PROTOCOL_VERSION,
-  ServerToPlayerMessage,
-  parseMessage,
-} from "@polyptic/protocol";
+import { PROTOCOL_VERSION, ServerToPlayerMessage, parseMessage } from "@polyptic/protocol";
 
 export type ConnState = "connecting" | "open" | "closed";
 

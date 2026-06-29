@@ -14,6 +14,7 @@ import type {
   PersistedPlacement,
   PersistedScreen,
   PersistedState,
+  PersistedVideoWall,
   Store,
 } from "./types";
 
@@ -28,6 +29,8 @@ export class MemoryStore implements Store {
   private readonly murals = new Map<string, PersistedMural>();
   /** Keyed by screenId — a screen is placed on at most one mural at a time. */
   private readonly placements = new Map<string, PersistedPlacement>();
+  /** Keyed by wall id — combined surfaces (Phase 3b). */
+  private readonly videoWalls = new Map<string, PersistedVideoWall>();
   private revision = 0;
 
   async migrate(): Promise<void> {
@@ -42,6 +45,7 @@ export class MemoryStore implements Store {
       content: [...this.content.values()].map(clone),
       murals: [...this.murals.values()].map(clone),
       placements: [...this.placements.values()].map(clone),
+      videoWalls: [...this.videoWalls.values()].map(clone),
     };
   }
 
@@ -78,6 +82,10 @@ export class MemoryStore implements Store {
     for (const [screenId, placement] of this.placements) {
       if (placement.muralId === id) this.placements.delete(screenId);
     }
+    // Drop any video walls on the mural (the control plane also deletes them individually).
+    for (const [wallId, wall] of this.videoWalls) {
+      if (wall.muralId === id) this.videoWalls.delete(wallId);
+    }
   }
 
   async listMurals(): Promise<PersistedMural[]> {
@@ -94,6 +102,20 @@ export class MemoryStore implements Store {
 
   async listPlacements(): Promise<PersistedPlacement[]> {
     return [...this.placements.values()].map(clone);
+  }
+
+  // ── Combined surfaces / video walls (Phase 3b) ──────────────────────────────
+
+  async upsertVideoWall(wall: PersistedVideoWall): Promise<void> {
+    this.videoWalls.set(wall.id, clone(wall));
+  }
+
+  async deleteVideoWall(id: string): Promise<void> {
+    this.videoWalls.delete(id);
+  }
+
+  async listVideoWalls(): Promise<PersistedVideoWall[]> {
+    return [...this.videoWalls.values()].map(clone);
   }
 
   async close(): Promise<void> {

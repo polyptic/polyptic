@@ -18,6 +18,7 @@ export type {
   PersistedPlacement,
   PersistedScreen,
   PersistedState,
+  PersistedVideoWall,
   Store,
 } from "./types";
 export { MemoryStore } from "./memory";

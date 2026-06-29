@@ -15,12 +15,16 @@ import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 
 const store = useConsoleStore();
-const { ident, identMany, isIdenting } = useIdent();
+const { ident, identMany, flash, isIdenting } = useIdent();
 
 const selectedIds = computed(() => store.selectedScreenIds);
 const count = computed(() => selectedIds.value.length);
 
+// A combined surface takes precedence: selecting a wall clears the screen selection.
+const wall = computed(() => store.selectedWall);
+
 const single = computed(() => {
+  if (wall.value) return undefined;
   const id = selectedIds.value[0];
   return count.value === 1 && id ? store.screenById(id) : undefined;
 });
@@ -29,6 +33,53 @@ const members = computed(() =>
     .map((id) => store.screenById(id))
     .filter((s): s is NonNullable<typeof s> => !!s),
 );
+
+// ── combined surface (wall) view ───────────────────────────────────────────
+const wallMembers = computed(() => (wall.value ? store.wallMembers(wall.value.id) : []));
+const wallName = computed(() => (wall.value ? store.wallName(wall.value.id) : ""));
+const wallHasContent = computed(() => (wall.value ? store.wallHasContent(wall.value.id) : false));
+const wallIdenting = computed(() =>
+  wall.value ? wall.value.memberScreenIds.some((id) => isIdenting(id)) : false,
+);
+const wallRes = computed(() => {
+  if (!wall.value) return "—";
+  const b = store.wallBounds(wall.value.id);
+  return b ? `${Math.round(b.w)} × ${Math.round(b.h)}` : "—";
+});
+const wallSurfaceText = computed(() => {
+  const n = wallMembers.value.reduce((sum, m) => sum + (m.screen.surfaceCount ?? 0), 0);
+  return `${n} surface${n === 1 ? "" : "s"} on air`;
+});
+
+const wallUrlDraft = ref("");
+watch(wall, () => {
+  wallUrlDraft.value = "";
+});
+// A just-combined wall carries a temp id until the authoritative admin/state re-points it; spanning
+// content against the temp id would 404, so the Span control is disabled until the real wall arrives.
+const wallPending = computed(() => (wall.value ? wall.value.id.startsWith("wall-pending") : false));
+function submitWallUrl() {
+  if (!wall.value || wallPending.value) return;
+  const u = wallUrlDraft.value.trim();
+  if (!u) return;
+  store.setWallContent(wall.value.id, u);
+  wallUrlDraft.value = "";
+}
+function identWall() {
+  if (!wall.value) return;
+  store.identWall(wall.value.id);
+  flash([...wall.value.memberScreenIds]);
+}
+function splitWall() {
+  if (wall.value) store.split(wall.value.id);
+}
+
+// ── multi-select pre-combine ───────────────────────────────────────────────
+function combine() {
+  const muralId = store.activeMuralId;
+  if (!muralId || count.value < 2) return;
+  store.combine(muralId, [...selectedIds.value]);
+}
 
 // ── rename ─────────────────────────────────────────────────────────────────
 const nameDraft = ref("");
@@ -57,7 +108,7 @@ function submitUrl() {
   if (!s) return;
   const u = urlDraft.value.trim();
   if (!u) return;
-  store.setScreenContentUrl(s.id, u);
+  store.setScreenContent(s.id, u);
   urlDraft.value = "";
 }
 
@@ -114,8 +165,62 @@ function selectOne(id: string) {
 
 <template>
   <div class="inspector">
+    <!-- ── COMBINED SURFACE (video wall) ──────────────────────────────── -->
+    <section v-if="wall" class="pad">
+      <div class="group-head">▦ Combined surface</div>
+      <div class="group-name">{{ wallName }}</div>
+
+      <div class="group-actions">
+        <button class="ident-btn flex" :class="{ on: wallIdenting }" @click="identWall">
+          <span class="dot accent"></span>{{ wallIdenting ? "Flashing…" : "Ident all" }}
+        </button>
+        <button class="split-btn" @click="splitWall">Split</button>
+      </div>
+
+      <div class="section-label">Content · spans whole surface</div>
+      <div v-if="wallHasContent" class="content-card">
+        <span class="thumb seamed">
+          <span class="seam-v" style="left: 33%"></span>
+          <span class="seam-v" style="left: 66%"></span>
+          <span class="seam-h"></span>
+        </span>
+        <span class="content-meta">
+          <span class="content-name">On air</span>
+          <span class="content-kind">{{ wallSurfaceText }}</span>
+        </span>
+      </div>
+      <div v-else class="content-empty">No content yet — spans across</div>
+
+      <div class="url-field">
+        <input
+          v-model="wallUrlDraft"
+          class="url-input"
+          placeholder="https://…"
+          :disabled="wallPending"
+          @keyup.enter="submitWallUrl"
+        />
+        <button class="url-btn" :disabled="!wallUrlDraft.trim() || wallPending" @click="submitWallUrl">
+          Span
+        </button>
+      </div>
+      <div class="hint">Content spans across every panel, with bezel seams shown.</div>
+
+      <div class="panels-head">
+        <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
+        <span class="panels-res">{{ wallRes }}</span>
+      </div>
+      <div class="member-list">
+        <div v-for="m in wallMembers" :key="m.screen.id" class="member static">
+          <span class="dot" :style="{ background: m.screen.online ? 'var(--ok)' : 'var(--bad)' }"></span>
+          <span class="member-name">{{ m.screen.friendlyName }}</span>
+          <span class="spacer"></span>
+          <span class="member-kind">{{ m.screen.connector }}</span>
+        </div>
+      </div>
+    </section>
+
     <!-- ── SINGLE ─────────────────────────────────────────────────────── -->
-    <section v-if="single" class="pad">
+    <section v-else-if="single" class="pad">
       <div class="section-label">Screen</div>
       <input
         v-model="nameDraft"
@@ -165,14 +270,17 @@ function selectOne(id: string) {
       <button class="unplace-btn" @click="unplace">Remove from wall</button>
     </section>
 
-    <!-- ── MULTI ──────────────────────────────────────────────────────── -->
+    <!-- ── MULTI (pre-combine) ────────────────────────────────────────── -->
     <section v-else-if="count > 1" class="pad">
       <div class="section-label">Selection</div>
       <div class="multi-count">{{ count }} screens selected</div>
 
-      <button class="ident-btn block" @click="identAll">
-        <span class="dot accent"></span>Ident all
-      </button>
+      <div class="group-actions">
+        <button class="combine-btn" @click="combine">▦ Combine into surface</button>
+        <button class="ident-btn shrink" @click="identAll">
+          <span class="dot accent"></span>Ident
+        </button>
+      </div>
 
       <div class="member-list">
         <button
@@ -187,8 +295,8 @@ function selectOne(id: string) {
       </div>
 
       <div class="hint gap-top">
-        Combining several panels into one surface — content spanning across, with
-        bezel seams — lands in Phase 3b.
+        Combining treats these panels as one screen — content spans across all of
+        them, with bezel seams shown.
       </div>
     </section>
 
@@ -476,5 +584,131 @@ function selectOne(id: string) {
   font-size: 11px;
   color: var(--muted2);
   line-height: 1.5;
+}
+
+/* ── combined surface (wall) ── */
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-fg);
+  margin-bottom: 11px;
+}
+.group-name {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.group-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.ident-btn.flex {
+  flex: 1;
+  margin-bottom: 0;
+}
+.ident-btn.shrink {
+  width: auto;
+  flex: 0 0 auto;
+  margin-bottom: 0;
+  padding: 10px 13px;
+}
+.split-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--bad);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  font-family: inherit;
+}
+.split-btn:hover {
+  background: var(--bad-soft);
+}
+.combine-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 10px;
+  border-radius: 8px;
+  border: none;
+  background: var(--primary);
+  color: var(--primary-fg);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+.combine-btn:hover {
+  opacity: 0.92;
+}
+
+.thumb.seamed {
+  position: relative;
+  overflow: hidden;
+}
+.seam-v {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--seam);
+}
+.seam-h {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 100%;
+  height: 1px;
+  background: var(--seam);
+}
+
+.panels-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 18px;
+  margin-bottom: 10px;
+}
+.section-label.flush {
+  margin-bottom: 0;
+}
+.panels-res {
+  font-size: 11px;
+  color: var(--muted2);
+  font-variant-numeric: tabular-nums;
+}
+.member.static {
+  cursor: default;
+}
+.member.static:hover {
+  background: transparent;
+}
+.member .spacer {
+  flex: 1;
+}
+.member-kind {
+  font-size: 10.5px;
+  color: var(--muted2);
 }
 </style>

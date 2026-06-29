@@ -3,15 +3,17 @@
  *
  * Every outgoing body is validated against the shared contract's zod schema before it leaves the
  * browser — the same parse-at-the-edge discipline used on the wire (see @polyptic/protocol). The
- * route paths follow the existing server conventions (POST /screens/:id/rename, /ident, /demo/web)
- * extended for Phase 3 murals & placement.
+ * route paths follow the existing server conventions (POST /screens/:id/rename, /ident) extended for
+ * Phase 3 murals & placement and Phase 3b combined surfaces (walls + content).
  */
 import {
+  CombineScreensBody,
   CreateMuralBody,
   IdentBody,
   PlaceScreenBody,
   RenameMuralBody,
   RenameScreenBody,
+  SetContentBody,
 } from "@polyptic/protocol";
 
 const BASE = "http://localhost:8080/api/v1";
@@ -95,7 +97,41 @@ export function identScreen(screenId: string, body: IdentBody): Promise<unknown>
   return send("POST", `/screens/${encodeURIComponent(screenId)}/ident`, IdentBody.parse(body));
 }
 
-/** POST /api/v1/demo/web { screenId, url } — assign a single full-canvas web surface. */
-export function setScreenContentUrl(screenId: string, url: string): Promise<unknown> {
-  return send("POST", "/demo/web", { screenId, url });
+/** PUT /api/v1/screens/:screenId/content { url } — point one screen at a single full-canvas web surface. */
+export function setScreenContent(screenId: string, url: string): Promise<unknown> {
+  return send(
+    "PUT",
+    `/screens/${encodeURIComponent(screenId)}/content`,
+    SetContentBody.parse({ url }),
+  );
+}
+
+// ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
+
+/** POST /api/v1/murals/:muralId/walls { muralId, memberScreenIds } — combine ≥2 adjacent screens. */
+export function combineScreens(muralId: string, memberScreenIds: string[]): Promise<unknown> {
+  return send(
+    "POST",
+    `/murals/${encodeURIComponent(muralId)}/walls`,
+    CombineScreensBody.parse({ muralId, memberScreenIds }),
+  );
+}
+
+/** DELETE /api/v1/walls/:wallId — split a combined surface back into individual screens. */
+export function splitWall(wallId: string): Promise<unknown> {
+  return send("DELETE", `/walls/${encodeURIComponent(wallId)}`);
+}
+
+/** PUT /api/v1/walls/:wallId/content { url } — assign content that spans across the whole surface. */
+export function setWallContent(wallId: string, url: string): Promise<unknown> {
+  return send(
+    "PUT",
+    `/walls/${encodeURIComponent(wallId)}/content`,
+    SetContentBody.parse({ url }),
+  );
+}
+
+/** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */
+export function identWall(wallId: string, body: IdentBody): Promise<unknown> {
+  return send("POST", `/walls/${encodeURIComponent(wallId)}/ident`, IdentBody.parse(body));
 }

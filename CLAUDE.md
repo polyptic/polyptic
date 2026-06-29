@@ -26,7 +26,7 @@ Polyptic is a **generic, self-hostable** system to centrally orchestrate **walls
 - **`@polyptic/protocol`** — shared zod contracts. **All cross-process messages are defined and validated here.** Change the contract here first.
 - **`@polyptic/server`** — Fastify + Postgres + `ws`; REST + WebSocket; Prometheus `/metrics`.
 - **`@polyptic/agent`** — Bun single binary; controls host via IPC sockets + child processes; `DisplayBackend` interface (`wayland-sway` | `x11-i3`, auto-detected).
-- **`@polyptic/console`** — Vue 3 + Vite + Vue Router + Pinia + Vue Flow (the operator console; D28). **`@polyptic/player`** — SolidJS + Vite (migrates to Vue at 3b). `@polyptic/admin` (SolidJS) — legacy, retired by 3e.
+- **`@polyptic/console`** — Vue 3 + Vite + Vue Router + Pinia + Vue Flow (the operator console; D28). **`@polyptic/player`** — Vue 3 + Vite (migrated from SolidJS at 3b; renders span slices for video walls). `@polyptic/admin` (SolidJS) — legacy, retired by 3e.
 
 ## Repo layout
 ```

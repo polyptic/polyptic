@@ -11,7 +11,7 @@
  */
 import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
-import type { MachineView, Mural, Placement, ScreenView } from "@polyptic/protocol";
+import type { MachineView, Mural, Placement, ScreenView, VideoWall } from "@polyptic/protocol";
 
 import * as api from "../api";
 
@@ -32,6 +32,17 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let backoffMs = RECONNECT_MIN_MS;
 let stopped = false;
 
+// When a Combine round-trips, the server assigns the real wall id; we remember the optimistic
+// member set so the next authoritative broadcast can re-point `selectedWallId` at the real wall.
+let pendingWallMembers: string[] | null = null;
+
+/** Two membership lists describe the same wall iff they hold the same screen ids (order-insensitive). */
+function sameMembers(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((id) => set.has(id));
+}
+
 function initialTheme(): "light" | "dark" {
   try {
     const saved = localStorage.getItem(THEME_KEY);
@@ -48,12 +59,16 @@ export interface ConsoleState {
   machines: MachineView[];
   murals: Mural[];
   placements: Placement[];
+  videoWalls: VideoWall[];
   activeMuralId: string | null;
   selectedScreenIds: string[];
+  /** A combined surface selected on the canvas (mutually exclusive with selectedScreenIds). */
+  selectedWallId: string | null;
   theme: "light" | "dark";
 }
 
 type PlacedEntry = { screen: ScreenView; placement: Placement };
+type WallBounds = { x: number; y: number; w: number; h: number };
 
 export const useConsoleStore = defineStore("console", {
   state: (): ConsoleState => ({
@@ -62,8 +77,10 @@ export const useConsoleStore = defineStore("console", {
     machines: [],
     murals: [],
     placements: [],
+    videoWalls: [],
     activeMuralId: null,
     selectedScreenIds: [],
+    selectedWallId: null,
     theme: initialTheme(),
   }),
 
@@ -107,6 +124,88 @@ export const useConsoleStore = defineStore("console", {
     machineForScreen(): (screenId: string) => MachineView | undefined {
       return (screenId: string) =>
         this.machines.find((m) => m.screens.some((s) => s.id === screenId));
+    },
+
+    // ── Combined surfaces (video walls, Phase 3b) ─────────────────────────────
+
+    /** The combined surfaces living on a given mural. */
+    wallsForMural(): (muralId: string) => VideoWall[] {
+      return (muralId: string) => this.videoWalls.filter((w) => w.muralId === muralId);
+    },
+
+    /** The combined surface a screen belongs to (if any) — members render inside it, not solo. */
+    wallForScreen(): (screenId: string) => VideoWall | undefined {
+      return (screenId: string) =>
+        this.videoWalls.find((w) => w.memberScreenIds.includes(screenId));
+    },
+
+    wallById(): (wallId: string) => VideoWall | undefined {
+      return (wallId: string) => this.videoWalls.find((w) => w.id === wallId);
+    },
+
+    /** Screens that are NOT a member of any combined surface (the ones drawn as solo tiles). */
+    unwalledScreens(): ScreenView[] {
+      const walled = new Set(this.videoWalls.flatMap((w) => w.memberScreenIds));
+      return this.screens.filter((s) => !walled.has(s.id));
+    },
+
+    /** A wall's member screens paired with their placement geometry (members with no placement
+     *  are skipped — combined surfaces only span *placed* screens). */
+    wallMembers(): (wallId: string) => PlacedEntry[] {
+      return (wallId: string) => {
+        const wall = this.videoWalls.find((w) => w.id === wallId);
+        if (!wall) return [];
+        return wall.memberScreenIds
+          .map((sid): PlacedEntry | null => {
+            const screen = this.screens.find((s) => s.id === sid);
+            const placement = this.placements.find((p) => p.screenId === sid);
+            return screen && placement ? { screen, placement } : null;
+          })
+          .filter((e): e is PlacedEntry => e !== null);
+      };
+    },
+
+    /** The union bounding box of a wall's members (canvas px) — its combined geometry/resolution.
+     *  Matches the server's span math: unionMin/Max over each member's placement. */
+    wallBounds(): (wallId: string) => WallBounds | undefined {
+      return (wallId: string) => {
+        const members = this.wallMembers(wallId);
+        if (members.length === 0) return undefined;
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const { placement: p } of members) {
+          if (p.x < minX) minX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.x + p.w > maxX) maxX = p.x + p.w;
+          if (p.y + p.h > maxY) maxY = p.y + p.h;
+        }
+        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+      };
+    },
+
+    /** A display name for a combined surface. The contract carries no wall name, so we derive one
+     *  from the member screens (e.g. "Nessie + Bertha"). */
+    wallName(): (wallId: string) => string {
+      return (wallId: string) => {
+        const members = this.wallMembers(wallId);
+        if (members.length === 0) return "Combined surface";
+        return members.map((m) => m.screen.friendlyName).join(" + ");
+      };
+    },
+
+    /** Whether any member of the wall currently has a surface on air (the wall is showing content). */
+    wallHasContent(): (wallId: string) => boolean {
+      return (wallId: string) =>
+        this.wallMembers(wallId).some((m) => (m.screen.surfaceCount ?? 0) > 0);
+    },
+
+    /** The currently selected combined surface, if any. */
+    selectedWall(state): VideoWall | undefined {
+      return state.selectedWallId
+        ? state.videoWalls.find((w) => w.id === state.selectedWallId)
+        : undefined;
     },
   },
 
@@ -197,15 +296,40 @@ export const useConsoleStore = defineStore("console", {
         this.machines = msg.machines;
         this.murals = msg.murals;
         this.placements = msg.placements;
+        this.videoWalls = msg.videoWalls;
 
         // Keep the active mural valid (default to the first mural the server knows about).
         if (!this.activeMuralId || !this.murals.some((m) => m.id === this.activeMuralId)) {
           this.activeMuralId = this.murals[0]?.id ?? null;
         }
 
-        // Prune any selection that no longer corresponds to a live screen.
+        // A freshly-combined surface had an optimistic temp id; re-point the selection at the real
+        // wall the server just created (matched by its member set), then drop the pending marker.
+        if (pendingWallMembers) {
+          const real = this.videoWalls.find((w) => sameMembers(w.memberScreenIds, pendingWallMembers!));
+          if (real) {
+            this.selectedWallId = real.id;
+            pendingWallMembers = null;
+          }
+        }
+
+        // Prune any selection that no longer corresponds to a live, un-walled screen; members of a
+        // combined surface are addressed through the wall, not individually.
         const live = new Set(this.machines.flatMap((m) => m.screens.map((s) => s.id)));
-        this.selectedScreenIds = this.selectedScreenIds.filter((id) => live.has(id));
+        const walled = new Set(this.videoWalls.flatMap((w) => w.memberScreenIds));
+        this.selectedScreenIds = this.selectedScreenIds.filter(
+          (id) => live.has(id) && !walled.has(id),
+        );
+
+        // Drop a wall selection that no longer exists (e.g. split elsewhere) unless a combine is
+        // still settling.
+        if (
+          this.selectedWallId &&
+          !pendingWallMembers &&
+          !this.videoWalls.some((w) => w.id === this.selectedWallId)
+        ) {
+          this.selectedWallId = null;
+        }
       }
     },
 
@@ -350,21 +474,96 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Point a screen at a URL (a single full-canvas web surface). */
-    async setScreenContentUrl(screenId: string, url: string): Promise<void> {
+    /** Point a single screen at a URL (a single full-canvas web surface). */
+    async setScreenContent(screenId: string, url: string): Promise<void> {
       const trimmed = url.trim();
       if (!trimmed) return;
       try {
-        await api.setScreenContentUrl(screenId, trimmed);
+        await api.setScreenContent(screenId, trimmed);
       } catch (err) {
-        console.error("[console] setScreenContentUrl failed", err);
+        console.error("[console] setScreenContent failed", err);
+      }
+    },
+
+    // ── Combined surfaces (video walls, Phase 3b) ───────────────────────────────
+
+    /** Combine ≥2 placed screens on a mural into one spanning surface. Optimistically shows the
+     *  combined box immediately (temp id) and selects it; the server's broadcast supplies the real
+     *  wall, which `applyMessage` re-points the selection onto. */
+    async combine(muralId: string, memberScreenIds: string[]): Promise<void> {
+      const members = [...new Set(memberScreenIds)];
+      if (!muralId || members.length < 2) return;
+      // Only combine screens that are actually placed on this mural.
+      const placedHere = members.filter((id) =>
+        this.placements.some((p) => p.screenId === id && p.muralId === muralId),
+      );
+      if (placedHere.length < 2) return;
+
+      const tempId = `wall-pending-${Date.now()}`;
+      this.videoWalls.push({ id: tempId, muralId, memberScreenIds: placedHere });
+      this.selectedScreenIds = [];
+      this.selectedWallId = tempId;
+      pendingWallMembers = [...placedHere];
+
+      try {
+        await api.combineScreens(muralId, placedHere);
+      } catch (err) {
+        // Roll the optimistic surface back.
+        this.videoWalls = this.videoWalls.filter((w) => w.id !== tempId);
+        if (this.selectedWallId === tempId) this.selectedWallId = null;
+        if (pendingWallMembers && sameMembers(pendingWallMembers, placedHere)) {
+          pendingWallMembers = null;
+        }
+        console.error("[console] combine failed", err);
+      }
+    },
+
+    /** Split a combined surface back into its individual screens. */
+    async split(wallId: string): Promise<void> {
+      this.videoWalls = this.videoWalls.filter((w) => w.id !== wallId); // optimistic
+      if (this.selectedWallId === wallId) this.selectedWallId = null;
+      try {
+        await api.splitWall(wallId);
+      } catch (err) {
+        console.error("[console] split failed", err);
+      }
+    },
+
+    /** Assign content (a URL) that spans across the whole combined surface. */
+    async setWallContent(wallId: string, url: string): Promise<void> {
+      const trimmed = url.trim();
+      if (!trimmed) return;
+      // A freshly-combined wall is optimistic until the authoritative admin/state arrives with its real
+      // id; sending content against the temp id would 404 (and be swallowed). Wait for the real wall.
+      if (wallId.startsWith("wall-pending")) return;
+      try {
+        await api.setWallContent(wallId, trimmed);
+      } catch (err) {
+        console.error("[console] setWallContent failed", err);
+      }
+    },
+
+    /** Flash every panel of a combined surface so an operator can map it on the wall. */
+    async identWall(wallId: string): Promise<void> {
+      try {
+        await api.identWall(wallId, { on: true, ttlMs: 3000 });
+      } catch (err) {
+        console.error("[console] identWall failed", err);
       }
     },
 
     // ── Selection & theme ───────────────────────────────────────────────────────
 
+    /** Select zero or more individual screens (clears any combined-surface selection). */
     select(ids: string[]): void {
       this.selectedScreenIds = [...ids];
+      this.selectedWallId = null;
+    },
+
+    /** Select a combined surface (clears any individual-screen selection). */
+    selectWall(wallId: string): void {
+      this.selectedWallId = wallId;
+      this.selectedScreenIds = [];
     },
 
     toggleTheme(): void {

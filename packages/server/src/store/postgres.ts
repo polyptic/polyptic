@@ -25,6 +25,7 @@ import type {
   PersistedPlacement,
   PersistedScreen,
   PersistedState,
+  PersistedVideoWall,
   Store,
 } from "./types";
 
@@ -70,6 +71,12 @@ interface PlacementRow {
   y: number;
   w: number;
   h: number;
+}
+
+interface VideoWallRow {
+  id: string;
+  mural_id: string;
+  member_screen_ids: unknown;
 }
 
 export class PostgresStore implements Store {
@@ -143,11 +150,19 @@ export class PostgresStore implements Store {
         h         double precision NOT NULL
       )
     `;
+    // Combined surfaces / video walls (Phase 3b). Members are stored as a jsonb array of screen ids.
+    await sql`
+      CREATE TABLE IF NOT EXISTS video_walls (
+        id                text PRIMARY KEY,
+        mural_id          text NOT NULL,
+        member_screen_ids jsonb NOT NULL DEFAULT '[]'::jsonb
+      )
+    `;
   }
 
   async load(): Promise<PersistedState> {
     const sql = this.sql;
-    const [machineRows, screenRows, contentRows, metaRows, muralRows, placementRows] =
+    const [machineRows, screenRows, contentRows, metaRows, muralRows, placementRows, videoWallRows] =
       await Promise.all([
         sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
         sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
@@ -155,6 +170,7 @@ export class PostgresStore implements Store {
         sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
         sql<MuralRow[]>`SELECT id, name FROM murals`,
         sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
+        sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids FROM video_walls`,
       ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -205,9 +221,18 @@ export class PostgresStore implements Store {
       h: Number(row.h),
     }));
 
+    const videoWalls: PersistedVideoWall[] = videoWallRows.map((row) => ({
+      id: row.id,
+      muralId: row.mural_id,
+      // jsonb comes back already parsed; keep only string members and degrade gracefully otherwise.
+      memberScreenIds: Array.isArray(row.member_screen_ids)
+        ? row.member_screen_ids.filter((v): v is string => typeof v === "string")
+        : [],
+    }));
+
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
 
-    return { revision, machines, screens, content, murals, placements };
+    return { revision, machines, screens, content, murals, placements, videoWalls };
   }
 
   async upsertMachine(machine: PersistedMachine): Promise<void> {
@@ -283,9 +308,10 @@ export class PostgresStore implements Store {
 
   async deleteMural(id: string): Promise<void> {
     const sql = this.sql;
-    // Drop the mural and any placements that referenced it (defensive — the control plane also
-    // unplaces each screen individually so its in-memory state and broadcasts stay correct).
+    // Drop the mural and any placements/video-walls that referenced it (defensive — the control plane
+    // also unplaces each screen and deletes each wall individually so memory + broadcasts stay correct).
     await sql`DELETE FROM placements WHERE mural_id = ${id}`;
+    await sql`DELETE FROM video_walls WHERE mural_id = ${id}`;
     await sql`DELETE FROM murals WHERE id = ${id}`;
   }
 
@@ -331,6 +357,36 @@ export class PostgresStore implements Store {
       y: Number(row.y),
       w: Number(row.w),
       h: Number(row.h),
+    }));
+  }
+
+  // ── Combined surfaces / video walls (Phase 3b) ──────────────────────────────
+
+  async upsertVideoWall(wall: PersistedVideoWall): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO video_walls (id, mural_id, member_screen_ids)
+      VALUES (${wall.id}, ${wall.muralId}, ${sql.json(wall.memberScreenIds)})
+      ON CONFLICT (id) DO UPDATE SET
+        mural_id          = EXCLUDED.mural_id,
+        member_screen_ids = EXCLUDED.member_screen_ids
+    `;
+  }
+
+  async deleteVideoWall(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM video_walls WHERE id = ${id}`;
+  }
+
+  async listVideoWalls(): Promise<PersistedVideoWall[]> {
+    const sql = this.sql;
+    const rows = await sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids FROM video_walls`;
+    return rows.map((row) => ({
+      id: row.id,
+      muralId: row.mural_id,
+      memberScreenIds: Array.isArray(row.member_screen_ids)
+        ? row.member_screen_ids.filter((v): v is string => typeof v === "string")
+        : [],
     }));
   }
 

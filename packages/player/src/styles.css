@@ -37,12 +37,16 @@ body {
   background: #000;
 }
 
-/* A positioned surface container; the region maths set left/top/width/height. */
+/* A positioned surface container; the region maths set left/top/width/height.
+   overflow:hidden is what clips a video-wall span to this screen's slice. */
 .surface {
   position: absolute;
   overflow: hidden;
 }
 
+/* The content element fills its region by default. For a video-wall span, an INLINE style sets an
+   explicit contentW×contentH px size + a negative translate, overriding these 100% rules so the
+   region reveals only this screen's window onto the spanning content. */
 .surface-frame {
   display: block;
   width: 100%;

@@ -3,19 +3,20 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Per-screen renderer — connects over WS, renders its screen's slice, applies changes via DOM diff (no reload).",
+  "description": "Per-screen renderer (Vue 3) — connects over WS, renders its screen's slice (incl. video-wall spans), applies changes via DOM diff (no reload).",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
     "@polyptic/protocol": "workspace:*",
-    "solid-js": "^1.8.0"
+    "vue": "^3.5.13"
   },
   "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "^5.5.0",
-    "vite": "^5.4.0",
-    "vite-plugin-solid": "^2.10.0"
+    "vite": "^5.4.11",
+    "vue-tsc": "^2.2.0"
   }
 }

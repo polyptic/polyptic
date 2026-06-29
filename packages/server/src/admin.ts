@@ -134,6 +134,7 @@ export function buildAdminState(
     machines,
     murals: control.getMurals(),
     placements: control.getPlacements(),
+    videoWalls: control.getVideoWalls(),
   });
 }
 

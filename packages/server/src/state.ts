@@ -21,7 +21,7 @@
  * registration/approval order. The mapping is stable per (machineId, connector): a reconnecting
  * machine reuses its existing screen ids, and the counter resumes past the highest persisted id.
  */
-import { WebSurface } from "@polyptic/protocol";
+import { VideoWall, WebSurface } from "@polyptic/protocol";
 import type {
   DesiredState,
   DisplayBackend,
@@ -66,6 +66,36 @@ export interface RegisterMachineResult {
   assignments: ScreenAssignment[];
 }
 
+/**
+ * Result of `combineScreens`. On success carries the new wall + the member slices that were cleared
+ * (the caller pushes a `server/render` to each). On failure carries a machine-readable reason the
+ * REST layer maps to an HTTP status (`unknown-*` → 404, `already-combined` → 409, else 400).
+ */
+export type CombineScreensResult =
+  | { ok: true; wall: VideoWall; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error:
+        | "too-few"
+        | "unknown-mural"
+        | "unknown-screen"
+        | "not-placed"
+        | "wrong-mural"
+        | "already-combined";
+      screenId?: string;
+      wallId?: string;
+    };
+
+/** Result of `setWallContent`: the per-member slices to render, or why it could not be computed. */
+export type SetWallContentResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | { ok: false; error: "unknown-wall" | "no-placements" };
+
+/** Result of `setScreenContent`: the new slice, or why the single-screen content was rejected. */
+export type SetScreenContentResult =
+  | { ok: true; slice: ScreenSlice }
+  | { ok: false; error: "unknown-screen" | "wall-member"; wallId?: string };
+
 /** Internal result of ensuring a Screen (+ slice) exists for each of a machine's outputs. */
 interface EnsureScreensResult {
   assignments: ScreenAssignment[];
@@ -93,6 +123,10 @@ export class ControlPlane {
   /** Phase 3 — placements keyed by screenId (a screen is placed on at most one mural at a time). */
   private readonly placements = new Map<string, Placement>();
   private muralCounter = 0;
+
+  /** Phase 3b — combined surfaces (video walls), keyed by wall id. */
+  private readonly videoWalls = new Map<string, VideoWall>();
+  private wallCounter = 0;
 
   constructor(private readonly store: Store) {}
 
@@ -197,6 +231,27 @@ export class ControlPlane {
         h: p.h,
       });
     }
+
+    // ── Combined surfaces / video walls (Phase 3b) ────────────────────────────
+    for (const w of persisted.videoWalls) {
+      // Re-validate at the edge; a wall needs ≥2 members, so drop any malformed/legacy row.
+      const parsed = VideoWall.safeParse({
+        id: w.id,
+        muralId: w.muralId,
+        memberScreenIds: w.memberScreenIds,
+      });
+      if (parsed.success) this.videoWalls.set(parsed.data.id, parsed.data);
+    }
+    // Resume the wall counter past the highest persisted "wall-N" so new ids stay unique.
+    let maxWall = 0;
+    for (const w of this.videoWalls.values()) {
+      const match = /^wall-(\d+)$/.exec(w.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxWall = Math.max(maxWall, n);
+      }
+    }
+    this.wallCounter = maxWall;
 
     // Seed a default mural the first time a deployment boots, so the Wall view always has a canvas.
     if (this.murals.size === 0) {
@@ -575,9 +630,22 @@ export class ControlPlane {
    * so those screens fall back to the unplaced tray. Write-through. Returns false if the mural is
    * unknown.
    */
-  async deleteMural(id: string): Promise<boolean> {
+  async deleteMural(id: string): Promise<{ slices: ScreenSlice[] } | null> {
     const mural = this.murals.get(id);
-    if (mural === undefined) return false;
+    if (mural === undefined) return null;
+
+    // Delete any combined surfaces on this mural first — their members are about to be unplaced, so
+    // the wall (which requires ≥2 placed members) can no longer exist. A wall's span content is
+    // meaningless once the wall is gone, so CLEAR each member's slice (a render change → push). (A
+    // lone placed screen's own content is left as-is, matching how it survives its mural's deletion.)
+    const wallsHere = [...this.videoWalls.values()].filter((w) => w.muralId === id);
+    const memberIds: string[] = [];
+    for (const w of wallsHere) {
+      this.videoWalls.delete(w.id);
+      await this.store.deleteVideoWall(w.id);
+      memberIds.push(...w.memberScreenIds);
+    }
+    const slices = this.clearSlices(memberIds);
 
     const placedHere = [...this.placements.values()].filter((p) => p.muralId === id);
     for (const p of placedHere) {
@@ -587,7 +655,19 @@ export class ControlPlane {
 
     this.murals.delete(id);
     await this.store.deleteMural(id);
-    return true;
+
+    if (slices.length > 0) {
+      this.bumpRevision();
+      for (const slice of slices) {
+        await this.store.upsertContent({
+          screenId: slice.screenId,
+          canvas: slice.canvas,
+          surfaces: slice.surfaces,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+    return { slices };
   }
 
   /**
@@ -623,11 +703,283 @@ export class ControlPlane {
     return placement;
   }
 
-  /** Remove a screen's placement (return it to the unplaced tray). Write-through. False if unplaced. */
-  async unplaceScreen(screenId: string): Promise<boolean> {
+  /**
+   * Remove a screen's placement (return it to the unplaced tray). Write-through. Returns `false` if it
+   * was not placed, otherwise the slices to render. If the screen belonged to a video wall, unplacing
+   * it breaks the combined surface, so the whole wall is DISSOLVED — every member's span slice is
+   * cleared (the operator re-combines what remains) — and those cleared slices are returned to push.
+   */
+  async unplaceScreen(screenId: string): Promise<{ slices: ScreenSlice[] } | false> {
     if (!this.placements.has(screenId)) return false;
     this.placements.delete(screenId);
     await this.store.deletePlacement(screenId);
-    return true;
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall === undefined) return { slices: [] };
+
+    this.videoWalls.delete(wall.id);
+    await this.store.deleteVideoWall(wall.id);
+    const slices = this.clearSlices(wall.memberScreenIds); // includes the just-unplaced screen
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+    return { slices };
+  }
+
+  // ── Combined surfaces / video walls (Phase 3b) ──────────────────────────────
+  //
+  // A video wall combines ≥2 adjacent placed screens on one mural into a single logical surface that
+  // one piece of content SPANS across (each member renders its slice — see Surface.span + THE SPAN
+  // MATH). Combining and splitting both CLEAR the members' slices (a render change → bump + push);
+  // setting wall content recomputes the union bounding box and gives each member one web surface with
+  // a span. Membership is exclusive: a screen belongs to at most one wall, and a wall member cannot
+  // also carry single-screen content.
+
+  getVideoWalls(): VideoWall[] {
+    return [...this.videoWalls.values()];
+  }
+
+  getVideoWall(id: string): VideoWall | undefined {
+    return this.videoWalls.get(id);
+  }
+
+  /** The wall a screen is a member of, if any. */
+  getWallForScreen(screenId: string): VideoWall | undefined {
+    for (const wall of this.videoWalls.values()) {
+      if (wall.memberScreenIds.includes(screenId)) return wall;
+    }
+    return undefined;
+  }
+
+  private nextWallId(): string {
+    this.wallCounter += 1;
+    return `wall-${this.wallCounter}`;
+  }
+
+  /** Clear (empty the surfaces of) each given screen's slice in memory; return the touched slices. */
+  private clearSlices(screenIds: string[]): ScreenSlice[] {
+    const touched: ScreenSlice[] = [];
+    for (const screenId of screenIds) {
+      const slice = this.state.slices[screenId];
+      if (slice === undefined) continue;
+      const next: ScreenSlice = { ...slice, surfaces: [] };
+      this.state.slices[screenId] = next;
+      touched.push(next);
+    }
+    return touched;
+  }
+
+  /**
+   * Combine ≥2 placed screens on a mural into a new video wall. Validates: the mural exists, each
+   * member exists, is placed on THAT mural, and is not already a member of another wall. On success
+   * creates the wall (server-assigned id), clears each member's slice (the wall now owns them; content
+   * is assigned separately), bumps the revision, and writes through. Returns the new wall + the cleared
+   * member slices (the caller pushes a `server/render` to each member). Returns an error result the
+   * REST layer maps to a status code otherwise.
+   */
+  async combineScreens(
+    muralId: string,
+    memberScreenIds: string[],
+  ): Promise<CombineScreensResult> {
+    if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
+
+    // Dedupe while preserving order; a wall needs ≥2 DISTINCT members.
+    const ids = [...new Set(memberScreenIds)];
+    if (ids.length < 2) return { ok: false, error: "too-few" };
+
+    for (const screenId of ids) {
+      if (!this.getScreen(screenId)) {
+        return { ok: false, error: "unknown-screen", screenId };
+      }
+      const placement = this.placements.get(screenId);
+      if (!placement) return { ok: false, error: "not-placed", screenId };
+      if (placement.muralId !== muralId) return { ok: false, error: "wrong-mural", screenId };
+      const existing = this.getWallForScreen(screenId);
+      if (existing) {
+        return { ok: false, error: "already-combined", screenId, wallId: existing.id };
+      }
+    }
+
+    const id = this.nextWallId();
+    const wall = VideoWall.parse({ id, muralId, memberScreenIds: ids });
+    this.videoWalls.set(id, wall);
+    await this.store.upsertVideoWall({
+      id: wall.id,
+      muralId: wall.muralId,
+      memberScreenIds: wall.memberScreenIds,
+    });
+
+    // Combining clears the members' previous (single-screen) content — render change → bump + push.
+    const slices = this.clearSlices(ids);
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    return { ok: true, wall, slices };
+  }
+
+  /**
+   * Split a video wall back into individual screens: delete the wall and clear its members' slices
+   * (render change → bump + push). Write-through. Returns the (now removed) wall + the cleared member
+   * slices, or null if the wall is unknown.
+   */
+  async splitWall(wallId: string): Promise<{ wall: VideoWall; slices: ScreenSlice[] } | null> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return null;
+
+    this.videoWalls.delete(wallId);
+    await this.store.deleteVideoWall(wallId);
+
+    const slices = this.clearSlices(wall.memberScreenIds);
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    return { wall, slices };
+  }
+
+  /**
+   * Assign content (a web URL) to a video wall so it SPANS across the members. Computes the union
+   * bounding box of the members' placements (canvas px) and gives EACH member one web surface whose
+   * region is its full screen and whose `span` slices the contentW×contentH content at the member's
+   * offset — see THE SPAN MATH. The surface id is stable per wall so a content change patches the
+   * player's existing iframe in place (the INSTANT property, D5). Bumps the revision and writes
+   * through. Returns the per-member slices (the caller pushes a `server/render` to each), or an error
+   * if the wall is unknown / none of its members are placed.
+   */
+  async setWallContent(wallId: string, url: string): Promise<SetWallContentResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    // Gather the members still placed on this wall's mural (defensive against later layout edits).
+    const members: { screenId: string; placement: Placement }[] = [];
+    for (const screenId of wall.memberScreenIds) {
+      const placement = this.placements.get(screenId);
+      if (placement && placement.muralId === wall.muralId) members.push({ screenId, placement });
+    }
+    if (members.length === 0) return { ok: false, error: "no-placements" };
+
+    // Union bounding box of the member placements (canvas pixels).
+    let unionMinX = Infinity;
+    let unionMinY = Infinity;
+    let unionMaxX = -Infinity;
+    let unionMaxY = -Infinity;
+    for (const { placement } of members) {
+      unionMinX = Math.min(unionMinX, placement.x);
+      unionMinY = Math.min(unionMinY, placement.y);
+      unionMaxX = Math.max(unionMaxX, placement.x + placement.w);
+      unionMaxY = Math.max(unionMaxY, placement.y + placement.h);
+    }
+    const contentW = unionMaxX - unionMinX;
+    const contentH = unionMaxY - unionMinY;
+
+    const slices: ScreenSlice[] = [];
+    for (const { screenId, placement } of members) {
+      const slice = this.state.slices[screenId];
+      if (slice === undefined) continue;
+      const surface = WebSurface.parse({
+        // Stable per-wall id: consecutive content pushes reconcile to the SAME keyed surface, so the
+        // player mutates the existing <iframe> src/transform in place (no remount) — INSTANT (D5).
+        id: `wall:${wall.id}`,
+        type: "web",
+        region: { x: 0, y: 0, w: placement.w, h: placement.h },
+        url,
+        placement: "iframe",
+        interactive: false,
+        span: {
+          contentW,
+          contentH,
+          offsetX: placement.x - unionMinX,
+          offsetY: placement.y - unionMinY,
+        },
+      });
+      const next: ScreenSlice = { ...slice, surfaces: [surface] };
+      this.state.slices[screenId] = next;
+      slices.push(next);
+    }
+    if (slices.length === 0) return { ok: false, error: "no-placements" };
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    return { ok: true, slices };
+  }
+
+  /**
+   * Assign content (a web URL) to a SINGLE screen: one full-canvas web surface, NO span. Rejected if
+   * the screen is a member of a video wall (combined screens take their content from the wall). The
+   * surface id is stable so repeated assignments patch the player's iframe in place (INSTANT, D5).
+   * Bumps the revision and writes through. Returns the new slice, or an error result.
+   */
+  async setScreenContent(screenId: string, url: string): Promise<SetScreenContentResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slice = this.state.slices[screenId];
+    if (slice === undefined) return { ok: false, error: "unknown-screen" };
+
+    const surface = WebSurface.parse({
+      id: "content-web",
+      type: "web",
+      region: { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
+      url,
+      placement: "iframe",
+      interactive: false,
+    });
+    const next: ScreenSlice = { ...slice, surfaces: [surface] };
+    this.state.slices[screenId] = next;
+    this.bumpRevision();
+
+    await this.store.upsertContent({
+      screenId,
+      canvas: next.canvas,
+      surfaces: next.surfaces,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    return { ok: true, slice: next };
+  }
+
+  /**
+   * The member screens of a video wall (resolved, in membership order). Used by the "ident all" action
+   * to flash every member's friendly name. Returns null if the wall is unknown.
+   */
+  identWall(wallId: string): Screen[] | null {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return null;
+    const screens: Screen[] = [];
+    for (const screenId of wall.memberScreenIds) {
+      const screen = this.getScreen(screenId);
+      if (screen) screens.push(screen);
+    }
+    return screens;
   }
 }

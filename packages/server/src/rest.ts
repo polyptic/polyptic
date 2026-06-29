@@ -20,6 +20,7 @@
 import { z } from "zod";
 
 import {
+  CombineScreensBody,
   CreateMuralBody,
   IdentBody,
   PlaceScreenBody,
@@ -29,6 +30,7 @@ import {
   ServerToAgentRejected,
   ServerToPlayerIdent,
   ServerToPlayerRender,
+  SetContentBody,
   Surface,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
@@ -41,6 +43,8 @@ import type { AdminBroadcaster } from "./admin";
 const ScreenParams = z.object({ screenId: z.string().min(1) });
 const MachineParams = z.object({ machineId: z.string().min(1) });
 const MuralParams = z.object({ id: z.string().min(1) });
+const MuralIdParams = z.object({ muralId: z.string().min(1) });
+const WallParams = z.object({ wallId: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
 const DemoWebBody = z.object({ screenId: z.string().min(1), url: z.string().url() });
 const RejectBody = z.object({ reason: z.string().optional() });
@@ -379,13 +383,15 @@ export function registerRestRoutes(
       return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
     }
 
-    const ok = await control.deleteMural(params.data.id);
-    if (!ok) {
+    const result = await control.deleteMural(params.data.id);
+    if (!result) {
       return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
     }
 
     fastify.log.info({ event: "mural.delete", muralId: params.data.id }, "mural deleted");
     broadcaster.broadcast();
+    // A deleted mural dissolves its video walls — push the cleared slices to those members' players.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
     return { ok: true, muralId: params.data.id };
   });
 
@@ -448,12 +454,203 @@ export function registerRestRoutes(
       return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
     }
 
-    const ok = await control.unplaceScreen(params.data.screenId);
+    const result = await control.unplaceScreen(params.data.screenId);
+    const wasPlaced = result !== false;
     fastify.log.info(
-      { event: "screen.unplace", screenId: params.data.screenId, wasPlaced: ok },
+      { event: "screen.unplace", screenId: params.data.screenId, wasPlaced },
       "screen unplaced",
     );
     broadcaster.broadcast();
-    return { ok: true, screenId: params.data.screenId, wasPlaced: ok };
+    // Unplacing a wall member dissolves the wall — push the cleared slices to all its members' players.
+    if (result !== false) for (const slice of result.slices) pushRender(slice.screenId, slice);
+    return { ok: true, screenId: params.data.screenId, wasPlaced };
+  });
+
+  // ── Phase 3b routes (combined surfaces / video walls) ─────────────────────────
+  //
+  // Combine/split CLEAR the members' slices and setting wall content recomputes spans — all are
+  // render changes, so these routes push `server/render` to every affected member's player (the
+  // instant path) and broadcast a fresh admin/state (which now carries videoWalls[]).
+
+  // GET /api/v1/walls -> VideoWall[]
+  fastify.get("/api/v1/walls", async () => control.getVideoWalls());
+
+  // POST /api/v1/murals/:muralId/walls  { muralId, memberScreenIds }  -> combine into a VideoWall (201)
+  fastify.post("/api/v1/murals/:muralId/walls", async (request, reply) => {
+    const params = MuralIdParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = CombineScreensBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    // The path mural and the body mural must agree (the body carries it per the contract).
+    if (body.data.muralId !== params.data.muralId) {
+      return reply.code(400).send({
+        error: `mural mismatch: path ${params.data.muralId} ≠ body ${body.data.muralId}`,
+      });
+    }
+
+    const result = await control.combineScreens(params.data.muralId, body.data.memberScreenIds);
+    if (!result.ok) {
+      const status =
+        result.error === "unknown-mural" || result.error === "unknown-screen"
+          ? 404
+          : result.error === "already-combined"
+            ? 409
+            : 400;
+      return reply.code(status).send({ error: result.error, screenId: result.screenId, wallId: result.wallId });
+    }
+
+    // Combining clears the members' previous content — push the (now empty) slice to each player.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "wall.combine",
+        wallId: result.wall.id,
+        muralId: result.wall.muralId,
+        members: result.wall.memberScreenIds,
+        revision: control.state.revision,
+      },
+      "screens combined into a video wall",
+    );
+    broadcaster.broadcast();
+    return reply.code(201).send({ ok: true, wall: result.wall, revision: control.state.revision });
+  });
+
+  // DELETE /api/v1/walls/:wallId  -> split the wall back into individual screens
+  fastify.delete("/api/v1/walls/:wallId", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.splitWall(params.data.wallId);
+    if (!result) {
+      return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+    }
+
+    // Splitting clears each member's slice — push the (now empty) slice to each player.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "wall.split",
+        wallId: params.data.wallId,
+        members: result.wall.memberScreenIds,
+        revision: control.state.revision,
+      },
+      "video wall split",
+    );
+    broadcaster.broadcast();
+    return { ok: true, wallId: params.data.wallId, revision: control.state.revision };
+  });
+
+  // PUT /api/v1/walls/:wallId/content  { url }  -> recompute spans + push render to all members
+  fastify.put("/api/v1/walls/:wallId/content", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetContentBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallContent(params.data.wallId, body.data.url);
+    if (!result.ok) {
+      const status = result.error === "unknown-wall" ? 404 : 409;
+      return reply.code(status).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "wall.content",
+        wallId: params.data.wallId,
+        url: body.data.url,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall content set",
+    );
+    broadcaster.broadcast(); // surfaceCount changed
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      revision: control.state.revision,
+      screens: result.slices.map((s) => s.screenId),
+    };
+  });
+
+  // PUT /api/v1/screens/:screenId/content  { url }  -> single-screen web surface (409 if wall member)
+  fastify.put("/api/v1/screens/:screenId/content", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetContentBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenContent(params.data.screenId, body.data.url);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; set content on the wall`,
+          wallId: result.wallId,
+        });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.content",
+        screenId: params.data.screenId,
+        url: body.data.url,
+        revision: control.state.revision,
+      },
+      "screen content set",
+    );
+    pushRender(params.data.screenId, result.slice);
+    broadcaster.broadcast(); // surfaceCount changed
+    return { ok: true, revision: control.state.revision, slice: result.slice };
+  });
+
+  // POST /api/v1/walls/:wallId/ident  { on, ttlMs? }  -> ident-pulse to every member
+  fastify.post("/api/v1/walls/:wallId/ident", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = IdentBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const members = control.identWall(params.data.wallId);
+    if (!members) {
+      return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+    }
+
+    let delivered = 0;
+    for (const screen of members) {
+      delivered += sendIdentPulse(screen, body.data.on);
+      if (body.data.on && body.data.ttlMs) {
+        scheduleIdentOff(screen.id, body.data.ttlMs);
+      }
+    }
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      on: body.data.on,
+      screens: members.map((s) => s.id),
+      delivered,
+    };
   });
 }

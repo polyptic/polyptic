@@ -25,6 +25,7 @@ import type { ScreenView } from "@polyptic/protocol";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 import ScreenNode from "./ScreenNode.vue";
+import WallNode from "./WallNode.vue";
 import SelectionToolbar from "./SelectionToolbar.vue";
 
 /** Canvas-px → display-px. 0.0625 maps a 1920×1080 screen to a 120×67.5 tile. */
@@ -67,20 +68,60 @@ function buildData(screen: ScreenView) {
   };
 }
 
+/** Vue Flow node id for a combined surface (prefixed so it can never collide with a screen id). */
+function wallNodeId(wallId: string): string {
+  return `w:${wallId}`;
+}
+
+function buildWallData(wall: { id: string; memberScreenIds: string[] }, bounds: { x: number; y: number; w: number; h: number }) {
+  const members = store.wallMembers(wall.id);
+  return {
+    wallId: wall.id,
+    name: store.wallName(wall.id),
+    count: wall.memberScreenIds.length,
+    allOnline: members.length > 0 && members.every((m) => !!m.screen.online),
+    selected: store.selectedWallId === wall.id,
+    identing: members.some((m) => identingIds.has(m.screen.id)),
+    hasContent: members.some((m) => (m.screen.surfaceCount ?? 0) > 0),
+    // Member sub-rectangles relative to the union box (canvas px → display px) for the bezel seams.
+    memberRects: members.map((m) => ({
+      id: m.screen.id,
+      x: (m.placement.x - bounds.x) * SCALE,
+      y: (m.placement.y - bounds.y) * SCALE,
+      w: m.placement.w * SCALE,
+      h: m.placement.h * SCALE,
+      online: !!m.screen.online,
+    })),
+  };
+}
+
 /** Reconcile the Vue Flow node list with the store, mutating in place so the
- *  canvas doesn't lose drag/selection state on every server push. */
+ *  canvas doesn't lose drag/selection state on every server push. Combined
+ *  surfaces become "wall" nodes spanning their members' union; the member
+ *  screens themselves are NOT drawn as solo tiles (they render inside the wall). */
 function reconcile() {
   const muralId = store.activeMuralId;
   const placed = muralId ? store.placedScreens(muralId) : [];
-  const wanted = new Map(placed.map((p) => [p.screen.id, p]));
+  const walls = muralId ? store.wallsForMural(muralId) : [];
+  const walledIds = new Set(walls.flatMap((w) => w.memberScreenIds));
 
-  // Drop nodes that are no longer placed on this mural.
+  // Screens drawn as solo tiles = placed screens that aren't members of a combined surface.
+  const soloScreens = placed.filter((p) => !walledIds.has(p.screen.id));
+
+  // Every node id we still want present after this pass.
+  const wantedIds = new Set<string>([
+    ...soloScreens.map((p) => p.screen.id),
+    ...walls.map((w) => wallNodeId(w.id)),
+  ]);
+
+  // Drop nodes that are no longer wanted (unplaced, walled, or a vanished wall).
   for (let i = nodes.value.length - 1; i >= 0; i--) {
     const n = nodes.value[i];
-    if (n && !wanted.has(n.id)) nodes.value.splice(i, 1);
+    if (n && !wantedIds.has(n.id)) nodes.value.splice(i, 1);
   }
 
-  for (const { screen, placement } of placed) {
+  // ── solo screen tiles ──
+  for (const { screen, placement } of soloScreens) {
     const data = buildData(screen);
     const pos = { x: placement.x * SCALE, y: placement.y * SCALE };
     const zIndex = data.identing ? 55 : data.selectedAlone ? 50 : data.selected ? 40 : 10;
@@ -111,6 +152,37 @@ function reconcile() {
       } as Node);
     }
   }
+
+  // ── combined surface boxes ──
+  for (const wall of walls) {
+    const bounds = store.wallBounds(wall.id);
+    if (!bounds) continue;
+    const nid = wallNodeId(wall.id);
+    const data = buildWallData(wall, bounds);
+    const pos = { x: bounds.x * SCALE, y: bounds.y * SCALE };
+    const zIndex = data.identing ? 56 : data.selected ? 46 : 12;
+    const style = {
+      width: `${bounds.w * SCALE}px`,
+      height: `${bounds.h * SCALE}px`,
+      zIndex: String(zIndex),
+    };
+    const existing = nodes.value.find((n) => n.id === nid);
+    if (existing) {
+      existing.data = data;
+      existing.style = style;
+      existing.position = pos;
+    } else {
+      nodes.value.push({
+        id: nid,
+        type: "wall",
+        position: pos,
+        data,
+        style,
+        draggable: false,
+        selectable: true,
+      } as Node);
+    }
+  }
 }
 
 watch(
@@ -118,7 +190,9 @@ watch(
     store.activeMuralId,
     store.placements,
     store.machines,
+    store.videoWalls,
     store.selectedScreenIds,
+    store.selectedWallId,
     [...identingIds],
   ],
   reconcile,
@@ -162,12 +236,20 @@ onNodeDragStop((p: any) => {
   const list = p?.nodes ?? (p?.node ? [p.node] : []);
   for (const n of list) {
     draggingIds.delete(n.id);
+    // Only screen tiles are draggable; combined surfaces (type "wall") are not moved here.
+    if (n.type === "wall") continue;
     store.moveScreen(n.id, Math.round(n.position.x / SCALE), Math.round(n.position.y / SCALE));
   }
 });
 
 onNodeClick((p: any) => {
-  const id = p.node.id as string;
+  const node = p.node;
+  // Clicking a combined surface selects the whole wall.
+  if (node?.type === "wall") {
+    store.selectWall(node.data.wallId as string);
+    return;
+  }
+  const id = node.id as string;
   const ev = p.event;
   const shift = !!(ev && (ev.shiftKey || (ev.srcEvent && ev.srcEvent.shiftKey)));
   if (shift) {
@@ -232,6 +314,10 @@ function onDragOver(e: DragEvent) {
 
       <template #node-screen="nodeProps">
         <ScreenNode :id="nodeProps.id" :data="nodeProps.data" />
+      </template>
+
+      <template #node-wall="nodeProps">
+        <WallNode :id="nodeProps.id" :data="nodeProps.data" />
       </template>
     </VueFlow>
 

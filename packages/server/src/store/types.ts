@@ -67,6 +67,16 @@ export interface PersistedPlacement {
   h: number;
 }
 
+/**
+ * A video-wall row (Phase 3b): a "combined surface" — ≥2 adjacent placed screens on one mural that
+ * one piece of content spans across. `memberScreenIds` is stored as jsonb (an array of screen ids).
+ */
+export interface PersistedVideoWall {
+  id: string;
+  muralId: string;
+  memberScreenIds: string[];
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -76,6 +86,8 @@ export interface PersistedState {
   /** Phase 3 — murals and placements. */
   murals: PersistedMural[];
   placements: PersistedPlacement[];
+  /** Phase 3b — combined surfaces (video walls). */
+  videoWalls: PersistedVideoWall[];
 }
 
 /**
@@ -111,6 +123,14 @@ export interface Store {
   deletePlacement(screenId: string): Promise<void>;
   /** All persisted placements. */
   listPlacements(): Promise<PersistedPlacement[]>;
+
+  // ── Combined surfaces / video walls (Phase 3b) ─────────────────────────────
+  /** Insert-or-update a video-wall row (id + mural + member screen ids). */
+  upsertVideoWall(wall: PersistedVideoWall): Promise<void>;
+  /** Delete a video-wall row (split it). No-op if absent. */
+  deleteVideoWall(id: string): Promise<void>;
+  /** All persisted video walls. */
+  listVideoWalls(): Promise<PersistedVideoWall[]>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

@@ -1,8 +1,13 @@
 <!--
-  SelectionToolbar — floating affordance shown when more than one screen is
-  selected on the canvas. For 3a, selection only highlights; *combining*
-  several panels into one surface lands in 3b, so the combine action is shown
-  as a disabled hint. Ident-all is live.
+  SelectionToolbar — the floating affordance over the canvas (docs/design selBar).
+
+  Two shapes, mirroring the design:
+    - multi-select (≥2 loose screens) : "N screens selected" · Ident · ▦ Combine into surface
+    - a combined surface selected      : "▦ {name}"          · Ident · Split
+
+  Combine/Split are live (Phase 3b) and go through the store. Ident flashes the
+  panels: for loose screens via per-screen pulses, for a wall via the single
+  /walls/:id/ident route plus a local flash of its members.
 -->
 <script setup lang="ts">
 import { computed } from "vue";
@@ -10,22 +15,44 @@ import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 
 const store = useConsoleStore();
-const { identMany } = useIdent();
+const { identMany, flash } = useIdent();
 
+const wall = computed(() => store.selectedWall);
 const count = computed(() => store.selectedScreenIds.length);
 
-function identAll() {
-  identMany([...store.selectedScreenIds]);
+// Show for a selected combined surface, or for a multi-screen pre-combine selection.
+const show = computed(() => !!wall.value || count.value > 1);
+
+const label = computed(() =>
+  wall.value ? `▦ ${store.wallName(wall.value.id)}` : `${count.value} screens selected`,
+);
+
+function identSel() {
+  if (wall.value) {
+    store.identWall(wall.value.id);
+    flash([...wall.value.memberScreenIds]);
+  } else {
+    identMany([...store.selectedScreenIds]);
+  }
+}
+
+function groupAction() {
+  if (wall.value) {
+    store.split(wall.value.id);
+  } else if (store.activeMuralId && count.value > 1) {
+    store.combine(store.activeMuralId, [...store.selectedScreenIds]);
+  }
 }
 </script>
 
 <template>
-  <div v-if="count > 1" class="sel-toolbar">
-    <span class="sel-count">{{ count }} screens selected</span>
-    <button class="sel-btn" @click="identAll">
-      <span class="dot"></span>Ident all
+  <div v-if="show" class="sel-toolbar">
+    <span class="sel-count">{{ label }}</span>
+    <button class="sel-btn" @click="identSel">
+      <span class="dot"></span>Ident
     </button>
-    <span class="sel-combine" title="Combining lands in Phase 3b">▦ Combine · 3b</span>
+    <button v-if="wall" class="sel-action split" @click="groupAction">Split</button>
+    <button v-else class="sel-action combine" @click="groupAction">▦ Combine into surface</button>
   </div>
 </template>
 
@@ -41,7 +68,7 @@ function identAll() {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 10px;
-  padding: 6px 8px 6px 12px;
+  padding: 6px 6px 6px 12px;
   box-shadow: var(--shadow-lg);
   z-index: 90;
 }
@@ -50,6 +77,9 @@ function identAll() {
   color: var(--fg2);
   font-weight: 500;
   white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .sel-btn {
   display: flex;
@@ -74,16 +104,31 @@ function identAll() {
   border-radius: 50%;
   background: var(--accent);
 }
-.sel-combine {
+.sel-action {
   display: flex;
   align-items: center;
   padding: 6px 11px;
   border-radius: 7px;
-  background: var(--muted-bg);
-  color: var(--muted2);
   font-size: 12px;
   font-weight: 600;
-  cursor: not-allowed;
+  cursor: pointer;
   white-space: nowrap;
+  font-family: inherit;
+  border: 1px solid transparent;
+}
+.sel-action.combine {
+  background: var(--primary);
+  color: var(--primary-fg);
+}
+.sel-action.combine:hover {
+  opacity: 0.92;
+}
+.sel-action.split {
+  background: var(--surface);
+  border-color: var(--line2);
+  color: var(--bad);
+}
+.sel-action.split:hover {
+  background: var(--bad-soft);
 }
 </style>
