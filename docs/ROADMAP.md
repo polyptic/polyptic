@@ -2,7 +2,7 @@
 
 The remembered path. Fixed direction, flexible detail. Update the **CURRENT** marker as we go. Phases are sequenced by dependency, not by calendar.
 
-> **CURRENT: Phase 1 ✅ done → building Phase 2a.** Vertical slice runs on bun (REST→player render ~4ms over WS, stable-id in-place swap, no reload; e2e 8/8). Now building Phase 2a: a persistent **Postgres** registry + multiple machines + a minimal **Admin UI** + **ident mode**.
+> **CURRENT: Phase 2a ✅ done → Phase 2b next.** Persistent **Postgres** registry, multi-machine, `/admin` channel + Admin UI, and **ident mode** all built + verified: full typecheck (6 pkgs) green, e2e **13/13**, and the persistence DoD proven against real Postgres (a rename survives a server restart). Next: Phase 2b (enrollment/claim + mTLS). **Note (D20):** Phase 3 is reshaped by the "murals" concept — operators drag/snap **screens** (independent of host) into spatial arrangements; a Screen gains a position and a **Mural/Wall** entity is introduced.
 
 ---
 
@@ -18,7 +18,7 @@ The thinnest end-to-end thing that proves the spine and the **instant** property
 - `deploy`: docker-compose Postgres (Phase 2+, unused by the slice); run everything with `bun run dev`.
 **DoD met:** REST change → player render in **~4ms** over WS, **stable-id in-place swap**, no reload. Verified by `scratchpad/harness.ts` (8/8) + typecheck + Vite build. See `docs/DEV.md`. Built in parallel against the locked contract, then cross-reviewed + fixed.
 
-## Phase 2a — Registry (Postgres) + multi-machine + Admin UI + ident ◀ CURRENT
+## Phase 2a — Registry (Postgres) + multi-machine + Admin UI + ident ✅ (done)
 Real Machine/Output/Screen/Scene registry in **PostgreSQL** (dev via `deploy/docker-compose.yml`), behind a `Store` interface (`PostgresStore` default; `MemoryStore` test double). Multiple machines × screens. A minimal **Admin UI** (`packages/admin`): live machines→screens list with connection status, **rename**, and an **ident** button. **Ident mode** flashes a screen's friendly name (the player overlay is already built). Promote the e2e harness into committed `bun test`.
 **DoD:** bring up Postgres + the stack; connect 2 machines; see both machines' screens in the Admin UI; click ident → the player flashes the name; rename a screen → persists across a server restart.
 
@@ -26,9 +26,9 @@ Real Machine/Output/Screen/Scene registry in **PostgreSQL** (dev via `deploy/doc
 Outbound-WSS **enrollment**: agent dials with a one-time bootstrap token → appears **pending** → operator **claims/approves** in the Admin UI → durable identity. Harden agent↔server identity to **mTLS** client certs keyed to `/etc/machine-id` (D12).
 **DoD:** a fresh machine shows as pending; approving it admits its screens; an unknown/unapproved machine is rejected.
 
-## Phase 3 — Layout, scenes, adapters, instant fan-out
-Global virtual-canvas **Layout** (arbitrary regions). Named, versioned **Scenes**. **Admin UI** layout editor + scene switcher. **Typed surfaces** + **content adapters** (web, dashboard/Grafana, image, video). Atomic scene fan-out across all screens.
-**DoD:** drag content onto named screens; save a scene; switch scenes → all screens flip together, instantly.
+## Phase 3 — Murals (spatial canvas) + layout, scenes, adapters, instant fan-out
+**Murals (D20):** the Admin UI's primary workspace is a canvas where operators **drag + snap screens** (independent of host machine) into spatial arrangements. A Screen gains a position/size; introduce a **Mural/Wall** entity = a named, positioned set of screens. Content can **span adjacent screens**. Then: **Typed surfaces** + **content adapters** (web, dashboard/Grafana, image, video), named versioned **Scenes** capturing a whole composition, an **Admin UI** layout/scene editor, and atomic scene fan-out across all screens.
+**DoD:** compose a mural by snapping screens together; assign content (incl. spanning screens); save a scene; switch scenes → all screens flip together, instantly.
 
 ## Phase 4 — Real device stack + zero-click boot
 Ubuntu image: greetd autologin → compositor → systemd-supervised agent + Chromium per output. `DisplayBackend` (`wayland-sway` default, `x11-i3` fallback). Agent as single-file `.deb`. Declarative provisioning (cloud-init/Ansible/image). Crash/restore hardening.

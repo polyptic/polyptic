@@ -15,6 +15,7 @@
     "@fastify/cors": "^9.0.1",
     "@polyptych/protocol": "workspace:*",
     "fastify": "^4.28.0",
+    "postgres": "^3.4.0",
     "ws": "^8.18.0",
     "zod": "^3.23.0"
   },

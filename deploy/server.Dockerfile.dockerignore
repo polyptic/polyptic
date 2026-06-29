@@ -1,0 +1,14 @@
+# Ignore file for deploy/server.Dockerfile (BuildKit reads <dockerfile>.dockerignore).
+# Patterns are relative to the build context root (the repo root).
+# Keep the build context lean and platform-clean: host node_modules are built for
+# the dev OS (e.g. macOS) and must not leak into the linux container — `bun install`
+# regenerates them inside the image.
+**/node_modules
+**/dist
+.git
+.idea
+.vscode
+**/*.log
+deploy
+docs
+README.md

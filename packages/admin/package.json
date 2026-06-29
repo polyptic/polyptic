@@ -1,0 +1,21 @@
+{
+  "name": "@polyptych/admin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Operator-facing admin UI — live registry of machines and screens, with rename and ident controls.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@polyptych/protocol": "workspace:*",
+    "solid-js": "^1.8.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0",
+    "vite-plugin-solid": "^2.10.0"
+  }
+}

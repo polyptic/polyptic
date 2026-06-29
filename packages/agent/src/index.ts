@@ -9,6 +9,12 @@
  *
  * Every inbound frame is parsed at the edge against the `@polyptych/protocol` contract;
  * every outbound frame is validated before it leaves.
+ *
+ * Phase 2a — identity overrides for multi-machine dev demos:
+ *   - `POLYPTYCH_MACHINE_ID` overrides the machine id (else `/etc/machine-id`, else "dev-mac").
+ *   - `POLYPTYCH_CONNECTOR`  overrides the advertised output connector (else "HDMI-1").
+ * Together these let two agents on one box present distinct machine + screen identities,
+ * so the persistent registry and the Admin UI have multiple machines to show.
  */
 import WebSocket from "ws";
 import {
@@ -33,8 +39,8 @@ const HEARTBEAT_MS = 10_000;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 10_000;
 
-/** This machine's outputs. Phase 1 is a single fixed 1080p output. */
-const OUTPUTS: Output[] = [{ connector: "HDMI-1", width: 1920, height: 1080 }];
+/** Default advertised connector when `POLYPTYCH_CONNECTOR` is unset. */
+const DEFAULT_CONNECTOR = "HDMI-1";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -42,8 +48,15 @@ function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] [agent] ${msg}`);
 }
 
-/** Stable machine id from `/etc/machine-id` (Linux); falls back to "dev-mac" elsewhere. */
+/**
+ * Stable machine id. Resolution order:
+ *   1. `POLYPTYCH_MACHINE_ID` env override (multi-machine dev demos),
+ *   2. `/etc/machine-id` (Linux),
+ *   3. "dev-mac" fallback (e.g. macOS dev host).
+ */
 function readMachineId(): string {
+  const override = process.env.POLYPTYCH_MACHINE_ID?.trim();
+  if (override) return override;
   try {
     const id = readFileSync("/etc/machine-id", "utf8").trim();
     if (id) return id;
@@ -51,6 +64,21 @@ function readMachineId(): string {
     // not present (e.g. macOS dev host)
   }
   return "dev-mac";
+}
+
+/**
+ * The advertised connector for this agent's single output. Overridable via
+ * `POLYPTYCH_CONNECTOR` so two agents on one box present distinct screens.
+ * Phase 1/2a remain a single fixed 1080p output.
+ */
+function resolveConnector(): string {
+  const override = process.env.POLYPTYCH_CONNECTOR?.trim();
+  return override && override.length > 0 ? override : DEFAULT_CONNECTOR;
+}
+
+/** This machine's outputs. Phase 2a is a single fixed 1080p output on the resolved connector. */
+function resolveOutputs(connector: string): Output[] {
+  return [{ connector, width: 1920, height: 1080 }];
 }
 
 function readAgentVersion(): string {
@@ -222,7 +250,18 @@ class Agent {
     this.sendStatus();
   }
 
+  /**
+   * Inbound `server/ident` on the agent channel.
+   *
+   * Phase 2a: the VISIBLE ident flash is server → player (`server/ident-pulse`, rendered by
+   * the player overlay), so the agent is not required to act here. We log the frame and, for
+   * Phase 1 continuity, still forward it to the backend (a no-op log under `dev-open`). Any
+   * backend failure is caught and logged — an ident must never crash the reconciler.
+   */
   private async onIdent(msg: IdentMsg): Promise<void> {
+    log(
+      `server/ident received (on=${msg.on}) — visible ident is server→player; no agent action required in Phase 2a`,
+    );
     try {
       await this.backend.ident(msg.on);
     } catch (err) {
@@ -312,12 +351,16 @@ class Agent {
 
 function main(): void {
   const machineId = readMachineId();
+  const connector = resolveConnector();
+  const outputs = resolveOutputs(connector);
   const agentVersion = readAgentVersion();
   const backend = selectBackend();
 
-  log(`polyptych-agent v${agentVersion} · machineId=${machineId} · backend=${backend.id}`);
+  log(
+    `polyptych-agent v${agentVersion} · machineId=${machineId} · connector=${connector} · backend=${backend.id}`,
+  );
 
-  const agent = new Agent(SERVER_URL, machineId, agentVersion, backend, OUTPUTS);
+  const agent = new Agent(SERVER_URL, machineId, agentVersion, backend, outputs);
   agent.start();
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {

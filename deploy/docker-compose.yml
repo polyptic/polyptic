@@ -1,40 +1,73 @@
-# Polyptych — local dev infrastructure
+# Polyptych — dev infrastructure + optional container stack
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 2+ ONLY.  NOT USED BY THE PHASE 1 VERTICAL SLICE.
+# TWO WAYS TO USE THIS FILE
 # ─────────────────────────────────────────────────────────────────────────────
-# The Phase 1 slice (`bun run dev`) holds all desired-state IN MEMORY in
-# @polyptych/server — it needs NO database and does NOT read this file.
 #
-# This Postgres service is scaffolding for Phase 2, when the real
-# Machine/Output/Screen registry + enrollment move into a durable store.
-# Until then it is safe to ignore; you do not need Docker to run the demo.
+# 1. DEV (the normal loop) — Postgres in Docker, everything else on the host:
 #
-# When Phase 2 lands, bring it up with:
-#     docker compose -f deploy/docker-compose.yml up -d
-# and point the server at:
-#     postgres://polyptych:polyptych@localhost:5432/polyptych
+#        bun run db:up      # starts ONLY the `db` service (Postgres 16)
+#        bun run dev        # server :8080 + player :5173 + admin :5174 + agent
+#
+#    The host processes connect to Postgres on localhost:5432 via
+#        DATABASE_URL=postgres://polyptych:polyptych@localhost:5432/polyptych  (the server's default)
+#    Stop Postgres with `bun run db:down` (data survives in the `pgdata` volume; add `-v` to wipe).
+#
+# 2. FULL (container-portable, prod-like) — Postgres AND the server in Docker:
+#
+#        docker compose -f deploy/docker-compose.yml --profile full up
+#
+#    The `server` service lives behind the `full` profile, so plain `up`/`db:up`
+#    never builds it. Under the `full` profile it is built from
+#    deploy/server.Dockerfile, waits for Postgres to be healthy, and reaches the
+#    DB over the compose network at host `db` (not `localhost`). This is the unit
+#    you carry to prod — `docker compose --profile full up -d` brings the whole
+#    control plane up anywhere Docker runs. (player + admin are dev-only Vite apps
+#    and are intentionally not containerised here.)
 
 services:
-  postgres:
+  db:
     image: postgres:16
-    container_name: polyptych-postgres
+    container_name: polyptych-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: polyptych
       POSTGRES_PASSWORD: polyptych
       POSTGRES_DB: polyptych
     ports:
-      # host:container — exposes the DB to the server running on the host.
+      # host:container — exposes the DB to host processes (server/agent) during dev.
       - "5432:5432"
     volumes:
       # Named volume so data survives `docker compose down` (use `down -v` to wipe).
-      - polyptych-pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
+      # `server` waits on this (condition: service_healthy) before it boots.
       test: ["CMD-SHELL", "pg_isready -U polyptych -d polyptych"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  server:
+    # Optional: only built/started under `--profile full`. Container-portable
+    # control plane for prod-like runs. Dev uses `bun run dev` on the host instead.
+    profiles: ["full"]
+    container_name: polyptych-server
+    build:
+      # Context is the repo root (one level up from this compose file) so the
+      # Dockerfile can copy the whole bun workspace.
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Reach Postgres over the compose network — host is the `db` service name.
+      DATABASE_URL: postgres://polyptych:polyptych@db:5432/polyptych
+      PORT: "8080"
+      # Persistent registry (the default); the in-memory store is a test-only double.
+      STORE: postgres
+    ports:
+      - "8080:8080"
+
 volumes:
-  polyptych-pgdata:
+  pgdata:

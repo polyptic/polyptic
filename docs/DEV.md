@@ -1,23 +1,27 @@
 # Polyptych — local development
 
-How to run the **Phase 1 vertical slice** on your dev machine and see the headline
-**instant** property: change a screen's content with one REST call and watch the
-player swap it in place in **< ~150 ms, with no page reload**.
+How to run the **Phase 2a** stack on your dev machine: a persistent **Postgres**
+registry, **multiple machines**, a minimal **Admin UI**, and **ident mode** — on top
+of the Phase 1 headline property (change a screen's content with one REST call and
+watch the player swap it in place in **< ~150 ms, with no page reload**).
 
-The slice runs on **Bun** and keeps all desired-state **in memory** — no Postgres,
-no Docker, no compositor. It works on macOS and Linux as-is.
+Phase 2a adds a real **Store**. The registry (machines, screens incl. `friendlyName`,
+per-screen surfaces) now lives in **PostgreSQL** by default and is loaded on boot, so a
+**rename survives a server restart**. The store is swappable: `STORE=memory` uses an
+in-memory test double (no Docker needed — that's what `bun run test` uses).
+
+Everything runs on **Bun**. Postgres runs in **Docker**. Works on macOS and Linux.
 
 ---
 
 ## Prerequisites
 
 - **Bun ≥ 1.1** — <https://bun.sh> (`curl -fsSL https://bun.sh/install | bash`). Check with `bun --version`.
+- **Docker** (with the Compose plugin) — only to run **Postgres** for dev. Check with `docker compose version`.
 
-> No Node, nvm, pnpm, or tsx needed — Bun installs the deps, runs the TypeScript
-> server/agent natively, and serves the Vite player.
->
-> You do **not** need Docker for Phase 1. `deploy/docker-compose.yml` (Postgres) is
-> Phase 2+ scaffolding and is ignored by the slice.
+> No Node, nvm, pnpm, or tsx needed — Bun installs the deps and runs the TypeScript
+> server/agent/admin natively. Docker is used **only** for the Postgres container;
+> if you set `STORE=memory` you don't need Docker at all (that's the test path).
 
 ---
 
@@ -27,92 +31,172 @@ From the repo root:
 
 ```sh
 bun install
-bun run dev
+bun run db:up      # start Postgres 16 in Docker (named volume `pgdata`)
+bun run dev        # build the contract, then run the whole stack
 ```
 
 `bun run dev` first builds the shared contract (`@polyptych/protocol`) and then starts
-all three processes together under [`concurrently`](https://www.npmjs.com/package/concurrently),
+four processes together under [`concurrently`](https://www.npmjs.com/package/concurrently),
 colour-coded by name:
 
-| name (colour)   | process                 | what it does                                                        |
-| --------------- | ----------------------- | ------------------------------------------------------------------- |
-| `server` (green)  | `@polyptych/server`   | HTTP + WS on **:8080**; holds desired-state in memory; REST API     |
-| `player` (cyan)   | `@polyptych/player`   | Vite dev server on **:5173**; the per-screen renderer (SolidJS)     |
-| `agent`  (yellow) | `@polyptych/agent`    | dials the server, registers one screen, opens the player page       |
+| name (colour)    | process               | what it does                                                              |
+| ---------------- | --------------------- | ------------------------------------------------------------------------- |
+| `server` (green)   | `@polyptych/server` | HTTP + WS on **:8080**; loads the registry from Postgres; REST API + `/admin` |
+| `player` (cyan)    | `@polyptych/player` | Vite dev server on **:5173**; the per-screen renderer (SolidJS)           |
+| `admin`  (magenta) | `@polyptych/admin`  | Vite dev server on **:5174**; the operator Admin UI (SolidJS)             |
+| `agent`  (yellow)  | `@polyptych/agent`  | dials the server, registers one screen, opens the player page             |
 
-Stop everything with **Ctrl-C**.
+Stop the stack with **Ctrl-C**. Postgres keeps running in Docker (that's what makes the
+[persistence check](#the-persistence-check--survives-a-restart) work); stop it with
+`bun run db:down`.
+
+> **Ports:** server `8080`, player `5173`, admin `5174`, Postgres `5432`. If any is busy,
+> free it before you start (the stack has no fallback ports).
 
 ### What to expect
 
-1. **server** logs that it is listening on `:8080`.
+1. **db** (Docker) reports healthy (`pg_isready`); the **server** logs that it is listening
+   on `:8080` after loading the persisted registry.
 2. **agent** connects to `ws://localhost:8080/agent`, sends `agent/hello`, and the
-   server registers the machine and assigns the first screen the id **`screen-1`**
-   (ids are handed out sequentially `screen-1`, `screen-2`, … in registration order;
-   default `friendlyName` is "Screen N").
-3. The agent's **`dev-open`** backend opens the player URL in your default browser
-   (`open` on macOS, `xdg-open` on Linux). **A browser tab opens automatically** at
-   roughly `http://localhost:5173/?screen=screen-1`.
+   server registers the machine and assigns its output the first screen id **`screen-1`**
+   (ids are handed out sequentially `screen-1`, `screen-2`, … **globally across machines**,
+   stable per `(machineId, connector)`; default `friendlyName` is "Screen N").
+3. The agent's **`dev-open`** backend opens the player URL in your default browser, so a
+   tab opens automatically at roughly `http://localhost:5173/?screen=screen-1`.
 4. **player** connects to `ws://localhost:8080/player`, sends `player/hello`, and the
-   server replies with `server/render`. Initially the screen's slice has no surfaces,
-   so you'll see an empty canvas — that's expected.
-
-> **Ports:** server `8080`, player `5173`. If either is busy, free it before
-> `bun run dev` (the slice has no fallback ports).
+   server replies with `server/render`. With no surfaces yet you'll see an empty canvas.
 
 ---
 
-## The demo — prove "instant"
+## Open the Admin UI
 
-With `bun run dev` running, push content to `screen-1` over the convenience REST route.
-This replaces the screen's slice with **one full-canvas web surface** and pushes it
-live to the player:
+Open **<http://localhost:5174>** in a browser.
 
-```sh
-curl -X POST localhost:8080/api/v1/demo/web \
-  -H 'content-type: application/json' \
-  -d '{"screenId":"screen-1","url":"https://example.com"}'
-```
+The Admin UI connects to the server's `/admin` WebSocket channel and shows the live
+registry: each **machine** and its **screens**, with **status dots**:
 
-The player iframes `https://example.com` immediately — no reload.
+- a **machine** dot is green when its agent's WS is connected (online), grey when not;
+- a **screen** dot is green when a player is currently connected for that screen.
 
-Now run it again with a **different** URL and watch the player **swap the content in
-place**, instantly, with no page reload (the demo surface keeps a stable id, so the
-DOM diff just changes the existing iframe's `src`):
-
-```sh
-curl -X POST localhost:8080/api/v1/demo/web \
-  -H 'content-type: application/json' \
-  -d '{"screenId":"screen-1","url":"https://wikipedia.org"}'
-```
-
-That snappy, reload-free swap **is** the Phase 1 headline property.
-
-### Manual fallback
-
-If the browser tab didn't open automatically (e.g. no default handler for `open`/
-`xdg-open`), open the player by hand:
-
-```sh
-open "http://localhost:5173/?screen=screen-1"
-```
-
-(On Linux use `xdg-open`, or just paste the URL into a browser.)
+It updates live — connect or kill an agent/player, rename a screen, push surfaces, and the
+list re-renders immediately (the server broadcasts `admin/state` on every change).
 
 ---
 
-## Other REST routes
+## The ident demo — map a physical panel to its screen identity
 
-All bodies are validated against the `@polyptych/protocol` zod schemas. CORS is
-enabled for the player origin `http://localhost:5173`.
+In the Admin UI, click **Ident** on a screen. The server sends a `server/ident-pulse` to
+that screen's player socket(s), and the **player tab flashes the screen's friendly name**
+as a full-screen overlay (already built into the player). That's how an operator maps a
+physical panel on the wall back to its screen identity.
+
+Equivalent over REST (handy for scripting / the Phase 1-style demo):
+
+```sh
+# Flash screen-1's name for 3 seconds, then auto-off (ttlMs).
+curl -X POST localhost:8080/api/v1/screens/screen-1/ident \
+  -H 'content-type: application/json' \
+  -d '{"on":true,"ttlMs":3000}'
+
+# Or ident every screen on a machine at once:
+curl -X POST localhost:8080/api/v1/machines/dev-mac/ident \
+  -H 'content-type: application/json' \
+  -d '{"on":true,"ttlMs":3000}'
+```
+
+(Without `ttlMs`, send `{"on":false}` yourself to clear the overlay.)
+
+---
+
+## The rename demo
+
+In the Admin UI, rename a screen (e.g. `screen-1` → **"Nessie"**). The new name shows up
+immediately across all admin clients, and it is **persisted** to Postgres.
+
+Equivalent over REST:
+
+```sh
+curl -X POST localhost:8080/api/v1/screens/screen-1/rename \
+  -H 'content-type: application/json' \
+  -d '{"friendlyName":"Nessie"}'
+```
+
+A `404` comes back for an unknown screen id.
+
+---
+
+## The multi-machine demo
+
+The first agent registers as machine `dev-mac` with one output. Start a **second agent**
+in another terminal, posing as a different machine with a different connector:
+
+```sh
+cd packages/agent && POLYPTYCH_MACHINE_ID=machine-b POLYPTYCH_CONNECTOR=HDMI-2 bun run dev
+```
+
+A **second machine** appears in the Admin UI, with its own screen (the next sequential id,
+e.g. `screen-2`). Status dots track each agent independently — kill one and only its
+machine goes grey. Screen ids stay globally sequential and stable per `(machineId, connector)`.
+
+---
+
+## The persistence check — survives a restart
+
+This is the Phase 2a Definition of Done.
+
+1. **Rename** a screen (Admin UI or the rename `curl` above), e.g. `screen-1` → "Nessie".
+2. **Stop the stack** with **Ctrl-C** (this stops the server/player/admin/agent). Leave
+   **Postgres running** — `bun run db:up` started it as a separate Docker container, and
+   its data lives in the `pgdata` volume.
+3. **Restart** with `bun run dev`.
+4. The server reloads the registry from Postgres on boot — the screen is **still "Nessie"**.
+
+The rename outlived the server process because it was written through to Postgres, not just
+held in memory. (To prove it's really the DB: `bun run db:down` then `db:up` keeps the data;
+only `docker compose -f deploy/docker-compose.yml down -v` wipes the volume.)
+
+---
+
+## REST routes
+
+All bodies/params are validated against the `@polyptych/protocol` zod schemas. CORS is
+enabled for the player and admin origins.
+
+### Phase 2a — registry & admin actions
+
+| method & path                                | body                          | effect                                                                 |
+| -------------------------------------------- | ----------------------------- | ---------------------------------------------------------------------- |
+| `GET  /api/v1/machines`                      | —                             | registered `Machine[]`                                                  |
+| `POST /api/v1/screens/:screenId/rename`      | `{ "friendlyName": string }`  | rename + persist + broadcast `admin/state`; `404` unknown screen       |
+| `POST /api/v1/screens/:screenId/ident`       | `{ "on": bool, "ttlMs"? }`    | `server/ident-pulse` to that screen's player(s); auto-off after `ttlMs` |
+| `POST /api/v1/machines/:machineId/ident`     | `{ "on": bool, "ttlMs"? }`    | ident every screen on that machine; `404` unknown machine              |
+
+### Phase 1 — content (the "instant" path, still works)
 
 | method & path                              | body                              | effect                                                            |
 | ------------------------------------------ | --------------------------------- | ----------------------------------------------------------------- |
 | `GET  /api/v1/state`                       | —                                 | the full `DesiredState`                                           |
 | `GET  /api/v1/screens`                     | —                                 | registered `Screen[]`                                             |
 | `POST /api/v1/screens/:screenId/surfaces`  | `{ "surfaces": Surface[] }`       | replace that screen's slice surfaces, bump revision, push render  |
-| `POST /api/v1/demo/web`                    | `{ "screenId", "url" }`           | convenience: one full-canvas web surface (used by the demo above) |
+| `POST /api/v1/demo/web`                    | `{ "screenId", "url" }`           | convenience: one full-canvas web surface (the instant demo)       |
 
-Example with the general route (two side-by-side surfaces on a 1920×1080 canvas):
+### The Phase 1 instant demo (still the headline)
+
+With the stack running, push content to `screen-1` and watch the player swap it in place,
+with **no reload**:
+
+```sh
+curl -X POST localhost:8080/api/v1/demo/web \
+  -H 'content-type: application/json' \
+  -d '{"screenId":"screen-1","url":"https://example.com"}'
+
+# run again with a different URL — the player swaps the iframe src in place, instantly:
+curl -X POST localhost:8080/api/v1/demo/web \
+  -H 'content-type: application/json' \
+  -d '{"screenId":"screen-1","url":"https://wikipedia.org"}'
+```
+
+Two side-by-side surfaces on a 1920×1080 canvas via the general route:
 
 ```sh
 curl -X POST localhost:8080/api/v1/screens/screen-1/surfaces \
@@ -127,25 +211,64 @@ curl -X POST localhost:8080/api/v1/screens/screen-1/surfaces \
   }'
 ```
 
+### Manual fallback
+
+If the player tab didn't open automatically, open it by hand:
+
+```sh
+open "http://localhost:5173/?screen=screen-1"   # Linux: xdg-open, or paste into a browser
+```
+
 ---
 
 ## Configuration
 
-| env var             | default                    | meaning                                                    |
-| ------------------- | -------------------------- | ---------------------------------------------------------- |
-| `PLAYER_BASE_URL`   | `http://localhost:5173`    | base the server uses to build each `playerUrl`             |
-| `POLYPTYCH_BACKEND` | _(auto → `dev-open`)_      | force the agent's display backend (`dev-open` in Phase 1)  |
+| env var                 | default                                                        | meaning                                                        |
+| ----------------------- | ------------------------------------------------------------- | -------------------------------------------------------------- |
+| `STORE`                 | `postgres`                                                     | registry backend: `postgres` (durable) or `memory` (test)      |
+| `DATABASE_URL`          | `postgres://polyptych:polyptych@localhost:5432/polyptych`     | Postgres connection used when `STORE=postgres`                 |
+| `PORT`                  | `8080`                                                         | server HTTP + WS port                                          |
+| `PLAYER_BASE_URL`       | `http://localhost:5173`                                       | base the server uses to build each `playerUrl`                 |
+| `POLYPTYCH_MACHINE_ID`  | `/etc/machine-id` if present, else `dev-mac`                  | the agent's machine identity (used for the multi-machine demo) |
+| `POLYPTYCH_CONNECTOR`   | `HDMI-1`                                                       | the agent's output connector (used for the multi-machine demo) |
+| `POLYPTYCH_BACKEND`     | _(auto → `dev-open`)_                                          | force the agent's display backend                              |
 
-The dev canvas defaults to **1920×1080**. The dev `machineId` is read from
-`/etc/machine-id` if present, else falls back to `dev-mac`.
+The dev canvas defaults to **1920×1080**.
 
 ---
 
-## Phase 1 — Definition of Done
+## Tests
 
-> Change a screen's content via a REST call → the player updates in **< ~150 ms with
-> no page reload** (DOM diff). Demo-able.
+```sh
+bun run test
+```
 
-If the two `curl` calls above swap the player's content instantly without a reload,
-the slice is doing its job. See [`ROADMAP.md`](./ROADMAP.md) for what comes next
-(Phase 2 brings the Postgres registry in `deploy/docker-compose.yml` to life).
+This builds the contract, then runs `bun test`. The tests use the **in-memory** store
+(`STORE=memory`) — **no Docker / Postgres required**. The Postgres path is exercised by
+running the real stack (above) and by the `full` container profile.
+
+---
+
+## Containerised stack (prod-like)
+
+For a container-portable run (Postgres **and** the server in Docker), use the `full`
+compose profile:
+
+```sh
+docker compose -f deploy/docker-compose.yml --profile full up --build
+```
+
+The `server` service is built from `deploy/server.Dockerfile`, waits for Postgres to be
+healthy, and reaches the DB over the compose network at host `db`. Plain `bun run db:up`
+never touches this service — it only starts Postgres for the dev loop. See the comments at
+the top of `deploy/docker-compose.yml`.
+
+---
+
+## Phase 2a — Definition of Done
+
+> Bring up Postgres + the stack; connect **2 machines**; see both machines' screens in the
+> Admin UI; click **ident** → the player flashes the name; **rename** a screen → it
+> **persists across a server restart**.
+
+See [`ROADMAP.md`](./ROADMAP.md) for what comes next (Phase 2b: enrollment/claim + mTLS).
