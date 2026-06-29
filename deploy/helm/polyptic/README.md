@@ -81,6 +81,37 @@ liveness probes and Prometheus scrapers, even with the auth gate on:
 - **Prometheus** scrape annotations for `/metrics` are added to the pod template when
   `metrics.enabled=true` (`prometheus.io/scrape|path|port`).
 
+## Media uploads (Phase 7)
+
+Operators can **upload** images/videos (`POST /api/v1/media`, gated) as well as
+**link** external media URLs (Phase 3c). Uploads are streamed to a **disk volume**
+(Polyptic does **not** use object storage) and served back, **ungated**, from the
+top-level `GET /media/:id` with **HTTP Range** support (so video can seek) — exactly
+like any external content URL, so a player on another host can fetch them without a
+session.
+
+The server reads three env vars (rendered into the ConfigMap):
+
+- `MEDIA_DIR` — where uploads are written. Backed by the media volume below.
+- `MEDIA_PUBLIC_BASE` — absolute base URL prepended to `/media/<id>` when an upload
+  becomes a `ContentSource.url`. **Must be reachable by the players/public wall** —
+  set it to your public origin (normally the same HTTPS host as `playerBaseUrl`).
+- `MEDIA_MAX_BYTES` — max accepted upload size, in bytes (default ~200MB).
+
+`media.persistence.enabled=true` (default) backs `MEDIA_DIR` with a
+**PersistentVolumeClaim** (`templates/pvc.yaml`, annotated `resource-policy: keep` so
+uploads survive `helm uninstall`); set it `false` to use an ephemeral `emptyDir`
+(uploads lost on restart — dev only), or point `media.persistence.existingClaim` at a
+PVC you manage yourself.
+
+```sh
+# Example: 50Gi media PVC on a named StorageClass, public origin set.
+helm install polyptic deploy/helm/polyptic \
+  --set media.publicBase=https://polyptic.example.com \
+  --set media.persistence.size=50Gi \
+  --set media.persistence.storageClass=fast-rwo
+```
+
 ## Database options
 
 | Goal | Settings |
@@ -107,6 +138,11 @@ liveness probes and Prometheus scrapers, even with the auth gate on:
 | `secrets.bootstrapToken` | `""` (OPEN) | Set for gated agent enrollment. |
 | `secrets.adminEmail` / `secrets.adminPassword` | `""` | Seed operator on first boot. |
 | `metrics.enabled` | `true` | Prometheus scrape annotations for `/metrics`. |
+| `media.dir` | `/var/lib/polyptic/media` | `MEDIA_DIR` — upload dir + media volumeMount path. |
+| `media.publicBase` | `https://polyptic.example.com` | `MEDIA_PUBLIC_BASE` — must be player-reachable. |
+| `media.maxBytes` | `209715200` | `MEDIA_MAX_BYTES` — max upload size (~200MB). |
+| `media.persistence.enabled` | `true` | Back `MEDIA_DIR` with a PVC (else ephemeral emptyDir). |
+| `media.persistence.size` / `.storageClass` / `.existingClaim` | `20Gi` / `""` / `""` | Media PVC sizing/class, or bring your own claim. |
 | `postgresql.enabled` | `true` | Bitnami Postgres subchart toggle. |
 | `externalDatabase.url` | `""` | Used when `postgresql.enabled=false`. |
 

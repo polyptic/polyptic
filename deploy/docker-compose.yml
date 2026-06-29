@@ -66,8 +66,28 @@ services:
       PORT: "8080"
       # Persistent registry (the default); the in-memory store is a test-only double.
       STORE: postgres
+      # ── Phase 7 — MEDIA ──────────────────────────────────────────────────────
+      # Uploaded images/videos are streamed to MEDIA_DIR (a mounted DISK VOLUME,
+      # NOT S3/MinIO) and served back over HTTP from GET /media/:id so wall players
+      # on other hosts can fetch them. MEDIA_DIR is the in-container mount path of
+      # the `polyptic-media` named volume below.
+      MEDIA_DIR: /var/lib/polyptic/media
+      # Absolute base URL prepended to /media/<id> when an upload becomes a
+      # ContentSource.url. MUST be reachable by the players/public wall (so in a
+      # real deploy this is your server's public origin, e.g. https://polyptic.example.com).
+      MEDIA_PUBLIC_BASE: http://localhost:8080
+      # Hard upload ceiling, in bytes (streamed; the request is rejected past this).
+      # Default ~200MB.
+      MEDIA_MAX_BYTES: "209715200"
     ports:
       - "8080:8080"
+    volumes:
+      # Named volume for uploaded media; survives `docker compose down`
+      # (use `down -v` to wipe). Mounted at MEDIA_DIR inside the container.
+      - polyptic-media:/var/lib/polyptic/media
 
 volumes:
   pgdata:
+  # Durable store for uploaded images/videos (Phase 7). A plain disk volume —
+  # Polyptic deliberately does NOT depend on object storage.
+  polyptic-media:

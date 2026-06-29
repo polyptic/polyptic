@@ -18,3 +18,10 @@ data:
   {{- if ne (toString .Values.config.captureIntervalMs) "" }}
   CAPTURE_INTERVAL_MS: {{ .Values.config.captureIntervalMs | quote }}
   {{- end }}
+  # ── Phase 7 — MEDIA ─────────────────────────────────────────────────────────
+  # Uploads (POST /api/v1/media) are streamed to MEDIA_DIR (a mounted volume, see
+  # the PVC/volumeMount in deployment.yaml) and served back, ungated, from the
+  # top-level GET /media/:id so players on other hosts can fetch them.
+  MEDIA_DIR: {{ .Values.media.dir | quote }}
+  MEDIA_PUBLIC_BASE: {{ .Values.media.publicBase | quote }}
+  MEDIA_MAX_BYTES: {{ .Values.media.maxBytes | quote }}

@@ -40,10 +40,21 @@ import {
 import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
 
+import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
+
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster } from "./admin";
+import type { MediaStore } from "./media";
+
+/** Phase 7 — where uploaded media lands + how its serve URL is built. Wired from env in index.ts. */
+export interface MediaConfig {
+  /** Absolute public base for the serve route, e.g. http://host:8080 → url `${publicBase}/media/<id>`. */
+  publicBase: string;
+  /** Byte cap enforced on an upload (mirrors the multipart fileSize limit). */
+  maxBytes: number;
+}
 
 const ScreenParams = z.object({ screenId: z.string().min(1) });
 const MachineParams = z.object({ machineId: z.string().min(1) });
@@ -63,6 +74,8 @@ export function registerRestRoutes(
   agentHub: AgentHub,
   broadcaster: AdminBroadcaster,
   capture: CaptureCoordinator,
+  media: MediaStore,
+  mediaConfig: MediaConfig,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -793,6 +806,10 @@ export function registerRestRoutes(
       return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
     }
 
+    // Phase 7 lifecycle: if this source was backed by an uploaded file, unlink it from the disk volume
+    // (a linked / non-uploaded source has nothing on disk → this is a no-op for it).
+    const unlinked = await media.deleteBySourceId(params.data.id);
+
     // Cleared every screen/wall that was showing this source — push the (now empty) slice to each.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
 
@@ -801,12 +818,76 @@ export function registerRestRoutes(
         event: "content-source.delete",
         sourceId: params.data.id,
         screens: result.slices.map((s) => s.screenId),
+        fileUnlinked: unlinked,
         revision: control.state.revision,
       },
       "content source deleted",
     );
     broadcaster.broadcast();
     return { ok: true, sourceId: params.data.id, screens: result.slices.map((s) => s.screenId) };
+  });
+
+  // ── Phase 7 routes (media upload) ─────────────────────────────────────────────
+  //
+  // POST /api/v1/media — GATED (operator only; it lives under /api/v1, behind the session gate). A
+  // multipart upload of ONE image/* or video/* file: stream it to the disk volume (MEDIA_DIR) under a
+  // generated <id>.<ext> (never the client filename), enforce the size cap, then create a Phase-3c
+  // ContentSource {kind, name, url:`${PUBLIC_BASE}/media/<id>`} so it appears in the library + admin/state
+  // and assigns to screens/walls exactly like a linked source. The matching ungated serve route
+  // (GET /media/:id) is registered TOP-LEVEL in index.ts. Returns {ok, source} (the {ok,resource}
+  // convention). 415 for a non-image/video type, 413 when the file exceeds MEDIA_MAX_BYTES.
+  fastify.post("/api/v1/media", async (request, reply) => {
+    let data;
+    try {
+      data = await request.file();
+    } catch (err) {
+      if (isFileTooLargeError(err)) return reply.code(413).send({ error: "file too large" });
+      return reply.code(400).send({ error: "invalid multipart upload" });
+    }
+    if (!data) {
+      return reply.code(400).send({ error: "no file in multipart upload" });
+    }
+
+    const kind = kindForMime(data.mimetype);
+    if (!kind) {
+      // Drain the rejected stream so busboy/the connection isn't left hanging on an unconsumed file.
+      data.file.resume();
+      return reply.code(415).send({ error: `unsupported media type: ${data.mimetype}` });
+    }
+
+    const originalName = data.filename && data.filename.length > 0 ? data.filename : "upload";
+    const providedName = readField(data.fields, "name");
+    const name = (providedName && providedName.trim().length > 0 ? providedName.trim() : originalName)
+      .slice(0, 120);
+
+    let record;
+    try {
+      record = await media.save(data.file, data.mimetype, originalName, mediaConfig.maxBytes);
+    } catch (err) {
+      if (err instanceof MediaTooLargeError || isFileTooLargeError(err)) {
+        return reply.code(413).send({ error: "file too large" });
+      }
+      throw err;
+    }
+
+    const url = `${mediaConfig.publicBase}/media/${record.id}`;
+    const source = await control.createContentSource({ name, kind, url });
+    await media.attachSource(record.id, source.id);
+
+    fastify.log.info(
+      {
+        event: "media.upload",
+        mediaId: record.id,
+        sourceId: source.id,
+        kind,
+        mime: record.mime,
+        size: record.size,
+        name: source.name,
+      },
+      "media uploaded",
+    );
+    broadcaster.broadcast();
+    return reply.code(201).send({ ok: true, source });
   });
 
   // ── Phase 3d routes (scenes) ──────────────────────────────────────────────────

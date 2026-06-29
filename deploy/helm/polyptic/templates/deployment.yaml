@@ -88,6 +88,10 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          volumeMounts:
+            # Phase 7: uploaded media lives on a disk volume mounted at MEDIA_DIR.
+            - name: media
+              mountPath: {{ .Values.media.dir | quote }}
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
@@ -99,6 +103,17 @@ spec:
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        # Phase 7 media store. When persistence is enabled, back MEDIA_DIR with a
+        # PVC (durable across pod restarts/redeploys); otherwise an emptyDir
+        # (ephemeral — uploads lost on restart; dev only).
+        - name: media
+          {{- if .Values.media.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "polyptic.media.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
           {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

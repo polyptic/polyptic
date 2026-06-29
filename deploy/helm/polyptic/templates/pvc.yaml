@@ -1,0 +1,36 @@
+{{- /*
+PersistentVolumeClaim for uploaded media (Phase 7).
+
+Uploaded images/videos are streamed to MEDIA_DIR on disk (Polyptic does NOT use
+object storage) and served back, ungated, from the top-level GET /media/:id.
+That directory MUST be durable, so when persistence is enabled we back MEDIA_DIR
+with this PVC and mount it into the server pod (see deployment.yaml).
+
+Gated by .Values.media.persistence.enabled. When disabled, the deployment mounts
+an emptyDir instead (ephemeral — uploads are lost on pod restart; dev only).
+
+resource-policy: keep prevents `helm uninstall` from deleting operators' uploads.
+*/ -}}
+{{- if and .Values.media.persistence.enabled (not .Values.media.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "polyptic.media.pvcName" . }}
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.media.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.media.persistence.size | quote }}
+  {{- if .Values.media.persistence.storageClass }}
+  {{- if (eq "-" .Values.media.persistence.storageClass) }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.media.persistence.storageClass | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

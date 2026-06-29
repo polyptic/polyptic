@@ -933,6 +933,42 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Upload an image/video file (Phase 7). POSTs the file to the GATED /api/v1/media route; the
+     * server saves it to its disk volume and mints a backing ContentSource (kind image|video) whose
+     * `url` points at the ungated /media/:id serve route. As with createSource, the authoritative
+     * admin/state broadcast is what actually adds the new source to `contentSources` — we don't push
+     * it locally here, so the library reconciles from the wire exactly like a linked source.
+     *
+     * Returns a result object the view can act on: `ok` plus, on failure, a human-readable `error`
+     * (special-casing 413 "too large" and 415 "unsupported type"). `onProgress` (0..1) is forwarded
+     * to the transport so the picker can show an upload bar.
+     */
+    async uploadSource(
+      file: File,
+      name?: string,
+      onProgress?: (fraction: number) => void,
+    ): Promise<{ ok: boolean; error?: string }> {
+      try {
+        await api.uploadMedia(file, name, onProgress);
+        return { ok: true };
+      } catch (err) {
+        console.error("[console] uploadSource failed", err);
+        if (err instanceof api.ApiError) {
+          if (err.status === 413) return { ok: false, error: "File too large for upload." };
+          if (err.status === 415) {
+            return { ok: false, error: "Unsupported file type — upload an image or video." };
+          }
+          const payloadMsg =
+            err.payload && typeof err.payload === "object" && "error" in err.payload
+              ? String((err.payload as { error: unknown }).error)
+              : null;
+          return { ok: false, error: payloadMsg ?? "Upload failed. Please try again." };
+        }
+        return { ok: false, error: "Upload failed. Please try again." };
+      }
+    },
+
     /** Arm a library source for click-to-assign (toggles off if it's already armed). */
     pickSource(id: string): void {
       this.pickedSourceId = this.pickedSourceId === id ? null : id;

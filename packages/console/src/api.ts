@@ -274,6 +274,82 @@ export function deleteContentSource(sourceId: string): Promise<unknown> {
   return send("DELETE", `/content-sources/${encodeURIComponent(sourceId)}`);
 }
 
+// ── Media uploads (Phase 7) ──────────────────────────────────────────────────
+
+/**
+ * POST /api/v1/media — upload an image or video file to the server's disk volume. The server saves
+ * it under MEDIA_DIR, records it, and mints a ContentSource (kind image|video) whose `url` is an
+ * absolute URL to the ungated GET /media/:id serve route, so a player on another host can fetch it.
+ * It then returns `{ source }`; we hand back the created ContentSource for the caller to surface.
+ *
+ * This deliberately does NOT go through `send()`: the body is multipart/form-data (a FormData with
+ * the file + optional display name), not JSON, and we want upload PROGRESS, which `fetch` can't
+ * report on a request body. So we drive an XMLHttpRequest directly — `withCredentials = true` is the
+ * XHR equivalent of `credentials: "include"`, carrying the operator's session cookie to the GATED
+ * upload route (same-origin in prod, credentialed cross-origin to :8080 in dev).
+ *
+ * A non-2xx rejects with an `ApiError` carrying the status + parsed JSON payload (so callers can
+ * special-case 413 "too large" / 415 "unsupported type"); a 401 additionally trips the global
+ * unauthorized handler (→ /signin), consistent with `send()`. `onProgress` (0..1), when supplied, is
+ * called as the bytes go up — and once more with 1 on completion.
+ */
+export function uploadMedia(
+  file: File,
+  name?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<ContentSource> {
+  const form = new FormData();
+  // The server generates the stored id + derives the extension from the validated mime; the original
+  // filename is sent only as a fallback display name (never used to build the on-disk path).
+  // Append the `name` text field BEFORE the file: multipart parsers (busboy) stream parts in order
+  // and the server reads `name` while consuming the file stream — a `name` after the file is missed.
+  const trimmed = name?.trim();
+  if (trimmed) form.append("name", trimmed);
+  form.append("file", file, file.name);
+
+  return new Promise<ContentSource>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE}/media`);
+    xhr.withCredentials = true;
+    xhr.responseType = "text";
+
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && ev.total > 0) onProgress(ev.loaded / ev.total);
+      };
+    }
+
+    xhr.onload = () => {
+      const raw = xhr.responseText;
+      let payload: unknown;
+      try {
+        payload = raw ? JSON.parse(raw) : undefined;
+      } catch {
+        payload = undefined;
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const source = (payload as { source?: ContentSource } | undefined)?.source;
+        if (source) {
+          onProgress?.(1);
+          resolve(source);
+        } else {
+          reject(new ApiError(xhr.status, "POST /media -> missing source in response", payload));
+        }
+        return;
+      }
+
+      if (xhr.status === 401) onUnauthorized?.();
+      reject(new ApiError(xhr.status, `POST /media -> ${xhr.status}`, payload));
+    };
+
+    xhr.onerror = () => reject(new ApiError(0, "POST /media -> network error"));
+    xhr.onabort = () => reject(new ApiError(0, "POST /media -> aborted"));
+
+    xhr.send(form);
+  });
+}
+
 // ── Scenes (Phase 3d) ─────────────────────────────────────────────────────────
 
 /**

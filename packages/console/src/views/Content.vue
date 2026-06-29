@@ -91,6 +91,94 @@ async function remove(s: ContentSource) {
 function pretty(url: string): string {
   return url.replace(/^https?:\/\//, "");
 }
+
+// ── upload modal (Phase 7) ─────────────────────────────────────────────────────
+// An alternative to the "add by URL" path above: pick (or drop) an image/video file, it's uploaded
+// to the server's disk volume and comes back as a ContentSource (kind image|video) via the same
+// admin/state broadcast that feeds `sources`. We never set kind/url by hand here — the server derives
+// them from the validated file and the serve route.
+const uploadOpen = ref(false);
+const uploadFile = ref<File | null>(null);
+const uploadName = ref("");
+const uploadError = ref<string | null>(null);
+const uploading = ref(false);
+const uploadProgress = ref(0); // 0..1
+const dragOver = ref(false);
+const fileInput = ref<HTMLInputElement | null>(null);
+
+const MAX_BYTES = 200 * 1024 * 1024; // mirrors the server's MEDIA_MAX_BYTES default (~200MB)
+
+function openUpload() {
+  uploadFile.value = null;
+  uploadName.value = "";
+  uploadError.value = null;
+  uploading.value = false;
+  uploadProgress.value = 0;
+  dragOver.value = false;
+  uploadOpen.value = true;
+}
+
+function closeUpload() {
+  if (uploading.value) return; // don't abandon an in-flight upload by closing
+  uploadOpen.value = false;
+}
+
+/** Validate locally (type + size) before accepting a file — cheap feedback before any network hop. */
+function acceptFile(file: File | null | undefined): void {
+  if (!file) return;
+  const isMedia = file.type.startsWith("image/") || file.type.startsWith("video/");
+  if (!isMedia) {
+    uploadError.value = "Unsupported file type — choose an image or video.";
+    uploadFile.value = null;
+    return;
+  }
+  if (file.size > MAX_BYTES) {
+    uploadError.value = "File too large — the limit is 200 MB.";
+    uploadFile.value = null;
+    return;
+  }
+  uploadError.value = null;
+  uploadFile.value = file;
+  // Default the display name to the filename without its extension (the operator can override).
+  if (!uploadName.value.trim()) uploadName.value = file.name.replace(/\.[^.]+$/, "");
+}
+
+function onPick(ev: Event) {
+  const input = ev.target as HTMLInputElement;
+  acceptFile(input.files?.[0]);
+}
+
+function onDrop(ev: DragEvent) {
+  dragOver.value = false;
+  acceptFile(ev.dataTransfer?.files?.[0]);
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
+
+async function doUpload() {
+  if (uploading.value || !uploadFile.value) return;
+  uploadError.value = null;
+  uploading.value = true;
+  uploadProgress.value = 0;
+  const res = await store.uploadSource(uploadFile.value, uploadName.value, (f) => {
+    uploadProgress.value = f;
+  });
+  uploading.value = false;
+  if (res.ok) {
+    uploadOpen.value = false; // the new source appears in the library via admin/state
+  } else {
+    uploadError.value = res.error ?? "Upload failed. Please try again.";
+  }
+}
+
+/** Whether a source's `url` resolves to a directly-renderable picture (for a list thumbnail). */
+function isImage(s: ContentSource): boolean {
+  return s.kind === "image";
+}
 </script>
 
 <template>
@@ -105,13 +193,17 @@ function pretty(url: string): string {
             video wall.
           </p>
         </div>
-        <button class="add-btn" @click="openAdd">+ Add source</button>
+        <div class="head-actions">
+          <button class="add-btn ghost compact" @click="openUpload">⤓ Upload</button>
+          <button class="add-btn" @click="openAdd">+ Add source</button>
+        </div>
       </header>
 
       <!-- list -->
       <div v-if="sources.length" class="list">
         <div v-for="c in sources" :key="c.id" class="row">
-          <span class="glyph" :style="{ color: `var(${kindColorVar(c.kind)})` }">
+          <img v-if="isImage(c)" class="thumb" :src="c.url" :alt="c.name" loading="lazy" />
+          <span v-else class="glyph" :style="{ color: `var(${kindColorVar(c.kind)})` }">
             {{ kindGlyph(c.kind) }}
           </span>
           <div class="row-meta">
@@ -131,7 +223,10 @@ function pretty(url: string): string {
         <span class="empty-sub">
           Add a web page, dashboard, image or video, then assign it to screens on the Wall.
         </span>
-        <button class="add-btn ghost" @click="openAdd">+ Add your first source</button>
+        <div class="empty-actions">
+          <button class="add-btn ghost" @click="openUpload">⤓ Upload a file</button>
+          <button class="add-btn ghost" @click="openAdd">+ Add by URL</button>
+        </div>
       </div>
     </div>
 
@@ -175,6 +270,64 @@ function pretty(url: string): string {
         <div class="modal-actions">
           <button class="btn-secondary" @click="closeModal">Cancel</button>
           <button class="btn-primary" :disabled="saving" @click="save">{{ saveLabel }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── upload modal (Phase 7) ────────────────────────────────────────────── -->
+    <div v-if="uploadOpen" class="scrim" @mousedown.self="closeUpload">
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="modal-title">Upload image or video</div>
+
+        <!-- drop zone / picker -->
+        <div
+          class="drop"
+          :class="{ over: dragOver, filled: !!uploadFile }"
+          @click="fileInput?.click()"
+          @dragover.prevent="dragOver = true"
+          @dragleave.prevent="dragOver = false"
+          @drop.prevent="onDrop"
+        >
+          <input
+            ref="fileInput"
+            type="file"
+            accept="image/*,video/*"
+            class="file-input"
+            @change="onPick"
+          />
+          <template v-if="uploadFile">
+            <span class="drop-glyph">{{ uploadFile.type.startsWith("video/") ? "▷" : "▦" }}</span>
+            <span class="drop-name">{{ uploadFile.name }}</span>
+            <span class="drop-sub">{{ fmtSize(uploadFile.size) }} · click to choose another</span>
+          </template>
+          <template v-else>
+            <span class="drop-glyph">⤓</span>
+            <span class="drop-name">Drop a file here, or click to browse</span>
+            <span class="drop-sub">Images and videos · up to 200 MB</span>
+          </template>
+        </div>
+
+        <label class="field-label">Name <span class="optional">(optional)</span></label>
+        <input
+          v-model="uploadName"
+          class="field"
+          placeholder="Defaults to the file name"
+          :disabled="uploading"
+        />
+
+        <!-- progress -->
+        <div v-if="uploading" class="progress-wrap">
+          <div class="progress-bar" :style="{ width: `${Math.round(uploadProgress * 100)}%` }"></div>
+          <span class="progress-label">Uploading… {{ Math.round(uploadProgress * 100) }}%</span>
+        </div>
+
+        <div v-if="uploadError" class="error">⚠ {{ uploadError }}</div>
+
+        <div class="modal-actions">
+          <button class="btn-secondary" :disabled="uploading" @click="closeUpload">Cancel</button>
+          <button class="btn-primary" :disabled="uploading || !uploadFile" @click="doUpload">
+            {{ uploading ? "Uploading…" : "Upload" }}
+          </button>
         </div>
       </div>
     </div>
@@ -483,5 +636,112 @@ function pretty(url: string): string {
 }
 .btn-primary:not(:disabled):hover {
   opacity: 0.92;
+}
+
+/* header actions */
+.head-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.add-btn.compact {
+  padding: 9px 13px;
+}
+
+/* image thumbnail in a list row (replaces the glyph badge for uploaded/linked images) */
+.thumb {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 9px;
+  object-fit: cover;
+  background: var(--muted-bg);
+  border: 1px solid var(--line);
+}
+
+/* empty-state action pair */
+.empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* upload drop zone */
+.drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  text-align: center;
+  position: relative;
+  border: 1.5px dashed var(--line2);
+  border-radius: 12px;
+  padding: 26px 18px;
+  margin-bottom: 16px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.drop:hover {
+  background: var(--muted-bg);
+}
+.drop.over {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.drop.filled {
+  border-style: solid;
+  border-color: var(--line);
+}
+.file-input {
+  display: none;
+}
+.drop-glyph {
+  font-size: 22px;
+  color: var(--accent);
+  font-weight: 700;
+}
+.drop-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  word-break: break-all;
+}
+.drop-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.optional {
+  color: var(--muted2);
+  font-weight: 400;
+}
+.field:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* upload progress */
+.progress-wrap {
+  position: relative;
+  height: 22px;
+  border-radius: 8px;
+  background: var(--muted-bg);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+.progress-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
 }
 </style>

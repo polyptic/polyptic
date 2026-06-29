@@ -61,7 +61,26 @@ Store:     {{ .Values.config.store }}
         enrollment in any real deployment.
 {{- end }}
 
-5. Database:
+5. Media uploads (Phase 7):
+     Uploads land in MEDIA_DIR ({{ .Values.media.dir }}) and are served, ungated,
+     from GET /media/:id (Range-enabled). MEDIA_PUBLIC_BASE is {{ .Values.media.publicBase }}.
+{{- if .Values.media.persistence.enabled }}
+  {{- if .Values.media.persistence.existingClaim }}
+     Persisted on existing PVC "{{ .Values.media.persistence.existingClaim }}".
+  {{- else }}
+     Persisted on PVC {{ include "polyptic.media.pvcName" . }} ({{ .Values.media.persistence.size }}{{ if .Values.media.persistence.storageClass }}, storageClass {{ .Values.media.persistence.storageClass }}{{ end }}).
+  {{- end }}
+  {{- if eq .Values.media.publicBase "https://polyptic.example.com" }}
+
+     ⚠️  media.publicBase is still the example origin. Set it to a URL your wall
+        players can actually reach, or uploaded media will 404 on the screens.
+  {{- end }}
+{{- else }}
+     ⚠️  media.persistence.enabled=false — uploads use an emptyDir and are LOST on
+        pod restart. Enable persistence for any real deployment.
+{{- end }}
+
+6. Database:
 {{- if .Values.postgresql.enabled }}
      In-cluster Postgres subchart enabled. DATABASE_URL is derived automatically
      and points at {{ include "polyptic.postgresql.host" . }}:5432.

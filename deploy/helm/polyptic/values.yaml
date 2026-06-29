@@ -156,6 +156,45 @@ config:
   # poll interval, milliseconds). Empty uses the server's built-in default.
   captureIntervalMs: ""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Media uploads (Phase 7).
+#   Operators can UPLOAD images/videos (POST /api/v1/media, gated) on top of
+#   LINKING external media URLs (Phase 3c). Uploads are streamed to a disk volume
+#   (Polyptic does NOT use object storage) and served back, ungated, from the
+#   top-level GET /media/:id with HTTP Range support (so video can seek). The
+#   server reads MEDIA_DIR / MEDIA_PUBLIC_BASE / MEDIA_MAX_BYTES (configmap).
+# ─────────────────────────────────────────────────────────────────────────────
+media:
+  # Directory the server writes uploads to. This is also the volumeMount path for
+  # the media volume below — keep them identical.
+  dir: /var/lib/polyptic/media
+
+  # Absolute base URL prepended to /media/<id> when an upload becomes a
+  # ContentSource.url. MUST be reachable by the players/public wall — in prod this
+  # is normally your public HTTPS origin (e.g. https://polyptic.example.com).
+  publicBase: "https://polyptic.example.com"
+
+  # Maximum accepted upload size, in bytes (streamed; rejected past this). ~200MB.
+  # Quoted to keep Helm from coercing the large integer to scientific-notation float.
+  maxBytes: "209715200"
+
+  persistence:
+    # When true, back MEDIA_DIR with a PersistentVolumeClaim so uploads survive
+    # pod restarts/redeploys. When false, the pod uses an emptyDir (ephemeral —
+    # uploads lost on restart; dev only).
+    enabled: true
+    # Use a pre-existing PVC instead of letting the chart create one. When set,
+    # no PVC is rendered and the deployment mounts this claim directly.
+    existingClaim: ""
+    # PVC access mode(s). RWO suits the single-writer control plane; switch to
+    # ReadWriteMany only if you scale the server and your storage supports it.
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    # StorageClass for the PVC. "" uses the cluster default; "-" disables dynamic
+    # provisioning (bind to a pre-created PV).
+    storageClass: ""
+
 secrets:
   # COOKIE_SECRET — signs the http-only session cookies. MUST be a long random
   # value in production. If left empty AND existingSecret is unset, the chart

@@ -99,6 +99,18 @@ Bitnami names it "<release>-postgresql".
 {{- end }}
 
 {{/*
+The name of the PVC backing MEDIA_DIR (Phase 7 uploads). Uses an externally
+supplied existingClaim when set, otherwise the chart-managed "<fullname>-media".
+*/}}
+{{- define "polyptic.media.pvcName" -}}
+{{- if .Values.media.persistence.existingClaim -}}
+{{- .Values.media.persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-media" (include "polyptic.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Resolve the COOKIE_SECRET value used at install time. Precedence:
   1. explicit .Values.secrets.cookieSecret
   2. the value already stored in the chart-managed Secret (preserve on upgrade)

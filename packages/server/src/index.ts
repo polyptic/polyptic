@@ -11,6 +11,7 @@
  */
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
@@ -19,6 +20,7 @@ import { registerAuthRoutes } from "./auth-routes";
 import { CaptureCoordinator, ThumbnailStore } from "./capture";
 import { Enrollment } from "./enroll";
 import { AgentHub, PlayerHub } from "./hub";
+import { MediaStore, registerMediaServeRoute } from "./media";
 import { registerOpsRoutes } from "./ops";
 import { registerRestRoutes } from "./rest";
 import { ControlPlane } from "./state";
@@ -54,6 +56,18 @@ const CORS_ORIGIN = (
   .map((o) => o.trim())
   .filter((o) => o.length > 0);
 const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
+
+// ── Media (Phase 7): uploads land on a disk VOLUME (MEDIA_DIR) and are served over plain HTTP. ──
+// MEDIA_DIR defaults to ./media in dev (a mounted volume / /var/lib/polyptic/media in prod). The serve
+// URL baked into each upload's ContentSource is `${MEDIA_PUBLIC_BASE}/media/<id>`, so a player on
+// ANOTHER host can fetch it — it must be the server's externally reachable base, not localhost in prod.
+const MEDIA_DIR = process.env.MEDIA_DIR?.trim() || "./media";
+const MEDIA_MAX_BYTES = Number(process.env.MEDIA_MAX_BYTES ?? 200 * 1024 * 1024);
+const MEDIA_PUBLIC_BASE = (
+  process.env.MEDIA_PUBLIC_BASE?.trim() ||
+  process.env.PUBLIC_BASE_URL?.trim() ||
+  "http://localhost:8080"
+).replace(/\/+$/, "");
 
 const fastify = Fastify({
   logger: { level: process.env.LOG_LEVEL ?? "info" },
@@ -105,6 +119,14 @@ await fastify.register(cors, {
   credentials: true,
 });
 
+// ── Media uploads (Phase 7): multipart parser (streamed to disk) + the disk-backed catalogue. ──
+// `fileSize` makes busboy abort an over-cap upload mid-stream; the upload route maps that to a 413.
+await fastify.register(multipart, {
+  limits: { fileSize: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024 },
+});
+const media = new MediaStore(MEDIA_DIR);
+await media.init();
+
 // ── Local operator auth (Phase 3f / D29): argon2id passwords, signed http-only session cookies. ──
 const authConfig = authConfigFromEnv();
 await fastify.register(cookie, { secret: authConfig.cookieSecret });
@@ -125,7 +147,13 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
 });
 
 registerAuthRoutes(fastify, auth, enrollment);
-registerRestRoutes(fastify, control, hub, agentHub, broadcaster, capture);
+registerRestRoutes(fastify, control, hub, agentHub, broadcaster, capture, media, {
+  publicBase: MEDIA_PUBLIC_BASE,
+  maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
+});
+// TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
+// load uploads without a session, exactly like any external content URL (ids are unguessable).
+registerMediaServeRoute(fastify, media);
 // TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.
 registerOpsRoutes(fastify, {
   control,
