@@ -347,6 +347,21 @@ export const VideoWall = z.object({
 });
 export type VideoWall = z.infer<typeof VideoWall>;
 
+/** The kind of a content source — mirrors the renderable Surface types. */
+export const ContentKind = z.enum(["web", "dashboard", "image", "video"]);
+export type ContentKind = z.infer<typeof ContentKind>;
+
+/** A reusable, named entry in the content LIBRARY. A screen or video wall is assigned a source by id;
+ *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
+ *  media served from a disk volume (an upload becomes a source whose url points at the media route). */
+export const ContentSource = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(120),
+  kind: ContentKind,
+  url: z.string().url(),
+});
+export type ContentSource = z.infer<typeof ContentSource>;
+
 export const AdminHello = z.object({
   t: z.literal("admin/hello"),
   protocol: z.literal(PROTOCOL_VERSION),
@@ -362,6 +377,7 @@ export const ServerToAdminState = z.object({
   murals: z.array(Mural), // Phase 3
   placements: z.array(Placement), // Phase 3 — which screen sits where on which mural
   videoWalls: z.array(VideoWall), // Phase 3b — combined surfaces
+  contentSources: z.array(ContentSource), // Phase 3c — the content library
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -401,10 +417,33 @@ export const CombineScreensBody = z.object({
 });
 export type CombineScreensBody = z.infer<typeof CombineScreensBody>;
 
-/** Assign content to a single screen OR a video wall (it spans across members). Ad-hoc web URL for
- *  now; the reusable content library lands in 3c. */
-export const SetContentBody = z.object({ url: z.string().url() });
+/** Assign content to a single screen OR a video wall (it spans across members): either a library
+ *  source (`sourceId`) or an ad-hoc link (`url`). Exactly one of the two. */
+export const SetContentBody = z
+  .object({
+    sourceId: z.string().optional(),
+    url: z.string().url().optional(),
+  })
+  .refine((b) => (b.sourceId === undefined) !== (b.url === undefined), {
+    message: "provide exactly one of sourceId or url",
+  });
 export type SetContentBody = z.infer<typeof SetContentBody>;
+
+// REST bodies — content library (Phase 3c)
+export const CreateContentSourceBody = z.object({
+  name: z.string().min(1).max(120),
+  kind: ContentKind,
+  url: z.string().url(),
+});
+export type CreateContentSourceBody = z.infer<typeof CreateContentSourceBody>;
+
+/** Partial update of a library source (any subset of fields). */
+export const UpdateContentSourceBody = z.object({
+  name: z.string().min(1).max(120).optional(),
+  kind: ContentKind.optional(),
+  url: z.string().url().optional(),
+});
+export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
