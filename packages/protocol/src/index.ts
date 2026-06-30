@@ -410,6 +410,15 @@ export const AdminHello = z.object({
 export const AdminMessage = z.discriminatedUnion("t", [AdminHello]);
 export type AdminMessage = z.infer<typeof AdminMessage>;
 
+/** A line in the Live Activity feed — a human-readable record of a notable event. */
+export const ActivityEvent = z.object({
+  id: z.string(),
+  at: z.string(), // ISO timestamp
+  severity: z.enum(["info", "good", "warn", "bad"]),
+  text: z.string(),
+});
+export type ActivityEvent = z.infer<typeof ActivityEvent>;
+
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
   t: z.literal("admin/state"),
@@ -420,6 +429,7 @@ export const ServerToAdminState = z.object({
   videoWalls: z.array(VideoWall), // Phase 3b — combined surfaces
   contentSources: z.array(ContentSource), // Phase 3c — the content library
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
+  activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
