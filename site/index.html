@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./vendor/react.production.min.js"></script>
+<script src="./vendor/react-dom.production.min.js"></script>
+<script src="./vendor/support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; }
+  ::selection{ background:#cfe0ff; }
+  @keyframes assemble{
+    0%{ opacity:0; transform:translate(var(--dx),var(--dy)) scale(.92) }
+    6%{ opacity:0 }
+    9%{ opacity:1 }
+    13%{ transform:translate(0,0) scale(1.02) }
+    16%{ transform:translate(0,0) scale(1) }
+    82%{ opacity:1; transform:translate(0,0) scale(1) }
+    90%{ opacity:0; transform:translate(calc(var(--dx)*.45),calc(var(--dy)*.45)) scale(.95) }
+    100%{ opacity:0; transform:translate(var(--dx),var(--dy)) scale(.92) }
+  }
+  @keyframes panelSnap{
+    0%,17%{ opacity:0; transform:translate(150px,0) scale(.97) }
+    20%{ opacity:1 }
+    27%{ transform:translate(-7px,0) scale(1.015) }
+    31%{ transform:translate(0,0) scale(1) }
+    82%{ opacity:1; transform:translate(0,0) scale(1) }
+    90%,100%{ opacity:0; transform:translate(120px,0) scale(.97) }
+  }
+  @keyframes guideFlash{
+    0%,20%{ opacity:0 } 23%{ opacity:1 } 28%{ opacity:.85 } 32%{ opacity:0 } 100%{ opacity:0 }
+  }
+  @keyframes reveal{
+    0%,13%{ opacity:0 } 19%{ opacity:1 } 82%{ opacity:1 } 90%,100%{ opacity:0 }
+  }
+  @keyframes sheen{
+    0%,38%{ transform:translateX(-130%) skewX(-14deg); opacity:0 }
+    44%{ opacity:.5 }
+    60%{ transform:translateX(280%) skewX(-14deg); opacity:0 }
+    100%{ transform:translateX(280%) skewX(-14deg); opacity:0 }
+  }
+  @keyframes ppulse{ 0%,100%{ opacity:1 } 50%{ opacity:.28 } }
+  @keyframes snapNudge{
+    0%{ transform:translateX(34px); opacity:.45 }
+    20%{ transform:translateX(34px); opacity:.45 }
+    33%{ transform:translateX(-4px); opacity:1 }
+    38%{ transform:translateX(0) }
+    86%{ transform:translateX(0); opacity:1 }
+    100%{ transform:translateX(34px); opacity:.45 }
+  }
+  @keyframes miniGuide{ 0%,22%{opacity:0} 30%{opacity:1} 40%{opacity:0} 100%{opacity:0} }
+  @keyframes identFlash{
+    0%,100%{ box-shadow:0 0 0 2px var(--accent),0 0 18px rgba(37,99,235,.4) }
+    50%{ box-shadow:0 0 0 2px rgba(37,99,235,.18) }
+  }
+  @keyframes clickRing{ 0%{ transform:scale(.25); opacity:.55 } 100%{ transform:scale(1.7); opacity:0 } }
+  @keyframes newGlow{ 0%,100%{ box-shadow:0 0 0 1px var(--accent-line) } 50%{ box-shadow:0 0 0 1px var(--accent),0 0 0 4px rgba(37,99,235,.13) } }
+  @keyframes joinPop{ 0%,10%{ opacity:0; transform:translateY(7px) scale(.97) } 20%{ opacity:1; transform:translateY(0) scale(1) } 86%{ opacity:1; transform:translateY(0) scale(1) } 95%,100%{ opacity:0; transform:translateY(7px) scale(.97) } }
+  @keyframes blink{ 0%,49%{ opacity:1 } 50%,100%{ opacity:0 } }
+</style>
+</helmet>
+
+<div ref="{{ rootRef }}" style="--bg:#fafafa;--surface:#ffffff;--ink:#0a0a0b;--ink2:#27272a;--muted:#52525b;--muted2:#76767f;--faint:#a1a1aa;--line:#ededf0;--line2:#e0e0e4;--accent:#2563eb;--accent-soft:#eef3ff;--accent-line:#cfddff;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--tileA:#e7eef9;--tileB:#dae4f4;--spd:1;background:var(--bg);color:var(--ink);font-family:'Geist',system-ui,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden;line-height:1.5">
+
+  <!-- ============ NAV ============ -->
+  <div style="position:sticky;top:0;z-index:50;background:rgba(250,250,250,.8);backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--line)">
+    <div style="max-width:1180px;margin:0 auto;padding:0 28px;height:64px;display:flex;align-items:center;gap:26px">
+      <a href="#top" style="display:flex;align-items:center;gap:11px;text-decoration:none">
+        <span style="width:30px;height:30px;border-radius:9px;background:#161618;display:flex;align-items:center;justify-content:center"><svg width="20" height="20" viewBox="0 0 32 32"><polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" fill="#fafafa" opacity=".62"/><polygon points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" fill="#fafafa" opacity=".62"/><rect x="13.1" y="8" width="5.8" height="16" fill="#fafafa"/></svg></span>
+        <span style="font-size:18px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Polyptic</span>
+      </a>
+      <div style="flex:1"></div>
+      <div style="display:flex;align-items:center;gap:28px">
+        <a href="#features" style="font-size:14px;color:var(--muted);text-decoration:none;font-weight:500" style-hover="color:var(--ink)">Features</a>
+        <a href="#how" style="font-size:14px;color:var(--muted);text-decoration:none;font-weight:500" style-hover="color:var(--ink)">How it works</a>
+        <a href="#open" style="font-size:14px;color:var(--muted);text-decoration:none;font-weight:500" style-hover="color:var(--ink)">Open source</a>
+        <a href="https://github.com/polyptic/polyptic" style="font-size:14px;color:var(--muted);text-decoration:none;font-weight:500" style-hover="color:var(--ink)">Docs</a>
+      </div>
+      <a href="https://github.com/polyptic/polyptic" style="display:inline-flex;align-items:center;gap:9px;padding:9px 15px;border-radius:10px;background:#161618;color:#fafafa;font-size:14px;font-weight:600;text-decoration:none;transition:transform .15s,box-shadow .15s" style-hover="transform:translateY(-1px);box-shadow:0 8px 22px rgba(0,0,0,.2)">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.6 18 4.9 18 4.9c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
+        Star <span style="opacity:.55;font-variant-numeric:tabular-nums">2.4k</span>
+      </a>
+    </div>
+  </div>
+
+  <!-- ============ HERO ============ -->
+  <div id="top" style="max-width:1180px;margin:0 auto;padding:78px 28px 0;text-align:center;position:relative">
+    <div style="display:inline-flex;align-items:center;gap:9px;padding:6px 13px 6px 11px;border-radius:999px;border:1px solid var(--line2);background:var(--surface);font-size:12.5px;color:var(--muted);box-shadow:0 1px 2px rgba(16,24,40,.04);margin-bottom:28px">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--ok);animation:ppulse 2.2s infinite"></span>
+      Open source · self-hosted
+      <span style="width:1px;height:13px;background:var(--line2)"></span>
+      <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">v2.3</span>
+    </div>
+    <h1 style="margin:0 auto;max-width:15ch;font-size:clamp(40px,6.4vw,76px);font-weight:600;letter-spacing:-.038em;line-height:1.02;color:var(--ink)">Control every display from one canvas.</h1>
+    <p style="margin:26px auto 0;max-width:60ch;font-size:clamp(16px,1.5vw,19px);line-height:1.6;color:var(--muted)">Polyptic is an open-source operator console for display walls. Arrange screens on a canvas, align them into murals, and assign content — running on your own hardware.</p>
+
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:34px;flex-wrap:wrap">
+      <a href="https://github.com/polyptic/polyptic" style="display:inline-flex;align-items:center;gap:10px;padding:14px 22px;border-radius:12px;background:var(--ink);color:#fafafa;font-size:15.5px;font-weight:600;text-decoration:none;border:1px solid var(--ink);transition:transform .15s,box-shadow .15s" style-hover="transform:translateY(-1px);box-shadow:0 10px 28px rgba(0,0,0,.22)">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.6 18 4.9 18 4.9c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
+        View on GitHub
+      </a>
+      <a href="https://github.com/polyptic/polyptic" style="display:inline-flex;align-items:center;gap:8px;padding:14px 20px;border-radius:12px;background:var(--surface);color:var(--ink);font-size:15.5px;font-weight:600;text-decoration:none;border:1px solid var(--line2);transition:border-color .15s" style-hover="border-color:#c9c9d0">Read the docs <span style="color:var(--muted2)">↗</span></a>
+    </div>
+
+    <div style="display:inline-flex;align-items:center;gap:14px;margin-top:24px;font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--muted2)">
+      <span style="display:inline-flex;align-items:center;gap:9px;padding:8px 13px;border-radius:9px;background:#f4f4f5;border:1px solid var(--line)"><span style="color:var(--accent)">$</span>docker compose up</span>
+      <span>MIT licensed · no account needed</span>
+    </div>
+  </div>
+
+  <!-- ============ ANIMATED PRODUCT FRAME ============ -->
+  <div style="max-width:1200px;margin:0 auto;padding:52px 28px 0;position:relative">
+    <div style="position:absolute;left:50%;top:30px;transform:translateX(-50%);width:74%;height:340px;background:radial-gradient(ellipse at center,rgba(37,99,235,.16),rgba(37,99,235,0) 70%);filter:blur(36px);z-index:0;pointer-events:none"></div>
+
+    <div style="position:relative;z-index:1;border-radius:16px;border:1px solid var(--line2);background:var(--surface);box-shadow:0 30px 70px -24px rgba(16,24,40,.34),0 8px 22px -10px rgba(16,24,40,.12);overflow:hidden">
+      <!-- live cursor-driven walkthrough stage -->
+      <div ref="{{ stageRef }}" style="position:relative;width:100%;height:{{ frameH }};overflow:hidden;background:#fbfcfd">{{ stage }}</div>
+    </div>
+  </div>
+
+  <!-- ============ FEATURES ============ -->
+  <div id="features" style="max-width:1180px;margin:0 auto;padding:120px 28px 0">
+    <div style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:2.4px;color:var(--accent);font-weight:500">CONSOLE</div>
+    <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:30px;margin-top:14px;flex-wrap:wrap">
+      <h2 style="margin:0;max-width:18ch;font-size:clamp(30px,3.6vw,44px);font-weight:600;letter-spacing:-.03em;line-height:1.06;color:var(--ink)">Tools for running a display wall.</h2>
+      <p style="margin:0;max-width:42ch;font-size:16px;line-height:1.6;color:var(--muted)">Arrange layouts, switch scenes, and monitor every panel from one place.</p>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:44px">
+
+      <!-- Onboard a machine (wide) -->
+      <div style="grid-column:1/3;display:grid;grid-template-columns:1.05fr 1fr;gap:28px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:30px;overflow:hidden">
+        <div>
+          <div style="display:inline-flex;width:34px;height:34px;border-radius:9px;background:var(--accent-soft);color:var(--accent);align-items:center;justify-content:center;font-size:16px;margin-bottom:16px">⬡</div>
+          <h3 style="margin:0;font-size:21px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Add a machine, its screens show up</h3>
+          <p style="margin:11px 0 0;font-size:15px;line-height:1.6;color:var(--muted)">Run one agent on any PC or NUC. It registers the machine, discovers every connected display, and brings each one online as a first-class screen — named, addressable, and ready for content. No per-screen setup.</p>
+        </div>
+        <div style="position:relative;height:188px;background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:14px;overflow:hidden;display:flex;flex-direction:column;gap:11px">
+          <div style="font-family:'Geist Mono',monospace;font-size:12.5px;color:var(--muted)"><span style="color:var(--accent)">$</span> polyptic agent up<span style="display:inline-block;width:7px;height:14px;background:var(--ink2);vertical-align:-2px;margin-left:3px;animation:blink 1.1s steps(1) infinite"></span></div>
+          <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px 12px;display:flex;flex-direction:column;gap:9px">
+            <div style="display:flex;align-items:center;gap:9px">
+              <span style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span>
+              <span style="font-size:13px;font-weight:600;color:var(--ink2)">reception-pc</span>
+              <span style="flex:1"></span>
+              <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--ok)">online</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:9px;font-family:'Geist Mono',monospace;font-size:11.5px;animation:joinPop 3.8s ease infinite both">
+              <span style="width:20px;height:14px;border:1.5px solid var(--accent);border-radius:3px;flex:0 0 auto"></span>
+              <span style="color:var(--ink2)">Display 1 · 1920×1080</span>
+              <span style="flex:1"></span>
+              <span style="color:var(--accent);font-weight:600">→ screen</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:9px;font-family:'Geist Mono',monospace;font-size:11.5px;animation:joinPop 3.8s ease infinite both;animation-delay:.5s">
+              <span style="width:20px;height:14px;border:1.5px solid var(--accent);border-radius:3px;flex:0 0 auto"></span>
+              <span style="color:var(--ink2)">Display 2 · 1920×1080</span>
+              <span style="flex:1"></span>
+              <span style="color:var(--accent);font-weight:600">→ screen</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Scenes (interactive) -->
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:30px;display:flex;flex-direction:column">
+        <div style="display:inline-flex;width:34px;height:34px;border-radius:9px;background:var(--accent-soft);color:var(--accent);align-items:center;justify-content:center;font-size:16px;margin-bottom:16px">◇</div>
+        <h3 style="margin:0;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Scenes</h3>
+        <p style="margin:10px 0 0;font-size:14.5px;line-height:1.6;color:var(--muted)">Save a layout as a scene and switch the whole wall between them in one click.</p>
+        <div style="margin-top:auto;padding-top:20px">
+          <div style="display:flex;gap:8px">
+            <sc-for list="{{ sceneTiles }}" as="t" hint-placeholder-count="3">
+              <div style="flex:1;aspect-ratio:4/3;border-radius:8px;overflow:hidden;border:1px solid rgba(2,6,23,.08);box-shadow:0 3px 10px rgba(16,24,40,.07);background:{{ t.bg }};color:{{ t.fg }};transition:background .5s ease,color .5s ease;display:flex;flex-direction:column;justify-content:flex-end;padding:10px">
+                <span style="font-family:'Geist Mono',monospace;font-size:8px;letter-spacing:1.2px;opacity:.72">{{ t.label }}</span>
+                <span style="font-size:12.5px;font-weight:600;letter-spacing:-.01em">{{ t.sub }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+            <sc-for list="{{ sceneChips }}" as="c" hint-placeholder-count="3">
+              <sc-if value="{{ c.active }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ c.fn }}" style="display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:8px;font-size:12.5px;cursor:pointer;background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--accent);font-weight:600"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></span>{{ c.name }}</div>
+              </sc-if>
+              <sc-if value="{{ c.inactive }}" hint-placeholder-val="{{ true }}">
+                <div onClick="{{ c.fn }}" style="display:inline-flex;align-items:center;padding:7px 12px;border-radius:8px;font-size:12.5px;cursor:pointer;background:#fff;border:1px solid var(--line2);color:var(--muted);font-weight:500">{{ c.name }}</div>
+              </sc-if>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+
+      <!-- Ident (interactive) -->
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:30px;display:flex;flex-direction:column">
+        <div style="display:inline-flex;width:34px;height:34px;border-radius:9px;background:var(--accent-soft);color:var(--accent);align-items:center;justify-content:center;font-size:16px;margin-bottom:16px">◎</div>
+        <h3 style="margin:0;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Screen ident</h3>
+        <p style="margin:10px 0 0;font-size:14.5px;line-height:1.6;color:var(--muted)">Not sure which physical panel is which? Hit ident on a screen and it flashes on the wall — walk straight to it. <span style="color:var(--muted2)">Try it:</span></p>
+
+        <!-- the two physical screens -->
+        <div style="margin-top:20px;display:flex;gap:18px;justify-content:center">
+          <div style="flex:1;max-width:190px;display:flex;flex-direction:column;align-items:center">
+            <div style="position:relative;width:100%;aspect-ratio:16/10;border:3px solid #d6d9e0;border-radius:9px;background:repeating-linear-gradient(135deg,var(--tileA) 0 12px,var(--tileB) 12px 24px);overflow:hidden;box-shadow:0 4px 12px rgba(16,24,40,.08)">
+              <div style="position:absolute;top:7px;left:8px;font-family:'Geist Mono',monospace;font-size:9px;color:rgba(2,6,23,.45);background:rgba(255,255,255,.72);padding:1px 5px;border-radius:3px">lobby-01</div>
+              <sc-if value="{{ ident0 }}" hint-placeholder-val="{{ false }}">
+                <div style="position:absolute;inset:0;background:var(--accent);display:flex;align-items:center;justify-content:center;animation:ppulse .65s ease-in-out infinite"><span style="font-size:42px;font-weight:700;color:#fff;letter-spacing:-.02em">1</span></div>
+              </sc-if>
+            </div>
+            <div style="width:30%;height:7px;background:#d6d9e0;border-radius:0 0 3px 3px"></div>
+            <div style="width:52%;height:4px;background:#c7cbd4;border-radius:3px;margin-top:1px"></div>
+          </div>
+          <div style="flex:1;max-width:190px;display:flex;flex-direction:column;align-items:center">
+            <div style="position:relative;width:100%;aspect-ratio:16/10;border:3px solid #d6d9e0;border-radius:9px;background:repeating-linear-gradient(135deg,var(--tileA) 0 12px,var(--tileB) 12px 24px);overflow:hidden;box-shadow:0 4px 12px rgba(16,24,40,.08)">
+              <div style="position:absolute;top:7px;left:8px;font-family:'Geist Mono',monospace;font-size:9px;color:rgba(2,6,23,.45);background:rgba(255,255,255,.72);padding:1px 5px;border-radius:3px">lobby-02</div>
+              <sc-if value="{{ ident1 }}" hint-placeholder-val="{{ false }}">
+                <div style="position:absolute;inset:0;background:var(--accent);display:flex;align-items:center;justify-content:center;animation:ppulse .65s ease-in-out infinite"><span style="font-size:42px;font-weight:700;color:#fff;letter-spacing:-.02em">2</span></div>
+              </sc-if>
+            </div>
+            <div style="width:30%;height:7px;background:#d6d9e0;border-radius:0 0 3px 3px"></div>
+            <div style="width:52%;height:4px;background:#c7cbd4;border-radius:3px;margin-top:1px"></div>
+          </div>
+        </div>
+
+        <!-- the console's screen list (click to ident) -->
+        <div style="margin-top:auto;padding-top:22px;display:flex;flex-direction:column;gap:8px">
+          <div onClick="{{ identA }}" style="display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:10px;border:1px solid var(--line2);background:#fbfcfd;cursor:pointer;transition:border-color .15s,background .15s" style-hover="border-color:var(--accent-line);background:var(--accent-soft)">
+            <span style="width:26px;height:18px;border:1.6px solid var(--muted2);border-radius:3px;flex:0 0 auto"></span>
+            <span style="font-size:13.5px;font-weight:600;color:var(--ink2)">lobby-01</span>
+            <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted2)">HDMI-1</span>
+            <span style="flex:1"></span>
+            <sc-if value="{{ ident0 }}" hint-placeholder-val="{{ false }}"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--accent);margin-right:2px">identifying…</span></sc-if>
+            <span style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:7px;background:var(--accent-soft);border:1px solid var(--accent-line);font-size:12px;color:var(--accent);font-weight:600">◎ Ident</span>
+          </div>
+          <div onClick="{{ identB }}" style="display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:10px;border:1px solid var(--line2);background:#fbfcfd;cursor:pointer;transition:border-color .15s,background .15s" style-hover="border-color:var(--accent-line);background:var(--accent-soft)">
+            <span style="width:26px;height:18px;border:1.6px solid var(--muted2);border-radius:3px;flex:0 0 auto"></span>
+            <span style="font-size:13.5px;font-weight:600;color:var(--ink2)">lobby-02</span>
+            <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted2)">DP-2</span>
+            <span style="flex:1"></span>
+            <sc-if value="{{ ident1 }}" hint-placeholder-val="{{ false }}"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--accent);margin-right:2px">identifying…</span></sc-if>
+            <span style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:7px;background:var(--accent-soft);border:1px solid var(--accent-line);font-size:12px;color:var(--accent);font-weight:600">◎ Ident</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Health (wide) -->
+      <div style="grid-column:1/3;display:grid;grid-template-columns:1fr 1.15fr;gap:28px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:30px">
+        <div>
+          <div style="display:inline-flex;width:34px;height:34px;border-radius:9px;background:var(--accent-soft);color:var(--accent);align-items:center;justify-content:center;font-size:16px;margin-bottom:16px">♥</div>
+          <h3 style="margin:0;font-size:21px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Fleet health</h3>
+          <p style="margin:11px 0 0;font-size:15px;line-height:1.6;color:var(--muted)">Each machine and output reports its status, so you can see when a panel goes offline.</p>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;font-family:'Geist Mono',monospace;font-size:12.5px">
+          <div style="display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:10px;background:#fbfcfd;border:1px solid var(--line)"><span style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span><span style="color:var(--ink2)">reception-pc</span><span style="flex:1"></span><span style="color:var(--muted2)">2 outputs</span></div>
+          <div style="display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:10px;background:#fbfcfd;border:1px solid var(--line)"><span style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span><span style="color:var(--ink2)">atrium-nuc</span><span style="flex:1"></span><span style="color:var(--muted2)">6 outputs</span></div>
+          <div style="display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:10px;background:#fef2f2;border:1px solid #fecaca"><span style="width:7px;height:7px;border-radius:50%;background:var(--bad);animation:ppulse 1.6s infinite"></span><span style="color:#b91c1c">cafe-mini</span><span style="flex:1"></span><span style="color:#dc8b8b">unreachable</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ HOW IT WORKS ============ -->
+  <div id="how" style="max-width:1180px;margin:0 auto;padding:120px 28px 0">
+    <div style="text-align:center">
+      <div style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:2.4px;color:var(--accent);font-weight:500">HOW IT WORKS</div>
+      <h2 style="margin:14px auto 0;max-width:20ch;font-size:clamp(30px,3.6vw,44px);font-weight:600;letter-spacing:-.03em;line-height:1.06;color:var(--ink)">Three steps to set up.</h2>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:52px">
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:28px">
+        <div style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:var(--accent);letter-spacing:1px">01</div>
+        <h3 style="margin:14px 0 0;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Connect your machines</h3>
+        <p style="margin:10px 0 0;font-size:14.5px;line-height:1.6;color:var(--muted)">Install the agent on each PC or NUC. Every output it drives appears as a screen.</p>
+      </div>
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:28px">
+        <div style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:var(--accent);letter-spacing:1px">02</div>
+        <h3 style="margin:14px 0 0;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Arrange the wall</h3>
+        <p style="margin:10px 0 0;font-size:14.5px;line-height:1.6;color:var(--muted)">Drag screens onto the canvas and align them edge-to-edge into murals that span content across panels.</p>
+      </div>
+      <div style="background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:28px">
+        <div style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:var(--accent);letter-spacing:1px">03</div>
+        <h3 style="margin:14px 0 0;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Assign content</h3>
+        <p style="margin:10px 0 0;font-size:14.5px;line-height:1.6;color:var(--muted)">Assign dashboards, video, or web pages to screens. Save layouts as scenes to switch between them.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ OPEN SOURCE BAND ============ -->
+  <div id="open" style="margin-top:120px;background:#0b0b0d;color:#fafafa">
+    <div style="max-width:1180px;margin:0 auto;padding:96px 28px;display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center">
+      <div>
+        <div style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:2.4px;color:#7da5ff;font-weight:500">OPEN SOURCE</div>
+        <h2 style="margin:16px 0 0;font-size:clamp(32px,4vw,50px);font-weight:600;letter-spacing:-.035em;line-height:1.04;color:#fafafa">Self-hosted and<br>MIT licensed.</h2>
+        <p style="margin:20px 0 0;max-width:46ch;font-size:16px;line-height:1.65;color:#a1a1aa">Polyptic is MIT-licensed and runs on your own hardware. There is no cloud service, no telemetry, and no per-seat pricing. The source is available to read, fork, and modify.</p>
+
+        <div style="display:flex;flex-direction:column;gap:13px;margin-top:28px">
+          <div style="display:flex;align-items:center;gap:11px;font-size:14.5px;color:#e4e4e7"><span style="color:#7da5ff">✓</span>MIT licensed</div>
+          <div style="display:flex;align-items:center;gap:11px;font-size:14.5px;color:#e4e4e7"><span style="color:#7da5ff">✓</span>Runs on your hardware, on your network</div>
+          <div style="display:flex;align-items:center;gap:11px;font-size:14.5px;color:#e4e4e7"><span style="color:#7da5ff">✓</span>No external services or telemetry</div>
+          <div style="display:flex;align-items:center;gap:11px;font-size:14.5px;color:#e4e4e7"><span style="color:#7da5ff">✓</span>Documented content and agent API</div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:12px;margin-top:32px;flex-wrap:wrap">
+          <a href="https://github.com/polyptic/polyptic" style="display:inline-flex;align-items:center;gap:10px;padding:13px 20px;border-radius:12px;background:#fafafa;color:#161618;font-size:15px;font-weight:600;text-decoration:none;transition:transform .15s,box-shadow .15s" style-hover="transform:translateY(-1px);box-shadow:0 10px 28px rgba(0,0,0,.4)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.6 18 4.9 18 4.9c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
+            Star on GitHub <span style="opacity:.5">2.4k</span>
+          </a>
+          <a href="https://github.com/polyptic/polyptic" style="display:inline-flex;align-items:center;gap:8px;padding:13px 18px;border-radius:12px;background:transparent;color:#e4e4e7;font-size:15px;font-weight:600;text-decoration:none;border:1px solid #2a2a2e;transition:border-color .15s" style-hover="border-color:#3f3f46">Read the docs <span style="opacity:.6">↗</span></a>
+        </div>
+      </div>
+
+      <!-- terminal -->
+      <div style="border-radius:14px;overflow:hidden;border:1px solid #232327;background:#0e0e11;box-shadow:0 24px 60px rgba(0,0,0,.5)">
+        <div style="display:flex;align-items:center;gap:7px;height:38px;padding:0 14px;border-bottom:1px solid #1c1c20;background:#121215">
+          <span style="width:11px;height:11px;border-radius:50%;background:#3a3a40"></span>
+          <span style="width:11px;height:11px;border-radius:50%;background:#3a3a40"></span>
+          <span style="width:11px;height:11px;border-radius:50%;background:#3a3a40"></span>
+          <span style="flex:1"></span>
+          <span style="font-family:'Geist Mono',monospace;font-size:11px;color:#52525b">polyptic — zsh</span>
+        </div>
+        <div style="padding:20px 18px;font-family:'Geist Mono',monospace;font-size:13px;line-height:2;color:#d4d4d8">
+          <div><span style="color:#7da5ff">$</span> git clone github.com/polyptic/polyptic</div>
+          <div><span style="color:#7da5ff">$</span> cd polyptic</div>
+          <div><span style="color:#7da5ff">$</span> docker compose up <span style="color:#52525b">-d</span></div>
+          <div style="color:#52525b">⠿ pulling agent · console · gateway…</div>
+          <div style="color:#22c55e">▸ console live at http://localhost:7000</div>
+          <div><span style="color:#7da5ff">$</span> <span style="display:inline-block;width:8px;height:16px;background:#d4d4d8;vertical-align:-3px;animation:ppulse 1.1s steps(1) infinite"></span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- stats strip -->
+    <div style="border-top:1px solid #1c1c20">
+      <div style="max-width:1180px;margin:0 auto;padding:26px 28px;display:flex;gap:48px;flex-wrap:wrap;font-family:'Geist Mono',monospace">
+        <div style="display:flex;flex-direction:column;gap:3px"><span style="font-size:22px;font-weight:600;color:#fafafa;font-family:'Geist',sans-serif;letter-spacing:-.02em">2,431</span><span style="font-size:11.5px;color:#71717a;letter-spacing:.5px">★ STARS</span></div>
+        <div style="display:flex;flex-direction:column;gap:3px"><span style="font-size:22px;font-weight:600;color:#fafafa;font-family:'Geist',sans-serif;letter-spacing:-.02em">188</span><span style="font-size:11.5px;color:#71717a;letter-spacing:.5px">FORKS</span></div>
+        <div style="display:flex;flex-direction:column;gap:3px"><span style="font-size:22px;font-weight:600;color:#fafafa;font-family:'Geist',sans-serif;letter-spacing:-.02em">MIT</span><span style="font-size:11.5px;color:#71717a;letter-spacing:.5px">LICENSE</span></div>
+        <div style="display:flex;flex-direction:column;gap:3px"><span style="font-size:22px;font-weight:600;color:#fafafa;font-family:'Geist',sans-serif;letter-spacing:-.02em">TypeScript</span><span style="font-size:11.5px;color:#71717a;letter-spacing:.5px">BUILT WITH</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ CLOSING + FOOTER ============ -->
+  <div style="max-width:1180px;margin:0 auto;padding:104px 28px;text-align:center">
+    <span style="width:42px;height:42px;border-radius:12px;background:#161618;display:inline-flex;align-items:center;justify-content:center;margin-bottom:24px"><svg width="28" height="28" viewBox="0 0 32 32"><polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" fill="#fafafa" opacity=".62"/><polygon points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" fill="#fafafa" opacity=".62"/><rect x="13.1" y="8" width="5.8" height="16" fill="#fafafa"/></svg></span>
+    <h2 style="margin:0 auto;max-width:18ch;font-size:clamp(30px,3.8vw,46px);font-weight:600;letter-spacing:-.035em;line-height:1.05;color:var(--ink)">Manage your display walls from one console.</h2>
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:30px;flex-wrap:wrap">
+      <a href="https://github.com/polyptic/polyptic" style="display:inline-flex;align-items:center;gap:10px;padding:14px 22px;border-radius:12px;background:var(--ink);color:#fafafa;font-size:15.5px;font-weight:600;text-decoration:none;transition:transform .15s,box-shadow .15s" style-hover="transform:translateY(-1px);box-shadow:0 10px 28px rgba(0,0,0,.22)">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.6 18 4.9 18 4.9c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
+        Get Polyptic on GitHub
+      </a>
+    </div>
+  </div>
+
+  <div style="border-top:1px solid var(--line)">
+    <div style="max-width:1180px;margin:0 auto;padding:34px 28px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="width:26px;height:26px;border-radius:8px;background:#161618;display:flex;align-items:center;justify-content:center"><svg width="17" height="17" viewBox="0 0 32 32"><polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" fill="#fafafa" opacity=".62"/><polygon points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" fill="#fafafa" opacity=".62"/><rect x="13.1" y="8" width="5.8" height="16" fill="#fafafa"/></svg></span>
+        <span style="font-size:15px;font-weight:600;letter-spacing:-.02em;color:var(--ink)">Polyptic</span>
+      </div>
+      <span style="font-size:13px;color:var(--muted2)">The open-source operator console for display walls.</span>
+      <span style="flex:1"></span>
+      <div style="display:flex;align-items:center;gap:22px;font-size:13.5px">
+        <a href="https://github.com/polyptic/polyptic" style="color:var(--muted);text-decoration:none" style-hover="color:var(--ink)">GitHub</a>
+        <a href="https://github.com/polyptic/polyptic" style="color:var(--muted);text-decoration:none" style-hover="color:var(--ink)">Docs</a>
+        <a href="https://github.com/polyptic/polyptic/issues" style="color:var(--muted);text-decoration:none" style-hover="color:var(--ink)">Issues</a>
+        <a href="https://github.com/polyptic/polyptic/blob/main/LICENSE" style="color:var(--muted);text-decoration:none" style-hover="color:var(--ink)">License</a>
+      </div>
+      <span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--faint)">MIT © {{ year }}</span>
+    </div>
+  </div>
+
+</div>
+
+<template id="__bundler_thumbnail" data-bg-color="#161618">
+  <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg">
+    <rect width="1200" height="800" fill="#161618"/>
+    <g transform="translate(600,400) scale(14)">
+      <polygon points="-9.4,-5 -3.7,-7.8 -3.7,7.8 -9.4,5" fill="#fafafa" opacity="0.62"/>
+      <polygon points="9.4,-5 3.7,-7.8 3.7,7.8 9.4,5" fill="#fafafa" opacity="0.62"/>
+      <rect x="-2.9" y="-8" width="5.8" height="16" fill="#fafafa"/>
+    </g>
+  </svg>
+</template></x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:2400},&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#2563eb&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;,&quot;options&quot;:[&quot;#2563eb&quot;,&quot;#0a0a0b&quot;,&quot;#7c3aed&quot;,&quot;#0d9488&quot;]},&quot;wallTone&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;Blue&quot;,&quot;options&quot;:[&quot;Blue&quot;,&quot;Slate&quot;,&quot;Graphite&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;heroSpeed&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;default&quot;:1,&quot;min&quot;:0.5,&quot;max&quot;:2,&quot;step&quot;:0.1,&quot;unit&quot;:&quot;\u00d7&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Hero animation&quot;}}">
+class Component extends DCLogic {
+  state = { snap: null, scale: 1, noTrans: false, identTarget: null, cardScene: 'Morning' };
+
+  pickScene(n){ this.setState({ cardScene: n }); }
+
+  ident(i){
+    this.setState({ identTarget: i });
+    clearTimeout(this._idt);
+    this._idt = setTimeout(() => this.setState({ identTarget: null }), 1700);
+  }
+
+  componentDidMount(){
+    this.applyTweaks();
+    this.cur = this.clone(this.INIT());
+    this.setState({ snap: this.cur }, () => { this.measure(); this.runStep(0); });
+    this._onResize = () => this.measure();
+    window.addEventListener('resize', this._onResize);
+  }
+  componentDidUpdate(){ this.applyTweaks(); }
+  componentWillUnmount(){
+    clearTimeout(this._t); clearTimeout(this._t2); clearTimeout(this._idt);
+    if(this._onResize) window.removeEventListener('resize', this._onResize);
+  }
+
+  measure(){
+    const el = this.stageEl; if(!el) return;
+    const s = Math.min(1, el.clientWidth / 1040);
+    if(Math.abs(s - (this.state.scale || 1)) > 0.004) this.setState({ scale: s });
+  }
+
+  clone(o){ return JSON.parse(JSON.stringify(o)); }
+  deepMerge(a, b){
+    const out = Array.isArray(a) ? a.slice() : Object.assign({}, a);
+    for(const k in b){
+      const v = b[k];
+      if(v && typeof v === 'object' && !Array.isArray(v) && a && typeof a[k] === 'object' && !Array.isArray(a[k])) out[k] = this.deepMerge(a[k], v);
+      else out[k] = v;
+    }
+    return out;
+  }
+
+  runStep(i){
+    const tl = this.tl();
+    const step = tl[i];
+    if(step.reset){
+      this.cur = this.clone(this.INIT());
+      this.setState({ snap: this.cur, noTrans: true });
+      clearTimeout(this._t2);
+      this._t2 = setTimeout(() => { this.setState({ noTrans: false }); this.scheduleNext(i, step); }, 60);
+      return;
+    }
+    if(step.patch){
+      const wasDown = this.cur.cursor.down;
+      this.cur = this.deepMerge(this.cur, step.patch);
+      if(!wasDown && this.cur.cursor.down) this._press = (this._press || 0) + 1;
+    }
+    this.setState({ snap: this.cur, noTrans: false });
+    this.scheduleNext(i, step);
+  }
+  scheduleNext(i, step){
+    const spd = this.props.heroSpeed || 1;
+    clearTimeout(this._t);
+    this._t = setTimeout(() => this.runStep((i + 1) % this.tl().length), (step.dur || 700) / spd);
+  }
+
+  applyTweaks(){
+    const el = this.rootEl;
+    if(!el) return;
+    const accent = this.props.accent || '#2563eb';
+    el.style.setProperty('--accent', accent);
+    // soft + line derived from accent
+    el.style.setProperty('--accent-soft', this.tint(accent, .92));
+    el.style.setProperty('--accent-line', this.tint(accent, .72));
+
+    const tones = {
+      Blue:     ['#e7eef9','#dae4f4'],
+      Slate:    ['#e8ebf0','#dbe0e8'],
+      Graphite: ['#e9e9ec','#dcdce1'],
+    };
+    const tone = tones[this.props.wallTone] || tones.Blue;
+    el.style.setProperty('--tileA', tone[0]);
+    el.style.setProperty('--tileB', tone[1]);
+
+    const spd = this.props.heroSpeed || 1;
+    el.querySelectorAll('[data-anim]').forEach(n => {
+      const base = parseFloat(n.getAttribute('data-dur'));
+      if(base) n.style.animationDuration = (base / spd) + 's';
+    });
+  }
+
+  // mix a hex toward white by amount (0..1)
+  tint(hex, amt){
+    const h = hex.replace('#','');
+    const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+    const mix = (c) => Math.round(c + (255 - c) * amt);
+    return 'rgb(' + mix(r) + ',' + mix(g) + ',' + mix(b) + ')';
+  }
+
+  INIT(){
+    return {
+      cursor: { x: 770, y: 522, down: false },
+      tiles: {
+        s1: { x: 360, y: 92,  vis: 1 }, s2: { x: 612, y: 74, vis: 1 }, s3: { x: 800, y: 168, vis: 1 },
+        s4: { x: 432, y: 372, vis: 1 }, s5: { x: 690, y: 358, vis: 1 },
+        s6: { x: 235, y: 60,  vis: 0 }, s7: { x: 235, y: 96, vis: 0 }
+      },
+      wallShown: false, wallContent: 'none', lobbyContent: 'none',
+      guides: [],
+      screens: { s06: 'hidden', lobby: 'hidden' },
+      sources: { kpi: 'idle', video: 'idle', map: 'idle' },
+      drag: { vis: false, label: '', x: 0, y: 0 },
+      scene: 'Morning',
+      caption: '5 screens connected'
+    };
+  }
+
+  tl(){
+    if(this._tl) return this._tl;
+    const W = { s1:[410,202], s2:[560,202], s3:[710,202], s4:[410,302], s5:[560,302], s6:[710,302] };
+    this._tl = [
+      { dur: 1100, patch: { caption: '5 screens connected' } },
+      { dur: 900,  patch: { screens: { s06: 'new' }, caption: 'New screen detected' } },
+      { dur: 700,  patch: { cursor: { x: 112, y: 92 } } },
+      { dur: 360,  patch: { cursor: { down: true }, screens: { s06: 'grabbed' }, tiles: { s6: { vis: 1, x: 235, y: 60 } } } },
+      { dur: 1000, patch: { cursor: { x: 560, y: 168 }, tiles: { s6: { x: 528, y: 142 } }, guides: [ { t:'v', p:612, a:60, b:470 }, { t:'h', p:168, a:235, b:900 } ], caption: 'Dragging onto the canvas' } },
+      { dur: 520,  patch: { cursor: { down: false }, screens: { s06: 'idle' }, guides: [], caption: '6 screens placed' } },
+      { dur: 720,  patch: { cursor: { x: 600, y: 300 }, caption: 'Snap into a mural' } },
+      { dur: 280,  patch: { guides: [ { t:'v', p:560, a:202, b:402 }, { t:'v', p:710, a:202, b:402 }, { t:'h', p:302, a:410, b:860 } ] } },
+      { dur: 1000, patch: { tiles: { s1:{x:W.s1[0],y:W.s1[1]}, s2:{x:W.s2[0],y:W.s2[1]}, s3:{x:W.s3[0],y:W.s3[1]}, s4:{x:W.s4[0],y:W.s4[1]}, s5:{x:W.s5[0],y:W.s5[1]}, s6:{x:W.s6[0],y:W.s6[1]} }, wallShown: true, caption: 'Mural · 6 screens aligned' } },
+      { dur: 480,  patch: { guides: [] } },
+      { dur: 760,  patch: { cursor: { x: 112, y: 209 }, caption: 'Assign a content source' } },
+      { dur: 360,  patch: { cursor: { down: true }, sources: { kpi: 'grabbed' }, drag: { vis: true, label: 'KPI Dashboard', x: 130, y: 209 } } },
+      { dur: 950,  patch: { cursor: { x: 600, y: 292 }, drag: { x: 600, y: 292 } } },
+      { dur: 520,  patch: { cursor: { down: false }, sources: { kpi: 'idle' }, drag: { vis: false }, wallContent: 'kpi', caption: 'KPI dashboard, spanning the wall' } },
+      { dur: 900,  patch: { screens: { lobby: 'new' }, caption: 'New screen: lobby-side' } },
+      { dur: 680,  patch: { cursor: { x: 112, y: 124 } } },
+      { dur: 360,  patch: { cursor: { down: true }, screens: { lobby: 'grabbed' }, tiles: { s7: { vis: 1, x: 235, y: 96 } } } },
+      { dur: 1000, patch: { cursor: { x: 332, y: 452 }, tiles: { s7: { x: 300, y: 430 } }, caption: 'Placed on its own' } },
+      { dur: 480,  patch: { cursor: { down: false }, screens: { lobby: 'idle' } } },
+      { dur: 720,  patch: { cursor: { x: 112, y: 243 }, caption: 'Assign a content source' } },
+      { dur: 360,  patch: { cursor: { down: true }, sources: { video: 'grabbed' }, drag: { vis: true, label: 'Welcome Video', x: 130, y: 243 } } },
+      { dur: 900,  patch: { cursor: { x: 360, y: 470 }, drag: { x: 360, y: 470 } } },
+      { dur: 520,  patch: { cursor: { down: false }, sources: { video: 'idle' }, drag: { vis: false }, lobbyContent: 'video', caption: 'Welcome video assigned' } },
+      { dur: 820,  patch: { cursor: { x: 520, y: 23 }, caption: 'Switch the scene' } },
+      { dur: 360,  patch: { cursor: { down: true } } },
+      { dur: 420,  patch: { cursor: { down: false }, scene: 'Visitor Tour' } },
+      { dur: 1000, patch: { wallContent: 'video', lobbyContent: 'map', caption: 'Scene applied · whole wall changes' } },
+      { dur: 1900, patch: { cursor: { x: 770, y: 522 }, caption: 'Scene · Visitor Tour' } },
+      { reset: true }
+    ];
+    return this._tl;
+  }
+
+  // ---------- stage rendering ----------
+  buildStage(snap, s){
+    const h = React.createElement;
+    const el = (style, ...kids) => h('div', { style }, ...kids);
+    const TW = 150, TH = 100;
+    const tex = 'repeating-linear-gradient(135deg,var(--tileA) 0 12px,var(--tileB) 12px 24px)';
+    const tileTrans = snap.noTrans ? 'none' : 'left .8s cubic-bezier(.34,1.25,.5,1),top .8s cubic-bezier(.34,1.25,.5,1),opacity .4s ease';
+    const cursorTrans = snap.noTrans ? 'none' : 'left .68s cubic-bezier(.4,0,.2,1),top .68s cubic-bezier(.4,0,.2,1)';
+    const kids = [];
+
+    // dotted canvas bg
+    kids.push(el({ position:'absolute', left:220, top:46, right:0, bottom:0, background:'#fbfcfd', backgroundImage:'radial-gradient(#e2e6ee 1px,transparent 1px)', backgroundSize:'22px 22px' }));
+
+    // sidebar panel
+    kids.push(el({ position:'absolute', left:0, top:46, width:220, bottom:0, background:'#f5f6f9', borderRight:'1px solid var(--line)' }));
+
+    // sidebar labels
+    const slabel = (top, txt) => el({ position:'absolute', left:18, top, fontFamily:"'Geist Mono',monospace", fontSize:10, letterSpacing:'1.6px', color:'var(--muted2)' }, txt);
+    kids.push(slabel(58, 'SCREENS'));
+    kids.push(slabel(170, 'SOURCES'));
+
+    // sidebar rows
+    const row = (top, state, icon, label) => {
+      const glow = state === 'new' ? 'newGlow 1.4s ease infinite' : 'none';
+      const border = state === 'new' ? '1px solid var(--accent-line)' : '1px solid var(--line2)';
+      return el({ position:'absolute', left:12, top, width:196, height:28, display:'flex', alignItems:'center', gap:8, padding:'0 9px',
+        background:'#fff', border, borderRadius:7, opacity: state === 'grabbed' ? 0.35 : 1, animation: glow,
+        transition: snap.noTrans ? 'none' : 'opacity .3s ease' },
+        icon, h('span', { style:{ fontSize:12, fontWeight:500, color:'var(--ink2)' } }, label));
+    };
+    const monIcon = (color) => h('div', { style:{ width:15, height:11, borderRadius:2, border:'1.4px solid '+(color||'var(--muted2)') } });
+    const srcIcon = (glyph) => h('div', { style:{ width:16, height:16, borderRadius:4, background:'var(--accent-soft)', color:'var(--accent)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:10 } }, glyph);
+    if(snap.screens.s06 !== 'hidden') kids.push(row(80, snap.screens.s06, monIcon('var(--accent)'), 'screen-06'));
+    if(snap.screens.lobby !== 'hidden') kids.push(row(112, snap.screens.lobby, monIcon('var(--accent)'), 'lobby-side'));
+    kids.push(row(196, snap.sources.kpi, srcIcon('▦'), 'KPI Dashboard'));
+    kids.push(row(230, snap.sources.video, srcIcon('▶'), 'Welcome Video'));
+    kids.push(row(264, snap.sources.map, srcIcon('◍'), 'Lobby Map'));
+
+    // tiles
+    const tile = (id, label) => {
+      const t = snap.tiles[id];
+      return h('div', { key:id, style:{ position:'absolute', left:t.x, top:t.y, width:TW, height:TH, borderRadius:6, background:tex,
+        border:'1px solid rgba(2,6,23,.09)', boxShadow:'0 6px 16px rgba(16,24,40,.13)', opacity:t.vis?1:0, transition:tileTrans, overflow:'hidden' } },
+        h('div', { style:{ position:'absolute', top:6, left:7, fontFamily:"'Geist Mono',monospace", fontSize:8, letterSpacing:'.5px',
+          color:'rgba(2,6,23,.42)', background:'rgba(255,255,255,.72)', padding:'1px 4px', borderRadius:3 } }, label));
+    };
+    ['s1','s2','s3','s4','s5','s6'].forEach((id,i) => kids.push(tile(id, 'S'+(i+1))));
+    kids.push(tile('s7', 'L'));
+
+    // wall overlay (spanning content)
+    kids.push(this.wallEl(h, snap));
+
+    // lobby content overlay
+    kids.push(this.lobbyEl(h, snap, tileTrans));
+
+    // guides
+    snap.guides.forEach((g, i) => {
+      if(g.t === 'v') kids.push(h('div', { key:'g'+i, style:{ position:'absolute', left:g.p, top:g.a, width:0, height:g.b-g.a, borderLeft:'1.6px dashed var(--accent)' } }));
+      else kids.push(h('div', { key:'g'+i, style:{ position:'absolute', left:g.a, top:g.p, height:0, width:g.b-g.a, borderTop:'1.6px dashed var(--accent)' } }));
+    });
+
+    // caption pill
+    kids.push(h('div', { style:{ position:'absolute', right:14, bottom:14, display:'flex', alignItems:'center', gap:8, padding:'7px 13px',
+      background:'rgba(255,255,255,.94)', border:'1px solid var(--line2)', borderRadius:9, boxShadow:'0 4px 14px rgba(16,24,40,.1)',
+      fontFamily:"'Geist Mono',monospace", fontSize:11.5, color:'var(--ink2)' } },
+      h('span', { style:{ width:7, height:7, borderRadius:'50%', background:'var(--accent)' } }), snap.caption));
+
+    // toolbar (drawn above canvas)
+    kids.push(this.toolbarEl(h, snap));
+
+    // drag ghost
+    kids.push(h('div', { style:{ position:'absolute', left:snap.drag.x, top:snap.drag.y, display:'flex', alignItems:'center', gap:8, padding:'7px 12px',
+      background:'rgba(255,255,255,.96)', border:'1px solid var(--accent)', borderRadius:8, boxShadow:'0 10px 24px rgba(37,99,235,.25)',
+      fontSize:12, fontWeight:600, color:'var(--accent)', transform:'rotate(-2deg)', transformOrigin:'top left', pointerEvents:'none',
+      opacity:snap.drag.vis?1:0, transition: snap.noTrans ? 'none' : 'left .85s cubic-bezier(.4,0,.2,1),top .85s cubic-bezier(.4,0,.2,1),opacity .25s ease', zIndex:70 } },
+      h('span', { style:{ width:16, height:16, borderRadius:4, background:'var(--accent-soft)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:9 } }, '▦'),
+      snap.drag.label));
+
+    // cursor
+    const cur = [ h('svg', { key:'p', width:24, height:24, viewBox:'0 0 24 24', style:{ filter:'drop-shadow(0 2px 3px rgba(0,0,0,.3))' } },
+      h('path', { d:'M5 3l14 7-6 1.6 3.4 6.2-2.6 1.4-3.4-6.2L5 21z', fill:'#fff', stroke:'#0a0a0b', strokeWidth:1.4, strokeLinejoin:'round' }) ) ];
+    if(snap.cursor.down) cur.push(h('div', { key:'ring'+(this._press||0), style:{ position:'absolute', left:-9, top:-9, width:30, height:30, borderRadius:'50%', border:'2px solid var(--accent)', animation:'clickRing .45s ease-out forwards' } }));
+    kids.push(h('div', { style:{ position:'absolute', left:snap.cursor.x, top:snap.cursor.y, transition:cursorTrans, zIndex:80, pointerEvents:'none' } }, ...cur));
+
+    const layer = h('div', { style:{ width:1040, height:560, position:'relative', transformOrigin:'top left', transform:'scale('+s+')', background:'var(--surface)', overflow:'hidden' } }, ...kids);
+    return h('div', { style:{ position:'absolute', top:0, left:'50%', marginLeft:-(1040*s/2), width:1040*s, height:560*s } }, layer);
+  }
+
+  toolbarEl(h){
+    const snap = this.state.snap;
+    const tab = (name) => {
+      const on = snap.scene === name;
+      return h('div', { key:name, style:{ display:'flex', alignItems:'center', gap:6, padding:'5px 11px', borderRadius:7, fontSize:12, fontWeight:600,
+        background: on ? 'var(--accent-soft)' : 'transparent', border:'1px solid '+(on ? 'var(--accent-line)' : 'var(--line2)'), color: on ? 'var(--accent)' : 'var(--muted)',
+        transition:'all .3s ease' } },
+        on ? h('span', { style:{ width:6, height:6, borderRadius:'50%', background:'var(--accent)' } }) : null, name);
+    };
+    return h('div', { style:{ position:'absolute', top:0, left:0, width:1040, height:46, display:'flex', alignItems:'center', gap:11, padding:'0 16px',
+      background:'var(--surface)', borderBottom:'1px solid var(--line)', boxSizing:'border-box', zIndex:50 } },
+      h('div', { style:{ width:22, height:22, borderRadius:7, background:'#161618', display:'flex', alignItems:'center', justifyContent:'center', flex:'0 0 auto' } },
+        h('svg', { width:14, height:14, viewBox:'0 0 32 32' },
+          h('polygon', { points:'6.6,11 12.3,8.2 12.3,23.8 6.6,21', fill:'#fafafa', opacity:.62 }),
+          h('polygon', { points:'25.4,11 19.7,8.2 19.7,23.8 25.4,21', fill:'#fafafa', opacity:.62 }),
+          h('rect', { x:13.1, y:8, width:5.8, height:16, fill:'#fafafa' }))),
+      h('span', { style:{ fontSize:13, fontWeight:600, color:'var(--ink2)' } }, 'Reception Mural'),
+      h('span', { style:{ color:'var(--faint)', fontSize:11 } }, '▾'),
+      h('div', { style:{ position:'absolute', left:'50%', transform:'translateX(-50%)', display:'flex', alignItems:'center', gap:7 } },
+        tab('Morning'), tab('Visitor Tour'), tab('Night')),
+      h('span', { style:{ flex:1 } }),
+      h('span', { style:{ display:'flex', alignItems:'center', gap:7, fontFamily:"'Geist Mono',monospace", fontSize:11.5, color:'var(--muted)' } },
+        h('span', { style:{ width:7, height:7, borderRadius:'50%', background:'var(--ok)', animation:'ppulse 2s infinite' } }), 'realtime'),
+      h('span', { style:{ fontFamily:"'Geist Mono',monospace", fontSize:11.5, color:'var(--muted)' } }, '7 screens · ', h('span', { style:{ color:'var(--ok)' } }, 'all healthy')));
+  }
+
+  wallEl(h){
+    const snap = this.state.snap;
+    const X = 410, Y = 202, Wd = 450, Ht = 200;
+    const trans = snap.noTrans ? 'none' : 'opacity .5s ease';
+    const inner = [];
+    // content
+    if(snap.wallContent === 'kpi') inner.push(this.kpiContent(h));
+    else if(snap.wallContent === 'video') inner.push(this.videoContent(h, 'KPI Wall', 30));
+    // seams
+    inner.push(h('div', { key:'sv1', style:{ position:'absolute', left:Wd/3, top:0, bottom:0, width:1, background:'rgba(2,6,23,.10)' } }));
+    inner.push(h('div', { key:'sv2', style:{ position:'absolute', left:2*Wd/3, top:0, bottom:0, width:1, background:'rgba(2,6,23,.10)' } }));
+    inner.push(h('div', { key:'sh1', style:{ position:'absolute', top:Ht/2, left:0, right:0, height:1, background:'rgba(2,6,23,.10)' } }));
+    const box = h('div', { key:'wallbox', style:{ position:'absolute', left:X, top:Y, width:Wd, height:Ht, borderRadius:6, overflow:'hidden',
+      opacity:snap.wallShown?1:0, transition:trans, boxShadow:snap.wallShown?'0 10px 30px rgba(16,24,40,.16)':'none', pointerEvents:'none' } }, ...inner);
+    const label = h('div', { key:'walllabel', style:{ position:'absolute', left:X+12, top:Y+12, display:'flex', alignItems:'center', gap:7,
+      background:'rgba(255,255,255,.94)', padding:'4px 9px', borderRadius:7, boxShadow:'0 1px 4px rgba(16,24,40,.14)',
+      opacity:snap.wallShown?1:0, transition:trans } },
+      h('span', { style:{ width:6, height:6, borderRadius:'50%', background:'var(--ok)' } }),
+      h('span', { style:{ fontSize:11, fontWeight:600, color:'var(--ink2)' } }, 'Atrium Wall'),
+      h('span', { style:{ fontFamily:"'Geist Mono',monospace", fontSize:9, color:'var(--muted2)' } }, 'live'));
+    return h('div', { key:'wallwrap' }, box, label);
+  }
+
+  kpiContent(h){
+    const stat = (label, val, delta) => h('div', { style:{ display:'flex', flexDirection:'column', gap:2 } },
+      h('span', { style:{ fontFamily:"'Geist Mono',monospace", fontSize:9, letterSpacing:'.5px', color:'var(--muted2)', textTransform:'uppercase' } }, label),
+      h('span', { style:{ fontSize:26, fontWeight:700, letterSpacing:'-.02em', color:'var(--ink)' } }, val),
+      h('span', { style:{ fontSize:10, fontWeight:600, color:'var(--ok)' } }, delta));
+    const bars = [38,54,46,68,60,82,72,90,78].map((bh,i) => h('div', { key:i, style:{ flex:1, height:bh+'%', borderRadius:'3px 3px 0 0',
+      background:'linear-gradient(180deg,var(--accent),#7da5ff)' } }));
+    return h('div', { key:'kpi', style:{ position:'absolute', inset:0, background:'linear-gradient(180deg,#ffffff,#eef3fb)', padding:'15px 20px', display:'flex', flexDirection:'column' } },
+      h('div', { style:{ display:'flex', alignItems:'center', justifyContent:'flex-end' } },
+        h('span', { style:{ fontFamily:"'Geist Mono',monospace", fontSize:9, color:'var(--muted2)' } }, 'UPDATED 2s AGO')),
+      h('div', { style:{ display:'flex', gap:30, marginTop:13 } }, stat('Visitors today','12,480','+8.2%'), stat('Avg dwell','4m 12s','+0.6%'), stat('On site now','326','live')),
+      h('div', { style:{ flex:1, display:'flex', alignItems:'flex-end', gap:9, marginTop:14 } }, ...bars));
+  }
+
+  videoContent(h, title, playSize){
+    return h('div', { key:'vid', style:{ position:'absolute', inset:0, background:'radial-gradient(circle at 50% 38%,#222c3a,#0b0e13)', display:'flex', alignItems:'center', justifyContent:'center' } },
+      h('div', { style:{ position:'absolute', top:14, left:18, fontFamily:"'Geist Mono',monospace", fontSize:10, letterSpacing:'2px', color:'rgba(255,255,255,.55)' } }, 'WELCOME'),
+      h('div', { style:{ width:playSize*1.6, height:playSize*1.6, borderRadius:'50%', background:'rgba(255,255,255,.14)', border:'1.5px solid rgba(255,255,255,.4)', display:'flex', alignItems:'center', justifyContent:'center' } },
+        h('div', { style:{ width:0, height:0, borderTop:(playSize*0.32)+'px solid transparent', borderBottom:(playSize*0.32)+'px solid transparent', borderLeft:(playSize*0.5)+'px solid #fff', marginLeft:playSize*0.16 } })),
+      h('div', { style:{ position:'absolute', left:18, right:18, bottom:16, height:3, borderRadius:2, background:'rgba(255,255,255,.2)' } },
+        h('div', { style:{ width:'42%', height:'100%', borderRadius:2, background:'var(--accent)' } })));
+  }
+
+  mapContent(h){
+    return h('div', { key:'map', style:{ position:'absolute', inset:0, background:'#e9eef3', overflow:'hidden' } },
+      h('div', { style:{ position:'absolute', left:'-10%', top:'30%', width:'120%', height:8, background:'#fff', transform:'rotate(-8deg)' } }),
+      h('div', { style:{ position:'absolute', left:'20%', top:'-10%', width:7, height:'120%', background:'#fff', transform:'rotate(6deg)' } }),
+      h('div', { style:{ position:'absolute', left:'55%', top:'-10%', width:5, height:'120%', background:'#dde4ec', transform:'rotate(6deg)' } }),
+      h('div', { style:{ position:'absolute', left:8, top:7, fontFamily:"'Geist Mono',monospace", fontSize:9, letterSpacing:'1px', color:'var(--muted)' } }, 'LOBBY MAP'),
+      h('div', { style:{ position:'absolute', left:'46%', top:'42%', width:14, height:14, borderRadius:'50% 50% 50% 0', background:'var(--accent)', transform:'rotate(-45deg)', boxShadow:'0 2px 6px rgba(0,0,0,.25)' } }));
+  }
+
+  lobbyEl(h, snap, tileTrans){
+    const t = snap.tiles.s7;
+    if(!t.vis || snap.lobbyContent === 'none') return h('div', { key:'lobbywrap' });
+    const inner = snap.lobbyContent === 'video' ? this.videoContent(h, 'Welcome', 16) : this.mapContent(h);
+    const box = h('div', { key:'lobbybox', style:{ position:'absolute', left:t.x, top:t.y, width:150, height:100, borderRadius:6, overflow:'hidden',
+      border:'1px solid rgba(2,6,23,.09)', boxShadow:'0 6px 16px rgba(16,24,40,.13)', transition:tileTrans } }, inner);
+    const label = h('div', { key:'lobbylabel', style:{ position:'absolute', left:t.x+9, top:t.y+9, display:'flex', alignItems:'center', gap:6,
+      background:'rgba(255,255,255,.94)', padding:'3px 8px', borderRadius:6, boxShadow:'0 1px 4px rgba(16,24,40,.14)', transition:tileTrans } },
+      h('span', { style:{ width:5, height:5, borderRadius:'50%', background:'var(--ok)' } }),
+      h('span', { style:{ fontSize:10, fontWeight:600, color:'var(--ink2)' } }, 'Lobby-Side'));
+    return h('div', { key:'lobbywrap' }, box, label);
+  }
+
+  renderVals(){
+    const snap = this.state.snap;
+    const scale = this.state.scale || 1;
+    const SCENES = {
+      'Morning': [
+        { label:'WELCOME', sub:'Good morning', bg:'linear-gradient(160deg,#eaf1fc,#d9e6f8)', fg:'#1a2b45' },
+        { label:'AGENDA',  sub:'9:00 Standup', bg:'#ffffff', fg:'#27272a' },
+        { label:'LOBBY',   sub:'12 checked in', bg:'linear-gradient(160deg,#f2f6fb,#e6eef8)', fg:'#1a2b45' }
+      ],
+      'Visitor Tour': [
+        { label:'TOUR', sub:'This way →', bg:'linear-gradient(160deg,var(--accent),#1e54c4)', fg:'#ffffff' },
+        { label:'MAP',  sub:'You are here', bg:'#e6edf4', fg:'#1a2b45' },
+        { label:'▶ FILM', sub:'Welcome', bg:'radial-gradient(circle at 50% 38%,#222c3a,#0b0e13)', fg:'#ffffff' }
+      ],
+      'Night': [
+        { label:'CLOSED',  sub:'Back at 8:00', bg:'#15171c', fg:'#9aa3b2' },
+        { label:'CLOCK',   sub:'23:40', bg:'#101216', fg:'#cdd3dd' },
+        { label:'STANDBY', sub:'Dimmed', bg:'#0c0e12', fg:'#5b616d' }
+      ]
+    };
+    const cs = this.state.cardScene || 'Morning';
+    const sceneChips = ['Morning','Visitor Tour','Night'].map((n) => ({
+      name: n,
+      active: n === cs,
+      inactive: n !== cs,
+      fn: () => this.pickScene(n)
+    }));
+    return {
+      sceneTiles: SCENES[cs],
+      sceneChips: sceneChips,
+      rootRef: (el) => { this.rootEl = el; },
+      stageRef: (el) => { this.stageEl = el; if(el) this.measure(); },
+      frameH: Math.round(560 * scale) + 'px',
+      stage: snap ? this.buildStage(snap, scale) : null,
+      ident0: this.state.identTarget === 0,
+      ident1: this.state.identTarget === 1,
+      identA: () => this.ident(0),
+      identB: () => this.ident(1),
+      year: new Date().getFullYear(),
+    };
+  }
+}
+</script>
+</body>
+</html>
