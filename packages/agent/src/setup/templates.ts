@@ -203,8 +203,11 @@ seat * hide_cursor 5000     # hide the pointer; no operator stands at the panel
 # IPC (Wayland forbids client self-positioning — --window-position is a no-op).
 
 ### Hand off to the systemd user session, which supervises polyptic-agent (Restart=always).
-exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR
-exec dbus-update-activation-environment --systemd WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP
+# LIBGL_ALWAYS_SOFTWARE is imported so the kiosk browser inherits the launcher's software-GL choice
+# on a 3D-less GPU (else WebKit/Chromium tries hardware GL and dies with no window). Unset on a real
+# GPU, so this is a no-op there — never forces software rendering on hardware that can do GL.
+exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR LIBGL_ALWAYS_SOFTWARE
+exec dbus-update-activation-environment --systemd WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP LIBGL_ALWAYS_SOFTWARE
 exec systemctl --user start ${p.sessionTarget}
 `;
 }
@@ -249,8 +252,8 @@ exec_always --no-startup-id xset s off -dpms s noblank
 exec_always --no-startup-id unclutter -idle 3
 
 ### Hand off to the systemd user session (supervises polyptic-agent, Restart=always).
-exec_always --no-startup-id systemctl --user import-environment DISPLAY XAUTHORITY
-exec_always --no-startup-id dbus-update-activation-environment --systemd DISPLAY XAUTHORITY
+exec_always --no-startup-id systemctl --user import-environment DISPLAY XAUTHORITY LIBGL_ALWAYS_SOFTWARE
+exec_always --no-startup-id dbus-update-activation-environment --systemd DISPLAY XAUTHORITY LIBGL_ALWAYS_SOFTWARE
 exec_always --no-startup-id systemctl --user start ${p.sessionTarget}
 `;
 }
