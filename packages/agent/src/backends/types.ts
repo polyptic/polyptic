@@ -15,6 +15,15 @@ export interface DisplayBackend {
   /** Which `DisplayBackend` enum value this implementation reports in `agent/hello`. */
   readonly id: BackendId;
 
+  /**
+   * Ask the compositor for its REAL output/connector names (the agent sits right next to it), so a
+   * machine self-describes its screens and an operator never hand-configures connector names.
+   * Returns the live names (e.g. sway `get_outputs`, xrandr connected+active), or `null` when this
+   * backend has no compositor to ask (dev-open) or the query is unavailable/errors. An empty array
+   * means "asked, none yet" (caller may retry while the compositor warms up).
+   */
+  discoverOutputs(): Promise<string[] | null>;
+
   /** Place/point a player at `url` on the given output `connector`. Idempotent per (connector,url). */
   showScreen(connector: string, url: string): Promise<void>;
 

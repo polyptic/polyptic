@@ -153,6 +153,21 @@ export class SwayBackend implements DisplayBackend {
     return this.browserBin;
   }
 
+  /**
+   * Real output names as reported by the live compositor (`swaymsg -t get_outputs`), for the
+   * agent to advertise on `agent/hello`. Returns the names (possibly `[]` if sway is up but has no
+   * outputs yet — the caller may retry), or `null` if swaymsg is unavailable / the query errors.
+   */
+  async discoverOutputs(): Promise<string[] | null> {
+    if (!(await which("swaymsg"))) return null;
+    try {
+      return await this.getOutputs();
+    } catch (err) {
+      this.log(`discoverOutputs: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
   /** Names of sway's connected outputs (validates connectors; surfaces a clear error). */
   private async getOutputs(): Promise<string[]> {
     const res = await run("swaymsg", ["-r", "-t", "get_outputs"]);

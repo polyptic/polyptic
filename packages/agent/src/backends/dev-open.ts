@@ -15,6 +15,11 @@ const run = promisify(execFile);
 export class DevOpenBackend implements DisplayBackend {
   readonly id = "dev-open" as const;
 
+  async discoverOutputs(): Promise<string[] | null> {
+    // No compositor to interrogate in dev; the agent advertises the configured/default connector.
+    return null;
+  }
+
   async showScreen(connector: string, url: string): Promise<void> {
     const opener =
       process.platform === "darwin"

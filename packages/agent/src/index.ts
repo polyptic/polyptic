@@ -23,6 +23,16 @@
  *     the agent advertises the single default output (POLYPTIC_CONNECTOR or the default connector),
  *     exactly as before.
  *
+ * Output auto-discovery — advertise the compositor's REAL outputs:
+ *   - The agent sits right next to the compositor, so by default it ASKS it which outputs exist
+ *     (`DisplayBackend.discoverOutputs()` → sway `get_outputs` / xrandr) and advertises THOSE real
+ *     connector names — retrying briefly because sway may still be warming up at hello time. This
+ *     means an operator never hand-configures connector names and the control plane never targets a
+ *     connector that doesn't exist (e.g. the guessed "HDMI-1" vs QEMU's actual "Virtual-1").
+ *   - `POLYPTIC_OUTPUTS` / a non-empty `POLYPTIC_CONNECTOR` remain an explicit OVERRIDE/pin: when set
+ *     they are honoured verbatim (the Phase 3c multi-output dev path is unchanged). dev-open (no
+ *     compositor) and any failed discovery fall back to the configured/default connector, as before.
+ *
  * Phase 2b — enrollment + durable credential (app-level identity; mTLS is a later layer):
  *   - `POLYPTIC_BOOTSTRAP_TOKEN` (if set) is sent on `agent/hello` for first-contact enrollment.
  *   - A durable per-machine `credential` is persisted locally (see ./credential.ts) and presented
@@ -133,6 +143,90 @@ function resolveOutputs(defaultConnector: string): Output[] {
     if (outputs.length > 0) return outputs;
   }
   return [{ connector: defaultConnector, width: 1920, height: 1080 }];
+}
+
+/** Geometry advertised for a discovered output whose exact mode we don't (yet) re-query. */
+const DISCOVERED_OUTPUT_WIDTH = 1920;
+const DISCOVERED_OUTPUT_HEIGHT = 1080;
+/** Short retry while the compositor (launched alongside the agent) finishes warming up (~5s). */
+const DISCOVERY_ATTEMPTS = 5;
+const DISCOVERY_RETRY_MS = 1_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Has the operator/dev pinned the advertised outputs explicitly? `POLYPTIC_OUTPUTS` (any value,
+ * including the Phase 3c multi-output dev path) or a non-empty `POLYPTIC_CONNECTOR` is treated as an
+ * OVERRIDE and honoured verbatim — discovery is then skipped so behaviour is exactly as before.
+ */
+function hasExplicitOutputOverride(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.POLYPTIC_OUTPUTS !== undefined) return true;
+  const connector = env.POLYPTIC_CONNECTOR?.trim();
+  return connector !== undefined && connector.length > 0;
+}
+
+/**
+ * Ask the backend's compositor what outputs really exist, retrying briefly: the agent is launched
+ * by sway, but sway may still be warming up at hello time. Returns the real connector names, or
+ * `null` if every attempt yielded nothing (compositor unavailable / no outputs).
+ */
+async function discoverOutputsWithRetry(backend: DisplayBackend): Promise<string[] | null> {
+  for (let attempt = 1; attempt <= DISCOVERY_ATTEMPTS; attempt++) {
+    let names: string[] | null = null;
+    try {
+      names = await backend.discoverOutputs();
+    } catch (err) {
+      log(`output discovery attempt ${attempt}/${DISCOVERY_ATTEMPTS} errored: ${(err as Error).message}`);
+    }
+    if (names && names.length > 0) return names;
+    if (attempt < DISCOVERY_ATTEMPTS) await sleep(DISCOVERY_RETRY_MS);
+  }
+  return null;
+}
+
+/**
+ * The outputs to advertise on `agent/hello`, in priority order:
+ *   1. Explicit override (`POLYPTIC_OUTPUTS` / non-empty `POLYPTIC_CONNECTOR`) → honoured verbatim
+ *      (Phase 2a/3c behaviour, unchanged).
+ *   2. Otherwise PREFER discovery: ask the selected (real) backend for the compositor's REAL output
+ *      names — with a short retry while it warms up — and advertise those.
+ *   3. Otherwise (dev-open / discovery unavailable / all retries failed) → the configured/default
+ *      single connector, exactly as before.
+ */
+async function resolveAdvertisedOutputs(
+  backend: DisplayBackend,
+  defaultConnector: string,
+): Promise<Output[]> {
+  if (hasExplicitOutputOverride()) {
+    const outputs = resolveOutputs(defaultConnector);
+    log(
+      `advertising ${outputs.length} explicitly configured output(s): ${outputs
+        .map((o) => o.connector)
+        .join(", ")}`,
+    );
+    return outputs;
+  }
+
+  // Only a real backend sits next to a compositor we can interrogate. dev-open has none, so skip the
+  // (retrying) discovery entirely and advertise the configured/default connector — keeping dev
+  // startup instant.
+  if (backend.id !== "dev-open") {
+    const discovered = await discoverOutputsWithRetry(backend);
+    if (discovered && discovered.length > 0) {
+      log(`advertising ${discovered.length} discovered output(s): ${discovered.join(", ")}`);
+      return discovered.map((connector) => ({
+        connector,
+        width: DISCOVERED_OUTPUT_WIDTH,
+        height: DISCOVERED_OUTPUT_HEIGHT,
+      }));
+    }
+  }
+
+  const outputs = resolveOutputs(defaultConnector);
+  log(`no compositor outputs discovered; using configured/default connector ${defaultConnector}`);
+  return outputs;
 }
 
 /** The operator-configured enrollment secret, if any (server GATED mode). */
@@ -489,7 +583,7 @@ class Agent {
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 
-function main(): void {
+async function main(): Promise<void> {
   // Subcommand dispatch: `polyptic-agent setup …` provisions/tears down the on-device stack
   // (greetd autologin → sway → systemd-supervised agent → Chromium-per-output). The setup CLI and
   // its (heavier) provisioning machinery are loaded lazily so the normal agent boot path never pays
@@ -507,9 +601,10 @@ function main(): void {
 
   const machineId = readMachineId();
   const connector = resolveConnector();
-  const outputs = resolveOutputs(connector);
   const agentVersion = readAgentVersion();
   const backend = selectBackend();
+  // Prefer the compositor's REAL outputs over a guessed default (unless explicitly overridden).
+  const outputs = await resolveAdvertisedOutputs(backend, connector);
   const bootstrapToken = readBootstrapToken();
   const credential = loadCredential(machineId);
 
@@ -544,4 +639,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err) => {
+  logError(`fatal: ${(err as Error).message}`);
+  process.exit(1);
+});

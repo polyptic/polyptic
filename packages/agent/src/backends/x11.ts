@@ -96,6 +96,21 @@ export class X11Backend implements DisplayBackend {
   }
 
   /**
+   * Real output names as reported by X (`xrandr --query`): the connected outputs with an active
+   * mode, for the agent to advertise on `agent/hello`. Returns the names (possibly `[]` if X is up
+   * but nothing is enabled yet — the caller may retry), or `null` if xrandr is unavailable / errors.
+   */
+  async discoverOutputs(): Promise<string[] | null> {
+    if (!(await which("xrandr"))) return null;
+    const res = await run("xrandr", ["--query"]);
+    if (res.code !== 0) {
+      this.log(`discoverOutputs: xrandr --query failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+      return null;
+    }
+    return parseXrandrOutputs(res.stdout);
+  }
+
+  /**
    * Resolve the requested `connector` to a real X11 output + its geometry via `xrandr`.
    * Exact matches pass through. For a single-output host (e.g. QEMU/virtio-gpu where the agent
    * advertised "HDMI-1" but the only enabled output is "Virtual-1"), fall back to that sole
