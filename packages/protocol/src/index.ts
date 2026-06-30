@@ -342,6 +342,9 @@ export const VideoWall = z.object({
   id: z.string(),
   muralId: z.string(),
   memberScreenIds: z.array(z.string()).min(2),
+  /** Operator-given name (e.g. "Atrium Wall"). Optional for back-compat with walls stored before
+   *  naming existed; the console falls back to a member-derived label when absent. */
+  name: z.string().min(1).max(80).optional(),
 });
 export type VideoWall = z.infer<typeof VideoWall>;
 
@@ -453,8 +456,13 @@ export type PlaceScreenBody = z.infer<typeof PlaceScreenBody>;
 export const CombineScreensBody = z.object({
   muralId: z.string(),
   memberScreenIds: z.array(z.string()).min(2),
+  name: z.string().min(1).max(80).optional(), // optional name at creation; else a default is derived
 });
 export type CombineScreensBody = z.infer<typeof CombineScreensBody>;
+
+/** Rename a combined surface (video wall). */
+export const RenameVideoWallBody = z.object({ name: z.string().min(1).max(80) });
+export type RenameVideoWallBody = z.infer<typeof RenameVideoWallBody>;
 
 /** Assign content to a single screen OR a video wall (it spans across members): either a library
  *  source (`sourceId`) or an ad-hoc link (`url`). Exactly one of the two. */
