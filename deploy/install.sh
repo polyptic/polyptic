@@ -161,7 +161,9 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 
 case "$BASE" in
-  "{{POLYPTIC_BASE}}"|"")
+  # Empty, or still-unsubstituted (leftover `{{…}}` — the server replaces the exact `{{POLYPTIC_BASE}}`
+  # token, so checking for bare braces here survives substitution where matching the token wouldn't).
+  ""|*'{{'*)
     die "control-plane base URL is unset. Pipe this script from the server (GET /install bakes it
      in), or set POLYPTIC_BASE=http://your-server:8080 explicitly." ;;
   http://*|https://*) : ;;
