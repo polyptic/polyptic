@@ -70,8 +70,11 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
 const ARCH_RE = /^(arm64|amd64)$/;
 /** A distro slug: `<id>` or `<id>-<version>` (e.g. `ubuntu`, `ubuntu-24.04`, `debian-12`). */
 const DISTRO_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-/** A bundle file name (.deb etc.): no path separators, no leading dot, bounded charset. */
-const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._+~-]{0,255}$/;
+/** A bundle file name (.deb etc.): no path separators, no leading dot, bounded charset. `:` is allowed
+ * because Debian version epochs put a colon in the filename (e.g. `chromium_2:1snap1_arm64.deb`), which
+ * the installer URL-encodes as `%3a`; the traversal guard (resolved path inside the root) is the real
+ * safety check, so the charset just has to exclude separators. */
+const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._+~:-]{0,255}$/;
 
 /** The placeholder substituted with the computed control-plane base in the install template. */
 const BASE_PLACEHOLDER = "{{POLYPTIC_BASE}}";
