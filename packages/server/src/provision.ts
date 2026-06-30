@@ -33,6 +33,10 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 /** Built-in fallback install template, shipped beside this module (served when the deploy file is absent). */
 const FALLBACK_TEMPLATE_PATH = join(dirname(fileURLToPath(import.meta.url)), "install.default.sh");
 
+/** Repo root (…/packages/server/src → repo) so the dev defaults find `deploy/dist` regardless of the
+ *  server's CWD. In the Docker image the env (AGENT_DIST_DIR=/app/deploy/dist, etc.) overrides these. */
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Config / wiring
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,9 +55,9 @@ export interface ProvisionConfig {
 /** Resolve provisioning config from the environment, with sensible repo-relative defaults. */
 export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ProvisionConfig {
   return {
-    installScriptPath: env.INSTALL_SCRIPT_PATH?.trim() || "./deploy/install.sh",
-    agentDistDir: env.AGENT_DIST_DIR?.trim() || "./deploy/dist",
-    depsDistDir: env.DEPS_DIST_DIR?.trim() || "./deploy/dist/deps",
+    installScriptPath: env.INSTALL_SCRIPT_PATH?.trim() || resolve(REPO_ROOT, "deploy/install.sh"),
+    agentDistDir: env.AGENT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist"),
+    depsDistDir: env.DEPS_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/deps"),
     publicBaseUrl: (env.PUBLIC_BASE_URL?.trim() || "http://localhost:8080").replace(/\/+$/, ""),
   };
 }
