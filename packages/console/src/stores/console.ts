@@ -12,6 +12,7 @@
 import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
+  ActivityEvent,
   AuthUser,
   ChangePasswordBody,
   ContentKind,
@@ -103,6 +104,10 @@ export interface ConsoleState {
   contentSources: ContentSource[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
+  /** The Live Activity feed (D25) — bounded, newest-first human event log, mirrored from
+   *  admin/state.activity. The field is OPTIONAL on the wire (back-compat), so it defaults to []
+   *  when a server omits it. */
+  activity: ActivityEvent[];
   /** The scene most recently applied this session. The admin/state snapshot does not surface the
    *  server's DesiredState.activeSceneId, so we track it client-side: set optimistically on apply,
    *  cleared when its scene is deleted. */
@@ -133,6 +138,7 @@ export const useConsoleStore = defineStore("console", {
     videoWalls: [],
     contentSources: [],
     scenes: [],
+    activity: [],
     activeSceneId: null,
     activeMuralId: null,
     selectedScreenIds: [],
@@ -580,6 +586,9 @@ export const useConsoleStore = defineStore("console", {
         this.videoWalls = msg.videoWalls;
         this.contentSources = msg.contentSources;
         this.scenes = msg.scenes;
+        // The Live Activity feed is optional on the wire (older servers omit it); default to [].
+        // The server sends it newest-first and pre-bounded, so we mirror it as-is.
+        this.activity = msg.activity ?? [];
 
         // Forget an active-scene marker whose scene the server no longer knows (e.g. deleted).
         if (this.activeSceneId && !this.scenes.some((sc) => sc.id === this.activeSceneId)) {

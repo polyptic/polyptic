@@ -48,6 +48,7 @@ import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane, RegisterMachineInput, ScreenAssignment } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import type { ActivityLog } from "./activity";
 
 interface WsDeps {
   server: Server;
@@ -60,6 +61,8 @@ interface WsDeps {
   adminHub: AdminHub;
   presence: Presence;
   broadcaster: AdminBroadcaster;
+  /** Live Activity feed (D25) — presence emits machine + screen connect/drop lines here. */
+  activity: ActivityLog;
   /** Live-preview capture (Phase 5) — ingests inbound `agent/thumbnail` frames. */
   capture: CaptureCoordinator;
   log: FastifyBaseLogger;
@@ -68,7 +71,7 @@ interface WsDeps {
 }
 
 export function attachWebSockets(deps: WsDeps): void {
-  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, capture, log, allowedOrigins } =
+  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, log, allowedOrigins } =
     deps;
 
   const agentWss = new WebSocketServer({ noServer: true });
@@ -128,10 +131,10 @@ export function attachWebSockets(deps: WsDeps): void {
   });
 
   agentWss.on("connection", (ws: WebSocket) =>
-    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, capture, log),
+    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, log),
   );
   playerWss.on("connection", (ws: WebSocket) =>
-    handlePlayer(ws, control, hub, presence, broadcaster, log),
+    handlePlayer(ws, control, hub, presence, broadcaster, activity, log),
   );
   adminWss.on("connection", (ws: WebSocket) =>
     handleAdmin(ws, adminHub, broadcaster, log),
@@ -145,6 +148,7 @@ function handleAgent(
   agentHub: AgentHub,
   presence: Presence,
   broadcaster: AdminBroadcaster,
+  activity: ActivityLog,
   capture: CaptureCoordinator,
   log: FastifyBaseLogger,
 ): void {
@@ -214,7 +218,11 @@ function handleAgent(
       agentHub.add(machineId, ws);
       hubRegistered = true;
     }
+    // True online edge: emit ONE "connected" line only when the machine goes 0→online (a second
+    // overlapping agent socket for the same machine doesn't re-announce).
+    let cameOnline = false;
     if (!presenceMarked) {
+      cameOnline = !presence.isMachineOnline(machineId);
       presence.agentConnected(machineId);
       presenceMarked = true;
     }
@@ -303,6 +311,10 @@ function handleAgent(
       }
 
       // A machine came online (and possibly new screens / a status change) — refresh the admin view.
+      if (cameOnline) {
+        const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+        activity.push("good", `${label} connected`);
+      }
       broadcaster.broadcast();
     } catch (err) {
       log.error(
@@ -338,7 +350,12 @@ function handleAgent(
   ws.on("close", (code) => {
     if (machineId && hubRegistered) agentHub.remove(machineId, ws);
     if (machineId && presenceMarked) {
+      // Resolve the label BEFORE dropping presence; emit only on the true online→offline edge.
+      const label = control.getMachine(machineId)?.label ?? machineId;
       presence.agentDisconnected(machineId);
+      if (!presence.isMachineOnline(machineId)) {
+        activity.push("bad", `${label} went unreachable`);
+      }
       broadcaster.broadcast();
     }
     log.info({ event: "agent.disconnected", machineId, code }, "agent socket closed");
@@ -354,6 +371,7 @@ function handlePlayer(
   hub: PlayerHub,
   presence: Presence,
   broadcaster: AdminBroadcaster,
+  activity: ActivityLog,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "player.connected" }, "player socket opened");
@@ -370,7 +388,13 @@ function handlePlayer(
 
     if (msg.t === "player/hello") {
       screenId = msg.screenId;
+      // True online edge: this socket takes the screen from 0→online (no player was connected before).
+      const cameOnline = hub.count(screenId) === 0;
       hub.add(screenId, ws);
+      if (cameOnline) {
+        const name = control.getScreen(screenId)?.friendlyName ?? screenId;
+        activity.push("good", `${name} connected`);
+      }
       const slice = control.sliceForPlayer(screenId);
       const render = ServerToPlayerRender.parse({
         t: "server/render",
@@ -403,7 +427,12 @@ function handlePlayer(
 
   ws.on("close", (code) => {
     if (screenId) {
+      // Resolve the name BEFORE removing; emit only on the true online→offline edge (last socket gone).
+      const name = control.getScreen(screenId)?.friendlyName ?? screenId;
       hub.remove(screenId, ws);
+      if (hub.count(screenId) === 0) {
+        activity.push("bad", `${name} went unreachable`);
+      }
       // Screen may have gone offline (no sockets left) — refresh the admin view.
       broadcaster.broadcast();
     }

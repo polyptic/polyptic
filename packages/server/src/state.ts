@@ -49,6 +49,7 @@ import type {
 } from "@polyptic/protocol";
 
 import type { PersistedMachine, PersistedScene, Store } from "./store/types";
+import type { ActivityLog } from "./activity";
 
 /** Where players live. The agent points each output's Chromium/browser at this base + ?screen=<id>. */
 const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
@@ -177,7 +178,28 @@ export class ControlPlane {
   private readonly scenes = new Map<string, Scene>();
   private sceneCounter = 0;
 
-  constructor(private readonly store: Store) {}
+  /**
+   * @param store    the durable backing store.
+   * @param activity OPTIONAL Live Activity feed (D25). When present, notable mutations push a short
+   *                 human line; when absent (e.g. a unit test that doesn't care), emits are no-ops.
+   */
+  constructor(
+    private readonly store: Store,
+    private readonly activity?: ActivityLog,
+  ) {}
+
+  /**
+   * When set, per-operation `emit` calls are swallowed. Used while a high-level composition (applyScene)
+   * runs the lower-level primitives (split/combine/setContent) so the feed gets ONE summary line for
+   * the whole apply instead of a flood of intermediate ones.
+   */
+  private suppressEmit = false;
+
+  /** Push a Live Activity line if a log is wired (no-op otherwise). Never throws into a mutation. */
+  private emit(severity: "info" | "good" | "warn" | "bad", text: string): void {
+    if (this.suppressEmit) return;
+    this.activity?.push(severity, text);
+  }
 
   /** Project an in-memory Scene onto the storage DTO (layout + grouping + content → `snapshot` jsonb). */
   private toPersistedScene(scene: Scene): PersistedScene {
@@ -585,6 +607,7 @@ export class ControlPlane {
     await this.persistScreens(ensured);
     if (ensured.changed) await this.store.setRevision(this.state.revision);
 
+    this.emit("good", `${machine.label} approved`);
     return { changed: ensured.changed, assignments: ensured.assignments };
   }
 
@@ -597,6 +620,7 @@ export class ControlPlane {
     if (!machine) return false;
     machine.status = "rejected";
     await this.store.setMachineStatus(machineId, "rejected");
+    this.emit("bad", `${machine.label} rejected`);
     return true;
   }
 
@@ -702,6 +726,7 @@ export class ControlPlane {
   async renameScreen(screenId: string, friendlyName: string): Promise<Screen | null> {
     const screen = this.state.screens.find((s) => s.id === screenId);
     if (screen === undefined) return null;
+    const previousName = screen.friendlyName;
     screen.friendlyName = friendlyName;
 
     await this.store.upsertScreen({
@@ -710,6 +735,7 @@ export class ControlPlane {
       machineId: screen.machineId,
       connector: screen.connector,
     });
+    if (previousName !== friendlyName) this.emit("info", `${previousName} renamed`);
     return screen;
   }
 
@@ -914,6 +940,15 @@ export class ControlPlane {
     return kind === "web" ? "Web page" : kind === "dashboard" ? "Dashboard" : kind === "image" ? "Image" : "Video";
   }
 
+  /** A human content name for an activity line: the library source's name, else the ad-hoc URL's host. */
+  private resolvedContentName(spec: ResolvedSpec, sourceId: string | null): string {
+    if (sourceId) {
+      const src = this.contentSources.get(sourceId);
+      if (src) return src.name;
+    }
+    return this.contentNameFromUrl(spec.url, spec.kind);
+  }
+
   private nextWallId(): string {
     this.wallCounter += 1;
     return `wall-${this.wallCounter}`;
@@ -1110,6 +1145,7 @@ export class ControlPlane {
     }
     await this.store.setRevision(this.state.revision);
 
+    this.emit("good", `Combined ${ids.length} panels into ${wall.name ?? id}`);
     return { ok: true, wall, slices };
   }
 
@@ -1137,6 +1173,7 @@ export class ControlPlane {
     const wall = this.videoWalls.get(wallId);
     if (wall === undefined) return null;
 
+    const previousName = wall.name ?? wall.id;
     const next: VideoWall = { ...wall, name: name.trim().slice(0, 80) };
     this.videoWalls.set(wallId, next);
     await this.store.upsertVideoWall({
@@ -1147,6 +1184,7 @@ export class ControlPlane {
       // Preserve the wall's current library-source assignment so the rename doesn't clear it.
       contentSourceId: this.wallSourceIds.get(wallId) ?? null,
     });
+    if (previousName !== next.name) this.emit("info", `${previousName} renamed`);
     return next;
   }
 
@@ -1174,6 +1212,7 @@ export class ControlPlane {
     }
     await this.store.setRevision(this.state.revision);
 
+    this.emit("info", `Split ${wall.name ?? wall.id}`);
     return { wall, slices };
   }
 
@@ -1211,6 +1250,10 @@ export class ControlPlane {
     }
     await this.store.setRevision(this.state.revision);
 
+    this.emit(
+      "good",
+      `${wall.name ?? wall.id} → ${this.resolvedContentName(resolved.spec, resolved.sourceId)}`,
+    );
     return { ok: true, slices };
   }
 
@@ -1253,6 +1296,10 @@ export class ControlPlane {
     });
     await this.store.setRevision(this.state.revision);
 
+    this.emit(
+      "good",
+      `${screen.friendlyName} → ${this.resolvedContentName(resolved.spec, resolved.sourceId)}`,
+    );
     return { ok: true, slice: next };
   }
 
@@ -1566,6 +1613,20 @@ export class ControlPlane {
     const muralId = scene.muralId;
     if (!this.murals.has(muralId)) return null;
 
+    // Compose the lower-level primitives WITHOUT each of them emitting its own activity line — the
+    // whole apply gets one summary line below.
+    this.suppressEmit = true;
+    try {
+      return await this.applySceneInner(scene, muralId);
+    } finally {
+      this.suppressEmit = false;
+    }
+  }
+
+  private async applySceneInner(
+    scene: Scene,
+    muralId: string,
+  ): Promise<{ scene: Scene; slices: ScreenSlice[] }> {
     const touched = new Map<string, ScreenSlice>();
     const accumulate = (slices: ScreenSlice[]): void => {
       for (const slice of slices) touched.set(slice.screenId, slice);
@@ -1634,6 +1695,8 @@ export class ControlPlane {
     // 5. Mark the scene active (in-memory desired-state; the console mirrors this on its side).
     this.state.activeSceneId = scene.id;
 
+    // One summary line for the whole apply. Pushed straight to the log (the per-op guard is on).
+    this.activity?.push("good", `Applied scene ${scene.name}`);
     return { scene, slices: [...touched.values()] };
   }
 

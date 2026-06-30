@@ -22,6 +22,7 @@ import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
 import type { PlayerHub } from "./hub";
+import type { ActivityLog } from "./activity";
 
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
 export class AdminHub {
@@ -95,6 +96,7 @@ export function buildAdminState(
   control: ControlPlane,
   playerHub: PlayerHub,
   presence: Presence,
+  activity: ActivityLog,
 ): ServerToAdminMessage {
   const screens = control.getScreens();
 
@@ -138,6 +140,7 @@ export function buildAdminState(
     videoWalls: control.getVideoWalls(),
     contentSources: control.getContentSources(),
     scenes: control.getScenes(),
+    activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
   });
 }
 
@@ -146,6 +149,7 @@ interface BroadcasterDeps {
   playerHub: PlayerHub;
   presence: Presence;
   adminHub: AdminHub;
+  activity: ActivityLog;
   log: FastifyBaseLogger;
 }
 
@@ -161,7 +165,12 @@ export class AdminBroadcaster {
 
   /** Current `admin/state` for a single recipient (e.g. on connect). */
   snapshot(): ServerToAdminMessage {
-    return buildAdminState(this.deps.control, this.deps.playerHub, this.deps.presence);
+    return buildAdminState(
+      this.deps.control,
+      this.deps.playerHub,
+      this.deps.presence,
+      this.deps.activity,
+    );
   }
 
   /** Schedule a coalesced broadcast of the latest state to all admin sockets. */

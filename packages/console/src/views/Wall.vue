@@ -19,6 +19,7 @@ import MuralSwitcher from "../components/canvas/MuralSwitcher.vue";
 import SceneStrip from "../components/canvas/SceneStrip.vue";
 import WallCanvas from "../components/canvas/WallCanvas.vue";
 import Inspector from "../components/canvas/Inspector.vue";
+import ActivityFeed from "../components/canvas/ActivityFeed.vue";
 
 const store = useConsoleStore();
 const { ident } = useIdent();
@@ -164,8 +165,11 @@ function place(id: string) {
       <!-- Canvas -->
       <WallCanvas class="canvas-area" />
 
-      <!-- Inspector -->
-      <Inspector class="inspector-area" />
+      <!-- Right rail: Inspector on top, Live activity feed below (design's right column). -->
+      <aside class="right-rail">
+        <Inspector class="inspector-area" />
+        <ActivityFeed />
+      </aside>
     </div>
   </div>
 </template>
@@ -471,9 +475,20 @@ function place(id: string) {
   flex: 1;
   min-width: 0;
 }
-.inspector-area {
+/* Right rail — a vertical column hosting the Inspector (top, sizes to content, scrolls if tall)
+   and the Live activity feed (fills the remainder, scrolls). The children carry their own
+   border-left so the rail's left edge reads as one continuous rule down its full height. */
+.right-rail {
   width: 272px;
   flex: 0 0 272px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.inspector-area {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 62%;
 }
 
 @keyframes wall-pulse {

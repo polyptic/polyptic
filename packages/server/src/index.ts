@@ -14,6 +14,7 @@ import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
+import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import { AuthService, authConfigFromEnv } from "./auth-local";
 import { registerAuthRoutes } from "./auth-routes";
@@ -78,7 +79,11 @@ const fastify = Fastify({
 const { store, kind: storeKind } = createStore();
 await store.migrate();
 
-const control = new ControlPlane(store);
+// ── Live Activity feed (D25): one bounded in-memory ring, shared by the control plane (content /
+// combine / split / rename / scene emits) and the ws presence layer (machine + screen connect/drop). ──
+const activity = new ActivityLog();
+
+const control = new ControlPlane(store, activity);
 await control.init();
 
 // ── Enrollment policy (Phase 2b/3f): seed the bootstrap from the store; on first boot derive it from
@@ -98,7 +103,7 @@ const hub = new PlayerHub();
 const agentHub = new AgentHub();
 const adminHub = new AdminHub();
 const presence = new Presence();
-const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, log: fastify.log });
+const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, log: fastify.log });
 
 // ── Live preview (Phase 5): bounded thumbnail store + capture coordinator. ──
 const thumbnails = new ThumbnailStore(
@@ -176,6 +181,7 @@ attachWebSockets({
   adminHub,
   presence,
   broadcaster,
+  activity,
   capture,
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,

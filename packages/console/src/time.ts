@@ -22,6 +22,25 @@ export function formatLastSeen(iso: string | undefined, nowMs: number): string {
   return `${days}d ago`;
 }
 
+/**
+ * Compact relative timestamp for the Live Activity feed (D25): "now", "4m", "1h", "2d" — terse
+ * enough to sit in a narrow gutter. Like `formatLastSeen`, it's computed against a caller-supplied
+ * ticking `nowMs` so the value stays fresh as the feed sits on screen.
+ */
+export function formatRelativeShort(iso: string | undefined, nowMs: number): string {
+  if (!iso) return "";
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "";
+  const secs = Math.max(0, Math.round((nowMs - then) / 1000));
+  if (secs < 45) return "now";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${Math.max(1, mins)}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
+}
+
 /** "2 screens" / "1 screen". */
 export function countLabel(count: number, singular: string): string {
   return `${count} ${count === 1 ? singular : `${singular}s`}`;
