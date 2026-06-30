@@ -29,3 +29,7 @@ yarn-debug.log*
 # agent artefacts
 *.deb
 profiles/
+
+# runtime media (dev MEDIA_DIR default = packages/server/media) + uploaded files
+packages/server/media/
+/media/

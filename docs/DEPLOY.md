@@ -51,6 +51,75 @@ The box cold-boots into a Chromium-per-output kiosk and dials home. It shows **P
 
 ---
 
+## Zero-touch, air-gapped install from the control plane (`curl … | sh`)
+
+The `.deb`/`apt` path above is the supply-chain-friendly default. But it needs the box to reach the Ubuntu archives, and it needs the operator to copy a `.deb` around. For an **edge box that reaches ONLY the server** — a locked-down VLAN, a shop-floor panel, a kiosk behind a captive firewall — Polyptic ships a **k3s-style one-liner** where **the control plane is the depot**:
+
+```bash
+# Agent only (headless enrol). Fully air-gapped — the box talks to the server and NOTHING else.
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$BOOTSTRAP_TOKEN sh -
+
+# Agent + the visual substrate (greetd→sway→Chromium kiosk):
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$BOOTSTRAP_TOKEN sh -s -- --kiosk
+```
+
+### The air-gap model — the server is the depot
+
+The box never touches the internet. Every byte it needs comes from the one server it can reach:
+
+```
+   edge box (reaches ONLY the server)                   control plane = depot
+   ┌──────────────────────────────┐                     ┌───────────────────────────────┐
+   │ curl /install ───────────────┼───────────────────▶ │ GET /install   (base baked in) │
+   │ download agent binary ───────┼───────────────────▶ │ GET /dist/agent/<arch>         │
+   │ download substrate .debs ────┼───────────────────▶ │ GET /dist/deps/<distro>/<arch>/ │
+   │ enrol over ws(s)://…/agent ──┼───────────────────▶ │ agent WebSocket channel        │
+   └──────────────────────────────┘                     └───────────────────────────────┘
+```
+
+- **`GET /install`** returns this very script (`deploy/install.sh`) with the control-plane base URL **baked in from the request's `Host` header** (the placeholder `{{POLYPTIC_BASE}}` is substituted server-side). So the box installs using the exact URL it curled — no base URL to hand-configure. Behind a reverse proxy, `X-Forwarded-Proto`/`X-Forwarded-Host` are honoured, so an `https://` front door yields a `wss://` `server_url`.
+- All provisioning routes are **top-level and ungated** (like `/healthz`) — the box has no operator session yet. They are path-traversal-safe and 404 cleanly when an artifact isn't bundled.
+- Override the baked-in base with `POLYPTIC_BASE=…` (handy when piping a saved copy of the script by hand).
+
+### Stage A — the agent (always; fully air-gapped)
+
+Runs on every invocation, with or without `--kiosk`:
+
+1. **Detect** arch (`uname -m` → `amd64`/`arm64`) and distro (`/etc/os-release` → e.g. `ubuntu-24.04`).
+2. **Download** the agent binary from `${BASE}/dist/agent/<arch>` → `/usr/local/bin/polyptic-agent` (`chmod +x`). A clear error if the server has no binary for that arch (`404`).
+3. **Write** `/etc/polyptic/agent.toml` (`server_url = ws(s)://<host>/agent`, `bootstrap_token = $POLYPTIC_TOKEN`, `backend = wayland-sway`) and a **systemd SYSTEM unit** `polyptic-agent.service` (`Restart=always`), then `enable --now`. **The box enrols immediately** — it shows **PENDING** in the console (GATED mode) until approved.
+
+This whole path uses **only the server**. A headless enrol (no display) stops here.
+
+### Stage B — the visual substrate (`--kiosk`; offline-first)
+
+With `--kiosk` (or `POLYPTIC_KIOSK=1`) the script provisions the greetd/sway/Chromium substrate, **offline-first**:
+
+1. **Server bundle (offline):** `GET ${BASE}/dist/deps/<distro>/<arch>/manifest.json`. On `200`, download each `.deb` it lists and `apt-get install -y ./*.deb` — **no internet**. This is the air-gapped happy path; the bundle is the full dependency closure baked into the image (see `bundle-deps.sh` below).
+2. **Online fallback:** on `404` (no bundle for this distro+arch) **and** the box happens to have internet, fall back to the distro package manager (`apt`/`dnf`/`pacman`) for `sway greetd chromium grim wayvnc dbus + fonts`.
+3. **Clear failure:** no bundle **and** no internet → exit with an actionable message (bundle this distro on the server with `bundle-deps.sh`, use a bundled distro, or give the box one-time internet).
+
+Then it hands off to **`polyptic-agent setup --skip-deps --server-url … --bootstrap-token … [--output …]`** for the greetd autologin → sway → Chromium-per-output wiring (the same `setup` CLI as the `apt` path; `--skip-deps` because the substrate is already present). Finally it **retires the Stage-A system service** — the kiosk runs the agent as a **systemd `--user`** unit *inside* the sway session (it must inherit `WAYLAND_DISPLAY` to drive Chromium), so one agent per machine, not two. After this, `sudo reboot` cold-boots into the kiosk.
+
+> **Flags & env:** `--kiosk`/`POLYPTIC_KIOSK=1` (substrate), `--output DP-1=1920x1080@0,0` (repeatable, forwarded to `setup`), `POLYPTIC_TOKEN` (enrolment token; empty → server OPEN mode), `POLYPTIC_BASE` (override the baked-in base). The script is POSIX `sh`, `set -eu`, **idempotent**, and logs every step; re-running it re-converges.
+
+> **Privilege:** the script runs privileged steps through `sudo` when not already root (so `curl … | sh` works for a sudo-capable user), or runs directly as root. No `sudo` and not root → it tells you to pipe through `sudo`.
+
+### Serving the depot
+
+The server only serves `/dist/agent/<arch>` and `/dist/deps/…` if the artifacts exist under `AGENT_DIST_DIR` (default `./deploy/dist`) and `DEPS_DIST_DIR` (default `./deploy/dist/deps`):
+
+- **The server Docker image bakes both in.** `deploy/server.Dockerfile` compiles the agent binary for **amd64 AND arm64** in the build stage (`bun build --compile --target=bun-linux-{x64,arm64}`) into `/app/deploy/dist`, and `--build-arg BUNDLE_DEPS=1` additionally runs `bundle-deps.sh` for the image's arch. The runtime stage sets `AGENT_DIST_DIR`/`DEPS_DIST_DIR` and serves them.
+- **Add a distro bundle** (e.g. a second Ubuntu point release, or arm64 alongside amd64) by running `deploy/bundle-deps.sh` on an Ubuntu host of the **target arch** and dropping the result into `DEPS_DIST_DIR` — see `docs/DISTRIBUTION.md` → "Air-gap depot".
+- **Dev/lab without Docker:** build the binary locally so the dev server serves `/dist/agent/<arch>` straight away:
+  ```bash
+  bash deploy/build-agent.sh arm64          # → deploy/dist/polyptic-agent-arm64
+  AGENT_DIST_DIR=deploy/dist bun packages/server/src/index.ts
+  # then on a VM:  curl -sfL http://<mac-ip>:8080/install | POLYPTIC_TOKEN=… sh -
+  ```
+
+---
+
 ## What the package wires (the cold-boot chain)
 
 ```

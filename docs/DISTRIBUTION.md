@@ -122,6 +122,76 @@ On RPM distros the command is `sudo dnf install ./polyptic-agent_0.1.0_x86_64.rp
 
 ---
 
+## (b2) The air-gap depot — zero-touch install where the box reaches only the server
+
+`apt install` needs the box on the internet (or a mirror) and an operator to copy a `.deb`. For an **edge box that can reach ONLY the control plane**, Polyptic turns the server itself into the depot and ships a k3s-style one-liner. The box pulls everything it needs — the agent binary and (with `--kiosk`) the visual substrate — from the one server it can see, and nothing else.
+
+```bash
+# agent only (headless enrol; fully air-gapped):
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$TOKEN sh -
+# agent + greetd/sway/Chromium substrate:
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$TOKEN sh -s -- --kiosk
+```
+
+The operator-facing flow, Stage A (agent, offline) vs Stage B (`--kiosk`, substrate offline-first), and the flags live in **`docs/DEPLOY.md` → "Zero-touch, air-gapped install"**. This section is the *packaging* side: what the depot serves and how the artifacts get there.
+
+### The artifacts the depot serves (all top-level, ungated, like `/healthz`)
+
+| Route | What | Source on disk |
+|---|---|---|
+| `GET /install` | `deploy/install.sh` with `{{POLYPTIC_BASE}}` replaced by the URL the box curled (from `Host` / `X-Forwarded-*`) | `INSTALL_SCRIPT_PATH` (default `./deploy/install.sh`) |
+| `GET /dist/agent/:arch` | the prebuilt agent **binary** (`arch` ∈ `arm64`\|`amd64`), streamed; `404` if not bundled | `AGENT_DIST_DIR/polyptic-agent-<arch>` (default `./deploy/dist`) |
+| `GET /dist/deps/:distro/:arch/manifest.json` | the substrate **bundle manifest** (file list); `404` → the script tries its online fallback | `DEPS_DIST_DIR/<distro>/<arch>/manifest.json` (default `./deploy/dist/deps`) |
+| `GET /dist/deps/:distro/:arch/:file` | one bundled `.deb` from the closure | `DEPS_DIST_DIR/<distro>/<arch>/<file>` |
+
+`:arch` is `arm64`/`amd64`; `:distro` is a slug like `ubuntu-24.04` (`/etc/os-release` `ID-VERSION_ID`). All paths are traversal-safe and 404 cleanly when an artifact is absent.
+
+### How the artifacts get baked in (the server image)
+
+`deploy/server.Dockerfile` is the normal way to fill the depot — no extra steps for the common case:
+
+- **Agent binaries, both arches.** The build stage cross-compiles the agent with `bun build --compile --target=bun-linux-x64` **and** `--target=bun-linux-arm64` into `/app/deploy/dist/polyptic-agent-{amd64,arm64}`. One image build serves every box, no per-arch build host (Bun bakes the runtime into each binary — see **D7**).
+- **Substrate bundle (optional, gated).** `--build-arg BUNDLE_DEPS=1` runs `deploy/bundle-deps.sh` for the **image's** arch into `/app/deploy/dist/deps`. It's best-effort — a failed bundle never sinks the server build (the substrate is only needed for `--kiosk`, and bundles can be added later).
+- The runtime stage copies `deploy/install.sh` + `deploy/dist`, and sets `AGENT_DIST_DIR=/app/deploy/dist` + `DEPS_DIST_DIR=/app/deploy/dist/deps`.
+
+```bash
+# build the server image WITH a baked substrate bundle for the image's arch:
+docker build -f deploy/server.Dockerfile --build-arg BUNDLE_DEPS=1 -t polyptic-server .
+```
+
+### Adding a distro/arch bundle with `bundle-deps.sh`
+
+A bundle is the **full `.deb` dependency closure** for the substrate (`sway`, `greetd`, a `.deb` Chromium — never the snap — `grim`, `wayvnc`, `dbus-user-session`, fonts) for one Ubuntu point-release + arch. Run it **on an Ubuntu host of the target arch**:
+
+```bash
+# on an amd64 Ubuntu host (or container):
+bash deploy/bundle-deps.sh
+#   → deploy/dist/deps/ubuntu-24.04/amd64/{manifest.json, *.deb}
+```
+
+**Cross-arch caveat:** `apt-get` resolves the closure for the **host's** arch — there is no reliable foreign-arch `apt-get download`. To bundle a different arch, run it in a target-arch container (binfmt/qemu makes this work from any host):
+
+```bash
+docker run --rm --platform linux/arm64 -v "$PWD":/repo -w /repo ubuntu:24.04 \
+  bash -c 'apt-get update && apt-get install -y --no-install-recommends ca-certificates && deploy/bundle-deps.sh'
+#   → deploy/dist/deps/ubuntu-24.04/arm64/{manifest.json, *.deb}
+```
+
+Drop the resulting `deploy/dist/deps/<distro>/<arch>/` directory into the server's `DEPS_DIST_DIR` (it's baked into the image, or mount it as a volume) and the offline `--kiosk` path lights up for that distro+arch. `bundle-deps.sh` is idempotent (clean rebuild each run) and writes a `manifest.json` whose `files` array the install script reads; install order is left to `apt-get install ./*.deb`, which resolves the closure itself.
+
+### Dev/lab without Docker
+
+The dev server serves the depot from local files too — build the binary and point the server at it:
+
+```bash
+bash deploy/build-agent.sh arm64                       # → deploy/dist/polyptic-agent-arm64
+AGENT_DIST_DIR=deploy/dist bun packages/server/src/index.ts
+# on a VM that can reach your Mac:
+curl -sfL http://<mac-ip>:8080/install | POLYPTIC_TOKEN=$TOKEN sh -
+```
+
+---
+
 ## (c) Releases — one tag builds everything
 
 Releases are driven entirely by **git tags**. Pushing a tag of the form `vX.Y.Z` is what triggers the release workflow; nothing builds or publishes on an ordinary push to `main`.

@@ -23,6 +23,7 @@ import { Enrollment } from "./enroll";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
 import { registerOpsRoutes } from "./ops";
+import { provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
 import { registerRestRoutes } from "./rest";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
@@ -171,6 +172,10 @@ registerOpsRoutes(fastify, {
   revision: BUILD_REVISION,
   startedAt: STARTED_AT,
 });
+// TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch, /dist/deps/**) —
+// NOT /api/v1, so an edge box with no operator session can bootstrap itself entirely from the server.
+const provisionConfig = provisionConfigFromEnv();
+registerProvisionRoutes(fastify, provisionConfig);
 attachWebSockets({
   server: fastify.server,
   control,
@@ -204,6 +209,26 @@ if (spaServed.length > 0) {
     "no CONSOLE_DIR/PLAYER_DIR set — API/WS only (the SPAs are served by their Vite dev servers in dev).",
   );
 }
+
+// Provisioning boot banner: report which zero-touch artifacts are present on disk (install template,
+// agent binaries per arch, deps bundle root) so a misconfigured AGENT_DIST_DIR/DEPS_DIST_DIR is obvious.
+const provisionSummary = await provisionBootSummary(provisionConfig);
+fastify.log.info(
+  {
+    event: "provision.dist",
+    installScriptPath: provisionConfig.installScriptPath,
+    installTemplate: provisionSummary.installTemplate ? "file" : "built-in-fallback",
+    agentDistDir: provisionConfig.agentDistDir,
+    agentDistDirExists: provisionSummary.agentDistDir,
+    agentArm64: provisionSummary.agentArm64,
+    agentAmd64: provisionSummary.agentAmd64,
+    depsDistDir: provisionConfig.depsDistDir,
+    depsDistDirExists: provisionSummary.depsDistDir,
+  },
+  `provisioning: install=${provisionSummary.installTemplate ? "template" : "fallback"} ` +
+    `agent[arm64=${provisionSummary.agentArm64} amd64=${provisionSummary.agentAmd64}] ` +
+    `deps-dir=${provisionSummary.depsDistDir}`,
+);
 
 // Start the periodic live-preview capture sweep (no-op when CAPTURE_INTERVAL_MS=0).
 capture.start();
