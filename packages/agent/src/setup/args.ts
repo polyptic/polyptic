@@ -6,7 +6,7 @@
  */
 
 export type Backend = "wayland-sway" | "x11-i3" | "dev-open";
-export type BrowserChoice = "chromium" | "cog";
+export type BrowserChoice = "chromium" | "cog" | "surf";
 
 export interface OutputPin {
   connector: string;
@@ -140,8 +140,8 @@ export function parseArgs(argv: string[]): SetupOptions {
       case "--browser": {
         const v = need(i, a);
         i++;
-        if (v !== "chromium" && v !== "cog") {
-          throw new Error(`--browser must be chromium | cog (got "${v}")`);
+        if (v !== "chromium" && v !== "cog" && v !== "surf") {
+          throw new Error(`--browser must be chromium | cog | surf (got "${v}")`);
         }
         opts.browser = v;
         break;
@@ -210,7 +210,8 @@ OPTIONS
   --user <name>                     kiosk login user (default: kiosk).
   --output <CONNECTOR[=WxH][@X,Y]>  pin a compositor output; repeatable. e.g. DP-1=1920x1080@0,0
   --connector <name>                single-output connector override (-> agent.toml).
-  --browser <chromium|cog>          kiosk browser (default chromium; cog = WPE/WebKit fallback, D27).
+  --browser <chromium|cog|surf>     kiosk browser (default chromium; surf = suckless WebKitGTK, the
+                                    Ubuntu .deb kiosk browser; cog = WPE/WebKit fallback, D27).
   --chromium-deb <path|url>         install a specific .deb Chromium (Ubuntu snap avoidance).
   --chromium-ppa <ppa>              add a PPA that ships a real .deb Chromium (Ubuntu).
   --agent-bin <path>                binary the unit launches (default: /usr/local/bin/polyptic-agent).

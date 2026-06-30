@@ -1,5 +1,5 @@
 #!/bin/sh
-# deploy/install.sh — Polyptic zero-touch, AIR-GAPPED edge provisioner.
+# deploy/install.sh — Polyptic zero-touch edge provisioner.
 #
 # This script is SERVED BY THE CONTROL PLANE at `GET /install`. The control-plane base URL is
 # BAKED IN by the server from the incoming request's Host header (it substitutes the literal
@@ -8,18 +8,18 @@
 #     curl -sfL http://HOST:8080/install | POLYPTIC_TOKEN=xyz sh -
 #     curl -sfL http://HOST:8080/install | POLYPTIC_TOKEN=xyz sh -s -- --kiosk
 #
-# THE AIR-GAP MODEL: the edge box reaches ONLY the server. The server is the depot. Everything
-# this script needs — the agent binary and (with --kiosk) the visual substrate .debs — is pulled
-# from the server, never from the internet. The substrate path is OFFLINE-FIRST: it tries the
-# server's bundle, and only if there is no bundle for this distro+arch AND the box happens to have
-# internet does it fall back to the distro package manager online.
+# THE NETWORK MODEL: Stage A (the agent) is ALWAYS air-gapped — the agent binary comes from the
+# server, never the internet. Stage B (the visual substrate) is ONLINE BY DEFAULT: it installs the
+# substrate + kiosk browser straight from the distro package manager (apt/dnf/pacman). For a true
+# air-gap, pass --offline (POLYPTIC_OFFLINE=1) and the box pulls the substrate .debs from the
+# server's bundle instead — the server is the depot, no internet required.
 #
 # STAGE A (always): download the agent binary, write /etc/polyptic/agent.toml + a systemd SYSTEM
 #   unit (Restart=always), enable+start it → the box ENROLS now. Fully air-gapped (server only).
-# STAGE B (--kiosk): provision the greetd→sway→Chromium substrate. Offline-first from the server's
-#   bundled .debs, else online apt/dnf/pacman, else a clear failure. Then hand off to
-#   `polyptic-agent setup --skip-deps …` for the kiosk wiring, and retire the Stage-A system unit
-#   in favour of the session-scoped user agent that setup installs.
+# STAGE B (--kiosk): provision the greetd→sway→surf substrate. ONLINE by default (apt/dnf/pacman);
+#   --offline (POLYPTIC_OFFLINE=1) uses the server's bundled .debs for a true air-gap; else a clear
+#   failure. Then hand off to `polyptic-agent setup --skip-deps …` for the kiosk wiring, and retire
+#   the Stage-A system unit in favour of the session-scoped user agent that setup installs.
 #
 # POSIX sh. `set -eu`. Idempotent. Every step logged. Clear errors.
 
@@ -41,10 +41,14 @@ TOKEN="${POLYPTIC_TOKEN:-}"
 # --kiosk / POLYPTIC_KIOSK=1 → also provision the visual substrate (Stage B).
 KIOSK="${POLYPTIC_KIOSK:-0}"
 
-# Kiosk runtime browser for Stage B (forwarded to `polyptic-agent setup --browser`). The depot
-# bundle ships cog (WPE/WebKit), NOT a working .deb Chromium, on Ubuntu/arm64 (Chromium is
-# snap-only there, D27) — so default to cog. POLYPTIC_BROWSER=chromium overrides on the curl line.
-BROWSER="${POLYPTIC_BROWSER:-cog}"
+# --offline / POLYPTIC_OFFLINE=1 → install the Stage-B substrate from the server's bundled .debs
+# (a true air-gap) instead of the default online package-manager install.
+OFFLINE="${POLYPTIC_OFFLINE:-0}"
+
+# Kiosk runtime browser for Stage B (forwarded to `polyptic-agent setup --browser`). Default surf
+# (suckless WebKitGTK) — the real .deb kiosk browser on Ubuntu/arm64, where Chromium is snap-only
+# and cog isn't packaged (D27). POLYPTIC_BROWSER=chromium|cog overrides on the curl line.
+BROWSER="${POLYPTIC_BROWSER:-surf}"
 
 # Install locations.
 BIN_PATH="/usr/local/bin/polyptic-agent"
@@ -136,14 +140,17 @@ polyptic install.sh — provision a box from the control plane.
 Usage (served): curl -sfL ${BASE}/install | POLYPTIC_TOKEN=… sh -s -- [flags]
 
 Flags:
-  --kiosk                       also provision the greetd→sway→Chromium substrate (Stage B)
+  --kiosk                       also provision the greetd→sway→surf substrate (Stage B)
+  --offline                     install the Stage-B substrate from the server's bundled .debs
+                                (a true air-gap) instead of the default online package manager
   --output CONN[=WxH][@X,Y]     pin a compositor output (repeatable); forwarded to setup
   -h, --help                    show this help
 
 Env:
   POLYPTIC_TOKEN   one-time enrolment bootstrap token (server GATED mode)
   POLYPTIC_KIOSK   set to 1 for the substrate (same as --kiosk)
-  POLYPTIC_BROWSER kiosk browser for --kiosk: cog (default) | chromium
+  POLYPTIC_OFFLINE set to 1 for the air-gap bundle install (same as --offline)
+  POLYPTIC_BROWSER kiosk browser for --kiosk: surf (default) | cog | chromium
   POLYPTIC_BASE    override the baked-in control-plane base URL
 EOF
 }
@@ -151,6 +158,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --kiosk) KIOSK="1" ;;
+    --offline) OFFLINE="1" ;;
     --output)
       [ $# -ge 2 ] || die "--output expects a value, e.g. --output DP-1=1920x1080@0,0"
       OUTPUT_ARGS="${OUTPUT_ARGS} --output $2"; shift ;;
@@ -218,7 +226,7 @@ else
 fi
 
 log "arch=${ARCH}  distro=${DISTRO_SLUG}  base=${BASE}  server_url=${SERVER_URL}"
-log "kiosk=${KIOSK}  browser=${BROWSER}  token=$( [ -n "$TOKEN" ] && echo 'set' || echo 'EMPTY (server OPEN mode)' )"
+log "kiosk=${KIOSK}  offline=${OFFLINE}  browser=${BROWSER}  token=$( [ -n "$TOKEN" ] && echo 'set' || echo 'EMPTY (server OPEN mode)' )"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # STAGE A — agent (fully air-gapped; server only)
@@ -324,133 +332,131 @@ EOF
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STAGE B — visual substrate (offline-first from the server, else online, else fail)
+# STAGE B — visual substrate (ONLINE by default; --offline uses the server bundle; else fail)
 # ═════════════════════════════════════════════════════════════════════════════
 
 step "B1: provisioning the visual substrate (--kiosk)"
 
-DEPS_BASE="${BASE}/dist/deps/${DISTRO_SLUG}/${ARCH}"
-MANIFEST_URL="${DEPS_BASE}/manifest.json"
-MANIFEST_TMP="${WORK}/manifest.json"
-
-step "B1: probing server bundle ${MANIFEST_URL}"
-CODE="$(http_fetch "$MANIFEST_URL" "$MANIFEST_TMP")"
-
 SUBSTRATE_DONE="0"
-if [ "$CODE" = "200" ] || { [ "${CODE#2}" != "$CODE" ] && [ -s "$MANIFEST_TMP" ]; }; then
-  # ── B2a. OFFLINE-FIRST: install the server's bundled .debs (no internet) ───
-  log "found a server bundle for ${DISTRO_SLUG}/${ARCH} — installing offline from the depot"
 
-  case "$DISTRO_ID" in
-    ubuntu|debian|*deb*) : ;;
-    *) case "$DISTRO_LIKE" in *debian*) : ;; *)
-         die "server bundle exists but this distro (${DISTRO_ID}) is not apt-based — bundles are
+if [ "$OFFLINE" = "1" ]; then
+  # ── B2a. OFFLINE / AIR-GAP: install the server's bundled .debs (no internet) ──
+  DEPS_BASE="${BASE}/dist/deps/${DISTRO_SLUG}/${ARCH}"
+  MANIFEST_URL="${DEPS_BASE}/manifest.json"
+  MANIFEST_TMP="${WORK}/manifest.json"
+
+  step "B1: --offline → probing server bundle ${MANIFEST_URL}"
+  CODE="$(http_fetch "$MANIFEST_URL" "$MANIFEST_TMP")"
+
+  if [ "$CODE" = "200" ] || { [ "${CODE#2}" != "$CODE" ] && [ -s "$MANIFEST_TMP" ]; }; then
+    log "found a server bundle for ${DISTRO_SLUG}/${ARCH} — installing offline from the depot"
+
+    case "$DISTRO_ID" in
+      ubuntu|debian|*deb*) : ;;
+      *) case "$DISTRO_LIKE" in *debian*) : ;; *)
+           die "server bundle exists but this distro (${DISTRO_ID}) is not apt-based — bundles are
      .deb closures and install with apt-get. Re-bundle for ${DISTRO_SLUG} or use a Debian/Ubuntu box." ;;
-       esac ;;
-  esac
-  command -v apt-get >/dev/null 2>&1 || die "apt-get not found but the server bundle is .debs"
-
-  # Parse the "files" array out of manifest.json without jq (flatten newlines, slice the array).
-  FLAT="$(tr -d '\n\r\t' < "$MANIFEST_TMP")"
-  FILES="$(printf '%s' "$FLAT" \
-    | sed -n 's/.*"files"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' \
-    | tr ',' '\n' \
-    | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' -e 's/[][" ]//g' \
-    | sed '/^$/d')"
-  [ -n "$FILES" ] || die "server bundle manifest at ${MANIFEST_URL} listed no files (\"files\": [])"
-
-  DEB_DIR="${WORK}/debs"
-  mkdir -p "$DEB_DIR"
-  N=0
-  for f in $FILES; do
-    # Path-traversal safety: reject anything but a bare filename.
-    case "$f" in
-      */*|*..*|"") die "refusing suspicious bundle filename '${f}' in manifest" ;;
+         esac ;;
     esac
-    N=$((N + 1))
-    step "B2: [${N}] downloading ${f}"
-    FCODE="$(http_fetch "${DEPS_BASE}/${f}" "${DEB_DIR}/${f}")"
-    case "$FCODE" in
-      2??) [ -s "${DEB_DIR}/${f}" ] || die "downloaded ${f} was empty" ;;
-      *) die "failed to download bundle file ${f} (HTTP ${FCODE} from ${DEPS_BASE}/${f})" ;;
-    esac
-  done
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found but the server bundle is .debs"
 
-  step "B2: installing ${N} bundled .deb(s) with apt-get (offline)"
-  # Install the whole closure at once so apt resolves interdependencies; -y, no network needed.
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-download --allow-downgrades \
-    "$DEB_DIR"/*.deb \
-    || $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB_DIR"/*.deb \
-    || die "apt-get failed installing the bundled substrate .debs (see output above)"
-  SUBSTRATE_DONE="1"
-  log "substrate installed offline from the server bundle"
+    # Parse the "files" array out of manifest.json without jq (flatten newlines, slice the array).
+    FLAT="$(tr -d '\n\r\t' < "$MANIFEST_TMP")"
+    FILES="$(printf '%s' "$FLAT" \
+      | sed -n 's/.*"files"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' \
+      | tr ',' '\n' \
+      | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' -e 's/[][" ]//g' \
+      | sed '/^$/d')"
+    [ -n "$FILES" ] || die "server bundle manifest at ${MANIFEST_URL} listed no files (\"files\": [])"
 
-elif [ "$CODE" = "404" ]; then
-  # ── B2b. ONLINE FALLBACK: no server bundle for this distro+arch ────────────
-  warn "no server bundle for ${DISTRO_SLUG}/${ARCH} (${MANIFEST_URL} → 404)"
-  if has_internet; then
-    log "box has internet — falling back to the distro package manager online"
-    # Install BOTH the substrate and the kiosk browser. cog (WPE/WebKit) is the default Stage-B
-    # browser (D27 — Ubuntu has no working .deb Chromium), so always pull cog; chromium is a
-    # best-effort extra so POLYPTIC_BROWSER=chromium still has a binary where a real .deb resolves.
-    install_online() {
-      case "$DISTRO_ID" in
-        ubuntu|debian)
-          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
-          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            sway greetd grim wayvnc dbus-user-session fonts-dejavu-core cog \
-            && { $SUDO apt-get install -y chromium-browser || $SUDO apt-get install -y chromium || true; }
-          ;;
-        fedora|rhel|centos|rocky|almalinux)
-          $SUDO dnf install -y sway greetd grim wayvnc dbus-daemon dejavu-sans-fonts cog \
-            && { $SUDO dnf install -y chromium || true; }
-          ;;
-        arch|archarm|manjaro)
-          $SUDO pacman -Sy --noconfirm sway greetd grim wayvnc dbus cog ttf-dejavu \
-            && { $SUDO pacman -S --noconfirm chromium || true; }
-          ;;
-        *)
-          case "$DISTRO_LIKE" in
-            *debian*)
-              $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
-              $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                sway greetd grim wayvnc dbus-user-session fonts-dejavu-core cog \
-                && { $SUDO apt-get install -y chromium-browser || $SUDO apt-get install -y chromium || true; } ;;
-            *fedora*|*rhel*)
-              $SUDO dnf install -y sway greetd grim wayvnc dbus-daemon dejavu-sans-fonts cog \
-                && { $SUDO dnf install -y chromium || true; } ;;
-            *arch*)
-              $SUDO pacman -Sy --noconfirm sway greetd grim wayvnc dbus cog ttf-dejavu \
-                && { $SUDO pacman -S --noconfirm chromium || true; } ;;
-            *)
-              return 3 ;;
-          esac
-          ;;
+    DEB_DIR="${WORK}/debs"
+    mkdir -p "$DEB_DIR"
+    N=0
+    for f in $FILES; do
+      # Path-traversal safety: reject anything but a bare filename.
+      case "$f" in
+        */*|*..*|"") die "refusing suspicious bundle filename '${f}' in manifest" ;;
       esac
-    }
-    if install_online; then
-      SUBSTRATE_DONE="1"
-      log "substrate installed online via the distro package manager"
-    else
-      die "no known online package recipe for distro '${DISTRO_ID}'. Add a server bundle with
-     deploy/bundle-deps.sh, or install sway greetd chromium grim wayvnc dbus + fonts by hand, then
-     re-run with --kiosk."
-    fi
-  else
-    die "no server bundle for ${DISTRO_SLUG}/${ARCH} and no internet on this box.
+      N=$((N + 1))
+      step "B2: [${N}] downloading ${f}"
+      FCODE="$(http_fetch "${DEPS_BASE}/${f}" "${DEB_DIR}/${f}")"
+      case "$FCODE" in
+        2??) [ -s "${DEB_DIR}/${f}" ] || die "downloaded ${f} was empty" ;;
+        *) die "failed to download bundle file ${f} (HTTP ${FCODE} from ${DEPS_BASE}/${f})" ;;
+      esac
+    done
+
+    step "B2: installing ${N} bundled .deb(s) with apt-get (offline)"
+    # Install the whole closure at once so apt resolves interdependencies; -y, no network needed.
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-download --allow-downgrades \
+      "$DEB_DIR"/*.deb \
+      || $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB_DIR"/*.deb \
+      || die "apt-get failed installing the bundled substrate .debs (see output above)"
+    SUBSTRATE_DONE="1"
+    log "substrate installed offline from the server bundle"
+
+  elif [ "$CODE" = "404" ]; then
+    # --offline but no bundle for this distro+arch → clear failure (no internet fallback in air-gap).
+    die "no server bundle for ${DISTRO_SLUG}/${ARCH} (${MANIFEST_URL} → 404) and --offline was given.
      Either: (a) bundle this distro on the server — run deploy/bundle-deps.sh on an Ubuntu host of
-     this arch and redeploy; or (b) use one of the bundled distros baked into the image; or
-     (c) give this box one-time internet so the online apt/dnf/pacman fallback can run."
+     this arch and redeploy; or (b) drop --offline to install online from the distro package manager."
+  else
+    die "unexpected HTTP ${CODE} probing the substrate bundle at ${MANIFEST_URL}"
   fi
 else
-  die "unexpected HTTP ${CODE} probing the substrate bundle at ${MANIFEST_URL}"
+  # ── B2b. ONLINE (default): install substrate + browser from the distro package manager ──
+  step "B1: installing the substrate online via the distro package manager"
+  # Install BOTH the substrate and the kiosk browser ($BROWSER, default surf). On Ubuntu/arm64 surf
+  # is the real .deb kiosk browser — Chromium is snap-only and cog isn't packaged (D27).
+  install_online() {
+    case "$DISTRO_ID" in
+      ubuntu|debian)
+        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
+        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          sway greetd grim wayvnc dbus-user-session fonts-dejavu-core "$BROWSER"
+        ;;
+      fedora|rhel|centos|rocky|almalinux)
+        $SUDO dnf install -y sway greetd grim wayvnc dbus-daemon dejavu-sans-fonts "$BROWSER"
+        ;;
+      arch|archarm|manjaro)
+        $SUDO pacman -Sy --noconfirm sway greetd grim wayvnc dbus "$BROWSER" ttf-dejavu
+        ;;
+      *)
+        case "$DISTRO_LIKE" in
+          *debian*)
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              sway greetd grim wayvnc dbus-user-session fonts-dejavu-core "$BROWSER" ;;
+          *fedora*|*rhel*)
+            $SUDO dnf install -y sway greetd grim wayvnc dbus-daemon dejavu-sans-fonts "$BROWSER" ;;
+          *arch*)
+            $SUDO pacman -Sy --noconfirm sway greetd grim wayvnc dbus "$BROWSER" ttf-dejavu ;;
+          *)
+            return 3 ;;
+        esac
+        ;;
+    esac
+  }
+  if ! has_internet; then
+    die "no internet on this box and --offline was not given.
+     Either: (a) give this box one-time internet so the online apt/dnf/pacman install can run; or
+     (b) re-run with --offline and bundle this distro on the server (deploy/bundle-deps.sh)."
+  fi
+  if install_online; then
+    SUBSTRATE_DONE="1"
+    log "substrate installed online via the distro package manager (browser: ${BROWSER})"
+  else
+    die "no known online package recipe for distro '${DISTRO_ID}'. Install
+     sway greetd ${BROWSER} grim wayvnc dbus + fonts by hand, then re-run with --kiosk; or
+     re-run with --offline and add a server bundle with deploy/bundle-deps.sh."
+  fi
 fi
 
 [ "$SUBSTRATE_DONE" = "1" ] || die "substrate provisioning did not complete"
 
-# ── B3. Hand off to the agent's setup CLI for the greetd/sway/Chromium wiring ─
+# ── B3. Hand off to the agent's setup CLI for the greetd/sway/browser wiring ──
 # Dependencies are present now, so --skip-deps. setup writes its own agent.toml + the session
-# units (greetd autologin → sway → systemd --user polyptic-agent.service → Chromium-per-output).
+# units (greetd autologin → sway → systemd --user polyptic-agent.service → browser-per-output).
 step "B3: wiring the kiosk via 'polyptic-agent setup --skip-deps'"
 # shellcheck disable=SC2086
 $SUDO "$BIN_PATH" setup --skip-deps \

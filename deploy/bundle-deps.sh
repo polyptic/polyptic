@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# deploy/bundle-deps.sh — build the AIR-GAP SUBSTRATE BUNDLE for one distro+arch.
+# deploy/bundle-deps.sh — build the (OPT-IN) AIR-GAP SUBSTRATE BUNDLE for one distro+arch.
+#
+# The bundle is OPT-IN: install.sh installs the substrate ONLINE from apt/dnf/pacman by default;
+# it only consumes this bundle when run with --offline (POLYPTIC_OFFLINE=1) for a true air-gap.
 #
 # Run this ON AN UBUNTU HOST OF THE TARGET ARCHITECTURE. It resolves the FULL dependency closure
-# for the visual substrate (sway, greetd, cog [the WPE/WebKit kiosk browser], grim, wayvnc,
+# for the visual substrate (sway, greetd, surf [the suckless WebKitGTK kiosk browser], grim, wayvnc,
 # dbus-user-session, fonts) and downloads every .deb into deploy/dist/deps/ubuntu-<VERSION_ID>/<arch>/,
 # alongside a manifest.json the control plane serves at:
 #
 #     GET /dist/deps/ubuntu-<VERSION_ID>/<arch>/manifest.json
 #     GET /dist/deps/ubuntu-<VERSION_ID>/<arch>/<file>.deb
 #
-# The served install script (deploy/install.sh, Stage B) downloads the manifest, pulls each .deb,
-# and `apt-get install -y ./*.deb` — NO INTERNET on the edge box. The server is the depot.
+# The served install script (deploy/install.sh, Stage B), when run with --offline, downloads the
+# manifest, pulls each .deb, and `apt-get install -y ./*.deb` — NO INTERNET on the edge box. The
+# server is the depot.
 #
 # ─ CROSS-ARCH CAVEAT ─────────────────────────────────────────────────────────────────────────────
 # `apt-get` resolves the dependency closure for the HOST's architecture. There is NO reliable way to
@@ -61,10 +65,11 @@ DEB_ARCH="$(dpkg --print-architecture)"   # amd64 | arm64 (matches the install s
 DISTRO_SLUG="${DISTRO_ID}-${DISTRO_VER}"  # e.g. ubuntu-24.04 (matches GET /dist/deps/<slug>/<arch>)
 
 # ── The substrate package set (top-level; apt pulls the rest of the closure) ──────────────────────
-# Browser: cog (WPE/WebKit), the kiosk browser — NOT Chromium. On Ubuntu the stock
-# `chromium-browser` is just a snap shim (confined, useless air-gapped, won't run under the kiosk),
-# so the bundle ships cog instead, which is a real `.deb` the agent launches with `cog <url>` (D27).
-DEFAULT_PKGS="sway greetd grim wayvnc dbus-user-session fonts-dejavu-core fonts-liberation cog"
+# Browser: surf (suckless WebKitGTK), the kiosk browser — NOT Chromium. On Ubuntu the stock
+# `chromium-browser` is just a snap shim (confined, useless air-gapped, won't run under the kiosk)
+# and cog isn't packaged, so the bundle ships surf instead — a real `.deb` the agent launches with
+# `surf <url>` (D27).
+DEFAULT_PKGS="sway greetd grim wayvnc dbus-user-session fonts-dejavu-core fonts-liberation surf"
 PKGS="${PKGS:-$DEFAULT_PKGS}"
 
 OUT_DIR="deploy/dist/deps/${DISTRO_SLUG}/${DEB_ARCH}"
@@ -78,11 +83,11 @@ echo "==> apt-get update"
 if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
 $SUDO apt-get update -y >/dev/null
 
-# Sanity-check the cog browser is in this index (it's the kiosk browser; the bundle is useless
+# Sanity-check the surf browser is in this index (it's the kiosk browser; the bundle is useless
 # without it). Don't hard-fail — PKGS may have been overridden — but warn loudly.
-if ! apt-cache show cog >/dev/null 2>&1; then
-  echo "WARN: no 'cog' .deb in the apt index. The bundle will lack a kiosk browser;" >&2
-  echo "      enable 'universe' (Ubuntu) or add a repo that ships cog, then re-run — or set PKGS=…" >&2
+if ! apt-cache show surf >/dev/null 2>&1; then
+  echo "WARN: no 'surf' .deb in the apt index. The bundle will lack a kiosk browser;" >&2
+  echo "      enable 'universe' (Ubuntu) or add a repo that ships surf, then re-run — or set PKGS=…" >&2
 fi
 
 # ── Resolve the FULL dependency closure for the requested top-level packages ──────────────────────

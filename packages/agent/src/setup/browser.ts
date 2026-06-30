@@ -13,8 +13,9 @@
  *   4. otherwise warns with an actionable message and flags it for verification — provisioning of the
  *      rest of the box still completes.
  *
- * `--browser cog` installs the WPE/WebKit `cog` kiosk browser instead — the documented fallback for
- * low-power clients (D27).
+ * `--browser surf` installs the suckless WebKitGTK `surf` kiosk browser instead — the Ubuntu .deb
+ * kiosk browser where Chromium is snap-only and cog isn't packaged. `--browser cog` installs the
+ * WPE/WebKit `cog` kiosk browser — the documented fallback for low-power clients (D27).
  */
 import type { Sys } from "./system";
 import type { Logger } from "./log";
@@ -76,6 +77,19 @@ export function installBrowser(
   needsVerification: string[],
 ): void {
   log.step(`install browser (${opts.browser})`);
+
+  if (opts.browser === "surf") {
+    const surf = installCmd(distro.pm, ["surf"]);
+    sys.exec(surf.cmd, surf.args, {
+      desc: "install surf (suckless WebKitGTK kiosk browser)",
+      allowFail: distro.pm !== "apt",
+      env: distro.pm === "apt" ? { DEBIAN_FRONTEND: "noninteractive" } : undefined,
+    });
+    if (distro.pm === "pacman") {
+      needsVerification.push("surf may not be in the Arch official repos (AUR) — verify it installed.");
+    }
+    return;
+  }
 
   if (opts.browser === "cog") {
     const cog = installCmd(distro.pm, ["cog"]);

@@ -20,10 +20,11 @@ import {
   resolveChromium,
 } from "./chromium";
 import { buildCogArgs, resolveCog } from "./cog";
+import { buildSurfArgs, resolveSurf } from "./surf";
 
 export interface Browser {
   /** Stable identity of the backend browser (for logs + selection). */
-  readonly name: "chromium" | "cog";
+  readonly name: "chromium" | "cog" | "surf";
   /** Resolve the launch binary (or throw a clear error). */
   resolveBin(env?: NodeJS.ProcessEnv): Promise<string>;
   /** Build the per-output argv from the shared launch spec. */
@@ -61,10 +62,28 @@ export const cogBrowser: Browser = {
   matchesWindow: (appId) => /cog|wpe|webkit/i.test(appId),
 };
 
+/** surf (suckless WebKitGTK) — the Ubuntu kiosk browser where Chromium is snap-only + cog isn't packaged (D27). */
+export const surfBrowser: Browser = {
+  name: "surf",
+  resolveBin: (env) => resolveSurf(env),
+  buildArgs: (spec) => buildSurfArgs(spec),
+  async prelaunch(profileDir, url, log) {
+    await ensureDir(profileDir);
+    // surf has no `--user-data-dir` token, so key the stale-reap on the unique player URL instead.
+    await killStaleByToken(url, log);
+    // No crash-flag reset: surf has no Chromium "Restore pages?" Preferences bubble to clear.
+  },
+  matchesWindow: (appId) => /surf|webkit/i.test(appId),
+};
+
 /**
- * Pick the backend browser from the environment. `POLYPTIC_BROWSER=cog` selects cog; anything else
- * (including unset) keeps Chromium, so existing setups are unaffected.
+ * Pick the backend browser from the environment. `POLYPTIC_BROWSER=cog` selects cog,
+ * `POLYPTIC_BROWSER=surf` selects surf; anything else (including unset) keeps Chromium, so existing
+ * setups are unaffected.
  */
 export function selectBrowser(env: NodeJS.ProcessEnv = process.env): Browser {
-  return env.POLYPTIC_BROWSER?.trim().toLowerCase() === "cog" ? cogBrowser : chromiumBrowser;
+  const choice = env.POLYPTIC_BROWSER?.trim().toLowerCase();
+  if (choice === "cog") return cogBrowser;
+  if (choice === "surf") return surfBrowser;
+  return chromiumBrowser;
 }
