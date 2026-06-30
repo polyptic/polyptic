@@ -9,7 +9,7 @@
  * Model A: the agent OWNS its Chromium children (launches/respawns them via the wayland-sway/x11-i3
  * DisplayBackend); systemd supervises the agent. So there is exactly ONE service unit here.
  */
-import type { OutputPin } from "./args";
+import type { Backend, OutputPin, RenderMode } from "./args";
 
 const MANAGED = "managed by `polyptic-agent setup` — re-running setup may overwrite this file.";
 
@@ -29,18 +29,131 @@ export function greetdConfig(p: GreetdParams): string {
 [terminal]
 vt = 1
 
-# Fallback greeter for any *non-initial* session (e.g. after a manual logout). A wall normally
-# reboots rather than logs out, so this is only a safety net. Run it as the kiosk user — greetd
-# refuses to start if this user doesn't exist, and a dedicated 'greeter' user isn't created by the
-# greetd package on every distro (e.g. Ubuntu 26.04), whereas the kiosk user always exists.
+# Fallback greeter for any *non-initial* session (e.g. after a manual logout). The initial_session
+# below is the polyptic-compositor launcher, which relaunches the compositor forever, so in practice
+# this greeter essentially never runs — it's only a last-ditch safety net. Run it as the kiosk user
+# — greetd refuses to start if this user doesn't exist, and a dedicated 'greeter' user isn't created
+# by the greetd package on every distro (e.g. Ubuntu 26.04), whereas the kiosk user always exists.
 [default_session]
 command = "agreety --cmd /bin/sh"
 user = "${p.user}"
 
-# The session run once at boot: kiosk user -> compositor -> systemd user session.
+# The session run once at boot: kiosk user -> compositor launcher -> compositor -> systemd user
+# session. The command is the polyptic-compositor launcher (restart-on-exit loop + empirical
+# hardware/software render selection), not a bare \`sway\`/\`startx\`, so the wall never drops to a
+# text login and renders even on GPUs with no working 3D.
 [initial_session]
 command = "${p.sessionCommand}"
 user = "${p.user}"
+`;
+}
+
+// ── compositor launcher (robust kiosk session entry point) ──────────────────────
+
+/** Fixed path the launcher script is installed to (mode 0755); greetd's initial_session runs it. */
+export const COMPOSITOR_LAUNCHER = "/usr/local/bin/polyptic-compositor";
+
+export interface CompositorLauncherParams {
+  /** Display backend — selects the compositor command + the software-render env. */
+  backend: Backend;
+  /** The bare compositor command greetd would otherwise run directly (`sway` | `startx`). */
+  sessionCommand: string;
+  /** Baked default for POLYPTIC_RENDER (the session env still overrides it). */
+  render: RenderMode;
+}
+
+/**
+ * POSIX `sh` script that greetd's [initial_session] runs INSTEAD of a bare `sway`/`startx`. It does
+ * two jobs a bare compositor command can't:
+ *
+ *  1. Restart-on-exit loop → the wall never drops to a text login. If the compositor dies we
+ *     relaunch it forever, so control never falls through to greetd's agreety greeter (which would
+ *     itself crash-loop into a black screen / text prompt on a headless wall).
+ *
+ *  2. Empirical hardware/software render selection → renders on GPUs with no working 3D (a QEMU/UTM
+ *     virtio-gpu without virgl renders one frame then crashes) WITHOUT handicapping real GPUs. We
+ *     do NOT force software rendering unconditionally — CPU-only rendering would cripple a real GPU
+ *     wall. `auto` instead measures how long the compositor survives and only switches to software
+ *     when the GPU demonstrably can't render.
+ */
+export function compositorLauncher(p: CompositorLauncherParams): string {
+  const isX11 = p.backend === "x11-i3";
+  // Software-render env. sway is wlroots → WLR_RENDERER=pixman selects the CPU renderer; i3/Xorg
+  // only needs Mesa's software path (LIBGL_ALWAYS_SOFTWARE), and the WLR_* vars are harmless no-ops
+  // there. Indented to sit inside the `if [ "$mode" = software ]` block in the loop below.
+  const softwareEnv = isX11
+    ? `    export LIBGL_ALWAYS_SOFTWARE=1
+    export WLR_NO_HARDWARE_CURSORS=1`
+    : `    export WLR_RENDERER=pixman
+    export WLR_NO_HARDWARE_CURSORS=1
+    export LIBGL_ALWAYS_SOFTWARE=1`;
+
+  return `#!/bin/sh
+# ${COMPOSITOR_LAUNCHER} — ${MANAGED}
+#
+# Robust kiosk compositor launcher. greetd's [initial_session] runs THIS instead of a bare
+# \`${p.sessionCommand}\`, which buys the wall two properties a bare compositor command can't:
+#
+#   1. It NEVER drops to a text login. The compositor is relaunched in a forever-loop, so a crash
+#      can't fall through to greetd's agreety greeter (which would itself crash-loop into a black
+#      screen / text prompt on a headless wall).
+#
+#   2. It renders on GPUs with no working 3D (e.g. a QEMU/UTM virtio-gpu without virgl) WITHOUT
+#      handicapping real GPUs. The renderer is chosen empirically — forcing software rendering on
+#      everyone would cripple a real GPU wall with CPU-only rendering.
+#
+# Renderer selection via POLYPTIC_RENDER (inherited from the session env; default baked by setup):
+#   hardware  run the compositor as-is on the GPU's GL renderer.
+#   software  always force the wlroots/Mesa software (CPU) renderer.
+#   auto      start on hardware; if the compositor dies within ~\${FAST_EXIT_SECS}s — the signature
+#             of a virtual GPU whose GL renderer paints one frame then crashes — switch to software
+#             for every later relaunch in THIS run and stay there. A real GPU runs for hours and
+#             never trips the switch (so it is never handicapped); a virtual GPU dies in ~1s, trips
+#             it once, and renders in software from then on.
+#
+# \`set -e\` must NOT kill the restart loop: the compositor exiting non-zero (a crash) is the normal
+# case we have to survive, so its invocation below is guarded with \`|| true\`.
+set -eu
+
+# Baked default for POLYPTIC_RENDER (from setup's --render); the session env still overrides it.
+: "\${POLYPTIC_RENDER:=${p.render}}"
+
+FAST_EXIT_SECS=8   # auto: a hardware run shorter than this counts as a GPU-render failure
+BACKOFF_SECS=2     # pause between relaunches so a hard crash-loop never pins the CPU
+
+log() { echo "polyptic-compositor: \$*" >&2; }
+
+# Effective renderer for this run. \`auto\` starts on hardware and may flip to software after a fast
+# crash (below); once flipped it stays software for every subsequent relaunch.
+mode="\$POLYPTIC_RENDER"
+if [ "\$mode" = auto ]; then mode=hardware; fi
+
+log "starting (POLYPTIC_RENDER=\$POLYPTIC_RENDER, backend=${p.backend})"
+
+while true; do
+  if [ "\$mode" = software ]; then
+    # Force the CPU renderer. Exported here so it persists across every later relaunch this run.
+${softwareEnv}
+  fi
+
+  start=\$(date +%s)
+  # Launch the compositor; blocks until it exits/crashes. \`|| true\` keeps \`set -e\` from killing
+  # the loop on a non-zero (crash) exit — surviving that crash is the whole point.
+  ${p.sessionCommand} || true
+  end=\$(date +%s)
+  elapsed=\$(( end - start ))
+
+  # auto fallback: a *hardware* run that died fast means the GPU can't actually render GL — switch
+  # to software for the rest of this run. Real GPUs run long and never reach this branch.
+  if [ "\$POLYPTIC_RENDER" = auto ] && [ "\$mode" = hardware ] && [ "\$elapsed" -lt "\$FAST_EXIT_SECS" ]; then
+    log "compositor exited after \${elapsed}s on hardware GL — falling back to software rendering"
+    mode=software
+  else
+    log "compositor exited after \${elapsed}s (mode=\$mode); relaunching in \${BACKOFF_SECS}s"
+  fi
+
+  sleep "\$BACKOFF_SECS"
+done
 `;
 }
 

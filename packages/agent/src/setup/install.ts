@@ -21,8 +21,10 @@ import { loadState, saveState } from "./state";
 import { renderAgentToml } from "./config";
 import {
   AGENT_SERVICE,
+  COMPOSITOR_LAUNCHER,
   SESSION_TARGET,
   agentServiceUnit,
+  compositorLauncher,
   greetdConfig,
   i3Config,
   sessionTargetUnit,
@@ -51,7 +53,6 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   const distro = detectDistro(sys);
   const isX11 = opts.backend === "x11-i3";
   const home = `/home/${opts.user}`;
-  const sessionCommand = isX11 ? "startx" : "sway";
 
   log.banner(
     `Polyptic device setup — ${distro.prettyName} (pm=${distro.pm}, backend=${opts.backend}, user=${opts.user})`,
@@ -73,14 +74,20 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   // 2 ─ kiosk user
   ensureKioskUser(sys, opts, log, home, state, assumptions);
 
-  // 3 ─ greetd autologin config
+  // 3 ─ greetd autologin config. initial_session runs the polyptic-compositor launcher (written in
+  // step 4), not a bare sway/startx, so the wall loops the compositor forever (never a text login)
+  // and picks a renderer empirically (works on no-3D virtual GPUs without crippling real ones).
   log.step("write greetd autologin config");
-  sys.writeFile("/etc/greetd/config.toml", greetdConfig({ user: opts.user, sessionCommand }), {
-    mode: 0o644,
-    backupOriginal: true,
-    desc: "greetd config",
-  });
+  sys.writeFile(
+    "/etc/greetd/config.toml",
+    greetdConfig({ user: opts.user, sessionCommand: COMPOSITOR_LAUNCHER }),
+    { mode: 0o644, backupOriginal: true, desc: "greetd config" },
+  );
   assumptions.push("greetd's fallback default_session runs as the kiosk user (no separate 'greeter' user needed — that user isn't created by the greetd package on every distro).");
+  assumptions.push(
+    `the kiosk compositor is launched via ${COMPOSITOR_LAUNCHER} — a restart-on-exit loop (so the ` +
+      `wall never drops to greetd's text greeter) with POLYPTIC_RENDER=${opts.render} render selection.`,
+  );
 
   // 4 ─ compositor config (sway or i3)
   writeCompositorConfig(sys, opts, log, home, isX11);
@@ -237,6 +244,17 @@ function writeCompositorConfig(
       desc: "sway config",
     });
   }
+
+  // Robust launcher greetd's initial_session runs instead of bare sway/startx: a forever-restart
+  // loop (the wall never falls through to a text login) + empirical hardware/software render
+  // selection (renders on no-3D virtual GPUs without handicapping real GPUs). System-wide, root-
+  // owned, executable.
+  const compositorCommand = isX11 ? "startx" : "sway";
+  sys.writeFile(
+    COMPOSITOR_LAUNCHER,
+    compositorLauncher({ backend: opts.backend, sessionCommand: compositorCommand, render: opts.render }),
+    { mode: 0o755, desc: "compositor launcher" },
+  );
 }
 
 function writeAgentConfig(sys: Sys, opts: SetupOptions, log: Logger, needsVerification: string[]): void {
@@ -332,6 +350,14 @@ function collectBackendVerification(opts: SetupOptions, isX11: boolean, needsVer
       "greetd -> sway -> agent -> Chromium-per-output with zero interaction; OrbStack (headless) only " +
       "verifies the install/systemd/enrolment plumbing.",
   );
+  if (opts.render === "auto") {
+    needsVerification.push(
+      `Auto render-fallback is active (${COMPOSITOR_LAUNCHER}): the launcher runs the compositor on the ` +
+        "GPU and only switches to software rendering if it crashes within ~8s (no-3D virtual GPUs). On a " +
+        "healthy GPU wall the compositor must survive >8s per launch, else it would wrongly fall back to " +
+        "slow CPU rendering — pin it with `--render hardware` (or `--render software` to force CPU).",
+    );
+  }
   if (opts.outputs.length === 0) {
     needsVerification.push(
       "No --output pins given: the compositor auto-arranges outputs. For a multi-panel wall, pin each " +

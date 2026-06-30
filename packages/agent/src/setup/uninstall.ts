@@ -11,7 +11,7 @@ import type { Sys } from "./system";
 import type { Logger } from "./log";
 import type { SetupOptions } from "./args";
 import type { SetupResult } from "./install";
-import { AGENT_SERVICE, SESSION_TARGET } from "./templates";
+import { AGENT_SERVICE, COMPOSITOR_LAUNCHER, SESSION_TARGET } from "./templates";
 import { STATE_PATH, loadState } from "./state";
 
 const UNIT_DIR = "/etc/systemd/user";
@@ -52,10 +52,11 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
     sys.remove("/etc/greetd/config.toml");
   }
 
-  // 5 ─ compositor config we wrote (leave the rest of the home dir untouched).
+  // 5 ─ compositor config + launcher we wrote (leave the rest of the home dir untouched).
   log.step("remove compositor config");
   sys.remove(`${home}/.config/sway/config`);
   sys.remove(`${home}/.config/i3/config`);
+  sys.remove(COMPOSITOR_LAUNCHER);
 
   // 6 ─ purge: agent config/credential + the kiosk user (only if we created it).
   if (opts.purge) {

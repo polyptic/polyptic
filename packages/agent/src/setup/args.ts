@@ -7,6 +7,8 @@
 
 export type Backend = "wayland-sway" | "x11-i3" | "dev-open";
 export type BrowserChoice = "chromium" | "cog" | "surf";
+/** Renderer the compositor launcher uses (POLYPTIC_RENDER). `auto` picks empirically at boot. */
+export type RenderMode = "auto" | "hardware" | "software";
 
 export interface OutputPin {
   connector: string;
@@ -31,6 +33,8 @@ export interface SetupOptions {
   connector?: string;
   /** Compositor output pins (positions/resolutions). */
   outputs: OutputPin[];
+  /** Renderer baked into the compositor launcher (POLYPTIC_RENDER). Default `auto`. */
+  render: RenderMode;
   browser: BrowserChoice;
   chromiumDeb?: string;
   chromiumPpa?: string;
@@ -73,6 +77,7 @@ export function parseArgs(argv: string[]): SetupOptions {
     backend: "wayland-sway",
     user: "kiosk",
     outputs: [],
+    render: "auto",
     browser: "chromium",
     agentBin: "/usr/local/bin/polyptic-agent",
     configPath: "/etc/polyptic/agent.toml",
@@ -137,6 +142,15 @@ export function parseArgs(argv: string[]): SetupOptions {
         opts.outputs.push(parseOutputPin(need(i, a)));
         i++;
         break;
+      case "--render": {
+        const v = need(i, a);
+        i++;
+        if (v !== "auto" && v !== "hardware" && v !== "software") {
+          throw new Error(`--render must be auto | hardware | software (got "${v}")`);
+        }
+        opts.render = v;
+        break;
+      }
       case "--browser": {
         const v = need(i, a);
         i++;
@@ -209,6 +223,10 @@ OPTIONS
   --backend <wayland-sway|x11-i3|dev-open>   default wayland-sway (x11-i3 = NVIDIA/fallback, D9).
   --user <name>                     kiosk login user (default: kiosk).
   --output <CONNECTOR[=WxH][@X,Y]>  pin a compositor output; repeatable. e.g. DP-1=1920x1080@0,0
+  --render <auto|hardware|software> compositor renderer baked into the launcher (default auto).
+                                    auto runs on the GPU and only falls back to software if the
+                                    compositor crashes fast (virtual GPUs with no working 3D),
+                                    so real GPUs are never handicapped; hardware/software force it.
   --connector <name>                single-output connector override (-> agent.toml).
   --browser <chromium|cog|surf>     kiosk browser (default chromium; surf = suckless WebKitGTK, the
                                     Ubuntu .deb kiosk browser; cog = WPE/WebKit fallback, D27).
