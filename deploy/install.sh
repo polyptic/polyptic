@@ -295,9 +295,12 @@ TimeoutStopSec=10
 WantedBy=multi-user.target
 EOF
 
-step "A3: enabling + starting polyptic-agent.service"
+step "A3: enabling + (re)starting polyptic-agent.service"
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now polyptic-agent.service
+$SUDO systemctl enable polyptic-agent.service
+# restart (not `enable --now`) so a RE-install actually picks up a freshly-downloaded binary —
+# `--now` only starts a stopped unit; it would leave an already-running old agent in place.
+$SUDO systemctl restart polyptic-agent.service
 log "Stage A complete — the box is enrolling. Approve it in the console (it shows PENDING in GATED mode)."
 
 # If this is an agent-only install, we're done.
