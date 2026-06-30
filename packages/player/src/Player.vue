@@ -26,7 +26,16 @@ import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protoco
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
 
-const SERVER_WS_URL = "ws://localhost:8080/player";
+// Reach the control plane's /player WS at the host THIS page was loaded from — so a remote wall box
+// works, not just localhost. Dev: the player is served on :5173, the server on :8080 (same host) →
+// map 5173→8080. Prod single-image: the player is served same-origin → use that origin. https → wss.
+const SERVER_WS_URL = (() => {
+  const { protocol, hostname, port } = window.location;
+  const wsProto = protocol === "https:" ? "wss:" : "ws:";
+  const serverPort = port === "5173" ? "8080" : port;
+  const authority = serverPort ? `${hostname}:${serverPort}` : hostname;
+  return `${wsProto}//${authority}/player`;
+})();
 const DEFAULT_CANVAS: Geometry = { x: 0, y: 0, w: 1920, h: 1080 };
 
 // Vite injects this; true only under `vite dev`. Gates the corner badge.
