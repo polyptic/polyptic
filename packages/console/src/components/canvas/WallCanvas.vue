@@ -28,8 +28,11 @@ import ScreenNode from "./ScreenNode.vue";
 import WallNode from "./WallNode.vue";
 import SelectionToolbar from "./SelectionToolbar.vue";
 
-/** Canvas-px → display-px. 0.0625 maps a 1920×1080 screen to a 120×67.5 tile. */
-const SCALE = 0.0625;
+/** Canvas-px → display-px. 0.094 maps a 1920×1080 screen to ~180×101 — matches the design's tile
+ *  size and gives the label + state text room. MIN_TILE_* keeps small/odd-res screens legible. */
+const SCALE = 0.094;
+const MIN_TILE_W = 150;
+const MIN_TILE_H = 96;
 
 const store = useConsoleStore();
 const { identingIds } = useIdent();
@@ -126,8 +129,8 @@ function reconcile() {
     const pos = { x: placement.x * SCALE, y: placement.y * SCALE };
     const zIndex = data.identing ? 55 : data.selectedAlone ? 50 : data.selected ? 40 : 10;
     const style = {
-      width: `${placement.w * SCALE}px`,
-      height: `${placement.h * SCALE}px`,
+      width: `${Math.max(placement.w * SCALE, MIN_TILE_W)}px`,
+      height: `${Math.max(placement.h * SCALE, MIN_TILE_H)}px`,
       zIndex: String(zIndex),
     };
     const existing = nodes.value.find((n) => n.id === screen.id);
