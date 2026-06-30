@@ -55,6 +55,16 @@ const wallSurfaceText = computed(() => {
   return `${n} surface${n === 1 ? "" : "s"} on air`;
 });
 
+// The actual content (name + kind) on the selection — a wall shows its source via any member.
+const singleContent = computed(() => single.value?.content ?? null);
+const wallContent = computed(() => wallMembers.value.map((m) => m.screen.content).find((c) => !!c) ?? null);
+const singleContentKind = computed(() =>
+  singleContent.value ? kindLabel(singleContent.value.kind) : surfaceText.value,
+);
+const wallContentKind = computed(() =>
+  wallContent.value ? `${kindLabel(wallContent.value.kind)} · spans all panels` : wallSurfaceText.value,
+);
+
 const wallUrlDraft = ref("");
 const wallSourcePick = ref("");
 watch(wall, () => {
@@ -208,8 +218,8 @@ function selectOne(id: string) {
           <span class="seam-h"></span>
         </span>
         <span class="content-meta">
-          <span class="content-name">On air</span>
-          <span class="content-kind">{{ wallSurfaceText }}</span>
+          <span class="content-name">{{ wallContent?.name ?? "On air" }}</span>
+          <span class="content-kind">{{ wallContentKind }}</span>
         </span>
       </div>
       <div v-else class="content-empty">No content yet — spans across</div>
@@ -287,8 +297,8 @@ function selectOne(id: string) {
       <div v-if="hasContent" class="content-card">
         <span class="thumb"></span>
         <span class="content-meta">
-          <span class="content-name">On air</span>
-          <span class="content-kind">{{ surfaceText }}</span>
+          <span class="content-name">{{ singleContent?.name ?? "On air" }}</span>
+          <span class="content-kind">{{ singleContentKind }}</span>
         </span>
       </div>
       <div v-else class="content-empty">No content yet</div>

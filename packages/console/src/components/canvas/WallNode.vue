@@ -13,6 +13,8 @@
 -->
 <script setup lang="ts">
 import { computed } from "vue";
+import type { ContentKind } from "@polyptic/protocol";
+import { kindLabel } from "../../content";
 
 interface MemberRect {
   id: string;
@@ -31,10 +33,16 @@ interface WallNodeData {
   selected: boolean;
   identing: boolean;
   hasContent: boolean;
+  contentName?: string | null;
+  contentKind?: ContentKind | null;
   memberRects: MemberRect[];
 }
 
 const props = defineProps<{ id: string; data: WallNodeData }>();
+
+const ckindText = computed(() =>
+  props.data.contentKind ? `${kindLabel(props.data.contentKind)} · spans all panels` : "spanning content",
+);
 
 const dotColor = computed(() => {
   if (props.data.identing) return "var(--accent)";
@@ -81,8 +89,8 @@ const nodeStyle = computed<Record<string, string>>(() => {
       <!-- content: spans across all members -->
       <div v-if="data.hasContent" class="overlay content">
         <span class="spans">SPANS {{ data.count }} SCREENS</span>
-        <span class="cname">On air</span>
-        <span class="ckind">spanning content</span>
+        <span class="cname">{{ data.contentName ?? "On air" }}</span>
+        <span class="ckind">{{ ckindText }}</span>
       </div>
 
       <!-- empty: prompt to set spanning content -->

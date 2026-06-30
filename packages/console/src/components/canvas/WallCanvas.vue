@@ -79,6 +79,7 @@ function wallNodeId(wallId: string): string {
 
 function buildWallData(wall: { id: string; memberScreenIds: string[] }, bounds: { x: number; y: number; w: number; h: number }) {
   const members = store.wallMembers(wall.id);
+  const content = members.map((m) => m.screen.content).find((c) => !!c) ?? null;
   return {
     wallId: wall.id,
     name: store.wallName(wall.id),
@@ -87,6 +88,8 @@ function buildWallData(wall: { id: string; memberScreenIds: string[] }, bounds: 
     selected: store.selectedWallId === wall.id,
     identing: members.some((m) => identingIds.has(m.screen.id)),
     hasContent: members.some((m) => (m.screen.surfaceCount ?? 0) > 0),
+    contentName: content?.name ?? null,
+    contentKind: content?.kind ?? null,
     // Member sub-rectangles relative to the union box (canvas px → display px) for the bezel seams.
     memberRects: members.map((m) => ({
       id: m.screen.id,
