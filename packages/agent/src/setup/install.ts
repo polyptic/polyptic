@@ -380,18 +380,44 @@ function configureSplash(
   // 4 ─ make it the default theme + rebuild the initramfs so it shows from early boot.
   applyPlymouthTheme(sys, log, state, needsVerification);
 
+  // 4b ─ also show the splash on the way DOWN (shutdown/reboot/halt/kexec), so there's no raw
+  // console text at EITHER end. The theme's script keys off Plymouth.GetMode() to say "Shutting
+  // down"/"Restarting" instead of "Starting up".
+  enablePlymouthShutdownUnits(sys, log);
+
   // 5 ─ kernel cmdline: quiet splash + ignore serial consoles → the splash replaces console text.
   ensureKernelCmdline(sys, log, needsVerification);
 
   state.splashConfigured = true;
   assumptions.push(
     `boot splash: Plymouth theme '${PLYMOUTH_THEME_NAME}' (logo, host ${host}, v${version}) shows from ` +
-      "early boot; the compositor launcher retains the final frame so sway paints over it (no flash).",
+      "early boot AND through shutdown/reboot; the compositor launcher retains the final frame so sway " +
+      "paints over it (no flash).",
   );
   needsVerification.push(
-    "Boot splash is a VISUAL cold-boot property: verify on a VM/hardware with a real display that the " +
-      "splash shows continuously from early boot to the player with no raw console text (an OrbStack " +
-      "headless box cannot show it).",
+    "Boot splash is a VISUAL property: verify on a VM/hardware with a real display that the splash " +
+      "shows continuously from early boot to the player AND through shutdown/reboot with no raw console " +
+      "text (an OrbStack headless box cannot show it).",
+  );
+}
+
+/**
+ * Enable Plymouth's shutdown-side units so the splash also covers poweroff/reboot/halt/kexec (POL-7).
+ * These are shipped by the plymouth package; on some distros they're static/preset (enable is then a
+ * harmless no-op), so this is best-effort.
+ */
+function enablePlymouthShutdownUnits(sys: Sys, log: Logger): void {
+  log.step("enable Plymouth shutdown/reboot splash units");
+  sys.exec(
+    "systemctl",
+    [
+      "enable",
+      "plymouth-poweroff.service",
+      "plymouth-reboot.service",
+      "plymouth-halt.service",
+      "plymouth-kexec.service",
+    ],
+    { desc: "splash on shutdown/reboot/halt/kexec", allowFail: true },
   );
 }
 

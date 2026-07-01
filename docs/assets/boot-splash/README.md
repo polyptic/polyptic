@@ -3,12 +3,15 @@
 Reference renders of the Polyptic boot splash (see `docs/DECISIONS.md` **D36** and
 `docs/ARCHITECTURE.md` "Boot splash").
 
-- `splash-1080.png` / `splash-4k.png` — the composed splash at 1920×1080 and 3840×2160. These are
-  built from the **real** theme assets (`logo.svg` / `stamp.svg` rasterised with `rsvg-convert`, the
-  same tool the box uses) laid out at the exact positions `polyptic.script` computes — a faithful
-  preview of what the wall shows. They are **not** live Plymouth captures: the on-device visual is a
-  VM/hardware check (see `docs/DEPLOY.md` → "Watch the cold boot"), and the on-box wordmark uses
-  DejaVu (the installed font) rather than Geist.
+- `splash-1080.png` / `splash-4k.png` — the composed **boot** splash at 1920×1080 and 3840×2160.
+  These are built from the **real** theme assets (`logo.svg` / `stamp.svg` rasterised with
+  `rsvg-convert`, the same tool the box uses) laid out at the exact positions `polyptic.script`
+  computes — a faithful preview of what the wall shows. They are **not** live Plymouth captures: the
+  on-device visual is a VM/hardware check (see `docs/DEPLOY.md` → "Watch the cold boot"), and the
+  on-box wordmark uses DejaVu (the installed font) rather than Geist.
+- `splash-shutdown.png` — the **shutdown/reboot** state (`Plymouth.GetMode()` → "Shutting down"): same
+  branding, no boot progress bar. The same theme covers going down, so there's no console text at
+  either end (POL-7).
 - `logo-asset.png` — the placeholder logo lockup on its own (the swappable SVG rasterised). Drop the
   final designed `logo.svg` into `/usr/share/plymouth/themes/polyptic/` and re-run
   `polyptic-agent setup` to replace it.

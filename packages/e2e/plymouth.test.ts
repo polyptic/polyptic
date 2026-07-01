@@ -99,6 +99,13 @@ describe("plymouthScript — the live splash program", () => {
     expect(script).toContain("Window.GetWidth()");
     expect(script).toContain("Window.GetHeight()");
   });
+  test("covers shutdown/reboot too (POL-7): keys off Plymouth.GetMode with the right status text", () => {
+    expect(script).toContain("Plymouth.GetMode()");
+    expect(script).toContain('"Shutting down"');
+    expect(script).toContain('"Restarting"');
+    // boot progress bar is gated so it doesn't show a stuck 0% bar on the way down
+    expect(script).toContain("show_bar");
+  });
 });
 
 describe("plymouthQuitDropin — seamless hand-off", () => {

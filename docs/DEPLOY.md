@@ -309,7 +309,7 @@ sudo reboot
 
 On reboot you should see, **with zero interaction**: the **Polyptic boot splash** (branded logo + version + hostname + a live status line, *instead of* kernel/systemd console text — POL-7) → greetd autologin → sway comes up (the splash's last frame is held until sway paints, so there's no flash of console) → the agent service starts and connects → a fullscreen kiosk Chromium appears on the virtual output. In the console the machine shows **PENDING**; **Approve** it, drag its screen onto a mural, assign content → the VM's screen flips to the **active scene**, instantly.
 
-> **Boot splash check (POL-7):** the splash must be visible from *early* boot (right after the bootloader), show the live status line advancing, and hand off to sway with **no raw console text** at any point. If you see kernel messages, `quiet splash` didn't reach the cmdline — check `cat /proc/cmdline` and `/etc/default/grub` (then `sudo update-grub`), and that `plymouth-set-default-theme` reports `polyptic` (`sudo plymouth-set-default-theme`). To swap in the final logo later: replace `/usr/share/plymouth/themes/polyptic/logo.svg` and re-run `sudo polyptic-agent setup`.
+> **Boot splash check (POL-7):** the splash must be visible from *early* boot (right after the bootloader), show the live status line advancing, and hand off to sway with **no raw console text** at any point. Then check the **way down**: `sudo reboot` (and `sudo poweroff`) must show the same splash reading "Restarting"/"Shutting down" — no kernel/systemd console text on shutdown either. If you see kernel messages on boot, `quiet splash` didn't reach the cmdline — check `cat /proc/cmdline` and `/etc/default/grub` (then `sudo update-grub`), and that `plymouth-set-default-theme` reports `polyptic` (`sudo plymouth-set-default-theme`). If shutdown shows text, confirm the shutdown units are enabled (`systemctl is-enabled plymouth-poweroff.service plymouth-reboot.service`). To swap in the final logo later: replace `/usr/share/plymouth/themes/polyptic/logo.svg` and re-run `sudo polyptic-agent setup`.
 
 Tail the agent while you watch:
 
@@ -415,6 +415,7 @@ Tick these on the VM ([UTM walkthrough](#utm-test-walkthrough-visual-cold-boot))
 - [ ] `apt install ./polyptic-agent_*.deb` succeeds and pulls deps (sway, `.deb` Chromium, greetd, grim).
 - [ ] `polyptic-agent setup …` is idempotent — running it twice converges, no duplicate/broken state.
 - [ ] **Cold boot is zero-click:** power on → greetd autologin → sway → agent → kiosk Chromium, **no login prompt, no sleep, no typed password**.
+- [ ] **Boot splash (POL-7):** branded splash (logo + version + host + live status) from early boot → player with **no console text**; `sudo reboot` / `sudo poweroff` shows it on the way **down** too ("Restarting"/"Shutting down").
 - [ ] The agent connects outbound and the machine appears **PENDING** in the console; **Approve** → its screen renders.
 - [ ] Assigning content / switching scenes in the console updates the screen **live, with no browser reload** (< ~150 ms).
 - [ ] No "Restore pages" bar, no infobars, no crash bubble on the screen.

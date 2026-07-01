@@ -2,9 +2,11 @@
  * Boot-splash (Plymouth) theme generators for the cold-boot chain (POL-7).
  *
  * On cold boot the wall would otherwise show raw kernel/systemd console text until the compositor
- * comes up. This module generates a small branded **Plymouth** theme — a scalable vector logo, the
- * build version + hostname, and a LIVE boot-status line — shown continuously from early boot until
- * the player paints (see docs/ARCHITECTURE.md "Boot splash").
+ * comes up — and the same raw text on the way DOWN at shutdown/reboot. This module generates a small
+ * branded **Plymouth** theme — a scalable vector logo, the build version + hostname, and a LIVE
+ * status line — shown continuously from early boot until the player paints, AND again through
+ * shutdown/reboot (the script keys off `Plymouth.GetMode()` to show "Starting up" vs "Shutting
+ * down"/"Restarting"). No kernel/console text at either end (see docs/ARCHITECTURE.md "Boot splash").
  *
  * Everything here is a pure string generator (like ./templates.ts): the agent single binary carries
  * the whole theme as source and `install.ts` writes it out + rasterises the SVGs to PNG at provision
@@ -186,6 +188,24 @@ sw = Window.GetWidth();
 sh = Window.GetHeight();
 cx = sw / 2;
 
+# The same theme covers BOTH cold boot AND machine shutdown/reboot (systemd runs plymouth on the way
+# down too), so no kernel/console text shows at either end. Pick the right status + only show the
+# boot progress bar when actually booting.
+boot_mode = Plymouth.GetMode();
+initial_status = "Starting up";
+show_bar = 1;
+if (boot_mode == "shutdown") {
+  initial_status = "Shutting down";
+  show_bar = 0;
+}
+if (boot_mode == "reboot") {
+  initial_status = "Restarting";
+  show_bar = 0;
+}
+if (boot_mode == "updates") {
+  initial_status = "Applying updates";
+}
+
 # ── logo lockup (centred, ~30% of screen width) ──────────────────────────────
 logo.image = Image("logo.png");
 logo.have = 0;
@@ -215,16 +235,18 @@ if (bar.h < 3) {
 bar.x = cx - bar.w / 2;
 bar.y = content_bottom + sh * 0.10;
 bar.have = 0;
-if (bar.track_img.GetWidth() > 0) {
-  bar.have = 1;
-  bar.track = Sprite(bar.track_img.Scale(bar.w, bar.h));
-  bar.track.SetX(bar.x);
-  bar.track.SetY(bar.y);
-  bar.track.SetZ(11);
-  bar.fill = Sprite();
-  bar.fill.SetX(bar.x);
-  bar.fill.SetY(bar.y);
-  bar.fill.SetZ(12);
+if (show_bar == 1) {
+  if (bar.track_img.GetWidth() > 0) {
+    bar.have = 1;
+    bar.track = Sprite(bar.track_img.Scale(bar.w, bar.h));
+    bar.track.SetX(bar.x);
+    bar.track.SetY(bar.y);
+    bar.track.SetZ(11);
+    bar.fill = Sprite();
+    bar.fill.SetX(bar.x);
+    bar.fill.SetY(bar.y);
+    bar.fill.SetZ(12);
+  }
 }
 
 fun draw_fill(p) {
@@ -267,7 +289,7 @@ fun set_status(text) {
     status.sprite.SetZ(11);
   }
 }
-set_status("Starting up");
+set_status(initial_status);
 
 # ── hostname / version stamp (bottom-centre) ─────────────────────────────────
 stamp.image = Image("stamp.png");
