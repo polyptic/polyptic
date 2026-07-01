@@ -61,13 +61,17 @@ Transport: agents dial **outbound `wss://` only**. ~10s lease, full status on ch
 ## On-device stack
 ```
 power on
+  → kernel (quiet splash) → Plymouth "polyptic" theme  ← branded splash, live boot status (POL-7)
   → systemd → greetd [initial_session] autologin user=kiosk
   → exec sway   (outputs pinned: `output DP-1 position 0 0 resolution 1920x1080`)
+       └─ plymouth quit --retain-splash   ← splash frame held until sway paints (no console flash)
   → systemctl --user start sway-session.target
        ├─ polyptic-agent.service          (Restart=always)
        └─ chromium@<screen>.service × N     (Restart=always; one per output)
   no swayidle · output * dpms on · power is the smart plug's job
 ```
+### Boot splash (POL-7)
+Instead of raw kernel/systemd console text, the wall shows a branded **Plymouth** splash from early boot until the player paints. `polyptic-agent setup` installs a `script`-plugin theme under `/usr/share/plymouth/themes/polyptic`, sets it default (`plymouth-set-default-theme -R`), and adds `quiet splash plymouth.ignore-serial-consoles` to the kernel cmdline (`/etc/default/grub` → `update-grub`, or `cmdline.txt` on Pi). It is **live**, not a static image: the script wires `SetUpdateStatusFunction` (systemd's "Starting …" messages), `SetBootProgressFunction` (a progress bar), and `SetMessageFunction` (anything the agent pushes with `plymouth message`). The **logo is a swappable SVG** (`logo.svg`, rasterised to PNG with `rsvg-convert` at install — vector, so it scales to any panel); the **version + hostname** are baked into a vector stamp from the build/host. Clean hand-off: a `plymouth-quit.service` drop-in + the compositor launcher both `quit --retain-splash`, so sway paints straight over the last frame with no flash. Disable with `setup --no-splash`; uninstall restores the prior theme + cmdline.
 ### Chromium launch (per output)
 `chromium --ozone-platform=wayland --app=<player-url?screen=ID> --user-data-dir=/home/kiosk/profiles/<ID> --password-store=basic --force-device-scale-factor=1 --no-first-run --no-default-browser-check --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars --noerrdialogs --disable-component-update --check-for-update-interval=31536000 --disable-features=Translate,InfobarUI`
 Before launch: sed-reset `exit_type`/`exited_cleanly` in `<profile>/Default/Preferences` so power cuts never show "Restore pages".
@@ -77,6 +81,7 @@ Before launch: sed-reset `exit_type`/`exited_cleanly` in `<profile>/Default/Pref
 - **Multiple Chromium share `app_id="chromium"`** under Wayland → `for_window [app_id]` can't disambiguate. Match on distinct **title**, run an **IPC placer** keyed on launch order, or force **XWayland** (`--ozone-platform=x11` + `--class=screen-a`).
 - **Each Chromium needs its own `--user-data-dir`** or a second launch just opens a tab in the first.
 - **NVIDIA on wlroots** needs `nvidia-drm.modeset=1` (maybe `WLR_NO_HARDWARE_CURSORS`); verify hardware before committing to Wayland.
+- **Plymouth needs an initramfs rebuild + the right cmdline** — a theme dropped in `/usr/share/plymouth/themes` does nothing until `plymouth-set-default-theme -R` (rebuilds the initrd) AND `quiet splash` is on the kernel cmdline. Plymouth renders **PNG**, not SVG, so the vector logo is rasterised at install (needs `rsvg-convert`/`librsvg2-bin`). Without `plymouth quit --retain-splash`, quitting Plymouth blanks the VT before sway paints → a flash of console; retain-splash holds the last frame. Serial consoles can slow/garble the splash → `plymouth.ignore-serial-consoles`.
 - **Embedding a dashboard:** the source must permit framing (no `X-Frame-Options: deny`; if CSP is on, list the player origin in `frame-ancestors`). Keep player + content on **one registrable domain** so `SameSite=Lax` cookies survive in the iframe. If the dashboard tool has an embedding / anonymous-access setting, enable it; prefer a single-panel embed URL and bake **every** parameter (including any kiosk / full-screen flag) into the URL, since an in-iframe refresh can drop query state. Pin the source version and re-test embedding on upgrade.
 - **Cross-origin iframe load-failure is undetectable** (Same-Origin Policy) → parent-side watchdog: spinner, load timeout, periodic `iframe.src = iframe.src`, error card + backoff. Sources that won't iframe cleanly become top-level `web-window` surfaces.
 

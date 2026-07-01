@@ -68,8 +68,10 @@ DISTRO_SLUG="${DISTRO_ID}-${DISTRO_VER}"  # e.g. ubuntu-24.04 (matches GET /dist
 # Browser: surf (suckless WebKitGTK), the kiosk browser — NOT Chromium. On Ubuntu the stock
 # `chromium-browser` is just a snap shim (confined, useless air-gapped, won't run under the kiosk)
 # and cog isn't packaged, so the bundle ships surf instead — a real `.deb` the agent launches with
-# `surf <url>` (D27).
-DEFAULT_PKGS="sway greetd grim wayvnc dbus-user-session fonts-dejavu-core fonts-liberation surf"
+# `surf <url>` (D27). plymouth + librsvg2-bin ship the boot splash (POL-7): the branded Plymouth
+# theme and rsvg-convert to rasterise its (swappable) SVG logo — needed on the `--skip-deps` air-gap
+# path where `polyptic-agent setup` does NOT touch the package manager.
+DEFAULT_PKGS="sway greetd grim wayvnc dbus-user-session fonts-dejavu-core fonts-liberation surf plymouth librsvg2-bin"
 PKGS="${PKGS:-$DEFAULT_PKGS}"
 
 OUT_DIR="deploy/dist/deps/${DISTRO_SLUG}/${DEB_ARCH}"

@@ -15,10 +15,12 @@ import type { Sys } from "./system";
 import type { Logger } from "./log";
 import type { RenderMode, SetupOptions } from "./args";
 import type { SetupState } from "./state";
+import { hostname as osHostname } from "node:os";
 import { detectDistro, corePackages, installCmd, refreshCmd } from "./distro";
 import { installBrowser } from "./browser";
 import { loadState, saveState } from "./state";
 import { renderAgentToml } from "./config";
+import { agentVersion } from "../version";
 import {
   AGENT_SERVICE,
   COMPOSITOR_LAUNCHER,
@@ -31,6 +33,17 @@ import {
   swayConfig,
   xinitrc,
 } from "./templates";
+import {
+  PLYMOUTH_QUIT_DROPIN,
+  PLYMOUTH_THEME_DIR,
+  PLYMOUTH_THEME_NAME,
+  mergeCmdlineTxt,
+  mergeGrubCmdline,
+  plymouthQuitDropin,
+  plymouthScript,
+  plymouthTheme,
+  splashAssets,
+} from "./plymouth";
 
 export interface SetupResult {
   needsVerification: string[];
@@ -116,6 +129,16 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   // 6 ─ /etc/polyptic/agent.toml
   writeAgentConfig(sys, opts, log, needsVerification);
 
+  // 6b ─ boot splash (Plymouth): branded logo + version/host + live status, from early boot until
+  // the player paints, in place of raw kernel/systemd console text (POL-7). Before enableServices
+  // so its daemon-reload picks up the plymouth-quit drop-in. (dev-open already threw above.)
+  if (opts.splash) {
+    configureSplash(sys, opts, log, state, needsVerification, assumptions);
+  } else {
+    log.step("configure boot splash");
+    log.skip("boot splash skipped (--no-splash)");
+  }
+
   // 7 ─ enable services + make greetd the display manager
   if (opts.enable) {
     enableServices(sys, log, state);
@@ -160,7 +183,7 @@ function installDeps(
     env,
   });
 
-  const pkgs = corePackages(distro.pm, opts.backend);
+  const pkgs = corePackages(distro.pm, opts.backend, opts.splash);
   const inst = installCmd(distro.pm, pkgs);
   sys.exec(inst.cmd, inst.args, { desc: `install ${pkgs.join(" ")}`, env });
 
@@ -299,6 +322,218 @@ function writeAgentConfig(sys: Sys, opts: SetupOptions, log: Logger, needsVerifi
       `Create ${opts.configPath} from the .example (server_url + bootstrap_token) before the agent can enrol.`,
     );
   }
+}
+
+// ── boot splash (Plymouth) — POL-7 ───────────────────────────────────────────────
+
+function configureSplash(
+  sys: Sys,
+  opts: SetupOptions,
+  log: Logger,
+  state: SetupState,
+  needsVerification: string[],
+  assumptions: string[],
+): void {
+  log.step("configure boot splash (Plymouth theme + kernel cmdline)");
+
+  const version = process.env.POLYPTIC_VERSION?.trim() || agentVersion();
+  const host = osHostname() || "polyptic";
+
+  // 1 ─ theme descriptor + script → /usr/share/plymouth/themes/polyptic
+  sys.ensureDir(PLYMOUTH_THEME_DIR, { mode: 0o755 });
+  sys.writeFile(`${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.plymouth`, plymouthTheme(), {
+    mode: 0o644,
+    desc: "plymouth theme descriptor",
+  });
+  sys.writeFile(`${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.script`, plymouthScript(), {
+    mode: 0o644,
+    desc: "plymouth theme script",
+  });
+
+  // 2 ─ SVG sources + rasterised PNGs. The logo is the swappable vector asset (POL-7): replace
+  // logo.svg with the final designed lockup and re-run setup. The stamp bakes host + build version.
+  let rasterOk = true;
+  for (const asset of splashAssets({ hostname: host, version })) {
+    const svgPath = `${PLYMOUTH_THEME_DIR}/${asset.base}.svg`;
+    const pngPath = `${PLYMOUTH_THEME_DIR}/${asset.base}.png`;
+    sys.writeFile(svgPath, asset.svg, { mode: 0o644, desc: `splash ${asset.base}.svg` });
+    if (!rasterizeSvg(sys, log, svgPath, pngPath, asset.width, asset.height)) rasterOk = false;
+  }
+  if (!rasterOk) {
+    log.warn(
+      "could not rasterise the splash SVGs to PNG (no rsvg-convert/ImageMagick). The theme is " +
+        "installed but the logo stays blank until a rasteriser is available — install librsvg2-bin " +
+        "and re-run `polyptic-agent setup`.",
+    );
+    needsVerification.push(
+      "Boot splash: install an SVG rasteriser (librsvg2-bin / librsvg2-tools / librsvg) so the logo " +
+        "PNGs generate, then re-run setup.",
+    );
+  }
+
+  // 3 ─ clean hand-off: retain the last splash frame when Plymouth quits (no console flash to sway).
+  sys.writeFile(PLYMOUTH_QUIT_DROPIN, plymouthQuitDropin(), {
+    mode: 0o644,
+    desc: "plymouth-quit retain-splash drop-in",
+  });
+
+  // 4 ─ make it the default theme + rebuild the initramfs so it shows from early boot.
+  applyPlymouthTheme(sys, log, state, needsVerification);
+
+  // 5 ─ kernel cmdline: quiet splash + ignore serial consoles → the splash replaces console text.
+  ensureKernelCmdline(sys, log, needsVerification);
+
+  state.splashConfigured = true;
+  assumptions.push(
+    `boot splash: Plymouth theme '${PLYMOUTH_THEME_NAME}' (logo, host ${host}, v${version}) shows from ` +
+      "early boot; the compositor launcher retains the final frame so sway paints over it (no flash).",
+  );
+  needsVerification.push(
+    "Boot splash is a VISUAL cold-boot property: verify on a VM/hardware with a real display that the " +
+      "splash shows continuously from early boot to the player with no raw console text (an OrbStack " +
+      "headless box cannot show it).",
+  );
+}
+
+/** Rasterise one SVG → PNG, best-effort across rsvg-convert then ImageMagick. True on success. */
+function rasterizeSvg(
+  sys: Sys,
+  log: Logger,
+  svgPath: string,
+  pngPath: string,
+  width: number,
+  height: number | undefined,
+): boolean {
+  if (sys.dryRun) {
+    log.plan(`rasterise ${svgPath} -> ${pngPath} (${width}px${height ? `x${height}` : ""})`);
+    return true;
+  }
+  const size = height ? `${width}x${height}` : `${width}`;
+
+  if (sys.which("rsvg-convert")) {
+    const args = ["-w", String(width)];
+    if (height) args.push("-h", String(height));
+    args.push("-o", pngPath, svgPath);
+    if (sys.exec("rsvg-convert", args, { desc: `rasterise ${basename(pngPath)}`, allowFail: true }).code === 0)
+      return sys.exists(pngPath);
+  }
+
+  // ImageMagick fallback: `convert` (v6) or `magick` (v7).
+  const im = sys.which("convert") ? "convert" : sys.which("magick") ? "magick" : null;
+  if (im) {
+    const args = ["-background", "none", "-density", "300", svgPath, "-resize", size, pngPath];
+    if (sys.exec(im, args, { desc: `rasterise ${basename(pngPath)} (ImageMagick)`, allowFail: true }).code === 0)
+      return sys.exists(pngPath);
+  }
+
+  // A pre-rendered PNG (e.g. shipped by a prebaked image) is also acceptable.
+  return sys.exists(pngPath);
+}
+
+/** Set the Plymouth default theme and rebuild the initramfs so it shows from early boot. */
+function applyPlymouthTheme(sys: Sys, log: Logger, state: SetupState, needsVerification: string[]): void {
+  if (!sys.which("plymouth-set-default-theme")) {
+    log.warn("plymouth-set-default-theme not found — cannot select the theme (is plymouth installed?).");
+    needsVerification.push("Boot splash: plymouth-set-default-theme missing; install plymouth then re-run setup.");
+    return;
+  }
+
+  // Record the prior default theme ONCE so uninstall can restore it.
+  if (state.priorPlymouthTheme === undefined) {
+    const cur = sys.probe("plymouth-set-default-theme", []).stdout.trim();
+    state.priorPlymouthTheme = cur && cur !== PLYMOUTH_THEME_NAME ? cur : null;
+  }
+
+  // `-R` sets the theme AND rebuilds the initramfs (apt/dnf). If it fails, set + rebuild manually.
+  const withRebuild = sys.exec("plymouth-set-default-theme", ["-R", PLYMOUTH_THEME_NAME], {
+    desc: "set default plymouth theme + rebuild initramfs",
+    allowFail: true,
+  });
+  if (withRebuild.code === 0) return;
+
+  sys.exec("plymouth-set-default-theme", [PLYMOUTH_THEME_NAME], {
+    desc: "set default plymouth theme",
+    allowFail: true,
+  });
+  rebuildInitramfs(sys, needsVerification);
+}
+
+function rebuildInitramfs(sys: Sys, needsVerification: string[]): void {
+  if (sys.which("update-initramfs")) {
+    sys.exec("update-initramfs", ["-u"], { desc: "rebuild initramfs (update-initramfs)", allowFail: true });
+    return;
+  }
+  if (sys.which("dracut")) {
+    sys.exec("dracut", ["-f"], { desc: "rebuild initramfs (dracut)", allowFail: true });
+    return;
+  }
+  if (sys.which("mkinitcpio")) {
+    sys.exec("mkinitcpio", ["-P"], { desc: "rebuild initramfs (mkinitcpio)", allowFail: true });
+    needsVerification.push(
+      "Arch: ensure the `plymouth` hook is in /etc/mkinitcpio.conf HOOKS so the splash loads from the initramfs.",
+    );
+    return;
+  }
+  needsVerification.push(
+    "Could not find update-initramfs/dracut/mkinitcpio: rebuild the initramfs for your distro so the " +
+      "splash appears from early boot.",
+  );
+}
+
+/** Ensure the kernel cmdline carries `quiet splash plymouth.ignore-serial-consoles`. */
+function ensureKernelCmdline(sys: Sys, log: Logger, needsVerification: string[]): void {
+  const grubDefault = "/etc/default/grub";
+  if (sys.exists(grubDefault)) {
+    const body = sys.readText(grubDefault) ?? "";
+    const merged = mergeGrubCmdline(body);
+    if (merged !== body) {
+      sys.writeFile(grubDefault, merged, {
+        mode: 0o644,
+        backupOriginal: true,
+        desc: "grub defaults (quiet splash)",
+      });
+    } else {
+      log.skip("grub cmdline already carries the splash tokens");
+    }
+    regenerateGrub(sys, needsVerification);
+    return;
+  }
+
+  for (const p of ["/boot/firmware/cmdline.txt", "/boot/cmdline.txt"]) {
+    if (!sys.exists(p)) continue;
+    const body = sys.readText(p) ?? "";
+    const merged = mergeCmdlineTxt(body);
+    if (merged !== body) {
+      sys.writeFile(p, merged, { mode: 0o644, backupOriginal: true, desc: "kernel cmdline.txt (quiet splash)" });
+    } else {
+      log.skip(`${p} already carries the splash tokens`);
+    }
+    return;
+  }
+
+  needsVerification.push(
+    "No /etc/default/grub or cmdline.txt found: add 'quiet splash plymouth.ignore-serial-consoles' to " +
+      "the kernel cmdline for this bootloader (e.g. systemd-boot loader entries) so the splash replaces console text.",
+  );
+}
+
+function regenerateGrub(sys: Sys, needsVerification: string[]): void {
+  if (sys.which("update-grub")) {
+    sys.exec("update-grub", [], { desc: "regenerate grub config (update-grub)", allowFail: true });
+    return;
+  }
+  if (sys.which("grub2-mkconfig")) {
+    sys.exec("grub2-mkconfig", ["-o", "/boot/grub2/grub.cfg"], { desc: "regenerate grub2 config", allowFail: true });
+    return;
+  }
+  if (sys.which("grub-mkconfig")) {
+    sys.exec("grub-mkconfig", ["-o", "/boot/grub/grub.cfg"], { desc: "regenerate grub config", allowFail: true });
+    return;
+  }
+  needsVerification.push(
+    "Edited /etc/default/grub but found no update-grub/grub-mkconfig — regenerate the GRUB config so the " +
+      "splash cmdline takes effect.",
+  );
 }
 
 function enableServices(sys: Sys, log: Logger, state: SetupState): void {

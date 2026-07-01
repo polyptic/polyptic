@@ -12,7 +12,9 @@ import type { Logger } from "./log";
 import type { SetupOptions } from "./args";
 import type { SetupResult } from "./install";
 import { AGENT_SERVICE, COMPOSITOR_LAUNCHER, SESSION_TARGET } from "./templates";
+import { PLYMOUTH_QUIT_DROPIN, PLYMOUTH_THEME_DIR } from "./plymouth";
 import { STATE_PATH, loadState } from "./state";
+import type { SetupState } from "./state";
 
 const UNIT_DIR = "/etc/systemd/user";
 
@@ -58,6 +60,9 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
   sys.remove(`${home}/.config/i3/config`);
   sys.remove(COMPOSITOR_LAUNCHER);
 
+  // 5b ─ boot splash: restore the prior Plymouth theme + kernel cmdline (POL-7).
+  teardownSplash(sys, log, state, needsVerification);
+
   // 6 ─ purge: agent config/credential + the kiosk user (only if we created it).
   if (opts.purge) {
     log.step("purge agent config + kiosk user");
@@ -82,6 +87,51 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
   );
 
   return { needsVerification, assumptions };
+}
+
+/** Reverse configureSplash: restore the prior Plymouth theme, remove our theme + cmdline edits. */
+function teardownSplash(sys: Sys, log: Logger, state: SetupState, needsVerification: string[]): void {
+  log.step("remove boot splash (restore Plymouth theme + kernel cmdline)");
+
+  // 1 ─ restore the prior default theme (`-R` also rebuilds the initramfs), or note it.
+  if (sys.which("plymouth-set-default-theme")) {
+    if (state.priorPlymouthTheme) {
+      sys.exec("plymouth-set-default-theme", ["-R", state.priorPlymouthTheme], {
+        desc: `restore prior plymouth theme ${state.priorPlymouthTheme}`,
+        allowFail: true,
+      });
+    } else {
+      log.info("no prior plymouth theme recorded; leaving the distro default.");
+      if (sys.which("update-initramfs")) {
+        sys.exec("update-initramfs", ["-u"], { desc: "rebuild initramfs", allowFail: true });
+      } else if (sys.which("dracut")) {
+        sys.exec("dracut", ["-f"], { desc: "rebuild initramfs", allowFail: true });
+      } else if (sys.which("mkinitcpio")) {
+        sys.exec("mkinitcpio", ["-P"], { desc: "rebuild initramfs", allowFail: true });
+      }
+      needsVerification.push(
+        "Boot splash removed but no prior Plymouth theme was recorded — set your preferred default theme if wanted.",
+      );
+    }
+  }
+
+  // 2 ─ remove our theme + the plymouth-quit drop-in.
+  sys.remove(PLYMOUTH_THEME_DIR);
+  sys.remove(PLYMOUTH_QUIT_DROPIN);
+  sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
+
+  // 3 ─ restore the kernel cmdline we edited (backup written at install), then regenerate.
+  if (sys.restoreBackup("/etc/default/grub")) {
+    if (sys.which("update-grub")) {
+      sys.exec("update-grub", [], { desc: "regenerate grub config", allowFail: true });
+    } else if (sys.which("grub2-mkconfig")) {
+      sys.exec("grub2-mkconfig", ["-o", "/boot/grub2/grub.cfg"], { desc: "regenerate grub2 config", allowFail: true });
+    } else if (sys.which("grub-mkconfig")) {
+      sys.exec("grub-mkconfig", ["-o", "/boot/grub/grub.cfg"], { desc: "regenerate grub config", allowFail: true });
+    }
+  }
+  sys.restoreBackup("/boot/firmware/cmdline.txt");
+  sys.restoreBackup("/boot/cmdline.txt");
 }
 
 function restoreDisplayManager(

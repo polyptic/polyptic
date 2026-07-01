@@ -124,6 +124,8 @@ interface PkgSet {
   wayland: string[];
   x11: string[];
   fonts: string[];
+  /** Boot-splash: Plymouth + its script plugin + an SVG rasteriser (rsvg-convert) — POL-7. */
+  splash: string[];
 }
 
 const PACKAGES: Record<PkgManager, PkgSet> = {
@@ -132,28 +134,36 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     wayland: ["sway", "grim", "wayvnc"],
     x11: ["xserver-xorg", "xinit", "i3", "x11vnc", "scrot", "imagemagick", "unclutter"],
     fonts: ["fonts-dejavu-core", "fonts-liberation"],
+    // On Debian/Ubuntu the `script` plugin ships inside `plymouth`; `librsvg2-bin` = rsvg-convert.
+    splash: ["plymouth", "librsvg2-bin"],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
     x11: ["xorg-x11-server-Xorg", "xorg-x11-xinit", "i3", "x11vnc", "scrot", "ImageMagick", "unclutter"],
     fonts: ["dejavu-sans-fonts", "liberation-fonts"],
+    // Fedora splits the script plugin + `plymouth-set-default-theme` into separate packages.
+    splash: ["plymouth", "plymouth-scripts", "plymouth-plugin-script", "librsvg2-tools"],
   },
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
     x11: ["xorg-server", "xorg-xinit", "i3-wm", "x11vnc", "scrot", "imagemagick", "unclutter"],
     fonts: ["ttf-dejavu", "ttf-liberation"],
+    // Arch's `plymouth` bundles the script plugin + set-default-theme; `librsvg` = rsvg-convert.
+    splash: ["plymouth", "librsvg"],
   },
 };
 
 /**
  * The packages to install for a given backend (browser added separately). `dev-open` provisions
  * only the base set (greetd) — it is not a real kiosk backend, but kept usable for completeness.
+ * `splash` adds Plymouth + the rasteriser for the real kiosk backends (POL-7); pass `false` to skip.
  */
-export function corePackages(pm: PkgManager, backend: Backend): string[] {
+export function corePackages(pm: PkgManager, backend: Backend, splash = true): string[] {
   const set = PACKAGES[pm];
-  if (backend === "wayland-sway") return [...set.base, ...set.wayland, ...set.fonts];
-  if (backend === "x11-i3") return [...set.base, ...set.x11, ...set.fonts];
+  const splashPkgs = splash ? set.splash : [];
+  if (backend === "wayland-sway") return [...set.base, ...set.wayland, ...set.fonts, ...splashPkgs];
+  if (backend === "x11-i3") return [...set.base, ...set.x11, ...set.fonts, ...splashPkgs];
   return [...set.base]; // dev-open
 }

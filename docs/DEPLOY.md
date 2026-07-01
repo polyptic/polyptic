@@ -307,7 +307,9 @@ sudo reboot
 
 ### Watch the cold boot
 
-On reboot you should see, **with zero interaction**: greetd autologin → sway comes up → the agent service starts and connects → a fullscreen kiosk Chromium appears on the virtual output. In the console the machine shows **PENDING**; **Approve** it, drag its screen onto a mural, assign content → the VM's screen flips to the **active scene**, instantly.
+On reboot you should see, **with zero interaction**: the **Polyptic boot splash** (branded logo + version + hostname + a live status line, *instead of* kernel/systemd console text — POL-7) → greetd autologin → sway comes up (the splash's last frame is held until sway paints, so there's no flash of console) → the agent service starts and connects → a fullscreen kiosk Chromium appears on the virtual output. In the console the machine shows **PENDING**; **Approve** it, drag its screen onto a mural, assign content → the VM's screen flips to the **active scene**, instantly.
+
+> **Boot splash check (POL-7):** the splash must be visible from *early* boot (right after the bootloader), show the live status line advancing, and hand off to sway with **no raw console text** at any point. If you see kernel messages, `quiet splash` didn't reach the cmdline — check `cat /proc/cmdline` and `/etc/default/grub` (then `sudo update-grub`), and that `plymouth-set-default-theme` reports `polyptic` (`sudo plymouth-set-default-theme`). To swap in the final logo later: replace `/usr/share/plymouth/themes/polyptic/logo.svg` and re-run `sudo polyptic-agent setup`.
 
 Tail the agent while you watch:
 
@@ -360,6 +362,13 @@ swaymsg -t get_tree           # is there a Chromium window, and is it on the rig
 journalctl --user -u polyptic-agent -e   # placement errors, respawn loops
 ```
 Common causes: a wrong/absent `--user-data-dir` (second window opened as a tab — should not happen with the per-output dirs), the app_id/title placer not matching (Wayland app_id gotcha), or `swayidle` somehow installed and blanking the screen (it must **not** be present).
+
+### Boot splash — console text still shows, or the logo is blank
+- **Console text instead of the splash:** the kernel cmdline is missing `quiet splash`. `cat /proc/cmdline`; if absent, confirm `/etc/default/grub` has them in `GRUB_CMDLINE_LINUX_DEFAULT`, run `sudo update-grub`, reboot. (On a Pi it's `/boot/firmware/cmdline.txt`.)
+- **Splash never appears / wrong theme:** `sudo plymouth-set-default-theme` should print `polyptic`. If not: `sudo plymouth-set-default-theme -R polyptic` (the `-R` rebuilds the initramfs — required).
+- **Logo blank but text/bar show:** the SVG wasn't rasterised to PNG (no `rsvg-convert`). `sudo apt install librsvg2-bin && sudo polyptic-agent setup` re-renders `/usr/share/plymouth/themes/polyptic/*.png`.
+- **A flash of console between splash and kiosk:** the retain-splash hand-off didn't apply. Check the drop-in `/etc/systemd/system/plymouth-quit.service.d/10-polyptic-retain-splash.conf` exists and `systemctl cat plymouth-quit.service` shows `--retain-splash`.
+- **Wrong version/hostname on the stamp:** it's baked at provision time — re-run `sudo polyptic-agent setup` after a rename/upgrade (or push a live line with `plymouth message --text=…`).
 
 ### Greetd isn't autologging in
 Check the `initial_session` block points at the `kiosk` user and `exec`s sway:

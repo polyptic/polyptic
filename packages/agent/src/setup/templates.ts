@@ -134,6 +134,14 @@ log "starting (POLYPTIC_RENDER=\$POLYPTIC_RENDER, backend=${p.backend})"
 # harmless no-op on the X11/i3 (startx) path. (Verified on Ubuntu 26.04/arm64 virtio-gpu.)
 export WLR_NO_HARDWARE_CURSORS=1
 
+# POL-7 clean hand-off: dismiss the boot splash but KEEP its final frame on screen
+# (\`--retain-splash\`) so the compositor paints straight over it — no flash of a blank console
+# between the splash and the player. Best-effort + once (a no-op if plymouth isn't installed or has
+# already quit via its systemd unit, which our drop-in also makes retain the splash).
+if command -v plymouth >/dev/null 2>&1; then
+  plymouth quit --retain-splash >/dev/null 2>&1 || true
+fi
+
 while true; do
   if [ "\$mode" = software ]; then
     # Force the CPU renderer. Exported here so it persists across every later relaunch this run.

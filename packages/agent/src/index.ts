@@ -58,13 +58,12 @@ import {
 import type { Output } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
+import { agentVersion } from "./version";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -82,8 +81,6 @@ const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 10_000;
 /** After a `server/rejected`, retry slowly so a rejected/unapproved machine never hammers. */
 const REJECT_BACKOFF_MS = 60_000;
-
-const here = dirname(fileURLToPath(import.meta.url));
 
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] [agent] ${msg}`);
@@ -118,14 +115,7 @@ function readBootstrapToken(): string | undefined {
 }
 
 function readAgentVersion(): string {
-  try {
-    const raw = readFileSync(join(here, "..", "package.json"), "utf8");
-    const pkg = JSON.parse(raw) as { version?: unknown };
-    if (typeof pkg.version === "string") return pkg.version;
-  } catch {
-    // ignore — fall through to default
-  }
-  return "0.0.0";
+  return agentVersion();
 }
 
 // Narrowed server-frame variants.

@@ -49,6 +49,8 @@ overrides:
       - wayvnc
       - dbus-user-session     # systemd --user + D-Bus activation for the in-session agent
       - fonts-dejavu-core     # a baseline font so kiosk pages render text
+      - plymouth              # branded boot splash (logo + version + live status) — POL-7
+      - librsvg2-bin          # rsvg-convert: rasterise the (swappable) SVG logo to PNG for Plymouth
     recommends:
       - i3-wm                 # x11-i3 fallback backend (NVIDIA / wlroots-unfriendly GPUs, D9)
       - scrot                 # x11 capture (grim is wayland-only)
@@ -63,6 +65,9 @@ overrides:
       - wayvnc
       - dbus-daemon           # systemd --user + D-Bus activation for the in-session agent
       - dejavu-sans-fonts     # a baseline font so kiosk pages render text
+      - plymouth              # branded boot splash (logo + version + live status) — POL-7
+      - plymouth-scripts      # plymouth-set-default-theme + the `script` plugin
+      - librsvg2-tools        # rsvg-convert: rasterise the (swappable) SVG logo to PNG for Plymouth
     recommends:
       - i3                    # x11-i3 fallback backend (NVIDIA / wlroots-unfriendly GPUs, D9)
       - scrot                 # x11 capture (grim is wayland-only)

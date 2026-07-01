@@ -66,10 +66,14 @@ if [ -z "${SKIP_INSTALL:-}" ]; then
 fi
 
 # ── Compile the agent entrypoint to a single self-contained executable for the target ────────────
-echo "==> bun build --compile -> $BIN_OUT"
+# Bake the version in at compile time: the standalone binary cannot read package.json off disk (bun
+# compiles sources into a virtual FS), so packages/agent/src/version.ts reads this define instead —
+# which is what the boot splash (POL-7) and `agent/hello` report.
+echo "==> bun build --compile -> $BIN_OUT  (POLYPTIC_BUILD_VERSION=$VERSION)"
 bun build \
   --compile \
   --minify \
+  --define "process.env.POLYPTIC_BUILD_VERSION=\"$VERSION\"" \
   --target="$BUN_TARGET" \
   --outfile "$BIN_OUT" \
   packages/agent/src/index.ts

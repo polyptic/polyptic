@@ -17,6 +17,10 @@ export interface SetupState {
   priorDisplayManager?: string | null;
   /** Default systemd target before we forced graphical.target. */
   priorDefaultTarget?: string | null;
+  /** Plymouth default theme active before we set ours (so uninstall can restore it), or null. */
+  priorPlymouthTheme?: string | null;
+  /** True once the boot splash (Plymouth theme + cmdline) was configured (so uninstall reverts it). */
+  splashConfigured?: boolean;
   installedAt?: string;
 }
 
