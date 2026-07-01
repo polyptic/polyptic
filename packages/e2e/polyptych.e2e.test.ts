@@ -533,3 +533,108 @@ describe("phase 2a", () => {
     TEST_TIMEOUT,
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POL-9 — no phantom "HDMI-1" screen before a compositor exists.
+//
+// The agent-side half (advertise ZERO outputs when a real backend can't discover any) is unit-tested
+// in packages/agent. Here we drive the SERVER over the real /agent WS to prove the end-to-end
+// behaviour operators see in the console: a box reporting no outputs has no screen, and when a
+// legacy/guessed connector is later replaced by the real one the phantom is pruned — no straggler
+// left next to the real panels.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function agentHelloWith(machineId: string, connectors: string[]): unknown {
+  return {
+    t: "agent/hello",
+    protocol: PROTOCOL_VERSION,
+    machineId,
+    agentVersion: "e2e",
+    backend: "wayland-sway",
+    outputs: connectors.map((connector) => ({ connector, width: 1920, height: 1080 })),
+  };
+}
+
+/** Connect a raw agent advertising exactly `connectors`, and await its server/apply. */
+async function connectAgentWith(
+  machineId: string,
+  connectors: string[],
+): Promise<{ client: WsClient; apply: Frame }> {
+  const client = await WsClient.connect(`${WS}/agent`);
+  openClients.push(client);
+  client.send(agentHelloWith(machineId, connectors));
+  const apply = await client.waitFor(
+    (m) => m.t === "server/apply" && m.machineId === machineId,
+    `server/apply for ${machineId}`,
+  );
+  return { client, apply };
+}
+
+describe("POL-9 phantom screen", () => {
+  test(
+    "a box reporting ZERO outputs shows no screen; the real panels appear only once discovered",
+    async () => {
+      const admin2 = await connectAdmin();
+
+      // Stage A: the headless system agent enrols before any compositor exists — zero outputs.
+      const fresh = await connectAgentWith("wall-fresh", []);
+      expect(fresh.apply.screens.length).toBe(0);
+
+      const emptyState = await admin2.waitFor(
+        (m) => m.t === "admin/state" && m.machines?.some((mm: Frame) => mm.id === "wall-fresh"),
+        "admin/state with wall-fresh present",
+      );
+      const freshMachine = emptyState.machines.find((mm: Frame) => mm.id === "wall-fresh");
+      expect(freshMachine.screens.length).toBe(0);
+      expect(freshMachine.outputCount).toBe(0);
+
+      // Stage B: sway comes up; the kiosk agent reconnects with the REAL outputs (both panels).
+      fresh.client.close();
+      const real = await connectAgentWith("wall-fresh", ["Virtual-1", "HDMI-A-1"]);
+      expect(real.apply.screens.length).toBe(2);
+
+      const realState = await admin2.waitFor(
+        (m) =>
+          m.t === "admin/state" &&
+          m.machines?.some((mm: Frame) => mm.id === "wall-fresh" && mm.screens?.length === 2),
+        "admin/state with wall-fresh's two real screens",
+      );
+      const realMachine = realState.machines.find((mm: Frame) => mm.id === "wall-fresh");
+      const connectors = realMachine.screens.map((s: Frame) => s.connector).sort();
+      expect(connectors).toEqual(["HDMI-A-1", "Virtual-1"]);
+      expect(connectors).not.toContain("HDMI-1"); // no phantom ever appears
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a stale guessed connector is pruned when the box re-advertises the real one",
+    async () => {
+      const admin2 = await connectAdmin();
+
+      // A legacy agent had guessed "HDMI-1" — an unused phantom screen.
+      const legacy = await connectAgentWith("wall-legacy", ["HDMI-1"]);
+      expect(legacy.apply.screens.length).toBe(1);
+      legacy.client.close();
+
+      // The upgraded agent reconnects advertising the REAL connector.
+      const real = await connectAgentWith("wall-legacy", ["Virtual-1"]);
+      expect(real.apply.screens.length).toBe(1);
+
+      const state = await admin2.waitFor(
+        (m) =>
+          m.t === "admin/state" &&
+          m.machines?.some(
+            (mm: Frame) =>
+              mm.id === "wall-legacy" &&
+              mm.screens?.length === 1 &&
+              mm.screens[0].connector === "Virtual-1",
+          ),
+        "admin/state with wall-legacy pruned to the real screen",
+      );
+      const machine = state.machines.find((mm: Frame) => mm.id === "wall-legacy");
+      expect(machine.screens.map((s: Frame) => s.connector)).toEqual(["Virtual-1"]);
+    },
+    TEST_TIMEOUT,
+  );
+});
