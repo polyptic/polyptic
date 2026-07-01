@@ -84,6 +84,8 @@ export function registerRestRoutes(
     const message = ServerToPlayerRender.parse({
       t: "server/render",
       revision: control.state.revision,
+      // Stamp the screen's current friendly name so the player labels itself with it, not the raw id.
+      friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
       slice,
     });
     const delivered = hub.send(screenId, message);
@@ -277,6 +279,11 @@ export function registerRestRoutes(
     if (!screen) {
       return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
     }
+
+    // Re-push the screen's current slice so its player relabels its idle splash / badge live (POL-29).
+    // renameScreen deliberately does NOT bump the revision (the name isn't render data), so this
+    // re-sends the SAME revision with the new name — an instant relabel, no reload, no "behind" ack.
+    pushRender(screen.id, control.sliceForPlayer(screen.id));
 
     fastify.log.info(
       { event: "screen.rename", screenId: screen.id, friendlyName: screen.friendlyName },
