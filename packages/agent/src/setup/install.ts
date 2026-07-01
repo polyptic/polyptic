@@ -34,6 +34,7 @@ import {
   xinitrc,
 } from "./templates";
 import {
+  PLYMOUTHD_CONF_PATH,
   PLYMOUTH_QUIT_DROPIN,
   PLYMOUTH_THEME_DIR,
   PLYMOUTH_THEME_NAME,
@@ -42,6 +43,7 @@ import {
   plymouthQuitDropin,
   plymouthScript,
   plymouthTheme,
+  plymouthdConf,
   splashAssets,
 } from "./plymouth";
 
@@ -456,53 +458,101 @@ function rasterizeSvg(
   return sys.exists(pngPath);
 }
 
-/** Set the Plymouth default theme and rebuild the initramfs so it shows from early boot. */
+/**
+ * Select the Plymouth theme and rebuild the initramfs so it shows from early boot.
+ *
+ * The theme is selected by writing `/etc/plymouth/plymouthd.conf` (`[Daemon] Theme=`) — the portable
+ * selector that BOTH modern plymouth and dracut honour. `plymouth-set-default-theme` is used too WHEN
+ * PRESENT (it also points the initramfs-tools `default.plymouth` alternative at our theme), but it is
+ * NOT required: Ubuntu 26.04 (dracut) ships without it, so the old code — which bailed out entirely
+ * when the helper was missing — left the splash on the stock theme (POL-7).
+ */
 function applyPlymouthTheme(sys: Sys, log: Logger, state: SetupState, needsVerification: string[]): void {
-  if (!sys.which("plymouth-set-default-theme")) {
-    log.warn("plymouth-set-default-theme not found — cannot select the theme (is plymouth installed?).");
-    needsVerification.push("Boot splash: plymouth-set-default-theme missing; install plymouth then re-run setup.");
-    return;
-  }
-
-  // Record the prior default theme ONCE so uninstall can restore it.
+  // Record the prior default theme ONCE so uninstall can restore the alternative (best-effort; the
+  // helper is absent on dracut boxes, where the plymouthd.conf backup is what restores the theme).
   if (state.priorPlymouthTheme === undefined) {
-    const cur = sys.probe("plymouth-set-default-theme", []).stdout.trim();
-    state.priorPlymouthTheme = cur && cur !== PLYMOUTH_THEME_NAME ? cur : null;
+    state.priorPlymouthTheme = sys.which("plymouth-set-default-theme")
+      ? (() => {
+          const cur = sys.probe("plymouth-set-default-theme", []).stdout.trim();
+          return cur && cur !== PLYMOUTH_THEME_NAME ? cur : null;
+        })()
+      : null;
   }
 
-  // `-R` sets the theme AND rebuilds the initramfs (apt/dnf). If it fails, set + rebuild manually.
-  const withRebuild = sys.exec("plymouth-set-default-theme", ["-R", PLYMOUTH_THEME_NAME], {
-    desc: "set default plymouth theme + rebuild initramfs",
-    allowFail: true,
+  // 1 ─ the authoritative, portable selector. Backed up so teardown restores the box's original.
+  sys.writeFile(PLYMOUTHD_CONF_PATH, plymouthdConf(), {
+    mode: 0o644,
+    backupOriginal: true,
+    desc: "plymouthd.conf (select the Polyptic theme)",
   });
-  if (withRebuild.code === 0) return;
 
-  sys.exec("plymouth-set-default-theme", [PLYMOUTH_THEME_NAME], {
-    desc: "set default plymouth theme",
-    allowFail: true,
-  });
-  rebuildInitramfs(sys, needsVerification);
+  // 2 ─ if the Debian helper exists, also point the default.plymouth alternative at our theme (what
+  //     initramfs-tools reads). A no-op where it's absent (Ubuntu 26.04 / dracut).
+  if (sys.which("plymouth-set-default-theme")) {
+    sys.exec("plymouth-set-default-theme", [PLYMOUTH_THEME_NAME], {
+      desc: "set default plymouth theme (alternative)",
+      allowFail: true,
+    });
+  }
+
+  // 3 ─ rebuild the initramfs with the REAL generator so the theme is embedded for early boot.
+  rebuildInitramfs(sys, log, needsVerification);
 }
 
-function rebuildInitramfs(sys: Sys, needsVerification: string[]): void {
-  if (sys.which("update-initramfs")) {
-    sys.exec("update-initramfs", ["-u"], { desc: "rebuild initramfs (update-initramfs)", allowFail: true });
-    return;
-  }
+/**
+ * Rebuild the initramfs so the selected Plymouth theme is embedded for early boot.
+ *
+ * Order matters: prefer `dracut` when present. Ubuntu 26.04 builds the initramfs with dracut but ALSO
+ * ships an `update-initramfs` compatibility shim — calling that shim first (the old order) left the
+ * real dracut initramfs untouched, so the theme never got in (POL-7). A box that genuinely uses
+ * initramfs-tools has no `dracut` and falls through to `update-initramfs`.
+ */
+function rebuildInitramfs(sys: Sys, log: Logger, needsVerification: string[]): void {
+  let rebuilt = false;
   if (sys.which("dracut")) {
-    sys.exec("dracut", ["-f"], { desc: "rebuild initramfs (dracut)", allowFail: true });
-    return;
-  }
-  if (sys.which("mkinitcpio")) {
-    sys.exec("mkinitcpio", ["-P"], { desc: "rebuild initramfs (mkinitcpio)", allowFail: true });
+    rebuilt = sys.exec("dracut", ["-f"], { desc: "rebuild initramfs (dracut)", allowFail: true }).code === 0;
+  } else if (sys.which("update-initramfs")) {
+    rebuilt =
+      sys.exec("update-initramfs", ["-u"], { desc: "rebuild initramfs (update-initramfs)", allowFail: true }).code === 0;
+  } else if (sys.which("mkinitcpio")) {
+    rebuilt = sys.exec("mkinitcpio", ["-P"], { desc: "rebuild initramfs (mkinitcpio)", allowFail: true }).code === 0;
     needsVerification.push(
       "Arch: ensure the `plymouth` hook is in /etc/mkinitcpio.conf HOOKS so the splash loads from the initramfs.",
     );
+  } else {
+    needsVerification.push(
+      "Could not find dracut/update-initramfs/mkinitcpio: rebuild the initramfs for your distro so the " +
+        "splash appears from early boot.",
+    );
     return;
   }
+
+  if (rebuilt && !sys.dryRun) verifyThemeInInitramfs(sys, log, needsVerification);
+}
+
+/**
+ * Best-effort guard against a SILENT theme miss (the POL-7 failure): after the rebuild, confirm our
+ * theme is actually inside the initramfs image. If we can't locate the image or a lister, skip
+ * quietly rather than warn spuriously.
+ */
+function verifyThemeInInitramfs(sys: Sys, log: Logger, needsVerification: string[]): void {
+  const rel = sys.probe("uname", ["-r"]).stdout.trim();
+  const image = [`/boot/initrd.img-${rel}`, `/boot/initramfs-${rel}.img`, `/boot/initrd-${rel}`].find(
+    (p) => rel && sys.exists(p),
+  );
+  const lister = sys.which("lsinitramfs") ?? sys.which("lsinitrd");
+  if (!image || !lister) return;
+
+  const listing = sys.probe(lister, [image]).stdout;
+  if (!listing) return;
+  if (listing.includes(PLYMOUTH_THEME_NAME)) {
+    log.info(`boot splash: confirmed the '${PLYMOUTH_THEME_NAME}' theme is embedded in ${image}`);
+    return;
+  }
+  log.warn(`boot splash: the '${PLYMOUTH_THEME_NAME}' theme is NOT in ${image} after rebuild.`);
   needsVerification.push(
-    "Could not find update-initramfs/dracut/mkinitcpio: rebuild the initramfs for your distro so the " +
-      "splash appears from early boot.",
+    `Boot splash: '${PLYMOUTH_THEME_NAME}' is not embedded in ${image} after the initramfs rebuild — the ` +
+      "splash will fall back to the distro default. Check that plymouth's dracut module is enabled, then re-run setup.",
   );
 }
 
