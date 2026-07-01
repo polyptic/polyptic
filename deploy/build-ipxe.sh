@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy/build-ipxe.sh — build the Polyptic iPXE BOOT MEDIUM (POL-33). Sibling of build-agent.sh.
+# deploy/build-ipxe.sh, build the Polyptic iPXE BOOT MEDIUM (POL-33). Sibling of build-agent.sh.
 #
 # Clones iPXE, bakes the control-plane base URL into an embedded script (deploy/embed.ipxe.tmpl → menu:
 # boot-now / offload), and compiles a UEFI binary whose embedded script chains ${base}/boot.ipxe. The
@@ -10,7 +10,7 @@
 # The server serves these UNGATED at GET /dist/ipxe/<file> and links the .img from Console ▸ Settings ▸
 # Netboot (Download boot medium).
 #
-# LINUX BUILD HOST ONLY — iPXE cross-compiles to a UEFI PE binary with a GNU toolchain; this CANNOT be
+# LINUX BUILD HOST ONLY, iPXE cross-compiles to a UEFI PE binary with a GNU toolchain; this CANNOT be
 # built or verified on macOS (no toolchain producing bin-*-efi/*.efi there). Run on Linux/CI.
 #
 # PREREQUISITES (Debian/Ubuntu build host):
@@ -31,11 +31,11 @@ case "$ARCH_IN" in
   arm64|aarch64)    ARCH=arm64; TARGET=bin-arm64-efi;  CROSS=(CROSS=aarch64-linux-gnu-); EFINAME=BOOTAA64.EFI ;;
   *) echo "build-ipxe: unknown arch '$ARCH_IN' (expected amd64 or arm64)" >&2; exit 2 ;;
 esac
-# NOTE: never pass ARCH= to make — iPXE derives it from the bin-<plat>-efi target name.
+# NOTE: never pass ARCH= to make, iPXE derives it from the bin-<plat>-efi target name.
 
-[ "$(uname -s)" = "Linux" ] || { echo "build-ipxe: Linux build host required (got $(uname -s)) — iPXE needs a GNU/EFI toolchain" >&2; exit 1; }
+[ "$(uname -s)" = "Linux" ] || { echo "build-ipxe: Linux build host required (got $(uname -s)), iPXE needs a GNU/EFI toolchain" >&2; exit 1; }
 command -v git  >/dev/null 2>&1 || { echo "build-ipxe: 'git' not found" >&2; exit 1; }
-command -v make >/dev/null 2>&1 || { echo "build-ipxe: 'make' not found — apt-get install build-essential" >&2; exit 1; }
+command -v make >/dev/null 2>&1 || { echo "build-ipxe: 'make' not found, apt-get install build-essential" >&2; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DIST="$HERE/dist/ipxe"
@@ -66,20 +66,20 @@ cp "$SRC/$TARGET/ipxe.efi"    "$DIST/polyptic-boot-$ARCH.efi"
 cp "$SRC/$TARGET/snponly.efi" "$DIST/polyptic-boot-$ARCH-snponly.efi"
 
 # A dd-able FAT32 USB image (boots via the firmware's default \EFI\BOOT\<EFINAME> path). NEVER touches a
-# target machine — this IS the dongle image itself. Needs mtools (mmd/mcopy) + dosfstools (mkfs.vfat).
+# target machine, this IS the dongle image itself. Needs mtools (mmd/mcopy) + dosfstools (mkfs.vfat).
 if [ -z "${SKIP_IMG:-}" ] && command -v mkfs.vfat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
   IMG="$DIST/polyptic-boot-$ARCH.img"
   echo "==> Wrapping into a FAT32 USB image -> $IMG"
-  # 64 MiB with 512-byte clusters (-s 1) gives ~130k data clusters — comfortably above the 65,525-cluster
+  # 64 MiB with 512-byte clusters (-s 1) gives ~130k data clusters, comfortably above the 65,525-cluster
   # FLOOR that *defines* FAT32. A smaller image (e.g. 16 MiB) lays out a FAT32 BPB but has too few clusters,
   # so a spec-strict UEFI FAT driver (EDK2/OVMF, incl. the arm64 UTM VMs) counts clusters, decides FAT16,
-  # misreads the BPB, and never finds \EFI\BOOT\<EFINAME> — the USB silently fails to boot on strict firmware.
+  # misreads the BPB, and never finds \EFI\BOOT\<EFINAME>, the USB silently fails to boot on strict firmware.
   dd if=/dev/zero of="$IMG" bs=1M count=64 status=none
   mkfs.vfat -F 32 -s 1 -n POLYPTIC "$IMG"    # keep stderr (a cluster-count warning must be visible)
   mmd   -i "$IMG" ::/EFI ::/EFI/BOOT
   mcopy -i "$IMG" "$DIST/polyptic-boot-$ARCH.efi" "::/EFI/BOOT/$EFINAME"
 else
-  echo "==> Skipping .img (SKIP_IMG set, or mtools/dosfstools missing) — the .efi still serves HTTP-boot"
+  echo "==> Skipping .img (SKIP_IMG set, or mtools/dosfstools missing), the .efi still serves HTTP-boot"
 fi
 
 echo

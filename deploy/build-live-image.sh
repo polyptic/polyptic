@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy/build-live-image.sh — bake a NETBOOTABLE Polyptic live image (POL-33). amd64 first.
+# deploy/build-live-image.sh, bake a NETBOOTABLE Polyptic live image (POL-33). amd64 first.
 #
 # Produces into deploy/dist/image/<arch>/ (served UNGATED at GET /dist/image/<arch>/{vmlinuz,initrd,
 # squashfs}): vmlinuz + initrd copied VERBATIM from the base ISO's casper/; squashfs = base rootfs +
@@ -13,9 +13,9 @@
 #
 # MODEL: unsquashfs the base rootfs, chroot, run the compiled `polyptic-agent setup`, overlay
 # deploy/live/, mksquashfs back. The kernel is NEVER changed (apt-mark hold) so the reused ISO initrd
-# stays matched to the squashfs's /lib/modules — the #1 netboot footgun.
+# stays matched to the squashfs's /lib/modules, the #1 netboot footgun.
 #
-# LINUX BUILD HOST ONLY — unsquashfs/mksquashfs/chroot/loop-mount are Linux-only; this CANNOT run or be
+# LINUX BUILD HOST ONLY, unsquashfs/mksquashfs/chroot/loop-mount are Linux-only; this CANNOT run or be
 # verified on macOS. The PURE identity layer IS verifiable here: `sh deploy/live/test/identity.test.sh`
 # (also wrapped by `bun test packages/e2e/netboot-identity.test.ts`).
 #
@@ -25,8 +25,8 @@
 #
 # USAGE:
 #   sudo BASE_ISO=/path/ubuntu-24.04.x-live-server-amd64.iso deploy/build-live-image.sh [amd64|arm64]
-#     env: BASE_ISO (required; a casper live ISO — Server-live keeps the squashfs small)
-#          BROWSER (default cog — Chromium is snap-only on Ubuntu and unreliable in a casper overlay)
+#     env: BASE_ISO (required; a casper live ISO, Server-live keeps the squashfs small)
+#          BROWSER (default cog, Chromium is snap-only on Ubuntu and unreliable in a casper overlay)
 #          OUT_DIR SQUASHFS
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO_ROOT"
@@ -45,8 +45,8 @@ OVERLAY="$REPO_ROOT/deploy/live"
 [ "$(uname -s)" = "Linux" ] || { echo "Linux build host required (got $(uname -s))" >&2; exit 1; }
 [ "$(id -u)" = 0 ]          || { echo "must run as root (chroot + mounts)" >&2; exit 1; }
 for t in unsquashfs mksquashfs rsync; do command -v "$t" >/dev/null || { echo "missing $t (squashfs-tools/rsync)" >&2; exit 1; }; done
-[ -f "$AGENT_BIN" ] || { echo "$AGENT_BIN missing — run deploy/build-agent.sh $ARCH first" >&2; exit 1; }
-[ -d "$OVERLAY" ]   || { echo "$OVERLAY missing — the diskless identity overlay is required" >&2; exit 1; }
+[ -f "$AGENT_BIN" ] || { echo "$AGENT_BIN missing, run deploy/build-agent.sh $ARCH first" >&2; exit 1; }
+[ -d "$OVERLAY" ]   || { echo "$OVERLAY missing, the diskless identity overlay is required" >&2; exit 1; }
 
 WORK="$(mktemp -d /var/tmp/polyptic-live.XXXXXX)"; ISO_MNT="$WORK/iso"; ROOTFS="$WORK/rootfs"
 mkdir -p "$ISO_MNT" "$ROOTFS" "$OUT_DIR"
@@ -76,10 +76,10 @@ install -m0755 "$AGENT_BIN" "$ROOTFS/usr/local/bin/polyptic-agent"
 chroot "$ROOTFS" /bin/sh -eux <<'CHROOT'
 export DEBIAN_FRONTEND=noninteractive
 # Hold the kernel so no apt operation desyncs the squashfs /lib/modules from the reused ISO initrd (the
-# #1 netboot footgun). `apt-mark hold` takes LITERAL package names — a glob would match nothing — so
+# #1 netboot footgun). `apt-mark hold` takes LITERAL package names, a glob would match nothing, so
 # expand the actually-installed kernel packages via dpkg-query first.
 held="$(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null | grep -v '^$' || true)"
-[ -n "$held" ] && apt-mark hold $held || echo "no linux-* packages to hold (unusual — verify the ISO)"
+[ -n "$held" ] && apt-mark hold $held || echo "no linux-* packages to hold (unusual, verify the ISO)"
 apt-get update
 CHROOT
 # No --server-url/--bootstrap-token/--start: those arrive on the kernel cmdline at boot; greetd starts
@@ -97,7 +97,7 @@ mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 for unit in polyptic-agent-env.service polyptic-offload.service; do
   ln -sf "../$unit" "$ROOTFS/etc/systemd/system/multi-user.target.wants/$unit"
 done
-# Empty machine-id so systemd mints a transient one each boot (the agent ignores it — our var wins).
+# Empty machine-id so systemd mints a transient one each boot (the agent ignores it, our var wins).
 : > "$ROOTFS/etc/machine-id"; rm -f "$ROOTFS/var/lib/dbus/machine-id"
 
 echo '==> [6/7] mksquashfs'
@@ -118,5 +118,5 @@ that script's kernel line is equivalent to:
   kernel <base>/dist/image/$ARCH/vmlinuz initrd=initrd boot=casper netboot=http ip=dhcp \\
          fetch=<base>/dist/image/$ARCH/squashfs polyptic.base=<base> \\
          polyptic.server_url=ws://<host>/agent polyptic.token=<enrolment-token>
-(busybox in the casper initrd resolves IPs, not DNS — use the server's IP in <base> if DNS is absent.)
+(busybox in the casper initrd resolves IPs, not DNS, use the server's IP in <base> if DNS is absent.)
 EOF

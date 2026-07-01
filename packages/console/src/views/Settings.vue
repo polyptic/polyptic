@@ -72,7 +72,7 @@ async function regenerate(): Promise<void> {
 }
 
 // ── Netboot (POL-33) ──────────────────────────────────────────────────────────
-// A per-field copy indicator (which URL was last copied) — one helper for the base + iPXE URLs.
+// A per-field copy indicator (which URL was last copied), one helper for the base + iPXE URLs.
 const nbCopied = ref<string | null>(null);
 
 async function copyNetboot(text: string, which: string): Promise<void> {
@@ -83,7 +83,7 @@ async function copyNetboot(text: string, which: string): Promise<void> {
       if (nbCopied.value === which) nbCopied.value = null;
     }, 1600);
   } catch {
-    /* clipboard unavailable (non-secure context) — Copy is best-effort */
+    /* clipboard unavailable (non-secure context), Copy is best-effort */
   }
 }
 
@@ -205,7 +205,7 @@ async function onChangePassword(): Promise<void> {
       <div class="card panel">
         <div class="panel-title">Netboot</div>
         <div class="panel-sub">
-          Boot a bare machine straight into Polyptic over the network — no OS install, no disk. Point the
+          Boot a bare machine straight into Polyptic over the network, no OS install, no disk. Point the
           machine's iPXE/PXE at the chain URL below, or write the ready-made boot medium to a USB stick.
         </div>
 
@@ -237,11 +237,11 @@ async function onChangePassword(): Promise<void> {
               write the boot medium to USB.
             </div>
             <div class="nb-step">
-              <span class="nb-num">2</span> Power on the bare machine — it streams the kernel, initrd and
+              <span class="nb-num">2</span> Power on the bare machine, it streams the kernel, initrd and
               root image from this server only, into RAM.
             </div>
             <div class="nb-step">
-              <span class="nb-num">3</span> It boots diskless into Polyptic and dials in —
+              <span class="nb-num">3</span> It boots diskless into Polyptic and dials in, 
               <template v-if="store.netboot.mode === 'gated'">approve it under Machines.</template>
               <template v-else>it is auto-approved (open mode).</template>
             </div>
@@ -255,12 +255,12 @@ async function onChangePassword(): Promise<void> {
             >Download boot medium</a
           >
           <div v-else class="token-hint nb-gap">
-            No prebuilt boot medium bundled yet — use the iPXE chain URL above, or build one into
+            No prebuilt boot medium bundled yet, use the iPXE chain URL above, or build one into
             <code class="inline-code">IPXE_DIST_DIR</code> on the server.
           </div>
 
           <div v-if="store.netboot.mode === 'gated'" class="nb-note">
-            Ownership of the fleet is the enrolment token, which the boot flow above bakes in — so multiple
+            Ownership of the fleet is the enrolment token, which the boot flow above bakes in, so multiple
             Polyptic instances can share a network without collision. Keep the netboot network
             operator-only, and regenerate the token (card above) to revoke.
           </div>

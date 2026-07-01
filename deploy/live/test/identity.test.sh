@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Pure-shell tests for the diskless identity layer (POL-33). Runs ANYWHERE (macOS/Linux/CI) — no root,
+# Pure-shell tests for the diskless identity layer (POL-33). Runs ANYWHERE (macOS/Linux/CI), no root,
 # no squashfs, just fixtures. This is the part of the live-image build that IS verifiable off-box; the
 # full squashfs build needs a Linux host (deploy/build-live-image.sh). Also wrapped by a bun test
 # (packages/e2e/netboot-identity.test.ts) so it runs in `bun test` / CI.

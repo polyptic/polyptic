@@ -175,7 +175,7 @@ registerOpsRoutes(fastify, {
 // TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch, /dist/deps/**) —
 // NOT /api/v1, so an edge box with no operator session can bootstrap itself entirely from the server.
 const provisionConfig = provisionConfigFromEnv();
-// Pass the live enrollment singleton so GET /boot.ipxe (POL-33) bakes the CURRENT token — the same one
+// Pass the live enrollment singleton so GET /boot.ipxe (POL-33) bakes the CURRENT token, the same one
 // the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
 registerProvisionRoutes(fastify, provisionConfig, enrollment);
 attachWebSockets({

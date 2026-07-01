@@ -1,10 +1,10 @@
 /**
- * @polyptic/e2e — NETBOOT stable diskless identity (POL-33).
+ * @polyptic/e2e, NETBOOT stable diskless identity (POL-33).
  *
  * The whole POL-33 fix: a diskless live image regenerates /etc/machine-id randomly each boot, which would
  * make every cold boot a brand-new PENDING machine with lost placement. The live image instead derives a
  * STABLE POLYPTIC_MACHINE_ID from hardware (DMI product_uuid, MAC-hash fallback) BEFORE the agent starts,
- * so enroll.ts case-4 re-attaches the same approved machine every boot — no server/protocol change.
+ * so enroll.ts case-4 re-attaches the same approved machine every boot, no server/protocol change.
  *
  * These are pure-shell helpers (deploy/live/usr/local/lib/polyptic/*.sh) with every input path overridable,
  * so they're verifiable off-box. This bun test (a) runs the standalone shell test suite and asserts it

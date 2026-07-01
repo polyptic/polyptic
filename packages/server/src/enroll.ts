@@ -100,8 +100,8 @@ export class Enrollment {
   /**
    * The live bootstrap token the agent WS currently accepts, or `undefined` in OPEN mode. Read by the
    * netboot boot-depot (POL-33): `GET /boot.ipxe` bakes this into the kernel cmdline so a diskless box
-   * carries it (and re-presents it on every cold boot). Because it's read from THIS instance — the same
-   * one `setToken` mutates on regenerate and `authenticate` compares against — the baked token can never
+   * carries it (and re-presents it on every cold boot). Because it's read from THIS instance, the same
+   * one `setToken` mutates on regenerate and `authenticate` compares against, the baked token can never
    * drift from what the agent channel will honour. Already normalized (empty/whitespace → undefined).
    */
   get currentToken(): string | undefined {

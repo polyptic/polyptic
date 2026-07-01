@@ -1,7 +1,7 @@
 /**
- * @polyptic/e2e — NETBOOT boot depot (POL-33).
+ * @polyptic/e2e, NETBOOT boot depot (POL-33).
  *
- * A bare box HTTP-boots a live Polyptic image straight into RAM — no OS install, no disk. This suite
+ * A bare box HTTP-boots a live Polyptic image straight into RAM, no OS install, no disk. This suite
  * drives the server-side boot-depot HTTP surface (added to provision.ts) against the REAL control plane.
  *
  * The box has no operator session, so the boot routes are TOP-LEVEL + UNGATED (like /install, /healthz):
@@ -37,7 +37,7 @@ const GATED_BASE = `http://${GATED_HOST}`;
 const FLEET_TOKEN = "netboot-e2e-fleet-token-abc123";
 const TEST_TIMEOUT = 10_000;
 
-// Marker bytes — unique sentinels so an assertion can prove EXACTLY which file answered. The squashfs is
+// Marker bytes, unique sentinels so an assertion can prove EXACTLY which file answered. The squashfs is
 // deliberately long enough to range over.
 const VMLINUZ_BYTES = "FAKE_POLYPTIC_VMLINUZ\x00kernel-marker\n";
 const INITRD_BYTES = "FAKE_POLYPTIC_INITRD\x00initrd-marker\n";
@@ -51,7 +51,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
 const serverEntry = resolve(repoRoot, "packages", "server", "src", "index.ts");
 
-/** The shape of GET /api/v1/settings/netboot (NetbootInfo) — for typing the parsed JSON in assertions. */
+/** The shape of GET /api/v1/settings/netboot (NetbootInfo), for typing the parsed JSON in assertions. */
 type NetbootInfoShape = {
   baseUrl: string;
   mode: string;
@@ -63,7 +63,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Temp dist roots: fabricate the netboot artifact layout WITHOUT a real image build.
-//   imageDir/amd64/{vmlinuz,initrd,squashfs}   (NO arm64 dir — asserts a clean 404)
+//   imageDir/amd64/{vmlinuz,initrd,squashfs}   (NO arm64 dir, asserts a clean 404)
 //   ipxeDir/polyptic-boot-amd64.efi
 //   rootDir/secret.txt                          (traversal canary, OUTSIDE both roots)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ function removeDistRoots(): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Server process lifecycle — two servers (open + gated)
+// Server process lifecycle, two servers (open + gated)
 // ─────────────────────────────────────────────────────────────────────────────
 
 let openProc: ReturnType<typeof Bun.spawn> | null = null;
@@ -166,7 +166,7 @@ afterAll(async () => {
 }, 10_000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /boot.ipxe — the iPXE chain script
+// GET /boot.ipxe, the iPXE chain script
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("netboot: GET /boot.ipxe", () => {
@@ -220,7 +220,7 @@ describe("netboot: GET /boot.ipxe", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /dist/image/:arch/:file — the live-image artifacts, Range-aware
+// GET /dist/image/:arch/:file, the live-image artifacts, Range-aware
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("netboot: GET /dist/image/:arch/:file", () => {
@@ -324,7 +324,7 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /dist/ipxe/:file — the tokenless boot medium
+// GET /dist/ipxe/:file, the tokenless boot medium
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("netboot: GET /dist/ipxe/:file", () => {
@@ -362,7 +362,7 @@ describe("netboot: GET /dist/ipxe/:file", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/v1/settings/netboot — the operator-facing (gated) info
+// GET /api/v1/settings/netboot, the operator-facing (gated) info
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("netboot: GET /api/v1/settings/netboot", () => {

@@ -1,5 +1,5 @@
 #!ipxe
-# Polyptic boot medium — the embedded script baked into polyptic-boot-<arch>.efi by build-ipxe.sh.
+# Polyptic boot medium, the embedded script baked into polyptic-boot-<arch>.efi by build-ipxe.sh.
 # @@POLYPTIC_BASE@@ is replaced with the control-plane base URL at BUILD time; ${...} are iPXE runtime
 # variables and must survive verbatim. TOKENLESS: this carries only the base URL. The enrolment token is
 # baked by GET /boot.ipxe at chain time (so the site-DHCP / UEFI-HTTP-boot paths, which have no medium,
@@ -29,7 +29,7 @@ chain ${base}/boot.ipxe || goto bootfail
 # The live image performs the offload (iPXE itself cannot write a local ESP or run efibootmgr). We ask
 # for it by chaining boot.ipxe?offload=1; the server adds polyptic.offload=1 to the kernel cmdline, and
 # the image's polyptic-offload.service drops the loader into the existing ESP + adds a UEFI boot entry
-# (never repartitions/wipes). After that, pull the USB — the box self-boots the identical flow forever.
+# (never repartitions/wipes). After that, pull the USB, the box self-boots the identical flow forever.
 echo Offload: booting the live image in one-time offload mode ...
 chain ${base}/boot.ipxe?offload=1 || goto bootfail
 

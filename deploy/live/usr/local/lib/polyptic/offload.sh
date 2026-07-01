@@ -16,13 +16,13 @@ STAMP="${POLYPTIC_OFFLOAD_STAMP:-/var/lib/polyptic/offloaded}"
 
 # UEFI-mode only: efibootmgr needs efivarfs. A BIOS/CSM boot has no NVRAM boot entries to add.
 if [ ! -d /sys/firmware/efi ]; then
-  echo "offload: not booted in UEFI mode — cannot add a boot entry; leaving box as dongle-only" >&2
+  echo "offload: not booted in UEFI mode, cannot add a boot entry; leaving box as dongle-only" >&2
   exit 0
 fi
 
 # Recover the HTTP control-plane base + arch from the cmdline (the same values GET /boot.ipxe baked).
 base="$(sed -n 's/.*polyptic\.base=\([^ ]*\).*/\1/p' /proc/cmdline)"
-[ -n "$base" ] || { echo "offload: no polyptic.base= on cmdline — aborting" >&2; exit 1; }
+[ -n "$base" ] || { echo "offload: no polyptic.base= on cmdline, aborting" >&2; exit 1; }
 arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 loader_efi="EFI/polyptic/polyptic.efi"
 
@@ -30,11 +30,11 @@ loader_efi="EFI/polyptic/polyptic.efi"
 tmp_efi="$(mktemp)"
 mnt=""
 # Clean up on ANY exit (set -eu means a mid-sequence failure would otherwise leave the ESP mounted on a
-# temp dir + leak the loader). Best-effort — never masks the real exit status.
+# temp dir + leak the loader). Best-effort, never masks the real exit status.
 cleanup() { [ -n "$mnt" ] && mountpoint -q "$mnt" 2>/dev/null && umount "$mnt" 2>/dev/null; [ -n "$mnt" ] && rmdir "$mnt" 2>/dev/null; rm -f "$tmp_efi" 2>/dev/null; return 0; }
 trap cleanup EXIT
 if ! curl -fsSL "$base/dist/ipxe/polyptic-boot-$arch.efi" -o "$tmp_efi"; then
-  echo "offload: could not fetch $base/dist/ipxe/polyptic-boot-$arch.efi — aborting" >&2
+  echo "offload: could not fetch $base/dist/ipxe/polyptic-boot-$arch.efi, aborting" >&2
   exit 1
 fi
 
@@ -43,7 +43,7 @@ esp_part=""
 for p in $(lsblk -rno NAME,PARTTYPE | awk -v g="$ESP_GUID" 'tolower($2)==g {print $1}'); do
   esp_part="$p"; break
 done
-[ -n "$esp_part" ] || { echo "offload: no EFI System Partition found — aborting (nothing wiped)" >&2; exit 1; }
+[ -n "$esp_part" ] || { echo "offload: no EFI System Partition found, aborting (nothing wiped)" >&2; exit 1; }
 disk="/dev/$(lsblk -no PKNAME "/dev/$esp_part")"
 partnum="$(cat "/sys/class/block/$esp_part/partition")"
 
@@ -59,5 +59,5 @@ if ! efibootmgr | grep -q "Polyptic Netboot"; then
 fi
 
 mkdir -p "$(dirname "$STAMP")"; : > "$STAMP"
-echo "offload: installed \\EFI\\polyptic\\polyptic.efi on $disk part $partnum + added UEFI entry — pull the USB."
+echo "offload: installed \\EFI\\polyptic\\polyptic.efi on $disk part $partnum + added UEFI entry, pull the USB."
 exit 0

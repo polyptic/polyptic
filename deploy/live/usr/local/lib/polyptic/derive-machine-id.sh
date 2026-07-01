@@ -2,19 +2,19 @@
 # Emit ONE stable machine id to stdout for a diskless (netboot) live boot (POL-33).
 #
 # WHY: a casper/live image regenerates /etc/machine-id randomly on every boot, so a diskless box would
-# look like a BRAND-NEW machine each power cycle — re-entering PENDING and losing its screen placement.
+# look like a BRAND-NEW machine each power cycle, re-entering PENDING and losing its screen placement.
 # Derive instead a value stable per PHYSICAL box:
 #   1) dmi-<product_uuid>              (SMBIOS/DMI, stable per motherboard)
 #   2) mac-<sha256(primary NIC MAC)>  (fallback for firmware that reports an all-zero/placeholder UUID)
-#   3) unknown-<random machine-id>    (last resort — still enrollable, just not stable)
+#   3) unknown-<random machine-id>    (last resort, still enrollable, just not stable)
 # The live image exports this as POLYPTIC_MACHINE_ID, which the agent honours ABOVE /etc/machine-id
 # (readMachineId()); the server's enroll.ts case-4 then re-attaches the same approved machine every boot.
 #
-# PURE + TESTABLE: every input path is overridable, so this runs against fixtures on macOS/Linux/CI —
+# PURE + TESTABLE: every input path is overridable, so this runs against fixtures on macOS/Linux/CI, 
 #   POLYPTIC_DMI_UUID_FILE (/sys/class/dmi/id/product_uuid)
 #   POLYPTIC_NET_DIR       (/sys/class/net)
 #   POLYPTIC_ROUTE_FILE    (/proc/net/route)
-# Deliberately NO `set -e` — it must NEVER wedge the boot; it always exits 0 with SOME value.
+# Deliberately NO `set -e`, it must NEVER wedge the boot; it always exits 0 with SOME value.
 
 UUID_FILE="${POLYPTIC_DMI_UUID_FILE:-/sys/class/dmi/id/product_uuid}"
 NET_DIR="${POLYPTIC_NET_DIR:-/sys/class/net}"
@@ -51,7 +51,7 @@ fi
 mac=""
 if [ -n "$iface" ] && [ -r "$NET_DIR/$iface/address" ]; then
   mac="$(lc < "$NET_DIR/$iface/address" 2>/dev/null)"
-  # An all-zero MAC on the default-route iface is useless as an identity — fall through to the scan below.
+  # An all-zero MAC on the default-route iface is useless as an identity, fall through to the scan below.
   [ "$mac" = "00:00:00:00:00:00" ] && mac=""
 fi
 if [ -z "$mac" ]; then
@@ -72,6 +72,6 @@ if [ -n "$mac" ]; then
   printf 'mac-%s\n' "$(printf '%s' "$mac" | sha256hex | cut -c1-32)"; exit 0
 fi
 
-# 3) last resort — still enrollable, just not stable across reboots.
+# 3) last resort, still enrollable, just not stable across reboots.
 printf 'unknown-%s\n' "$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]')"
 exit 0

@@ -1,5 +1,5 @@
 [Unit]
-Description=Polyptic — one-shot offload: install the boot loader to this box's ESP + a UEFI entry (POL-33)
+Description=Polyptic, one-shot offload: install the boot loader to this box's ESP + a UEFI entry (POL-33)
 Documentation=file:///usr/local/lib/polyptic/offload.sh
 # Only runs when the boot medium's "Offload to this box" item chained GET /boot.ipxe?offload=1, which
 # tagged the kernel cmdline. Ordered before greetd so it finishes before the kiosk session comes up.

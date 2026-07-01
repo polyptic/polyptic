@@ -12,14 +12,14 @@
  *   GET /dist/deps/:distro/:arch/manifest.json    → the bundled substrate package manifest.
  *   GET /dist/deps/:distro/:arch/:file            → one bundled substrate package (.deb) by name.
  *
- * NETBOOT (POL-33) — a bare box HTTP-boots a live Polyptic image straight into RAM, no OS install:
+ * NETBOOT (POL-33), a bare box HTTP-boots a live Polyptic image straight into RAM, no OS install:
  *   GET /boot.ipxe                                → an iPXE chain script with the control-plane base
  *                                                   (and, in GATED mode, the enrolment token) baked in
- *                                                   from THIS request. Ungated — the box has no session.
+ *                                                   from THIS request. Ungated, the box has no session.
  *   GET /dist/image/:arch/{vmlinuz,initrd,squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/ipxe/:file                          → a prebuilt boot medium (polyptic-boot-<arch>.{efi,img}),
  *                                                   TOKENLESS so ungated (UEFI HTTP Boot / DHCP / offload).
- *   GET /api/v1/settings/netboot                  → operator-facing netboot info for the console (GATED —
+ *   GET /api/v1/settings/netboot                  → operator-facing netboot info for the console (GATED, 
  *                                                   under /api/v1; secret-free, points at the URLs above).
  *
  * The install flow (the script): detect arch+distro → download the agent binary → write
@@ -161,7 +161,7 @@ export function toWsAgentUrl(httpBase: string): string {
  * The kernel command line a diskless box boots with (POL-33). CENTRALISED here so the casper/live-boot
  * contract is a one-line change once validated on real hardware (the one piece not testable in-repo):
  *   - `boot=casper netboot=http fetch=<squashfs>` streams the root image straight into RAM over HTTP
- *     and builds a tmpfs overlay — nothing touches disk ("live image, no install").
+ *     and builds a tmpfs overlay, nothing touches disk ("live image, no install").
  *   - `ip=dhcp` brings the NIC up before the fetch.
  *   - `polyptic.server_url=` / `polyptic.token=` are picked out of /proc/cmdline by the image's
  *     parse-cmdline helper and become the agent's POLYPTIC_SERVER_URL / POLYPTIC_BOOTSTRAP_TOKEN.
@@ -188,9 +188,9 @@ function bootKernelCmdline(gated: boolean, offload: boolean): string {
 
 /**
  * Build the `GET /boot.ipxe` chain script for a control plane at `base`, baking in the WS agent URL and
- * — in GATED mode — the current enrolment token (POL-33). The box has no operator session at boot, so
+ *, in GATED mode, the current enrolment token (POL-33). The box has no operator session at boot, so
  * this route is ungated; a leaked token cannot self-admit (a NEW machine still lands PENDING for an
- * operator to approve — see enroll.ts case 1). `${buildarch}` selects amd64/arm64 at boot so one script
+ * operator to approve, see enroll.ts case 1). `${buildarch}` selects amd64/arm64 at boot so one script
  * serves both arches (amd64 images are bundled first). `offload` (from `/boot.ipxe?offload=1`) tags the
  * cmdline so the live image writes the loader to the box's ESP once, then boots the same flow forever.
  */
@@ -202,7 +202,7 @@ export function buildBootIpxeScript(
   const gated = token !== undefined;
   const lines = [
     "#!ipxe",
-    "# Polyptic netboot (POL-33) — generated for THIS control plane from the request Host.",
+    "# Polyptic netboot (POL-33), generated for THIS control plane from the request Host.",
     "# Ownership is by KEY: the box belongs to the server whose enrolment token it carries.",
     `set polyptic_base ${base}`,
     `set polyptic_ws ${toWsAgentUrl(base)}`,
@@ -259,7 +259,7 @@ export function parseRange(
 /**
  * Resolve the preferred downloadable boot medium for `arch` under `ipxeDistDir`, traversal-safe: the
  * `dd`-able `.img` dongle first (what an operator writes to USB), else the raw `.efi` loader. Returns the
- * absolute path of the first that is a regular file, else `null` (the medium is optional — the UI falls
+ * absolute path of the first that is a regular file, else `null` (the medium is optional, the UI falls
  * back to the raw `/boot.ipxe` URL when it's absent).
  */
 export async function resolveBootMedium(ipxeDistDir: string, arch: string): Promise<string | null> {
@@ -387,7 +387,7 @@ export function registerProvisionRoutes(
 
   // ─── Netboot depot (POL-33) ────────────────────────────────────────────────────────────────────
 
-  // ── GET /boot.ipxe — UNGATED iPXE chain script; base baked from THIS request, enrolment token
+  // ── GET /boot.ipxe, UNGATED iPXE chain script; base baked from THIS request, enrolment token
   //    baked in GATED mode. A diskless box (or the site's DHCP/UEFI-HTTP boot) chains this. ──
   fastify.get("/boot.ipxe", async (request, reply) => {
     const base = computeBaseUrl(request, publicBaseUrl);
@@ -401,7 +401,7 @@ export function registerProvisionRoutes(
     return script;
   });
 
-  // ── GET /dist/image/:arch/:file — the netboot root image (vmlinuz|initrd|squashfs), Range-aware
+  // ── GET /dist/image/:arch/:file, the netboot root image (vmlinuz|initrd|squashfs), Range-aware
   //    (the squashfs is large and streamed byte-range into RAM). 404 → the box's boot cleanly stalls. ──
   fastify.get("/dist/image/:arch/:file", async (request, reply) => {
     const { arch, file } = request.params as { arch?: string; file?: string };
@@ -442,8 +442,8 @@ export function registerProvisionRoutes(
     return reply.send(createReadStream(abs));
   });
 
-  // ── GET /dist/ipxe/:file — UNGATED download of a prebuilt boot medium (polyptic-boot-<arch>.{efi,img}).
-  //    Tokenless (it only chains /boot.ipxe), so — like /dist/agent — it's ungated: UEFI HTTP Boot, DHCP
+  // ── GET /dist/ipxe/:file, UNGATED download of a prebuilt boot medium (polyptic-boot-<arch>.{efi,img}).
+  //    Tokenless (it only chains /boot.ipxe), so, like /dist/agent, it's ungated: UEFI HTTP Boot, DHCP
   //    option-67 and the offload flow all fetch it with no session. 404 when not bundled. ──
   fastify.get("/dist/ipxe/:file", async (request, reply) => {
     const file = (request.params as { file?: string }).file ?? "";
@@ -468,7 +468,7 @@ export function registerProvisionRoutes(
     return reply.send(createReadStream(abs));
   });
 
-  // ── GET /api/v1/settings/netboot — GATED (auto: /api/v1 prefix → the global preHandler). Secret-free
+  // ── GET /api/v1/settings/netboot, GATED (auto: /api/v1 prefix → the global preHandler). Secret-free
   //    netboot info for the console (the token stays in EnrollmentInfo). ──
   fastify.get("/api/v1/settings/netboot", async (request) => {
     const base = computeBaseUrl(request, publicBaseUrl);
