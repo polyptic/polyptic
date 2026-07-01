@@ -55,6 +55,25 @@ export class PlayerHub {
     }
     return delivered;
   }
+
+  /**
+   * Broadcast a validated server→player message to EVERY open player socket, across all screens.
+   * The fleet-wide fan-out path (POL-6): flipping a global setting reaches every wall at once, with
+   * no per-screen recompute. Returns the total number of sockets delivered to.
+   */
+  broadcastAll(message: ServerToPlayerMessage): number {
+    const data = JSON.stringify(message);
+    let delivered = 0;
+    for (const set of this.byScreen.values()) {
+      for (const socket of set) {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(data);
+          delivered += 1;
+        }
+      }
+    }
+    return delivered;
+  }
 }
 
 /**

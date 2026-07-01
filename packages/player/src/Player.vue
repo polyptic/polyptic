@@ -41,9 +41,6 @@ const SERVER_WS_URL = `${window.location.protocol === "https:" ? "wss:" : "ws:"}
 const SERVER_HTTP_BASE = `${window.location.protocol}//${SERVER_AUTHORITY}`;
 const DEFAULT_CANVAS: Geometry = { x: 0, y: 0, w: 1920, h: 1080 };
 
-// Vite injects this; true only under `vite dev`. Gates the corner badge.
-const isDev = import.meta.env.DEV;
-
 /** Read `?screen=<id>` from the URL — the one piece of identity this page is launched with. */
 function readScreenId(): string {
   const params = new URLSearchParams(window.location.search);
@@ -59,6 +56,12 @@ const connState = ref<ConnState>("connecting");
 const revision = ref(-1);
 const ident = ref<{ friendlyName: string; color: string } | null>(null);
 
+// POL-6 — corner status-badge visibility is a fleet-wide setting the server pushes over the player WS
+// (`server/settings`), no longer the build-time `import.meta.env.DEV` flag. We seed it from DEV so a dev
+// build shows the badge instantly on load (and prod hides it) until the authoritative value lands right
+// after the first render; an operator's console toggle then flips it live on every screen.
+const showBadges = ref<boolean>(import.meta.env.DEV);
+
 // Pre-first-render the revision is -1; show an em-dash until the first slice lands.
 const revLabel = computed(() => (revision.value < 0 ? "—" : String(revision.value)));
 
@@ -73,6 +76,9 @@ function handleMessage(msg: ServerToPlayerMessage): void {
     revision.value = msg.revision;
     // Close the reconcile loop so the control plane knows this screen is at this revision.
     socket?.send({ t: "player/ack", screenId, revision: msg.revision });
+  } else if (msg.t === "server/settings") {
+    // POL-6 — fleet-wide display settings: show/hide the corner status badge on this screen live.
+    showBadges.value = msg.settings.showBadges;
   } else {
     // server/ident-pulse → flash the friendly name so an operator can map physical panels.
     ident.value = msg.on ? { friendlyName: msg.friendlyName, color: msg.color } : null;
@@ -233,7 +239,7 @@ function connLabel(state: ConnState): string {
       <span class="ident-name">{{ ident.friendlyName }}</span>
     </div>
 
-    <div v-if="isDev" class="badge">
+    <div v-if="showBadges" class="badge">
       <span class="badge-dot" :class="`badge-dot--${connState}`" />
       <span class="badge-text">{{ connLabel(connState) }}</span>
       <span class="badge-sep">·</span>

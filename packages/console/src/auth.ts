@@ -10,8 +10,12 @@
  * Every response is zod-validated at the edge against the shared contract, same discipline as the
  * wire. No secret (password or hash) is ever sent back by these routes or logged here.
  */
-import { AuthUser, ChangePasswordBody, EnrollmentInfo, LoginBody } from "@polyptic/protocol";
-import type { ChangePasswordBody as ChangePasswordBodyT, LoginBody as LoginBodyT } from "@polyptic/protocol";
+import { AuthUser, ChangePasswordBody, DisplaySettings, EnrollmentInfo, LoginBody } from "@polyptic/protocol";
+import type {
+  ChangePasswordBody as ChangePasswordBodyT,
+  DisplaySettings as DisplaySettingsT,
+  LoginBody as LoginBodyT,
+} from "@polyptic/protocol";
 
 import { send } from "./api";
 
@@ -82,4 +86,16 @@ export async function getEnrollment(): Promise<EnrollmentInfo> {
 export async function regenerateEnrollment(): Promise<EnrollmentInfo> {
   const raw = await send<unknown>("POST", `${BASE_SETTINGS}/enrollment/regenerate`);
   return unwrapEnrollment(raw);
+}
+
+/** GET /api/v1/settings/display → the current fleet-wide display settings (badge toggle) (POL-6). */
+export async function getDisplaySettings(): Promise<DisplaySettingsT> {
+  const raw = await send<unknown>("GET", `${BASE_SETTINGS}/display`);
+  return DisplaySettings.parse(raw);
+}
+
+/** PUT /api/v1/settings/display { showBadges } → the applied settings (POL-6). */
+export async function updateDisplaySettings(showBadges: boolean): Promise<DisplaySettingsT> {
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/display`, { showBadges });
+  return DisplaySettings.parse(raw);
 }

@@ -30,6 +30,7 @@ import type {
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
+  PersistedDisplaySettings,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
@@ -127,6 +128,10 @@ interface SessionRow {
 interface BootstrapRow {
   mode: string;
   token: string | null;
+}
+
+interface DisplaySettingsRow {
+  show_badges: boolean;
 }
 
 interface CountRow {
@@ -272,6 +277,15 @@ export class PostgresStore implements Store {
         id    int PRIMARY KEY DEFAULT 1,
         mode  text NOT NULL DEFAULT 'open',
         token text
+      )
+    `;
+    // Display settings (POL-6): a single row holding the fleet-wide on-screen badge toggle. Absent
+    // until an operator first changes it — the control plane falls back to its env default (prod off,
+    // dev on) until then, so the row is written on the first mutation, not on migrate.
+    await sql`
+      CREATE TABLE IF NOT EXISTS display_settings (
+        id          int PRIMARY KEY DEFAULT 1,
+        show_badges boolean NOT NULL
       )
     `;
   }
@@ -778,6 +792,26 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO bootstrap (id, mode, token) VALUES (1, ${bootstrap.mode}, ${bootstrap.token})
       ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, token = EXCLUDED.token
+    `;
+  }
+
+  // ── Display settings (POL-6) ─────────────────────────────────────────────────
+
+  async getDisplaySettings(): Promise<PersistedDisplaySettings | undefined> {
+    const sql = this.sql;
+    const rows = await sql<DisplaySettingsRow[]>`
+      SELECT show_badges FROM display_settings WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return { showBadges: row.show_badges };
+  }
+
+  async setDisplaySettings(settings: PersistedDisplaySettings): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO display_settings (id, show_badges) VALUES (1, ${settings.showBadges})
+      ON CONFLICT (id) DO UPDATE SET show_badges = EXCLUDED.show_badges
     `;
   }
 

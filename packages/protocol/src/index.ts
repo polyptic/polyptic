@@ -272,9 +272,27 @@ export const ServerToPlayerIdent = z.object({
   color: z.string().default("#00c2ff"),
 });
 
+/** Fleet-wide, operator-toggleable display settings pushed to every player (POL-6). Structured as an
+ *  object so future on-screen overlay flags slot in without a new message. Sent to a player right after
+ *  its first `server/render` (on hello) and re-broadcast to ALL players whenever an operator flips it. */
+export const DisplaySettings = z.object({
+  /** Show the player status badge (`live · screen-N · rev`) and any passive dev overlays on every
+   *  screen. Default is decided SERVER-side — prod off, dev on — so it is a runtime setting, not a
+   *  build-time flag; an operator can override the default in either direction from the console. */
+  showBadges: z.boolean(),
+});
+export type DisplaySettings = z.infer<typeof DisplaySettings>;
+
+/** Push the current fleet-wide display settings to a player (badge visibility, …). */
+export const ServerToPlayerSettings = z.object({
+  t: z.literal("server/settings"),
+  settings: DisplaySettings,
+});
+
 export const ServerToPlayerMessage = z.discriminatedUnion("t", [
   ServerToPlayerRender,
   ServerToPlayerIdent,
+  ServerToPlayerSettings,
 ]);
 export type ServerToPlayerMessage = z.infer<typeof ServerToPlayerMessage>;
 
@@ -432,6 +450,7 @@ export const ServerToAdminState = z.object({
   contentSources: z.array(ContentSource), // Phase 3c — the content library
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
+  settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -548,6 +567,12 @@ export const EnrollmentInfo = z.object({
   token: z.string().nullable(),
 });
 export type EnrollmentInfo = z.infer<typeof EnrollmentInfo>;
+
+/** Update the fleet-wide display settings from the console (POL-6). Currently just the badge toggle. */
+export const UpdateDisplaySettingsBody = z.object({
+  showBadges: z.boolean(),
+});
+export type UpdateDisplaySettingsBody = z.infer<typeof UpdateDisplaySettingsBody>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers

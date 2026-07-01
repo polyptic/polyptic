@@ -141,6 +141,7 @@ export function buildAdminState(
     contentSources: control.getContentSources(),
     scenes: control.getScenes(),
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
+    settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
   });
 }
 

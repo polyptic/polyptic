@@ -33,9 +33,11 @@ import {
   ServerToAgentRejected,
   ServerToPlayerIdent,
   ServerToPlayerRender,
+  ServerToPlayerSettings,
   SetContentBody,
   Surface,
   UpdateContentSourceBody,
+  UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
@@ -94,6 +96,20 @@ export function registerRestRoutes(
         delivered,
       },
       "pushed render to player(s)",
+    );
+    return delivered;
+  }
+
+  /** Fan the current fleet-wide display settings out to EVERY connected player (POL-6). */
+  function broadcastDisplaySettings(): number {
+    const message = ServerToPlayerSettings.parse({
+      t: "server/settings",
+      settings: control.getDisplaySettings(),
+    });
+    const delivered = hub.broadcastAll(message);
+    fastify.log.info(
+      { event: "settings.broadcast", showBadges: message.settings.showBadges, delivered },
+      "broadcast display settings to player(s)",
     );
     return delivered;
   }
@@ -475,6 +491,31 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return { ok: true, screenId: params.data.screenId };
+  });
+
+  // ── Display settings (POL-6) ──────────────────────────────────────────────────
+  //
+  // Fleet-wide on-screen badge visibility. GET reports the current value; PUT sets + persists it and
+  // fans the new settings out to EVERY connected player over the player WS (instant, fleet-wide) plus
+  // a fresh admin/state so the console reflects it live. Not part of any render slice → no revision bump.
+
+  // GET /api/v1/settings/display -> DisplaySettings { showBadges }
+  fastify.get("/api/v1/settings/display", async () => control.getDisplaySettings());
+
+  // PUT /api/v1/settings/display  { showBadges }  -> DisplaySettings
+  fastify.put("/api/v1/settings/display", async (request, reply) => {
+    const body = UpdateDisplaySettingsBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const settings = await control.setDisplaySettings({ showBadges: body.data.showBadges });
+    const delivered = broadcastDisplaySettings();
+    fastify.log.info(
+      { event: "settings.display.set", showBadges: settings.showBadges, delivered },
+      "display settings updated",
+    );
+    broadcaster.broadcast();
+    return settings;
   });
 
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────

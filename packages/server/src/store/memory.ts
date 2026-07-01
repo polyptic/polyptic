@@ -11,6 +11,7 @@ import type {
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
+  PersistedDisplaySettings,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
@@ -46,6 +47,8 @@ export class MemoryStore implements Store {
   private readonly sessions = new Map<string, PersistedSession>();
   /** The enrollment bootstrap (mode + token), seeded on first boot. */
   private bootstrap: PersistedBootstrap | undefined;
+  /** Fleet-wide display settings (POL-6), undefined until first changed. */
+  private displaySettings: PersistedDisplaySettings | undefined;
   private revision = 0;
 
   async migrate(): Promise<void> {
@@ -252,6 +255,16 @@ export class MemoryStore implements Store {
 
   async setBootstrap(bootstrap: PersistedBootstrap): Promise<void> {
     this.bootstrap = clone(bootstrap);
+  }
+
+  // ── Display settings (POL-6) ─────────────────────────────────────────────────
+
+  async getDisplaySettings(): Promise<PersistedDisplaySettings | undefined> {
+    return this.displaySettings ? clone(this.displaySettings) : undefined;
+  }
+
+  async setDisplaySettings(settings: PersistedDisplaySettings): Promise<void> {
+    this.displaySettings = clone(settings);
   }
 
   async close(): Promise<void> {

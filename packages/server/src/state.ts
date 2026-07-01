@@ -35,6 +35,7 @@ import type {
   CreateContentSourceBody,
   DesiredState,
   DisplayBackend,
+  DisplaySettings,
   Geometry,
   Machine,
   Mural,
@@ -56,6 +57,14 @@ const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
 
 /** Fallback canvas for a player that connects before its screen is known. */
 const DEFAULT_CANVAS = { x: 0, y: 0, w: 1920, h: 1080 } as const;
+
+/**
+ * POL-6 — the fleet-wide badge DEFAULT: ON in dev, OFF in production, decided here (server-side) so it
+ * is a runtime setting, not a build-time flag baked into the player. `NODE_ENV` is the same dev/prod
+ * signal the auth layer uses for secure cookies. An operator's persisted override (loaded in `init`)
+ * supersedes this; absent an override, a deployment simply follows its `NODE_ENV` on each boot.
+ */
+const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
 
 function playerUrlFor(screenId: string): string {
   return `${PLAYER_BASE_URL}/?screen=${encodeURIComponent(screenId)}`;
@@ -181,6 +190,10 @@ export class ControlPlane {
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
   private sceneCounter = 0;
+
+  /** POL-6 — fleet-wide display settings (on-screen badge visibility) pushed to every player. Starts
+   *  at the env default; `init()` loads any persisted operator override on top. */
+  private displaySettings: DisplaySettings = { showBadges: DEFAULT_SHOW_BADGES };
 
   /**
    * @param store    the durable backing store.
@@ -408,6 +421,11 @@ export class ControlPlane {
       this.murals.set(id, mural);
       await this.store.upsertMural({ id: mural.id, name: mural.name });
     }
+
+    // POL-6 — a persisted operator override supersedes the env badge default; absent one, keep the
+    // default (so a deployment that never touches the setting follows its NODE_ENV each boot).
+    const persistedSettings = await this.store.getDisplaySettings();
+    if (persistedSettings) this.displaySettings = { showBadges: persistedSettings.showBadges };
   }
 
   private nextMuralId(): string {
@@ -779,6 +797,24 @@ export class ControlPlane {
         surfaces: [],
       }
     );
+  }
+
+  /** The current fleet-wide display settings (POL-6). Returned by value so callers can't mutate state. */
+  getDisplaySettings(): DisplaySettings {
+    return { ...this.displaySettings };
+  }
+
+  /**
+   * Set + persist the fleet-wide display settings (POL-6). Does NOT bump the revision — badge
+   * visibility is a presentation setting broadcast on its own `server/settings` channel, not part of
+   * the content reconcile loop players ack. The caller fans it out to players + the admin console.
+   * Returns the new settings.
+   */
+  async setDisplaySettings(next: DisplaySettings): Promise<DisplaySettings> {
+    this.displaySettings = { showBadges: next.showBadges };
+    await this.store.setDisplaySettings({ showBadges: next.showBadges });
+    this.emit("info", `On-screen badges ${next.showBadges ? "shown on" : "hidden from"} every screen`);
+    return this.getDisplaySettings();
   }
 
   /**

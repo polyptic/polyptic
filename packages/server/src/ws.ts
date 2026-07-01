@@ -35,6 +35,7 @@ import {
   ServerToAgentPending,
   ServerToAgentRejected,
   ServerToPlayerRender,
+  ServerToPlayerSettings,
   parseMessage,
 } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
@@ -405,6 +406,14 @@ function handlePlayer(
         slice,
       });
       ws.send(JSON.stringify(render));
+      // POL-6 — hand the player the current fleet-wide display settings (badge visibility) right after
+      // its first render, so a freshly-connected screen honours the global toggle without waiting for
+      // the next operator change.
+      const settings = ServerToPlayerSettings.parse({
+        t: "server/settings",
+        settings: control.getDisplaySettings(),
+      });
+      ws.send(JSON.stringify(settings));
       log.info(
         {
           event: "player.hello",

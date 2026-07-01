@@ -11,10 +11,27 @@ const router = useRouter();
 onMounted(() => {
   // Load the enrollment-token info (open vs gated) so the card can render the real value.
   void store.fetchEnrollment();
+  // Load the fleet-wide badge toggle so the card is correct even before the admin/state snapshot lands.
+  void store.fetchDisplaySettings();
 });
 
 function setTheme(theme: "light" | "dark"): void {
   if (store.theme !== theme) store.toggleTheme();
+}
+
+// ── On-screen badges (POL-6) ────────────────────────────────────────────────────
+const badgesSaving = ref(false);
+
+async function setBadges(show: boolean): Promise<void> {
+  if (badgesSaving.value || store.showBadges === show) return;
+  badgesSaving.value = true;
+  try {
+    await store.setShowBadges(show);
+  } catch {
+    /* the store already reverted the optimistic value; the pills reflect the true state */
+  } finally {
+    badgesSaving.value = false;
+  }
 }
 
 // ── Logout ────────────────────────────────────────────────────────────────────
@@ -107,6 +124,34 @@ async function onChangePassword(): Promise<void> {
             ☾ Dark
           </div>
         </div>
+      </div>
+
+      <!-- On-screen badges ------------------------------------------------------ -->
+      <div class="card panel">
+        <div class="panel-title">On-screen badges</div>
+        <div class="panel-sub">
+          The status badge (<code class="inline-code">live · screen-N · rev</code>) shown in the corner of
+          every screen. Off by default in production, on in development.
+        </div>
+        <div class="pill-group">
+          <div
+            class="pill"
+            :class="{ active: store.showBadges }"
+            :aria-disabled="badgesSaving"
+            @click="setBadges(true)"
+          >
+            ● Shown
+          </div>
+          <div
+            class="pill"
+            :class="{ active: !store.showBadges }"
+            :aria-disabled="badgesSaving"
+            @click="setBadges(false)"
+          >
+            ○ Hidden
+          </div>
+        </div>
+        <div class="badges-hint">Applies live to every connected screen.</div>
       </div>
 
       <!-- Enrolment token ------------------------------------------------------- -->
@@ -274,6 +319,18 @@ async function onChangePassword(): Promise<void> {
   font-size: 11.5px;
   color: var(--muted2);
   margin-top: 8px;
+}
+.badges-hint {
+  font-size: 11.5px;
+  color: var(--muted2);
+  margin-top: 10px;
+}
+.inline-code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  background: var(--muted-bg);
+  padding: 1px 5px;
+  border-radius: 5px;
 }
 .btn-ghost-sm {
   padding: 9px 14px;

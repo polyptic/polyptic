@@ -18,6 +18,7 @@ import type {
   ContentKind,
   ContentSource,
   CreateContentSourceBody,
+  DisplaySettings,
   EnrollmentInfo,
   LoginBody,
   MachineView,
@@ -94,6 +95,9 @@ export interface ConsoleState {
   sessionChecked: boolean;
   /** Enrollment-token visibility for Settings + the cold-start wizard (open mode vs gated token). */
   enrollment: EnrollmentInfo | null;
+  /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
+   *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
+  settings: DisplaySettings | null;
   connected: boolean;
   revision: number;
   machines: MachineView[];
@@ -134,6 +138,7 @@ export const useConsoleStore = defineStore("console", {
     currentUser: null,
     sessionChecked: false,
     enrollment: null,
+    settings: null,
     connected: false,
     revision: 0,
     machines: [],
@@ -188,6 +193,11 @@ export const useConsoleStore = defineStore("console", {
     /** The gated bootstrap token, when in gated mode and loaded; else null. */
     enrollmentToken(state): string | null {
       return state.enrollment?.mode === "gated" ? state.enrollment.token : null;
+    },
+
+    /** Whether on-screen badges are shown fleet-wide (POL-6). Defaults to false until settings load. */
+    showBadges(state): boolean {
+      return state.settings?.showBadges ?? false;
     },
 
     /** Every screen across all machines, flattened. Each ScreenView already carries its machineId. */
@@ -502,6 +512,32 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    // ── Display settings / badge toggle (POL-6) ──────────────────────────────────
+
+    /** Load the current fleet-wide display settings for Settings (the admin/state broadcast also
+     *  carries them, but a direct fetch makes the toggle correct even before the WS snapshot lands). */
+    async fetchDisplaySettings(): Promise<void> {
+      try {
+        this.settings = await auth.getDisplaySettings();
+      } catch (err) {
+        console.error("[console] fetchDisplaySettings failed", err);
+      }
+    },
+
+    /** Flip on-screen badges fleet-wide. Optimistic (snappy toggle); the authoritative admin/state
+     *  broadcast reconciles. Reverts the optimistic value and rethrows on failure so the UI can react. */
+    async setShowBadges(showBadges: boolean): Promise<void> {
+      const previous = this.settings;
+      this.settings = { showBadges };
+      try {
+        this.settings = await auth.updateDisplaySettings(showBadges);
+      } catch (err) {
+        this.settings = previous;
+        console.error("[console] setShowBadges failed", err);
+        throw err;
+      }
+    },
+
     // ── Admin WebSocket ───────────────────────────────────────────────────────
 
     /** Open (and keep open) the admin channel. Idempotent — safe to call on every shell mount. */
@@ -594,6 +630,9 @@ export const useConsoleStore = defineStore("console", {
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
         this.activity = msg.activity ?? [];
+        // POL-6 — fleet-wide display settings (badge toggle). Optional on the wire (back-compat); keep
+        // the last known value when a snapshot omits it rather than clobbering the toggle to null.
+        if (msg.settings) this.settings = msg.settings;
 
         // Forget an active-scene marker whose scene the server no longer knows (e.g. deleted).
         if (this.activeSceneId && !this.scenes.some((sc) => sc.id === this.activeSceneId)) {

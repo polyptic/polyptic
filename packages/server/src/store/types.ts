@@ -170,6 +170,15 @@ export interface PersistedBootstrap {
   token: string | null;
 }
 
+/**
+ * Fleet-wide display settings (POL-6): the operator-toggleable on-screen badge visibility, persisted
+ * so a runtime choice survives a restart. Absent until the setting is first changed — the control
+ * plane then falls back to its env-derived default (prod off / dev on).
+ */
+export interface PersistedDisplaySettings {
+  showBadges: boolean;
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -287,6 +296,12 @@ export interface Store {
   getBootstrap(): Promise<PersistedBootstrap | undefined>;
   /** Persist the enrollment bootstrap (single row). */
   setBootstrap(bootstrap: PersistedBootstrap): Promise<void>;
+
+  // ── Display settings (POL-6) ───────────────────────────────────────────────
+  /** The persisted fleet-wide display settings (badge toggle). Undefined until first changed. */
+  getDisplaySettings(): Promise<PersistedDisplaySettings | undefined>;
+  /** Persist the fleet-wide display settings (single row). */
+  setDisplaySettings(settings: PersistedDisplaySettings): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;
