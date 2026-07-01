@@ -124,33 +124,42 @@ interface PkgSet {
   wayland: string[];
   x11: string[];
   fonts: string[];
-  /** Boot-splash: Plymouth + its script plugin + an SVG rasteriser (rsvg-convert) — POL-7. */
+  /** Boot-splash: Plymouth + its script AND label plugins + an SVG rasteriser (rsvg-convert) — POL-7. */
   splash: string[];
 }
 
+// POL-7 (D43): our theme uses the `script` plugin and draws text via `Image.Text` (the live status
+// line + version/host stamp). Plymouth renders that text through a SEPARATE **label** plugin. If the
+// label plugin is absent, text rendering is disabled — and plymouth's script plugin then dereferences
+// a NULL console viewer during sprite refresh (`ply_console_viewer_hide`) and SEGFAULTS on every
+// boot, killing the splash. So the label plugin is REQUIRED, not optional. On Ubuntu it's a separate
+// package (`plymouth-label`, which also pulls pango/fontconfig + a font); dracut's plymouth module
+// then bundles the whole text-render closure into the initramfs for early boot.
 const PACKAGES: Record<PkgManager, PkgSet> = {
   apt: {
     base: ["greetd", "dbus-user-session", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
     x11: ["xserver-xorg", "xinit", "i3", "x11vnc", "scrot", "imagemagick", "unclutter"],
     fonts: ["fonts-dejavu-core", "fonts-liberation"],
-    // On Debian/Ubuntu the `script` plugin ships inside `plymouth`; `librsvg2-bin` = rsvg-convert.
-    splash: ["plymouth", "librsvg2-bin"],
+    // Debian/Ubuntu: `script` plugin ships inside `plymouth`; `plymouth-label` = the text renderer
+    // (REQUIRED, see above); `librsvg2-bin` = rsvg-convert.
+    splash: ["plymouth", "plymouth-label", "librsvg2-bin"],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
     x11: ["xorg-x11-server-Xorg", "xorg-x11-xinit", "i3", "x11vnc", "scrot", "ImageMagick", "unclutter"],
     fonts: ["dejavu-sans-fonts", "liberation-fonts"],
-    // Fedora splits the script plugin + `plymouth-set-default-theme` into separate packages.
-    splash: ["plymouth", "plymouth-scripts", "plymouth-plugin-script", "librsvg2-tools"],
+    // Fedora splits the script plugin, `plymouth-set-default-theme`, and the label renderer into
+    // separate packages; `plymouth-plugin-label` is the text renderer (REQUIRED, see above).
+    splash: ["plymouth", "plymouth-scripts", "plymouth-plugin-script", "plymouth-plugin-label", "librsvg2-tools"],
   },
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
     x11: ["xorg-server", "xorg-xinit", "i3-wm", "x11vnc", "scrot", "imagemagick", "unclutter"],
     fonts: ["ttf-dejavu", "ttf-liberation"],
-    // Arch's `plymouth` bundles the script plugin + set-default-theme; `librsvg` = rsvg-convert.
+    // Arch's `plymouth` bundles ALL plugins (script, label, set-default-theme); `librsvg` = rsvg-convert.
     splash: ["plymouth", "librsvg"],
   },
 };

@@ -12,7 +12,13 @@ import type { Logger } from "./log";
 import type { SetupOptions } from "./args";
 import type { SetupResult } from "./install";
 import { AGENT_SERVICE, COMPOSITOR_LAUNCHER, SESSION_TARGET } from "./templates";
-import { PLYMOUTHD_CONF_PATH, PLYMOUTH_QUIT_DROPIN, PLYMOUTH_THEME_DIR } from "./plymouth";
+import {
+  PLYMOUTHD_CONF_PATH,
+  PLYMOUTH_DRACUT_CONF_PATH,
+  PLYMOUTH_QUIT_DROPIN,
+  PLYMOUTH_THEME_DIR,
+  PLYMOUTH_THEME_NAME,
+} from "./plymouth";
 import { STATE_PATH, loadState } from "./state";
 import type { SetupState } from "./state";
 
@@ -96,6 +102,13 @@ function teardownSplash(sys: Sys, log: Logger, state: SetupState, needsVerificat
   // 1 ─ revert the theme selector. Our plymouthd.conf was written with backupOriginal, so restore the
   //     box's original; if the Debian helper exists, also point the alternative back at the prior theme.
   const confRestored = sys.restoreBackup(PLYMOUTHD_CONF_PATH);
+  if (!confRestored) {
+    // No backup means install CREATED plymouthd.conf fresh (the box shipped none — e.g. an Arch or
+    // minimal image). Remove OUR managed file so teardown doesn't leave a `Theme=polyptic` selector
+    // dangling at the theme dir we're about to delete. Only delete if it's ours, never a foreign one.
+    const cur = sys.readText(PLYMOUTHD_CONF_PATH) ?? "";
+    if (cur.includes(`Theme=${PLYMOUTH_THEME_NAME}`)) sys.remove(PLYMOUTHD_CONF_PATH);
+  }
   if (sys.which("plymouth-set-default-theme") && state.priorPlymouthTheme) {
     sys.exec("plymouth-set-default-theme", [state.priorPlymouthTheme], {
       desc: `restore prior plymouth theme ${state.priorPlymouthTheme}`,
@@ -108,9 +121,10 @@ function teardownSplash(sys: Sys, log: Logger, state: SetupState, needsVerificat
     );
   }
 
-  // 2 ─ remove our theme + the plymouth-quit drop-in.
+  // 2 ─ remove our theme, the plymouth-quit drop-in, and the dracut install_items drop-in.
   sys.remove(PLYMOUTH_THEME_DIR);
   sys.remove(PLYMOUTH_QUIT_DROPIN);
+  sys.remove(PLYMOUTH_DRACUT_CONF_PATH);
   sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
 
   // 3 ─ rebuild the initramfs so the reverted theme takes effect (prefer dracut; mirrors install.ts).

@@ -14,8 +14,11 @@ import {
   SPLASH_CMDLINE_TOKENS,
   mergeCmdlineTxt,
   mergeGrubCmdline,
+  plymouthDracutConf,
+  plymouthScript,
   plymouthdConf,
 } from "../src/setup/plymouth";
+import { corePackages } from "../src/setup/distro";
 
 describe("plymouthdConf — the portable, dracut-honoured theme selector", () => {
   const conf = plymouthdConf();
@@ -29,6 +32,53 @@ describe("plymouthdConf — the portable, dracut-honoured theme selector", () =>
     // Regression guard: Ubuntu ships plymouthd.conf with a COMMENTED '#[Daemon]', which is why the
     // theme was never applied. Our generated file must have a live section header.
     expect(conf).toMatch(/^\[Daemon\]$/m);
+  });
+});
+
+describe("substrate packages must include the plymouth LABEL plugin (text renderer, POL-7 crash)", () => {
+  // Without the label plugin, the script theme's Image.Text has no renderer → plymouth leaves the
+  // console viewer NULL → the script plugin segfaults on it every boot. Required, not optional.
+  test("apt splash set includes plymouth-label for a real kiosk backend", () => {
+    const pkgs = corePackages("apt", "wayland-sway");
+    expect(pkgs).toContain("plymouth-label");
+    expect(pkgs).toContain("plymouth");
+  });
+
+  test("dnf splash set includes the Fedora label plugin", () => {
+    expect(corePackages("dnf", "wayland-sway")).toContain("plymouth-plugin-label");
+  });
+
+  test("the x11-i3 backend also gets the splash text renderer", () => {
+    expect(corePackages("apt", "x11-i3")).toContain("plymouth-label");
+  });
+
+  test("splash=false (opt-out) drops the splash packages entirely", () => {
+    expect(corePackages("apt", "wayland-sway", false)).not.toContain("plymouth-label");
+  });
+});
+
+describe("plymouthDracutConf — force the theme into the dracut initramfs", () => {
+  test("emits an install_items line naming every file it's given", () => {
+    const conf = plymouthDracutConf(["/etc/plymouth/plymouthd.conf", "/x/script.so", "/t/polyptic.plymouth"]);
+    expect(conf).toMatch(/^install_items\+=/m);
+    expect(conf).toContain("/etc/plymouth/plymouthd.conf");
+    expect(conf).toContain("/x/script.so");
+    expect(conf).toContain("/t/polyptic.plymouth");
+  });
+});
+
+describe("plymouthScript — must never hold an image-less sprite (plymouth 5.x segfault, POL-7)", () => {
+  const script = plymouthScript();
+
+  test("does not eagerly create an empty message sprite", () => {
+    // The bug: `message.sprite = Sprite();` with no image → plymouth 5.x crashes in
+    // script_lib_sprite_refresh on the first frame of a normal boot (no message ever arrives).
+    expect(script).not.toContain("message.sprite = Sprite();");
+  });
+
+  test("creates the message sprite lazily, WITH an image, on the first message", () => {
+    expect(script).toContain("message.have = 0");
+    expect(script).toContain("Sprite(img)");
   });
 });
 
