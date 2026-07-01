@@ -26,6 +26,10 @@ import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protoco
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
+import IdleSplash from "./IdleSplash.vue";
+
+// Injected by Vite (see vite.config.ts) from package.json — the build version shown on the idle splash.
+const APP_VERSION = __APP_VERSION__;
 
 // Reach the control plane at the host THIS page was loaded from — so a remote wall box works, not just
 // localhost. `serverAuthority` maps the dev player port 5173→8080 (prod serves both same-origin); we
@@ -177,6 +181,17 @@ function connLabel(state: ConnState): string {
   </div>
 
   <main v-else class="stage">
+    <!--
+      No surfaces assigned to this screen → show the idle splash instead of a bare black stage
+      (POL-27). It sits below the ident overlay and dev badge (higher z-index), so both still work.
+    -->
+    <IdleSplash
+      v-if="surfaces.length === 0"
+      :screen-id="screenId"
+      :conn-state="connState"
+      :version="APP_VERSION"
+    />
+
     <!--
       Keyed by surface.id so the SAME DOM element survives content changes (the "instant" trick):
       a url change patches the existing iframe's src in place; no remount, no reload.
