@@ -25,17 +25,16 @@ import type { CSSProperties } from "vue";
 import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protocol";
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
+import { resolveMediaSrc, serverAuthority } from "./media-url";
 
-// Reach the control plane's /player WS at the host THIS page was loaded from — so a remote wall box
-// works, not just localhost. Dev: the player is served on :5173, the server on :8080 (same host) →
-// map 5173→8080. Prod single-image: the player is served same-origin → use that origin. https → wss.
-const SERVER_WS_URL = (() => {
-  const { protocol, hostname, port } = window.location;
-  const wsProto = protocol === "https:" ? "wss:" : "ws:";
-  const serverPort = port === "5173" ? "8080" : port;
-  const authority = serverPort ? `${hostname}:${serverPort}` : hostname;
-  return `${wsProto}//${authority}/player`;
-})();
+// Reach the control plane at the host THIS page was loaded from — so a remote wall box works, not just
+// localhost. `serverAuthority` maps the dev player port 5173→8080 (prod serves both same-origin); we
+// use the SAME authority for the /player WS and for re-homing media URLs, so the two never disagree.
+const SERVER_AUTHORITY = serverAuthority(window.location);
+// https → wss.
+const SERVER_WS_URL = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${SERVER_AUTHORITY}/player`;
+// HTTP base for the same origin — where uploaded media (`/media/<id>`) is served (see `mediaSrc`).
+const SERVER_HTTP_BASE = `${window.location.protocol}//${SERVER_AUTHORITY}`;
 const DEFAULT_CANVAS: Geometry = { x: 0, y: 0, w: 1920, h: 1080 };
 
 // Vite injects this; true only under `vite dev`. Gates the corner badge.
@@ -143,7 +142,10 @@ function frameUrl(surface: Surface): string {
   return surface.type === "web" || surface.type === "dashboard" ? surface.url : "";
 }
 function mediaSrc(surface: Surface): string {
-  return surface.type === "image" || surface.type === "video" ? surface.src : "";
+  const raw = surface.type === "image" || surface.type === "video" ? surface.src : "";
+  // Re-home a loopback-baked media URL onto the origin this box reaches the server at (POL-5): a
+  // remote wall can't fetch `http://localhost:8080/media/<id>`. External URLs pass through untouched.
+  return resolveMediaSrc(raw, SERVER_HTTP_BASE);
 }
 function isInteractive(surface: Surface): boolean {
   return surface.type === "web" ? surface.interactive : false;
