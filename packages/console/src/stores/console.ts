@@ -693,6 +693,32 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Permanently forget a machine (POL-14): drop it, its screens, and anything derived from them
+     * (placements, combined surfaces, selection) optimistically for a snappy feel; the authoritative
+     * admin/state broadcast reconciles. Unlike rejectMachine (a remembered "rejected" state), this
+     * deletes the machine — it must re-enrol to come back.
+     */
+    async removeMachine(id: string): Promise<void> {
+      const machine = this.machines.find((m) => m.id === id);
+      const screenIds = new Set(machine?.screens.map((s) => s.id) ?? []);
+      // optimistic prune — machine, its placements, any wall touching its screens, and selection
+      this.machines = this.machines.filter((m) => m.id !== id);
+      this.placements = this.placements.filter((p) => !screenIds.has(p.screenId));
+      this.videoWalls = this.videoWalls.filter(
+        (w) => !w.memberScreenIds.some((sid) => screenIds.has(sid)),
+      );
+      this.selectedScreenIds = this.selectedScreenIds.filter((sid) => !screenIds.has(sid));
+      if (this.selectedWallId && !this.videoWalls.some((w) => w.id === this.selectedWallId)) {
+        this.selectedWallId = null;
+      }
+      try {
+        await api.deleteMachine(id);
+      } catch (err) {
+        console.error("[console] removeMachine failed", err);
+      }
+    },
+
     // ── Murals ────────────────────────────────────────────────────────────────
 
     async createMural(name: string): Promise<void> {
@@ -819,6 +845,34 @@ export const useConsoleStore = defineStore("console", {
         await api.identScreen(screenId, { on: true, ttlMs: 3000 });
       } catch (err) {
         console.error("[console] identScreen failed", err);
+      }
+    },
+
+    /**
+     * Permanently forget a single screen (POL-14): drop it from its machine, plus its placement, any
+     * combined surface it belonged to, and any selection — optimistically; the authoritative
+     * admin/state broadcast reconciles. If the screen's machine still reports the output, the screen
+     * reappears on the machine's next reconnect (this targets stale/decommissioned screens).
+     */
+    async removeScreen(screenId: string): Promise<void> {
+      // optimistic prune — remove the screen from whichever machine holds it
+      for (const machine of this.machines) {
+        const idx = machine.screens.findIndex((s) => s.id === screenId);
+        if (idx >= 0) {
+          machine.screens.splice(idx, 1);
+          break;
+        }
+      }
+      this.placements = this.placements.filter((p) => p.screenId !== screenId);
+      this.videoWalls = this.videoWalls.filter((w) => !w.memberScreenIds.includes(screenId));
+      this.selectedScreenIds = this.selectedScreenIds.filter((sid) => sid !== screenId);
+      if (this.selectedWallId && !this.videoWalls.some((w) => w.id === this.selectedWallId)) {
+        this.selectedWallId = null;
+      }
+      try {
+        await api.deleteScreen(screenId);
+      } catch (err) {
+        console.error("[console] removeScreen failed", err);
       }
     },
 

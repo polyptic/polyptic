@@ -679,6 +679,71 @@ export class ControlPlane {
     return true;
   }
 
+  /**
+   * Permanently FORGET a machine and everything derived from it: every screen it drives (dissolving
+   * any combined surface those screens belong to), their placements + content, its off-band
+   * credential, and the machine row itself. Write-through — `store.deleteMachine` cascades the
+   * screens/content/placements. Bumps the revision iff desired state actually changed (a pending
+   * machine with no screens is registry-only, like a rename). Returns the slices to push a
+   * `server/render` for — the cleared slices of the removed screens PLUS any surviving wall members on
+   * OTHER machines (so no stale fragment keeps rendering) — or null if the machine is unknown.
+   *
+   * Unlike `rejectMachine` (a terminal-but-remembered state), a removed machine is GONE: in gated mode
+   * a reconnect with the now-unknown credential is rejected, and presenting the bootstrap token
+   * re-enrols it fresh as pending; in open mode it re-registers as a brand-new machine.
+   */
+  async removeMachine(machineId: string): Promise<{ slices: ScreenSlice[] } | null> {
+    const machine = this.machines.get(machineId);
+    if (machine === undefined) return null;
+
+    const screenIds = this.state.screens.filter((s) => s.machineId === machineId).map((s) => s.id);
+    const removed = new Set(screenIds);
+    const touched = new Map<string, ScreenSlice>();
+
+    // Dissolve every combined surface that includes a removed screen (a wall may also hold members on
+    // OTHER machines — those survivors need a render clear). Clearing walks all their members' slices.
+    for (const wall of [...this.videoWalls.values()]) {
+      if (!wall.memberScreenIds.some((id) => removed.has(id))) continue;
+      this.videoWalls.delete(wall.id);
+      this.wallSourceIds.delete(wall.id);
+      await this.store.deleteVideoWall(wall.id);
+      for (const s of this.clearSlices(wall.memberScreenIds)) touched.set(s.screenId, s);
+    }
+
+    // Clear + drop each of the machine's screens (slice, placement, desired-state entry).
+    for (const id of screenIds) {
+      for (const s of this.clearSlices([id])) touched.set(s.screenId, s);
+      this.placements.delete(id); // store.deleteMachine cascades the placement row
+      delete this.state.slices[id];
+      const idx = this.state.screens.findIndex((s) => s.id === id);
+      if (idx >= 0) this.state.screens.splice(idx, 1);
+    }
+
+    // Drop the machine itself (+ its off-band credential). deleteMachine cascades screens/content/placements.
+    this.machines.delete(machineId);
+    this.credentialHashes.delete(machineId);
+    await this.store.deleteMachine(machineId);
+
+    // Removing screens shrinks desired state; a screenless (pending) machine is registry-only (no bump).
+    const changed = screenIds.length > 0 || touched.size > 0;
+    if (changed) {
+      this.bumpRevision();
+      // Persist the cleared content of SURVIVING screens only — removed screens' rows are already gone.
+      for (const s of touched.values()) {
+        if (removed.has(s.screenId)) continue;
+        await this.store.upsertContent({
+          screenId: s.screenId,
+          canvas: s.canvas,
+          surfaces: s.surfaces,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+
+    this.emit("warn", `${machine.label} removed`);
+    return { slices: [...touched.values()] };
+  }
+
   getScreens(): Screen[] {
     return this.state.screens;
   }
@@ -941,6 +1006,64 @@ export class ControlPlane {
     }
     await this.store.setRevision(this.state.revision);
     return { slices };
+  }
+
+  /**
+   * Permanently FORGET a single screen: dissolve any combined surface it belongs to (clearing every
+   * member's slice), drop its placement + content-source assignment, remove it from desired state, and
+   * write through (`store.deleteScreen` cascades its content + placement rows). Bumps the revision.
+   * Returns the slices to push a `server/render` for — the cleared slices of any surviving wall members
+   * PLUS the removed screen itself (an empty slice, so a still-connected player clears) — or null if the
+   * screen is unknown.
+   *
+   * Note: the screen is derived from its machine's reported outputs, so if that machine is still
+   * connected and reports this output it will be RE-CREATED on the machine's next `agent/hello`. This
+   * is aimed at forgetting a STALE screen (an output the machine no longer drives) or clearing one out
+   * ahead of removing its whole machine.
+   */
+  async removeScreen(screenId: string): Promise<{ slices: ScreenSlice[] } | null> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return null;
+
+    const touched = new Map<string, ScreenSlice>();
+
+    // Dissolve a wall this screen is a member of — a combined surface can't outlive a member. Clears
+    // every member's slice (surviving members need a render clear; the removed screen is cleared too).
+    const wall = this.getWallForScreen(screenId);
+    if (wall) {
+      this.videoWalls.delete(wall.id);
+      this.wallSourceIds.delete(wall.id);
+      await this.store.deleteVideoWall(wall.id);
+      for (const s of this.clearSlices(wall.memberScreenIds)) touched.set(s.screenId, s);
+    }
+
+    // Clear the removed screen's own slice too (so a still-connected player renders nothing).
+    for (const s of this.clearSlices([screenId])) touched.set(s.screenId, s);
+
+    // Drop its placement, slice + desired-state entry, then delete the rows (screen + its content +
+    // placement are separate store deletes — deleteScreen removes only the screen row).
+    this.placements.delete(screenId);
+    delete this.state.slices[screenId];
+    const idx = this.state.screens.findIndex((s) => s.id === screenId);
+    if (idx >= 0) this.state.screens.splice(idx, 1);
+    await this.store.deleteContent(screenId);
+    await this.store.deletePlacement(screenId);
+    await this.store.deleteScreen(screenId);
+
+    this.bumpRevision();
+    // Persist the cleared content of SURVIVING screens only — the removed one's row is already gone.
+    for (const s of touched.values()) {
+      if (s.screenId === screenId) continue;
+      await this.store.upsertContent({
+        screenId: s.screenId,
+        canvas: s.canvas,
+        surfaces: s.surfaces,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("warn", `${screen.friendlyName} removed`);
+    return { slices: [...touched.values()] };
   }
 
   // ── Combined surfaces / video walls (Phase 3b) ──────────────────────────────

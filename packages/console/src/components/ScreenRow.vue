@@ -61,6 +61,17 @@ function ident(): void {
     identing.value = false;
   }, 3000);
 }
+
+// Permanently forget this screen (POL-14) — deletes it, its placement + content. Aimed at stale
+// screens (an output the machine no longer drives); a still-reported output reappears on reconnect.
+function remove(): void {
+  const yes = window.confirm(
+    `Remove screen "${props.screen.friendlyName}"? This permanently deletes it, its placement and ` +
+      `content from the console. If its machine still drives this output, the screen reappears when the ` +
+      `machine next reconnects.`,
+  );
+  if (yes) void store.removeScreen(props.screen.id);
+}
 </script>
 
 <template>
@@ -105,6 +116,10 @@ function ident(): void {
 
     <button class="ident-btn" :class="{ active: identing }" @click="ident">
       <span class="ident-dot"></span>{{ identing ? "Flashing…" : "Ident" }}
+    </button>
+
+    <button class="remove-btn" title="Remove this screen from the console" @click="remove">
+      Remove
     </button>
   </div>
 </template>
@@ -234,5 +249,22 @@ function ident(): void {
   height: 6px;
   border-radius: 50%;
   background: var(--accent);
+}
+.remove-btn {
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--bad);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+.remove-btn:hover {
+  background: var(--bad-soft);
+  border-color: var(--bad);
 }
 </style>

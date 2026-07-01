@@ -351,11 +351,13 @@ function handleAgent(
   ws.on("close", (code) => {
     if (machineId && hubRegistered) agentHub.remove(machineId, ws);
     if (machineId && presenceMarked) {
-      // Resolve the label BEFORE dropping presence; emit only on the true online→offline edge.
-      const label = control.getMachine(machineId)?.label ?? machineId;
+      // Resolve the machine BEFORE dropping presence; emit only on the true online→offline edge — and
+      // NOT when the machine was just REMOVED (its socket close is expected; removal already logged it,
+      // and it no longer resolves to a friendly label).
+      const machine = control.getMachine(machineId);
       presence.agentDisconnected(machineId);
-      if (!presence.isMachineOnline(machineId)) {
-        activity.push("bad", `${label} went unreachable`);
+      if (machine && !presence.isMachineOnline(machineId)) {
+        activity.push("bad", `${machine.label} went unreachable`);
       }
       broadcaster.broadcast();
     }

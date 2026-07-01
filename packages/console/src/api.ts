@@ -188,6 +188,15 @@ export function identMachine(machineId: string, body: IdentBody): Promise<unknow
   return send("POST", `/machines/${encodeURIComponent(machineId)}/ident`, IdentBody.parse(body));
 }
 
+/**
+ * DELETE /api/v1/machines/:machineId — permanently forget a machine (POL-14). Unlike reject/revoke,
+ * this deletes the machine, all its screens, their placement + content, and its credential; the server
+ * closes its agent socket. A removed machine must re-enrol to return.
+ */
+export function deleteMachine(machineId: string): Promise<unknown> {
+  return send("DELETE", `/machines/${encodeURIComponent(machineId)}`);
+}
+
 // ── Screen registry / content (existing Phase 2 routes) ──────────────────────
 
 /** POST /api/v1/screens/:screenId/rename { friendlyName }. */
@@ -202,6 +211,15 @@ export function renameScreen(screenId: string, friendlyName: string): Promise<un
 /** POST /api/v1/screens/:screenId/ident { on, ttlMs? } — flash the screen on the wall. */
 export function identScreen(screenId: string, body: IdentBody): Promise<unknown> {
   return send("POST", `/screens/${encodeURIComponent(screenId)}/ident`, IdentBody.parse(body));
+}
+
+/**
+ * DELETE /api/v1/screens/:screenId — permanently forget a single screen (POL-14). Dissolves any
+ * combined surface it belonged to and clears its player. If the screen's machine is still connected
+ * and reports this output, it reappears on the machine's next reconnect.
+ */
+export function deleteScreen(screenId: string): Promise<unknown> {
+  return send("DELETE", `/screens/${encodeURIComponent(screenId)}`);
 }
 
 /**
