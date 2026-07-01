@@ -65,6 +65,20 @@ function reapprove(m: MachineView): void {
   void store.approveMachine(m.id);
 }
 
+/**
+ * Permanently forget a machine (POL-14) — deletes it, its screens, layout + content. Distinct from
+ * Revoke (a remembered "rejected" state): a removed machine must be set up again to return.
+ */
+function remove(m: MachineView): void {
+  const n = m.screens.length;
+  const what = n > 0 ? `its ${countLabel(n, "screen")} plus their layout and content` : "it";
+  const yes = window.confirm(
+    `Remove "${m.label}"? This permanently forgets the machine and deletes ${what} from the console. ` +
+      `If it reconnects it will have to be set up again.`,
+  );
+  if (yes) void store.removeMachine(m.id);
+}
+
 function identAll(m: MachineView): void {
   void store.identMachine(m.id);
 }
@@ -137,6 +151,7 @@ function drives(m: MachineView): string {
                     {{ m.online ? "just now" : formatLastSeen(m.lastSeen, now) }}
                   </div>
                 </div>
+                <button class="btn-remove" @click="remove(m)">Remove</button>
                 <button class="btn-reject" @click="reject(m)">Reject</button>
                 <button class="btn-approve" @click="approve(m)">Approve</button>
               </div>
@@ -178,6 +193,7 @@ function drives(m: MachineView): string {
                   <span class="ident-dot"></span>Ident all
                 </button>
                 <button class="btn-revoke" @click="revoke(m)">Revoke</button>
+                <button class="btn-remove" @click="remove(m)">Remove</button>
               </div>
 
               <div v-if="m.screens.length" class="screens">
@@ -214,6 +230,7 @@ function drives(m: MachineView): string {
                     Access denied · {{ formatLastSeen(m.lastSeen, now) }}
                   </div>
                 </div>
+                <button class="btn-remove" @click="remove(m)">Remove</button>
                 <button class="btn-approve" @click="reapprove(m)">Re-approve</button>
               </div>
             </div>
@@ -524,6 +541,21 @@ function drives(m: MachineView): string {
 .btn-revoke:hover {
   background: var(--bad-soft);
   color: var(--bad);
+}
+.btn-remove {
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--bad-line, var(--line2));
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--bad);
+  cursor: pointer;
+  font-family: inherit;
+}
+.btn-remove:hover {
+  background: var(--bad-soft);
+  border-color: var(--bad);
 }
 
 .pending-note {

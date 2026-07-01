@@ -75,6 +75,18 @@ export class MemoryStore implements Store {
     if (machine) machine.status = status;
   }
 
+  async deleteMachine(id: string): Promise<void> {
+    this.machines.delete(id);
+    // Cascade the machine's screens + their content + placements (defensive — the control plane also
+    // removes each in memory + dissolves walls first so memory + broadcasts stay correct).
+    for (const [screenId, screen] of this.screens) {
+      if (screen.machineId !== id) continue;
+      this.screens.delete(screenId);
+      this.content.delete(screenId);
+      this.placements.delete(screenId);
+    }
+  }
+
   async upsertScreen(screen: PersistedScreen): Promise<void> {
     this.screens.set(screen.id, clone(screen));
   }

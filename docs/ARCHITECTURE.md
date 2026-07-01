@@ -1,6 +1,6 @@
 # Polyptic — architecture & developer reference
 
-Build-facing companion to `README.md`. Polyptic is a **generic, vendor-neutral** display-wall / kiosk-fleet orchestrator. Nothing here depends on a specific stack; integrations (Grafana, Keycloak, …) are pluggable adapters, covered in *Example integration* at the end.
+Build-facing companion to `README.md`. Polyptic is a **generic, vendor-neutral** display-wall / kiosk-fleet orchestrator. Nothing here depends on a specific stack; integrations (dashboards, identity providers, media stores, …) are pluggable adapters behind stable seams, sketched in *Example integration* at the end.
 
 ## Desired-state model (sketch)
 
@@ -27,7 +27,7 @@ An **adapter** resolves a logical `Source` into a concrete render spec + auth st
 adapter.resolve(source) -> { url | launchSpec, surfaceType, auth: AuthStrategy, refresh? }
 ```
 - `web` — any URL, rendered as an iframe (`web-url`) or a top-level window (`web-window`) if framing is blocked.
-- `grafana` (reference adapter) — builds `/d-solo/<uid>/<slug>?orgId=1&panelId=<id>&kiosk&<vars>` for single-panel tiles or `&kiosk` dashboard pages; picks `anonymous-viewer` or `reverse-proxy-header` auth.
+- `dashboard` — builds a single-panel embed URL (or a full `kiosk`-mode dashboard page) from a logical panel reference; picks `anonymous-viewer` or `reverse-proxy-header` auth.
 - `media` — `image | video | slideshow` from an asset store; Office docs are pre-converted to images/PDF/MP4 (e.g. `soffice --headless --convert-to`) at upload time.
 - `native` — a launch-spec for a non-web app, placed by the agent.
 
@@ -35,8 +35,8 @@ New integrations = new adapters; the core model never changes.
 
 ## Auth — two separate concerns (don't conflate)
 
-**Bucket A — content auth ("can the kiosk *see* the website?").** This is **website/browser level**, not Polyptic's. When the player iframes `https://grafana…`, the browser handles the session (cookies, OAuth redirects) exactly as on a laptop. Polyptic just points a tile at a URL. The only wrinkle is that a wall is *unattended* — no human to log in — so we provide ways to make the browser arrive **already authenticated**, without re-implementing anyone's login. Per-source strategies:
-`public` (do nothing) · `anonymous-viewer` (e.g. a Grafana anonymous org — nothing to do) · `reverse-proxy-header-injection` (a proxy in front of the source adds `Authorization:` because an iframe can't) · `persisted-session` (seed the kiosk browser profile with a session cookie once, persist via `--user-data-dir`) · `oidc` (pre-seeded/refreshed token). Polyptic's only role here is *config* — which URL/proxy a tile points at. Often: nothing. If a tile needs login and nothing is arranged, it simply shows that site's login page.
+**Bucket A — content auth ("can the kiosk *see* the website?").** This is **website/browser level**, not Polyptic's. When the player iframes a content URL, the browser handles the session (cookies, OAuth redirects) exactly as on a laptop. Polyptic just points a tile at a URL. The only wrinkle is that a wall is *unattended* — no human to log in — so we provide ways to make the browser arrive **already authenticated**, without re-implementing anyone's login. Per-source strategies:
+`public` (do nothing) · `anonymous-viewer` (e.g. a source configured for anonymous read access — nothing to do) · `reverse-proxy-header-injection` (a proxy in front of the source adds `Authorization:` because an iframe can't) · `persisted-session` (seed the kiosk browser profile with a session cookie once, persist via `--user-data-dir`) · `oidc` (pre-seeded/refreshed token). Polyptic's only role here is *config* — which URL/proxy a tile points at. Often: nothing. If a tile needs login and nothing is arranged, it simply shows that site's login page.
 
 **Bucket B — Polyptic's own auth ("can a *person* reconfigure the wall?").** This **is** our application layer. The admin UI/API is OIDC-gated via standard discovery (any IdP) so randoms on the network can't take over the wall. Agent↔server identity is separate again: bootstrap token → mTLS cert keyed to `/etc/machine-id` (or OIDC client credentials).
 
@@ -77,19 +77,14 @@ Before launch: sed-reset `exit_type`/`exited_cleanly` in `<profile>/Default/Pref
 - **Multiple Chromium share `app_id="chromium"`** under Wayland → `for_window [app_id]` can't disambiguate. Match on distinct **title**, run an **IPC placer** keyed on launch order, or force **XWayland** (`--ozone-platform=x11` + `--class=screen-a`).
 - **Each Chromium needs its own `--user-data-dir`** or a second launch just opens a tab in the first.
 - **NVIDIA on wlroots** needs `nvidia-drm.modeset=1` (maybe `WLR_NO_HARDWARE_CURSORS`); verify hardware before committing to Wayland.
-- **Embedding a dashboard:** the source must permit framing (no `X-Frame-Options: deny`; if CSP is on, list the player origin in `frame-ancestors`). Keep player + content on **one registrable domain** so `SameSite=Lax` cookies survive in the iframe. For Grafana: `[security] allow_embedding=true`, single-panel `/d-solo`, put **every** template var + `&kiosk` in the URL (else an in-iframe refresh can drop kiosk mode). Pin the version; re-test kiosk on upgrade.
+- **Embedding a dashboard:** the source must permit framing (no `X-Frame-Options: deny`; if CSP is on, list the player origin in `frame-ancestors`). Keep player + content on **one registrable domain** so `SameSite=Lax` cookies survive in the iframe. If the dashboard tool has an embedding / anonymous-access setting, enable it; prefer a single-panel embed URL and bake **every** parameter (including any kiosk / full-screen flag) into the URL, since an in-iframe refresh can drop query state. Pin the source version and re-test embedding on upgrade.
 - **Cross-origin iframe load-failure is undetectable** (Same-Origin Policy) → parent-side watchdog: spinner, load timeout, periodic `iframe.src = iframe.src`, error card + backoff. Sources that won't iframe cleanly become top-level `web-window` surfaces.
 
-## Reuse
-`grafana/grafana-kiosk` (Go) handles Chromium-kiosk-pointed-at-Grafana incl. login (`-login-method`, `-kiosk-mode`, `-window-position`) — handy for the Phase 0/1 quick win; the mosaic player + Grafana adapter supersede it for multi-source screens.
+## Example integration — wiring to an existing stack
 
----
+A sketch of how a real deployment slots Polyptic in front of infrastructure you already run. It is **illustrative**, not required by the product — every piece below is a swappable adapter.
 
-## Example integration — Grafana + Keycloak (reference deployment)
-
-This shows how a real deployment wires Polyptic to an existing stack. It is **illustrative**, not required by the product.
-
-- **Identity:** point Polyptic's admin OIDC at the existing IdP (e.g. Keycloak realm). Any compliant OIDC provider works.
-- **Dashboards:** the Grafana adapter renders `d-solo` panels / `&kiosk` pages. For public demo content, use a dedicated Grafana **anonymous-Viewer org** (`[auth.anonymous] org_role=Viewer`, `[security] allow_embedding=true`) so the wall holds no credentials and is orthogonal to human OAuth login. For protected content, use the **reverse-proxy header-injection** auth strategy on an IP-allowlisted kiosk ingress.
-- **Hosting:** deploy `polyptic-server` via its Helm chart onto the same cluster (e.g. behind the existing Traefik ingress) or anywhere else that can reach the IdP and dashboards.
-- **Originating use case (AMRC):** Polyptic was conceived to drive the AMRC's ACS/Factory+ demo wall (Grafana 6.52.4 + an MQTT-traffic "visualiser" web app, Keycloak OIDC, Traefik). That validated the OIDC + dashboard-embedding paths — but Polyptic itself depends on none of it. The visualiser is just a `web-url`/`web-window` source like any other; if it sends framing-blocking headers it renders as a top-level window.
+- **Identity:** point Polyptic's admin OIDC at whatever IdP you already run — any compliant OIDC provider works via standard discovery.
+- **Dashboards:** the `dashboard` adapter renders single-panel embeds or full kiosk pages. For public content, back it with a source configured for **anonymous read-only** access (and embedding enabled) so the wall holds no credentials and is orthogonal to human login. For protected content, use the **reverse-proxy header-injection** auth strategy on an IP-allowlisted kiosk ingress.
+- **Hosting:** deploy `polyptic-server` via its Helm chart onto any cluster (e.g. behind your existing ingress controller) or any Docker host that can reach the IdP and the content sources.
+- **Non-embeddable sources:** any app that sends framing-blocking headers is just a `web-url`/`web-window` source like any other — if it can't be iframed it renders as a top-level window.

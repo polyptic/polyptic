@@ -200,9 +200,19 @@ export interface Store {
   upsertMachine(machine: PersistedMachine): Promise<void>;
   /** Update only a machine's enrollment status (operator approve/reject). No-op if the row is absent. */
   setMachineStatus(id: string, status: EnrollmentStatus): Promise<void>;
+  /**
+   * Permanently forget a machine: delete its row AND cascade its screens, their content, and their
+   * placements (defensive — the control plane also removes each in memory + dissolves walls first, so
+   * memory + broadcasts stay correct). No-op if the row is absent.
+   */
+  deleteMachine(id: string): Promise<void>;
   /** Insert-or-update a screen row (incl. its friendly name). */
   upsertScreen(screen: PersistedScreen): Promise<void>;
-  /** Delete a screen row (e.g. pruning a stale phantom the machine no longer advertises). No-op if absent. */
+  /**
+   * Delete a screen row ONLY (not its content/placement — callers drop those via deleteContent /
+   * deletePlacement). Used both to prune a stale phantom the machine no longer advertises and to
+   * permanently remove a screen from the console (POL-14). No-op if absent.
+   */
   deleteScreen(id: string): Promise<void>;
   /** Insert-or-update a screen's content row (canvas + surfaces). */
   upsertContent(content: PersistedContent): Promise<void>;

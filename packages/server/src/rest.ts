@@ -408,6 +408,75 @@ export function registerRestRoutes(
     };
   });
 
+  // ── Removal (POL-14) — permanently forget a machine or a single screen ────────
+  //
+  // Unlike reject/revoke (a remembered "rejected" state) or unplace (return-to-tray), these DELETEs
+  // FORGET the entity: the machine (with all its screens, layout + content) or one stale screen. Both
+  // dissolve any combined surface an affected screen belonged to and push the cleared slices to the
+  // surviving members' players (the instant path), then broadcast a fresh admin/state.
+
+  // DELETE /api/v1/machines/:machineId  -> forget the machine + all its screens; close its agent socket
+  fastify.delete("/api/v1/machines/:machineId", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.removeMachine(params.data.machineId);
+    if (!result) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    // If the agent is connected NOW, close its socket — the machine is gone, so it must re-enrol to
+    // return (a lingering socket would otherwise sit idle until its next reconnect).
+    const closed = agentHub.close(params.data.machineId);
+
+    // Dissolving its screens' walls cleared surviving members' slices — push the (now empty) renders.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "machine.remove",
+        machineId: params.data.machineId,
+        screens: result.slices.map((s) => s.screenId),
+        closed,
+        revision: control.state.revision,
+      },
+      "machine removed",
+    );
+    broadcaster.broadcast();
+    return { ok: true, machineId: params.data.machineId, closed };
+  });
+
+  // DELETE /api/v1/screens/:screenId  -> forget a single screen (dissolves its wall, clears its player)
+  fastify.delete("/api/v1/screens/:screenId", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.removeScreen(params.data.screenId);
+    if (!result) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    // Push the cleared slices — the removed screen's own (empty) render clears a still-connected player,
+    // and any dissolved wall's surviving members clear their span fragment.
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+
+    fastify.log.info(
+      {
+        event: "screen.remove",
+        screenId: params.data.screenId,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "screen removed",
+    );
+    broadcaster.broadcast();
+    return { ok: true, screenId: params.data.screenId };
+  });
+
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────
   //
   // Murals + placement are spatial layout metadata for the console, not part of any player's render
