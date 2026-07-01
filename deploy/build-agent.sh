@@ -1,35 +1,34 @@
 #!/usr/bin/env bash
-# deploy/build-agent.sh — compile the Polyptic agent to a single binary and package it as .deb + .rpm.
+# deploy/build-agent.sh — compile the Polyptic agent to a single self-contained binary.
 #
-# PREREQUISITES (on the BUILD host):
-#   * bun   >= 1.1    https://bun.sh                   (REQUIRED — compiles the single binary)
-#   * nfpm  >= 2.30   https://nfpm.goreleaser.com      (OPTIONAL — only for .deb/.rpm; `brew install nfpm`)
-# The single binary (served by the control-plane depot at /dist/agent/<arch> and installed by the
-# zero-touch `curl|sh`) needs only bun; nfpm is just for the classic `apt install ./*.deb` path.
+# The agent is delivered ONLY via the zero-touch control-plane depot (D35/D41): the server serves
+# this binary at GET /dist/agent/<arch> and the box installs it with `curl -sfL …/install | sh -`.
+# There is NO standalone .deb/.rpm/apt path (removed in D41). Use this script to (re)produce the
+# binary that seeds the depot (AGENT_DIST_DIR) when you are not building the whole server image
+# (deploy/server.Dockerfile builds the same binary for both arches inside the image).
+#
+# PREREQUISITE (on the BUILD host): bun >= 1.1 (https://bun.sh) — compiles the single binary.
 #
 # USAGE:
 #   deploy/build-agent.sh [arch]
 #     arch = arm64 (default; the Apple-Silicon UTM/Parallels test VM) | amd64 (the thin clients)
 #
 #   env overrides:
-#     VERSION=<semver>   package version (default: read from packages/agent/package.json)
+#     VERSION=<semver>   version baked into the binary (default: read from packages/agent/package.json)
 #     SKIP_INSTALL=1     skip `bun install` (assume workspace deps already present)
 #
 # OUTPUT (into deploy/dist/):
-#   polyptic-agent-<arch>                       the compiled single binary
-#   polyptic-agent_<version>_<arch>.deb
-#   polyptic-agent-<version>-1.<rpmarch>.rpm
+#   polyptic-agent-<arch>                       the compiled single binary (what the depot serves)
 #
 # D7: the agent ships as a Bun single binary — one file, no runtime to install on the box.
 # bun cross-compiles the runtime INTO the binary, so one host can build BOTH arches (e.g. an
-# arm64 Mac builds the amd64 thin-client package too). D26: same binary + `setup` logic, packaged
-# for deb AND rpm from this one config.
+# arm64 Mac builds the amd64 thin-client binary too).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# ── Resolve target arch -> (nfpm arch, bun target) ───────────────────────────────────────────────
+# ── Resolve target arch -> bun compile target ───────────────────────────────────────────────────
 ARCH_IN="${1:-arm64}"
 case "$ARCH_IN" in
   amd64|x86_64|x64)  ARCH=amd64; BUN_TARGET=bun-linux-x64   ;;
@@ -48,10 +47,6 @@ fi
 
 # ── Prereq checks ────────────────────────────────────────────────────────────────────────────────
 command -v bun  >/dev/null 2>&1 || { echo "build-agent: 'bun' not found — see https://bun.sh" >&2; exit 1; }
-# nfpm is OPTIONAL — it only builds the .deb/.rpm. The single binary needs only bun, so a missing
-# nfpm just skips packaging (with a note) rather than failing the build.
-HAVE_NFPM=0
-command -v nfpm >/dev/null 2>&1 && HAVE_NFPM=1
 
 OUT_DIR="deploy/dist"
 mkdir -p "$OUT_DIR"
@@ -79,19 +74,6 @@ bun build \
   packages/agent/src/index.ts
 chmod 0755 "$BIN_OUT"
 
-# ── Package (OPTIONAL): nfpm reads ${ARCH}/${VERSION} from the env (see deploy/nfpm.yaml). The binary
-#    above is the primary artifact; .deb/.rpm are only for the classic `apt install` path. ──────────
-if [ "$HAVE_NFPM" = 1 ]; then
-  export ARCH VERSION
-  echo "==> nfpm package (deb)"
-  nfpm package --config deploy/nfpm.yaml --packager deb --target "$OUT_DIR/"
-  echo "==> nfpm package (rpm)"
-  nfpm package --config deploy/nfpm.yaml --packager rpm --target "$OUT_DIR/"
-else
-  echo "==> nfpm not installed — built the binary only, skipping .deb/.rpm."
-  echo "    (the depot + curl|sh use the binary; for the classic apt path: brew install nfpm)"
-fi
-
 echo
-echo "==> Done. Artifacts in $OUT_DIR/:"
-ls -1 "$BIN_OUT" "$OUT_DIR"/*.deb "$OUT_DIR"/*.rpm 2>/dev/null || true
+echo "==> Done. Serve this at GET /dist/agent/${ARCH} (point AGENT_DIST_DIR at $OUT_DIR/):"
+ls -1 "$BIN_OUT" 2>/dev/null || true

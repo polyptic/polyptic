@@ -61,7 +61,7 @@ Open **http://localhost:5175**, sign in (dev default `operator@polyptic.local` /
 | `@polyptic/server` | Bun · Fastify · `ws` · Postgres (porsager) · `zod` | source of truth: registry, murals/placement, combined surfaces, content library, scenes, media; REST + WS (`/agent`, `/player`, `/admin`); local auth; `/healthz` + Prometheus `/metrics`; serves both SPAs |
 | `@polyptic/console` | **Vue 3 · Vite · Vue Router · Pinia · Vue Flow** | the operator UI: spatial **Wall** canvas, content library, scenes, machines + cold-start wizard, settings, live activity feed |
 | `@polyptic/player` | **Vue 3 · Vite** | per-screen renderer; draws its slice of typed surfaces, including a video-wall **span** of one piece of content across panels; in-place updates |
-| `@polyptic/agent` | **Bun single binary** (`.deb`/`.rpm`) | outbound WS, reconciles its slice, drives `sway` (`swaymsg`) or `x11/i3`, launches Chromium-per-output, captures `grim`/`scrot` preview thumbnails |
+| `@polyptic/agent` | **Bun single binary** (served by the control-plane depot) | outbound WS, reconciles its slice, drives `sway` (`swaymsg`) or `x11/i3`, launches Chromium-per-output, captures `grim`/`scrot` preview thumbnails |
 | `@polyptic/protocol` | `zod` | the shared contract — every cross-process message is defined and validated here |
 
 ### Device stack (each display client)
@@ -90,7 +90,7 @@ curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -
 curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -s -- --kiosk
 ```
 
-The script bakes in the control-plane URL from the host you curled. The server bundles the substrate `.deb`s for a supported distro (Ubuntu latest); `--kiosk` prefers that bundle and only reaches the internet when the box is on a distro you haven't bundled. The classic path also works: `sudo apt install ./polyptic-agent_*.deb` then `polyptic-agent setup …` (see `docs/DEPLOY.md`).
+The script bakes in the control-plane URL from the host you curled and downloads the agent binary from the server (`GET /dist/agent/<arch>`). The server bundles the substrate `.deb`s for a supported distro (Ubuntu latest); `--kiosk` prefers that bundle and only reaches the internet when the box is on a distro you haven't bundled. This depot one-liner is the **only** way to install an agent — there is no standalone `.deb`/`.rpm` to `apt install` (D41). See `docs/DEPLOY.md`.
 
 Once provisioned, a box **dials in and waits to be approved**. The operator journey from there —
 **enrol → approve → ident the panels to name them → place on a mural → assign content** — is point-and-confirm (a guided **Cold-start wizard** in the console walks you through it). Full step-by-step:
@@ -100,15 +100,15 @@ Once provisioned, a box **dials in and waits to be approved**. The operator jour
 See **[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md)** for the full packaging story.
 
 - **Server** — one **Docker image** (`ghcr.io/<owner>/polyptic-server`) bundling the control plane **plus** the console and player SPAs, served same-origin (so the session cookie just works). `docker run`, the **docker-compose** `full` profile (server + Postgres + media volume), or the **Helm chart** in `deploy/helm/polyptic` (bring-your-own Postgres; renders standalone). You don't `npm install` Polyptic — you run the image.
-- **Agent** — a per-box **`.deb`/`.rpm`**, or the `curl | sh` install above.
-- **Releases** are **tag-driven** (GitHub Actions): pushing `vX.Y.Z` builds the image + packages and attaches them to the Release. CI (typecheck + tests) runs on every push; nothing publishes on a normal push.
+- **Agent** — installed on each box via the `curl | sh` depot one-liner above (the server serves the binary; no standalone package — D41).
+- **Releases** are **tag-driven** (GitHub Actions): pushing `vX.Y.Z` builds the server image + the agent binaries and attaches the binaries to the Release. CI (typecheck + tests) runs on every push; nothing publishes on a normal push.
 
 ## Status
 
 **Feature-complete through Phase 8** and verified headlessly + in a real browser; the remaining work is environmental (real hardware), not features.
 
 - **Built & tested:** Phases 1–3 (instant slice → registry → enrollment → the full Vue console: murals, combined surfaces, content library, scenes, machines + cold-start wizard, local auth + settings), Phase 5 (live preview, metrics, Helm), Phase 7 (media upload to disk), Phase 8 (single-image packaging + CI/release/Pages). **101 end-to-end tests** (real server, REST + WS) + full TypeScript typecheck are green; the console's interactions (content names, drag-to-assign, combine/rename, the activity feed) are **verified in-browser** via the `tools/ui-check` Playwright harness. *(Phase 6 / OIDC is deliberately deferred — the seam is in place.)*
-- **Code-complete, not yet proven on hardware:** the **device stack** (Phase 4 — real `sway`/`x11` backends, `.deb` packaging, greetd cold-boot, Chromium-per-output) and the **production image build** / actual multi-machine deploy. These can only be validated on real boxes/VMs — that's the active next step.
+- **Code-complete, not yet proven on hardware:** the **device stack** (Phase 4 — real `sway`/`x11` backends, zero-touch depot install, greetd cold-boot, boot splash, Chromium-per-output) and the **production image build** / actual multi-machine deploy. These can only be validated on real boxes/VMs — that's the active next step.
 
 See **`docs/ONBOARDING.md`** to add a display, `docs/DEPLOY.md` for the device side, `docs/DISTRIBUTION.md` for packaging, `docs/ROADMAP.md` for the detailed state, `docs/DECISIONS.md` for the decision log (D1–D34+), `docs/DESIGN.md` for the narrative, `docs/ARCHITECTURE.md` for the build reference, and `CLAUDE.md` for working conventions.
 

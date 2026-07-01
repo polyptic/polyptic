@@ -5,9 +5,9 @@ channels on `:8080`) to Kubernetes. This mirrors `deploy/docker-compose.yml`,
 `deploy/server.Dockerfile`, and `deploy/.env.example`.
 
 > **Scope.** This chart deploys ONLY the server. The on-device **agent is installed
-> per box** from the `.deb`/`.rpm` package (`deploy/nfpm.yaml`) — it is never run in
-> Kubernetes. Agents connect *out* to the server over a WebSocket; expose the server
-> (Ingress / LoadBalancer) so the fleet can reach it.
+> per box** from the control-plane depot (`curl -sfL http://SERVER/install | sh -`; D41) —
+> it is never run in Kubernetes. Agents connect *out* to the server over a WebSocket; expose
+> the server (Ingress / LoadBalancer) so the fleet can reach it.
 
 ## TL;DR
 

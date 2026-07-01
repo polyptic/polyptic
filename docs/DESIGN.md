@@ -63,7 +63,7 @@ Surface types: `web-url` · `dashboard-panel` · `dashboard-page` (player iframe
 
 ## Build vs buy
 
-**Borrow wholesale:** device stack (Ubuntu, `sway`/`greetd`/`systemd`, Chromium kiosk, `grim`, `wayvnc`); the *discipline* of OTA / env-as-config provisioning (ship the agent as a single-file `.deb`, provision the image declaratively) — without taking on a hosted-SaaS device manager.
+**Borrow wholesale:** device stack (Ubuntu, `sway`/`greetd`/`systemd`, Chromium kiosk, `grim`, `wayvnc`); the *discipline* of OTA / env-as-config provisioning (ship the agent as a single-file **binary**, provision declaratively) — without taking on a hosted-SaaS device manager.
 
 **Build (only net-new):** `polyptic-server` (registry + global layout + versioned scenes + REST/WS API + web UI) and `polyptic-agent`. Tightly scoped, *not* a generic signage CMS.
 
@@ -120,13 +120,13 @@ The **Polyptic Console v2** model settles the operator console. We adopt it whol
 
 ---
 
-## Update 2026-06-29 — Phase 4 device stack: `apt install`, not a (mandatory) image (D26/D27)
+## Update 2026-06-29 — Phase 4 device stack: zero-touch depot install, not a (mandatory) image (D26/D27; agent delivery revised by D41)
 
 Settled while the design was in flight; build deferred until after Phase 3.
 
-**Delivery.** The primary on-device path is **`apt install polyptic-agent`** (a `.deb`) — *not* a dedicated OS image. The image (and cloud-init/Ansible) are **optional wrappers around the same package** for big fleets / fast reprovision. The package's `postinst` wires the whole chain on a **stock** Ubuntu: greetd autologin (`kiosk` user) → **sway** → `systemd`-supervised agent + **Chromium-per-output**, plus crash hardening (`Restart=always`, popup/`exit_type` suppression, no `swayidle`, `dpms on`). Per-box config (control-plane URL + bootstrap token) via debconf or `/etc/polyptic/agent.toml`. Clean split: **`apt install` = the box is a Polyptic display; the console = what it shows** (it enrols via 2b → you Approve it).
+**Delivery.** The only on-device path is the **zero-touch depot one-liner** — `curl -sfL http://SERVER:8080/install | POLYPTIC_TOKEN=… sh -s -- --kiosk` — served by the control plane; there is no standalone package and no dedicated OS image (D41). The install script runs `polyptic-agent setup`, which wires the whole chain on a **stock** Ubuntu: greetd autologin (`kiosk` user) → **sway** → `systemd`-supervised agent + **Chromium-per-output**, plus crash hardening (`Restart=always`, popup/`exit_type` suppression, no `swayidle`, `dpms on`). Per-box config (control-plane URL + bootstrap token) via `/etc/polyptic/agent.toml`. Clean split: **the depot install = the box is a Polyptic display; the console = what it shows** (it enrols via 2b → you Approve it).
 
-**Generic Linux.** The runtime stack (systemd, greetd, sway/cage, Chromium, Wayland) is distro-agnostic; only the package format and the DM-to-displace differ. So the **setup logic lives in the agent binary** (`polyptic-agent setup`), distro-aware (apt/dnf/pacman), wrapped in a native `.deb` first (Ubuntu/Debian = the actual hardware) and `.rpm`/AUR later — one source of truth, two front-ends (native package **or** universal installer), like k3s/tailscale.
+**Generic Linux.** The runtime stack (systemd, greetd, sway/cage, Chromium, Wayland) is distro-agnostic; only the package format and the DM-to-displace differ. So the **setup logic lives in the agent binary** (`polyptic-agent setup`), distro-aware (apt/dnf/pacman) for the substrate it installs (Ubuntu/Debian = the actual hardware, `.rpm`/AUR later) — one source of truth, delivered by the depot's universal installer (`curl … | sh`), like k3s/tailscale.
 
 **"How does a browser show on a *server*?"** A "server" install isn't CLI-*only* — it's the same OS with no desktop. The hardware still has a GPU + real outputs (that's how you see boot text). The Linux graphics stack is: kernel **DRM/KMS** (drives the panel) → a **compositor / display server** (sway on Wayland; Xorg on X11) → a **GUI app** (Chromium). A "server" is missing only the middle layer. We add **just a compositor** (sway, a few MB) + the browser — *no* desktop environment (GNOME/KDE bundle a compositor *plus* tons of apps we don't want). So we deliberately start from **Server-minimal**: nothing to fight, lean, fast-booting. `apt install greetd sway chromium grim` is essentially the whole graphical layer.
 
@@ -134,7 +134,7 @@ Settled while the design was in flight; build deferred until after Phase 3.
 
 **Backends.** Phase 4 makes the agent's `wayland-sway`/`x11-i3` `DisplayBackend`s **real** (swaymsg-IPC window placement + Chromium launching + `grim`/`wayvnc` capture), replacing today's Phase-1 stubs; `dev-open` stays for non-Linux dev.
 
-**Test target (noted).** Two complementary VMs: **OrbStack** (headless, no display) for fast iteration on the **install → systemd → agent → enrolment** plumbing + a *headless* sway (`WLR_BACKENDS=headless`); and **UTM** (QEMU + virtio-gpu) — a desktop-virtualization VM with a real virtual display — for the **visual** "cold-boot → active scene, zero clicks" DoD, where sway + Chromium actually render. Caveats for the visual VM: it presents ~one virtual output (so *multi-output-per-client* + the real multi-screen wall stay a real-hardware test), the virtual GPU may need `WLR_NO_HARDWARE_CURSORS` or the x11/i3 fallback, and on Apple Silicon the guest is arm64 (build the `.deb` for the VM arch *and* the likely-amd64 thin clients).
+**Test target (noted).** Two complementary VMs: **OrbStack** (headless, no display) for fast iteration on the **install → systemd → agent → enrolment** plumbing + a *headless* sway (`WLR_BACKENDS=headless`); and **UTM** (QEMU + virtio-gpu) — a desktop-virtualization VM with a real virtual display — for the **visual** "cold-boot → active scene, zero clicks" DoD, where sway + Chromium actually render. Caveats for the visual VM: it presents ~one virtual output (so *multi-output-per-client* + the real multi-screen wall stay a real-hardware test), the virtual GPU may need `WLR_NO_HARDWARE_CURSORS` or the x11/i3 fallback, and on Apple Silicon the guest is arm64 (build the agent binary for the VM arch *and* the likely-amd64 thin clients).
 
 ---
 

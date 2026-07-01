@@ -1,23 +1,23 @@
 # Polyptic — on-device deploy & onboarding
 
-How a bare Linux box becomes a Polyptic display. This is the **device** guide (the `polyptic-agent` package, the cold-boot chain, the kiosk stack). For running the **control plane** (server + console + Postgres) see `docs/DEV.md`; for the why behind these choices see `docs/ARCHITECTURE.md` ("On-device stack" + "Gotchas") and `docs/DECISIONS.md` (**D26**, **D27**, **D9**, **D16**).
+How a bare Linux box becomes a Polyptic display. This is the **device** guide (the zero-touch depot install, the cold-boot chain, the kiosk stack). For running the **control plane** (server + console + Postgres) see `docs/DEV.md`; for the why behind these choices see `docs/ARCHITECTURE.md` ("On-device stack" + "Gotchas") and `docs/DECISIONS.md` (**D26**, **D27**, **D35**, **D41**, **D9**).
 
-> **Packaging & distribution** — how Polyptic *ships* (the server Docker image, the agent `.deb`/`.rpm`, the tag-driven release flow, and the optional private npm story) lives in **`docs/DISTRIBUTION.md`**. This page is the operational "install it on a box" guide; that page is "what the artifacts are and where they come from."
+> **Packaging & distribution** — how Polyptic *ships* (the server Docker image, the depot-served agent binary, the tag-driven release flow, and the optional private npm story) lives in **`docs/DISTRIBUTION.md`**. This page is the operational "install it on a box" guide; that page is "what the artifacts are and where they come from."
 
 > Status: Phase 4. The real `wayland-sway` / `x11-i3` display backends and `polyptic-agent setup` ship in this phase. The backends drive a real compositor + GPU, so they are **VM-/hardware-verified**, not unit-tested — every step below that touches a display is marked where it needs a real virtual output or real hardware. See the [Verification checklist](#verification-checklist--visual-cold-boot-dod) at the end.
 
 ---
 
-## The model — "just install it" (D26 / D27)
+## The model — "just install it" (D26 / D27 / D35 / D41)
 
 Polyptic deliberately splits the box from the brain:
 
-- **`apt install polyptic-agent` makes the box a Polyptic display.** That is the entire on-device story. The package turns a stock **Ubuntu Server-minimal** install into a zero-click kiosk: passwordless autologin → a Wayland compositor → a supervised agent that runs a kiosk Chromium per output and dials home over `wss://`.
+- **One `curl … | sh` from the control plane makes the box a Polyptic display.** That is the entire on-device story. The one-liner turns a stock **Ubuntu Server-minimal** install into a zero-click kiosk: passwordless autologin → a Wayland compositor → a supervised agent that runs a kiosk Chromium per output and dials home over `wss://`.
 - **The console decides what it shows.** Nothing about *what content appears* is configured on the device. Once the box is enrolled and approved, the operator drags screens onto a mural and assigns content from the console; it arrives live over the player WebSocket. The device never holds a layout, a credential for any dashboard, or a per-machine boot script.
 
 That split is the whole point — it replaces "a fragile per-machine boot script that clicks here, waits, opens a browser, and types a password in plaintext" with **one declarative control plane + thin reconciling agents**.
 
-**apt is the primary path.** A prebuilt **image** and **cloud-init / Ansible** are optional thin wrappers around the *same* `.deb` + the *same* `polyptic-agent setup` logic (the provisioning lives in the binary, not in an image, so there is one source of truth). Use the image only when flashing a large fleet; a handful of boxes is just `apt install`.
+**The zero-touch depot one-liner is the ONLY install path (D41).** The agent is a Bun single binary the control plane serves at `GET /dist/agent/<arch>`; the box pulls it (and, with `--kiosk`, the visual substrate) from the one server it can reach and nothing else. There is **no** standalone `.deb`/`.rpm` to `apt install`, and no first-boot package hook — the provisioning lives in the binary (`polyptic-agent setup`), one source of truth. A prebuilt **image** is an optional wrapper that simply runs the same installer for a large fleet; a handful of boxes is just the one-liner.
 
 **The substrate is borrowed, not built (D27).** Start from Ubuntu Server-minimal — a "server" is CLI-*by-default*, not CLI-*only*; the kernel's DRM/KMS already drives the panel. We add only a **compositor** (`sway`) and a **browser** (a **`.deb` Chromium**, *not* the snap — see [Troubleshooting](#snap-chromium-avoid-it)), no desktop environment, no GDM/GNOME to fight. `cog` / WPE WebKit is the documented fallback for low-power clients.
 
@@ -25,35 +25,21 @@ That split is the whole point — it replaces "a fragile per-machine boot script
 
 ## TL;DR
 
-On a machine with the repo checked out (build host — can be your Mac or a Linux box with `bun`):
+On the **target box** (Ubuntu Server-minimal), as a user with sudo — the box only needs to reach your control plane:
 
 ```bash
-# 1. Build the .deb for the target's architecture (amd64 thin clients, arm64 Apple-Silicon VMs)
-bash deploy/build-agent.sh amd64          # → dist/polyptic-agent_<ver>_amd64.deb
-```
-
-On the **target box** (Ubuntu Server-minimal), as a user with sudo:
-
-```bash
-# 2. Install (the leading ./ makes apt treat it as a local file, pulling deps from the repos)
-sudo apt install ./polyptic-agent_<ver>_amd64.deb
-
-# 3. Point it at the control plane and wire the kiosk stack (idempotent)
-sudo polyptic-agent setup \
-  --server-url wss://control.example.com/agent \
-  --bootstrap-token "$BOOTSTRAP_TOKEN"
-
-# 4. Reboot into the kiosk
+# Agent + the visual substrate (greetd→sway→Chromium kiosk), then cold-boot into it:
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$BOOTSTRAP_TOKEN sh -s -- --kiosk
 sudo reboot
 ```
 
-The box cold-boots into a Chromium-per-output kiosk and dials home. It shows **PENDING** in the console until an operator **Approves** it (Phase 2b). After approval its screens flip to the active scene. Done — no further on-device steps, ever.
+The installer downloads the arch-matched agent binary from the server, wires the kiosk stack (`polyptic-agent setup`), and the box cold-boots into a Chromium-per-output kiosk and dials home. It shows **PENDING** in the console until an operator **Approves** it (Phase 2b). After approval its screens flip to the active scene. Done — no further on-device steps, ever. (Drop `--kiosk` for a headless enrol with no display; drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode.)
 
 ---
 
 ## Zero-touch, air-gapped install from the control plane (`curl … | sh`)
 
-The `.deb`/`apt` path above is the supply-chain-friendly default. But it needs the box to reach the Ubuntu archives, and it needs the operator to copy a `.deb` around. For an **edge box that reaches ONLY the server** — a locked-down VLAN, a shop-floor panel, a kiosk behind a captive firewall — Polyptic ships a **k3s-style one-liner** where **the control plane is the depot**:
+This is the one and only way to install an agent (D41): a **k3s-style one-liner** where **the control plane is the depot**. It suits everything from a normal LAN box to an **edge box that reaches ONLY the server** — a locked-down VLAN, a shop-floor panel, a kiosk behind a captive firewall — because the box pulls the agent binary (and, with `--kiosk`, the substrate) from the one server it can see and nothing else.
 
 ```bash
 # Agent only (headless enrol). Fully air-gapped — the box talks to the server and NOTHING else.
@@ -99,7 +85,7 @@ With `--kiosk` (or `POLYPTIC_KIOSK=1`) the script provisions the greetd/sway/Chr
 2. **Online fallback:** on `404` (no bundle for this distro+arch) **and** the box happens to have internet, fall back to the distro package manager (`apt`/`dnf`/`pacman`) for `sway greetd chromium grim wayvnc dbus + fonts`.
 3. **Clear failure:** no bundle **and** no internet → exit with an actionable message (bundle this distro on the server with `bundle-deps.sh`, use a bundled distro, or give the box one-time internet).
 
-Then it hands off to **`polyptic-agent setup --skip-deps --server-url … --bootstrap-token … [--output …]`** for the greetd autologin → sway → Chromium-per-output wiring (the same `setup` CLI as the `apt` path; `--skip-deps` because the substrate is already present). Finally it **retires the Stage-A system service** — the kiosk runs the agent as a **systemd `--user`** unit *inside* the sway session (it must inherit `WAYLAND_DISPLAY` to drive Chromium), so one agent per machine, not two. After this, `sudo reboot` cold-boots into the kiosk.
+Then it hands off to **`polyptic-agent setup --skip-deps --server-url … --bootstrap-token … [--output …]`** for the greetd autologin → sway → Chromium-per-output wiring (`--skip-deps` because the substrate is already present). Finally it **retires the Stage-A system service** — the kiosk runs the agent as a **systemd `--user`** unit *inside* the sway session (it must inherit `WAYLAND_DISPLAY` to drive Chromium), so one agent per machine, not two. After this, `sudo reboot` cold-boots into the kiosk.
 
 > **Flags & env:** `--kiosk`/`POLYPTIC_KIOSK=1` (substrate), `--output DP-1=1920x1080@0,0` (repeatable, forwarded to `setup`), `POLYPTIC_TOKEN` (enrolment token; empty → server OPEN mode), `POLYPTIC_BASE` (override the baked-in base). The script is POSIX `sh`, `set -eu`, **idempotent**, and logs every step; re-running it re-converges.
 
@@ -120,7 +106,7 @@ The server only serves `/dist/agent/<arch>` and `/dist/deps/…` if the artifact
 
 ---
 
-## What the package wires (the cold-boot chain)
+## What the installer wires (the cold-boot chain)
 
 ```
 power on
@@ -184,42 +170,19 @@ chromium \
 
 ## Prerequisites & supported targets
 
-- **OS:** Ubuntu Server-minimal (24.04 LTS class) is the validated target; the setup logic is **distro-aware** (apt/dnf/pacman) so it is generic across any systemd Linux, but native `.deb` (Ubuntu/Debian) is the hardware path. `.rpm`/others are later.
+- **OS:** Ubuntu Server-minimal (24.04 LTS class) is the validated target; the setup logic is **distro-aware** (apt/dnf/pacman for the substrate it installs) so it is generic across any systemd Linux, but Ubuntu/Debian is the hardware path.
 - **GPU:** Intel/AMD → Wayland/sway (default, best path). NVIDIA → likely the **x11-i3 fallback** (D9); see [NVIDIA](#nvidia--wayland).
-- **Architecture:** the `.deb` is **arch-specific**. Thin clients are typically **amd64**; an Apple-Silicon UTM/Parallels VM guest is **arm64**. Build the `.deb` for the arch you are installing on (`--arch amd64` / `--arch arm64`) — installing the wrong arch fails with a dpkg architecture error.
+- **Architecture:** the agent **binary** is arch-specific, but you don't pick it — the installer downloads the one matching the box's `uname -m` from `GET /dist/agent/<arch>` (`amd64` thin clients; `arm64` Apple-Silicon VM guests). The server bakes both arches, so one depot serves every box.
 - **Network:** the agent dials **outbound `wss://` only** to the control plane's `/agent` path. No inbound ports, no NAT holes. The box must be able to reach the server URL.
 - **Control plane already running.** Bring up the server + console + Postgres first (`docs/DEV.md`). Note the **bootstrap token** (`POLYPTIC_BOOTSTRAP_TOKEN`) — the device needs the same value to enrol in gated mode.
 
 ---
 
-## Step 1 — Build the `.deb`
+## The provisioner under the hood (`polyptic-agent setup`)
 
-The agent is a **Bun single binary** (D7): `deploy/build-agent.sh` compiles `packages/agent` with `bun build --compile` for the chosen Linux target and packages it with a postinst that drops the `polyptic-agent` binary on `PATH`, declares the runtime deps (`greetd`, `sway`, `chromium-browser`/`chromium` as a **`.deb`** not the snap, `grim`, plus `scrot`/`imagemagick` for the x11 path), and prepares `/etc/polyptic/`.
+The `curl … | sh` installer runs this for you — you don't normally call it by hand. `setup` is the idempotent provisioner baked into the agent binary (D7 — the binary embeds no npm runtime and shells out to `swaymsg`/`chromium`/`grim` via `node:child_process`, so there is nothing to `npm install` on the device). It detects the distro, ensures the substrate deps (`greetd`, `sway`, a **`.deb`** Chromium not the snap, `grim`, plus `scrot`/`imagemagick` for the x11 path), creates the **`kiosk`** user, writes the greetd autologin config, the sway config (outputs, `dpms on`, no idle), the systemd unit(s), the **boot splash** (POL-7), and `/etc/polyptic/agent.toml`, then enables them.
 
-```bash
-# from the repo root, on a host with bun
-bash deploy/build-agent.sh amd64      # x86-64 thin clients
-bash deploy/build-agent.sh arm64      # Apple-Silicon VM guests, ARM clients
-# → dist/polyptic-agent_<version>_<arch>.deb
-```
-
-> The binary embeds no npm runtime and shells out to the system tools (`swaymsg`, `chromium`, `grim`, …) via `node:child_process` — there is nothing to `npm install` on the device.
-
-## Step 2 — Install on the box
-
-Copy the `.deb` to the target (scp/USB/your fleet tool) and:
-
-```bash
-sudo apt install ./polyptic-agent_<version>_amd64.deb
-```
-
-The leading `./` is important — it tells apt this is a **local file** and to resolve `Depends:` (sway, the `.deb` Chromium, greetd, grim, …) from the configured repositories. `dpkg -i` alone would *not* pull dependencies.
-
-The package install only **places files + declares deps**. It does **not** flip the box into kiosk mode on its own — that is `setup`, so an accidental `apt install` never hijacks a machine.
-
-## Step 3 — Configure & wire the stack (`polyptic-agent setup`)
-
-`setup` is the idempotent provisioner baked into the binary. It detects the distro, ensures deps, creates the **`kiosk`** user, writes the greetd autologin config, the sway config (outputs, `dpms on`, no idle), the systemd unit(s), and `/etc/polyptic/agent.toml` from your flags, then enables them.
+You'd re-run it to re-point a box at a new server, switch backend, rotate the token, pin outputs, or swap the splash logo — it converges without piling up duplicate state:
 
 ```bash
 sudo polyptic-agent setup \
@@ -227,10 +190,11 @@ sudo polyptic-agent setup \
   --bootstrap-token "$BOOTSTRAP_TOKEN" \
   # optional:
   # --backend wayland-sway|x11-i3     # default: auto-detect (wayland-sway, x11-i3 for NVIDIA)
-  # --kiosk-user kiosk                # the autologin user it creates/uses
+  # --output DP-1=1920x1080@0,0       # pin a compositor output (repeatable)
+  # --no-splash                       # skip the Plymouth boot splash (POL-7)
 ```
 
-- **Idempotent:** safe to re-run; it converges the box to the desired config (re-point at a new server, switch backend, rotate the token) without piling up duplicate state.
+- **Idempotent:** safe to re-run; it converges the box to the desired config without piling up duplicate state.
 - **Server URL** must be the **agent channel**: `wss://<host>/agent` in production, `ws://<host>:8080/agent` against a dev control plane.
 - **Bootstrap token** is only needed in the server's **gated** mode (the safe default for anything real). If your dev server runs **open** mode it auto-approves and the token is ignored (with a server-side warning) — see `docs/DEV.md` → Phase 2b.
 
@@ -248,7 +212,7 @@ bootstrap_token = "change-me-to-a-long-random-secret"
 
 These map onto the agent's environment knobs (the systemd unit exports them): `POLYPTIC_SERVER_URL`, `POLYPTIC_BOOTSTRAP_TOKEN`, `POLYPTIC_BACKEND`, `POLYPTIC_CONNECTOR`. The durable per-machine credential the server issues after first enrolment is stored under the kiosk user's state dir (`~/.polyptic/credential-<machineId>`, `0600`); the server keeps only its `sha256` (D12 / Phase 2b).
 
-## Step 4 — Enrol & approve (Phase 2b)
+## Enrol & approve (Phase 2b)
 
 1. `sudo reboot` (or `sudo systemctl start greetd`) — the box cold-boots the chain above.
 2. The agent dials out, sends `agent/hello` with the bootstrap token, and the server replies `server/enrolled` + `server/pending`. It now shows up **PENDING** in the console's enrollment view. The connection stays open; a rejected/unknown machine backs off and retries slowly (~60 s) rather than hammering.
@@ -284,20 +248,23 @@ OrbStack/Docker verifies the install → systemd → agent → enrolment *plumbi
 1. **UTM → Create → Virtualize → Linux.**
 2. **Backend: QEMU — *not* Apple Virtualization.** Apple's hypervisor exposes a paravirtual GPU that does **not** give sway a DRM/KMS device; sway won't start. QEMU with virtio-gpu does.
 3. **Display / GPU: `virtio-gpu` (virtio-ramfb / virtio-gpu-gl).** This is what gives the guest a `/dev/dri/card0` KMS device so **sway gets KMS** and can drive a virtual output. Without it you get no console framebuffer for the compositor.
-4. **ISO: Ubuntu Server-minimal.** On Apple Silicon the guest is **arm64**, so download the **arm64** Ubuntu Server ISO. (Build the **arm64** `.deb` for this VM — and separately the **amd64** `.deb` for your real thin clients.)
+4. **ISO: Ubuntu Server-minimal.** On Apple Silicon the guest is **arm64**, so download the **arm64** Ubuntu Server ISO. (Make sure the depot serves the **arm64** binary for this VM — and, for your real thin clients, the **amd64** one; the server image bakes both.)
 5. RAM 2–4 GB, a few CPU cores, 16 GB+ disk. Finish the Ubuntu Server install (create a normal sudo user; you do **not** pre-create `kiosk` — `setup` does that).
 
 ### Install & point it at the dev control plane
 
-On your Mac, make sure the dev control plane is reachable from the guest (run `bun run dev` per `docs/DEV.md`; use the host's LAN IP, not `localhost`, from inside the VM). Then in the guest:
+On your Mac, make sure the dev control plane is reachable from the guest and **serving the agent binary** for the guest's arch — run `bun run dev` per `docs/DEV.md`, and build the arm64 binary so the dev server's depot can hand it out:
 
 ```bash
-# copy the arm64 .deb in (scp from the Mac, or a UTM shared dir)
-sudo apt install ./polyptic-agent_<version>_arm64.deb
+# on the Mac (once): build the arm64 binary the guest will download
+bash deploy/build-agent.sh arm64                 # → deploy/dist/polyptic-agent-arm64
+```
 
-sudo polyptic-agent setup \
-  --server-url ws://<your-mac-ip>:8080/agent \
-  --bootstrap-token "$BOOTSTRAP_TOKEN"      # omit if your dev server runs OPEN mode
+Then in the guest (use the host's LAN IP, not `localhost`) — the zero-touch one-liner does the rest:
+
+```bash
+curl -sfL http://<your-mac-ip>:8080/install | POLYPTIC_TOKEN="$BOOTSTRAP_TOKEN" sh -s -- --kiosk
+#   (drop POLYPTIC_TOKEN= if your dev server runs OPEN mode)
 
 # virtio-gpu has no hardware cursor plane — set this so sway's cursor renders
 echo 'WLR_NO_HARDWARE_CURSORS=1' | sudo tee -a /etc/environment
@@ -324,7 +291,7 @@ swaymsg -t get_tree                           # confirm the Chromium window is p
 
 - **~1 virtual output.** A VM typically presents a single virtual display, so the VM validates **single-output** placement + the whole cold-boot chain. **Multi-output-per-client placement** (two+ Chromium windows on two+ connectors via the app_id/title disambiguation) and the **real multi-screen wall** stay a **real-hardware** test.
 - **Virtual GPU quirks.** The virtual GPU often needs `WLR_NO_HARDWARE_CURSORS=1` (above). If sway still won't render, that *usefully* exercises the **x11-i3 fallback** (`sudo polyptic-agent setup --backend x11-i3 …`) — the same path you'd use for NVIDIA on real hardware.
-- **Arch.** The VM proves the **arm64** build; your thin clients are almost certainly **amd64** — build and smoke-test that `.deb` separately.
+- **Arch.** The VM proves the **arm64** build; your thin clients are almost certainly **amd64** — build and smoke-test that binary separately (the server image bakes both).
 - **No GPU-accelerated video.** Heavy `video` surfaces may be soft-rendered in the VM; judge media performance on real hardware.
 
 ---
@@ -332,7 +299,7 @@ swaymsg -t get_tree                           # confirm the Chromium window is p
 ## Troubleshooting
 
 ### snap Chromium — avoid it
-Ubuntu's default `chromium` is a **snap**: confined, slow to cold-start, and awkward about external `--user-data-dir` profile paths (exactly what per-output kiosks need). Use a **`.deb` Chromium** (D27). The package depends on a `.deb` Chromium; if a snap got in first, remove it and install the deb:
+Ubuntu's default `chromium` is a **snap**: confined, slow to cold-start, and awkward about external `--user-data-dir` profile paths (exactly what per-output kiosks need). Use a **`.deb` Chromium** (D27). `polyptic-agent setup` installs a `.deb` Chromium; if a snap got in first, remove it and install the deb:
 ```bash
 snap list | grep chromium && sudo snap remove chromium
 # install a .deb Chromium (e.g. the Ubuntu chromium .deb / a PPA / vendor .deb), then re-run setup
@@ -401,9 +368,9 @@ swaymsg -t get_outputs ; swaymsg -t get_tree
 `setup` has an inverse. `teardown` disables the kiosk chain (greetd autologin, the units, the sway/Chromium session) and returns the box toward a normal server, idempotently:
 
 ```bash
-sudo polyptic-agent teardown            # disable + remove the wiring, keep the package
+sudo polyptic-agent teardown            # disable + remove the wiring, keep the binary + config
 sudo polyptic-agent teardown --purge    # also remove /etc/polyptic, the kiosk user, profiles & credential
-sudo apt remove polyptic-agent          # or: apt purge, to drop config too
+sudo rm -f /usr/local/bin/polyptic-agent   # finally, remove the binary itself
 ```
 
 ---
@@ -412,7 +379,7 @@ sudo apt remove polyptic-agent          # or: apt purge, to drop config too
 
 Tick these on the VM ([UTM walkthrough](#utm-test-walkthrough-visual-cold-boot)) for the single-output DoD; the ⚠ items need **real multi-output hardware**.
 
-- [ ] `apt install ./polyptic-agent_*.deb` succeeds and pulls deps (sway, `.deb` Chromium, greetd, grim).
+- [ ] `curl -sfL http://SERVER:8080/install | … sh -s -- --kiosk` succeeds: downloads the agent binary and installs the substrate (sway, `.deb` Chromium, greetd, grim, plymouth).
 - [ ] `polyptic-agent setup …` is idempotent — running it twice converges, no duplicate/broken state.
 - [ ] **Cold boot is zero-click:** power on → greetd autologin → sway → agent → kiosk Chromium, **no login prompt, no sleep, no typed password**.
 - [ ] **Boot splash (POL-7):** branded splash (logo + version + host + live status) from early boot → player with **no console text**; `sudo reboot` / `sudo poweroff` shows it on the way **down** too ("Restarting"/"Shutting down").

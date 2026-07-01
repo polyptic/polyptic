@@ -9,8 +9,9 @@
 #
 # On a tag it:
 #   1. builds + pushes the single control-plane image to GHCR (multi-arch),
-#   2. builds the agent .deb + .rpm (amd64 + arm64) and attaches them to the
-#      GitHub Release,
+#   2. builds the agent single binary (amd64 + arm64) and attaches it to the
+#      GitHub Release — the zero-touch depot serves these at /dist/agent/<arch>
+#      (there is no standalone .deb/.rpm agent package; see D41),
 #   3. (opt-in) publishes the npm packages to GitHub Packages.
 name: release
 
@@ -77,12 +78,14 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 2. Agent packages (.deb + .rpm) for amd64 + arm64 → attached to the Release.
-  #    Bun cross-compiles the runtime into the binary, so one amd64 runner builds
+  # 2. Agent single binary for amd64 + arm64 → attached to the Release.
+  #    The agent is delivered ONLY via the zero-touch depot (D35/D41): the server
+  #    serves these at GET /dist/agent/<arch>. There is no .deb/.rpm agent package.
+  #    Bun cross-compiles the runtime into each binary, so one amd64 runner builds
   #    BOTH arches (deploy/build-agent.sh takes the arch as its first arg).
   # ───────────────────────────────────────────────────────────────────────────
-  agent-packages:
-    name: build agent packages (${{ matrix.arch }})
+  agent-binaries:
+    name: build agent binary (${{ matrix.arch }})
     runs-on: ubuntu-latest
     # Only attach to a real Release object — i.e. on a tag, not workflow_dispatch.
     permissions:
@@ -91,8 +94,6 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
-    env:
-      NFPM_VERSION: "2.41.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -110,14 +111,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-bun-
 
-      - name: Install nfpm (pinned)
-        run: |
-          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb" -o /tmp/nfpm.deb
-          sudo dpkg -i /tmp/nfpm.deb
-          nfpm --version
-
-      # Derive the package version from the tag (strip the leading `v`); fall back
-      # to the agent package.json default when run manually with no tag.
+      # Derive the version from the tag (strip the leading `v`); fall back to the
+      # agent package.json default when run manually with no tag. Baked into the
+      # binary via build-agent.sh's `--define` so the boot splash reports it (POL-7).
       - name: Resolve version
         id: ver
         run: |
@@ -128,28 +124,24 @@ jobs:
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build .deb + .rpm
+      - name: Build agent binary
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: bash deploy/build-agent.sh ${{ matrix.arch }}
 
-      - name: Upload build artifacts (always)
+      - name: Upload build artifact (always)
         uses: actions/upload-artifact@v4
         with:
           name: polyptic-agent-${{ matrix.arch }}
-          path: |
-            deploy/dist/*.deb
-            deploy/dist/*.rpm
+          path: deploy/dist/polyptic-agent-${{ matrix.arch }}
 
       # Attach to the GitHub Release. Only runs on a tag push (a Release exists);
-      # softprops appends, so each matrix arch adds its own packages.
+      # softprops appends, so each matrix arch adds its own binary.
       - name: Attach to Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            deploy/dist/*.deb
-            deploy/dist/*.rpm
+          files: deploy/dist/polyptic-agent-${{ matrix.arch }}
           fail_on_unmatched_files: true
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -162,7 +154,7 @@ jobs:
     name: publish npm packages (GitHub Packages)
     runs-on: ubuntu-latest
     if: vars.PUBLISH_NPM == 'true'
-    needs: [server-image, agent-packages]
+    needs: [server-image, agent-binaries]
     permissions:
       contents: read
       packages: write
