@@ -402,6 +402,8 @@ function handlePlayer(
       const render = ServerToPlayerRender.parse({
         t: "server/render",
         revision: control.state.revision,
+        // Stamp the current friendly name so the player labels itself with it, not the raw id (POL-29).
+        friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
         slice,
       });
       ws.send(JSON.stringify(render));

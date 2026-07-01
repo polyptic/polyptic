@@ -52,6 +52,11 @@ function readScreenId(): string {
 
 const screenId = readScreenId();
 
+// The screen's friendly name (as named in the console). The server stamps it onto every render, so
+// this relabels live when an operator renames the screen — no reload (POL-29). Until the first render
+// lands we fall back to the raw id, so a just-launched player still shows *something* sensible.
+const screenName = ref(screenId);
+
 // Reactive render state. `surfaces` is replaced wholesale on each render; the keyed v-for diffs it.
 const canvas = ref<Geometry>({ ...DEFAULT_CANVAS });
 const surfaces = ref<Surface[]>([]);
@@ -71,6 +76,8 @@ function handleMessage(msg: ServerToPlayerMessage): void {
     canvas.value = msg.slice.canvas;
     surfaces.value = msg.slice.surfaces;
     revision.value = msg.revision;
+    // The name rides on every render, so a console rename relabels the idle splash / badge instantly.
+    screenName.value = msg.friendlyName;
     // Close the reconcile loop so the control plane knows this screen is at this revision.
     socket?.send({ t: "player/ack", screenId, revision: msg.revision });
   } else {
@@ -187,7 +194,7 @@ function connLabel(state: ConnState): string {
     -->
     <IdleSplash
       v-if="surfaces.length === 0"
-      :screen-id="screenId"
+      :name="screenName"
       :conn-state="connState"
       :version="APP_VERSION"
     />
@@ -237,7 +244,7 @@ function connLabel(state: ConnState): string {
       <span class="badge-dot" :class="`badge-dot--${connState}`" />
       <span class="badge-text">{{ connLabel(connState) }}</span>
       <span class="badge-sep">·</span>
-      <span class="badge-text">{{ screenId }}</span>
+      <span class="badge-text">{{ screenName }}</span>
       <span class="badge-sep">·</span>
       <span class="badge-text">rev {{ revLabel }}</span>
     </div>

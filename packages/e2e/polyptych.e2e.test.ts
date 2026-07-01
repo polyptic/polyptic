@@ -314,6 +314,9 @@ describe("phase 1 regression", () => {
       expect(render.slice.screenId).toBe(screenA);
       expect(Array.isArray(render.slice.surfaces)).toBe(true);
       expect(typeof render.revision).toBe("number");
+      // The render carries the screen's friendly name so the player labels itself with it, not the
+      // raw id — the default is the spaced "Screen 1", never the "screen-1" id/slug (POL-29).
+      expect(render.friendlyName).toBe("Screen 1");
     },
     TEST_TIMEOUT,
   );
@@ -445,6 +448,28 @@ describe("phase 2a", () => {
         .flatMap((mm: Frame) => mm.screens)
         .find((s: Frame) => s.id === screenB);
       expect(renamed.friendlyName).toBe(friendlyName);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "renaming a screen re-pushes a server/render carrying the new name to its player (POL-29)",
+    async () => {
+      // playerScreenA is watching screenA. A rename must relabel it live — the server re-pushes the
+      // current slice stamped with the new friendly name, so the idle splash / badge relabel with no
+      // reload. This is the fix: the player showed the raw `screen-1` id before, not the console name.
+      const friendlyName = "Big-Bertha";
+      const res = await postJson(`/api/v1/screens/${screenA}/rename`, { friendlyName });
+      expect(res.status).toBe(200);
+      await res.body?.cancel();
+
+      const render = await playerScreenA.waitFor(
+        (m) =>
+          m.t === "server/render" && m.slice?.screenId === screenA && m.friendlyName === friendlyName,
+        "server/render relabelled to the new name",
+      );
+      expect(render.friendlyName).toBe(friendlyName);
+      expect(render.slice.screenId).toBe(screenA);
     },
     TEST_TIMEOUT,
   );

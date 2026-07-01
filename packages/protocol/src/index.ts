@@ -261,6 +261,10 @@ export type PlayerMessage = z.infer<typeof PlayerMessage>;
 export const ServerToPlayerRender = z.object({
   t: z.literal("server/render"),
   revision: z.number().int().nonnegative(),
+  /** The screen's current friendly name, stamped from the registry at send time (NOT part of the
+   *  stored slice — see ControlPlane.renameScreen). The player labels its idle splash / dev badge
+   *  with this so a console rename shows through live, instead of the raw `screen-N` id (POL-29). */
+  friendlyName: z.string(),
   slice: ScreenSlice,
 });
 
