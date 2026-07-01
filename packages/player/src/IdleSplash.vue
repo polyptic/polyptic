@@ -13,8 +13,9 @@
 import type { ConnState } from "./ws";
 
 defineProps<{
-  /** The `?screen=<id>` this page is — the only identity the player is launched with. */
-  screenId: string;
+  /** The screen's friendly name (as named in the console), falling back to its id pre-first-render.
+   *  Labelled exactly as typed — never the raw `screen-N` id once the console has named it (POL-29). */
+  name: string;
   /** Drives the status-dot colour: live (green) vs connecting (amber) vs offline (red). */
   connState: ConnState;
   /** Build version string, injected from package.json at build time. */
@@ -38,7 +39,7 @@ defineProps<{
 
     <div class="idle-status">
       <span class="idle-dot" :class="`idle-dot--${connState}`" />
-      <span class="idle-screen">{{ screenId }}</span>
+      <span class="idle-screen">{{ name }}</span>
     </div>
 
     <div class="idle-version">v{{ version }}</div>
