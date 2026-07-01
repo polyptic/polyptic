@@ -74,6 +74,13 @@ bun build \
   packages/agent/src/index.ts
 chmod 0755 "$BIN_OUT"
 
+# ── OTA (POL-28): (re)generate the release manifest (version + per-arch sha256) the depot serves at
+# GET /dist/agent/manifest.json. It hashes EVERY binary present in $OUT_DIR, so building each arch and
+# re-running this converges to a manifest covering both. PROVISION_EPOCH env bumps the provisioning
+# epoch for a provisioning-changing release (default 1).
+echo "==> gen-manifest -> $OUT_DIR/manifest.json"
+VERSION="$VERSION" bun deploy/gen-manifest.mjs "$OUT_DIR" "$VERSION" "${PROVISION_EPOCH:-1}"
+
 echo
 echo "==> Done. Serve this at GET /dist/agent/${ARCH} (point AGENT_DIST_DIR at $OUT_DIR/):"
-ls -1 "$BIN_OUT" 2>/dev/null || true
+ls -1 "$BIN_OUT" "$OUT_DIR/manifest.json" 2>/dev/null || true

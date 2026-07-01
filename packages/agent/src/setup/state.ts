@@ -21,6 +21,8 @@ export interface SetupState {
   priorPlymouthTheme?: string | null;
   /** True once the boot splash (Plymouth theme + cmdline) was configured (so uninstall reverts it). */
   splashConfigured?: boolean;
+  /** True once OTA A/B slots + the rollback guard were provisioned (so uninstall removes them). POL-28. */
+  otaConfigured?: boolean;
   installedAt?: string;
 }
 

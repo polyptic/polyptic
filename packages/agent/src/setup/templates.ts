@@ -287,8 +287,20 @@ exec i3
 
 export const SESSION_TARGET = "polyptic-session.target";
 export const AGENT_SERVICE = "polyptic-agent.service";
+// OTA (POL-28): the standalone rollback guard's user units (renderers live in ./ota.ts). Named here so
+// the session target can `Wants=` the timer without a circular import.
+export const ROLLBACK_SERVICE = "polyptic-agent-rollback.service";
+export const ROLLBACK_TIMER = "polyptic-agent-rollback.timer";
 
-export function sessionTargetUnit(): string {
+export interface SessionTargetParams {
+  /** OTA (POL-28): also start the standalone rollback guard timer with the session. */
+  withRollbackTimer?: boolean;
+}
+
+export function sessionTargetUnit(p: SessionTargetParams = {}): string {
+  // OTA (POL-28): `Wants` (not `Requires`) the rollback timer too — it's armed with the session but
+  // its lifecycle is otherwise independent of the agent, so a crash-looping agent can't stop it firing.
+  const rollbackWants = p.withRollbackTimer ? `\nWants=${ROLLBACK_TIMER}` : "";
   return `# /etc/systemd/user/${SESSION_TARGET} — ${MANAGED}
 [Unit]
 Description=Polyptic kiosk session (compositor-supervised)
@@ -296,7 +308,7 @@ Documentation=file:///etc/polyptic/agent.toml
 # Grouping target the compositor starts once the Wayland/X session env is imported. \`Wants\` (not
 # \`Requires\`) so a momentary agent hiccup never tears the session down — the agent's own
 # Restart=always brings it back.
-Wants=${AGENT_SERVICE}
+Wants=${AGENT_SERVICE}${rollbackWants}
 After=graphical-session.target
 `;
 }
@@ -304,9 +316,12 @@ After=graphical-session.target
 export interface AgentServiceParams {
   agentBin: string;
   configPath: string;
+  /** OTA (POL-28): pin POLYPTIC_OTA_DIR so the agent + rollback guard read the same slot tree. */
+  otaDir?: string;
 }
 
 export function agentServiceUnit(p: AgentServiceParams): string {
+  const otaEnv = p.otaDir ? `\nEnvironment=POLYPTIC_OTA_DIR=${p.otaDir}` : "";
   return `# /etc/systemd/user/${AGENT_SERVICE} — ${MANAGED}
 [Unit]
 Description=Polyptic agent — display reconciler + Chromium-per-output supervisor
@@ -320,11 +335,13 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# OTA (POL-28): ExecStart points at the stable \`current\` slot symlink, NOT a fixed binary path — an
+# update only ever flips that symlink; this unit file is never rewritten.
 ExecStart=${p.agentBin}
 Restart=always
 RestartSec=2
 # Config (control-plane URL + bootstrap token + backend) lives in agent.toml, written by setup.
-Environment=POLYPTIC_CONFIG=${p.configPath}
+Environment=POLYPTIC_CONFIG=${p.configPath}${otaEnv}
 # Crash/restore hardening: a power cut must never leave Chromium showing "Restore pages". The agent
 # resets exit_type/exited_cleanly in each profile's Preferences before (re)launch (per ARCHITECTURE).
 

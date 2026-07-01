@@ -18,8 +18,10 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -211,6 +213,24 @@ export class Sys {
     chmodSync(path, mode);
     if (opts.owner || opts.group) this.chown(path, opts.owner, opts.group);
     this.log.ok(`wrote ${label}`);
+  }
+
+  /** Idempotently (re)point a symlink at `target` (atomic replace). Dry-run aware. */
+  symlink(target: string, link: string): void {
+    if (this.readlinkSafe(link) === target) {
+      this.log.skip(`symlink ${link} already → ${target}`);
+      return;
+    }
+    if (this.dryRun) {
+      this.log.plan(`symlink ${link} → ${target}`);
+      return;
+    }
+    this.ensureDir(dirname(link));
+    const tmp = `${link}.tmp`;
+    rmSync(tmp, { force: true });
+    symlinkSync(target, tmp);
+    renameSync(tmp, link); // atomic replace
+    this.log.ok(`symlinked ${link} → ${target}`);
   }
 
   /** Recursively/forcefully remove a path (file, symlink, or directory). */

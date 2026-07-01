@@ -17,10 +17,11 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  StartRolloutBody,
   UpdateContentSourceBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
-import type { ContentSource, Scene, VideoWall } from "@polyptic/protocol";
+import type { ContentSource, Scene, StartRolloutBody as StartRolloutBodyT, VideoWall } from "@polyptic/protocol";
 
 const BASE = "http://localhost:8080/api/v1";
 
@@ -195,6 +196,40 @@ export function identMachine(machineId: string, body: IdentBody): Promise<unknow
  */
 export function deleteMachine(machineId: string): Promise<unknown> {
   return send("DELETE", `/machines/${encodeURIComponent(machineId)}`);
+}
+
+// ── Fleet rollout / OTA (POL-28) ─────────────────────────────────────────────
+// Drive the depot-wide agent version. The server broadcasts the authoritative rollout state on
+// admin/state, so these just POST and let the broadcast reconcile.
+
+/** POST /api/v1/fleet/rollout — start (or replace) a rollout. Body validated against the contract. */
+export function startRollout(body: StartRolloutBodyT): Promise<unknown> {
+  return send("POST", "/fleet/rollout", StartRolloutBody.parse(body));
+}
+
+/** POST /api/v1/fleet/rollout/promote — promote the canary to the rest of the fleet. */
+export function promoteRollout(): Promise<unknown> {
+  return send("POST", "/fleet/rollout/promote");
+}
+
+/** POST /api/v1/fleet/rollout/pause — kill-switch: stop offering updates. */
+export function pauseRollout(): Promise<unknown> {
+  return send("POST", "/fleet/rollout/pause");
+}
+
+/** POST /api/v1/fleet/rollout/resume — resume a paused rollout. */
+export function resumeRollout(): Promise<unknown> {
+  return send("POST", "/fleet/rollout/resume");
+}
+
+/** POST /api/v1/fleet/rollout/rollback — revert the fleet to its previous version. */
+export function rollbackRollout(): Promise<unknown> {
+  return send("POST", "/fleet/rollout/rollback");
+}
+
+/** DELETE /api/v1/fleet/rollout — clear the rollout (dismiss/abandon). */
+export function cancelRollout(): Promise<unknown> {
+  return send("DELETE", "/fleet/rollout");
 }
 
 // ── Screen registry / content (existing Phase 2 routes) ──────────────────────

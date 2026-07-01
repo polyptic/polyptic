@@ -23,6 +23,7 @@ import { WebSocket } from "ws";
 import type { ControlPlane } from "./state";
 import type { PlayerHub } from "./hub";
 import type { ActivityLog } from "./activity";
+import type { RolloutController } from "./rollout";
 
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
 export class AdminHub {
@@ -97,6 +98,7 @@ export function buildAdminState(
   playerHub: PlayerHub,
   presence: Presence,
   activity: ActivityLog,
+  rollout: RolloutController,
 ): ServerToAdminMessage {
   const screens = control.getScreens();
 
@@ -117,6 +119,8 @@ export function buildAdminState(
         } satisfies ScreenView;
       });
 
+    // OTA (POL-28) — the live self-update runtime + rollout target for this box.
+    const report = control.agentReport(machine.id);
     return {
       id: machine.id,
       label: machine.label,
@@ -128,6 +132,10 @@ export function buildAdminState(
       outputCount: machine.outputs.length,
       lastSeen: machine.lastSeen,
       screens: machineScreens,
+      targetAgentVersion: rollout.targetFor(machine.id),
+      updateState: report?.updateState,
+      updateError: report?.updateError,
+      needsInstaller: rollout.needsInstaller(machine),
     } satisfies MachineView;
   });
 
@@ -141,6 +149,8 @@ export function buildAdminState(
     contentSources: control.getContentSources(),
     scenes: control.getScenes(),
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
+    agentRelease: rollout.release(), // OTA (POL-28) — the depot's advertised agent release
+    rollout: rollout.view(), // OTA (POL-28) — the active fleet rollout (null when none)
   });
 }
 
@@ -150,6 +160,7 @@ interface BroadcasterDeps {
   presence: Presence;
   adminHub: AdminHub;
   activity: ActivityLog;
+  rollout: RolloutController;
   log: FastifyBaseLogger;
 }
 
@@ -170,6 +181,7 @@ export class AdminBroadcaster {
       this.deps.playerHub,
       this.deps.presence,
       this.deps.activity,
+      this.deps.rollout,
     );
   }
 

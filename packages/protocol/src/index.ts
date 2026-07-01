@@ -12,6 +12,16 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1;
 
+/**
+ * Provisioning epoch (POL-28 / OTA). Bumped ONLY when an agent release changes on-device provisioning
+ * that a plain binary swap cannot apply — new systemd units, greetd/sway config, packages (which need
+ * root the unprivileged agent doesn't have). An OTA is offered only when the box's reported epoch is
+ * ≥ the target release's epoch; a box behind it is flagged "needs installer re-run" in the console
+ * instead of being self-updated. Pre-OTA agents report no epoch (treated as 0), so they are always
+ * flagged — which is correct: they must re-run the installer once to gain OTA capability.
+ */
+export const PROVISION_EPOCH = 1;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Primitives
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +63,8 @@ export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
   label: z.string(),
   agentVersion: z.string().optional(),
+  /** OTA (POL-28) — the agent's provisioning epoch, reported on hello/status. */
+  provisionEpoch: z.number().int().nonnegative().optional(),
   backend: DisplayBackend.optional(),
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
@@ -145,6 +157,63 @@ export const DesiredState = z.object({
 export type DesiredState = z.infer<typeof DesiredState>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OTA — over-the-air agent auto-updates (POL-28)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A build target the depot serves an agent binary for. */
+export const AgentArch = z.enum(["amd64", "arm64"]);
+export type AgentArch = z.infer<typeof AgentArch>;
+
+/**
+ * The agent's self-update state, reported on `agent/status` (+ `agent/hello`) so the server drives the
+ * rollout from real reported state, not guesses:
+ *   idle         — on a version; nothing in flight.
+ *   downloading  — pulling the target binary.
+ *   staged       — verified + written into an A/B slot; about to reboot.
+ *   updating     — rebooting into the target.
+ *   healthy      — reconnected on the target + committed (marker cleared).
+ *   rolled-back  — the standalone rollback guard reverted a failed update.
+ *   failed       — the update was refused/aborted (e.g. checksum mismatch); still on the old version.
+ */
+export const AgentUpdateState = z.enum([
+  "idle",
+  "downloading",
+  "staged",
+  "updating",
+  "healthy",
+  "rolled-back",
+  "failed",
+]);
+export type AgentUpdateState = z.infer<typeof AgentUpdateState>;
+
+/** One arch's downloadable artifact: the integrity checksum (+ size) of the served binary. The agent
+ *  downloads it from `${serverOrigin}/dist/agent/<arch>` and verifies this sha256 before swapping. */
+export const AgentArtifact = z.object({
+  sha256: z.string().regex(/^[0-9a-f]{64}$/, "sha256 must be 64 hex chars"),
+  size: z.number().int().positive().optional(),
+});
+export type AgentArtifact = z.infer<typeof AgentArtifact>;
+
+/** The depot's advertised agent release — served at `GET /dist/agent/manifest.json` and read by the
+ *  server on boot so it knows the latest version available to roll out (+ its per-arch checksums). */
+export const AgentManifest = z.object({
+  version: z.string().min(1),
+  provisionEpoch: z.number().int().nonnegative().default(0),
+  artifacts: z.object({
+    amd64: AgentArtifact.optional(),
+    arm64: AgentArtifact.optional(),
+  }),
+});
+export type AgentManifest = z.infer<typeof AgentManifest>;
+
+/** The latest agent version the depot can serve, surfaced to the console (from the manifest). */
+export const AgentRelease = z.object({
+  version: z.string().min(1),
+  provisionEpoch: z.number().int().nonnegative(),
+});
+export type AgentRelease = z.infer<typeof AgentRelease>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Agent channel  (machine ↔ server)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -157,6 +226,14 @@ export const AgentHello = z.object({
   outputs: z.array(Output),
   /** The box's os.hostname(), used as the human machine label (additive-safe; optional). */
   hostname: z.string().optional(),
+  /** OTA (POL-28): the agent's provisioning epoch, so the server can gate a provisioning-changing
+   *  release (offer OTA only when this ≥ the release epoch). Absent on pre-OTA agents (treated as 0). */
+  provisionEpoch: z.number().int().nonnegative().optional(),
+  /** OTA (POL-28): a terminal update outcome to report on the first hello after a reboot (e.g.
+   *  `rolled-back` after the rollback guard fired, or `failed` after a refused update). */
+  updateState: AgentUpdateState.optional(),
+  /** OTA (POL-28): a short human reason paired with a `failed`/`rolled-back` updateState. */
+  updateError: z.string().optional(),
   /** First contact only: the operator-configured enrollment secret. The server validates it,
    * creates the machine as `pending`, and replies `server/enrolled` with a durable credential. */
   bootstrapToken: z.string().optional(),
@@ -171,6 +248,17 @@ export const AgentStatus = z.object({
   screens: z.array(
     z.object({ connector: z.string(), ok: z.boolean(), note: z.string().optional() }),
   ),
+  /** OTA (POL-28): the running agent version, echoed on every heartbeat so the server tracks live
+   *  progress from reported state (the version also arrives on hello; this keeps it fresh). */
+  agentVersion: z.string().optional(),
+  /** OTA (POL-28): the agent's provisioning epoch (see {@link PROVISION_EPOCH}). */
+  provisionEpoch: z.number().int().nonnegative().optional(),
+  /** OTA (POL-28): the agent's self-update state. */
+  updateState: AgentUpdateState.optional(),
+  /** OTA (POL-28): a short reason paired with a `failed`/`rolled-back` updateState. */
+  updateError: z.string().optional(),
+  /** OTA (POL-28): the version this agent is updating toward, if an update is in flight. */
+  targetVersion: z.string().optional(),
 });
 
 export const AgentThumbnail = z.object({
@@ -228,6 +316,23 @@ export const ServerToAgentRejected = z.object({
   reason: z.string(),
 });
 
+/**
+ * OTA update offer (POL-28). Sent ONLY to a machine the rollout controller has decided should move to
+ * `targetVersion` (in the active wave, reported version ≠ target, epoch-eligible). The agent selects
+ * its own arch's `artifact`, downloads `${serverOrigin}/dist/agent/<arch>`, verifies the sha256, swaps
+ * into an A/B slot and reboots. `artifacts` may be EMPTY for a rollback offer — the agent then
+ * reactivates its retained local slot for `targetVersion` (no download); if it has neither the slot
+ * nor an artifact it reports `failed` and stays put.
+ */
+export const ServerToAgentUpdate = z.object({
+  t: z.literal("server/update"),
+  targetVersion: z.string().min(1),
+  artifacts: z.object({
+    amd64: AgentArtifact.optional(),
+    arm64: AgentArtifact.optional(),
+  }),
+});
+
 export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentApply,
   ServerToAgentIdent,
@@ -235,6 +340,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
+  ServerToAgentUpdate,
 ]);
 export type ServerToAgentMessage = z.infer<typeof ServerToAgentMessage>;
 
@@ -310,6 +416,16 @@ export const MachineView = z.object({
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
   screens: z.array(ScreenView),
+  // ── OTA (POL-28) ──────────────────────────────────────────────────────────
+  /** The version the active rollout wants this box on (undefined = no rollout targeting it). */
+  targetAgentVersion: z.string().optional(),
+  /** The agent's live self-update state (from its last heartbeat), if reported. */
+  updateState: AgentUpdateState.optional(),
+  /** A short reason paired with a `failed`/`rolled-back` updateState, for the console. */
+  updateError: z.string().optional(),
+  /** True when the depot's release changes provisioning beyond this box's epoch — it must re-run the
+   *  installer to gain the new provisioning, and cannot be OTA'd there. */
+  needsInstaller: z.boolean().optional(),
 });
 export type MachineView = z.infer<typeof MachineView>;
 
@@ -421,6 +537,43 @@ export const ActivityEvent = z.object({
 });
 export type ActivityEvent = z.infer<typeof ActivityEvent>;
 
+// ── Fleet rollout (POL-28) ─────────────────────────────────────────────────────
+// A rollout is the INTENT to move the fleet to a target agent version. It survives a server restart
+// (only the intent is persisted; live progress is derived from the versions agents report).
+
+/** All-at-once, or a canary wave first (a hand-picked subset) then the rest. */
+export const RolloutStrategy = z.enum(["all", "canary"]);
+export type RolloutStrategy = z.infer<typeof RolloutStrategy>;
+
+/** How the canary wave promotes to the rest: an operator click, or automatically after a soak window. */
+export const RolloutPromotion = z.enum(["manual", "auto"]);
+export type RolloutPromotion = z.infer<typeof RolloutPromotion>;
+
+/** Where the rollout is, derived from reported state:
+ *   canary   — the canary wave is updating / soaking (not yet promoted).
+ *   fleet    — the rest of the fleet is updating (all-at-once, or a promoted canary).
+ *   complete — every approved machine is on the target. */
+export const RolloutStage = z.enum(["canary", "fleet", "complete"]);
+export type RolloutStage = z.infer<typeof RolloutStage>;
+
+/** The live rollout, surfaced to the console: the persisted intent plus a little derived progress. */
+export const RolloutView = z.object({
+  targetVersion: z.string(),
+  strategy: RolloutStrategy,
+  promotion: RolloutPromotion,
+  /** The canary wave's machine ids (empty for an all-at-once rollout). */
+  canaryMachineIds: z.array(z.string()),
+  /** True once the canary has promoted to the rest of the fleet. */
+  promoted: z.boolean(),
+  /** Kill-switch: while paused the server offers no updates (boxes already updating are unaffected). */
+  paused: z.boolean(),
+  stage: RolloutStage,
+  createdAt: z.string(),
+  /** For auto promotion: ms left in the canary soak before it promotes (absent when not soaking). */
+  soakRemainingMs: z.number().int().nonnegative().optional(),
+});
+export type RolloutView = z.infer<typeof RolloutView>;
+
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
   t: z.literal("admin/state"),
@@ -432,6 +585,10 @@ export const ServerToAdminState = z.object({
   contentSources: z.array(ContentSource), // Phase 3c — the content library
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
+  /** OTA (POL-28): the latest agent version the depot can serve (from its manifest), or null. */
+  agentRelease: AgentRelease.nullable().optional(),
+  /** OTA (POL-28): the active fleet rollout, or null when none is running. */
+  rollout: RolloutView.nullable().optional(),
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -548,6 +705,22 @@ export const EnrollmentInfo = z.object({
   token: z.string().nullable(),
 });
 export type EnrollmentInfo = z.infer<typeof EnrollmentInfo>;
+
+// ── Fleet rollout (POL-28) ─────────────────────────────────────────────────────
+
+/** Start (or replace) a fleet rollout to `version`. `all` updates every approved box at once; `canary`
+ *  updates `canaryMachineIds` first, then promotes to the rest (operator click, or auto after soak). */
+export const StartRolloutBody = z
+  .object({
+    version: z.string().min(1),
+    strategy: RolloutStrategy.default("all"),
+    canaryMachineIds: z.array(z.string()).default([]),
+    promotion: RolloutPromotion.default("manual"),
+  })
+  .refine((b) => b.strategy === "all" || b.canaryMachineIds.length > 0, {
+    message: "a canary rollout needs at least one canaryMachineIds entry",
+  });
+export type StartRolloutBody = z.infer<typeof StartRolloutBody>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers

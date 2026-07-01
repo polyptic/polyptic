@@ -10,6 +10,9 @@ const store = useConsoleStore();
 
 // Pending-approval badge on the Machines item (machines awaiting an operator decision).
 const pendingCount = computed(() => store.machines.filter((m) => m.status === "pending").length);
+// OTA (POL-28): a dot on the Updates item when the depot has a release some box isn't on, or a rollout
+// is running.
+const fleetAttention = computed(() => store.fleetUpdateAvailable || store.rollout !== null);
 const themeIcon = computed(() => (store.theme === "light" ? "☾" : "☼"));
 
 function go(name: string): void {
@@ -45,6 +48,17 @@ function isActive(name: string): boolean {
         <span v-if="pendingCount > 0" class="badge">{{ pendingCount }}</span>
       </span>
       <span class="label">Machines</span>
+    </button>
+
+    <button class="nav" :class="{ active: isActive('fleet') }" title="Updates" @click="go('fleet')">
+      <span class="icon-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-3-6.7" />
+          <path d="M21 4v4h-4" />
+        </svg>
+        <span v-if="fleetAttention" class="dot-badge"></span>
+      </span>
+      <span class="label">Updates</span>
     </button>
 
     <button class="nav" :class="{ active: isActive('content') }" title="Content" @click="go('content')">
@@ -163,6 +177,16 @@ function isActive(name: string): boolean {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.dot-badge {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1.5px solid var(--surface);
 }
 
 .spacer {

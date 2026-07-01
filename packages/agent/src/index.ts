@@ -54,13 +54,26 @@ import {
   ServerToAgentMessage,
   parseMessage,
   PROTOCOL_VERSION,
+  PROVISION_EPOCH,
 } from "@polyptic/protocol";
-import type { Output } from "@polyptic/protocol";
+import type { AgentUpdateState, Output } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import {
+  clearRollbackBreadcrumb,
+  clearMarker,
+  currentArch,
+  otaRoot,
+  performUpdate,
+  readMarker,
+  readRollbackBreadcrumb,
+  rollbackIfExpired,
+} from "./ota";
+import type { ConfirmMarker, OtaSys, RollbackBreadcrumb } from "./ota";
+import { agentDownloadUrl, createOtaSys, httpBaseFromServerUrl } from "./ota-sys";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
@@ -81,6 +94,12 @@ const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 10_000;
 /** After a `server/rejected`, retry slowly so a rejected/unapproved machine never hammers. */
 const REJECT_BACKOFF_MS = 60_000;
+// ── OTA (POL-28) ──────────────────────────────────────────────────────────────
+/** Grace period the trial boot has to commit (clear the marker) before the standalone guard reverts.
+ *  Comfortably longer than reboot + the commit window below, and shorter than the guard's fire delay. */
+const CONFIRM_WINDOW_MS = Number(process.env.POLYPTIC_OTA_CONFIRM_MS ?? 180_000);
+/** How long the new agent must stay connected on the trial boot before it commits (marks healthy). */
+const COMMIT_STABILITY_MS = Number(process.env.POLYPTIC_OTA_COMMIT_MS ?? 45_000);
 
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] [agent] ${msg}`);
@@ -125,6 +144,7 @@ type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
+type UpdateMsg = Extract<ServerToAgentMessage, { t: "server/update" }>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent
@@ -148,6 +168,26 @@ class Agent {
   /** connector → last placement outcome, reported in heartbeats. */
   private readonly status = new Map<string, { ok: boolean; note?: string }>();
 
+  // ── OTA (POL-28) ──────────────────────────────────────────────────────────────
+  private readonly otaRootPath: string;
+  private readonly otaSys: OtaSys;
+  /** The server's HTTP origin (derived from the WS url) the box downloads the binary from. */
+  private readonly httpBase: string;
+  /** The confirm marker found at boot — present iff we are the trial boot of an update. */
+  private readonly bootMarker: ConfirmMarker | null;
+  /** A breadcrumb left by the rollback guard — reported once as `rolled-back`, then cleared. */
+  private rollbackCrumb: RollbackBreadcrumb | null;
+  private updateState: AgentUpdateState;
+  private updateError?: string;
+  /** The version we are updating toward, while an update is in flight. */
+  private updateTarget?: string;
+  /** True while an update is being staged, so overlapping offers don't double-apply. */
+  private updating = false;
+  /** True once the trial boot has committed (marker cleared) — never re-commits. */
+  private committed = false;
+  /** When the current WS connection opened (ms), or null when disconnected — the commit health clock. */
+  private connectedSince: number | null = null;
+
   constructor(
     private readonly url: string,
     private readonly machineId: string,
@@ -158,6 +198,24 @@ class Agent {
     credential: string | null,
   ) {
     this.credential = credential;
+    this.otaRootPath = otaRoot();
+    this.otaSys = createOtaSys(log);
+    this.httpBase = httpBaseFromServerUrl(url);
+    this.bootMarker = readMarker(this.otaRootPath);
+    this.rollbackCrumb = readRollbackBreadcrumb(this.otaRootPath);
+
+    // Initial update state: a fresh boot after the guard reverted us reports `rolled-back`; a trial
+    // boot of an update (our version matches the pending marker) reports `updating` until it commits;
+    // otherwise we're `idle`.
+    if (this.rollbackCrumb) {
+      this.updateState = "rolled-back";
+      this.updateError = `reverted from ${this.rollbackCrumb.revertedFrom}`;
+    } else if (this.bootMarker && this.bootMarker.version === this.agentVersion) {
+      this.updateState = "updating";
+      this.updateTarget = this.agentVersion;
+    } else {
+      this.updateState = "idle";
+    }
   }
 
   start(): void {
@@ -186,6 +244,9 @@ class Agent {
       // A fresh connection: clear the stale "rejected" flag. If the server rejects us again it
       // re-sets the flag before close, so the long backoff persists across rejection cycles.
       this.rejected = false;
+      // OTA (POL-28): start the commit health clock — a trial boot commits after staying connected
+      // continuously for COMMIT_STABILITY_MS (a reconnect restarts the window).
+      this.connectedSince = Date.now();
       log("agent channel open — enrolling");
       this.sendHello();
       this.startHeartbeat();
@@ -206,6 +267,7 @@ class Agent {
 
     ws.on("close", (code: number) => {
       log(`agent channel closed (code ${code})`);
+      this.connectedSince = null; // reset the OTA commit clock — health requires continuous connection
       this.stopHeartbeat();
       if (!this.closing) this.scheduleReconnect();
     });
@@ -260,6 +322,9 @@ class Agent {
         break;
       case "server/rejected":
         this.onRejected(msg);
+        break;
+      case "server/update":
+        await this.onUpdate(msg);
         break;
     }
   }
@@ -387,6 +452,87 @@ class Agent {
     // long backoff because `this.rejected` is now set.
   }
 
+  /**
+   * OTA (POL-28) `server/update` — the rollout controller wants this box on `targetVersion`. Stage it
+   * into an A/B slot (prefer a retained, already-verified slot; else download + verify the sha256) then
+   * reboot. A checksum mismatch (or any failure) aborts with the box left on its current version and a
+   * `failed` state reported — the swap is atomic; a bad download never becomes `current`.
+   */
+  private async onUpdate(msg: UpdateMsg): Promise<void> {
+    const target = msg.targetVersion;
+    if (target === this.agentVersion) {
+      // Already running the target — the pending trial-boot marker (if any) commits via the heartbeat.
+      log(`server/update to ${target}: already running it`);
+      return;
+    }
+    if (this.updating) {
+      log(`server/update to ${target}: an update is already in flight — ignoring`);
+      return;
+    }
+
+    this.updating = true;
+    this.updateTarget = target;
+    this.updateError = undefined;
+    const arch = currentArch();
+    const artifact = msg.artifacts[arch];
+    log(
+      `server/update → ${target} (arch=${arch}${artifact ? "" : "; no artifact — will use a retained slot if present"})`,
+    );
+    this.updateState = "downloading";
+    this.sendStatus();
+
+    try {
+      const result = await performUpdate(this.otaRootPath, this.otaSys, {
+        targetVersion: target,
+        artifact,
+        downloadUrl: agentDownloadUrl(this.httpBase, arch),
+        confirmWindowMs: CONFIRM_WINDOW_MS,
+      });
+      if (!result.ok) {
+        this.updateState = "failed";
+        this.updateError = result.error;
+        this.updating = false;
+        logError(`update to ${target} FAILED: ${result.error} — staying on ${this.agentVersion}`);
+        this.sendStatus();
+        return;
+      }
+      this.updateState = "updating";
+      log(
+        `update to ${target} staged (${result.usedLocalSlot ? "retained slot" : "downloaded + verified"}) — rebooting`,
+      );
+      this.sendStatus();
+      // Let the status frame flush, then reboot into the trial boot of the new version.
+      setTimeout(() => this.otaSys.reboot(), 500);
+    } catch (err) {
+      this.updateState = "failed";
+      this.updateError = (err as Error).message;
+      this.updating = false;
+      logError(`update to ${target} errored: ${this.updateError}`);
+      this.sendStatus();
+    }
+  }
+
+  /**
+   * Commit the trial boot once healthy: if we booted with a confirm marker for OUR version and have
+   * stayed connected continuously for the stability window, clear the marker so the standalone rollback
+   * guard finds nothing to revert. This is the "healthy" definition — reconnected + stable.
+   */
+  private maybeCommit(): void {
+    if (this.committed) return;
+    if (!this.bootMarker || this.bootMarker.version !== this.agentVersion) return;
+    if (this.connectedSince === null) return;
+    if (Date.now() - this.connectedSince < COMMIT_STABILITY_MS) return;
+    try {
+      clearMarker(this.otaRootPath);
+      this.committed = true;
+      this.updateState = "healthy";
+      this.updateTarget = undefined;
+      log(`update to ${this.agentVersion} committed — healthy (marker cleared)`);
+    } catch (err) {
+      logError(`failed to clear confirm marker: ${(err as Error).message}`);
+    }
+  }
+
   // ── outbound ─────────────────────────────────────────────────────────────────
 
   private sendHello(): void {
@@ -398,6 +544,11 @@ class Agent {
       protocol: PROTOCOL_VERSION,
       machineId: this.machineId,
       agentVersion: this.agentVersion,
+      // OTA (POL-28): report the provisioning epoch (so the server can gate a provisioning-changing
+      // release) + any terminal outcome from a just-completed/failed update.
+      provisionEpoch: PROVISION_EPOCH,
+      updateState: this.updateState,
+      updateError: this.updateError,
       backend: this.backend.id,
       outputs: this.outputs,
       hostname: osHostname(),
@@ -405,9 +556,24 @@ class Agent {
       credential: this.credential ?? undefined,
     };
     this.send(hello);
+
+    // We've now reported any `rolled-back` outcome — drop the breadcrumb file so a future boot doesn't
+    // re-report it (the in-memory state stays `rolled-back` for this session, which is accurate).
+    if (this.rollbackCrumb) {
+      try {
+        clearRollbackBreadcrumb(this.otaRootPath);
+      } catch {
+        /* best-effort; a stale breadcrumb is harmless — it only re-reports rolled-back once more */
+      }
+      this.rollbackCrumb = null;
+    }
   }
 
   private sendStatus(): void {
+    // OTA (POL-28): commit the trial boot if it's healthy before we build the frame, so the very
+    // heartbeat that crosses the stability threshold reports `healthy`.
+    this.maybeCommit();
+
     const screens = [...this.status.entries()].map(([connector, st]) => {
       const entry: { connector: string; ok: boolean; note?: string } = {
         connector,
@@ -421,6 +587,12 @@ class Agent {
       machineId: this.machineId,
       observedRevision: this.lastAppliedRevision,
       screens,
+      // OTA (POL-28): live version + self-update state, so the rollout controller tracks real progress.
+      agentVersion: this.agentVersion,
+      provisionEpoch: PROVISION_EPOCH,
+      updateState: this.updateState,
+      updateError: this.updateError,
+      targetVersion: this.updateTarget,
     });
   }
 
@@ -452,6 +624,35 @@ class Agent {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OTA rollback guard (POL-28)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `polyptic-agent rollback-check` — the standalone rollback guard. Reads the confirm marker and, if it
+ * is past its deadline while we are still running the version it guarded (the trial boot never
+ * committed), reverts `current` → `previous` and reboots. Marker-gated, so a normal boot no-ops. Runs
+ * the FROZEN /usr/local/bin binary (never OTA'd), so it works even if the new slot's binary is broken.
+ */
+function runRollbackCheck(): void {
+  const root = otaRoot();
+  try {
+    const crumb = rollbackIfExpired(root, Date.now());
+    if (crumb) {
+      log(
+        `rollback guard: reverted ${crumb.revertedFrom} → ${crumb.revertedTo} (trial boot never committed) — rebooting`,
+      );
+      createOtaSys(log).reboot();
+    } else {
+      log("rollback guard: nothing to revert (no past-deadline marker)");
+    }
+  } catch (err) {
+    logError(`rollback guard failed: ${(err as Error).message}`);
+  }
+  // Oneshot: exit promptly (the reboot, if issued, takes the box down anyway).
+  process.exit(0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -468,6 +669,14 @@ async function main(): Promise<void> {
         console.error(`[setup] fatal: ${(err as Error).message}`);
         process.exit(1);
       });
+    return;
+  }
+
+  // OTA (POL-28): the standalone rollback guard. A systemd USER timer runs this ~5 min after the kiosk
+  // session starts — NOT tied to the agent unit, so it still fires when the new agent crash-loops. It
+  // reverts a failed update and reboots; on a normal boot it finds no past-deadline marker and no-ops.
+  if (process.argv[2] === "rollback-check") {
+    runRollbackCheck();
     return;
   }
 

@@ -21,6 +21,7 @@ const routes: RouteRecordRaw[] = [
       { path: "", redirect: { name: "wall" } },
       { path: "wall", name: "wall", component: () => import("./views/Wall.vue") },
       { path: "machines", name: "machines", component: () => import("./views/Machines.vue") },
+      { path: "fleet", name: "fleet", component: () => import("./views/Fleet.vue") },
       { path: "content", name: "content", component: () => import("./views/Content.vue") },
       { path: "scenes", name: "scenes", component: () => import("./views/Scenes.vue") },
       { path: "settings", name: "settings", component: () => import("./views/Settings.vue") },

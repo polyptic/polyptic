@@ -50,6 +50,8 @@ export interface SetupOptions {
   installDeps: boolean;
   /** Configure the Plymouth boot splash (default true; `--no-splash` to skip). POL-7. */
   splash: boolean;
+  /** Provision OTA A/B slots + the rollback guard (default true; `--no-ota` to skip). POL-28. */
+  ota: boolean;
   /** uninstall: also remove /etc/polyptic and the kiosk user. */
   purge: boolean;
 }
@@ -87,6 +89,7 @@ export function parseArgs(argv: string[]): SetupOptions {
     enable: true,
     installDeps: true,
     splash: true,
+    ota: true,
     purge: false,
   };
 
@@ -194,6 +197,9 @@ export function parseArgs(argv: string[]): SetupOptions {
       case "--no-splash":
         opts.splash = false;
         break;
+      case "--no-ota":
+        opts.ota = false;
+        break;
       case "--purge":
         opts.purge = true;
         break;
@@ -245,6 +251,8 @@ OPTIONS
   --no-enable                       write configs but do not enable services / swap the display manager.
   --skip-deps                       do not install OS packages (pre-baked image).
   --no-splash                       do not configure the Plymouth boot splash (POL-7).
+  --no-ota                          do not provision OTA A/B slots + the rollback guard (POL-28);
+                                    ExecStart then runs --agent-bin directly (no self-update).
   --purge                           (uninstall) also remove /etc/polyptic and the kiosk user.
   -n, --dry-run                     print the plan; make no changes (safe to run as non-root).
   -h, --help                        this help.

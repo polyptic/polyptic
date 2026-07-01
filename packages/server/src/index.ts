@@ -16,6 +16,8 @@ import Fastify from "fastify";
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import { hasManifestFile, loadAgentManifest } from "./agent-manifest";
+import { RolloutController } from "./rollout";
 import { AuthService, authConfigFromEnv } from "./auth-local";
 import { registerAuthRoutes } from "./auth-routes";
 import { CaptureCoordinator, ThumbnailStore } from "./capture";
@@ -48,6 +50,10 @@ const BUILD_VERSION = process.env.POLYPTIC_VERSION?.trim() || "0.0.0";
 const BUILD_REVISION = process.env.POLYPTIC_REVISION?.trim() || process.env.GIT_SHA?.trim() || "dev";
 // Live-preview capture sweep cadence (ms). 0 disables the periodic sweep (on-demand still works).
 const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS ?? 4000);
+// OTA (POL-28): canary soak window before auto-promotion (~20 min default), and the rollout re-evaluate
+// cadence (advances soak/halt/completion + re-offers to in-wave boxes independent of heartbeat timing).
+const ROLLOUT_SOAK_MS = Number(process.env.ROLLOUT_SOAK_MS ?? 20 * 60 * 1000);
+const ROLLOUT_TICK_MS = Number(process.env.ROLLOUT_TICK_MS ?? 15_000);
 // Max thumbnails held in memory at once (LRU cap).
 const THUMBNAIL_CAPACITY = Number(process.env.CAPTURE_THUMBNAIL_CAP ?? 300);
 const CORS_ORIGIN = (
@@ -104,7 +110,28 @@ const hub = new PlayerHub();
 const agentHub = new AgentHub();
 const adminHub = new AdminHub();
 const presence = new Presence();
-const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, log: fastify.log });
+
+// ── Zero-touch depot config + the OTA release manifest (POL-28). Resolved up front because the rollout
+// controller (read by every admin/state snapshot) is built here. ──
+const provisionConfig = provisionConfigFromEnv();
+const agentManifest = await loadAgentManifest(provisionConfig.agentDistDir, BUILD_VERSION);
+
+// The broadcaster and the rollout controller reference each other — the admin/state snapshot reads the
+// rollout, and the rollout broadcasts when its intent changes. Break the cycle with a forward-declared
+// `broadcaster` the rollout closes over (only ever invoked at runtime, after the assignment below).
+let broadcaster: AdminBroadcaster;
+const rollout = new RolloutController({
+  store,
+  control,
+  presence,
+  agentHub,
+  activity,
+  manifest: agentManifest,
+  broadcast: () => broadcaster.broadcast(),
+  soakMs: Number.isFinite(ROLLOUT_SOAK_MS) && ROLLOUT_SOAK_MS > 0 ? ROLLOUT_SOAK_MS : 20 * 60 * 1000,
+});
+await rollout.init();
+broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, rollout, log: fastify.log });
 
 // ── Live preview (Phase 5): bounded thumbnail store + capture coordinator. ──
 const thumbnails = new ThumbnailStore(
@@ -154,10 +181,20 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
 });
 
 registerAuthRoutes(fastify, auth, enrollment);
-registerRestRoutes(fastify, control, hub, agentHub, broadcaster, capture, media, {
-  publicBase: MEDIA_PUBLIC_BASE,
-  maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
-});
+registerRestRoutes(
+  fastify,
+  control,
+  hub,
+  agentHub,
+  broadcaster,
+  capture,
+  media,
+  {
+    publicBase: MEDIA_PUBLIC_BASE,
+    maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
+  },
+  rollout,
+);
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).
 registerMediaServeRoute(fastify, media);
@@ -172,10 +209,10 @@ registerOpsRoutes(fastify, {
   revision: BUILD_REVISION,
   startedAt: STARTED_AT,
 });
-// TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch, /dist/deps/**) —
-// NOT /api/v1, so an edge box with no operator session can bootstrap itself entirely from the server.
-const provisionConfig = provisionConfigFromEnv();
-registerProvisionRoutes(fastify, provisionConfig);
+// TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch,
+// /dist/agent/manifest.json, /dist/deps/**) — NOT /api/v1, so an edge box with no operator session can
+// bootstrap itself entirely from the server. The OTA manifest (POL-28) is served here too.
+registerProvisionRoutes(fastify, provisionConfig, agentManifest);
 attachWebSockets({
   server: fastify.server,
   control,
@@ -188,6 +225,7 @@ attachWebSockets({
   broadcaster,
   activity,
   capture,
+  rollout,
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
 });
@@ -233,6 +271,29 @@ fastify.log.info(
 // Start the periodic live-preview capture sweep (no-op when CAPTURE_INTERVAL_MS=0).
 capture.start();
 
+// ── OTA (POL-28): advertise the depot's agent release + resume any persisted rollout ──
+const manifestPresent = await hasManifestFile(provisionConfig.agentDistDir);
+fastify.log.info(
+  {
+    event: "ota.release",
+    version: agentManifest?.version ?? null,
+    provisionEpoch: agentManifest?.provisionEpoch ?? null,
+    manifestFile: manifestPresent ? "file" : "synthesized-or-none",
+    rollout: rollout.current()?.targetVersion ?? null,
+  },
+  agentManifest
+    ? `OTA: depot serves agent ${agentManifest.version} (epoch ${agentManifest.provisionEpoch})` +
+        (rollout.current() ? ` · resuming rollout → ${rollout.current()!.targetVersion}` : "")
+    : "OTA: no agent manifest — self-update disabled (set POLYPTIC_VERSION + bundle the agent binaries).",
+);
+// Periodic re-evaluate so a canary soak, halt-on-failure, completion + re-offers advance independently
+// of heartbeat timing. No-op when there's no rollout.
+const rolloutTimer = setInterval(() => {
+  void rollout.evaluate().catch((err) => fastify.log.warn({ event: "ota.tick.error", err: String(err) }));
+}, Number.isFinite(ROLLOUT_TICK_MS) && ROLLOUT_TICK_MS > 0 ? ROLLOUT_TICK_MS : 15_000);
+// Don't let the tick keep the process alive on its own during shutdown.
+if (typeof rolloutTimer.unref === "function") rolloutTimer.unref();
+
 // Auth boot banner: secure by default; make the dev shortcuts loud.
 if (!authConfig.enabled) {
   fastify.log.warn(
@@ -276,6 +337,7 @@ if (enrollment.open) {
 async function shutdown(signal: string): Promise<void> {
   fastify.log.info({ event: "server.shutdown", signal }, "shutting down");
   capture.stop();
+  clearInterval(rolloutTimer);
   try {
     await fastify.close();
   } catch (err) {

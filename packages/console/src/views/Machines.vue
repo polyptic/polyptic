@@ -88,6 +88,27 @@ function drives(m: MachineView): string {
   if (m.screens.length === 0) return countLabel(m.outputCount, "screen");
   return m.screens.map((s) => s.friendlyName).join(", ");
 }
+
+/** OTA (POL-28) — a small update-status pill for a machine, or null when there's nothing notable. */
+function updatePill(m: MachineView): { text: string; cls: string } | null {
+  if (m.needsInstaller) return { text: "needs installer", cls: "warn" };
+  const s = m.updateState;
+  if (!s || s === "idle" || s === "healthy") {
+    return m.targetAgentVersion ? { text: `→ v${m.targetAgentVersion}`, cls: "info" } : null;
+  }
+  switch (s) {
+    case "downloading":
+      return { text: "updating…", cls: "info" };
+    case "staged":
+    case "updating":
+      return { text: "rebooting…", cls: "info" };
+    case "rolled-back":
+      return { text: "rolled back", cls: "bad" };
+    case "failed":
+      return { text: "update failed", cls: "bad" };
+  }
+  return null;
+}
 </script>
 
 <template>
@@ -175,6 +196,10 @@ function drives(m: MachineView): string {
                 <div class="machine-id">
                   <div class="machine-id-line">
                     <span class="machine-label">{{ m.label }}</span>
+                    <span v-if="m.agentVersion" class="ver-chip">v{{ m.agentVersion }}</span>
+                    <span v-if="updatePill(m)" class="upd-pill" :class="updatePill(m)!.cls">
+                      {{ updatePill(m)!.text }}
+                    </span>
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                   <div class="machine-meta drives">Drives {{ drives(m) }}</div>
@@ -429,6 +454,36 @@ function drives(m: MachineView): string {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* OTA (POL-28): the running agent version + an update-status pill */
+.ver-chip {
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--mono, ui-monospace, "Geist Mono", monospace);
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--muted-bg);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.upd-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.upd-pill.info {
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.upd-pill.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.upd-pill.bad {
+  background: var(--bad-soft);
+  color: var(--bad);
 }
 .machine-meta {
   font-size: 12px;

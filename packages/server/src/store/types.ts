@@ -28,6 +28,9 @@ export interface PersistedMachine {
   id: string;
   label: string;
   agentVersion?: string;
+  /** OTA (POL-28) — the agent's provisioning epoch (see protocol PROVISION_EPOCH). Undefined on
+   *  pre-OTA agents / legacy rows; loaded as 0-equivalent (never OTA-eligible for a newer epoch). */
+  provisionEpoch?: number;
   backend?: DisplayBackend;
   outputs: Output[];
   /**
@@ -161,6 +164,26 @@ export interface PersistedSession {
 export type EnrollmentMode = "open" | "gated";
 
 /**
+ * OTA (POL-28) — the persisted fleet-rollout INTENT (a single row). Only the intent is durable; live
+ * progress (who's on the target, canary health, soak clock) is derived from the versions agents
+ * report, so a server restart resumes the rollout without inventing state. Absent = no rollout.
+ */
+export interface PersistedRollout {
+  targetVersion: string;
+  strategy: "all" | "canary";
+  promotion: "manual" | "auto";
+  /** The canary wave's machine ids (empty for an all-at-once rollout). */
+  canaryMachineIds: string[];
+  /** True once the canary has promoted to the rest of the fleet. */
+  promoted: boolean;
+  /** Kill-switch: while paused the server offers no updates. */
+  paused: boolean;
+  /** The fleet's majority version when the rollout started — the rollback target. Null if unknown. */
+  previousVersion: string | null;
+  createdAt: string;
+}
+
+/**
  * The persisted enrollment bootstrap: which mode the deployment runs in and (when `gated`) the
  * current bootstrap token an agent must present on first contact. `open` mode has a `null` token.
  * Seeded on first boot from `POLYPTIC_BOOTSTRAP_TOKEN`; mutated by the Settings "regenerate" action.
@@ -287,6 +310,14 @@ export interface Store {
   getBootstrap(): Promise<PersistedBootstrap | undefined>;
   /** Persist the enrollment bootstrap (single row). */
   setBootstrap(bootstrap: PersistedBootstrap): Promise<void>;
+
+  // ── Fleet rollout intent (POL-28) ──────────────────────────────────────────
+  /** The persisted rollout intent (single row), or undefined when no rollout is running. */
+  getRollout(): Promise<PersistedRollout | undefined>;
+  /** Persist the rollout intent (single row, upsert). */
+  setRollout(rollout: PersistedRollout): Promise<void>;
+  /** Remove the rollout intent (no rollout running). No-op if absent. */
+  clearRollout(): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

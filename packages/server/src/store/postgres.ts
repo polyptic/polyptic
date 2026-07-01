@@ -33,6 +33,7 @@ import type {
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
+  PersistedRollout,
   PersistedScene,
   PersistedScreen,
   PersistedSession,
@@ -48,6 +49,7 @@ interface MachineRow {
   id: string;
   label: string;
   agent_version: string | null;
+  provision_epoch: number | null;
   backend: string | null;
   outputs: unknown;
   status: string | null;
@@ -127,6 +129,17 @@ interface SessionRow {
 interface BootstrapRow {
   mode: string;
   token: string | null;
+}
+
+interface RolloutRow {
+  target_version: string;
+  strategy: string;
+  promotion: string;
+  canary_machine_ids: unknown;
+  promoted: boolean;
+  paused: boolean;
+  previous_version: string | null;
+  created_at: Date;
 }
 
 interface CountRow {
@@ -274,6 +287,24 @@ export class PostgresStore implements Store {
         token text
       )
     `;
+    // OTA (POL-28): the agent's provisioning epoch, reported on hello/status. Idempotent add for
+    // databases created before OTA; NULL on pre-OTA agents (loaded as "epoch unknown / 0-equivalent").
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS provision_epoch int`;
+    // OTA (POL-28): the fleet-rollout INTENT (single row). Only the intent is persisted; live progress
+    // is derived from reported agent versions, so a restart resumes the rollout without inventing state.
+    await sql`
+      CREATE TABLE IF NOT EXISTS rollout (
+        id                 int PRIMARY KEY DEFAULT 1,
+        target_version     text NOT NULL,
+        strategy           text NOT NULL DEFAULT 'all',
+        promotion          text NOT NULL DEFAULT 'manual',
+        canary_machine_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+        promoted           boolean NOT NULL DEFAULT false,
+        paused             boolean NOT NULL DEFAULT false,
+        previous_version   text,
+        created_at         timestamptz NOT NULL DEFAULT now()
+      )
+    `;
   }
 
   async load(): Promise<PersistedState> {
@@ -289,7 +320,7 @@ export class PostgresStore implements Store {
       contentSourceRows,
       sceneRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, provision_epoch, backend, outputs, status, credential_hash, last_seen FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
@@ -308,6 +339,7 @@ export class PostgresStore implements Store {
         id: row.id,
         label: row.label,
         agentVersion: row.agent_version ?? undefined,
+        provisionEpoch: row.provision_epoch ?? undefined,
         backend: backend.success ? backend.data : undefined,
         outputs: outputs.success ? outputs.data : [],
         // Legacy rows (NULL) and anything unrecognised degrade to `approved`.
@@ -403,11 +435,12 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen)
+      INSERT INTO machines (id, label, agent_version, provision_epoch, backend, outputs, status, credential_hash, last_seen)
       VALUES (
         ${machine.id},
         ${machine.label},
         ${machine.agentVersion ?? null},
+        ${machine.provisionEpoch ?? null},
         ${machine.backend ?? null},
         ${sql.json(machine.outputs)},
         ${machine.status ?? "approved"},
@@ -417,6 +450,7 @@ export class PostgresStore implements Store {
       ON CONFLICT (id) DO UPDATE SET
         label           = EXCLUDED.label,
         agent_version   = EXCLUDED.agent_version,
+        provision_epoch = EXCLUDED.provision_epoch,
         backend         = EXCLUDED.backend,
         outputs         = EXCLUDED.outputs,
         status          = EXCLUDED.status,
@@ -779,6 +813,62 @@ export class PostgresStore implements Store {
       INSERT INTO bootstrap (id, mode, token) VALUES (1, ${bootstrap.mode}, ${bootstrap.token})
       ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, token = EXCLUDED.token
     `;
+  }
+
+  // ── Fleet rollout intent (POL-28) ─────────────────────────────────────────────
+
+  async getRollout(): Promise<PersistedRollout | undefined> {
+    const sql = this.sql;
+    const rows = await sql<RolloutRow[]>`
+      SELECT target_version, strategy, promotion, canary_machine_ids, promoted, paused, previous_version, created_at
+      FROM rollout WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    const ids = Array.isArray(row.canary_machine_ids)
+      ? (row.canary_machine_ids as unknown[]).filter((v): v is string => typeof v === "string")
+      : [];
+    return {
+      targetVersion: row.target_version,
+      strategy: row.strategy === "canary" ? "canary" : "all",
+      promotion: row.promotion === "auto" ? "auto" : "manual",
+      canaryMachineIds: ids,
+      promoted: Boolean(row.promoted),
+      paused: Boolean(row.paused),
+      previousVersion: row.previous_version ?? null,
+      createdAt: row.created_at.toISOString(),
+    };
+  }
+
+  async setRollout(rollout: PersistedRollout): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO rollout (id, target_version, strategy, promotion, canary_machine_ids, promoted, paused, previous_version, created_at)
+      VALUES (
+        1,
+        ${rollout.targetVersion},
+        ${rollout.strategy},
+        ${rollout.promotion},
+        ${sql.json(rollout.canaryMachineIds)},
+        ${rollout.promoted},
+        ${rollout.paused},
+        ${rollout.previousVersion ?? null},
+        ${new Date(rollout.createdAt)}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        target_version     = EXCLUDED.target_version,
+        strategy           = EXCLUDED.strategy,
+        promotion          = EXCLUDED.promotion,
+        canary_machine_ids = EXCLUDED.canary_machine_ids,
+        promoted           = EXCLUDED.promoted,
+        paused             = EXCLUDED.paused,
+        previous_version   = EXCLUDED.previous_version,
+        created_at         = EXCLUDED.created_at
+    `;
+  }
+
+  async clearRollout(): Promise<void> {
+    await this.sql`DELETE FROM rollout WHERE id = 1`;
   }
 
   async close(): Promise<void> {

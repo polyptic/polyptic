@@ -14,6 +14,7 @@ import type {
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
+  PersistedRollout,
   PersistedScene,
   PersistedScreen,
   PersistedSession,
@@ -46,6 +47,8 @@ export class MemoryStore implements Store {
   private readonly sessions = new Map<string, PersistedSession>();
   /** The enrollment bootstrap (mode + token), seeded on first boot. */
   private bootstrap: PersistedBootstrap | undefined;
+  /** The fleet-rollout intent (POL-28), or undefined when no rollout is running. */
+  private rollout: PersistedRollout | undefined;
   private revision = 0;
 
   async migrate(): Promise<void> {
@@ -252,6 +255,20 @@ export class MemoryStore implements Store {
 
   async setBootstrap(bootstrap: PersistedBootstrap): Promise<void> {
     this.bootstrap = clone(bootstrap);
+  }
+
+  // ── Fleet rollout intent (POL-28) ─────────────────────────────────────────────
+
+  async getRollout(): Promise<PersistedRollout | undefined> {
+    return this.rollout ? clone(this.rollout) : undefined;
+  }
+
+  async setRollout(rollout: PersistedRollout): Promise<void> {
+    this.rollout = clone(rollout);
+  }
+
+  async clearRollout(): Promise<void> {
+    this.rollout = undefined;
   }
 
   async close(): Promise<void> {

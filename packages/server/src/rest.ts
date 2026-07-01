@@ -34,6 +34,7 @@ import {
   ServerToPlayerIdent,
   ServerToPlayerRender,
   SetContentBody,
+  StartRolloutBody,
   Surface,
   UpdateContentSourceBody,
   UpdateSceneBody,
@@ -48,6 +49,7 @@ import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster } from "./admin";
 import type { MediaStore } from "./media";
+import type { RolloutController } from "./rollout";
 
 /** Phase 7 — where uploaded media lands + how its serve URL is built. Wired from env in index.ts. */
 export interface MediaConfig {
@@ -77,6 +79,7 @@ export function registerRestRoutes(
   capture: CaptureCoordinator,
   media: MediaStore,
   mediaConfig: MediaConfig,
+  rollout: RolloutController,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -475,6 +478,85 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return { ok: true, screenId: params.data.screenId };
+  });
+
+  // ── Fleet rollout routes (OTA — POL-28) ───────────────────────────────────────
+  //
+  // Drive the fleet's agent version. Push a new agent to the depot (a new server image), then start a
+  // rollout: boxes pull + verify + swap + reboot themselves, gated by canary + auto-rollback. The
+  // controller persists only the intent; live progress rides on the versions agents report. All of
+  // these broadcast a fresh admin/state (which carries agentRelease + rollout), then re-evaluate so any
+  // in-wave box is offered its update immediately rather than on the next heartbeat.
+
+  // GET /api/v1/fleet -> { release, rollout } (also on admin/state; handy for a non-WS caller)
+  fastify.get("/api/v1/fleet", async () => ({
+    release: rollout.release(),
+    rollout: rollout.view(),
+  }));
+
+  // POST /api/v1/fleet/rollout  { version, strategy?, canaryMachineIds?, promotion? } -> start/replace
+  fastify.post("/api/v1/fleet/rollout", async (request, reply) => {
+    const body = StartRolloutBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const result = await rollout.start(body.data);
+    if (!result.ok) {
+      const status = result.error === "unknown-version" ? 409 : 400;
+      return reply.code(status).send({ error: result.error });
+    }
+    await rollout.evaluate();
+    fastify.log.info(
+      { event: "fleet.rollout.start", version: body.data.version, strategy: body.data.strategy },
+      "rollout started",
+    );
+    return { ok: true, rollout: result.view };
+  });
+
+  // POST /api/v1/fleet/rollout/promote -> promote the canary to the rest of the fleet
+  fastify.post("/api/v1/fleet/rollout/promote", async (_request, reply) => {
+    const ok = await rollout.promote();
+    if (!ok) return reply.code(409).send({ error: "no promotable rollout" });
+    await rollout.evaluate();
+    fastify.log.info({ event: "fleet.rollout.promote" }, "rollout promoted");
+    return { ok: true, rollout: rollout.view() };
+  });
+
+  // POST /api/v1/fleet/rollout/pause -> kill-switch: stop offering updates
+  fastify.post("/api/v1/fleet/rollout/pause", async (_request, reply) => {
+    const ok = await rollout.pause();
+    if (!ok) return reply.code(409).send({ error: "no pausable rollout" });
+    fastify.log.info({ event: "fleet.rollout.pause" }, "rollout paused");
+    return { ok: true, rollout: rollout.view() };
+  });
+
+  // POST /api/v1/fleet/rollout/resume -> resume a paused rollout
+  fastify.post("/api/v1/fleet/rollout/resume", async (_request, reply) => {
+    const ok = await rollout.resume();
+    if (!ok) return reply.code(409).send({ error: "no paused rollout" });
+    await rollout.evaluate();
+    fastify.log.info({ event: "fleet.rollout.resume" }, "rollout resumed");
+    return { ok: true, rollout: rollout.view() };
+  });
+
+  // POST /api/v1/fleet/rollout/rollback -> revert the fleet to its previous version (retained slots)
+  fastify.post("/api/v1/fleet/rollout/rollback", async (_request, reply) => {
+    const result = await rollout.rollback();
+    if (!result.ok) {
+      const status = result.error === "no-rollout" ? 409 : 422;
+      return reply.code(status).send({ error: result.error });
+    }
+    await rollout.evaluate();
+    fastify.log.info({ event: "fleet.rollout.rollback", version: result.view.targetVersion }, "rollout rolled back");
+    return { ok: true, rollout: result.view };
+  });
+
+  // DELETE /api/v1/fleet/rollout -> clear the rollout (dismiss/abandon; boxes stay where they are)
+  fastify.delete("/api/v1/fleet/rollout", async (_request, reply) => {
+    const ok = await rollout.cancel();
+    if (!ok) return reply.code(409).send({ error: "no rollout to clear" });
+    fastify.log.info({ event: "fleet.rollout.cancel" }, "rollout cleared");
+    return { ok: true };
   });
 
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────

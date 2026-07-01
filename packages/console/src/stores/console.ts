@@ -13,6 +13,7 @@ import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
   ActivityEvent,
+  AgentRelease,
   AuthUser,
   ChangePasswordBody,
   ContentKind,
@@ -23,8 +24,10 @@ import type {
   MachineView,
   Mural,
   Placement,
+  RolloutView,
   Scene,
   ScreenView,
+  StartRolloutBody,
   UpdateContentSourceBody,
   UpdateSceneBody,
   VideoWall,
@@ -108,6 +111,10 @@ export interface ConsoleState {
    *  admin/state.activity. The field is OPTIONAL on the wire (back-compat), so it defaults to []
    *  when a server omits it. */
   activity: ActivityEvent[];
+  /** OTA (POL-28) — the depot's advertised agent release (latest servable version), or null. */
+  agentRelease: AgentRelease | null;
+  /** OTA (POL-28) — the active fleet rollout, or null when none is running. */
+  rollout: RolloutView | null;
   /** The scene most recently applied this session. The admin/state snapshot does not surface the
    *  server's DesiredState.activeSceneId, so we track it client-side: set optimistically on apply,
    *  cleared when its scene is deleted. */
@@ -143,6 +150,8 @@ export const useConsoleStore = defineStore("console", {
     contentSources: [],
     scenes: [],
     activity: [],
+    agentRelease: null,
+    rollout: null,
     activeSceneId: null,
     activeMuralId: null,
     selectedScreenIds: [],
@@ -256,6 +265,34 @@ export const useConsoleStore = defineStore("console", {
 
     machineById(): (id: string) => MachineView | undefined {
       return (id: string) => this.machines.find((m) => m.id === id);
+    },
+
+    // ── Fleet / OTA (POL-28) ──────────────────────────────────────────────────
+
+    /** Approved machines that report a version below the depot's release and can't OTA (epoch too low)
+     *  are "up to date" for the badge's purposes; the badge counts genuinely-updatable boxes. */
+    agentVersionBreakdown(state): Array<{ version: string; count: number }> {
+      const counts = new Map<string, number>();
+      for (const m of state.machines) {
+        if (m.status !== "approved") continue;
+        const v = m.agentVersion ?? "unknown";
+        counts.set(v, (counts.get(v) ?? 0) + 1);
+      }
+      return [...counts.entries()]
+        .map(([version, count]) => ({ version, count }))
+        .sort((a, b) => b.count - a.count || a.version.localeCompare(b.version));
+    },
+
+    /** Approved machines NOT yet on the depot's release version (candidates for a rollout). */
+    machinesBehindRelease(state): MachineView[] {
+      const target = state.agentRelease?.version;
+      if (!target) return [];
+      return state.machines.filter((m) => m.status === "approved" && m.agentVersion !== target);
+    },
+
+    /** True when the depot advertises a release some approved box isn't on yet — drives the nav badge. */
+    fleetUpdateAvailable(): boolean {
+      return this.machinesBehindRelease.length > 0;
     },
 
     // ── Combined surfaces (video walls, Phase 3b) ─────────────────────────────
@@ -594,6 +631,9 @@ export const useConsoleStore = defineStore("console", {
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
         this.activity = msg.activity ?? [];
+        // OTA (POL-28) — the depot release + active rollout (both optional/nullable on the wire).
+        this.agentRelease = msg.agentRelease ?? null;
+        this.rollout = msg.rollout ?? null;
 
         // Forget an active-scene marker whose scene the server no longer knows (e.g. deleted).
         if (this.activeSceneId && !this.scenes.some((sc) => sc.id === this.activeSceneId)) {
@@ -716,6 +756,77 @@ export const useConsoleStore = defineStore("console", {
         await api.deleteMachine(id);
       } catch (err) {
         console.error("[console] removeMachine failed", err);
+      }
+    },
+
+    // ── Fleet rollout / OTA (POL-28) ────────────────────────────────────────────
+    // These drive the depot-wide agent version. The server broadcasts the authoritative rollout state
+    // on admin/state; each action just posts and lets the broadcast reconcile. They surface a boolean
+    // so a caller (the Fleet view) can flag a rejected action; errors are logged, not thrown.
+
+    /** Start (or replace) a rollout to `version`. */
+    async startRollout(body: StartRolloutBody): Promise<boolean> {
+      try {
+        await api.startRollout(body);
+        return true;
+      } catch (err) {
+        console.error("[console] startRollout failed", err);
+        return false;
+      }
+    },
+
+    /** Promote the canary wave to the rest of the fleet. */
+    async promoteRollout(): Promise<boolean> {
+      try {
+        await api.promoteRollout();
+        return true;
+      } catch (err) {
+        console.error("[console] promoteRollout failed", err);
+        return false;
+      }
+    },
+
+    /** Kill-switch: pause the rollout (stop offering updates). */
+    async pauseRollout(): Promise<boolean> {
+      try {
+        await api.pauseRollout();
+        return true;
+      } catch (err) {
+        console.error("[console] pauseRollout failed", err);
+        return false;
+      }
+    },
+
+    /** Resume a paused rollout. */
+    async resumeRollout(): Promise<boolean> {
+      try {
+        await api.resumeRollout();
+        return true;
+      } catch (err) {
+        console.error("[console] resumeRollout failed", err);
+        return false;
+      }
+    },
+
+    /** Roll the fleet back to its previous version (boxes reactivate their retained slot). */
+    async rollbackRollout(): Promise<boolean> {
+      try {
+        await api.rollbackRollout();
+        return true;
+      } catch (err) {
+        console.error("[console] rollbackRollout failed", err);
+        return false;
+      }
+    },
+
+    /** Clear the rollout (dismiss a completed one / abandon; boxes stay where they are). */
+    async cancelRollout(): Promise<boolean> {
+      try {
+        await api.cancelRollout();
+        return true;
+      } catch (err) {
+        console.error("[console] cancelRollout failed", err);
+        return false;
       }
     },
 

@@ -49,6 +49,7 @@ import type { ControlPlane, RegisterMachineInput, ScreenAssignment } from "./sta
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
+import type { RolloutController } from "./rollout";
 
 interface WsDeps {
   server: Server;
@@ -65,13 +66,15 @@ interface WsDeps {
   activity: ActivityLog;
   /** Live-preview capture (Phase 5) — ingests inbound `agent/thumbnail` frames. */
   capture: CaptureCoordinator;
+  /** OTA (POL-28) — the rollout controller decides whether to offer a `server/update` to each box. */
+  rollout: RolloutController;
   log: FastifyBaseLogger;
   /** Allowed browser origins for the /admin WS upgrade (anti-CSWSH); from CORS_ORIGIN. */
   allowedOrigins: string[];
 }
 
 export function attachWebSockets(deps: WsDeps): void {
-  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, log, allowedOrigins } =
+  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, rollout, log, allowedOrigins } =
     deps;
 
   const agentWss = new WebSocketServer({ noServer: true });
@@ -131,7 +134,7 @@ export function attachWebSockets(deps: WsDeps): void {
   });
 
   agentWss.on("connection", (ws: WebSocket) =>
-    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, log),
+    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, rollout, log),
   );
   playerWss.on("connection", (ws: WebSocket) =>
     handlePlayer(ws, control, hub, presence, broadcaster, activity, log),
@@ -150,6 +153,7 @@ function handleAgent(
   broadcaster: AdminBroadcaster,
   activity: ActivityLog,
   capture: CaptureCoordinator,
+  rollout: RolloutController,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected" }, "agent socket opened");
@@ -230,6 +234,7 @@ function handleAgent(
     const input: RegisterMachineInput = {
       machineId: msg.machineId,
       agentVersion: msg.agentVersion,
+      provisionEpoch: msg.provisionEpoch,
       backend: msg.backend,
       outputs: msg.outputs,
       hostname: msg.hostname,
@@ -316,6 +321,20 @@ function handleAgent(
         const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
         activity.push("good", `${label} connected`);
       }
+
+      // OTA (POL-28): capture any update outcome the agent reports on the first hello after a reboot
+      // (e.g. `rolled-back`/`failed`), then — if a rollout is targeting this box — offer it now, so a
+      // reconnecting box on the old version updates immediately rather than waiting a heartbeat.
+      if (decision.kind === "open" || decision.kind === "admit") {
+        await control.recordAgentReport(msg.machineId, {
+          agentVersion: msg.agentVersion,
+          provisionEpoch: msg.provisionEpoch,
+          updateState: msg.updateState,
+          updateError: msg.updateError,
+        });
+        rollout.maybeOffer(msg.machineId);
+      }
+
       broadcaster.broadcast();
     } catch (err) {
       log.error(
@@ -338,9 +357,36 @@ function handleAgent(
       void onHello(msg);
     } else if (msg.t === "agent/status") {
       log.info(
-        { event: "agent.status", machineId: msg.machineId, observedRevision: msg.observedRevision },
+        {
+          event: "agent.status",
+          machineId: msg.machineId,
+          observedRevision: msg.observedRevision,
+          agentVersion: msg.agentVersion,
+          updateState: msg.updateState,
+        },
         "agent status",
       );
+      // OTA (POL-28): fold the heartbeat's reported version + update state into the registry, then let
+      // the rollout controller act on it (offer this box an update if it's behind + in-wave, advance a
+      // canary soak, halt on a failure, mark completion). Broadcast so the console tracks it live.
+      void (async () => {
+        try {
+          await control.recordAgentReport(msg.machineId, {
+            agentVersion: msg.agentVersion,
+            provisionEpoch: msg.provisionEpoch,
+            updateState: msg.updateState,
+            updateError: msg.updateError,
+            targetVersion: msg.targetVersion,
+          });
+          await rollout.onHeartbeat(msg.machineId);
+          broadcaster.broadcast();
+        } catch (err) {
+          log.warn(
+            { event: "agent.status.error", machineId: msg.machineId, err: String(err) },
+            "failed to process agent status",
+          );
+        }
+      })();
     } else {
       // agent/thumbnail — the frame is already AgentMessage-validated; hand it to the coordinator,
       // which resolves connector→screenId, decodes the payload and stores the latest preview (Phase 5).

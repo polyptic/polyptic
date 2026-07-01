@@ -24,6 +24,8 @@ import { agentVersion } from "../version";
 import {
   AGENT_SERVICE,
   COMPOSITOR_LAUNCHER,
+  ROLLBACK_SERVICE,
+  ROLLBACK_TIMER,
   SESSION_TARGET,
   agentServiceUnit,
   compositorLauncher,
@@ -33,6 +35,16 @@ import {
   swayConfig,
   xinitrc,
 } from "./templates";
+import {
+  OTA_SUDOERS_PATH,
+  ROLLBACK_DELAY_SEC,
+  otaDirFor,
+  otaSlotExec,
+  otaSudoers,
+  provisionOtaSlots,
+  rollbackServiceUnit,
+  rollbackTimerUnit,
+} from "./ota";
 import {
   PLYMOUTH_QUIT_DROPIN,
   PLYMOUTH_THEME_DIR,
@@ -111,20 +123,49 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   // 4 ─ compositor config (sway or i3)
   writeCompositorConfig(sys, opts, log, home, isX11);
 
-  // 5 ─ systemd user unit(s)
+  // 5 ─ OTA A/B slots (POL-28) + systemd user unit(s). With OTA on, the agent unit's ExecStart points
+  // at the stable `current` slot symlink so an update only ever flips symlinks — the unit is never
+  // rewritten. The FROZEN opts.agentBin (/usr/local/bin) still runs `setup` + the rollback guard.
+  const otaDir = otaDirFor(home);
+  const otaVersion = process.env.POLYPTIC_VERSION?.trim() || agentVersion();
+  let execStart = opts.agentBin;
+  if (opts.ota) {
+    provisionOtaSlots(sys, log, {
+      user: opts.user,
+      otaDir,
+      sourceBinary: opts.agentBin,
+      version: otaVersion,
+    });
+    execStart = otaSlotExec(otaDir);
+    state.otaConfigured = true;
+  } else {
+    log.step("provision OTA A/B slots");
+    log.skip("OTA slots + rollback guard skipped (--no-ota) — ExecStart runs the binary directly");
+  }
+
   log.step("write systemd user units");
-  sys.writeFile(`${UNIT_DIR}/${SESSION_TARGET}`, sessionTargetUnit(), {
+  sys.writeFile(`${UNIT_DIR}/${SESSION_TARGET}`, sessionTargetUnit({ withRollbackTimer: opts.ota }), {
     mode: 0o644,
     desc: SESSION_TARGET,
   });
   sys.writeFile(
     `${UNIT_DIR}/${AGENT_SERVICE}`,
-    agentServiceUnit({ agentBin: opts.agentBin, configPath: opts.configPath }),
+    agentServiceUnit({
+      agentBin: execStart,
+      configPath: opts.configPath,
+      otaDir: opts.ota ? otaDir : undefined,
+    }),
     { mode: 0o644, desc: AGENT_SERVICE },
   );
   assumptions.push(
-    `the agent single binary is installed at ${opts.agentBin} (the .deb / installer places it; override with --agent-bin).`,
+    `the agent single binary is installed at ${opts.agentBin} (the depot installer places it; override with --agent-bin).`,
   );
+
+  // 5b ─ OTA rollback guard (POL-28): a STANDALONE user timer + oneshot (not bound to the agent unit)
+  // that reverts a self-update which never comes back healthy, plus a narrow reboot sudoers rule.
+  if (opts.ota) {
+    configureOta(sys, opts, log, otaDir, assumptions, needsVerification);
+  }
 
   // 6 ─ /etc/polyptic/agent.toml
   writeAgentConfig(sys, opts, log, needsVerification);
@@ -398,6 +439,56 @@ function configureSplash(
     "Boot splash is a VISUAL property: verify on a VM/hardware with a real display that the splash " +
       "shows continuously from early boot to the player AND through shutdown/reboot with no raw console " +
       "text (an OrbStack headless box cannot show it).",
+  );
+}
+
+// ── OTA rollback guard (POL-28) ──────────────────────────────────────────────────
+
+/**
+ * Install the standalone rollback guard (a systemd user timer + oneshot, NOT bound to the agent unit)
+ * plus the narrow reboot sudoers rule. The guard runs the FROZEN installed binary so it works even
+ * when a bad update's slot binary is broken.
+ */
+function configureOta(
+  sys: Sys,
+  opts: SetupOptions,
+  log: Logger,
+  otaDir: string,
+  assumptions: string[],
+  needsVerification: string[],
+): void {
+  log.step("install OTA rollback guard (standalone user timer + oneshot) + reboot sudoers");
+
+  sys.writeFile(`${UNIT_DIR}/${ROLLBACK_SERVICE}`, rollbackServiceUnit({ frozenBin: opts.agentBin, otaDir }), {
+    mode: 0o644,
+    desc: ROLLBACK_SERVICE,
+  });
+  sys.writeFile(`${UNIT_DIR}/${ROLLBACK_TIMER}`, rollbackTimerUnit(), {
+    mode: 0o644,
+    desc: ROLLBACK_TIMER,
+  });
+
+  // The one privileged action OTA needs — a reboot — behind a narrow NOPASSWD rule (0440, root-owned).
+  sys.writeFile(OTA_SUDOERS_PATH, otaSudoers(opts.user), {
+    mode: 0o440,
+    owner: "root",
+    group: "root",
+    desc: "OTA reboot sudoers",
+  });
+  // Validate the drop-in best-effort so a malformed rule can never lock sudo out.
+  if (sys.which("visudo")) {
+    sys.exec("visudo", ["-cf", OTA_SUDOERS_PATH], { desc: "validate OTA sudoers", allowFail: true });
+  }
+
+  assumptions.push(
+    `OTA (POL-28): the agent unit runs the kiosk-writable slot at ${otaDir}/current — updates flip that ` +
+      `symlink (the unit file is never rewritten). A standalone user timer reverts a failed update ~` +
+      `${ROLLBACK_DELAY_SEC}s after the session starts, and '${opts.user}' may reboot via ${OTA_SUDOERS_PATH}.`,
+  );
+  needsVerification.push(
+    "OTA (POL-28): on a VM/hardware, confirm the kiosk session arms polyptic-agent-rollback.timer, a " +
+      "self-update reboots + commits (marker cleared), and a deliberately-bad build auto-reverts to the " +
+      "previous slot within the confirm window.",
   );
 }
 

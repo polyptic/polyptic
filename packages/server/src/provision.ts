@@ -28,6 +28,7 @@ import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import type { AgentManifest } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 
 /** Built-in fallback install template, shipped beside this module (served when the deploy file is absent). */
@@ -126,10 +127,26 @@ export function computeBaseUrl(request: FastifyRequest, fallback: string): strin
 
 /**
  * Register the provisioning routes. ALL are TOP-LEVEL and UNGATED — register OUTSIDE the /api/v1 gate
- * (alongside /healthz). Pass the resolved {@link ProvisionConfig}.
+ * (alongside /healthz). Pass the resolved {@link ProvisionConfig} and the loaded agent manifest (OTA,
+ * POL-28) — served verbatim at `GET /dist/agent/manifest.json` so a box's checksums match the exact
+ * bytes `/dist/agent/<arch>` serves. `null` when the depot has no release to advertise.
  */
-export function registerProvisionRoutes(fastify: FastifyInstance, config: ProvisionConfig): void {
+export function registerProvisionRoutes(
+  fastify: FastifyInstance,
+  config: ProvisionConfig,
+  manifest: AgentManifest | null = null,
+): void {
   const { installScriptPath, agentDistDir, depsDistDir, publicBaseUrl } = config;
+
+  // ── GET /dist/agent/manifest.json — the OTA release manifest (version + per-arch sha256). ──
+  // A static route, so it wins over `/dist/agent/:arch` below (find-my-way prefers static over param).
+  fastify.get("/dist/agent/manifest.json", async (_request, reply) => {
+    if (!manifest) return reply.code(404).send({ error: "no agent manifest" });
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.type("application/json; charset=utf-8");
+    return manifest;
+  });
 
   // ── GET /install — the install script, with the control-plane base baked in from THIS request. ──
   fastify.get("/install", async (request, reply) => {

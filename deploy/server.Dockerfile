@@ -57,7 +57,10 @@ RUN mkdir -p /app/deploy/dist \
       --outfile /app/deploy/dist/polyptic-agent-amd64 packages/agent/src/index.ts \
  && bun build --compile --minify --define "process.env.POLYPTIC_BUILD_VERSION=\"$AGENT_VER\"" --target=bun-linux-arm64 \
       --outfile /app/deploy/dist/polyptic-agent-arm64 packages/agent/src/index.ts \
- && chmod 0755 /app/deploy/dist/polyptic-agent-amd64 /app/deploy/dist/polyptic-agent-arm64
+ && chmod 0755 /app/deploy/dist/polyptic-agent-amd64 /app/deploy/dist/polyptic-agent-arm64 \
+ && bun deploy/gen-manifest.mjs /app/deploy/dist "$AGENT_VER" "${PROVISION_EPOCH:-1}"
+# ↑ OTA (POL-28): emit /app/deploy/dist/manifest.json (version + per-arch sha256) that the server
+#   advertises at GET /dist/agent/manifest.json — the checksums match the exact bytes served.
 
 # ── Optional: bundle the visual substrate (.deb closure) for THIS image's arch ─
 # Gated by --build-arg BUNDLE_DEPS=1. Best-effort: a failed bundle (e.g. no Chromium .deb in the

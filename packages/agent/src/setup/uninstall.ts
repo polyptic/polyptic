@@ -11,7 +11,8 @@ import type { Sys } from "./system";
 import type { Logger } from "./log";
 import type { SetupOptions } from "./args";
 import type { SetupResult } from "./install";
-import { AGENT_SERVICE, COMPOSITOR_LAUNCHER, SESSION_TARGET } from "./templates";
+import { AGENT_SERVICE, COMPOSITOR_LAUNCHER, ROLLBACK_SERVICE, ROLLBACK_TIMER, SESSION_TARGET } from "./templates";
+import { OTA_SUDOERS_PATH } from "./ota";
 import { PLYMOUTH_QUIT_DROPIN, PLYMOUTH_THEME_DIR } from "./plymouth";
 import { STATE_PATH, loadState } from "./state";
 import type { SetupState } from "./state";
@@ -42,11 +43,16 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
     log.skip("display-manager restore skipped (--no-enable)");
   }
 
-  // 3 ─ remove our systemd user units.
+  // 3 ─ remove our systemd user units (incl. the OTA rollback guard) + the reboot sudoers rule (POL-28).
   log.step("remove systemd user units");
   sys.remove(`${UNIT_DIR}/${AGENT_SERVICE}`);
   sys.remove(`${UNIT_DIR}/${SESSION_TARGET}`);
+  sys.remove(`${UNIT_DIR}/${ROLLBACK_SERVICE}`);
+  sys.remove(`${UNIT_DIR}/${ROLLBACK_TIMER}`);
+  sys.remove(OTA_SUDOERS_PATH);
   sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
+  // The OTA slot tree lives under the kiosk home ($HOME/.polyptic/agent); it is removed with the user
+  // on --purge (below). A non-purge teardown leaves it, harmless without the units.
 
   // 4 ─ greetd config: restore the original if we backed one up, else remove ours.
   log.step("restore/remove greetd config");

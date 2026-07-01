@@ -19,6 +19,7 @@ export type {
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
+  PersistedRollout,
   PersistedScene,
   PersistedScreen,
   PersistedSession,

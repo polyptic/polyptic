@@ -47,6 +47,7 @@ import type {
   UpdateContentSourceBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
+import type { AgentUpdateState } from "@polyptic/protocol";
 
 import type { PersistedMachine, PersistedScene, Store } from "./store/types";
 import type { ActivityLog } from "./activity";
@@ -71,10 +72,20 @@ export interface ScreenAssignment {
 export interface RegisterMachineInput {
   machineId: string;
   agentVersion: string;
+  /** OTA (POL-28) — the agent's provisioning epoch, if it reported one (pre-OTA agents omit it). */
+  provisionEpoch?: number;
   backend: DisplayBackend;
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
+}
+
+/** OTA (POL-28) — a machine's LIVE self-update runtime (ephemeral; never persisted). */
+export interface AgentReport {
+  updateState?: AgentUpdateState;
+  updateError?: string;
+  /** The version the agent said it is updating toward, if any. */
+  targetVersion?: string;
 }
 
 export interface RegisterMachineResult {
@@ -158,6 +169,8 @@ export class ControlPlane {
   private readonly machines = new Map<string, Machine>();
   /** machineId → sha256(credential) hex. Kept off the wire `Machine`; persisted via the DTO. */
   private readonly credentialHashes = new Map<string, string>();
+  /** OTA (POL-28) — machineId → live self-update runtime (ephemeral; from agent/status heartbeats). */
+  private readonly agentReports = new Map<string, AgentReport>();
   private screenCounter = 0;
 
   /** Phase 3 — the named, switchable canvases. */
@@ -226,6 +239,7 @@ export class ControlPlane {
       id: machine.id,
       label: machine.label,
       agentVersion: machine.agentVersion,
+      provisionEpoch: machine.provisionEpoch,
       backend: machine.backend,
       outputs: machine.outputs,
       status: machine.status,
@@ -248,6 +262,7 @@ export class ControlPlane {
         id: m.id,
         label: m.label,
         agentVersion: m.agentVersion,
+        provisionEpoch: m.provisionEpoch,
         backend: m.backend,
         outputs: m.outputs,
         // Legacy rows without a status load as `approved` (Phase 2a parity).
@@ -574,6 +589,7 @@ export class ControlPlane {
       // hostname, so an already-registered machine still UUID-labelled relabels on its next hello.
       label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
       agentVersion: input.agentVersion,
+      provisionEpoch: input.provisionEpoch ?? existing?.provisionEpoch,
       backend: input.backend,
       outputs: input.outputs,
       status: "approved",
@@ -605,6 +621,7 @@ export class ControlPlane {
       // hostname, so an already-registered machine still UUID-labelled relabels on its next hello.
       label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
       agentVersion: input.agentVersion,
+      provisionEpoch: input.provisionEpoch ?? existing?.provisionEpoch,
       backend: input.backend,
       outputs: input.outputs,
       status: "pending",
@@ -719,9 +736,11 @@ export class ControlPlane {
       if (idx >= 0) this.state.screens.splice(idx, 1);
     }
 
-    // Drop the machine itself (+ its off-band credential). deleteMachine cascades screens/content/placements.
+    // Drop the machine itself (+ its off-band credential + live OTA runtime). deleteMachine cascades
+    // screens/content/placements.
     this.machines.delete(machineId);
     this.credentialHashes.delete(machineId);
+    this.agentReports.delete(machineId);
     await this.store.deleteMachine(machineId);
 
     // Removing screens shrinks desired state; a screenless (pending) machine is registry-only (no bump).
@@ -763,6 +782,55 @@ export class ControlPlane {
   /** The stored credential hash for a machine, if it has ever been issued one. */
   getCredentialHash(machineId: string): string | undefined {
     return this.credentialHashes.get(machineId);
+  }
+
+  /**
+   * OTA (POL-28) — fold an agent's heartbeat report into the registry. Updates the DURABLE version +
+   * provisioning epoch on the machine (write-through, only when they actually change — heartbeats are
+   * frequent) and the EPHEMERAL live update runtime (updateState/updateError/targetVersion) held off
+   * the persisted row. Returns true iff the persisted machine changed (so the caller knows a durable
+   * write happened). No-op for an unknown machine.
+   */
+  async recordAgentReport(
+    machineId: string,
+    report: {
+      agentVersion?: string;
+      provisionEpoch?: number;
+      updateState?: AgentUpdateState;
+      updateError?: string;
+      targetVersion?: string;
+    },
+  ): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return false;
+
+    // Live runtime (ephemeral) — always refreshed from the latest heartbeat.
+    this.agentReports.set(machineId, {
+      updateState: report.updateState,
+      updateError: report.updateError,
+      targetVersion: report.targetVersion,
+    });
+
+    // Durable fields — persist only on a real change to avoid write amplification on every heartbeat.
+    let changed = false;
+    if (report.agentVersion !== undefined && report.agentVersion !== machine.agentVersion) {
+      machine.agentVersion = report.agentVersion;
+      changed = true;
+    }
+    if (report.provisionEpoch !== undefined && report.provisionEpoch !== machine.provisionEpoch) {
+      machine.provisionEpoch = report.provisionEpoch;
+      changed = true;
+    }
+    if (changed) {
+      machine.lastSeen = new Date().toISOString();
+      await this.store.upsertMachine(this.toPersistedMachine(machine));
+    }
+    return changed;
+  }
+
+  /** OTA (POL-28) — the machine's last reported live update runtime, if any. */
+  agentReport(machineId: string): AgentReport | undefined {
+    return this.agentReports.get(machineId);
   }
 
   /** The stored slice for a screen, if any. */
