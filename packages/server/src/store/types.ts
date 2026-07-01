@@ -202,8 +202,12 @@ export interface Store {
   setMachineStatus(id: string, status: EnrollmentStatus): Promise<void>;
   /** Insert-or-update a screen row (incl. its friendly name). */
   upsertScreen(screen: PersistedScreen): Promise<void>;
+  /** Delete a screen row (e.g. pruning a stale phantom the machine no longer advertises). No-op if absent. */
+  deleteScreen(id: string): Promise<void>;
   /** Insert-or-update a screen's content row (canvas + surfaces). */
   upsertContent(content: PersistedContent): Promise<void>;
+  /** Delete a screen's content row. No-op if absent. */
+  deleteContent(screenId: string): Promise<void>;
   /** Persist the global revision counter. */
   setRevision(revision: number): Promise<void>;
 
