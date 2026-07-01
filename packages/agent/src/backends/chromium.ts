@@ -69,6 +69,15 @@ export interface ChromiumLaunchSpec {
   position?: { x: number; y: number };
   /** X11 only — initial size (the output's resolution). */
   size?: { w: number; h: number };
+  /**
+   * GPU path. `"software"` appends `--disable-gpu` so Chromium's GPU process doesn't try (and fail
+   * on) hardware GL on a no-3D GPU — e.g. a QEMU/UTM virtio-gpu without virgl. The compositor's
+   * inherited `LIBGL_ALWAYS_SOFTWARE=1` does NOT reach Chromium's GPU process (Chromium defaults to
+   * ANGLE and ignores it), so the flag must be explicit. `"hardware"` (default) leaves GPU accel on
+   * so a real GPU wall is never handicapped. Verified on Ubuntu 26.04/arm64 virtio-gpu: with
+   * `--disable-gpu` the player paints fullscreen; without it, no window ever appears.
+   */
+  render?: "hardware" | "software";
   /** Any extra flags (escape hatch, e.g. `--ignore-certificate-errors` in a lab). */
   extra?: string[];
 }
@@ -85,6 +94,8 @@ export function buildChromiumArgs(spec: ChromiumLaunchSpec): string[] {
     `--force-device-scale-factor=${scale}`,
     ...POPUP_SUPPRESSION_FLAGS,
   ];
+  // No-3D GPU: force software rendering for Chromium's GPU process (see ChromiumLaunchSpec.render).
+  if (spec.render === "software") args.push("--disable-gpu");
   if (spec.className) args.push(`--class=${spec.className}`);
   if (spec.platform === "x11" && spec.position) {
     args.push(`--window-position=${spec.position.x},${spec.position.y}`);

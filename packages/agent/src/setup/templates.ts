@@ -82,10 +82,8 @@ export function compositorLauncher(p: CompositorLauncherParams): string {
   // only needs Mesa's software path (LIBGL_ALWAYS_SOFTWARE), and the WLR_* vars are harmless no-ops
   // there. Indented to sit inside the `if [ "$mode" = software ]` block in the loop below.
   const softwareEnv = isX11
-    ? `    export LIBGL_ALWAYS_SOFTWARE=1
-    export WLR_NO_HARDWARE_CURSORS=1`
+    ? `    export LIBGL_ALWAYS_SOFTWARE=1`
     : `    export WLR_RENDERER=pixman
-    export WLR_NO_HARDWARE_CURSORS=1
     export LIBGL_ALWAYS_SOFTWARE=1`;
 
   return `#!/bin/sh
@@ -129,6 +127,12 @@ mode="\$POLYPTIC_RENDER"
 if [ "\$mode" = auto ]; then mode=hardware; fi
 
 log "starting (POLYPTIC_RENDER=\$POLYPTIC_RENDER, backend=${p.backend})"
+
+# Virtual-GPU hardware cursor planes (virtio-gpu / QXL) are frequently broken — the cursor renders
+# upside-down or offset from where clicks land. Force wlroots to composite the cursor in software
+# REGARDLESS of the render mode: negligible cost, a wall hides the cursor anyway, and it is a
+# harmless no-op on the X11/i3 (startx) path. (Verified on Ubuntu 26.04/arm64 virtio-gpu.)
+export WLR_NO_HARDWARE_CURSORS=1
 
 while true; do
   if [ "\$mode" = software ]; then
@@ -187,7 +191,10 @@ export function swayConfig(p: SwayParams): string {
 
 ### Outputs — pin connectors so per-output placement is deterministic, and keep panels awake.
 ${swayOutputLines(p.outputs)}
-output * dpms on            # always-on wall; power is the smart plug's job (no DPMS sleep)
+# always-on wall; power is the smart plug's job (no DPMS sleep). NB: sway does NOT accept a trailing
+# '#' comment on a directive line — it parses the rest as arguments — so every comment sits on its
+# own line here.
+output * dpms on
 
 ### No idle / no blank / no lock. A wall runs unattended for days.
 # (intentionally NO \`exec swayidle\` and NO lock — never blank the content)
@@ -197,7 +204,8 @@ default_border none
 default_floating_border none
 hide_edge_borders both
 focus_follows_mouse no
-seat * hide_cursor 5000     # hide the pointer; no operator stands at the panel
+# hide the pointer; no operator stands at the panel
+seat * hide_cursor 5000
 # Gotcha: every Chromium shares app_id="chromium" under Wayland, so the agent's wayland-sway
 # backend disambiguates by window title / launch order and places each on its output via swaymsg
 # IPC (Wayland forbids client self-positioning — --window-position is a no-op).

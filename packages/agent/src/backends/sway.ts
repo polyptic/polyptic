@@ -246,7 +246,12 @@ export class SwayBackend implements DisplayBackend {
     const sub = startSwayWindowSubscription((appId) => this.browser.matchesWindow(appId), (m) => this.log(m));
     let child: ChildProcess;
     try {
-      const args = this.browser.buildArgs({ url, profileDir, platform: "wayland", scaleFactor: 1 });
+      // Chromium's GPU process needs an explicit --disable-gpu on a no-3D GPU. The compositor's
+      // software-render choice reaches us as LIBGL_ALWAYS_SOFTWARE=1 (the sway config imports it into
+      // the user session, which this agent service inherits), so key the browser's render off it.
+      // cog/surf buildArgs ignore `render`; on a real GPU wall this stays "hardware" (no handicap).
+      const render = process.env.LIBGL_ALWAYS_SOFTWARE === "1" ? "software" : "hardware";
+      const args = this.browser.buildArgs({ url, profileDir, platform: "wayland", scaleFactor: 1, render });
       child = spawnChild(bin, args, { stdio: "ignore" });
       this.log(`spawned ${this.browser.name} pid=${child.pid ?? "?"} for ${connector} → ${url}`);
     } catch (err) {
