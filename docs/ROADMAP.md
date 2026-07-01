@@ -59,3 +59,33 @@ Media: image/video/**slideshow** + Office→media conversion (server-side). **Na
 
 ### Parallel AMRC track (independent, anytime)
 **Phase 0-AMRC quick win:** point the *existing Windows wall* at anonymous Grafana `&kiosk` / `d-solo` URLs to delete the plaintext-password boot hack now. No Polyptic code; reversible. Relieves pain while the product is built.
+
+---
+
+## Remaining work → Linear (POL-13)
+
+The phases above are **feature-complete through Phase 8** (skipping Phase 6/OIDC). The still-open work has been pulled into Linear issues with dependency links. Bugs/regressions found during the VM bring-up live in POL-5…POL-14 and aren't re-listed here.
+
+**Verification & release** (the pending CURRENT-marker items)
+- **POL-15** — OrbStack headless install→enrol plumbing pass.
+- **POL-23** — Visual cold-boot DoD on a UTM/Parallels VM (single output) · *blocked by POL-15*.
+- **POL-26** — Real-hardware validation: multi-output, GPU path, full N-screen wall · *blocked by POL-23*.
+- **POL-16** — Verify the prod `vite build` + Docker image (esbuild disabled in the build sandbox).
+
+**Phase 6 — Auth, properly**
+- **POL-17** — Admin OIDC for the console/API (Bucket B).
+- **POL-24** — Per-source content auth strategies (Bucket A) · *related to POL-17*.
+- **POL-25** — mTLS agent identity (bootstrap token → durable client cert) · *related to POL-17*.
+
+**Phase 7 — Nice-to-haves (remaining beyond media upload)**
+- **POL-22** — Slideshow surface + Office→media conversion · *blocked by POL-5*.
+- **POL-18** — Native-app / `web-window` surfaces (agent-placed top-level windows).
+
+**Phase 5 — deferred half**
+- **POL-19** — On-demand `wayvnc`→noVNC live screen view through the control plane.
+
+**Product / parallel**
+- **POL-20** — Formal trademark + domain clearance before any public launch (D2).
+- **POL-21** — AMRC quick win: point the existing wall at anonymous Grafana `&kiosk` URLs.
+
+Release-gate dependency chain: **POL-15 → POL-23 → POL-26**.
