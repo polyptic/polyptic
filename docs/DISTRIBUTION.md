@@ -9,7 +9,7 @@ Polyptic is two deployable things plus an optional one:
 | What | Artifact | How you install it | Lives where |
 |---|---|---|---|
 | **Server** (control plane + console + player) | one **Docker image** `ghcr.io/<owner>/polyptic-server` | `docker run` / compose / Helm | your cluster or Docker host |
-| **Agent** (per display box) | a **`.deb`** (and `.rpm`) from the GitHub Release | `apt install ./polyptic-agent_*.deb` | each kiosk machine |
+| **Agent** (per display box) | the agent **single binary**, served by the control-plane depot (D35/D41) | `curl -sfL http://SERVER:8080/install \| sh -` | each kiosk machine |
 | **Workspace packages** (`@polyptic/*`) | npm tarballs | *optional* — internal to the product; you almost never need these | a private registry, only if you want one |
 
 Throughout, replace `<owner>` with your GitHub org/user (the chart default is `ghcr.io/polyptic/polyptic-server`, i.e. `<owner>` = `polyptic`).
@@ -20,7 +20,7 @@ Throughout, replace `<owner>` with your GitHub org/user (the chart default is `g
 
 The server image is **self-contained**: it bundles the **control plane** (Fastify REST + WebSocket on `:8080`, `/healthz`, `/metrics`, `/media`), the **console** (the Vue operator SPA) and the **player** (the Vue per-screen SPA) in a single artifact. The server serves the console and player as static assets from the *same origin* as the API, which is a real simplification: the session cookie is same-origin, so there is **no cross-origin CORS to configure** for the bundled UIs. You ship one image; you don't wire three.
 
-> **Why the image, and not `npm install`?** Polyptic is a *product you run*, not a library you depend on. The unit of deployment is this image (server) and the `.deb` (agent). You never `npm install polyptic` to stand it up — see [(d) Self-hosted npm](#d-self-hosted-npm--optional-and-only-if-you-want-it) for why the workspace packages are internal.
+> **Why the image, and not `npm install`?** Polyptic is a *product you run*, not a library you depend on. The unit of deployment is this image (server) and the depot-served binary (agent). You never `npm install polyptic` to stand it up — see [(d) Self-hosted npm](#d-self-hosted-npm--optional-and-only-if-you-want-it) for why the workspace packages are internal.
 
 ### The image is built in CI, not here
 
@@ -95,45 +95,34 @@ Set on `docker run -e …`, the compose `environment:` / `.env`, or Helm `config
 
 ---
 
-## (b) The agent — `apt install` a `.deb` (or `.rpm`)
+## (b) The agent — zero-touch install from the control-plane depot
 
-The per-box agent is **not** in the server image. It ships as a native package built by `deploy/nfpm.yaml` (nFPM produces both a `.deb` for Debian/Ubuntu and a `.rpm` for Fedora/RHEL/openSUSE from one compiled Bun single-file binary). Each release attaches these to the GitHub Release.
+The per-box agent is **not** in the server image, and there is **no standalone `.deb`/`.rpm` to `apt install`** (removed in **D41**). The agent is a Bun single binary that the control plane itself serves; a box installs it with a k3s-style one-liner and nothing else — the box needs to reach **only the server** (D35). This is the **one** supported way to put an agent on a box.
 
 On a target box (Ubuntu Server-minimal), as a sudo user:
 
 ```bash
-# 1. install from the Release asset (the leading ./ makes apt resolve deps from the repos)
-sudo apt install ./polyptic-agent_0.1.0_amd64.deb        # or _arm64.deb for ARM/Apple-Silicon VMs
+# agent only (headless enrol; fully air-gapped) — downloads the binary, writes config, enrols:
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN="$POLYPTIC_BOOTSTRAP_TOKEN" sh -
 
-# 2. point it at the control plane and wire the zero-click kiosk chain (idempotent)
-sudo polyptic-agent setup \
-  --server-url wss://polyptic.example.com/agent \
-  --bootstrap-token "$POLYPTIC_BOOTSTRAP_TOKEN"          # omit only if the server runs OPEN mode
+# agent + the greetd/sway/Chromium kiosk substrate (the visual wall):
+curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN="$POLYPTIC_BOOTSTRAP_TOKEN" sh -s -- --kiosk
 
-# 3. reboot into the kiosk
+# then cold-boot into the kiosk:
 sudo reboot
 ```
 
-The box cold-boots into a Chromium-per-output kiosk and dials home; it shows **PENDING** in the console until an operator **Approves** it. Per-box config lives in `/etc/polyptic/agent.toml` (written by `setup`, re-editable; `systemctl restart polyptic-agent` or re-run `setup` to apply). The full device story — backends, multi-output placement, crash hardening, troubleshooting, the UTM/VM walkthrough — is in **`docs/DEPLOY.md`**.
+The installer downloads the arch-matched binary from `GET /dist/agent/<arch>`, installs it, and (with `--kiosk`) runs `polyptic-agent setup` to wire the zero-click chain (greetd autologin → sway → agent → Chromium-per-output, plus the boot splash). The box cold-boots and dials home; it shows **PENDING** in the console until an operator **Approves** it. Per-box config lives in `/etc/polyptic/agent.toml` (`systemctl restart polyptic-agent` or re-run the installer / `sudo polyptic-agent setup` to apply). Drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode. The full device story — backends, multi-output placement, crash hardening, troubleshooting, the UTM/VM walkthrough — is in **`docs/DEPLOY.md`**; the depot internals (what the server serves, how the binary is baked, air-gap bundles) are in **(b2)** below.
 
-On RPM distros the command is `sudo dnf install ./polyptic-agent_0.1.0_x86_64.rpm` (nFPM maps `amd64→x86_64`, `arm64→aarch64`), then the same `polyptic-agent setup`.
-
-> **Build the package yourself** (until you cut a release, or for an arch CI doesn't build): `bash deploy/build-agent.sh amd64` on a host with `bun` + `nfpm` produces `deploy/dist/polyptic-agent_<ver>_amd64.deb`. See `docs/DEPLOY.md` → "Step 1 — Build the `.deb`".
+> **Build the binary yourself** (to seed a depot without building the whole server image, or for an arch CI doesn't build): `bash deploy/build-agent.sh amd64` on a host with `bun` produces `deploy/dist/polyptic-agent-amd64`; point the server's `AGENT_DIST_DIR` at `deploy/dist`.
 
 ---
 
-## (b2) The air-gap depot — zero-touch install where the box reaches only the server
+## (b2) The depot internals — what the server serves and how it's baked
 
-`apt install` needs the box on the internet (or a mirror) and an operator to copy a `.deb`. For an **edge box that can reach ONLY the control plane**, Polyptic turns the server itself into the depot and ships a k3s-style one-liner. The box pulls everything it needs — the agent binary and (with `--kiosk`) the visual substrate — from the one server it can see, and nothing else.
+For an **edge box that can reach ONLY the control plane**, the server itself is the depot: it serves the agent binary and (with `--kiosk`) the visual substrate, so the box pulls everything from the one server it can see, and nothing else. Section (b) is the operator command; this section is the *packaging* side — what the depot serves and how the artifacts get there.
 
-```bash
-# agent only (headless enrol; fully air-gapped):
-curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$TOKEN sh -
-# agent + greetd/sway/Chromium substrate:
-curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$TOKEN sh -s -- --kiosk
-```
-
-The operator-facing flow, Stage A (agent, offline) vs Stage B (`--kiosk`, substrate offline-first), and the flags live in **`docs/DEPLOY.md` → "Zero-touch, air-gapped install"**. This section is the *packaging* side: what the depot serves and how the artifacts get there.
+The operator command is in (b) above; the operator-facing flow, Stage A (agent, offline) vs Stage B (`--kiosk`, substrate offline-first), and the flags live in **`docs/DEPLOY.md` → "Zero-touch, air-gapped install"**.
 
 ### The artifacts the depot serves (all top-level, ungated, like `/healthz`)
 
@@ -204,15 +193,15 @@ git push origin v0.1.0
 
 On that tag the release workflow:
 
-1. **Builds the server image** and pushes it to GHCR as `ghcr.io/<owner>/polyptic-server:0.1.0` (and `:latest`). This includes the `vite build` of the console + player that this sandbox can't run — it runs in CI.
-2. **Builds the agent packages** — `polyptic-agent_0.1.0_amd64.deb`, `_arm64.deb`, and the matching `.rpm`s — via `deploy/build-agent.sh` + `deploy/nfpm.yaml`.
-3. **Creates the GitHub Release** for the tag and **attaches the `.deb`/`.rpm` assets** so operators can `apt install ./…` straight from the Release page.
+1. **Builds the server image** and pushes it to GHCR as `ghcr.io/<owner>/polyptic-server:0.1.0` (and `:latest`). This includes the `vite build` of the console + player that this sandbox can't run — it runs in CI, and the image's build stage also bakes the agent binaries (both arches) into the depot with the version baked in via `--build-arg POLYPTIC_VERSION`.
+2. **Builds the agent binaries** — `polyptic-agent-amd64` and `polyptic-agent-arm64` — via `deploy/build-agent.sh` (Bun single binary, version baked in via `--define`).
+3. **Creates the GitHub Release** for the tag and **attaches the agent binaries** so you can seed a depot's `AGENT_DIST_DIR` from the Release (the running server image already serves them; there is no `.deb`/`.rpm` to `apt install` — D41).
 
 What it needs before it can succeed (you set these up when you're ready, not before):
 
 - **GHCR push:** the built-in `GITHUB_TOKEN` with `packages: write` (granted in the workflow's `permissions:`), or a PAT if you push to a different org. No external secret needed for the default org.
 - **Release assets:** `contents: write` (again the built-in token).
-- That's it — no third-party registries, no cloud credentials. The chart's `appVersion` / image `tag` and `nfpm.yaml`'s `${VERSION}` should match the tag you push (e.g. bump `Chart.yaml` `version`/`appVersion` to `0.1.0` in the commit you tag).
+- That's it — no third-party registries, no cloud credentials. The chart's `appVersion` / image `tag` should match the tag you push (e.g. bump `Chart.yaml` `version`/`appVersion` to `0.1.0` in the commit you tag); the release workflow strips the leading `v` from the tag for the agent binary version.
 
 > Pre-tag dry run: build locally with `docker build -f deploy/server.Dockerfile -t polyptic-server:test .` and `bash deploy/build-agent.sh amd64` to confirm both artifacts build before you ever push a tag.
 
@@ -220,7 +209,7 @@ What it needs before it can succeed (you set these up when you're ready, not bef
 
 ## (d) Self-hosted npm — OPTIONAL, and only if you want it
 
-**You do not need this to deploy Polyptic.** The `@polyptic/*` workspace packages (`@polyptic/protocol`, `@polyptic/server`, `@polyptic/console`, `@polyptic/player`, `@polyptic/agent`) are **internal to the product**: they are wired together inside the monorepo and shipped *as* the Docker image and the `.deb`. You deploy the image and the package — you never `npm install @polyptic/server` to run Polyptic. So **publishing to any npm registry is entirely optional**, and **nothing is published until you deliberately choose to.**
+**You do not need this to deploy Polyptic.** The `@polyptic/*` workspace packages (`@polyptic/protocol`, `@polyptic/server`, `@polyptic/console`, `@polyptic/player`, `@polyptic/agent`) are **internal to the product**: they are wired together inside the monorepo and shipped *as* the Docker image and the depot-served agent binary. You deploy the image and the binary — you never `npm install @polyptic/server` to run Polyptic. So **publishing to any npm registry is entirely optional**, and **nothing is published until you deliberately choose to.**
 
 You'd only want a registry if your org wants to **consume these packages elsewhere** — e.g. a separate internal tool that imports `@polyptic/protocol`'s zod contracts, or you split a package out of the monorepo later. If that day comes, here are the two sane paths.
 
@@ -265,7 +254,7 @@ npm publish        # uses publishConfig.registry + the scoped .npmrc above
 
 If you want the registry **entirely under your control** — air-gapped, on your own host, no GitHub dependency — run **[Verdaccio](https://verdaccio.org/)**, a lightweight self-hosted npm registry and caching proxy. In one paragraph: `docker run -d -p 4873:4873 -v verdaccio-storage:/verdaccio/storage verdaccio/verdaccio` stands it up; create a user with `npm adduser --registry http://your-host:4873`; point the scope at it with `.npmrc` line `@polyptic:registry=http://your-host:4873`; then `npm publish --registry http://your-host:4873`. Verdaccio transparently proxies the public npm registry for everything *not* under `@polyptic`, so a single registry URL serves both your private scope and public deps. Put TLS + auth in front of it for anything beyond a trusted LAN. This is the right choice when policy forbids storing packages on GitHub; otherwise GitHub Packages is less to operate.
 
-**Either way: this is opt-in.** Until you add `publishConfig` and run `npm publish` (or set up a publish workflow), the `@polyptic/*` packages stay inside the monorepo and ship only as the image and the `.deb`.
+**Either way: this is opt-in.** Until you add `publishConfig` and run `npm publish` (or set up a publish workflow), the `@polyptic/*` packages stay inside the monorepo and ship only as the image and the depot-served agent binary.
 
 ---
 

@@ -1,8 +1,8 @@
 /**
  * Argument parsing + usage for `polyptic-agent setup`.
  *
- * Fully non-interactive (suits cloud-init / Ansible / a `.deb` postinst); every run is idempotent so
- * there is nothing to confirm. `--dry-run` previews the whole provision without touching the box.
+ * Fully non-interactive (the zero-touch depot installer / Ansible run it, D41); every run is idempotent
+ * so there is nothing to confirm. `--dry-run` previews the whole provision without touching the box.
  */
 
 export type Backend = "wayland-sway" | "x11-i3" | "dev-open";
