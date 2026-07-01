@@ -35,9 +35,8 @@ curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -s -- --
 ```
 
 The script bakes the control-plane URL in from the host you curled, writes `/etc/polyptic/agent.toml`
-(`server_url`, `bootstrap_token`), installs a `systemd` service, and starts the agent. The classic path
-is equivalent: `sudo apt install ./polyptic-agent_*.deb` then `sudo polyptic-agent setup --server-url
-ws://CONTROL_PLANE:8080/agent --bootstrap-token <token> [--output DP-1=1920x1080@0,0]`.
+(`server_url`, `bootstrap_token`), installs a `systemd` service, and starts the agent. It is the **only**
+supported way to install the agent (D41) — there is no standalone package to `apt install`.
 
 The agent identifies the machine by **`/etc/machine-id`**, so every box is distinct automatically. To
 advertise more than one output, set `POLYPTIC_OUTPUTS="HDMI-1,HDMI-2"` (or repeat `--output` in `setup`).

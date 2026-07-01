@@ -43,16 +43,19 @@ RUN cd packages/protocol && bun run build
 RUN cd packages/console && bun run build
 RUN cd packages/player && bun run build
 
-# ── Air-gap depot: compile the agent single binary for BOTH arches ───────────
-# The control plane serves these at GET /dist/agent/<arch> for zero-touch edge provisioning
-# (deploy/install.sh downloads the one matching the box's uname -m). Bun cross-compiles the runtime
-# INTO each binary, so this one image build produces amd64 AND arm64 — no per-arch build host.
-# (We invoke `bun build --compile` directly rather than deploy/build-agent.sh because the latter
-# also packages .deb/.rpm via nfpm, which isn't present in this image; the compile step is identical.)
+# ── Zero-touch depot: compile the agent single binary for BOTH arches ─────────
+# The agent is delivered ONLY via this depot (D35/D41): the control plane serves these at
+# GET /dist/agent/<arch> and deploy/install.sh downloads the one matching the box's uname -m. Bun
+# cross-compiles the runtime INTO each binary, so this one image build produces amd64 AND arm64 — no
+# per-arch build host. (Same `bun build --compile` as deploy/build-agent.sh, inlined here.)
+# The version is baked in at compile time (POLYPTIC_VERSION build-arg → `--define`): the standalone
+# binary can't read package.json off disk, and it's what the boot splash + agent/hello report (POL-7).
+ARG POLYPTIC_VERSION=0.0.0
 RUN mkdir -p /app/deploy/dist \
- && bun build --compile --minify --target=bun-linux-x64 \
+ && AGENT_VER="${POLYPTIC_VERSION#v}" \
+ && bun build --compile --minify --define "process.env.POLYPTIC_BUILD_VERSION=\"$AGENT_VER\"" --target=bun-linux-x64 \
       --outfile /app/deploy/dist/polyptic-agent-amd64 packages/agent/src/index.ts \
- && bun build --compile --minify --target=bun-linux-arm64 \
+ && bun build --compile --minify --define "process.env.POLYPTIC_BUILD_VERSION=\"$AGENT_VER\"" --target=bun-linux-arm64 \
       --outfile /app/deploy/dist/polyptic-agent-arm64 packages/agent/src/index.ts \
  && chmod 0755 /app/deploy/dist/polyptic-agent-amd64 /app/deploy/dist/polyptic-agent-arm64
 
