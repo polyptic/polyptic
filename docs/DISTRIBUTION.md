@@ -105,14 +105,12 @@ On a target box (Ubuntu Server-minimal), as a sudo user:
 # agent only (headless enrol; fully air-gapped) — downloads the binary, writes config, enrols:
 curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN="$POLYPTIC_BOOTSTRAP_TOKEN" sh -
 
-# agent + the greetd/sway/Chromium kiosk substrate (the visual wall):
+# agent + the greetd/sway/Chromium kiosk substrate (the visual wall) — auto-reboots into it when done:
 curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN="$POLYPTIC_BOOTSTRAP_TOKEN" sh -s -- --kiosk
-
-# then cold-boot into the kiosk:
-sudo reboot
+#   add --no-reboot to wire the kiosk but reboot yourself later
 ```
 
-The installer downloads the arch-matched binary from `GET /dist/agent/<arch>`, installs it, and (with `--kiosk`) runs `polyptic-agent setup` to wire the zero-click chain (greetd autologin → sway → agent → Chromium-per-output, plus the boot splash). The box cold-boots and dials home; it shows **PENDING** in the console until an operator **Approves** it. Per-box config lives in `/etc/polyptic/agent.toml` (`systemctl restart polyptic-agent` or re-run the installer / `sudo polyptic-agent setup` to apply). Drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode. The full device story — backends, multi-output placement, crash hardening, troubleshooting, the UTM/VM walkthrough — is in **`docs/DEPLOY.md`**; the depot internals (what the server serves, how the binary is baked, air-gap bundles) are in **(b2)** below.
+The installer downloads the arch-matched binary from `GET /dist/agent/<arch>`, installs it, and (with `--kiosk`) runs `polyptic-agent setup` to wire the zero-click chain (greetd autologin → sway → agent → Chromium-per-output, plus the boot splash), then **auto-reboots** so the box cold-boots straight into the kiosk (`--no-reboot`/`POLYPTIC_NO_REBOOT=1` opts out; the agent-only install never reboots). The box cold-boots and dials home; it shows **PENDING** in the console until an operator **Approves** it. Per-box config lives in `/etc/polyptic/agent.toml` (`systemctl restart polyptic-agent` or re-run the installer / `sudo polyptic-agent setup` to apply). Drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode. The full device story — backends, multi-output placement, crash hardening, troubleshooting, the UTM/VM walkthrough — is in **`docs/DEPLOY.md`**; the depot internals (what the server serves, how the binary is baked, air-gap bundles) are in **(b2)** below.
 
 > **Build the binary yourself** (to seed a depot without building the whole server image, or for an arch CI doesn't build): `bash deploy/build-agent.sh amd64` on a host with `bun` produces `deploy/dist/polyptic-agent-amd64`; point the server's `AGENT_DIST_DIR` at `deploy/dist`.
 

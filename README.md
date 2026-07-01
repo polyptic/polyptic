@@ -86,11 +86,12 @@ The control plane *is* the depot — an edge box needs to reach **only your serv
 curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -
 
 # full kiosk — substrate (sway/greetd/Chromium) from the server's bundle,
-# falling back to the distro's package manager only on an un-bundled distro with internet:
+# falling back to the distro's package manager only on an un-bundled distro with internet.
+# Auto-reboots into the kiosk when done (add --no-reboot to reboot yourself):
 curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -s -- --kiosk
 ```
 
-The script bakes in the control-plane URL from the host you curled and downloads the agent binary from the server (`GET /dist/agent/<arch>`). The server bundles the substrate `.deb`s for a supported distro (Ubuntu latest); `--kiosk` prefers that bundle and only reaches the internet when the box is on a distro you haven't bundled. This depot one-liner is the **only** way to install an agent — there is no standalone `.deb`/`.rpm` to `apt install` (D41). See `docs/DEPLOY.md`.
+The script bakes in the control-plane URL from the host you curled and downloads the agent binary from the server (`GET /dist/agent/<arch>`). The server bundles the substrate `.deb`s for a supported distro (Ubuntu latest); `--kiosk` prefers that bundle and only reaches the internet when the box is on a distro you haven't bundled. With `--kiosk` it **auto-reboots** at the end so the box cold-boots straight into content (`--no-reboot` opts out; the agent-only install never reboots). This depot one-liner is the **only** way to install an agent — there is no standalone `.deb`/`.rpm` to `apt install` (D41). See `docs/DEPLOY.md`.
 
 Once provisioned, a box **dials in and waits to be approved**. The operator journey from there —
 **enrol → approve → ident the panels to name them → place on a mural → assign content** — is point-and-confirm (a guided **Cold-start wizard** in the console walks you through it). Full step-by-step:

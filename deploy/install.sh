@@ -45,6 +45,15 @@ KIOSK="${POLYPTIC_KIOSK:-0}"
 # (a true air-gap) instead of the default online package-manager install.
 OFFLINE="${POLYPTIC_OFFLINE:-0}"
 
+# --no-reboot / POLYPTIC_NO_REBOOT=1 → do NOT auto-reboot after a --kiosk install. A fresh box only
+# renders the kiosk once it cold-boots (greetd autologin → sway → agent → browser), so by default we
+# finish the job and reboot. Opt out to reboot on your own schedule (Stage-A-only never reboots).
+NO_REBOOT="${POLYPTIC_NO_REBOOT:-0}"
+
+# Grace period (whole seconds) before the post-kiosk auto-reboot — a window to Ctrl-C at a console.
+# 0 (or non-numeric) reboots with no countdown. Overridable with POLYPTIC_REBOOT_DELAY.
+REBOOT_DELAY="${POLYPTIC_REBOOT_DELAY:-5}"
+
 # Kiosk runtime browser for Stage B (forwarded to `polyptic-agent setup --browser`). Default chromium
 # — the fleet engine the agent drives. On Ubuntu `polyptic-agent setup` pulls a REAL .deb Chromium
 # from the xtradeb PPA (never the snap); Debian/Fedora/Arch have a native chromium. POLYPTIC_BROWSER=
@@ -130,6 +139,19 @@ write_file() {
   rm -f "$_tmp" 2>/dev/null || true
 }
 
+# reboot_now — trigger a system reboot through whatever tool the box has. Best-effort fallbacks so a
+# minimal image still reboots. Returns non-zero (never exits) if nothing worked, so the caller warns.
+reboot_now() {
+  if command -v systemctl >/dev/null 2>&1; then
+    $SUDO systemctl reboot && return 0
+  fi
+  if command -v reboot >/dev/null 2>&1; then
+    $SUDO reboot && return 0
+  fi
+  $SUDO shutdown -r now && return 0
+  return 1
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,14 +167,17 @@ Flags:
   --offline                     install the Stage-B substrate from the server's bundled .debs
                                 (a true air-gap) instead of the default online package manager
   --output CONN[=WxH][@X,Y]     pin a compositor output (repeatable); forwarded to setup
+  --no-reboot                   don't auto-reboot after --kiosk (reboot yourself when ready)
   -h, --help                    show this help
 
 Env:
-  POLYPTIC_TOKEN   one-time enrolment bootstrap token (server GATED mode)
-  POLYPTIC_KIOSK   set to 1 for the substrate (same as --kiosk)
-  POLYPTIC_OFFLINE set to 1 for the air-gap bundle install (same as --offline)
-  POLYPTIC_BROWSER kiosk browser for --kiosk: surf (default) | cog | chromium
-  POLYPTIC_BASE    override the baked-in control-plane base URL
+  POLYPTIC_TOKEN        one-time enrolment bootstrap token (server GATED mode)
+  POLYPTIC_KIOSK        set to 1 for the substrate (same as --kiosk)
+  POLYPTIC_OFFLINE      set to 1 for the air-gap bundle install (same as --offline)
+  POLYPTIC_BROWSER      kiosk browser for --kiosk: surf (default) | cog | chromium
+  POLYPTIC_BASE         override the baked-in control-plane base URL
+  POLYPTIC_NO_REBOOT    set to 1 to skip the post-kiosk auto-reboot (same as --no-reboot)
+  POLYPTIC_REBOOT_DELAY seconds to wait before the auto-reboot (default 5; 0 = immediate)
 EOF
 }
 
@@ -160,6 +185,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --kiosk) KIOSK="1" ;;
     --offline) OFFLINE="1" ;;
+    --no-reboot) NO_REBOOT="1" ;;
     --output)
       [ $# -ge 2 ] || die "--output expects a value, e.g. --output DP-1=1920x1080@0,0"
       OUTPUT_ARGS="${OUTPUT_ARGS} --output $2"; shift ;;
@@ -445,13 +471,36 @@ $SUDO systemctl disable --now polyptic-agent.service 2>/dev/null || true
 
 log "Done (Stage A + Stage B — kiosk)."
 cat >&2 <<EOF
-  • binary  : ${BIN_PATH}
+  • binary   : ${BIN_PATH}
   • substrate: sway + greetd + ${BROWSER} + grim + wayvnc + dbus + fonts
-  • wiring  : polyptic-agent setup (greetd autologin → sway → user agent → ${BROWSER}-per-output)
-  • next    : sudo reboot   # cold-boot into the kiosk; approve the box in the console
+  • wiring   : polyptic-agent setup (greetd autologin → sway → user agent → ${BROWSER}-per-output)
 
 Logs after reboot:
   • session : journalctl -b -u greetd
   • agent   : journalctl --user -u polyptic-agent   (run inside the kiosk session)
 EOF
+
+# ── B5. Cold-boot into the kiosk ─────────────────────────────────────────────
+# A fresh box only renders the kiosk after a reboot (greetd autologin → sway → agent → browser). The
+# zero-touch contract is "power on → content", so finish the job and reboot. --no-reboot
+# (POLYPTIC_NO_REBOOT=1) opts out for operators who want to reboot on their own schedule.
+if [ "$NO_REBOOT" = "1" ]; then
+  log "Skipping auto-reboot (--no-reboot). Cold-boot into the kiosk when ready:  sudo reboot"
+  exit 0
+fi
+
+step "B5: rebooting to cold-boot into the kiosk (--no-reboot to skip)"
+if [ "${REBOOT_DELAY:-0}" -gt 0 ] 2>/dev/null; then
+  warn "auto-reboot in ${REBOOT_DELAY}s — press Ctrl-C now to cancel (then reboot yourself: sudo reboot)"
+  _n="$REBOOT_DELAY"
+  while [ "$_n" -gt 0 ]; do
+    printf '\033[1;33m[polyptic]\033[0m   rebooting in %ss…\r' "$_n" >&2
+    sleep 1
+    _n=$((_n - 1))
+  done
+  printf '\n' >&2
+fi
+log "rebooting now"
+reboot_now || die "could not trigger a reboot automatically — reboot manually to cold-boot the kiosk: sudo reboot"
+# The box is going down now; nothing past here runs.
 exit 0
