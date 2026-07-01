@@ -141,6 +141,8 @@ interface EnsureScreensResult {
   assignments: ScreenAssignment[];
   newScreens: Screen[];
   touchedSlices: ScreenSlice[];
+  /** Ids of stale UNUSED screens pruned because the machine no longer advertises their connector. */
+  prunedScreenIds: string[];
   changed: boolean;
 }
 
@@ -438,6 +440,7 @@ export class ControlPlane {
     const assignments: ScreenAssignment[] = [];
     const newScreens: Screen[] = [];
     const touchedSlices: ScreenSlice[] = [];
+    const prunedScreenIds: string[] = [];
 
     for (const output of outputs) {
       let screen = this.state.screens.find(
@@ -482,10 +485,52 @@ export class ControlPlane {
       });
     }
 
-    return { assignments, newScreens, touchedSlices, changed };
+    // POL-9 — reconcile away stale, UNUSED screens for connectors this machine no longer advertises,
+    // so a connector-name change (a guessed phantom → the real name, or a hotplug) doesn't leave a
+    // straggler. Guards that keep this safe:
+    //   - Only when a NON-EMPTY set is advertised. An empty advertise means "no compositor yet / no
+    //     info" (the POL-9 headless Stage-A case), NOT "these outputs are gone" — so we must never
+    //     wipe on it.
+    //   - Only screens that are genuinely UNUSED (never placed, not in a wall, no surfaces, no
+    //     library source). A phantom carries no operator work; anything in use is left untouched so a
+    //     transient compositor flap can never silently destroy a layout.
+    if (outputs.length > 0) {
+      const advertised = new Set(outputs.map((o) => o.connector));
+      const stale = this.state.screens.filter(
+        (s) =>
+          s.machineId === machineId &&
+          !advertised.has(s.connector) &&
+          this.isScreenUnused(s.id),
+      );
+      for (const screen of stale) {
+        const idx = this.state.screens.findIndex((s) => s.id === screen.id);
+        if (idx >= 0) this.state.screens.splice(idx, 1);
+        delete this.state.slices[screen.id];
+        this.screenSourceIds.delete(screen.id);
+        prunedScreenIds.push(screen.id);
+        changed = true;
+      }
+    }
+
+    return { assignments, newScreens, touchedSlices, prunedScreenIds, changed };
   }
 
-  /** Write-through newly created screens + their (empty) content rows. */
+  /**
+   * Is a screen genuinely UNUSED — i.e. safe to prune when its machine stops advertising the
+   * connector (POL-9)? Unused = not placed on any mural, not a member of a video wall, has no
+   * surfaces on its slice, and carries no library-source assignment. A guessed phantom is unused;
+   * any screen an operator has actually configured is NOT, and is never pruned out from under them.
+   */
+  private isScreenUnused(screenId: string): boolean {
+    if (this.placements.has(screenId)) return false;
+    if (this.screenSourceIds.has(screenId)) return false;
+    if (this.getWallForScreen(screenId)) return false;
+    const slice = this.state.slices[screenId];
+    if (slice && slice.surfaces.length > 0) return false;
+    return true;
+  }
+
+  /** Write-through newly created screens + their (empty) content rows, and drop any pruned ones. */
   private async persistScreens(result: EnsureScreensResult): Promise<void> {
     for (const s of result.newScreens) {
       await this.store.upsertScreen({
@@ -501,6 +546,10 @@ export class ControlPlane {
         canvas: slice.canvas,
         surfaces: slice.surfaces,
       });
+    }
+    for (const screenId of result.prunedScreenIds) {
+      await this.store.deleteContent(screenId);
+      await this.store.deleteScreen(screenId);
     }
   }
 

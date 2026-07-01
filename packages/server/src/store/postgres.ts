@@ -442,6 +442,11 @@ export class PostgresStore implements Store {
     `;
   }
 
+  async deleteScreen(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM screens WHERE id = ${id}`;
+  }
+
   async upsertContent(content: PersistedContent): Promise<void> {
     const sql = this.sql;
     await sql`
@@ -457,6 +462,11 @@ export class PostgresStore implements Store {
         surfaces  = EXCLUDED.surfaces,
         source_id = EXCLUDED.source_id
     `;
+  }
+
+  async deleteContent(screenId: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM screen_content WHERE screen_id = ${screenId}`;
   }
 
   async setRevision(revision: number): Promise<void> {

@@ -79,8 +79,16 @@ export class MemoryStore implements Store {
     this.screens.set(screen.id, clone(screen));
   }
 
+  async deleteScreen(id: string): Promise<void> {
+    this.screens.delete(id);
+  }
+
   async upsertContent(content: PersistedContent): Promise<void> {
     this.content.set(content.screenId, clone(content));
+  }
+
+  async deleteContent(screenId: string): Promise<void> {
+    this.content.delete(screenId);
   }
 
   async setRevision(revision: number): Promise<void> {

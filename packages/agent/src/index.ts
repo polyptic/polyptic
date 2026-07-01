@@ -20,10 +20,9 @@
  *   - `POLYPTIC_OUTPUTS` (comma-separated connector names, e.g. "HDMI-1,HDMI-2,HDMI-3") makes a
  *     single agent advertise one 1920×1080 output per connector, so one `bun run dev` yields ≥2
  *     screens to drag into a wall. Blanks are trimmed/skipped and duplicates de-duped. When unset,
- *     the agent advertises the single default output (POLYPTIC_CONNECTOR or the default connector),
- *     exactly as before.
+ *     the advertised outputs come from discovery (see the next block), not a fixed default.
  *
- * Output auto-discovery — advertise the compositor's REAL outputs:
+ * Output auto-discovery — advertise the compositor's REAL outputs (see ./outputs.ts):
  *   - The agent sits right next to the compositor, so by default it ASKS it which outputs exist
  *     (`DisplayBackend.discoverOutputs()` → sway `get_outputs` / xrandr) and advertises THOSE real
  *     connector names — retrying briefly because sway may still be warming up at hello time. This
@@ -31,7 +30,11 @@
  *     connector that doesn't exist (e.g. the guessed "HDMI-1" vs QEMU's actual "Virtual-1").
  *   - `POLYPTIC_OUTPUTS` / a non-empty `POLYPTIC_CONNECTOR` remain an explicit OVERRIDE/pin: when set
  *     they are honoured verbatim (the Phase 3c multi-output dev path is unchanged). dev-open (no
- *     compositor) and any failed discovery fall back to the configured/default connector, as before.
+ *     compositor) falls back to the configured/default connector, as before.
+ *   - POL-9: a REAL backend with NO override whose compositor reports nothing (it isn't up yet —
+ *     e.g. the headless Stage-A system agent enrolling before Stage B installs/starts sway) advertises
+ *     ZERO outputs, NOT a guessed default. A wrong-named placeholder screen breaks placement and
+ *     lingers next to the real panels once the kiosk agent later advertises them.
  *
  * Phase 2b — enrollment + durable credential (app-level identity; mTLS is a later layer):
  *   - `POLYPTIC_BOOTSTRAP_TOKEN` (if set) is sent on `agent/hello` for first-contact enrollment.
@@ -60,6 +63,7 @@ import { fileURLToPath } from "node:url";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,9 +82,6 @@ const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 10_000;
 /** After a `server/rejected`, retry slowly so a rejected/unapproved machine never hammers. */
 const REJECT_BACKOFF_MS = 60_000;
-
-/** Default advertised connector when `POLYPTIC_CONNECTOR` is unset. */
-const DEFAULT_CONNECTOR = "HDMI-1";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -108,125 +109,6 @@ function readMachineId(): string {
     // not present (e.g. macOS dev host)
   }
   return "dev-mac";
-}
-
-/**
- * The advertised connector for this agent's single output. Overridable via
- * `POLYPTIC_CONNECTOR` so two agents on one box present distinct screens.
- * Phase 1/2a remain a single fixed 1080p output.
- */
-function resolveConnector(): string {
-  const override = process.env.POLYPTIC_CONNECTOR?.trim();
-  return override && override.length > 0 ? override : DEFAULT_CONNECTOR;
-}
-
-/**
- * This machine's outputs.
- *
- * Phase 3c: if `POLYPTIC_OUTPUTS` is set (comma-separated connector names) this agent advertises
- * one 1920×1080 output per connector — so a single `bun run dev` can yield ≥2 screens for a local
- * video-wall demo. Blank entries are trimmed/skipped and duplicates de-duped (first wins). If the
- * variable is unset or yields no usable connector, fall back to the single default output on the
- * resolved connector — Phase 1/2a behaviour, unchanged.
- */
-function resolveOutputs(defaultConnector: string): Output[] {
-  const raw = process.env.POLYPTIC_OUTPUTS;
-  if (raw !== undefined) {
-    const seen = new Set<string>();
-    const outputs: Output[] = [];
-    for (const part of raw.split(",")) {
-      const connector = part.trim();
-      if (connector.length === 0 || seen.has(connector)) continue;
-      seen.add(connector);
-      outputs.push({ connector, width: 1920, height: 1080 });
-    }
-    if (outputs.length > 0) return outputs;
-  }
-  return [{ connector: defaultConnector, width: 1920, height: 1080 }];
-}
-
-/** Geometry advertised for a discovered output whose exact mode we don't (yet) re-query. */
-const DISCOVERED_OUTPUT_WIDTH = 1920;
-const DISCOVERED_OUTPUT_HEIGHT = 1080;
-/** Short retry while the compositor (launched alongside the agent) finishes warming up (~5s). */
-const DISCOVERY_ATTEMPTS = 5;
-const DISCOVERY_RETRY_MS = 1_000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Has the operator/dev pinned the advertised outputs explicitly? `POLYPTIC_OUTPUTS` (any value,
- * including the Phase 3c multi-output dev path) or a non-empty `POLYPTIC_CONNECTOR` is treated as an
- * OVERRIDE and honoured verbatim — discovery is then skipped so behaviour is exactly as before.
- */
-function hasExplicitOutputOverride(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.POLYPTIC_OUTPUTS !== undefined) return true;
-  const connector = env.POLYPTIC_CONNECTOR?.trim();
-  return connector !== undefined && connector.length > 0;
-}
-
-/**
- * Ask the backend's compositor what outputs really exist, retrying briefly: the agent is launched
- * by sway, but sway may still be warming up at hello time. Returns the real connector names, or
- * `null` if every attempt yielded nothing (compositor unavailable / no outputs).
- */
-async function discoverOutputsWithRetry(backend: DisplayBackend): Promise<string[] | null> {
-  for (let attempt = 1; attempt <= DISCOVERY_ATTEMPTS; attempt++) {
-    let names: string[] | null = null;
-    try {
-      names = await backend.discoverOutputs();
-    } catch (err) {
-      log(`output discovery attempt ${attempt}/${DISCOVERY_ATTEMPTS} errored: ${(err as Error).message}`);
-    }
-    if (names && names.length > 0) return names;
-    if (attempt < DISCOVERY_ATTEMPTS) await sleep(DISCOVERY_RETRY_MS);
-  }
-  return null;
-}
-
-/**
- * The outputs to advertise on `agent/hello`, in priority order:
- *   1. Explicit override (`POLYPTIC_OUTPUTS` / non-empty `POLYPTIC_CONNECTOR`) → honoured verbatim
- *      (Phase 2a/3c behaviour, unchanged).
- *   2. Otherwise PREFER discovery: ask the selected (real) backend for the compositor's REAL output
- *      names — with a short retry while it warms up — and advertise those.
- *   3. Otherwise (dev-open / discovery unavailable / all retries failed) → the configured/default
- *      single connector, exactly as before.
- */
-async function resolveAdvertisedOutputs(
-  backend: DisplayBackend,
-  defaultConnector: string,
-): Promise<Output[]> {
-  if (hasExplicitOutputOverride()) {
-    const outputs = resolveOutputs(defaultConnector);
-    log(
-      `advertising ${outputs.length} explicitly configured output(s): ${outputs
-        .map((o) => o.connector)
-        .join(", ")}`,
-    );
-    return outputs;
-  }
-
-  // Only a real backend sits next to a compositor we can interrogate. dev-open has none, so skip the
-  // (retrying) discovery entirely and advertise the configured/default connector — keeping dev
-  // startup instant.
-  if (backend.id !== "dev-open") {
-    const discovered = await discoverOutputsWithRetry(backend);
-    if (discovered && discovered.length > 0) {
-      log(`advertising ${discovered.length} discovered output(s): ${discovered.join(", ")}`);
-      return discovered.map((connector) => ({
-        connector,
-        width: DISCOVERED_OUTPUT_WIDTH,
-        height: DISCOVERED_OUTPUT_HEIGHT,
-      }));
-    }
-  }
-
-  const outputs = resolveOutputs(defaultConnector);
-  log(`no compositor outputs discovered; using configured/default connector ${defaultConnector}`);
-  return outputs;
 }
 
 /** The operator-configured enrollment secret, if any (server GATED mode). */
@@ -603,8 +485,9 @@ async function main(): Promise<void> {
   const connector = resolveConnector();
   const agentVersion = readAgentVersion();
   const backend = selectBackend();
-  // Prefer the compositor's REAL outputs over a guessed default (unless explicitly overridden).
-  const outputs = await resolveAdvertisedOutputs(backend, connector);
+  // Prefer the compositor's REAL outputs over a guessed default (unless explicitly overridden). A
+  // real backend whose compositor isn't up yet advertises ZERO outputs — no phantom screen (POL-9).
+  const outputs = await resolveAdvertisedOutputs(backend, connector, { log });
   const bootstrapToken = readBootstrapToken();
   const credential = loadCredential(machineId);
 
@@ -639,7 +522,11 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  logError(`fatal: ${(err as Error).message}`);
-  process.exit(1);
-});
+// Only auto-run when invoked as the entry point (`bun src/index.ts`), so importing this module for
+// tests doesn't dial the control plane.
+if (import.meta.main) {
+  main().catch((err) => {
+    logError(`fatal: ${(err as Error).message}`);
+    process.exit(1);
+  });
+}
