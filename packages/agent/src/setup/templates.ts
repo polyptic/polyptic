@@ -116,6 +116,13 @@ set -eu
 # Baked default for POLYPTIC_RENDER (from setup's --render); the session env still overrides it.
 : "\${POLYPTIC_RENDER:=${p.render}}"
 
+# POL-7: keep the VT clean during the boot-splash hand-off. greetd runs this launcher on a text VT
+# (console=tty0), so ANY stdout/stderr we or the compositor emit is drawn onto that console — right
+# over Plymouth's retained splash frame, before sway ever paints. Redirect it all to a logfile so the
+# retained splash stays untouched until the compositor takes the screen. Overridable for debugging.
+POLYPTIC_COMPOSITOR_LOG="\${POLYPTIC_COMPOSITOR_LOG:-/tmp/polyptic-compositor.log}"
+exec >>"\$POLYPTIC_COMPOSITOR_LOG" 2>&1 || true
+
 FAST_EXIT_SECS=8   # auto: a hardware run shorter than this counts as a GPU-render failure
 BACKOFF_SECS=2     # pause between relaunches so a hard crash-loop never pins the CPU
 

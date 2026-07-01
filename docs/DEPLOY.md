@@ -332,9 +332,15 @@ Common causes: a wrong/absent `--user-data-dir` (second window opened as a tab �
 
 ### Boot splash — console text still shows, or the logo is blank
 - **Console text instead of the splash:** the kernel cmdline is missing `quiet splash`. `cat /proc/cmdline`; if absent, confirm `/etc/default/grub` has them in `GRUB_CMDLINE_LINUX_DEFAULT`, run `sudo update-grub`, reboot. (On a Pi it's `/boot/firmware/cmdline.txt`.)
-- **Splash never appears / wrong theme:** `sudo plymouth-set-default-theme` should print `polyptic`. If not: `sudo plymouth-set-default-theme -R polyptic` (the `-R` rebuilds the initramfs — required).
+- **Wrong theme shows (the STOCK distro splash, not `polyptic`):** the theme wasn't embedded in the initramfs. The selector is `/etc/plymouth/plymouthd.conf` — confirm it has an **uncommented** `[Daemon]` section with `Theme=polyptic` (`cat /etc/plymouth/plymouthd.conf`), then rebuild and verify it landed:
+  ```bash
+  # dracut boxes (Ubuntu 25.10+/26.04): rebuild with dracut, NOT update-initramfs
+  sudo dracut -f && lsinitramfs /boot/initrd.img-$(uname -r) | grep polyptic
+  # initramfs-tools boxes (Ubuntu 24.04 LTS): sudo update-initramfs -u && lsinitramfs … | grep polyptic
+  ```
+  Re-running `sudo polyptic-agent setup` does all of this (writes plymouthd.conf, rebuilds dracut-first, verifies). **Note:** `plymouth-set-default-theme` **does not exist on Ubuntu 26.04** (dracut) — plymouthd.conf is the portable selector both builders read; don't rely on that helper.
 - **Logo blank but text/bar show:** the SVG wasn't rasterised to PNG (no `rsvg-convert`). `sudo apt install librsvg2-bin && sudo polyptic-agent setup` re-renders `/usr/share/plymouth/themes/polyptic/*.png`.
-- **A flash of console between splash and kiosk:** the retain-splash hand-off didn't apply. Check the drop-in `/etc/systemd/system/plymouth-quit.service.d/10-polyptic-retain-splash.conf` exists and `systemctl cat plymouth-quit.service` shows `--retain-splash`.
+- **A flash of console between splash and kiosk (compositor/sway text over the splash):** two guards must both be in place. (1) The retain-splash hand-off: the drop-in `/etc/systemd/system/plymouth-quit.service.d/10-polyptic-retain-splash.conf` exists and `systemctl cat plymouth-quit.service` shows `--retain-splash`. (2) The compositor launcher must not print to the VT — it redirects its own + the compositor's output to `/tmp/polyptic-compositor.log` (check the launcher `head /usr/local/bin/polyptic-compositor` has the `exec >>… 2>&1` line; read that log to debug the compositor itself).
 - **Wrong version/hostname on the stamp:** it's baked at provision time — re-run `sudo polyptic-agent setup` after a rename/upgrade (or push a live line with `plymouth message --text=…`).
 
 ### Greetd isn't autologging in
