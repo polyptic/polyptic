@@ -1,0 +1,14 @@
+<!--
+  Polyptic mark — canonical standalone icon (for light / on-light backgrounds).
+  Source of truth: packages/console/src/components/Logo.vue. Keep in sync with that component.
+  Holder = primary token (#18181b); panels = primary-fg token (#fafafa), side panels at 62% opacity.
+  Inner art is Logo.vue's 32x32 viewBox scaled to 76% and centred within the rounded holder.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="Polyptic">
+  <rect width="32" height="32" rx="8.64" fill="#18181b"/>
+  <g transform="translate(3.84 3.84) scale(0.76)">
+    <polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" fill="#fafafa" opacity=".62"/>
+    <polygon points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" fill="#fafafa" opacity=".62"/>
+    <rect x="13.1" y="8" width="5.8" height="16" fill="#fafafa"/>
+  </g>
+</svg>
