@@ -24,6 +24,8 @@ import type { ScreenView } from "@polyptic/protocol";
 
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
+import { reconcileNodes } from "./reconcileNodes";
+import type { NodeSpec } from "./reconcileNodes";
 import ScreenNode from "./ScreenNode.vue";
 import WallNode from "./WallNode.vue";
 import SelectionToolbar from "./SelectionToolbar.vue";
@@ -102,11 +104,11 @@ function buildWallData(wall: { id: string; memberScreenIds: string[] }, bounds: 
   };
 }
 
-/** Reconcile the Vue Flow node list with the store, mutating in place so the
- *  canvas doesn't lose drag/selection state on every server push. Combined
- *  surfaces become "wall" nodes spanning their members' union; the member
- *  screens themselves are NOT drawn as solo tiles (they render inside the wall). */
-function reconcile() {
+/** Build the DESIRED Vue Flow node specs from the store: one "screen" node per solo placed screen,
+ *  one "wall" node per combined surface (spanning its members' union). Members of a combined surface
+ *  are NOT drawn as solo tiles — they render inside the wall. reconcileNodes() then patches the live
+ *  node array to match, preserving identity so tiles diff in place instead of re-mounting. */
+function computeDesired(): NodeSpec[] {
   const muralId = store.activeMuralId;
   const placed = muralId ? store.placedScreens(muralId) : [];
   const walls = muralId ? store.wallsForMural(muralId) : [];
@@ -115,81 +117,55 @@ function reconcile() {
   // Screens drawn as solo tiles = placed screens that aren't members of a combined surface.
   const soloScreens = placed.filter((p) => !walledIds.has(p.screen.id));
 
-  // Every node id we still want present after this pass.
-  const wantedIds = new Set<string>([
-    ...soloScreens.map((p) => p.screen.id),
-    ...walls.map((w) => wallNodeId(w.id)),
-  ]);
-
-  // Drop nodes that are no longer wanted (unplaced, walled, or a vanished wall).
-  for (let i = nodes.value.length - 1; i >= 0; i--) {
-    const n = nodes.value[i];
-    if (n && !wantedIds.has(n.id)) nodes.value.splice(i, 1);
-  }
+  const specs: NodeSpec[] = [];
 
   // ── solo screen tiles ──
   for (const { screen, placement } of soloScreens) {
     const data = buildData(screen);
-    const pos = { x: placement.x * SCALE, y: placement.y * SCALE };
     const zIndex = data.identing ? 55 : data.selectedAlone ? 50 : data.selected ? 40 : 10;
-    const style = {
-      width: `${Math.max(placement.w * SCALE, MIN_TILE_W)}px`,
-      height: `${Math.max(placement.h * SCALE, MIN_TILE_H)}px`,
-      zIndex: String(zIndex),
-    };
-    const existing = nodes.value.find((n) => n.id === screen.id);
-    if (existing) {
-      existing.data = data;
-      existing.style = style;
-      // Don't yank a node out from under an in-progress drag.
-      if (!draggingIds.has(screen.id)) {
-        const cx = existing.position?.x ?? 0;
-        const cy = existing.position?.y ?? 0;
-        if (Math.abs(cx - pos.x) > 0.5 || Math.abs(cy - pos.y) > 0.5) existing.position = pos;
-      }
-    } else {
-      nodes.value.push({
-        id: screen.id,
-        type: "screen",
-        position: pos,
-        data,
-        style,
-        draggable: true,
-        selectable: true,
-      } as Node);
-    }
+    specs.push({
+      id: screen.id,
+      type: "screen",
+      position: { x: placement.x * SCALE, y: placement.y * SCALE },
+      data,
+      style: {
+        width: `${Math.max(placement.w * SCALE, MIN_TILE_W)}px`,
+        height: `${Math.max(placement.h * SCALE, MIN_TILE_H)}px`,
+        zIndex: String(zIndex),
+      },
+      draggable: true,
+      selectable: true,
+    });
   }
 
   // ── combined surface boxes ──
   for (const wall of walls) {
     const bounds = store.wallBounds(wall.id);
     if (!bounds) continue;
-    const nid = wallNodeId(wall.id);
     const data = buildWallData(wall, bounds);
-    const pos = { x: bounds.x * SCALE, y: bounds.y * SCALE };
     const zIndex = data.identing ? 56 : data.selected ? 46 : 12;
-    const style = {
-      width: `${bounds.w * SCALE}px`,
-      height: `${bounds.h * SCALE}px`,
-      zIndex: String(zIndex),
-    };
-    const existing = nodes.value.find((n) => n.id === nid);
-    if (existing) {
-      existing.data = data;
-      existing.style = style;
-      existing.position = pos;
-    } else {
-      nodes.value.push({
-        id: nid,
-        type: "wall",
-        position: pos,
-        data,
-        style,
-        draggable: false,
-        selectable: true,
-      } as Node);
-    }
+    specs.push({
+      id: wallNodeId(wall.id),
+      type: "wall",
+      position: { x: bounds.x * SCALE, y: bounds.y * SCALE },
+      data,
+      style: {
+        width: `${bounds.w * SCALE}px`,
+        height: `${bounds.h * SCALE}px`,
+        zIndex: String(zIndex),
+      },
+      draggable: false,
+      selectable: true,
+    });
   }
+
+  return specs;
+}
+
+/** Reconcile the Vue Flow node list with the store, mutating in place so the canvas doesn't re-mount
+ *  tiles (and lose drag/selection state, or flash) on every server push. */
+function reconcile() {
+  reconcileNodes(nodes.value, computeDesired(), { freezePosition: draggingIds });
 }
 
 watch(
