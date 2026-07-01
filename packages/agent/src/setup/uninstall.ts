@@ -93,6 +93,12 @@ function restoreDisplayManager(
   log.step("restore display manager + default target");
   sys.exec("systemctl", ["disable", "greetd"], { desc: "disable greetd", allowFail: true });
 
+  // Undo the getty@tty1 mask install applied to free VT1 for greetd, so a normal text login returns.
+  sys.exec("systemctl", ["unmask", "getty@tty1.service"], {
+    desc: "unmask getty@tty1 (restore the VT1 text login)",
+    allowFail: true,
+  });
+
   if (state.priorDisplayManager) {
     sys.exec("systemctl", ["enable", state.priorDisplayManager], {
       desc: `re-enable prior display manager ${state.priorDisplayManager}`,

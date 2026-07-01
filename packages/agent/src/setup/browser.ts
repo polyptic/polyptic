@@ -6,12 +6,12 @@
  * package that pulls the **snap** — confined, slow to cold-start, awkward `--user-data-dir` profiles
  * — exactly what a kiosk must avoid.
  *
- * So on Ubuntu this module does NOT silently grab a random PPA. It:
+ * So on Ubuntu this module resolves a REAL .deb, in priority order:
  *   1. uses an existing non-snap Chromium/Chrome if one is already present;
- *   2. installs from `--chromium-deb <path|url>` if given;
+ *   2. installs from `--chromium-deb <path|url>` if given (the air-gap / vendored path);
  *   3. adds `--chromium-ppa <ppa>` (a real .deb source) if given, then installs `chromium-browser`;
- *   4. otherwise warns with an actionable message and flags it for verification — provisioning of the
- *      rest of the box still completes.
+ *   4. otherwise defaults to the **xtradeb PPA** (`ppa:xtradeb/apps`), which ships a real .deb
+ *      Chromium for Ubuntu on amd64 + arm64 (verified on 26.04/arm64) — NEVER the snap.
  *
  * `--browser surf` installs the suckless WebKitGTK `surf` kiosk browser instead — the Ubuntu .deb
  * kiosk browser where Chromium is snap-only and cog isn't packaged. `--browser cog` installs the
@@ -155,13 +155,23 @@ export function installBrowser(
     return;
   }
 
-  // apt + Ubuntu and nothing usable: don't silently install the snap. Be loud + actionable.
-  const msg =
-    "Ubuntu ships Chromium only as a confined snap, which D27 says to avoid for kiosks. " +
-    "No real .deb was found and neither --chromium-deb nor --chromium-ppa was given. " +
-    "Re-run with one of: `--chromium-ppa ppa:<vendor>/<repo>` (a PPA that ships a real .deb), " +
-    "`--chromium-deb <path-or-url-to-.deb>`, or `--browser cog` (WPE fallback). " +
-    "All other provisioning completed; only the browser is unresolved.";
-  log.warn(msg);
-  needsVerification.push(`Install a .deb Chromium on Ubuntu (snap avoided per D27): ${msg}`);
+  // apt + Ubuntu: Ubuntu's own chromium/chromium-browser packages are the confined snap (D27). The
+  // xtradeb PPA ships a REAL .deb Chromium for Ubuntu (amd64 + arm64) — verified on 26.04/arm64
+  // (Chromium 149 at /usr/bin/chromium, NOT /snap; renders the player fullscreen with --disable-gpu
+  // on a no-3D virtio-gpu). Default to it. --chromium-deb / --chromium-ppa above override (e.g. a
+  // vendored .deb for air-gapped boxes, or a different real-.deb PPA).
+  const ppa = "ppa:xtradeb/apps";
+  sys.exec("apt-get", ["install", "-y", "software-properties-common"], {
+    desc: "install add-apt-repository helper",
+    env: { DEBIAN_FRONTEND: "noninteractive" },
+  });
+  sys.exec("add-apt-repository", ["-y", ppa], { desc: `add ${ppa} (real .deb Chromium for Ubuntu)` });
+  sys.exec("apt-get", ["update"], { desc: "refresh package lists after adding the PPA" });
+  sys.exec("apt-get", ["install", "-y", "chromium"], {
+    desc: `install real .deb chromium from ${ppa}`,
+    env: { DEBIAN_FRONTEND: "noninteractive" },
+  });
+  needsVerification.push(
+    `Confirm chromium resolved to the .deb from ${ppa} (NOT the snap): \`readlink -f "$(command -v chromium)"\` must not point into /snap. ${ppa} is single-maintainer — for a locked supply chain pass --chromium-deb <vendored .deb>.`,
+  );
 }

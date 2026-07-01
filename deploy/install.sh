@@ -45,10 +45,11 @@ KIOSK="${POLYPTIC_KIOSK:-0}"
 # (a true air-gap) instead of the default online package-manager install.
 OFFLINE="${POLYPTIC_OFFLINE:-0}"
 
-# Kiosk runtime browser for Stage B (forwarded to `polyptic-agent setup --browser`). Default surf
-# (suckless WebKitGTK) — the real .deb kiosk browser on Ubuntu/arm64, where Chromium is snap-only
-# and cog isn't packaged (D27). POLYPTIC_BROWSER=chromium|cog overrides on the curl line.
-BROWSER="${POLYPTIC_BROWSER:-surf}"
+# Kiosk runtime browser for Stage B (forwarded to `polyptic-agent setup --browser`). Default chromium
+# — the fleet engine the agent drives. On Ubuntu `polyptic-agent setup` pulls a REAL .deb Chromium
+# from the xtradeb PPA (never the snap); Debian/Fedora/Arch have a native chromium. POLYPTIC_BROWSER=
+# surf|cog overrides on the curl line (legacy WebKit fallbacks).
+BROWSER="${POLYPTIC_BROWSER:-chromium}"
 
 # Install locations.
 BIN_PATH="/usr/local/bin/polyptic-agent"
@@ -338,6 +339,7 @@ fi
 step "B1: provisioning the visual substrate (--kiosk)"
 
 SUBSTRATE_DONE="0"
+SETUP_SKIP_DEPS="--skip-deps"   # offline default; the online branch clears it so setup installs deps
 
 if [ "$OFFLINE" = "1" ]; then
   # ── B2a. OFFLINE / AIR-GAP: install the server's bundled .debs (no internet) ──
@@ -393,6 +395,7 @@ if [ "$OFFLINE" = "1" ]; then
       || $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB_DIR"/*.deb \
       || die "apt-get failed installing the bundled substrate .debs (see output above)"
     SUBSTRATE_DONE="1"
+    SETUP_SKIP_DEPS="--skip-deps"   # offline: the bundle already installed the substrate + browser
     log "substrate installed offline from the server bundle"
 
   elif [ "$CODE" = "404" ]; then
@@ -404,52 +407,19 @@ if [ "$OFFLINE" = "1" ]; then
     die "unexpected HTTP ${CODE} probing the substrate bundle at ${MANIFEST_URL}"
   fi
 else
-  # ── B2b. ONLINE (default): install substrate + browser from the distro package manager ──
-  step "B1: installing the substrate online via the distro package manager"
-  # Install BOTH the substrate and the kiosk browser ($BROWSER, default surf). On Ubuntu/arm64 surf
-  # is the real .deb kiosk browser — Chromium is snap-only and cog isn't packaged (D27).
-  install_online() {
-    case "$DISTRO_ID" in
-      ubuntu|debian)
-        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
-        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          sway greetd grim wayvnc dbus-user-session fonts-dejavu-core "$BROWSER"
-        ;;
-      fedora|rhel|centos|rocky|almalinux)
-        $SUDO dnf install -y sway greetd grim wayvnc dbus-daemon dejavu-sans-fonts "$BROWSER"
-        ;;
-      arch|archarm|manjaro)
-        $SUDO pacman -Sy --noconfirm sway greetd grim wayvnc dbus "$BROWSER" ttf-dejavu
-        ;;
-      *)
-        case "$DISTRO_LIKE" in
-          *debian*)
-            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
-            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              sway greetd grim wayvnc dbus-user-session fonts-dejavu-core "$BROWSER" ;;
-          *fedora*|*rhel*)
-            $SUDO dnf install -y sway greetd grim wayvnc dbus-daemon dejavu-sans-fonts "$BROWSER" ;;
-          *arch*)
-            $SUDO pacman -Sy --noconfirm sway greetd grim wayvnc dbus "$BROWSER" ttf-dejavu ;;
-          *)
-            return 3 ;;
-        esac
-        ;;
-    esac
-  }
+  # ── B2b. ONLINE (default): let `polyptic-agent setup` install the substrate + real .deb browser. ──
+  # setup's installDeps knows the per-distro package set (sway/greetd/grim/wayvnc/dbus/fonts) AND the
+  # Ubuntu snap-Chromium gotcha — on Ubuntu it pulls a REAL .deb Chromium from the xtradeb PPA, never
+  # the snap. Delegating keeps ONE source of truth (no duplicated package lists in this bootstrap).
+  step "B1: online — 'polyptic-agent setup' will install the substrate + browser"
   if ! has_internet; then
     die "no internet on this box and --offline was not given.
-     Either: (a) give this box one-time internet so the online apt/dnf/pacman install can run; or
+     Either: (a) give this box one-time internet so the online install can run; or
      (b) re-run with --offline and bundle this distro on the server (deploy/bundle-deps.sh)."
   fi
-  if install_online; then
-    SUBSTRATE_DONE="1"
-    log "substrate installed online via the distro package manager (browser: ${BROWSER})"
-  else
-    die "no known online package recipe for distro '${DISTRO_ID}'. Install
-     sway greetd ${BROWSER} grim wayvnc dbus + fonts by hand, then re-run with --kiosk; or
-     re-run with --offline and add a server bundle with deploy/bundle-deps.sh."
-  fi
+  SUBSTRATE_DONE="1"           # setup (below, WITHOUT --skip-deps) installs the substrate + browser
+  SETUP_SKIP_DEPS=""
+  log "online: substrate + browser will be installed by 'polyptic-agent setup'"
 fi
 
 [ "$SUBSTRATE_DONE" = "1" ] || die "substrate provisioning did not complete"
@@ -457,9 +427,9 @@ fi
 # ── B3. Hand off to the agent's setup CLI for the greetd/sway/browser wiring ──
 # Dependencies are present now, so --skip-deps. setup writes its own agent.toml + the session
 # units (greetd autologin → sway → systemd --user polyptic-agent.service → browser-per-output).
-step "B3: wiring the kiosk via 'polyptic-agent setup --skip-deps'"
+step "B3: wiring the kiosk via 'polyptic-agent setup'${SETUP_SKIP_DEPS:+ $SETUP_SKIP_DEPS}"
 # shellcheck disable=SC2086
-$SUDO "$BIN_PATH" setup --skip-deps \
+$SUDO "$BIN_PATH" setup $SETUP_SKIP_DEPS \
   --server-url "$SERVER_URL" \
   --bootstrap-token "$TOKEN" \
   --browser "$BROWSER" \
