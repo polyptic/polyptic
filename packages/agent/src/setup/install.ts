@@ -35,11 +35,13 @@ import {
 } from "./templates";
 import {
   PLYMOUTHD_CONF_PATH,
+  PLYMOUTH_DRACUT_CONF_PATH,
   PLYMOUTH_QUIT_DROPIN,
   PLYMOUTH_THEME_DIR,
   PLYMOUTH_THEME_NAME,
   mergeCmdlineTxt,
   mergeGrubCmdline,
+  plymouthDracutConf,
   plymouthQuitDropin,
   plymouthScript,
   plymouthTheme,
@@ -495,8 +497,48 @@ function applyPlymouthTheme(sys: Sys, log: Logger, state: SetupState, needsVerif
     });
   }
 
-  // 3 ─ rebuild the initramfs with the REAL generator so the theme is embedded for early boot.
+  // 3 ─ on dracut, force the theme + its script plugin into the initramfs. dracut's plymouth module
+  //     (plymouth-populate-initrd) does NOT reliably bundle a non-default theme on Ubuntu 26.04 (no
+  //     plymouth-set-default-theme helper / no default.plymouth symlink), so name the files explicitly
+  //     in an install_items drop-in; plymouthd then loads them at boot via plymouthd.conf's Theme=.
+  if (sys.which("dracut")) {
+    configureDracutSplashInclude(sys, log, needsVerification);
+  }
+
+  // 4 ─ rebuild the initramfs with the REAL generator so the theme is embedded for early boot.
   rebuildInitramfs(sys, log, needsVerification);
+}
+
+/** Write a dracut drop-in that force-includes the splash theme files + the `script` plugin (POL-7). */
+function configureDracutSplashInclude(sys: Sys, log: Logger, needsVerification: string[]): void {
+  // Resolve the arch-specific plymouth `script` plugin — the theme's ModuleName=script needs it.
+  const scriptSo = sys
+    .probe("sh", ["-c", "ls /usr/lib/*/plymouth/script.so /usr/lib64/plymouth/script.so 2>/dev/null | head -n1"])
+    .stdout.trim();
+  if (!scriptSo) {
+    log.warn("plymouth 'script' plugin (script.so) not found — the boot-splash theme cannot render.");
+    needsVerification.push(
+      "Boot splash: the plymouth 'script' plugin (script.so) is missing — install the plymouth script-plugin " +
+        "package, then re-run setup, or the splash won't render (it falls back to the console).",
+    );
+    return;
+  }
+  // The theme files plymouth needs at boot: descriptor, script, and the rasterised PNGs (SVGs aren't
+  // read at boot; hostname/version don't affect the base names, so any StampParams works here).
+  // Filter to files that ACTUALLY exist: dracut treats `install_items` as REQUIRED, so naming a
+  // missing path (e.g. a PNG that didn't rasterise on the air-gap path with no rsvg-convert) makes
+  // EVERY `dracut -f` abort — including later kernel-upgrade rebuilds, since the drop-in persists in
+  // /etc/dracut.conf.d. A missing logo must degrade to a logo-less splash, not wedge the initramfs.
+  const themeFiles = [
+    `${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.plymouth`,
+    `${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.script`,
+    ...splashAssets({ hostname: "", version: "" }).map((a) => `${PLYMOUTH_THEME_DIR}/${a.base}.png`),
+  ].filter((p) => sys.exists(p));
+  sys.writeFile(PLYMOUTH_DRACUT_CONF_PATH, plymouthDracutConf([PLYMOUTHD_CONF_PATH, scriptSo, ...themeFiles]), {
+    mode: 0o644,
+    desc: "dracut install_items for the boot splash",
+  });
+  log.info(`boot splash: dracut will bundle the theme + ${basename(scriptSo)} into the initramfs`);
 }
 
 /**
@@ -527,7 +569,18 @@ function rebuildInitramfs(sys: Sys, log: Logger, needsVerification: string[]): v
     return;
   }
 
-  if (rebuilt && !sys.dryRun) verifyThemeInInitramfs(sys, log, needsVerification);
+  if (sys.dryRun) return;
+  if (rebuilt) {
+    verifyThemeInInitramfs(sys, log, needsVerification);
+  } else {
+    // Don't swallow a failed rebuild: the box stays on its old/stock initramfs (no splash), and a
+    // later kernel-triggered rebuild may fail too. Surface it instead of only the milder raster warning.
+    log.warn("initramfs rebuild returned non-zero — the boot splash won't appear from early boot.");
+    needsVerification.push(
+      "Boot splash: the initramfs rebuild FAILED (non-zero exit) — the splash won't show and a later " +
+        "kernel-update rebuild may also fail. Ensure an SVG rasteriser is present (librsvg2-bin) and re-run setup.",
+    );
+  }
 }
 
 /**
@@ -545,14 +598,21 @@ function verifyThemeInInitramfs(sys: Sys, log: Logger, needsVerification: string
 
   const listing = sys.probe(lister, [image]).stdout;
   if (!listing) return;
-  if (listing.includes(PLYMOUTH_THEME_NAME)) {
-    log.info(`boot splash: confirmed the '${PLYMOUTH_THEME_NAME}' theme is embedded in ${image}`);
+
+  const hasTheme = listing.includes(`${PLYMOUTH_THEME_NAME}/${PLYMOUTH_THEME_NAME}.script`);
+  // The theme's ModuleName=script needs the `script` plugin bundled too, or plymouthd can't render it.
+  const hasScriptPlugin = listing.includes("plymouth/script.so");
+  if (hasTheme && hasScriptPlugin) {
+    log.info(`boot splash: confirmed the '${PLYMOUTH_THEME_NAME}' theme + script plugin are embedded in ${image}`);
     return;
   }
-  log.warn(`boot splash: the '${PLYMOUTH_THEME_NAME}' theme is NOT in ${image} after rebuild.`);
+  const missing = [hasTheme ? null : `theme '${PLYMOUTH_THEME_NAME}'`, hasScriptPlugin ? null : "script.so plugin"]
+    .filter(Boolean)
+    .join(" + ");
+  log.warn(`boot splash: ${missing} NOT in ${image} after rebuild — the splash won't render.`);
   needsVerification.push(
-    `Boot splash: '${PLYMOUTH_THEME_NAME}' is not embedded in ${image} after the initramfs rebuild — the ` +
-      "splash will fall back to the distro default. Check that plymouth's dracut module is enabled, then re-run setup.",
+    `Boot splash: ${missing} is not embedded in ${image} after the initramfs rebuild — the splash will fall ` +
+      "back to the console. On dracut, check /etc/dracut.conf.d/polyptic-splash.conf then re-run setup.",
   );
 }
 
