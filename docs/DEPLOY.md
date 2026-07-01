@@ -28,12 +28,11 @@ That split is the whole point — it replaces "a fragile per-machine boot script
 On the **target box** (Ubuntu Server-minimal), as a user with sudo — the box only needs to reach your control plane:
 
 ```bash
-# Agent + the visual substrate (greetd→sway→Chromium kiosk), then cold-boot into it:
+# Agent + the visual substrate (greetd→sway→Chromium kiosk) — auto-reboots into it when done:
 curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN=$BOOTSTRAP_TOKEN sh -s -- --kiosk
-sudo reboot
 ```
 
-The installer downloads the arch-matched agent binary from the server, wires the kiosk stack (`polyptic-agent setup`), and the box cold-boots into a Chromium-per-output kiosk and dials home. It shows **PENDING** in the console until an operator **Approves** it (Phase 2b). After approval its screens flip to the active scene. Done — no further on-device steps, ever. (Drop `--kiosk` for a headless enrol with no display; drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode.)
+The installer downloads the arch-matched agent binary from the server, wires the kiosk stack (`polyptic-agent setup`), and **auto-reboots** so the box cold-boots into a Chromium-per-output kiosk and dials home — no `sudo reboot` to remember. It shows **PENDING** in the console until an operator **Approves** it (Phase 2b). After approval its screens flip to the active scene. Done — no further on-device steps, ever. (Drop `--kiosk` for a headless enrol with no display — that path doesn't reboot; add `--no-reboot` to skip the auto-reboot; drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode.)
 
 ---
 
@@ -85,9 +84,9 @@ With `--kiosk` (or `POLYPTIC_KIOSK=1`) the script provisions the greetd/sway/Chr
 2. **Online fallback:** on `404` (no bundle for this distro+arch) **and** the box happens to have internet, fall back to the distro package manager (`apt`/`dnf`/`pacman`) for `sway greetd chromium grim wayvnc dbus + fonts`.
 3. **Clear failure:** no bundle **and** no internet → exit with an actionable message (bundle this distro on the server with `bundle-deps.sh`, use a bundled distro, or give the box one-time internet).
 
-Then it hands off to **`polyptic-agent setup --skip-deps --server-url … --bootstrap-token … [--output …]`** for the greetd autologin → sway → Chromium-per-output wiring (`--skip-deps` because the substrate is already present). Finally it **retires the Stage-A system service** — the kiosk runs the agent as a **systemd `--user`** unit *inside* the sway session (it must inherit `WAYLAND_DISPLAY` to drive Chromium), so one agent per machine, not two. After this, `sudo reboot` cold-boots into the kiosk.
+Then it hands off to **`polyptic-agent setup --skip-deps --server-url … --bootstrap-token … [--output …]`** for the greetd autologin → sway → Chromium-per-output wiring (`--skip-deps` because the substrate is already present). It **retires the Stage-A system service** — the kiosk runs the agent as a **systemd `--user`** unit *inside* the sway session (it must inherit `WAYLAND_DISPLAY` to drive Chromium), so one agent per machine, not two. Finally, because a fresh box only renders the kiosk after a cold boot, the installer **auto-reboots** (after a short, `Ctrl-C`-able countdown) — realising the "power on → content" contract with no manual `sudo reboot`. Pass `--no-reboot` (or `POLYPTIC_NO_REBOOT=1`) to skip it. (Stage-A-only — no `--kiosk` — never reboots: the agent is already running and enrolled.)
 
-> **Flags & env:** `--kiosk`/`POLYPTIC_KIOSK=1` (substrate), `--output DP-1=1920x1080@0,0` (repeatable, forwarded to `setup`), `POLYPTIC_TOKEN` (enrolment token; empty → server OPEN mode), `POLYPTIC_BASE` (override the baked-in base). The script is POSIX `sh`, `set -eu`, **idempotent**, and logs every step; re-running it re-converges.
+> **Flags & env:** `--kiosk`/`POLYPTIC_KIOSK=1` (substrate), `--output DP-1=1920x1080@0,0` (repeatable, forwarded to `setup`), `--no-reboot`/`POLYPTIC_NO_REBOOT=1` (skip the post-kiosk auto-reboot), `POLYPTIC_REBOOT_DELAY` (countdown seconds before it, default `5`; `0` = immediate), `POLYPTIC_TOKEN` (enrolment token; empty → server OPEN mode), `POLYPTIC_BASE` (override the baked-in base). The script is POSIX `sh`, `set -eu`, **idempotent**, and logs every step; re-running it re-converges.
 
 > **Privilege:** the script runs privileged steps through `sudo` when not already root (so `curl … | sh` works for a sudo-capable user), or runs directly as root. No `sudo` and not root → it tells you to pipe through `sudo`.
 
@@ -214,7 +213,7 @@ These map onto the agent's environment knobs (the systemd unit exports them): `P
 
 ## Enrol & approve (Phase 2b)
 
-1. `sudo reboot` (or `sudo systemctl start greetd`) — the box cold-boots the chain above.
+1. The `--kiosk` installer already **auto-rebooted** the box into the chain above (unless you passed `--no-reboot`, in which case: `sudo reboot`, or `sudo systemctl start greetd`).
 2. The agent dials out, sends `agent/hello` with the bootstrap token, and the server replies `server/enrolled` + `server/pending`. It now shows up **PENDING** in the console's enrollment view. The connection stays open; a rejected/unknown machine backs off and retries slowly (~60 s) rather than hammering.
 3. An operator **Approves** the machine in the console. The server sends `server/apply` and the agent points each output's Chromium at its player URL. (Approval admits the *machine*; in Phase 3 an approved screen still has to be **dragged onto a mural** before it shows scene content — until then the player shows its idle/unplaced state.)
 4. From then on the device reconnects automatically with its durable credential on every cold boot — no token, no clicks.
@@ -263,7 +262,8 @@ bash deploy/build-agent.sh arm64                 # → deploy/dist/polyptic-agen
 Then in the guest (use the host's LAN IP, not `localhost`) — the zero-touch one-liner does the rest:
 
 ```bash
-curl -sfL http://<your-mac-ip>:8080/install | POLYPTIC_TOKEN="$BOOTSTRAP_TOKEN" sh -s -- --kiosk
+# --no-reboot so we can set the virtio-gpu cursor tweak before the cold boot (see next command)
+curl -sfL http://<your-mac-ip>:8080/install | POLYPTIC_TOKEN="$BOOTSTRAP_TOKEN" sh -s -- --kiosk --no-reboot
 #   (drop POLYPTIC_TOKEN= if your dev server runs OPEN mode)
 
 # virtio-gpu has no hardware cursor plane — set this so sway's cursor renders
@@ -271,6 +271,8 @@ echo 'WLR_NO_HARDWARE_CURSORS=1' | sudo tee -a /etc/environment
 
 sudo reboot
 ```
+
+> On real hardware you'd drop `--no-reboot` and let the installer reboot itself — the extra `WLR_NO_HARDWARE_CURSORS` step is a virtio-gpu quirk, not a general requirement.
 
 ### Watch the cold boot
 

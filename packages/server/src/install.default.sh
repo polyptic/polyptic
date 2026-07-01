@@ -24,12 +24,24 @@ log()  { printf '[polyptic-install] %s\n' "$*" >&2; }
 warn() { printf '[polyptic-install] WARN: %s\n' "$*" >&2; }
 die()  { printf '[polyptic-install] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Trigger a reboot through whatever tool the box has; returns non-zero (never exits) if none worked.
+reboot_now() {
+  if command -v systemctl >/dev/null 2>&1; then $SUDO systemctl reboot && return 0; fi
+  if command -v reboot >/dev/null 2>&1; then $SUDO reboot && return 0; fi
+  $SUDO shutdown -r now && return 0
+  return 1
+}
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 KIOSK="${POLYPTIC_KIOSK:-0}"
+# Auto-reboot after a --kiosk install so the box cold-boots into the kiosk; --no-reboot opts out.
+NO_REBOOT="${POLYPTIC_NO_REBOOT:-0}"
+REBOOT_DELAY="${POLYPTIC_REBOOT_DELAY:-5}"
 OUTPUT_ARGS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --kiosk) KIOSK=1 ;;
+    --no-reboot) NO_REBOOT=1 ;;
     --output) shift; [ $# -gt 0 ] || die "--output needs a value"; OUTPUT_ARGS="$OUTPUT_ARGS --output $1" ;;
     --output=*) OUTPUT_ARGS="$OUTPUT_ARGS --output ${1#--output=}" ;;
     *) warn "ignoring unknown argument: $1" ;;
@@ -229,4 +241,19 @@ $SUDO /usr/local/bin/polyptic-agent setup \
   ${TOKEN:+--bootstrap-token "$TOKEN"} \
   $OUTPUT_ARGS
 
-log "Stage B complete — the kiosk substrate is provisioned. Reboot to cold-boot straight into content."
+log "Stage B complete — the kiosk substrate is provisioned."
+
+# Cold-boot into the kiosk. A fresh box only renders after a reboot (greetd → sway → agent → browser),
+# so finish the zero-touch job and reboot; --no-reboot (POLYPTIC_NO_REBOOT=1) opts out.
+if [ "$NO_REBOOT" = "1" ]; then
+  log "Skipping auto-reboot (--no-reboot). Cold-boot into the kiosk when ready:  sudo reboot"
+  exit 0
+fi
+if [ "${REBOOT_DELAY:-0}" -gt 0 ] 2>/dev/null; then
+  warn "auto-reboot in ${REBOOT_DELAY}s — press Ctrl-C now to cancel (then reboot yourself: sudo reboot)"
+  _n="$REBOOT_DELAY"
+  while [ "$_n" -gt 0 ]; do printf '[polyptic-install]   rebooting in %ss…\r' "$_n" >&2; sleep 1; _n=$((_n - 1)); done
+  printf '\n' >&2
+fi
+log "rebooting now to cold-boot into the kiosk"
+reboot_now || die "could not trigger a reboot automatically — reboot manually: sudo reboot"
