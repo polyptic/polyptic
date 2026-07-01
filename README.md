@@ -6,7 +6,7 @@
 
 It replaces the all-too-common pattern of "a fragile per-machine boot script that clicks here, waits, opens a browser, and types a password in plaintext" with one declarative control plane and thin reconciling agents.
 
-> This repo is the **product**. It has **no dependency on any specific stack** — ACS/Factory+, Grafana, Keycloak and friends are optional content/identity adapters that motivated the design, never foundations.
+> This repo is the **product**. It has **no dependency on any specific stack** — dashboards, identity providers and content sources are optional adapters behind stable seams, never foundations.
 
 ---
 
@@ -112,5 +112,5 @@ See **[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md)** for the full packaging st
 
 See **`docs/ONBOARDING.md`** to add a display, `docs/DEPLOY.md` for the device side, `docs/DISTRIBUTION.md` for packaging, `docs/ROADMAP.md` for the detailed state, `docs/DECISIONS.md` for the decision log (D1–D34+), `docs/DESIGN.md` for the narrative, `docs/ARCHITECTURE.md` for the build reference, and `CLAUDE.md` for working conventions.
 
-## Naming note
-"Polyptic" was chosen over the working name "Mural" after a name-clash review: nothing in the display-wall/signage/kiosk space is named Mural, but **MURAL by Tactivos** holds registered software trademarks (USPTO `97134497`) and the entire `mural.*` namespace — fine for an internal codename, risky for a public product. Polyptic keeps the multi-panel metaphor with a clean namespace. *(Trademark/domain for "Polyptic" not yet cleared — do before any public launch.)*
+## Naming
+A **polyptic** is a multi-panel painting whose panels together compose one picture — the same relationship a video wall has to the single image it shows. Many panels, one composition: screens, scenes, and the mosaic all fall out of that metaphor.

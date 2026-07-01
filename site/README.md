@@ -1,9 +1,9 @@
 # Polyptic landing site
 
-The public landing page for Polyptic. Imported from the Claude Design project
-**Polyptic Landing v2** and made fully self-contained.
+The public landing page for Polyptic — the "Polyptic Landing v2" design, made
+fully self-contained.
 
-It is a single static `index.html` rendered by the Claude Design runtime
+It is a single static `index.html` rendered by a small template runtime
 (`vendor/support.js`), with **React and ReactDOM vendored locally** under
 `vendor/`. Nothing is fetched from a CDN at runtime — in keeping with
 Polyptic's no-external-services ethos. (The only external request is the Geist
@@ -16,7 +16,7 @@ third-party calls.)
 site/
   index.html                       the page (dc template + inline logic)
   vendor/
-    support.js                     Claude Design runtime (parses + mounts the page)
+    support.js                     static template runtime (parses + mounts the page)
     react.production.min.js        React 18.3.1 UMD
     react-dom.production.min.js    ReactDOM 18.3.1 UMD
   nginx.conf                       static server config (listens on :8081)

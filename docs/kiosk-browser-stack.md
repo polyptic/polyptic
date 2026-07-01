@@ -1,9 +1,8 @@
 # Generic kiosk browser + display stack — design
 
-> Status: **proposed** (2026-06-30). Output of a web-grounded, adversarial multi-agent investigation
-> (11 agents) into how to make Polyptic's per-screen browser render on **all** hardware/OS, not a
-> one-off for the UTM/QEMU arm64 test box. Supersedes the surf/cog choice (D27). **Implement only
-> after the de-risking experiment in §6 passes on real hardware** — the design's own discipline.
+> Status: **proposed** (2026-06-30). A design for making Polyptic's per-screen browser render on
+> **all** hardware/OS, not a one-off for the UTM/QEMU arm64 test box. Supersedes the surf/cog choice
+> (D27). **Implement only after the de-risking experiment in §6 passes on real hardware.**
 
 ## TL;DR
 

@@ -3,7 +3,7 @@
 **Read this first every session**, then `docs/ROADMAP.md` (where we are + what's next) and `docs/DECISIONS.md` (locked calls — do not re-litigate). If a decision genuinely changes, update `docs/DECISIONS.md` with the new entry and reasoning.
 
 ## What this is
-Polyptic is a **generic, self-hostable** system to centrally orchestrate **walls of screens / fleets of display kiosks** from a web UI. Vendor-neutral. **Not based on ACS** — ACS is one example deployment that motivated it. Full narrative: `docs/DESIGN.md`. Build reference: `docs/ARCHITECTURE.md`.
+Polyptic is a **generic, self-hostable** system to centrally orchestrate **walls of screens / fleets of display kiosks** from a web UI. Vendor-neutral by design — no dependency on any specific dashboard, identity provider, or content source. Full narrative: `docs/DESIGN.md`. Build reference: `docs/ARCHITECTURE.md`.
 
 ## Non-negotiables (the spirit — keep these true)
 1. **Screens are first-class and named; machines are plumbing.** The API/layout/scenes address named screens. Ident mode maps physical panels → screen identities.

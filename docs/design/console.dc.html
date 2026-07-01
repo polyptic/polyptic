@@ -527,8 +527,8 @@ class Component extends DCLogic {
       { id:'loading-dock-nuc', label:'Loading-Dock NUC', enrol:'pending', online:true, lastSeen:'just now', pending:[{name:'Loading-Dock 1'},{name:'Loading-Dock 2'}] },
     ],
     sources: [
-      { id:'c-kpi', name:'KPI Wall', type:'dashboard', address:'grafana.local/d/kpi-wall', auth:'proxy' },
-      { id:'c-lobby', name:'Lobby Dashboard', type:'dashboard', address:'grafana.local/d/lobby', auth:'proxy' },
+      { id:'c-kpi', name:'KPI Wall', type:'dashboard', address:'dashboards.local/d/kpi-wall', auth:'proxy' },
+      { id:'c-lobby', name:'Lobby Dashboard', type:'dashboard', address:'dashboards.local/d/lobby', auth:'proxy' },
       { id:'c-welcome', name:'Welcome reel', type:'video', address:'cdn.accent.co/welcome.mp4', auth:'public' },
       { id:'c-agenda', name:"Today's Agenda", type:'web', address:'intranet.accent.co/agenda', auth:'signin' },
       { id:'c-map', name:'Visitor Map', type:'web', address:'maps.accent.co/visitor', auth:'public' },

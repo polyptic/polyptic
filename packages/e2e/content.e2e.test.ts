@@ -356,7 +356,7 @@ let wallId = ""; // the VideoWall created over REST
 
 // Library sources, distinct urls so a player render can be matched by its content url.
 const WEB_URL = "https://example.com/lib-web";
-const DASH_URL = "https://grafana.example.com/d-solo/abc?kiosk";
+const DASH_URL = "https://dashboard.example.com/embed/abc?kiosk";
 const IMAGE_URL = "https://cdn.example.com/lib-image.png";
 const VIDEO_URL = "https://cdn.example.com/lib-video.mp4";
 const WEB_URL_V2 = "https://example.com/lib-web-updated"; // PATCH target — proves a live re-resolve

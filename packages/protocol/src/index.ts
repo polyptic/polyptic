@@ -100,7 +100,7 @@ export const WebSurface = SurfaceBase.extend({
 
 export const DashboardSurface = SurfaceBase.extend({
   type: z.literal("dashboard"),
-  url: z.string().url(), // adapter-built (e.g. Grafana /d-solo ...&kiosk)
+  url: z.string().url(), // adapter-built (e.g. a single-panel dashboard embed URL)
   refreshSeconds: z.number().int().positive().optional(),
 });
 

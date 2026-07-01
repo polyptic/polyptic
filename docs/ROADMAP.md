@@ -33,15 +33,15 @@ The big UI phase. Model adopted from the **Console v2** design (D20–D25):
 - **Content library (D23):** reusable `ContentSource` items (web/dashboard/image/video + auth strategy) dragged onto a screen or surface.
 - **Scenes (D24):** save the whole composition (content + layout + grouping) per mural; switch → atomic fan-out across all screens, instantly.
 - **Activity feed (D25):** live event stream in the console.
-- Contract gains: Mural, Surface, ContentSource, Scene, screen placement (position/size), + the WS/REST to drive them. **Admin UI** rebuilt as the canvas console (per the chosen Claude Design direction).
+- Contract gains: Mural, Surface, ContentSource, Scene, screen placement (position/size), + the WS/REST to drive them. **Admin UI** rebuilt as the canvas console.
 **DoD:** compose a mural by snapping/combining screens; assign content from the library (incl. spanning a surface); save a scene; switch scenes → all screens flip together, instantly.
 
-> **Missing operator flows** (not in Console v2; queued for the design agent → then build): cold-start (nothing connected), the **enrollment/approval** UI (2b's bouncer), first-time *ident→name→place* mapping, a **fleet/machines** view, **content-source** add/edit, **scene management**, and console **settings/sign-in** (admin OIDC, Phase 6).
+> **Missing operator flows** (not in Console v2; queued for design → then build): cold-start (nothing connected), the **enrollment/approval** UI (2b's bouncer), first-time *ident→name→place* mapping, a **fleet/machines** view, **content-source** add/edit, **scene management**, and console **settings/sign-in** (admin OIDC, Phase 6).
 
 ## Phase 4 — Real device stack + zero-click boot
 **Delivery = `apt install polyptic-agent`** (a `.deb`), NOT a mandatory image (D26). Setup logic lives in the agent binary (`polyptic-agent setup`, distro-aware: apt/dnf/pacman → generic across systemd Linux); image + cloud-init/Ansible are optional wrappers. Start from **Ubuntu Server-minimal** (D27); the package wires **greetd** autologin → **sway** (Wayland; `x11-i3` fallback for NVIDIA, D9) → **systemd**-supervised agent + **Chromium-per-output** (`.deb` Chromium not the snap; `cog`/WPE fallback). **Make the `DisplayBackend`s real** — replace the Phase-1 sway/x11 stubs with swaymsg-IPC placement + Chromium launching. Crash/restore hardening (`Restart=always`, popup/`exit_type` suppression, no `swayidle`, `dpms on`). Config (control-plane URL + bootstrap token) via debconf or `/etc/polyptic/agent.toml` → it enrols (2b) → approve in the console.
 **DoD:** cold power-on → wall shows the active scene with zero interaction; survives EOD smart-plug cut.
-> **Test note:** **OrbStack** (headless — no display) verifies the install → systemd → agent → enrolment plumbing + a *headless* sway, fast. For the **visual** cold-boot DoD use a desktop-virtualization VM with a real virtual display — **Parallels** (or UTM) — where sway + Chromium actually render. Caveats: a VM gives ~one virtual output, so *multi-output-per-client* placement + the real 6-screen wall stay a real-hardware test; and a virtual GPU may need `WLR_NO_HARDWARE_CURSORS` or the x11/i3 fallback (which usefully exercises that path). On Apple Silicon the guest is arm64 — build the `.deb` for the test VM's arch *and* for the (likely amd64) thin clients.
+> **Test note:** **OrbStack** (headless — no display) verifies the install → systemd → agent → enrolment plumbing + a *headless* sway, fast. For the **visual** cold-boot DoD use a desktop-virtualization VM with a real virtual display — **Parallels** (or UTM) — where sway + Chromium actually render. Caveats: a VM gives ~one virtual output, so *multi-output-per-client* placement + the real multi-screen wall stay a real-hardware test; and a virtual GPU may need `WLR_NO_HARDWARE_CURSORS` or the x11/i3 fallback (which usefully exercises that path). On Apple Silicon the guest is arm64 — build the `.deb` for the test VM's arch *and* for the (likely amd64) thin clients.
 
 ## Phase 5 — Preview, health, resilience, packaging
 `grim` thumbnails (always-on) + on-demand `wayvnc`→noVNC through the control plane. Prometheus metrics, fleet/screen health in the admin UI. Agent caches last-good slice (rides out control-plane outages). Helm chart for any cluster.
@@ -54,8 +54,3 @@ Generic **OIDC** for admin UI/API (any IdP). Per-source auth strategies (`public
 ## Phase 7 — Nice-to-haves
 Media: image/video/**slideshow** + Office→media conversion (server-side). **Native-app** surfaces (CAD/RTSP/etc.) via the agent's top-level-window placement.
 **DoD:** play a looping video + a converted slide deck as scene content; place one native window beside web tiles.
-
----
-
-### Parallel AMRC track (independent, anytime)
-**Phase 0-AMRC quick win:** point the *existing Windows wall* at anonymous Grafana `&kiosk` / `d-solo` URLs to delete the plaintext-password boot hack now. No Polyptic code; reversible. Relieves pain while the product is built.

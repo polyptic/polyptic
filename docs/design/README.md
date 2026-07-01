@@ -1,13 +1,11 @@
 # Console design reference
 
 `console.dc.html` is the **canonical UI spec for Phase 3** — the "Polyptic Console v2" design
-from the Claude Design project (`ebc2c163-ece8-4b11-b30c-b8c1aaec717d`, file
-`Polyptic Console v2.dc.html`). It's a static prototype (`{{ }}` template bindings + a `support.js`
-runtime on claude.ai/design); we read it for exact **layout, components, styling, labels and
-states**, then build the real **Vue** console (`packages/console`) to match.
+prototype. It's a static HTML mockup (`{{ }}` template bindings + a small `support.js` runtime);
+we read it for exact **layout, components, styling, labels and states**, then build the real
+**Vue** console (`packages/console`) to match.
 
-To see it rendered, open the file in the Claude Design project. Locally this `.dc.html` won't run
-without its runtime, but the inline CSS + markup are the reference.
+Locally this `.dc.html` won't run without its runtime, but the inline CSS + markup are the reference.
 
 > **v4 (2026-06-29):** brand is now **Polyptic**; the **logo mark** (hinged panels + squared centre on
 > a rounded holder, theme-inverting) replaces the old "P" — implemented as `Logo.vue`; and the **scene
