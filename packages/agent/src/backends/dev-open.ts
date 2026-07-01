@@ -1,10 +1,11 @@
 /**
  * dev-open — the development DisplayBackend.
  *
- * No compositor required: it just opens the player URL in the host's default browser
- * (`open` on macOS, `xdg-open` on Linux), so the Phase 1 vertical slice runs on any dev
- * machine. Content still arrives instantly over the player WS channel; this backend only
- * gets the player page on screen once.
+ * No compositor required. By default it just LOGS the player URL for each screen (content still
+ * arrives live over the player WS channel — nothing here drives it). It can also open the URL in the
+ * host browser (`open` on macOS, `xdg-open` on Linux) for the zero-config Phase-1 demo, but that is
+ * OPT-IN via `POLYPTIC_DEV_OPEN=1`: auto-opening on every (re)placement steals window focus and is
+ * pure noise when you're running the dev stack to work on the server/console.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -12,8 +13,17 @@ import type { DisplayBackend } from "./types";
 
 const run = promisify(execFile);
 
+/** Auto-open the player in the host browser? Off unless POLYPTIC_DEV_OPEN is explicitly truthy. */
+function autoOpenEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.POLYPTIC_DEV_OPEN?.trim() ?? "");
+}
+
 export class DevOpenBackend implements DisplayBackend {
   readonly id = "dev-open" as const;
+
+  // Last URL surfaced per connector. A reconcile that doesn't change a screen's URL must never
+  // re-open it (content flips travel over the player WS, not by changing this URL), so we dedupe.
+  private readonly shown = new Map<string, string>();
 
   async discoverOutputs(): Promise<string[] | null> {
     // No compositor to interrogate in dev; the agent advertises the configured/default connector.
@@ -21,6 +31,16 @@ export class DevOpenBackend implements DisplayBackend {
   }
 
   async showScreen(connector: string, url: string): Promise<void> {
+    if (this.shown.get(connector) === url) return; // unchanged — never re-open / re-log
+    this.shown.set(connector, url);
+
+    if (!autoOpenEnabled()) {
+      console.log(
+        `[dev-open] player for ${connector} → ${url} (auto-open off; set POLYPTIC_DEV_OPEN=1 to open it)`,
+      );
+      return;
+    }
+
     const opener =
       process.platform === "darwin"
         ? "open"
@@ -36,6 +56,7 @@ export class DevOpenBackend implements DisplayBackend {
 
   async hideScreen(connector: string): Promise<void> {
     // The host's default browser is not ours to drive; nothing to tear down in dev.
+    this.shown.delete(connector);
     console.log(`[dev-open] hideScreen(${connector}) — no-op in dev`);
   }
 
