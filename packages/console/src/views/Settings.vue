@@ -11,7 +11,7 @@ const router = useRouter();
 onMounted(() => {
   // Load the enrollment-token info (open vs gated) so the card can render the real value.
   void store.fetchEnrollment();
-  // Load the netboot info (control-plane base + iPXE URL + boot-medium download) for the Netboot card.
+  // Load the netboot info (control-plane base + boot config URL + boot-medium download) for the Netboot card.
   void store.fetchNetboot();
   // Load the fleet-wide badge toggle so the card is correct even before the admin/state snapshot lands.
   void store.fetchDisplaySettings();
@@ -72,7 +72,7 @@ async function regenerate(): Promise<void> {
 }
 
 // ── Netboot (POL-33) ──────────────────────────────────────────────────────────
-// A per-field copy indicator (which URL was last copied), one helper for the base + iPXE URLs.
+// A per-field copy indicator (which URL was last copied), one helper for the base + boot config URLs.
 const nbCopied = ref<string | null>(null);
 
 async function copyNetboot(text: string, which: string): Promise<void> {
@@ -205,8 +205,8 @@ async function onChangePassword(): Promise<void> {
       <div class="card panel">
         <div class="panel-title">Netboot</div>
         <div class="panel-sub">
-          Boot a bare machine straight into Polyptic over the network, no OS install, no disk. Point the
-          machine's iPXE/PXE at the chain URL below, or write the ready-made boot medium to a USB stick.
+          Boot a bare machine straight into Polyptic over the network with Secure Boot ON, no OS install,
+          no disk. Write the ready-made boot medium to a USB stick; it chains the boot config URL below.
         </div>
 
         <template v-if="store.netboot === null">
@@ -222,29 +222,34 @@ async function onChangePassword(): Promise<void> {
             </button>
           </div>
 
-          <label class="field-label nb-gap">iPXE chain URL</label>
+          <label class="field-label nb-gap">Boot config URL</label>
           <div class="token-row">
-            <code class="token">{{ store.netboot.bootIpxeUrl }}</code>
-            <button class="btn-ghost-sm" @click="copyNetboot(store.netboot.bootIpxeUrl, 'ipxe')">
-              {{ nbCopied === "ipxe" ? "Copied ✓" : "Copy" }}
+            <code class="token">{{ store.netboot.bootConfigUrl }}</code>
+            <button class="btn-ghost-sm" @click="copyNetboot(store.netboot.bootConfigUrl, 'config')">
+              {{ nbCopied === "config" ? "Copied ✓" : "Copy" }}
             </button>
           </div>
 
           <div class="nb-steps">
             <div class="nb-step">
-              <span class="nb-num">1</span> Chainload
-              <code class="inline-code">{{ store.netboot.bootIpxeUrl }}</code> from your DHCP/PXE server, or
-              write the boot medium to USB.
+              <span class="nb-num">1</span> Download the boot medium and write it to a USB stick
+              (<code class="inline-code">dd if=polyptic-boot.img of=/dev/sdX bs=4M</code>); one stick boots
+              amd64 and arm64 alike.
             </div>
             <div class="nb-step">
-              <span class="nb-num">2</span> Power on the bare machine, it streams the kernel, initrd and
-              root image from this server only, into RAM.
+              <span class="nb-num">2</span> Plug it into the bare box and boot from USB, leaving Secure
+              Boot ON. The signed loader streams the live image from this server into RAM.
             </div>
             <div class="nb-step">
-              <span class="nb-num">3</span> It boots diskless into Polyptic and dials in, 
-              <template v-if="store.netboot.mode === 'gated'">approve it under Machines.</template>
+              <span class="nb-num">3</span> The box appears in Machines,
+              <template v-if="store.netboot.mode === 'gated'">approve it there.</template>
               <template v-else>it is auto-approved (open mode).</template>
             </div>
+          </div>
+
+          <div class="token-hint">
+            Choosing "offload" in the boot menu installs the loader on the box once; after that it
+            self-boots over the network without the USB stick.
           </div>
 
           <a
@@ -255,8 +260,11 @@ async function onChangePassword(): Promise<void> {
             >Download boot medium</a
           >
           <div v-else class="token-hint nb-gap">
-            No prebuilt boot medium bundled yet, use the iPXE chain URL above, or build one into
-            <code class="inline-code">IPXE_DIST_DIR</code> on the server.
+            No prebuilt boot medium bundled yet, build one into
+            <code class="inline-code">BOOT_DIST_DIR</code> with
+            <code class="inline-code">deploy/build-boot-medium.sh</code>, or point DHCP option 67 / UEFI
+            HTTP Boot at <code class="inline-code">{{ store.netboot.baseUrl }}/dist/boot/shimx64.efi</code>
+            (see <code class="inline-code">docs/NETBOOT.md</code> for the recipe and the arm64 name).
           </div>
 
           <div v-if="store.netboot.mode === 'gated'" class="nb-note">

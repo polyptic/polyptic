@@ -1,19 +1,23 @@
 /**
- * @polyptic/e2e, NETBOOT boot depot (POL-33).
+ * @polyptic/e2e, NETBOOT boot depot (POL-33/D47).
  *
- * A bare box HTTP-boots a live Polyptic image straight into RAM, no OS install, no disk. This suite
- * drives the server-side boot-depot HTTP surface (added to provision.ts) against the REAL control plane.
+ * A bare box boots Ubuntu's SIGNED shim+GRUB chain over the network into a live Polyptic image in RAM,
+ * Secure Boot stays ON, no OS install, no disk. This suite drives the server-side boot-depot HTTP
+ * surface (provision.ts) against the REAL control plane.
  *
  * The box has no operator session, so the boot routes are TOP-LEVEL + UNGATED (like /install, /healthz):
- *   - GET /boot.ipxe                         → the iPXE chain script, control-plane base baked from the
- *                                              Host header, enrolment token baked in GATED mode only.
- *                                              `?offload=1` tags the cmdline for the offload flow.
- *   - GET /dist/image/:arch/{vmlinuz,initrd,squashfs} → the live-image artifacts, Range-streamed (206).
- *   - GET /dist/ipxe/:file                   → the tokenless prebuilt boot medium (polyptic-boot-*.efi).
+ *   - GET /boot/grub.cfg                     → the generated GRUB menu, control-plane base baked from
+ *                                              the Host header, enrolment token baked in GATED mode only.
+ *   - GET /grub/grub.cfg (+ per-arch aliases) → the same menu where an HTTP-booted grubnet looks
+ *                                              ($prefix resolves to (http,host:port)/grub at server root).
+ *   - GET /dist/image/:arch/{vmlinuz,initrd,polyptic.iso} → the live-image artifacts, Range-streamed (206).
+ *   - GET /dist/boot/:file                   → the tokenless universal dongle (polyptic-boot.img) + the
+ *                                              four signed loaders (shim + GRUB .efi). shim fetches its
+ *                                              second stage as <dir>//grubx64.efi (double slash).
  * And one operator-facing route, GATED under /api/v1 (reachable cookie-free here with AUTH_ENABLED=false):
- *   - GET /api/v1/settings/netboot           → NetbootInfo {baseUrl, mode, bootIpxeUrl, bootMediumUrl}.
+ *   - GET /api/v1/settings/netboot           → NetbootInfo {baseUrl, mode, bootConfigUrl, bootMediumUrl}.
  *
- * We fabricate IMAGE_DIST_DIR + IPXE_DIST_DIR on disk with marker files (no real image build) and a
+ * We fabricate IMAGE_DIST_DIR + BOOT_DIST_DIR on disk with marker files (no real image build) and a
  * SECRET canary OUTSIDE both roots to prove traversal never leaks. Two servers are spawned on their own
  * ports: OPEN (no token) on 8111 and GATED (POLYPTIC_BOOTSTRAP_TOKEN set) on 8112, so both enrolment
  * modes are asserted. Temp dirs are removed + both servers torn down in afterAll.
@@ -37,14 +41,23 @@ const GATED_BASE = `http://${GATED_HOST}`;
 const FLEET_TOKEN = "netboot-e2e-fleet-token-abc123";
 const TEST_TIMEOUT = 10_000;
 
-// Marker bytes, unique sentinels so an assertion can prove EXACTLY which file answered. The squashfs is
+// Marker bytes, unique sentinels so an assertion can prove EXACTLY which file answered. The ISO is
 // deliberately long enough to range over.
 const VMLINUZ_BYTES = "FAKE_POLYPTIC_VMLINUZ\x00kernel-marker\n";
 const INITRD_BYTES = "FAKE_POLYPTIC_INITRD\x00initrd-marker\n";
-const SQUASHFS_BYTES =
-  "FAKE_POLYPTIC_SQUASHFS_ROOTFS_" + "0123456789abcdef".repeat(8) + "\x00rootfs-marker\n";
-const BOOT_MEDIUM_NAME = "polyptic-boot-amd64.efi";
-const BOOT_MEDIUM_BYTES = "FAKE_POLYPTIC_IPXE_EFI\x00MZ-marker\n";
+const ISO_BYTES =
+  "FAKE_POLYPTIC_LIVE_ISO_" + "0123456789abcdef".repeat(8) + "\x00iso-marker\n";
+// A decoy by the OLD artifact name: proves the /dist/image 404 is the whitelist, not mere absence.
+const SQUASHFS_DECOY_BYTES = "FAKE_POLYPTIC_SQUASHFS_DECOY_MUST_NOT_BE_SERVED\n";
+const BOOT_MEDIUM_NAME = "polyptic-boot.img";
+const BOOT_MEDIUM_BYTES = "FAKE_POLYPTIC_BOOT_IMG\x00FAT32-marker\n";
+// The four signed loaders (shim + network GRUB, both arches), each with its own sentinel payload.
+const EFI_FILES: Record<string, string> = {
+  "shimx64.efi": "FAKE_POLYPTIC_SHIMX64\x00MZ-shim-x64\n",
+  "shimaa64.efi": "FAKE_POLYPTIC_SHIMAA64\x00MZ-shim-aa64\n",
+  "grubx64.efi": "FAKE_POLYPTIC_GRUBX64\x00MZ-grub-x64\n",
+  "grubaa64.efi": "FAKE_POLYPTIC_GRUBAA64\x00MZ-grub-aa64\n",
+};
 const SECRET_MARKER = "TOP_SECRET_OUT_OF_ROOT_FILE_CONTENTS_DO_NOT_LEAK";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -55,7 +68,7 @@ const serverEntry = resolve(repoRoot, "packages", "server", "src", "index.ts");
 type NetbootInfoShape = {
   baseUrl: string;
   mode: string;
-  bootIpxeUrl: string;
+  bootConfigUrl: string;
   bootMediumUrl: string | null;
 };
 
@@ -63,28 +76,33 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Temp dist roots: fabricate the netboot artifact layout WITHOUT a real image build.
-//   imageDir/amd64/{vmlinuz,initrd,squashfs}   (NO arm64 dir, asserts a clean 404)
-//   ipxeDir/polyptic-boot-amd64.efi
-//   rootDir/secret.txt                          (traversal canary, OUTSIDE both roots)
+//   imageDir/amd64/{vmlinuz,initrd,polyptic.iso,squashfs}   (squashfs is a whitelist decoy;
+//                                                            NO arm64 dir, asserts a clean 404)
+//   bootDir/{polyptic-boot.img,shimx64.efi,shimaa64.efi,grubx64.efi,grubaa64.efi}
+//   rootDir/secret.txt                                       (traversal canary, OUTSIDE both roots)
 // ─────────────────────────────────────────────────────────────────────────────
 
 let rootDir = "";
 let imageDir = "";
-let ipxeDir = "";
+let bootDir = "";
 
 function fabricateDistRoots(): void {
   rootDir = mkdtempSync(join(tmpdir(), "polyptic-netboot-e2e-"));
   imageDir = join(rootDir, "image");
-  ipxeDir = join(rootDir, "ipxe");
+  bootDir = join(rootDir, "boot");
 
   const amd64 = join(imageDir, "amd64");
   mkdirSync(amd64, { recursive: true });
   writeFileSync(join(amd64, "vmlinuz"), VMLINUZ_BYTES, "binary");
   writeFileSync(join(amd64, "initrd"), INITRD_BYTES, "binary");
-  writeFileSync(join(amd64, "squashfs"), SQUASHFS_BYTES, "binary");
+  writeFileSync(join(amd64, "polyptic.iso"), ISO_BYTES, "binary");
+  writeFileSync(join(amd64, "squashfs"), SQUASHFS_DECOY_BYTES, "binary");
 
-  mkdirSync(ipxeDir, { recursive: true });
-  writeFileSync(join(ipxeDir, BOOT_MEDIUM_NAME), BOOT_MEDIUM_BYTES, "binary");
+  mkdirSync(bootDir, { recursive: true });
+  writeFileSync(join(bootDir, BOOT_MEDIUM_NAME), BOOT_MEDIUM_BYTES, "binary");
+  for (const [name, bytes] of Object.entries(EFI_FILES)) {
+    writeFileSync(join(bootDir, name), bytes, "binary");
+  }
 
   writeFileSync(join(rootDir, "secret.txt"), SECRET_MARKER, "utf8");
 }
@@ -114,7 +132,7 @@ function spawnServer(port: number, token?: string): ReturnType<typeof Bun.spawn>
     // lets the e2e reach it cookie-free (the gate no-ops).
     AUTH_ENABLED: "false",
     IMAGE_DIST_DIR: imageDir,
-    IPXE_DIST_DIR: ipxeDir,
+    BOOT_DIST_DIR: bootDir,
     LOG_LEVEL: "error",
   };
   if (token) env.POLYPTIC_BOOTSTRAP_TOKEN = token;
@@ -166,54 +184,87 @@ afterAll(async () => {
 }, 10_000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /boot.ipxe, the iPXE chain script
+// GET /boot/grub.cfg, the generated GRUB menu
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("netboot: GET /boot.ipxe", () => {
+describe("netboot: GET /boot/grub.cfg", () => {
   test(
-    "OPEN mode: an ungated iPXE script with the base baked from the Host header, NO token",
+    "OPEN mode: an ungated GRUB menu with the base baked from the Host header, NO token",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/boot.ipxe`);
+      const res = await fetch(`${OPEN_BASE}/boot/grub.cfg`);
       expect(res.status).toBe(200);
-      const ct = (res.headers.get("content-type") ?? "").toLowerCase();
-      expect(ct.includes("text/plain") || ct.includes("ipxe")).toBe(true);
-
+      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("text/plain");
       const body = await res.text();
-      expect(body.startsWith("#!ipxe")).toBe(true);
-      // The control-plane base is the exact host the box fetched from (Host header), like /install.
-      expect(body).toContain(`set polyptic_base ${OPEN_BASE}`);
-      // Derived WS agent URL.
-      expect(body).toContain(`set polyptic_ws ws://${OPEN_HOST}/agent`);
-      expect(body).toContain("/dist/image/");
-      expect(body).toContain("boot=casper");
+      // GRUB's + the firmware's HTTP clients reject chunked encoding: Content-Length must be present.
+      expect(res.headers.get("content-length")).toBe(String(Buffer.byteLength(body)));
+
+      // The GRUB net device is the exact host the box fetched from (Host header), like /install.
+      expect(body).toContain(`set net=(http,${OPEN_HOST})`);
+      // Both menu entries by --id; casper pulls the whole ISO (URL must end .iso); WS agent URL baked.
+      expect(body).toContain("--id live");
+      expect(body).toContain("--id offload");
+      expect(body).toContain(`iso-url=http://${OPEN_HOST}/dist/image/$arch/polyptic.iso`);
+      expect(body).toContain(`polyptic.server_url=ws://${OPEN_HOST}/agent`);
       // OPEN mode carries NO enrolment token.
-      expect(body).not.toContain("set polyptic_token");
       expect(body).not.toContain("polyptic.token=");
     },
     TEST_TIMEOUT,
   );
 
   test(
-    "GATED mode: bakes in the current enrolment token so the diskless box carries it",
+    "the menu speaks noble GRUB: plain linux/initrd, --- terminator, no iPXE remnants",
     async () => {
-      const res = await fetch(`${GATED_BASE}/boot.ipxe`);
-      expect(res.status).toBe(200);
-      const body = await res.text();
-      expect(body).toContain(`set polyptic_base ${GATED_BASE}`);
-      expect(body).toContain(`set polyptic_token ${FLEET_TOKEN}`);
-      expect(body).toContain("polyptic.token=${polyptic_token}");
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      // Noble's signed GRUB dropped linuxefi/initrdefi; only plain `linux` + `initrd` exist.
+      expect(body).not.toContain("linuxefi");
+      expect(body).not.toContain("initrdefi");
+      expect(body).toMatch(/^ {2}linux {2}\$net\/dist\/image\/\$arch\/vmlinuz .+ ---$/m);
+      expect(body).toMatch(/^ {2}initrd \$net\/dist\/image\/\$arch\/initrd$/m);
+      // The iPXE first stage is gone (D47): no shebang, no chain URL.
+      expect(body).not.toContain("#!ipxe");
+      expect(body).not.toContain("boot.ipxe");
     },
     TEST_TIMEOUT,
   );
 
   test(
-    "?offload=1 tags the kernel cmdline for the one-shot ESP-loader install",
+    "only the offload entry tags the cmdline with polyptic.offload=1 (before the --- terminator)",
     async () => {
-      const plain = await (await fetch(`${GATED_BASE}/boot.ipxe`)).text();
-      expect(plain).not.toContain("polyptic.offload=1");
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      const liveStart = body.indexOf("--id live");
+      const offloadStart = body.indexOf("--id offload");
+      expect(liveStart).toBeGreaterThan(-1);
+      expect(offloadStart).toBeGreaterThan(liveStart);
+      const liveEntry = body.slice(liveStart, offloadStart);
+      const offloadEntry = body.slice(offloadStart);
+      expect(liveEntry).not.toContain("polyptic.offload=1");
+      expect(offloadEntry).toContain("polyptic.offload=1 ---");
+    },
+    TEST_TIMEOUT,
+  );
 
-      const off = await (await fetch(`${GATED_BASE}/boot.ipxe?offload=1`)).text();
-      expect(off).toContain("polyptic.offload=1");
+  test(
+    "GATED mode: bakes in the current enrolment token, inside the arg list (before ---)",
+    async () => {
+      const res = await fetch(`${GATED_BASE}/boot/grub.cfg`);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain(`set net=(http,${GATED_HOST})`);
+      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} ---`));
+      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} polyptic\\.offload=1 ---`));
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the /grub aliases (server-root prefix of an HTTP-booted grubnet) return the SAME body",
+    async () => {
+      const canonical = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      for (const alias of ["/grub/grub.cfg", "/grub/x86_64-efi/grub.cfg", "/grub/arm64-efi/grub.cfg"]) {
+        const res = await fetch(`${OPEN_BASE}${alias}`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe(canonical);
+      }
     },
     TEST_TIMEOUT,
   );
@@ -225,12 +276,12 @@ describe("netboot: GET /boot.ipxe", () => {
 
 describe("netboot: GET /dist/image/:arch/:file", () => {
   test(
-    "streams the full squashfs (200) with Accept-Ranges",
+    "streams the full ISO (200) with Accept-Ranges",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/squashfs`);
+      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/polyptic.iso`);
       expect(res.status).toBe(200);
       expect((res.headers.get("accept-ranges") ?? "").toLowerCase()).toBe("bytes");
-      expect(await res.text()).toBe(SQUASHFS_BYTES);
+      expect(await res.text()).toBe(ISO_BYTES);
     },
     TEST_TIMEOUT,
   );
@@ -247,13 +298,13 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
   test(
     "honours a byte Range with a 206 + exact Content-Range + partial body",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/squashfs`, {
+      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/polyptic.iso`, {
         headers: { Range: "bytes=0-9" },
       });
       expect(res.status).toBe(206);
-      expect(res.headers.get("content-range")).toBe(`bytes 0-9/${SQUASHFS_BYTES.length}`);
+      expect(res.headers.get("content-range")).toBe(`bytes 0-9/${ISO_BYTES.length}`);
       expect(res.headers.get("content-length")).toBe("10");
-      expect(await res.text()).toBe(SQUASHFS_BYTES.slice(0, 10));
+      expect(await res.text()).toBe(ISO_BYTES.slice(0, 10));
     },
     TEST_TIMEOUT,
   );
@@ -261,13 +312,13 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
   test(
     "a suffix Range (last N bytes) returns the tail",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/squashfs`, {
+      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/polyptic.iso`, {
         headers: { Range: "bytes=-8" },
       });
       expect(res.status).toBe(206);
-      const len = SQUASHFS_BYTES.length;
+      const len = ISO_BYTES.length;
       expect(res.headers.get("content-range")).toBe(`bytes ${len - 8}-${len - 1}/${len}`);
-      expect(await res.text()).toBe(SQUASHFS_BYTES.slice(len - 8));
+      expect(await res.text()).toBe(ISO_BYTES.slice(len - 8));
     },
     TEST_TIMEOUT,
   );
@@ -275,8 +326,8 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
   test(
     "a Range past EOF is 416 with a Content-Range of the size",
     async () => {
-      const len = SQUASHFS_BYTES.length;
-      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/squashfs`, {
+      const len = ISO_BYTES.length;
+      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/polyptic.iso`, {
         headers: { Range: `bytes=${len}-${len + 10}` },
       });
       expect(res.status).toBe(416);
@@ -286,7 +337,18 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
   );
 
   test(
-    "404 for a file outside the {vmlinuz,initrd,squashfs} whitelist (never leaks a sibling)",
+    "404 for squashfs: dropped from the whitelist (D47), even though a file by that name exists",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/dist/image/amd64/squashfs`);
+      expect(res.status).toBe(404);
+      const body = await res.text();
+      expect(body).not.toContain(SQUASHFS_DECOY_BYTES.trim());
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "404 for a file outside the {vmlinuz,initrd,polyptic.iso} whitelist (never leaks a sibling)",
     async () => {
       const res = await fetch(`${OPEN_BASE}/dist/image/amd64/passwd`);
       expect(res.status).toBe(404);
@@ -300,7 +362,7 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
     "404 for an unknown arch, and for an arch with no image bundled (arm64)",
     async () => {
       expect((await fetch(`${OPEN_BASE}/dist/image/x86/vmlinuz`)).status).toBe(404);
-      expect((await fetch(`${OPEN_BASE}/dist/image/arm64/squashfs`)).status).toBe(404);
+      expect((await fetch(`${OPEN_BASE}/dist/image/arm64/polyptic.iso`)).status).toBe(404);
     },
     TEST_TIMEOUT,
   );
@@ -324,14 +386,14 @@ describe("netboot: GET /dist/image/:arch/:file", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /dist/ipxe/:file, the tokenless boot medium
+// GET /dist/boot/:file, the tokenless boot depot (dongle + signed loaders)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("netboot: GET /dist/ipxe/:file", () => {
+describe("netboot: GET /dist/boot/:file", () => {
   test(
-    "serves the bundled boot medium byte-for-byte (ungated) with a download filename",
+    "serves the universal dongle image byte-for-byte (ungated) with a download filename",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/dist/ipxe/${BOOT_MEDIUM_NAME}`);
+      const res = await fetch(`${OPEN_BASE}/dist/boot/${BOOT_MEDIUM_NAME}`);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-disposition") ?? "").toContain(BOOT_MEDIUM_NAME);
       expect(await res.text()).toBe(BOOT_MEDIUM_BYTES);
@@ -340,10 +402,35 @@ describe("netboot: GET /dist/ipxe/:file", () => {
   );
 
   test(
-    "404 for a filename outside the polyptic-boot-<arch>.{efi,img} whitelist",
+    "serves each of the four signed loaders byte-for-byte with a download filename",
     async () => {
-      for (const name of ["evil.sh", "polyptic-boot-amd64.txt", "polyptic-boot-x86.efi", "../secret.txt"]) {
-        const res = await fetch(`${OPEN_BASE}/dist/ipxe/${encodeURIComponent(name)}`);
+      for (const [name, bytes] of Object.entries(EFI_FILES)) {
+        const res = await fetch(`${OPEN_BASE}/dist/boot/${name}`);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-disposition") ?? "").toContain(name);
+        expect(await res.text()).toBe(bytes);
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "tolerates shim's duplicate-slash second-stage fetch: /dist/boot//grubx64.efi",
+    async () => {
+      // UEFI HTTP Boot: shim appends "/grubx64.efi" to its own URL directory INCLUDING the trailing
+      // slash, so the request on the wire is <dir>//grubx64.efi. ignoreDuplicateSlashes must absorb it.
+      const res = await fetch(`${OPEN_BASE}/dist/boot//grubx64.efi`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(EFI_FILES["grubx64.efi"] as string);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "404 for filenames outside the whitelist (incl. the old per-arch medium names)",
+    async () => {
+      for (const name of ["evil.sh", "polyptic-boot-amd64.efi", "shimia32.efi", "../secret.txt"]) {
+        const res = await fetch(`${OPEN_BASE}/dist/boot/${encodeURIComponent(name)}`);
         expect(res.status).toBe(404);
         const body = await res.text();
         expect(body).not.toContain(SECRET_MARKER);
@@ -353,9 +440,18 @@ describe("netboot: GET /dist/ipxe/:file", () => {
   );
 
   test(
-    "404 for a well-formed-but-unbundled medium (arm64)",
+    "path traversal in :file never escapes the boot dist root",
     async () => {
-      expect((await fetch(`${OPEN_BASE}/dist/ipxe/polyptic-boot-arm64.efi`)).status).toBe(404);
+      const attempts = [
+        "/dist/boot/..%2f..%2fsecret.txt",
+        "/dist/boot/%2e%2e%2fsecret.txt",
+        "/dist/boot/../../secret.txt",
+      ];
+      for (const path of attempts) {
+        const res = await fetch(`${OPEN_BASE}${path}`);
+        const body = await res.text();
+        expect(body).not.toContain(SECRET_MARKER);
+      }
     },
     TEST_TIMEOUT,
   );
@@ -374,8 +470,8 @@ describe("netboot: GET /api/v1/settings/netboot", () => {
       const info = (await res.json()) as NetbootInfoShape;
       expect(info.mode).toBe("gated");
       expect(info.baseUrl).toBe(GATED_BASE);
-      expect(info.bootIpxeUrl).toBe(`${GATED_BASE}/boot.ipxe`);
-      expect(info.bootMediumUrl).toBe(`${GATED_BASE}/dist/ipxe/${BOOT_MEDIUM_NAME}`);
+      expect(info.bootConfigUrl).toBe(`${GATED_BASE}/boot/grub.cfg`);
+      expect(info.bootMediumUrl).toBe(`${GATED_BASE}/dist/boot/${BOOT_MEDIUM_NAME}`);
       // Secret-free: the token is NOT surfaced here (it lives in EnrollmentInfo).
       expect(JSON.stringify(info)).not.toContain(FLEET_TOKEN);
     },
@@ -389,7 +485,7 @@ describe("netboot: GET /api/v1/settings/netboot", () => {
       expect(res.status).toBe(200);
       const info = (await res.json()) as NetbootInfoShape;
       expect(info.mode).toBe("open");
-      expect(info.bootMediumUrl).toBe(`${OPEN_BASE}/dist/ipxe/${BOOT_MEDIUM_NAME}`);
+      expect(info.bootMediumUrl).toBe(`${OPEN_BASE}/dist/boot/${BOOT_MEDIUM_NAME}`);
     },
     TEST_TIMEOUT,
   );

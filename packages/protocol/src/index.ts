@@ -572,14 +572,15 @@ export const EnrollmentInfo = z.object({
 });
 export type EnrollmentInfo = z.infer<typeof EnrollmentInfo>;
 
-/** Netboot (POL-33) surface for Settings: where a diskless box PXE/HTTP-chains from, and whether a
- *  prebuilt boot medium is bundled for download. Deliberately SECRET-FREE, the enrolment token that
- *  the boot flow bakes in lives only in {@link EnrollmentInfo}; this just surfaces the URLs an operator
- *  needs (control-plane base, the `/boot.ipxe` chain URL, and the boot-medium download when present). */
+/** Netboot (POL-33/D47) surface for Settings: where a bare box's signed shim+GRUB chain fetches its
+ *  boot menu from, and whether a prebuilt boot medium is bundled for download. Deliberately SECRET-FREE,
+ *  the enrolment token that the boot flow bakes in lives only in {@link EnrollmentInfo}; this just
+ *  surfaces the URLs an operator needs (control-plane base, the `/boot/grub.cfg` config URL, and the
+ *  boot-medium download when present). */
 export const NetbootInfo = z.object({
   baseUrl: z.string(),
   mode: z.enum(["open", "gated"]),
-  bootIpxeUrl: z.string(),
+  bootConfigUrl: z.string(),
   bootMediumUrl: z.string().nullable(),
 });
 export type NetbootInfo = z.infer<typeof NetbootInfo>;

@@ -97,8 +97,8 @@ export async function regenerateEnrollment(): Promise<EnrollmentInfo> {
 
 /**
  * GET /api/v1/settings/netboot → where a diskless box HTTP-boots from (control-plane base + the
- * `/boot.ipxe` chain URL) and the optional boot-medium download (POL-33). Secret-free, the enrolment
- * token the boot flow bakes in lives in the enrollment card, not here.
+ * `/boot/grub.cfg` boot config URL) and the optional boot-medium download (POL-33). Secret-free, the
+ * enrolment token the boot flow bakes in lives in the enrollment card, not here.
  */
 export async function getNetboot(): Promise<NetbootInfo> {
   const raw = await send<unknown>("GET", `${BASE_SETTINGS}/netboot`);

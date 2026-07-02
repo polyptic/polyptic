@@ -74,6 +74,8 @@ const MEDIA_PUBLIC_BASE = (
 
 const fastify = Fastify({
   logger: { level: process.env.LOG_LEVEL ?? "info" },
+  // shim's UEFI HTTP Boot fetch requests its second stage as <dir>//grubx64.efi (double slash, D47).
+  ignoreDuplicateSlashes: true,
 });
 
 // ── Durable store: select by STORE env, run migrations, load persisted state ──
@@ -147,7 +149,10 @@ await auth.seedAdmin();
 // device channels (/agent, /player), health/metrics and the WS upgrades are NOT /api/v1 and untouched.
 fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyReply) => {
   if (!auth.enabled) return;
-  const path = request.url.split("?")[0] ?? request.url;
+  // Collapse duplicate slashes the SAME way find-my-way does under ignoreDuplicateSlashes (above),
+  // or the gate desyncs from the router: `//api/v1/x` would route to the real handler while this
+  // raw-url check saw a leading `//`, failed startsWith, and skipped requireAuth entirely (bypass).
+  const path = (request.url.split("?")[0] ?? request.url).replace(/\/{2,}/g, "/");
   if (!path.startsWith("/api/v1/")) return;
   if (AUTH_PUBLIC_PATHS.has(path)) return;
   await auth.requireAuth(request, reply);
@@ -175,8 +180,8 @@ registerOpsRoutes(fastify, {
 // TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch, /dist/deps/**) —
 // NOT /api/v1, so an edge box with no operator session can bootstrap itself entirely from the server.
 const provisionConfig = provisionConfigFromEnv();
-// Pass the live enrollment singleton so GET /boot.ipxe (POL-33) bakes the CURRENT token, the same one
-// the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
+// Pass the live enrollment singleton so GET /boot/grub.cfg (POL-33/D47) bakes the CURRENT token, the
+// same one the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
 registerProvisionRoutes(fastify, provisionConfig, enrollment);
 attachWebSockets({
   server: fastify.server,
@@ -213,8 +218,8 @@ if (spaServed.length > 0) {
 }
 
 // Provisioning boot banner: report which zero-touch artifacts are present on disk (install template,
-// agent binaries per arch, deps bundle root, netboot image + boot medium) so a misconfigured
-// AGENT_DIST_DIR/DEPS_DIST_DIR/IMAGE_DIST_DIR/IPXE_DIST_DIR is obvious.
+// agent binaries per arch, deps bundle root, netboot image + boot medium + signed loaders) so a
+// misconfigured AGENT_DIST_DIR/DEPS_DIST_DIR/IMAGE_DIST_DIR/BOOT_DIST_DIR is obvious.
 const provisionSummary = await provisionBootSummary(provisionConfig);
 fastify.log.info(
   {
@@ -230,13 +235,15 @@ fastify.log.info(
     imageDistDir: provisionConfig.imageDistDir,
     imageDistDirExists: provisionSummary.imageDistDir,
     imageAmd64: provisionSummary.imageAmd64,
-    ipxeDistDir: provisionConfig.ipxeDistDir,
-    bootMediumAmd64: provisionSummary.bootMediumAmd64,
+    bootDistDir: provisionConfig.bootDistDir,
+    bootMedium: provisionSummary.bootMedium,
+    signedLoaders: provisionSummary.signedLoaders,
   },
   `provisioning: install=${provisionSummary.installTemplate ? "template" : "fallback"} ` +
     `agent[arm64=${provisionSummary.agentArm64} amd64=${provisionSummary.agentAmd64}] ` +
     `deps-dir=${provisionSummary.depsDistDir} ` +
-    `netboot[image-amd64=${provisionSummary.imageAmd64} medium-amd64=${provisionSummary.bootMediumAmd64}]`,
+    `netboot[iso-amd64=${provisionSummary.imageAmd64} medium=${provisionSummary.bootMedium} ` +
+    `signed-loaders=${provisionSummary.signedLoaders}] (Secure Boot: supported)`,
 );
 
 // Start the periodic live-preview capture sweep (no-op when CAPTURE_INTERVAL_MS=0).

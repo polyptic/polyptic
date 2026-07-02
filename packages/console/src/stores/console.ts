@@ -96,8 +96,8 @@ export interface ConsoleState {
   sessionChecked: boolean;
   /** Enrollment-token visibility for Settings + the cold-start wizard (open mode vs gated token). */
   enrollment: EnrollmentInfo | null;
-  /** Netboot info for Settings (POL-33): control-plane base, the `/boot.ipxe` chain URL, and the
-   *  optional boot-medium download. Null until the Settings view fetches it. */
+  /** Netboot info for Settings (POL-33): control-plane base, the `/boot/grub.cfg` boot config URL,
+   *  and the optional boot-medium download. Null until the Settings view fetches it. */
   netboot: NetbootInfo | null;
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */

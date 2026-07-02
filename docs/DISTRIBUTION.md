@@ -10,7 +10,7 @@ Polyptic is two deployable things plus an optional one:
 |---|---|---|---|
 | **Server** (control plane + console + player) | one **Docker image** `ghcr.io/<owner>/polyptic-server` | `docker run` / compose / Helm | your cluster or Docker host |
 | **Agent** (per display box) | the agent **single binary**, served by the control-plane depot (D35/D41) | `curl -sfL http://SERVER:8080/install \| sh -` | each kiosk machine |
-| **Netboot** (diskless box, *no OS install*) | a **live image** + a tiny **iPXE boot medium**, served by the depot (D46) | HTTP-boot / a USB dongle → the box streams into RAM | nothing persists on the box, see [NETBOOT.md](NETBOOT.md) |
+| **Netboot** (diskless box, *no OS install*) | a **live image** + a universal **boot medium** `polyptic-boot.img` (Ubuntu's **signed shim + GRUB**, so **Secure Boot stays ON**), served by the depot (D46/D47) | UEFI HTTP Boot / a USB dongle → the box streams into RAM | nothing persists on the box, see [NETBOOT.md](NETBOOT.md) |
 | **Workspace packages** (`@polyptic/*`) | npm tarballs | *optional* — internal to the product; you almost never need these | a private registry, only if you want one |
 
 Throughout, replace `<owner>` with your GitHub org/user (the chart default is `ghcr.io/polyptic/polyptic-server`, i.e. `<owner>` = `polyptic`).

@@ -12,14 +12,19 @@
  *   GET /dist/deps/:distro/:arch/manifest.json    → the bundled substrate package manifest.
  *   GET /dist/deps/:distro/:arch/:file            → one bundled substrate package (.deb) by name.
  *
- * NETBOOT (POL-33), a bare box HTTP-boots a live Polyptic image straight into RAM, no OS install:
- *   GET /boot.ipxe                                → an iPXE chain script with the control-plane base
+ * NETBOOT (POL-33/D47), a bare box boots Ubuntu's SIGNED shim+GRUB chain over the network into a live
+ * Polyptic image in RAM, Secure Boot stays ON, no OS install:
+ *   GET /boot/grub.cfg                            → the generated GRUB menu with the control-plane base
  *                                                   (and, in GATED mode, the enrolment token) baked in
  *                                                   from THIS request. Ungated, the box has no session.
- *   GET /dist/image/:arch/{vmlinuz,initrd,squashfs} → the live-image artifacts, Range-streamed to RAM.
- *   GET /dist/ipxe/:file                          → a prebuilt boot medium (polyptic-boot-<arch>.{efi,img}),
- *                                                   TOKENLESS so ungated (UEFI HTTP Boot / DHCP / offload).
- *   GET /api/v1/settings/netboot                  → operator-facing netboot info for the console (GATED, 
+ *   GET /grub/grub.cfg (+ per-arch aliases)       → the SAME menu where an HTTP-booted grubnet looks:
+ *                                                   its baked prefix resolves to (http,host:port)/grub
+ *                                                   at the server root, not next to the shim URL.
+ *   GET /dist/image/:arch/{vmlinuz,initrd,polyptic.iso} → the live-image artifacts, Range-streamed to RAM.
+ *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
+ *                                                   the four signed loaders (shim + GRUB .efi), TOKENLESS
+ *                                                   so ungated (UEFI HTTP Boot / offload).
+ *   GET /api/v1/settings/netboot                  → operator-facing netboot info for the console (GATED,
  *                                                   under /api/v1; secret-free, points at the URLs above).
  *
  * The install flow (the script): detect arch+distro → download the agent binary → write
@@ -39,7 +44,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { NetbootInfo } from "@polyptic/protocol";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Enrollment } from "./enroll";
 
@@ -61,10 +66,10 @@ export interface ProvisionConfig {
   agentDistDir: string;
   /** Directory holding bundled substrate packages: `<distro>/<arch>/{manifest.json,*.deb}`. */
   depsDistDir: string;
-  /** Directory holding the netboot root images: `<arch>/{vmlinuz,initrd,squashfs}` (POL-33). */
+  /** Directory holding the netboot live-image artifacts: `<arch>/{vmlinuz,initrd,polyptic.iso}` (POL-33). */
   imageDistDir: string;
-  /** Directory holding prebuilt boot media `polyptic-boot-<arch>.{efi,img}` (POL-33). */
-  ipxeDistDir: string;
+  /** Directory holding the boot depot: `polyptic-boot.img` + the four signed loaders (POL-33/D47). */
+  bootDistDir: string;
   /** Last-resort base URL when the request carries no Host/forwarded headers. */
   publicBaseUrl: string;
 }
@@ -76,7 +81,7 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
     agentDistDir: env.AGENT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist"),
     depsDistDir: env.DEPS_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/deps"),
     imageDistDir: env.IMAGE_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/image"),
-    ipxeDistDir: env.IPXE_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/ipxe"),
+    bootDistDir: env.BOOT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/boot"),
     publicBaseUrl: (env.PUBLIC_BASE_URL?.trim() || "http://localhost:8080").replace(/\/+$/, ""),
   };
 }
@@ -87,15 +92,16 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
 
 /** Build target architectures we serve binaries + bundles for. */
 const ARCH_RE = /^(arm64|amd64)$/;
-/** The three netboot root-image artifacts a diskless box streams (POL-33). Nothing else is servable. */
-const IMAGE_FILE_RE = /^(vmlinuz|initrd|squashfs)$/;
-/** A boot-medium filename: `polyptic-boot-<arch>[-snponly].{efi,img}`. The `.img` is a `dd`-able FAT32
- *  USB dongle image; the `.efi` is the raw loader for UEFI HTTP Boot / DHCP option-67 / offload. Both
- *  are TOKENLESS (they only chain `/boot.ipxe`), so this route is ungated like `/dist/agent`. */
-const IPXE_FILE_RE = /^polyptic-boot-(amd64|arm64)(-snponly)?\.(efi|img)$/;
-/** Extensions tried when resolving the "best" downloadable medium for an arch: the dongle image first
- *  (what an operator writes to USB), then the raw loader. `polyptic-boot-<arch>.<ext>` (POL-33). */
-const BOOT_MEDIUM_EXTS = ["img", "efi"] as const;
+/** The three netboot live-image artifacts a diskless box streams (POL-33): the Canonical-signed kernel,
+ *  the initrd, and the ISO wrapper casper `iso-url=` pulls whole into RAM. Nothing else is servable. */
+const IMAGE_FILE_RE = /^(vmlinuz|initrd|polyptic\.iso)$/;
+/** The boot-depot files (POL-33/D47): `polyptic-boot.img` is the universal `dd`-able FAT32 dongle (both
+ *  arches on one stick); the four `.efi` files are the SIGNED loaders (shim + network GRUB per arch) for
+ *  UEFI HTTP Boot and the offload flow. All TOKENLESS (they only chain `/boot/grub.cfg`), so this route
+ *  is ungated like `/dist/agent`. */
+const BOOT_FILE_RE = /^(polyptic-boot\.img|shimx64\.efi|shimaa64\.efi|grubx64\.efi|grubaa64\.efi)$/;
+/** The four signed loaders the depot serves and the offload flow installs (for the boot summary). */
+const SIGNED_LOADER_FILES = ["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grubaa64.efi"] as const;
 /** A distro slug: `<id>` or `<id>-<version>` (e.g. `ubuntu`, `ubuntu-24.04`, `debian-12`). */
 const DISTRO_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 /** A bundle file name (.deb etc.): no path separators, no leading dot, bounded charset. `:` is allowed
@@ -150,78 +156,88 @@ export function computeBaseUrl(request: FastifyRequest, fallback: string): strin
 
 /**
  * Derive the agent WebSocket URL from an HTTP(S) control-plane base: `http`→`ws`, `https`→`wss`, and
- * append the `/agent` channel path. Baked into `/boot.ipxe` so a diskless box's agent dials the exact
- * same host it netbooted from (the outbound-WSS channel, D12). `http://h:8080` → `ws://h:8080/agent`.
+ * append the `/agent` channel path. Baked into `/boot/grub.cfg` so a diskless box's agent dials the
+ * exact same host it netbooted from (the outbound-WSS channel, D12). `http://h:8080` → `ws://h:8080/agent`.
  */
 export function toWsAgentUrl(httpBase: string): string {
   return `${httpBase.replace(/\/+$/, "").replace(/^http/, "ws")}/agent`;
 }
 
 /**
- * The kernel command line a diskless box boots with (POL-33). CENTRALISED here so the casper/live-boot
+ * The kernel command line a diskless box boots with (POL-33/D47). CENTRALISED here so the casper
  * contract is a one-line change once validated on real hardware (the one piece not testable in-repo):
- *   - `boot=casper netboot=http fetch=<squashfs>` streams the root image straight into RAM over HTTP
- *     and builds a tmpfs overlay, nothing touches disk ("live image, no install").
+ *   - `boot=casper iso-url=<url ending .iso>` makes casper wget the WHOLE ISO into RAM (initramfs
+ *     tmpfs) and loop-mount the squashfs inside it, nothing touches disk ("live image, no install").
+ *     `netboot=http fetch=` does not exist in casper; `iso-url` is the real mechanism.
  *   - `ip=dhcp` brings the NIC up before the fetch.
  *   - `polyptic.server_url=` / `polyptic.token=` are picked out of /proc/cmdline by the image's
  *     parse-cmdline helper and become the agent's POLYPTIC_SERVER_URL / POLYPTIC_BOOTSTRAP_TOKEN.
- * `arch` + `polyptic_base` are iPXE variables the script resolves at boot; the token (when gated) is
- * a baked literal. Kernel + initrd are served alongside the squashfs from `/dist/image/<arch>/`.
- * When `offload` is set (the boot medium's "Offload to this box" menu item chains `/boot.ipxe?offload=1`),
- * `polyptic.offload=1` is added so the live image runs its one-shot ESP-loader install before reconciling.
+ * `$arch` is a GRUB runtime variable expanded at boot; the http URLs are literals (GRUB/casper have no
+ * TLS, the boot depot is plain http by contract) and the token (when gated) is a baked literal. The
+ * caller appends `polyptic.offload=1` (offload entry only) and the Ubuntu `---` arg-list terminator,
+ * so every polyptic.* arg here stays BEFORE the `---`.
  */
-function bootKernelCmdline(gated: boolean, offload: boolean): string {
+function bootKernelCmdline(httpBase: string, token: string | undefined): string {
   const parts = [
-    "initrd=initrd",
     "boot=casper",
-    "netboot=http",
+    `iso-url=${httpBase}/dist/image/$arch/polyptic.iso`,
     "ip=dhcp",
-    "fetch=${polyptic_base}/dist/image/${arch}/squashfs",
-    // The HTTP base (for the offload flow to fetch the loader) + the WS agent URL (for the agent).
-    "polyptic.base=${polyptic_base}",
-    "polyptic.server_url=${polyptic_ws}",
+    // The HTTP base (for the offload flow to fetch the loaders) + the WS agent URL (for the agent).
+    `polyptic.base=${httpBase}`,
+    `polyptic.server_url=${toWsAgentUrl(httpBase)}`,
   ];
-  if (gated) parts.push("polyptic.token=${polyptic_token}");
-  if (offload) parts.push("polyptic.offload=1");
+  if (token !== undefined) parts.push(`polyptic.token=${token}`);
   return parts.join(" ");
 }
 
 /**
- * Build the `GET /boot.ipxe` chain script for a control plane at `base`, baking in the WS agent URL and
- *, in GATED mode, the current enrolment token (POL-33). The box has no operator session at boot, so
- * this route is ungated; a leaked token cannot self-admit (a NEW machine still lands PENDING for an
- * operator to approve, see enroll.ts case 1). `${buildarch}` selects amd64/arm64 at boot so one script
- * serves both arches (amd64 images are bundled first). `offload` (from `/boot.ipxe?offload=1`) tags the
- * cmdline so the live image writes the loader to the box's ESP once, then boots the same flow forever.
+ * Build the GRUB menu served at `GET /boot/grub.cfg` (+ the /grub aliases) for a control plane at
+ * `base`, baking in the WS agent URL and, in GATED mode, the current enrolment token (POL-33/D47). The
+ * box has no operator session at boot, so the route is ungated; a leaked token cannot self-admit (a NEW
+ * machine still lands PENDING for an operator to approve, see enroll.ts case 1). `$grub_cpu` selects
+ * amd64/arm64 at boot so one menu serves both arches. The `--id offload` entry tags the cmdline so the
+ * live image writes the signed loaders to the box's ESP once, then boots the same flow forever. Every
+ * `$var` in the emitted config is GRUB runtime syntax, written literally (never JS interpolation); the
+ * commands are plain `linux`/`initrd` (noble's signed GRUB has no linuxefi). When the computed base is
+ * https, http is emitted anyway: GRUB/casper have no TLS, the boot depot is plain-HTTP by contract.
  */
-export function buildBootIpxeScript(
-  base: string,
-  token: string | undefined,
-  offload = false,
-): string {
-  const gated = token !== undefined;
+export function buildBootGrubCfg(base: string, token: string | undefined): string {
+  const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  const httpBase = `http://${hostPort}`;
+  const cmdline = bootKernelCmdline(httpBase, token);
   const lines = [
-    "#!ipxe",
-    "# Polyptic netboot (POL-33), generated for THIS control plane from the request Host.",
+    "# Polyptic netboot (POL-33/D47), generated for THIS control plane from the request Host.",
     "# Ownership is by KEY: the box belongs to the server whose enrolment token it carries.",
-    `set polyptic_base ${base}`,
-    `set polyptic_ws ${toWsAgentUrl(base)}`,
-    "iseq ${buildarch} arm64 && set arch arm64 || set arch amd64",
+    "# Chain: firmware db -> shim (Microsoft-signed) -> GRUB (Canonical-signed) -> Canonical-signed",
+    "# kernel, verified by shim_lock even when fetched over HTTP. Secure Boot stays ON.",
   ];
-  if (gated) lines.push(`set polyptic_token ${token}`);
-  const mode = offload ? "offload (writing the boot loader to this box) then " : "";
+  if (base.startsWith("https://")) {
+    lines.push(
+      "# The operator base is https, but GRUB/casper have no TLS: the boot depot speaks plain http.",
+    );
+  }
   lines.push(
-    `echo Polyptic: ${mode}streaming the \${arch} live image from \${polyptic_base} (diskless, no install) …`,
-    `kernel \${polyptic_base}/dist/image/\${arch}/vmlinuz ${bootKernelCmdline(gated, offload)}`,
-    "initrd ${polyptic_base}/dist/image/${arch}/initrd",
-    "boot",
+    'if [ "$grub_cpu" = "x86_64" ]; then set arch=amd64; else set arch=arm64; fi',
+    `set net=(http,${hostPort})`,
+    "set timeout=5",
+    "set default=live",
+    'menuentry "Polyptic: boot now (diskless, nothing written to this box)" --id live {',
+    '  echo "Polyptic: streaming the $arch live image into RAM ..."',
+    `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} ---`,
+    "  initrd $net/dist/image/$arch/initrd",
+    "}",
+    'menuentry "Polyptic: offload to this box, then boot (one-time; adds a loader to the ESP)" --id offload {',
+    '  echo "Polyptic: offload mode, the live image will install the loader, then keep booting ..."',
+    `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1 ---`,
+    "  initrd $net/dist/image/$arch/initrd",
+    "}",
   );
   return lines.join("\n") + "\n";
 }
 
 /**
- * Parse a single `Range: bytes=start-end` header against a known `size`. The squashfs root image is
- * hundreds of MB and casper/iPXE issue byte-range GETs while streaming it, so `/dist/image` serves real
+ * Parse a single `Range: bytes=start-end` header against a known `size`. The live ISO is hundreds of
+ * MB and casper's fetch can issue byte-range GETs while streaming it, so `/dist/image` serves real
  * 206 partial content. Returns `null` for an absent / multi-range / malformed header (caller streams the
  * full 200), `{ unsatisfiable: true }` for a start past EOF (→ 416), else the inclusive `{ start, end }`.
  * Supports the suffix form `bytes=-N` (last N bytes). Mirrors the media store's range handling.
@@ -257,21 +273,18 @@ export function parseRange(
 }
 
 /**
- * Resolve the preferred downloadable boot medium for `arch` under `ipxeDistDir`, traversal-safe: the
- * `dd`-able `.img` dongle first (what an operator writes to USB), else the raw `.efi` loader. Returns the
- * absolute path of the first that is a regular file, else `null` (the medium is optional, the UI falls
- * back to the raw `/boot.ipxe` URL when it's absent).
+ * Resolve the downloadable boot medium under `bootDistDir`, traversal-safe: the universal `dd`-able
+ * `polyptic-boot.img` dongle (one stick boots amd64 AND arm64, no per-arch media). Returns its absolute
+ * path when it is a regular file, else `null` (the medium is optional, the UI falls back to pointing
+ * DHCP option-67 / UEFI HTTP Boot at the shim URL when it's absent).
  */
-export async function resolveBootMedium(ipxeDistDir: string, arch: string): Promise<string | null> {
-  if (!ARCH_RE.test(arch)) return null;
-  for (const ext of BOOT_MEDIUM_EXTS) {
-    const abs = safeResolve(ipxeDistDir, `polyptic-boot-${arch}.${ext}`);
-    if (!abs) continue;
-    try {
-      if ((await stat(abs)).isFile()) return abs;
-    } catch {
-      // try the next extension
-    }
+export async function resolveBootMedium(bootDistDir: string): Promise<string | null> {
+  const abs = safeResolve(bootDistDir, "polyptic-boot.img");
+  if (!abs) return null;
+  try {
+    if ((await stat(abs)).isFile()) return abs;
+  } catch {
+    // medium not bundled
   }
   return null;
 }
@@ -289,7 +302,7 @@ export function registerProvisionRoutes(
   config: ProvisionConfig,
   enrollment: Enrollment,
 ): void {
-  const { installScriptPath, agentDistDir, depsDistDir, imageDistDir, ipxeDistDir, publicBaseUrl } =
+  const { installScriptPath, agentDistDir, depsDistDir, imageDistDir, bootDistDir, publicBaseUrl } =
     config;
 
   // ── GET /install — the install script, with the control-plane base baked in from THIS request. ──
@@ -387,22 +400,26 @@ export function registerProvisionRoutes(
 
   // ─── Netboot depot (POL-33) ────────────────────────────────────────────────────────────────────
 
-  // ── GET /boot.ipxe, UNGATED iPXE chain script; base baked from THIS request, enrolment token
-  //    baked in GATED mode. A diskless box (or the site's DHCP/UEFI-HTTP boot) chains this. ──
-  fastify.get("/boot.ipxe", async (request, reply) => {
+  // ── GET /boot/grub.cfg (+ /grub aliases), UNGATED per-request GRUB menu; base baked from THIS
+  //    request, enrolment token baked in GATED mode. The dongle's stage-1 config chains /boot/grub.cfg;
+  //    an HTTP-booted grubnet instead resolves its baked $prefix to (http,host:port)/grub at the SERVER
+  //    ROOT and probes the per-arch paths first, hence the three aliases (same handler, same body). ──
+  const serveBootConfig = async (request: FastifyRequest, reply: FastifyReply): Promise<string> => {
     const base = computeBaseUrl(request, publicBaseUrl);
-    // The boot medium's "Offload to this box" menu item chains `/boot.ipxe?offload=1`.
-    const offload = (request.query as { offload?: string }).offload === "1";
-    const script = buildBootIpxeScript(base, enrollment.currentToken, offload);
+    const config = buildBootGrubCfg(base, enrollment.currentToken);
     reply.header("Cache-Control", "no-store");
     reply.header("X-Content-Type-Options", "nosniff");
-    // iPXE fetches its scripts as text/plain; the shebang (#!ipxe) is what iPXE keys off, not the type.
+    // A string reply makes Fastify set Content-Length; REQUIRED, firmware/GRUB reject chunked encoding.
     reply.type("text/plain; charset=utf-8");
-    return script;
-  });
+    return config;
+  };
+  fastify.get("/boot/grub.cfg", serveBootConfig);
+  fastify.get("/grub/grub.cfg", serveBootConfig);
+  fastify.get("/grub/x86_64-efi/grub.cfg", serveBootConfig);
+  fastify.get("/grub/arm64-efi/grub.cfg", serveBootConfig);
 
-  // ── GET /dist/image/:arch/:file, the netboot root image (vmlinuz|initrd|squashfs), Range-aware
-  //    (the squashfs is large and streamed byte-range into RAM). 404 → the box's boot cleanly stalls. ──
+  // ── GET /dist/image/:arch/:file, the live-image artifacts (vmlinuz|initrd|polyptic.iso), Range-aware
+  //    (the ISO is large and streamed into RAM). 404 → the box's boot cleanly stalls. ──
   fastify.get("/dist/image/:arch/:file", async (request, reply) => {
     const { arch, file } = request.params as { arch?: string; file?: string };
     if (!arch || !ARCH_RE.test(arch)) return reply.code(404).send({ error: "unknown architecture" });
@@ -442,22 +459,23 @@ export function registerProvisionRoutes(
     return reply.send(createReadStream(abs));
   });
 
-  // ── GET /dist/ipxe/:file, UNGATED download of a prebuilt boot medium (polyptic-boot-<arch>.{efi,img}).
-  //    Tokenless (it only chains /boot.ipxe), so, like /dist/agent, it's ungated: UEFI HTTP Boot, DHCP
-  //    option-67 and the offload flow all fetch it with no session. 404 when not bundled. ──
-  fastify.get("/dist/ipxe/:file", async (request, reply) => {
+  // ── GET /dist/boot/:file, UNGATED download of the boot depot: the universal dd-able dongle
+  //    (polyptic-boot.img) + the four signed loaders (shim*/grub*.efi). Tokenless (they only chain
+  //    /boot/grub.cfg), so, like /dist/agent, it's ungated: UEFI HTTP Boot, DHCP option-67 and the
+  //    offload flow all fetch with no session. 404 when not bundled. ──
+  fastify.get("/dist/boot/:file", async (request, reply) => {
     const file = (request.params as { file?: string }).file ?? "";
-    if (!IPXE_FILE_RE.test(file)) return reply.code(404).send({ error: "unknown boot medium" });
-    const abs = safeResolve(ipxeDistDir, file);
+    if (!BOOT_FILE_RE.test(file)) return reply.code(404).send({ error: "unknown boot file" });
+    const abs = safeResolve(bootDistDir, file);
     if (!abs) return reply.code(404).send({ error: "not found" });
 
     let st;
     try {
       st = await stat(abs);
     } catch {
-      return reply.code(404).send({ error: "boot medium not bundled" });
+      return reply.code(404).send({ error: "boot file not bundled" });
     }
-    if (!st.isFile()) return reply.code(404).send({ error: "boot medium not bundled" });
+    if (!st.isFile()) return reply.code(404).send({ error: "boot file not bundled" });
 
     reply.header("Cache-Control", "no-store");
     reply.header("X-Content-Type-Options", "nosniff");
@@ -472,14 +490,13 @@ export function registerProvisionRoutes(
   //    netboot info for the console (the token stays in EnrollmentInfo). ──
   fastify.get("/api/v1/settings/netboot", async (request) => {
     const base = computeBaseUrl(request, publicBaseUrl);
-    // amd64-first; resolveBootMedium prefers the dd-able .img (dongle) over the raw .efi for download.
-    const medium = await resolveBootMedium(ipxeDistDir, "amd64");
-    const mediumFile = medium ? (medium.split(sep).pop() ?? null) : null;
+    // The universal dd-able dongle image, when bundled (one medium for both arches).
+    const medium = await resolveBootMedium(bootDistDir);
     return NetbootInfo.parse({
       baseUrl: base,
       mode: enrollment.open ? "open" : "gated",
-      bootIpxeUrl: `${base}/boot.ipxe`,
-      bootMediumUrl: mediumFile ? `${base}/dist/ipxe/${mediumFile}` : null,
+      bootConfigUrl: `${base}/boot/grub.cfg`,
+      bootMediumUrl: medium ? `${base}/dist/boot/polyptic-boot.img` : null,
     });
   });
 }
@@ -549,9 +566,10 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
   agentAmd64: boolean;
   imageDistDir: boolean;
   imageAmd64: boolean;
-  bootMediumAmd64: boolean;
+  bootMedium: boolean;
+  signedLoaders: boolean;
 }> {
-  const [installTemplate, agentDir, depsDir, arm64, amd64, imageDir, imageAmd64, mediumAmd64] =
+  const [installTemplate, agentDir, depsDir, arm64, amd64, imageDir, imageAmd64, medium, loaders] =
     await Promise.all([
       isFile(config.installScriptPath),
       isDir(config.agentDistDir),
@@ -559,8 +577,12 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
       isFile(resolve(config.agentDistDir, "polyptic-agent-arm64")),
       isFile(resolve(config.agentDistDir, "polyptic-agent-amd64")),
       isDir(config.imageDistDir),
-      isFile(resolve(config.imageDistDir, "amd64", "squashfs")),
-      resolveBootMedium(config.ipxeDistDir, "amd64").then((p) => p !== null),
+      isFile(resolve(config.imageDistDir, "amd64", "polyptic.iso")),
+      resolveBootMedium(config.bootDistDir).then((p) => p !== null),
+      // Serving UEFI HTTP Boot / offload needs ALL FOUR loaders (shim + network GRUB, both arches).
+      Promise.all(
+        SIGNED_LOADER_FILES.map((f) => isFile(resolve(config.bootDistDir, f))),
+      ).then((present) => present.every(Boolean)),
     ]);
   return {
     installTemplate,
@@ -570,6 +592,7 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
     agentAmd64: amd64,
     imageDistDir: imageDir,
     imageAmd64,
-    bootMediumAmd64: mediumAmd64,
+    bootMedium: medium,
+    signedLoaders: loaders,
   };
 }

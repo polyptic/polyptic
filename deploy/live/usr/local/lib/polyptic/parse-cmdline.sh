@@ -2,7 +2,7 @@
 # Parse Polyptic runtime config out of the kernel command line → systemd EnvironmentFile lines on stdout
 # (POL-33). Pure; the source is overridable via POLYPTIC_CMDLINE_FILE (default /proc/cmdline).
 #
-# Namespaced keys (so they can't clash with kernel/casper options), baked by GET /boot.ipxe:
+# Namespaced keys (so they can't clash with kernel/casper options), baked by GET /boot/grub.cfg:
 #   polyptic.server_url=<ws(s) agent URL, e.g. ws://10.0.0.10:8080/agent> → POLYPTIC_SERVER_URL
 #   polyptic.token=<one bootstrap enrolment token>                        → POLYPTIC_BOOTSTRAP_TOKEN
 # Other polyptic.* keys (polyptic.base=, polyptic.offload=1) are read elsewhere and ignored here.
