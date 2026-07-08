@@ -155,6 +155,39 @@ What the build guarantees, and why:
 
 **26.04 / dracut outlook.** Ubuntu 26.04's own live ISOs still ship casper + initramfs-tools, so this flow holds as-is. When Ubuntu's live images move to dracut-live, the cmdline mechanism changes from casper's `iso-url=` to dracut's `root=live:<url>` (which fetches a bare squashfs, no ISO wrapper); that migration is a scoped follow-up, and the depot side is unchanged either way.
 
+### The VM test ISO (macOS or Linux)
+
+A hypervisor sanity check for the **OS half only**, no netboot infrastructure involved: wrap the
+already-built live rootfs into a stock Ubuntu live ISO that a UEFI VM boots straight from a
+virtual CD, with the control-plane address + enrolment token baked into the GRUB cmdline.
+
+```bash
+POLYPTIC_BASE=http://192.168.1.62:8080 POLYPTIC_TOKEN=lab-token-123 \
+  BASE_ISO=~/Downloads/ubuntu-26.04-live-server-arm64.iso \
+  deploy/build-vm-test-iso.sh arm64
+#   → deploy/dist/image/arm64/polyptic-vm-test.iso  (attach to a UEFI VM as a CD)
+```
+
+Needs only `xorriso` (`brew install xorriso`), no root, runs on macOS. It reuses the netboot
+payload's squashfs (`deploy/dist/image/<arch>/polyptic.iso`, so build that first on the Linux
+host) and the base ISO's own kernel/initrd/ESP. The token rides the ISO in cleartext: **lab use
+only**.
+
+**The remaster pitfall this script exists to avoid (POL-38):** on post-20.10 Ubuntu ISOs the EFI
+System Partition is an **appended partition** that the El Torito catalog points into, not a file
+in the ISO tree. A naive xorriso grow/replay repack carries over only the first 2048-byte sector
+of the ~5 MiB ESP, so the firmware mounts a FAT whose directory tree is garbage, finds no
+`\EFI\BOOT\BOOT*.EFI`, skips the CD, and drops to the UEFI shell (where even the manual
+`FS0:\EFI\BOOT\BOOTAA64.EFI` fails with `File Not Found`). The script rebuilds the layout the way
+Ubuntu ships it (`-append_partition` + `-e --interval:appended_partition_2:all::`) and
+self-verifies that the El Torito image and the appended GPT ESP are the same, byte-identical
+region before it will hand you the ISO.
+
+UTM specifics (arm64, Apple Silicon): display card **`virtio-gpu-gl-pci` ("GPU Supported")**, or
+sway has no GL renderer and the screen stays black; leave the drive as a USB CD; RAM ≥ 4 GiB
+(casper copies the ISO into RAM); turn the QEMU **Hypervisor** (HVF) toggle on, TCG-emulated boots
+take many times longer.
+
 ### The boot medium (macOS or Linux)
 
 ```bash

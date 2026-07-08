@@ -137,6 +137,7 @@ chroot "$ROOTFS" /bin/sh -c 'apt-get clean'
 echo '==> [5/8] overlay diskless identity + offload layer'
 rsync -a "$OVERLAY"/ "$ROOTFS"/ --exclude test
 chmod 0755 "$ROOTFS"/usr/local/lib/polyptic/*.sh
+chmod 0600 "$ROOTFS"/etc/netplan/01-polyptic-dhcp.yaml   # netplan refuses/warns on world-readable configs
 # Enable the system units OFFLINE via the same .wants symlinks `systemctl enable` would create (which
 # is a no-op/warn inside a chroot).
 mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
