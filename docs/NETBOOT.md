@@ -173,6 +173,12 @@ payload's squashfs (`deploy/dist/image/<arch>/polyptic.iso`, so build that first
 host) and the base ISO's own kernel/initrd/ESP. The token rides the ISO in cleartext: **lab use
 only**.
 
+The default output path (`deploy/dist/image/<arch>/polyptic-vm-test.iso`) is inside the image
+depot, so the server serves it at `GET /dist/image/<arch>/polyptic-vm-test.iso` and **Console ▸
+Settings ▸ Netboot** shows a "Download VM test ISO" button whenever the artifact exists. The baked
+cmdline carries `quiet splash`, so the boot shows the Polyptic Plymouth splash (the theme is baked
+into the squashfs by `setup` at image-build time) instead of scrolling kernel text.
+
 **The remaster pitfall this script exists to avoid (POL-38):** on post-20.10 Ubuntu ISOs the EFI
 System Partition is an **appended partition** that the El Torito catalog points into, not a file
 in the ISO tree. A naive xorriso grow/replay repack carries over only the first 2048-byte sector

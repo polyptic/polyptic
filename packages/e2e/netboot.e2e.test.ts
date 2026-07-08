@@ -256,8 +256,9 @@ describe("netboot: GET /boot/grub.cfg", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain(`set net=(http,${GATED_HOST})`);
-      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} ---`));
-      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} polyptic\\.offload=1 ---`));
+      // `quiet splash` (POL-7/POL-38) sits between the token and the `---` terminator.
+      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} quiet splash ---`));
+      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} quiet splash polyptic\\.offload=1 ---`));
     },
     TEST_TIMEOUT,
   );

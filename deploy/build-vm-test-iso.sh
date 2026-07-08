@@ -89,13 +89,15 @@ xorriso -osirrox on -indev "$PAYLOAD" -extract /casper/filesystem.size "$TREE/ca
 # kernel (apt-mark hold), so the base initrd matches the squashfs modules AND its baked casper-uuid.
 
 echo '==> [3/5] bake the enrolment cmdline into /boot/grub/grub.cfg'
+# `quiet splash` (POL-7/POL-38): the squashfs carries the Polyptic Plymouth theme (baked by `setup`
+# at image-build time); these flags are what replace the scrolling kernel/systemd text with it.
 mkdir -p "$TREE/boot/grub"
 cat > "$TREE/boot/grub/grub.cfg" <<EOF
 set timeout=5
 set default=0
 menuentry "Polyptic (live, enrol into $HOSTPORT)" {
     set gfxpayload=keep
-    linux  /casper/vmlinuz boot=casper layerfs-path=filesystem.squashfs polyptic.server_url=ws://$HOSTPORT/agent polyptic.token=$POLYPTIC_TOKEN --- console=tty0
+    linux  /casper/vmlinuz boot=casper layerfs-path=filesystem.squashfs polyptic.server_url=ws://$HOSTPORT/agent polyptic.token=$POLYPTIC_TOKEN quiet splash --- console=tty0
     initrd /casper/initrd
 }
 menuentry 'UEFI Firmware Settings' { fwsetup }

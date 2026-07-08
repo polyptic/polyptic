@@ -582,6 +582,11 @@ export const NetbootInfo = z.object({
   mode: z.enum(["open", "gated"]),
   bootConfigUrl: z.string(),
   bootMediumUrl: z.string().nullable(),
+  /** Self-contained bootable VM/lab test ISOs present in the image depot (POL-38): attach to a UEFI
+   *  VM as a CD and it boots to enrolment with no netboot infrastructure. One entry per arch whose
+   *  artifact exists on disk. NOTE: unlike everything else here these DO bake the enrolment token
+   *  (cleartext on the ISO) — lab use only, which the console spells out next to the link. */
+  vmTestIsos: z.array(z.object({ arch: z.enum(["arm64", "amd64"]), url: z.string() })).default([]),
 });
 export type NetbootInfo = z.infer<typeof NetbootInfo>;
 

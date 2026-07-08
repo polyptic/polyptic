@@ -267,6 +267,22 @@ async function onChangePassword(): Promise<void> {
             (see <code class="inline-code">docs/NETBOOT.md</code> for the recipe and the arm64 name).
           </div>
 
+          <template v-if="store.netboot.vmTestIsos.length > 0">
+            <div class="token-hint nb-gap">
+              VM test image (POL-38): a self-contained bootable ISO — attach to a UEFI VM (or burn for a
+              lab box) and it boots straight to enrolment with no netboot setup. It bakes the current
+              enrolment token in cleartext, so treat the file itself as lab-only.
+            </div>
+            <a
+              v-for="iso in store.netboot.vmTestIsos"
+              :key="iso.arch"
+              class="btn btn-primary save nb-download"
+              :href="iso.url"
+              download
+              >Download VM test ISO ({{ iso.arch }})</a
+            >
+          </template>
+
           <div v-if="store.netboot.mode === 'gated'" class="nb-note">
             Ownership of the fleet is the enrolment token, which the boot flow above bakes in, so multiple
             Polyptic instances can share a network without collision. Keep the netboot network

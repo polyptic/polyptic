@@ -92,9 +92,12 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
 
 /** Build target architectures we serve binaries + bundles for. */
 const ARCH_RE = /^(arm64|amd64)$/;
-/** The three netboot live-image artifacts a diskless box streams (POL-33): the Canonical-signed kernel,
- *  the initrd, and the ISO wrapper casper `iso-url=` pulls whole into RAM. Nothing else is servable. */
-const IMAGE_FILE_RE = /^(vmlinuz|initrd|polyptic\.iso)$/;
+/** The netboot live-image artifacts a diskless box streams (POL-33): the Canonical-signed kernel,
+ *  the initrd, and the ISO wrapper casper `iso-url=` pulls whole into RAM — plus the self-contained
+ *  bootable VM test ISO (POL-38, `build-vm-test-iso.sh`; it bakes the token like `/boot/grub.cfg`
+ *  does, and a leaked token still cannot self-admit a NEW box past the operator). Nothing else is
+ *  servable. */
+const IMAGE_FILE_RE = /^(vmlinuz|initrd|polyptic\.iso|polyptic-vm-test\.iso)$/;
 /** The boot-depot files (POL-33/D47): `polyptic-boot.img` is the universal `dd`-able FAT32 dongle (both
  *  arches on one stick); the four `.efi` files are the SIGNED loaders (shim + network GRUB per arch) for
  *  UEFI HTTP Boot and the offload flow. All TOKENLESS (they only chain `/boot/grub.cfg`), so this route
@@ -192,6 +195,10 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
     `polyptic.server_url=${toWsAgentUrl(httpBase)}`,
   ];
   if (token !== undefined) parts.push(`polyptic.token=${token}`);
+  // POL-7/POL-38: boot splash instead of scrolling kernel/systemd text. The live rootfs carries the
+  // Polyptic Plymouth theme (`setup` bakes it into the squashfs); `quiet splash` is what makes
+  // plymouthd actually display it. Must sit BEFORE the caller-appended `---` terminator.
+  parts.push("quiet", "splash");
   return parts.join(" ");
 }
 
@@ -536,11 +543,22 @@ export function registerProvisionRoutes(
     const base = computeBaseUrl(request, publicBaseUrl);
     // The universal dd-able dongle image, when bundled (one medium for both arches).
     const medium = await resolveBootMedium(bootDistDir);
+    // The self-contained bootable VM test ISOs (POL-38), listed per arch when built into the depot.
+    const vmTestIsos: Array<{ arch: "arm64" | "amd64"; url: string }> = [];
+    for (const arch of ["arm64", "amd64"] as const) {
+      try {
+        const st = await stat(join(imageDistDir, arch, "polyptic-vm-test.iso"));
+        if (st.isFile()) vmTestIsos.push({ arch, url: `${base}/dist/image/${arch}/polyptic-vm-test.iso` });
+      } catch {
+        // not bundled for this arch — omit the entry
+      }
+    }
     return NetbootInfo.parse({
       baseUrl: base,
       mode: enrollment.open ? "open" : "gated",
       bootConfigUrl: `${base}/boot/grub.cfg`,
       bootMediumUrl: medium ? `${base}/dist/boot/polyptic-boot.img` : null,
+      vmTestIsos,
     });
   });
 }
