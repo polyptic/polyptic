@@ -30,6 +30,7 @@ import type {
   UpdateContentSourceBody,
   UpdateSceneBody,
   VideoWall,
+  ImageUpdateInfo,
 } from "@polyptic/protocol";
 
 import * as api from "../api";
@@ -99,6 +100,8 @@ export interface ConsoleState {
   /** Netboot info for Settings (POL-33): control-plane base, the `/boot/grub.cfg` boot config URL,
    *  and the optional boot-medium download. Null until the Settings view fetches it. */
   netboot: NetbootInfo | null;
+  /** Image-updates settings + published images (POL-41): schedule, urgency, last rebuild. */
+  imageUpdates: ImageUpdateInfo | null;
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
@@ -143,6 +146,7 @@ export const useConsoleStore = defineStore("console", {
     sessionChecked: false,
     enrollment: null,
     netboot: null,
+    imageUpdates: null,
     settings: null,
     connected: false,
     revision: 0,
@@ -514,6 +518,15 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] regenerateEnrollment failed", err);
         return false;
+      }
+    },
+
+    /** Load image-updates info for the Settings card (POL-41). Non-throwing, like fetchNetboot. */
+    async fetchImageUpdates(): Promise<void> {
+      try {
+        this.imageUpdates = await auth.getImageUpdates();
+      } catch (err) {
+        console.error("[console] fetchImageUpdates failed", err);
       }
     },
 

@@ -392,10 +392,17 @@ export async function resolveBootMedium(bootDistDir: string): Promise<string | n
  * Register the provisioning routes. ALL are TOP-LEVEL and UNGATED — register OUTSIDE the /api/v1 gate
  * (alongside /healthz). Pass the resolved {@link ProvisionConfig}.
  */
+/** The slice of the image-updates service the ungated manifest route needs (POL-41). */
+export interface ImageManifestSource {
+  manifest(arch: string): Promise<{ arch: string; imageId: string; builtAt: string; sha256: string | null } | null>;
+  state(): Promise<{ urgent: boolean }>;
+}
+
 export function registerProvisionRoutes(
   fastify: FastifyInstance,
   config: ProvisionConfig,
   enrollment: Enrollment,
+  imageUpdates?: ImageManifestSource,
 ): void {
   const { installScriptPath, agentDistDir, depsDistDir, imageDistDir, bootDistDir, publicBaseUrl } =
     config;
@@ -515,6 +522,23 @@ export function registerProvisionRoutes(
 
   // ── GET /dist/image/:arch/:file, the live-image artifacts (vmlinuz|initrd|polyptic.iso), Range-aware
   //    (the ISO is large and streamed into RAM). 404 → the box's boot cleanly stalls. ──
+  // ── GET /dist/image/:arch/manifest.json — the published image identity + roll-out urgency
+  //    (POL-41). UNGATED like the artifacts themselves (the box has no session) and secret-free:
+  //    an image id + checksum reveal nothing an attacker can use, and the urgency flag only makes
+  //    boxes reboot into the image this same depot serves. Netbooted boxes poll this every 5
+  //    minutes and reboot when their /etc/polyptic/image-id no longer matches (urgent → now,
+  //    else the nightly window). 404 until a POL-41 build publishes an image-id.txt.
+  fastify.get("/dist/image/:arch/manifest.json", async (request, reply) => {
+    if (!imageUpdates) return reply.code(404).send({ error: "image updates not wired" });
+    const { arch } = request.params as { arch?: string };
+    if (!arch || !ARCH_RE.test(arch)) return reply.code(404).send({ error: "unknown architecture" });
+    const m = await imageUpdates.manifest(arch);
+    if (!m) return reply.code(404).send({ error: "no published image for this arch" });
+    const { urgent } = await imageUpdates.state();
+    reply.header("Cache-Control", "no-store");
+    return { ...m, urgent };
+  });
+
   fastify.get("/dist/image/:arch/:file", async (request, reply) => {
     const { arch, file } = request.params as { arch?: string; file?: string };
     if (!arch || !ARCH_RE.test(arch)) return reply.code(404).send({ error: "unknown architecture" });

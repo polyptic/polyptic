@@ -1,0 +1,13 @@
+# Polyptic update poll (POL-41): fire the image-id comparison every 5 minutes, first check 5
+# minutes after boot (a box that JUST booted is by definition fresh, or about to learn otherwise).
+[Unit]
+Description=Polyptic - poll the control plane for live-image updates every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+Unit=polyptic-update-poll.service
+
+[Install]
+WantedBy=timers.target

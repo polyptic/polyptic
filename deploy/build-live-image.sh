@@ -173,8 +173,17 @@ mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 for unit in polyptic-agent-env.service polyptic-offload.service; do
   ln -sf "../$unit" "$ROOTFS/etc/systemd/system/multi-user.target.wants/$unit"
 done
+# The update-poll timer (POL-41) is a timer unit, so it enables under timers.target.
+mkdir -p "$ROOTFS/etc/systemd/system/timers.target.wants"
+ln -sf "../polyptic-update-poll.timer" "$ROOTFS/etc/systemd/system/timers.target.wants/polyptic-update-poll.timer"
 # Empty machine-id so systemd mints a transient one each boot (the agent ignores it, our var wins).
 : > "$ROOTFS/etc/machine-id"; rm -f "$ROOTFS/var/lib/dbus/machine-id"
+# The image id (POL-41): a per-build identity the box carries at /etc/polyptic/image-id and the
+# server publishes in /dist/image/<arch>/manifest.json. The update-poll timer compares the two
+# every 5 minutes; a mismatch means "the server has a newer image than the one I booted".
+IMAGE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+printf '%s\n' "$IMAGE_ID" > "$ROOTFS/etc/polyptic/image-id"
+chmod 0644 "$ROOTFS/etc/polyptic/image-id"
 # Kill the per-boot "first boot after update" churn (POL-38): with nothing persisted, systemd's
 # ConditionNeedsUpdate check trips EVERY boot and runs ldconfig.service (a ~40-60s dynamic-linker
 # cache rebuild that stalls the splash), journal-catalog-update, sysusers, etc. Stamping .updated
@@ -253,6 +262,7 @@ rm -f "$OUT_DIR/polyptic.iso"
 xorriso -as mkisofs -J -r -V POLYPTIC -o "$OUT_DIR/polyptic.iso" "$STAGE"
 
 echo "==> [8/8] done -> $OUT_DIR"
+printf '%s\n' "$IMAGE_ID" > "$OUT_DIR/image-id.txt"   # published in /dist/image/<arch>/manifest.json (POL-41)
 ( cd "$OUT_DIR" && sha256sum vmlinuz initrd polyptic.iso > SHA256SUMS && cat SHA256SUMS )
 umount -lf "$ISO_MNT"; rm -rf "$WORK"; trap - EXIT
 

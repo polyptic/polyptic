@@ -12,6 +12,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedDisplaySettings,
+  PersistedImageRollout,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
@@ -258,6 +259,18 @@ export class MemoryStore implements Store {
   }
 
   // ── Display settings (POL-6) ─────────────────────────────────────────────────
+
+  // ── Image updates (POL-41) ─────────────────────────────────────────────────
+
+  private imageRollout: PersistedImageRollout | undefined;
+
+  async getImageRollout(): Promise<PersistedImageRollout | undefined> {
+    return this.imageRollout ? clone(this.imageRollout) : undefined;
+  }
+
+  async setImageRollout(rollout: PersistedImageRollout): Promise<void> {
+    this.imageRollout = clone(rollout);
+  }
 
   async getDisplaySettings(): Promise<PersistedDisplaySettings | undefined> {
     return this.displaySettings ? clone(this.displaySettings) : undefined;

@@ -16,7 +16,9 @@ import {
   DisplaySettings,
   EnrollmentInfo,
   LoginBody,
+  ImageUpdateInfo,
   NetbootInfo,
+  UpdateImageSettingsBody,
 } from "@polyptic/protocol";
 import type {
   ChangePasswordBody as ChangePasswordBodyT,
@@ -103,6 +105,24 @@ export async function regenerateEnrollment(): Promise<EnrollmentInfo> {
 export async function getNetboot(): Promise<NetbootInfo> {
   const raw = await send<unknown>("GET", `${BASE_SETTINGS}/netboot`);
   return NetbootInfo.parse(raw);
+}
+
+/** GET /api/v1/settings/image → schedule + urgency + last rebuild + published images (POL-41). */
+export async function getImageUpdates(): Promise<ImageUpdateInfo> {
+  const raw = await send<unknown>("GET", `${BASE_SETTINGS}/image`);
+  return ImageUpdateInfo.parse(raw);
+}
+
+/** PUT /api/v1/settings/image { scheduleEnabled?, scheduleTime?, urgent? } (POL-41). */
+export async function updateImageSettings(patch: UpdateImageSettingsBody): Promise<ImageUpdateInfo> {
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/image`, patch);
+  return ImageUpdateInfo.parse(raw);
+}
+
+/** POST /api/v1/settings/image/rebuild → kick the rebuild hook now (POL-41). */
+export async function rebuildImageNow(): Promise<ImageUpdateInfo> {
+  const raw = await send<unknown>("POST", `${BASE_SETTINGS}/image/rebuild`);
+  return ImageUpdateInfo.parse(raw);
 }
 
 /** GET /api/v1/settings/display → the current fleet-wide display settings (badge toggle) (POL-6). */

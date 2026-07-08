@@ -31,6 +31,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedDisplaySettings,
+  PersistedImageRollout,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,
@@ -277,6 +278,20 @@ export class PostgresStore implements Store {
         id    int PRIMARY KEY DEFAULT 1,
         mode  text NOT NULL DEFAULT 'open',
         token text
+      )
+    `;
+    // Image updates (POL-41): a single row with the scheduled-rebuild settings, the urgent
+    // roll-out switch, and the last rebuild-hook run's outcome.
+    await sql`
+      CREATE TABLE IF NOT EXISTS image_rollout (
+        id                     int PRIMARY KEY DEFAULT 1,
+        schedule_enabled       boolean NOT NULL DEFAULT true,
+        schedule_time          text NOT NULL DEFAULT '01:00',
+        urgent                 boolean NOT NULL DEFAULT false,
+        last_build_started_at  timestamptz,
+        last_build_finished_at timestamptz,
+        last_build_status      text,
+        last_build_log         text
       )
     `;
     // Display settings (POL-6): a single row holding the fleet-wide on-screen badge toggle. Absent
@@ -796,6 +811,51 @@ export class PostgresStore implements Store {
   }
 
   // ── Display settings (POL-6) ─────────────────────────────────────────────────
+
+  // ── Image updates (POL-41) ─────────────────────────────────────────────────
+
+  async getImageRollout(): Promise<PersistedImageRollout | undefined> {
+    const sql = this.sql;
+    const rows = await sql<
+      {
+        schedule_enabled: boolean;
+        schedule_time: string;
+        urgent: boolean;
+        last_build_started_at: Date | null;
+        last_build_finished_at: Date | null;
+        last_build_status: string | null;
+        last_build_log: string | null;
+      }[]
+    >`SELECT schedule_enabled, schedule_time, urgent, last_build_started_at, last_build_finished_at, last_build_status, last_build_log FROM image_rollout WHERE id = 1 LIMIT 1`;
+    const row = rows[0];
+    if (!row) return undefined;
+    const status = row.last_build_status;
+    return {
+      scheduleEnabled: row.schedule_enabled,
+      scheduleTime: row.schedule_time,
+      urgent: row.urgent,
+      lastBuildStartedAt: row.last_build_started_at?.toISOString() ?? null,
+      lastBuildFinishedAt: row.last_build_finished_at?.toISOString() ?? null,
+      lastBuildStatus: status === "running" || status === "success" || status === "failure" ? status : null,
+      lastBuildLog: row.last_build_log,
+    };
+  }
+
+  async setImageRollout(rollout: PersistedImageRollout): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, urgent, last_build_started_at, last_build_finished_at, last_build_status, last_build_log)
+      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.urgent}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog})
+      ON CONFLICT (id) DO UPDATE SET
+        schedule_enabled = EXCLUDED.schedule_enabled,
+        schedule_time = EXCLUDED.schedule_time,
+        urgent = EXCLUDED.urgent,
+        last_build_started_at = EXCLUDED.last_build_started_at,
+        last_build_finished_at = EXCLUDED.last_build_finished_at,
+        last_build_status = EXCLUDED.last_build_status,
+        last_build_log = EXCLUDED.last_build_log
+    `;
+  }
 
   async getDisplaySettings(): Promise<PersistedDisplaySettings | undefined> {
     const sql = this.sql;

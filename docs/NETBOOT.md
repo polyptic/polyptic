@@ -296,6 +296,43 @@ Three things make this work: the firmware announces vendor class `HTTPClient` wi
 
 ---
 
+## Keeping the image updated (POL-41)
+
+A baked image is convenient and immutable — and immediately starts ageing. The update loop closes
+that gap with **zero per-box work**, because a diskless box re-pulls its whole OS at every boot:
+**an update is just a rebuilt image plus a reboot.**
+
+**Server side — scheduled refresh.** Console ▸ Settings ▸ **Image updates** runs a rebuild hook on
+a schedule (default 01:00, server-local; or the **Rebuild now** button). The hook is a command by
+contract (`IMAGE_REBUILD_CMD`); the ready-made one is:
+
+```bash
+IMAGE_REBUILD_CMD="deploy/rebuild-image-docker.sh arm64"   # privileged Linux container, any host
+```
+
+which runs `deploy/refresh-live-image.sh`: unsquash the CURRENT image, `apt-get upgrade` it in a
+chroot (security + updates pockets), re-wrap, and stamp a **new image id**. Two deliberate
+properties: **nothing to upgrade → nothing changes** (no image-id churn, no pointless fleet
+reboots), and **the kernel stays held** (the D47 signed-kernel/initrd invariant) — kernel CVEs need
+a full `build-live-image.sh` run against a newer base ISO; everything user-space refreshes
+automatically.
+
+**Box side — the 5-minute poll.** Every netbooted box carries its identity at
+`/etc/polyptic/image-id` and compares it against `GET /dist/image/<arch>/manifest.json`
+(`{imageId, builtAt, sha256, urgent}`, ungated, secret-free) every 5 minutes
+(`polyptic-update-poll.timer`). On a mismatch:
+
+- **urgent on** (the Settings switch): reboot **now**, splayed 0–4 min per box (derived from the
+  stable machine id) so a wall never hits the depot in unison;
+- **urgent off**: reboot only inside the nightly window (03:00–04:59 local) — a 01:00 scheduled
+  refresh therefore rolls across the fleet the same night, invisibly.
+
+Boxes booted from the **live ISO / USB stick never auto-reboot** — they would re-boot the same
+stale medium (the poll guards on the netboot-only `iso-url=` kernel arg). Refresh those by
+regenerating and re-flashing the ISO (`deploy/build-live-iso.sh`).
+
+---
+
 ## Lab: the full netboot chain in a UTM VM (POL-39, verified)
 
 All three flows run end to end in a UTM (QEMU/EDK2, Apple Silicon) VM against a dev control plane

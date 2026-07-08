@@ -591,6 +591,51 @@ export const NetbootInfo = z.object({
 });
 export type NetbootInfo = z.infer<typeof NetbootInfo>;
 
+/** One arch's published live image, as served UNGATED at `/dist/image/<arch>/manifest.json` and
+ *  compared by every netbooted box's 5-minute update poll (POL-41). `urgent` is the fleet-wide
+ *  roll-out switch: true → boxes running a different imageId reboot within minutes (splayed);
+ *  false → they wait for the nightly window. Secret-free by design (boxes have no session). */
+export const ImageManifest = z.object({
+  arch: z.enum(["arm64", "amd64"]),
+  imageId: z.string(),
+  builtAt: z.string(),
+  sha256: z.string().nullable(),
+  urgent: z.boolean(),
+});
+export type ImageManifest = z.infer<typeof ImageManifest>;
+
+/** The image-updates surface for Console ▸ Settings (POL-41): the rebuild schedule (server-local
+ *  HH:MM, default 01:00), the urgent roll-out switch, the last hook run's outcome, and the
+ *  currently published per-arch images. GATED under /api/v1. */
+export const ImageUpdateInfo = z.object({
+  scheduleEnabled: z.boolean(),
+  /** Server-local `HH:MM` the rebuild hook fires at (default "01:00"). */
+  scheduleTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+  urgent: z.boolean(),
+  /** Whether the server has a rebuild hook configured (IMAGE_REBUILD_CMD); without one the
+   *  schedule and "rebuild now" can only report, not build. */
+  rebuildConfigured: z.boolean(),
+  lastBuild: z
+    .object({
+      startedAt: z.string(),
+      finishedAt: z.string().nullable(),
+      status: z.enum(["running", "success", "failure"]),
+      /** Tail of the hook's combined output — enough to see apt's verdict or the failure. */
+      logTail: z.string(),
+    })
+    .nullable(),
+  images: z.array(ImageManifest),
+});
+export type ImageUpdateInfo = z.infer<typeof ImageUpdateInfo>;
+
+/** Update the image-updates schedule / urgency from the console (POL-41). */
+export const UpdateImageSettingsBody = z.object({
+  scheduleEnabled: z.boolean().optional(),
+  scheduleTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+  urgent: z.boolean().optional(),
+});
+export type UpdateImageSettingsBody = z.infer<typeof UpdateImageSettingsBody>;
+
 /** Update the fleet-wide display settings from the console (POL-6). Currently just the badge toggle. */
 export const UpdateDisplaySettingsBody = z.object({
   showBadges: z.boolean(),

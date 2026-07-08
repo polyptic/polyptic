@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
+
+import * as auth from "../auth";
 import { useConsoleStore } from "../stores/console";
 
 // The real Settings view (Phase 3f — D29): signed-in account, change password, logout, the
@@ -15,6 +17,8 @@ onMounted(() => {
   void store.fetchNetboot();
   // Load the fleet-wide badge toggle so the card is correct even before the admin/state snapshot lands.
   void store.fetchDisplaySettings();
+  // Load the image-updates state (schedule, urgency, last rebuild, published images) (POL-41).
+  void store.fetchImageUpdates();
 });
 
 function setTheme(theme: "light" | "dark"): void {
@@ -85,6 +89,43 @@ async function copyNetboot(text: string, which: string): Promise<void> {
   } catch {
     /* clipboard unavailable (non-secure context), Copy is best-effort */
   }
+}
+
+// ── Image updates (POL-41) ──────────────────────────────────────────────────────
+const imgSaving = ref(false);
+const imgTime = ref("");
+
+async function applyImageSettings(patch: {
+  scheduleEnabled?: boolean;
+  scheduleTime?: string;
+  urgent?: boolean;
+}): Promise<void> {
+  if (imgSaving.value) return;
+  imgSaving.value = true;
+  try {
+    store.imageUpdates = await auth.updateImageSettings(patch);
+  } catch (err) {
+    console.error("[console] image settings update failed", err);
+  } finally {
+    imgSaving.value = false;
+  }
+}
+
+async function rebuildNow(): Promise<void> {
+  if (imgSaving.value) return;
+  imgSaving.value = true;
+  try {
+    store.imageUpdates = await auth.rebuildImageNow();
+  } catch (err) {
+    console.error("[console] rebuild trigger failed", err);
+  } finally {
+    imgSaving.value = false;
+  }
+}
+
+function saveScheduleTime(): void {
+  const t = imgTime.value.trim();
+  if (/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) void applyImageSettings({ scheduleTime: t });
 }
 
 // ── Change password ─────────────────────────────────────────────────────────────
@@ -296,6 +337,90 @@ async function onChangePassword(): Promise<void> {
         </template>
       </div>
 
+      <!-- Image updates (POL-41) ------------------------------------------------ -->
+      <div class="card panel">
+        <div class="panel-title">Image updates</div>
+        <div class="panel-sub">
+          Rebuild the live image with the latest Ubuntu bug/security fixes on a schedule, and roll it
+          across the fleet: netbooted boxes compare image ids with this server every 5 minutes and
+          reboot to re-pull — overnight by default, within minutes when marked urgent.
+        </div>
+
+        <template v-if="store.imageUpdates === null">
+          <div class="token-hint">Loading image-update state…</div>
+        </template>
+        <template v-else>
+          <div class="token-hint" v-if="store.imageUpdates.images.length > 0">
+            Published image<span v-if="store.imageUpdates.images.length > 1">s</span>:
+            <code class="inline-code" v-for="img in store.imageUpdates.images" :key="img.arch">
+              {{ img.arch }} · {{ img.imageId }}
+            </code>
+          </div>
+          <div class="token-hint" v-else>
+            No published image carries an id yet — rebuild once with the current
+            <code class="inline-code">deploy/build-live-image.sh</code> to start tracking updates.
+          </div>
+
+          <div class="pill-group">
+            <div
+              class="pill"
+              :class="{ active: store.imageUpdates.scheduleEnabled }"
+              :aria-disabled="imgSaving"
+              @click="applyImageSettings({ scheduleEnabled: true })"
+            >
+              ● Nightly rebuild at
+            </div>
+            <input
+              class="nb-time"
+              type="time"
+              :value="store.imageUpdates.scheduleTime"
+              :disabled="imgSaving"
+              @change="imgTime = ($event.target as HTMLInputElement).value; saveScheduleTime()"
+            />
+            <div
+              class="pill"
+              :class="{ active: !store.imageUpdates.scheduleEnabled }"
+              :aria-disabled="imgSaving"
+              @click="applyImageSettings({ scheduleEnabled: false })"
+            >
+              ○ Off
+            </div>
+          </div>
+          <div class="token-hint" v-if="!store.imageUpdates.rebuildConfigured">
+            This server has no rebuild hook (<code class="inline-code">IMAGE_REBUILD_CMD</code>), so the
+            schedule and “Rebuild now” cannot build from here — set it to e.g.
+            <code class="inline-code">deploy/rebuild-image-docker.sh arm64</code>.
+          </div>
+
+          <button
+            class="btn btn-primary save nb-download"
+            :disabled="imgSaving || !store.imageUpdates.rebuildConfigured || store.imageUpdates.lastBuild?.status === 'running'"
+            @click="rebuildNow"
+          >
+            {{ store.imageUpdates.lastBuild?.status === "running" ? "Rebuilding…" : "Rebuild now" }}
+          </button>
+          <div class="token-hint" v-if="store.imageUpdates.lastBuild">
+            Last rebuild: {{ store.imageUpdates.lastBuild.status }}
+            ({{ new Date(store.imageUpdates.lastBuild.startedAt).toLocaleString() }})
+          </div>
+
+          <div class="nb-note" v-if="store.imageUpdates.urgent">
+            <strong>Urgent roll-out is ON:</strong> any netbooted box running a different image reboots
+            within minutes. Switch it off once the fleet has converged.
+            <button class="btn-ghost-sm" :disabled="imgSaving" @click="applyImageSettings({ urgent: false })">
+              Clear urgent
+            </button>
+          </div>
+          <div class="nb-note" v-else>
+            New images roll out in the nightly window (03:00–05:00 on each box). For a critical fix,
+            <button class="btn-ghost-sm" :disabled="imgSaving" @click="applyImageSettings({ urgent: true })">
+              mark urgent
+            </button>
+            — stale boxes reboot within minutes (splayed).
+          </div>
+        </template>
+      </div>
+
       <!-- Change password ------------------------------------------------------- -->
       <div class="card panel">
         <div class="panel-title">Change password</div>
@@ -438,6 +563,16 @@ async function onChangePassword(): Promise<void> {
   color: var(--muted2);
   margin-top: 10px;
 }
+/* ── Image updates card (POL-41) ── */
+.nb-time {
+  border: 1px solid var(--border, #d0d4dc);
+  background: var(--bg, transparent);
+  color: inherit;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font: inherit;
+}
+
 /* ── Netboot card (POL-33) ── */
 .nb-gap {
   margin-top: 14px;

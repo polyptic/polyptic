@@ -14,6 +14,8 @@ import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
+import { ImageUpdateInfo, UpdateImageSettingsBody } from "@polyptic/protocol";
+
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import { AuthService, authConfigFromEnv } from "./auth-local";
@@ -22,6 +24,7 @@ import { CaptureCoordinator, ThumbnailStore } from "./capture";
 import { Enrollment } from "./enroll";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
+import { ImageUpdates } from "./image-updates";
 import { registerOpsRoutes } from "./ops";
 import { provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
 import { registerRestRoutes } from "./rest";
@@ -180,9 +183,51 @@ registerOpsRoutes(fastify, {
 // TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch, /dist/deps/**) —
 // NOT /api/v1, so an edge box with no operator session can bootstrap itself entirely from the server.
 const provisionConfig = provisionConfigFromEnv();
+
+// ── Image updates (POL-41): the scheduled rebuild hook + the published manifest + urgency. The hook
+// command comes from IMAGE_REBUILD_CMD (e.g. `deploy/rebuild-image-docker.sh arm64`); without it the
+// schedule and "rebuild now" log a warning instead of building (a laptop server can still SERVE). ──
+const imageUpdates = new ImageUpdates(
+  store,
+  provisionConfig.imageDistDir,
+  process.env.IMAGE_REBUILD_CMD?.trim() || undefined,
+  fastify.log,
+);
+imageUpdates.start();
+
 // Pass the live enrollment singleton so GET /boot/grub.cfg (POL-33/D47) bakes the CURRENT token, the
 // same one the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
-registerProvisionRoutes(fastify, provisionConfig, enrollment);
+registerProvisionRoutes(fastify, provisionConfig, enrollment, imageUpdates);
+
+// ── Image-updates operator surface (POL-41), GATED under /api/v1. ──
+const imageUpdateInfo = async () => {
+  const st = await imageUpdates.state();
+  return ImageUpdateInfo.parse({
+    scheduleEnabled: st.scheduleEnabled,
+    scheduleTime: st.scheduleTime,
+    urgent: st.urgent,
+    rebuildConfigured: imageUpdates.rebuildConfigured,
+    lastBuild: st.lastBuildStartedAt
+      ? {
+          startedAt: st.lastBuildStartedAt,
+          finishedAt: st.lastBuildFinishedAt,
+          status: st.lastBuildStatus ?? "failure",
+          logTail: st.lastBuildLog ?? "",
+        }
+      : null,
+    images: (await imageUpdates.manifests()).map((m) => ({ ...m, urgent: st.urgent })),
+  });
+};
+fastify.get("/api/v1/settings/image", async () => imageUpdateInfo());
+fastify.put("/api/v1/settings/image", async (request) => {
+  const body = UpdateImageSettingsBody.parse(request.body ?? {});
+  await imageUpdates.updateSettings(body);
+  return imageUpdateInfo();
+});
+fastify.post("/api/v1/settings/image/rebuild", async () => {
+  await imageUpdates.trigger("manual");
+  return imageUpdateInfo();
+});
 attachWebSockets({
   server: fastify.server,
   control,
