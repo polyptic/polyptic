@@ -19,11 +19,17 @@
  */
 import { spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { FastifyBaseLogger } from "fastify";
 
 import type { PersistedImageRollout, Store } from "./store/types";
+
+/** The hook runs from the REPO ROOT (…/packages/server/src → repo), so `deploy/…` paths in
+ *  IMAGE_REBUILD_CMD work regardless of the server process's own cwd (the dev stack runs from
+ *  packages/server; found live when the first hook run failed with "No such file or directory"). */
+const HOOK_CWD = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 const ARCHES = ["arm64", "amd64"] as const;
 type Arch = (typeof ARCHES)[number];
@@ -179,6 +185,7 @@ export class ImageUpdates {
 
     const status: "success" | "failure" = await new Promise((resolvePromise) => {
       const child = spawn("/bin/sh", ["-c", this.rebuildCmd as string], {
+        cwd: HOOK_CWD,
         stdio: ["ignore", "pipe", "pipe"],
       });
       const killer = setTimeout(() => {
