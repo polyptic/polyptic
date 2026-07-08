@@ -198,8 +198,26 @@ fi
 mksquashfs "$ROOTFS" "$WORK/filesystem.squashfs" -noappend -comp zstd -Xcompression-level 19 -no-progress
 cp -f "$VMLINUZ" "$OUT_DIR/vmlinuz"; cp -f "$INITRD" "$OUT_DIR/initrd"
 chmod u+w "$OUT_DIR/initrd"   # the ISO's initrd is read-only; the splash append below needs +w
-# Append the splash closure as an extra cpio segment (zstd like the main segment; the kernel unpacks
-# concatenated segments in order and later files win). If the harvest is absent this is a no-op.
+# Neuter the initrd's multipath boot scripts (rides the same appended segment): the stock server
+# initrd's scripts/init-top/multipath unconditionally modprobes dm-multipath and starts
+# `multipathd -B` — there is NO cmdline gate in the initramfs-tools version (`multipath=off` is a
+# dracut-ism) — and in a live boot it aborts on /etc/multipath/bindings, spraying "fatal
+# configuration error" on the console at ~0.2s, before plymouth owns the screen. A kiosk never
+# boots from SAN multipath. init-bottom/local-premount are neutered too (they would log
+# "inconsistent PIDs" noise for the daemon that never started).
+mkdir -p "$WORK/ply-harvest"
+for hook in init-top init-bottom local-premount; do
+  mkdir -p "$WORK/ply-harvest/scripts/$hook"
+  cat > "$WORK/ply-harvest/scripts/$hook/multipath" <<'NOOP'
+#!/bin/sh
+# Polyptic live image (POL-38): multipath neutered — see deploy/build-live-image.sh.
+case "$1" in prereqs) echo ""; exit 0 ;; esac
+exit 0
+NOOP
+  chmod 0755 "$WORK/ply-harvest/scripts/$hook/multipath"
+done
+# Append the extras (splash closure + multipath no-ops) as an extra cpio segment (zstd like the
+# main segment; the kernel unpacks concatenated segments in order and later files win).
 if [ -d "$WORK/ply-harvest" ]; then
   # The hook resolves the theme via the `default.plymouth` update-alternatives entry (setup
   # registers it); if the harvest is missing the theme dir, the registration didn't happen (e.g.

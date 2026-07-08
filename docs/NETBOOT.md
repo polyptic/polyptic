@@ -155,27 +155,28 @@ What the build guarantees, and why:
 
 **26.04 / dracut outlook.** Ubuntu 26.04's own live ISOs still ship casper + initramfs-tools, so this flow holds as-is. When Ubuntu's live images move to dracut-live, the cmdline mechanism changes from casper's `iso-url=` to dracut's `root=live:<url>` (which fetches a bare squashfs, no ISO wrapper); that migration is a scoped follow-up, and the depot side is unchanged either way.
 
-### The VM test ISO (macOS or Linux)
+### The live ISO (macOS or Linux)
 
-A hypervisor sanity check for the **OS half only**, no netboot infrastructure involved: wrap the
-already-built live rootfs into a stock Ubuntu live ISO that a UEFI VM boots straight from a
-virtual CD, with the control-plane address + enrolment token baked into the GRUB cmdline.
+The **no-netboot provisioning option** (and the fastest VM sanity check): wrap the already-built
+live rootfs into a stock Ubuntu live ISO that boots from a USB stick / CD / virtual CD, with the
+control-plane address + enrolment token baked into the GRUB cmdline. Write it to a stick, boot the
+box, it comes up diskless and enrols — same diskless contract as netboot, no boot infrastructure.
 
 ```bash
 POLYPTIC_BASE=http://192.168.1.62:8080 POLYPTIC_TOKEN=lab-token-123 \
   BASE_ISO=~/Downloads/ubuntu-26.04-live-server-arm64.iso \
-  deploy/build-vm-test-iso.sh arm64
-#   → deploy/dist/image/arm64/polyptic-vm-test.iso  (attach to a UEFI VM as a CD)
+  deploy/build-live-iso.sh arm64
+#   → deploy/dist/image/arm64/polyptic-live.iso  (USB stick, CD, or a UEFI VM's virtual CD)
 ```
 
 Needs only `xorriso` (`brew install xorriso`), no root, runs on macOS. It reuses the netboot
 payload's squashfs (`deploy/dist/image/<arch>/polyptic.iso`, so build that first on the Linux
-host) and the base ISO's own kernel/initrd/ESP. The token rides the ISO in cleartext: **lab use
-only**.
+host) and the base ISO's own kernel/initrd/ESP. The token rides the ISO in cleartext, so the
+FILE is a credential — share it like one (a leaked token still only lands new boxes as PENDING).
 
-The default output path (`deploy/dist/image/<arch>/polyptic-vm-test.iso`) is inside the image
-depot, so the server serves it at `GET /dist/image/<arch>/polyptic-vm-test.iso` and **Console ▸
-Settings ▸ Netboot** shows a "Download VM test ISO" button whenever the artifact exists. The baked
+The default output path (`deploy/dist/image/<arch>/polyptic-live.iso`) is inside the image
+depot, so the server serves it at `GET /dist/image/<arch>/polyptic-live.iso` and **Console ▸
+Settings ▸ Netboot** shows a per-arch "Download live ISO" button whenever the artifact exists. The baked
 cmdline carries `quiet splash plymouth.ignore-serial-consoles`, so the boot shows the Polyptic
 Plymouth splash instead of scrolling kernel text. Three load-bearing details behind that (D49): the
 theme rides INSIDE the initrd (an extra cpio segment appended by `build-live-image.sh`, harvested

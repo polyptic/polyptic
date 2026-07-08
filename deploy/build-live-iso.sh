@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# deploy/build-vm-test-iso.sh, build a SELF-CONTAINED, BOOTABLE live test ISO for a hypervisor
-# (UTM/QEMU/OVMF; POL-38). Sibling of build-live-image.sh, which makes the NETBOOT payload
-# (deploy/dist/image/<arch>/polyptic.iso, deliberately NOT bootable, casper wgets it over HTTP).
-# This script wraps that same rootfs into a stock Ubuntu live ISO so a VM can boot it from a
-# virtual CD with NO network boot infrastructure: sanity-checks the OS half (compositor + agent
-# enrolment) independent of netboot.
+# deploy/build-live-iso.sh, build the SELF-CONTAINED, BOOTABLE Polyptic live ISO (POL-38).
+# Sibling of build-live-image.sh, which makes the NETBOOT payload (deploy/dist/image/<arch>/
+# polyptic.iso, deliberately NOT bootable, casper wgets it over HTTP). This script wraps that same
+# rootfs into a stock Ubuntu live ISO that boots from USB/CD/virtual-CD with NO network boot
+# infrastructure — a first-class provisioning option alongside netboot (D49): write it to a stick,
+# boot the box, it comes up diskless and enrols. Also the fastest way to sanity-check the OS half
+# in a VM (UTM/QEMU/OVMF). Served by the control plane at GET /dist/image/<arch>/polyptic-live.iso
+# with a download button in Console > Settings > Netboot.
 #
 # MODEL: take a stock casper BASE_ISO, swap in the Polyptic squashfs from the netboot payload,
 # bake server URL + enrolment token into /boot/grub/grub.cfg, and REBUILD the boot metadata the
@@ -26,15 +28,16 @@
 # USAGE:
 #   POLYPTIC_BASE=http://192.168.1.62:8080 POLYPTIC_TOKEN=lab-token-123 \
 #     BASE_ISO=~/Downloads/ubuntu-26.04-live-server-arm64.iso \
-#     deploy/build-vm-test-iso.sh [amd64|arm64]
+#     deploy/build-live-iso.sh [amd64|arm64]
 #     env: BASE_ISO       (required) stock casper live ISO, SAME release/arch the payload was
 #                         built from (kernel/initrd/casper-uuid must match the squashfs)
 #          POLYPTIC_BASE  (required) control plane, plain http://host:port (VM-reachable address)
-#          POLYPTIC_TOKEN (required) enrolment token baked into the cmdline (lab use only: anyone
-#                         who can read the ISO can read the token)
+#          POLYPTIC_TOKEN (required) enrolment token baked into the cmdline (the ISO file is a
+#                         CREDENTIAL: anyone who can read it can read the token; a leaked token
+#                         still only lands a NEW box as PENDING for operator approval)
 #          PAYLOAD        netboot payload ISO holding casper/filesystem.squashfs
 #                         (default deploy/dist/image/<arch>/polyptic.iso, from build-live-image.sh)
-#          OUT            output path (default deploy/dist/image/<arch>/polyptic-vm-test.iso)
+#          OUT            output path (default deploy/dist/image/<arch>/polyptic-live.iso)
 #
 # UTM notes (POL-38): give the VM a GPU display card (virtio-gpu-gl-pci, "GPU Supported") or sway
 # has no GL renderer and the screen stays black; leave the drive as a USB CD (auto-boots once the
@@ -45,17 +48,17 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 case "${1:-arm64}" in
   amd64|x86_64|x64) ARCH=amd64 ;;
   arm64|aarch64)    ARCH=arm64 ;;
-  *) echo "build-vm-test-iso: unknown arch '${1:-}' (amd64|arm64)" >&2; exit 2 ;;
+  *) echo "build-live-iso: unknown arch '${1:-}' (amd64|arm64)" >&2; exit 2 ;;
 esac
 : "${BASE_ISO:?set BASE_ISO=/path/to/ubuntu-*-live-*.iso (stock casper ISO, same release as the payload)}"
 : "${POLYPTIC_BASE:?set POLYPTIC_BASE, e.g. http://192.168.1.62:8080 (VM-reachable)}"
 : "${POLYPTIC_TOKEN:?set POLYPTIC_TOKEN (the enrolment/bootstrap token to bake in)}"
 PAYLOAD="${PAYLOAD:-$REPO_ROOT/deploy/dist/image/$ARCH/polyptic.iso}"
-OUT="${OUT:-$REPO_ROOT/deploy/dist/image/$ARCH/polyptic-vm-test.iso}"
+OUT="${OUT:-$REPO_ROOT/deploy/dist/image/$ARCH/polyptic-live.iso}"
 
 case "$POLYPTIC_BASE" in
   http://*) ;;
-  *) echo "build-vm-test-iso: POLYPTIC_BASE must be plain http://host[:port] (GRUB/casper speak no TLS)" >&2; exit 2 ;;
+  *) echo "build-live-iso: POLYPTIC_BASE must be plain http://host[:port] (GRUB/casper speak no TLS)" >&2; exit 2 ;;
 esac
 HOSTPORT="${POLYPTIC_BASE#http://}"; HOSTPORT="${HOSTPORT%/}"
 
@@ -103,7 +106,7 @@ mkdir -p "$TREE/boot/grub"
 cat > "$TREE/boot/grub/grub.cfg" <<EOF
 set timeout=5
 set default=0
-menuentry "Polyptic (live, enrol into $HOSTPORT)" {
+menuentry "Polyptic" {
     set gfxpayload=keep
     linux  /casper/vmlinuz boot=casper layerfs-path=filesystem.squashfs polyptic.server_url=ws://$HOSTPORT/agent polyptic.token=$POLYPTIC_TOKEN multipath=off quiet splash plymouth.ignore-serial-consoles --- console=tty0
     initrd /casper/initrd
@@ -114,7 +117,7 @@ EOF
 echo '==> [4/5] rebuild the ISO with the ESP appended (El Torito -> appended GPT partition)'
 VOLID="$(xorriso -indev "$BASE_ISO" -pvd_info 2>/dev/null | awk -F': ' '/^Volume Id/{print $2}')"
 rm -f "$OUT"
-xorriso -as mkisofs -r -V "${VOLID:-POLYPTIC-VM-TEST}" -J -joliet-long -l \
+xorriso -as mkisofs -r -V "${VOLID:-POLYPTIC-LIVE}" -J -joliet-long -l \
   -o "$OUT" \
   -partition_offset 16 \
   -append_partition 2 C12A7328-F81F-11D2-BA4B-00A0C93EC93B "$WORK/esp.img" \
@@ -137,5 +140,7 @@ cat <<EOF
 
 Attach $OUT to a UEFI VM as a (USB) CD and it auto-boots: GRUB (5s) -> casper -> greetd/sway ->
 agent enrols into ws://$HOSTPORT/agent with the baked token. UTM: set the display card to
-virtio-gpu-gl-pci ("GPU Supported"), RAM >= 4 GiB. The token is in cleartext on the ISO: lab only.
+virtio-gpu-gl-pci ("GPU Supported"), RAM >= 4 GiB. For a real box: write it to a USB stick
+(dd if=<iso> of=/dev/<usb-disk> bs=4M) and boot with Secure Boot ON. The baked token makes the
+FILE a credential: share it like one (a leaked token still only lands new boxes as PENDING).
 EOF

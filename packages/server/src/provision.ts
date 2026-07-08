@@ -94,10 +94,10 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
 const ARCH_RE = /^(arm64|amd64)$/;
 /** The netboot live-image artifacts a diskless box streams (POL-33): the Canonical-signed kernel,
  *  the initrd, and the ISO wrapper casper `iso-url=` pulls whole into RAM — plus the self-contained
- *  bootable VM test ISO (POL-38, `build-vm-test-iso.sh`; it bakes the token like `/boot/grub.cfg`
+ *  bootable live ISO (POL-38/D49, `build-live-iso.sh`; it bakes the token like `/boot/grub.cfg`
  *  does, and a leaked token still cannot self-admit a NEW box past the operator). Nothing else is
  *  servable. */
-const IMAGE_FILE_RE = /^(vmlinuz|initrd|polyptic\.iso|polyptic-vm-test\.iso)$/;
+const IMAGE_FILE_RE = /^(vmlinuz|initrd|polyptic\.iso|polyptic-live\.iso)$/;
 /** The boot-depot files (POL-33/D47): `polyptic-boot.img` is the universal `dd`-able FAT32 dongle (both
  *  arches on one stick); the four `.efi` files are the SIGNED loaders (shim + network GRUB per arch) for
  *  UEFI HTTP Boot and the offload flow. All TOKENLESS (they only chain `/boot/grub.cfg`), so this route
@@ -202,10 +202,10 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
   // never paint the local display (verified live with plymouthd --debug in the POL-38 UTM boot).
   // A wall renders on its panel by definition, so ignoring serial consoles is always right here.
   // Must sit BEFORE the caller-appended `---` terminator.
-  // `multipath=off` silences the INITRAMFS multipath boot script (stock server initrds carry it):
-  // in a live boot it aborts on its bindings file at ~0.2s and sprays "fatal configuration error"
-  // on the console BEFORE plymouth takes the screen — the rootfs unit mask can't reach it. A kiosk
-  // never boots from SAN multipath, so off is always right here.
+  // `multipath=off` is honoured by DRACUT-based initrds only — the initramfs-tools multipath boot
+  // script has no cmdline gate at all, which is why build-live-image.sh overrides it with a no-op
+  // inside the shipped initrd (the real fix for the pre-splash "fatal configuration error" spray).
+  // The flag stays as documentation-of-intent + coverage for future dracut-based images.
   parts.push("multipath=off", "quiet", "splash", "plymouth.ignore-serial-consoles");
   return parts.join(" ");
 }
@@ -551,12 +551,12 @@ export function registerProvisionRoutes(
     const base = computeBaseUrl(request, publicBaseUrl);
     // The universal dd-able dongle image, when bundled (one medium for both arches).
     const medium = await resolveBootMedium(bootDistDir);
-    // The self-contained bootable VM test ISOs (POL-38), listed per arch when built into the depot.
-    const vmTestIsos: Array<{ arch: "arm64" | "amd64"; url: string }> = [];
+    // The self-contained bootable live ISOs (POL-38/D49), listed per arch when built into the depot.
+    const liveIsos: Array<{ arch: "arm64" | "amd64"; url: string }> = [];
     for (const arch of ["arm64", "amd64"] as const) {
       try {
-        const st = await stat(join(imageDistDir, arch, "polyptic-vm-test.iso"));
-        if (st.isFile()) vmTestIsos.push({ arch, url: `${base}/dist/image/${arch}/polyptic-vm-test.iso` });
+        const st = await stat(join(imageDistDir, arch, "polyptic-live.iso"));
+        if (st.isFile()) liveIsos.push({ arch, url: `${base}/dist/image/${arch}/polyptic-live.iso` });
       } catch {
         // not bundled for this arch — omit the entry
       }
@@ -566,7 +566,7 @@ export function registerProvisionRoutes(
       mode: enrollment.open ? "open" : "gated",
       bootConfigUrl: `${base}/boot/grub.cfg`,
       bootMediumUrl: medium ? `${base}/dist/boot/polyptic-boot.img` : null,
-      vmTestIsos,
+      liveIsos,
     });
   });
 }

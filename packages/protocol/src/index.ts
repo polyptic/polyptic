@@ -582,11 +582,12 @@ export const NetbootInfo = z.object({
   mode: z.enum(["open", "gated"]),
   bootConfigUrl: z.string(),
   bootMediumUrl: z.string().nullable(),
-  /** Self-contained bootable VM/lab test ISOs present in the image depot (POL-38): attach to a UEFI
-   *  VM as a CD and it boots to enrolment with no netboot infrastructure. One entry per arch whose
-   *  artifact exists on disk. NOTE: unlike everything else here these DO bake the enrolment token
-   *  (cleartext on the ISO) — lab use only, which the console spells out next to the link. */
-  vmTestIsos: z.array(z.object({ arch: z.enum(["arm64", "amd64"]), url: z.string() })).default([]),
+  /** Self-contained bootable Polyptic live ISOs in the image depot (POL-38/D49): write to a USB
+   *  stick (or attach to a UEFI VM) and the box boots straight into Polyptic and enrols — the
+   *  manual-provisioning alternative to netboot. One entry per arch whose artifact exists on
+   *  disk. NOTE: unlike everything else here these DO bake the current enrolment token, so the
+   *  FILE is a credential — the console spells that out next to the download. */
+  liveIsos: z.array(z.object({ arch: z.enum(["arm64", "amd64"]), url: z.string() })).default([]),
 });
 export type NetbootInfo = z.infer<typeof NetbootInfo>;
 
