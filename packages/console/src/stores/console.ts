@@ -40,7 +40,11 @@ import * as auth from "../auth";
  *  contract's SetContentBody refinement). The ad-hoc URL path is the Phase-3b behaviour. */
 export type ContentAssignment = { sourceId: string } | { url: string };
 
-const ADMIN_WS_URL = "ws://localhost:8080/admin";
+// Same split as api.ts BASE: cross-port in dev (Vite :5175 -> server :8080), same-origin in a
+// production build served by the server itself (ws/wss follows the page protocol).
+const ADMIN_WS_URL = import.meta.env.DEV
+  ? "ws://localhost:8080/admin"
+  : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/admin`;
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
 const THEME_KEY = "polyptic.theme";

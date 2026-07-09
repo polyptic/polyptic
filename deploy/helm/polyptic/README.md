@@ -9,25 +9,52 @@ channels on `:8080`) to Kubernetes. This mirrors `deploy/docker-compose.yml`,
 > it is never run in Kubernetes. Agents connect *out* to the server over a WebSocket; expose
 > the server (Ingress / LoadBalancer) so the fleet can reach it.
 
-## TL;DR
+## TL;DR — install a release (GHCR-hosted)
+
+Every `v*` tag publishes **both halves to GHCR** (`.github/workflows/release.yml`):
+the multi-arch server image (`ghcr.io/polyptic/polyptic-server`) and this chart as
+an **OCI chart** (also attached to the GitHub Release as a `.tgz`):
 
 ```sh
-# 1. Pull the Postgres subchart dependency (once, or after bumping Chart.yaml deps).
-helm dependency update deploy/helm/polyptic
+helm install polyptic oci://ghcr.io/polyptic/charts/polyptic --version <x.y.z> \
+  --namespace polyptic --create-namespace
+```
 
-# 2. Install with the in-cluster Postgres subchart (default).
-helm install polyptic deploy/helm/polyptic \
+The chart's `appVersion` is pinned to the same tag, so the default image tag
+always matches the release you installed. From a working tree instead (no
+release), `helm install polyptic deploy/helm/polyptic …` works the same way.
+
+## K3s quick start
+
+K3s fits this chart unusually well: it **ships Traefik** (so `ingressRoute.*`
+works out of the box — the `web`/`websecure` entryPoints below are K3s's
+defaults) and its `local-path` StorageClass satisfies both PVCs.
+
+```sh
+helm install polyptic oci://ghcr.io/polyptic/charts/polyptic --version <x.y.z> \
   --namespace polyptic --create-namespace \
-  --set image.repository=ghcr.io/polyptic/polyptic-server \
-  --set image.tag=0.1.0
+  --set ingressRoute.enabled=true \
+  --set ingressRoute.host=polyptic.your-domain \
+  --set ingressRoute.tls.certResolver=letsencrypt \
+  --set ingressRoute.bootHost=boot.polyptic.your-domain \
+  --set config.corsOrigin=https://polyptic.your-domain \
+  --set config.playerBaseUrl=https://polyptic.your-domain \
+  --set media.publicBase=https://polyptic.your-domain \
+  --set imageUpdates.arch=<amd64|arm64 — your BOXES' arch> \
+  --set secrets.bootstrapToken="$(openssl rand -hex 24)" \
+  --set secrets.adminEmail=you@example.com \
+  --set secrets.adminPassword="$(openssl rand -base64 18)"
 ```
 
-The server image is built from `deploy/server.Dockerfile`:
+Two K3s-specific notes:
 
-```sh
-docker build -f deploy/server.Dockerfile -t ghcr.io/polyptic/polyptic-server:0.1.0 .
-docker push ghcr.io/polyptic/polyptic-server:0.1.0
-```
+- **`imageUpdates.arch` must have a matching Linux node** — the rebuild Jobs
+  carry a `kubernetes.io/arch` selector *and* a pod-affinity to the server's
+  node (the depot PVC is RWO). On a single-node K3s VM that means: the VM's
+  arch is the arch you can build images for.
+- **The boot path stays plain HTTP.** K3s Traefik listens on :80 (`web`) by
+  default, so `bootHost` works immediately; point DNS for both hosts at the VM
+  and bake `http://<bootHost>` into your boot media.
 
 ## Production install (HTTPS + Ingress + external Postgres)
 

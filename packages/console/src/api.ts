@@ -22,7 +22,11 @@ import {
 } from "@polyptic/protocol";
 import type { ContentSource, Scene, VideoWall } from "@polyptic/protocol";
 
-const BASE = "http://localhost:8080/api/v1";
+/** Dev runs the console on Vite (:5175) against the server on :8080 (CORS_ORIGIN covers it).
+ *  A production build is served BY the server itself (single image, D28/D31), so the API is
+ *  same-origin — hardcoding localhost:8080 there breaks any containerized/port-forwarded deploy
+ *  (found live: the in-cluster console called the operator's :8080 dev stack instead of its pod). */
+const BASE = import.meta.env.DEV ? "http://localhost:8080/api/v1" : `${window.location.origin}/api/v1`;
 
 /** A non-2xx REST response, with the parsed error payload (if any) for diagnostics. */
 export class ApiError extends Error {

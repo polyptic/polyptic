@@ -12,7 +12,11 @@
 #   2. builds the agent single binary (amd64 + arm64) and attaches it to the
 #      GitHub Release — the zero-touch depot serves these at /dist/agent/<arch>
 #      (there is no standalone .deb/.rpm agent package; see D41),
-#   3. (opt-in) publishes the npm packages to GitHub Packages.
+#   3. packages the Helm chart and pushes it to GHCR as an OCI chart
+#      (`helm install polyptic oci://ghcr.io/<owner>/charts/polyptic`), also
+#      attaching the .tgz to the Release — chart and image live side by side,
+#      no Pages/branch machinery needed (POL-43),
+#   4. (opt-in) publishes the npm packages to GitHub Packages.
 name: release
 
 on:
@@ -145,7 +149,55 @@ jobs:
           fail_on_unmatched_files: true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 3. OPT-IN: publish npm packages to GitHub Packages.
+  # 3. Helm chart → GHCR (OCI) + attached to the Release (POL-43).
+  #    The chart version is the tag without the `v`; appVersion keeps the `v` so
+  #    the chart's default image tag matches exactly what job 1 pushed. Install:
+  #      helm install polyptic oci://ghcr.io/<owner>/charts/polyptic --version <x.y.z>
+  # ───────────────────────────────────────────────────────────────────────────
+  helm-chart:
+    name: package & push Helm chart (GHCR OCI)
+    runs-on: ubuntu-latest
+    needs: [server-image]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint deploy/helm/polyptic
+
+      - name: Package chart
+        id: pkg
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          helm package deploy/helm/polyptic --destination /tmp/chart \
+            --version "$VERSION" --app-version "$TAG"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tgz=/tmp/chart/polyptic-$VERSION.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR (helm)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push chart (OCI)
+        run: helm push "${{ steps.pkg.outputs.tgz }}" "oci://ghcr.io/${{ github.repository_owner }}/charts"
+
+      - name: Attach chart to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.tgz }}
+          fail_on_unmatched_files: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. OPT-IN: publish npm packages to GitHub Packages.
   #    Hard-gated: this job is skipped entirely unless the repo variable
   #    PUBLISH_NPM == "true". Without that opt-in it is a no-op. (Packages must
   #    also have publish metadata / be un-private'd for `npm publish` to succeed.)
