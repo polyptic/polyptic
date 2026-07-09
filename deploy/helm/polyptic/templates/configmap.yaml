@@ -39,4 +39,8 @@ data:
   IMAGE_REBUILD_CMD: "bun deploy/k8s-run-job.ts refresh"
   IMAGE_FULL_REBUILD_CMD: "bun deploy/k8s-run-job.ts full"
   POLYPTIC_JOB_TEMPLATE_DIR: "/etc/polyptic/jobs"
+  # Builds retained per arch in the depot (POL-45). Any of them can be made the
+  # ACTIVE image from the console, which is how a fleet rolls back. Each costs
+  # ~2GB on the depot PVC — size netboot.persistence.size to match.
+  IMAGE_RETAIN_BUILDS: {{ .Values.imageUpdates.retainBuilds | quote }}
   {{- end }}

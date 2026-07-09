@@ -126,6 +126,13 @@ export async function rebuildImageNow(kind: "refresh" | "full" = "refresh"): Pro
   return ImageUpdateInfo.parse(raw);
 }
 
+/** POST /api/v1/settings/image/activate → serve a retained build (POL-45). Fleet-wide: boxes on a
+ *  different image reboot into it per the roll-out policy, so an older build is a rollback. */
+export async function activateImage(arch: "arm64" | "amd64", imageId: string): Promise<ImageUpdateInfo> {
+  const raw = await send<unknown>("POST", `${BASE_SETTINGS}/image/activate`, { arch, imageId });
+  return ImageUpdateInfo.parse(raw);
+}
+
 /** GET /api/v1/settings/display → the current fleet-wide display settings (badge toggle) (POL-6). */
 export async function getDisplaySettings(): Promise<DisplaySettingsT> {
   const raw = await send<unknown>("GET", `${BASE_SETTINGS}/display`);
