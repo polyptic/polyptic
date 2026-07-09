@@ -249,9 +249,12 @@ netboot:
     existingClaim: ""
     accessModes:
       - ReadWriteOnce
-    # A live image is ~1.5–2GB and the weekly full rebuild caches the ~3GB base
-    # ISO alongside it; 15Gi leaves room for both plus a build in flight.
-    size: 15Gi
+    # Sized for build retention (POL-45). A live image is ~1.5–2GB, the weekly
+    # full rebuild caches the ~3GB base ISO alongside it, and the depot keeps
+    # `imageUpdates.retainBuilds` builds PER ARCH so an operator can roll back:
+    #   3 builds x 2 arches x ~2GB  +  ~3GB base ISO  +  a build in flight
+    # 30Gi covers the default. Shrink it if you retain fewer builds or one arch.
+    size: 30Gi
     storageClass: ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,6 +274,11 @@ imageUpdates:
   # Architecture the in-cluster Jobs build for. Must match your boxes; the Jobs
   # get a kubernetes.io/arch nodeSelector so they land on a matching node.
   arch: arm64
+  # How many builds the depot keeps PER ARCH (POL-45). The newest is served; any
+  # retained build can be made active from Console ▸ Settings ▸ Onboard Screens,
+  # which rolls the fleet back to it. Each retained build costs ~2GB of ISO on
+  # the depot volume — raise netboot.persistence.size if you raise this.
+  retainBuilds: 3
   # Base ISO for the weekly full rebuild. Empty derives the official Ubuntu
   # live-server URL from ubuntuRelease + arch. Downloaded once onto the depot
   # volume and cached under cache/.

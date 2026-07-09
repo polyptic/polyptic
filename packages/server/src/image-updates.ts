@@ -18,7 +18,7 @@
  * rebuild from a newer base ISO (documented in NETBOOT.md).
  */
 import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { copyFile, link, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -70,6 +70,36 @@ export interface ArchManifest {
   sha256: string | null;
 }
 
+/** One retained build in the depot (POL-45), read from `<arch>/builds/<imageId>/`. */
+export interface ArchBuild extends ArchManifest {
+  /** True for the build whose artifacts are hardlinked at the arch root (what the boot chain serves). */
+  active: boolean;
+  /** Whether this build carries a standalone bootable ISO (`polyptic-live.iso`, D49). */
+  hasLiveIso: boolean;
+}
+
+/** The artifacts a build owns. The first four are what the netboot chain streams; the live ISO is
+ *  the standalone bootable alternative (D49) and is absent unless `build-live-iso.sh` ran. */
+const BUILD_ARTIFACTS = ["polyptic.iso", "vmlinuz", "initrd", "SHA256SUMS"] as const;
+const LIVE_ISO = "polyptic-live.iso";
+
+/**
+ * Which artifacts may be HARDLINKED between the arch root and a build directory, and which must be
+ * copied. The distinction is not about size, it is about how the build scripts rewrite them:
+ *
+ *  - The two ISOs are always replaced by `mv`/`rm`+create, which allocates a NEW inode. Old builds
+ *    keep the one they hold, so sharing is safe — and these are the multi-GB files, so sharing is
+ *    the whole point of the layout.
+ *  - `SHA256SUMS` is written with shell `>` (`refresh-live-image.sh`), and `vmlinuz`/`initrd` with
+ *    `cp`. Both TRUNCATE THE EXISTING INODE IN PLACE, which through a hardlink would silently
+ *    rewrite a retained build's artifact to the new build's bytes. So these are copied. It costs
+ *    ~100 MB per retained build against ~1.5 GB shared, and it cannot be corrupted by a script
+ *    that writes in place.
+ */
+const SHAREABLE = new Set<string>([ "polyptic.iso", LIVE_ISO ]);
+/** Default builds retained per arch before the oldest are pruned (IMAGE_RETAIN_BUILDS). */
+export const DEFAULT_RETAIN_BUILDS = 3;
+
 export class ImageUpdates {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
@@ -83,6 +113,8 @@ export class ImageUpdates {
     /** The weekly full-rebuild hook (IMAGE_FULL_REBUILD_CMD). Optional — without it the weekly
      *  cycle simply never fires and the console marks it unconfigured. */
     private readonly fullRebuildCmd: string | undefined = undefined,
+    /** Builds retained per arch (IMAGE_RETAIN_BUILDS). The active build is never pruned. */
+    readonly retainBuilds: number = DEFAULT_RETAIN_BUILDS,
   ) {}
 
   /** The persisted state, with defaults before the first mutation. */
@@ -161,6 +193,162 @@ export class ImageUpdates {
       if (m) out.push(m);
     }
     return out;
+  }
+
+  // ── Build history (POL-45) ───────────────────────────────────────────────────────────────────
+  //
+  // Depot layout per arch:
+  //
+  //   <arch>/builds/<imageId>/{polyptic.iso,vmlinuz,initrd,SHA256SUMS[,polyptic-live.iso]}
+  //   <arch>/{polyptic.iso,vmlinuz,initrd,SHA256SUMS[,polyptic-live.iso]}   hardlinks → ACTIVE build
+  //   <arch>/image-id.txt                                                   the active build's id
+  //
+  // The arch root is exactly what it always was, so the boot chain (grub.cfg's `iso-url=`, the
+  // /dist/image/<arch>/… routes) and every already-written boot medium keep working untouched.
+  // Hardlinking means the active build costs no extra bytes. ACTIVATING a build relinks the root
+  // and rewrites image-id.txt, and because every netbooted box compares manifest.json's imageId
+  // against its own /etc/polyptic/image-id every 5 minutes, that IS the fleet rollback path.
+
+  private buildDir(arch: string, imageId: string): string {
+    return join(this.imageDistDir, arch, "builds", imageId);
+  }
+
+  /**
+   * Put `name` at `dest` from `src`, replacing whatever is there. Shareable artifacts (the ISOs) are
+   * hardlinked so the active build costs no extra disk; the rest are copied because the build
+   * scripts rewrite them in place (see {@link SHAREABLE}). Hardlinks fall back to a copy across
+   * filesystems (EXDEV) — a depot spanning mounts still works, it just uses more space.
+   */
+  private async place(name: string, src: string, dest: string): Promise<void> {
+    await unlink(dest).catch(() => {}); // absent is fine — we are (re)creating it
+    if (!SHAREABLE.has(name)) {
+      await copyFile(src, dest);
+      return;
+    }
+    try {
+      await link(src, dest);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+      await copyFile(src, dest);
+    }
+  }
+
+  /** The retained builds for one arch, newest first. Empty when the depot has no `builds/` dir. */
+  async builds(arch: string): Promise<ArchBuild[]> {
+    if (!(ARCHES as readonly string[]).includes(arch)) return [];
+    const root = join(this.imageDistDir, arch, "builds");
+    let names: string[];
+    try {
+      names = (await readdir(root, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name);
+    } catch {
+      return []; // no builds/ dir yet (pre-POL-45 depot, or nothing built)
+    }
+    const active = (await this.manifest(arch))?.imageId ?? null;
+    const out: ArchBuild[] = [];
+    for (const imageId of names) {
+      const dir = join(root, imageId);
+      // The payload ISO's mtime is the build time; the directory's changes when we prune siblings.
+      let builtAt: string;
+      try {
+        builtAt = (await stat(join(dir, "polyptic.iso"))).mtime.toISOString();
+      } catch {
+        continue; // a half-written or hand-made directory — not a build
+      }
+      let sha256: string | null = null;
+      try {
+        const sums = await readFile(join(dir, "SHA256SUMS"), "utf8");
+        sha256 = sums.split("\n").find((l) => l.trim().endsWith("polyptic.iso"))?.trim().split(/\s+/)[0] ?? null;
+      } catch {
+        // checksums are best-effort metadata; the imageId is the identity
+      }
+      const hasLiveIso = await stat(join(dir, LIVE_ISO)).then(
+        (st) => st.isFile(),
+        () => false,
+      );
+      out.push({ arch: arch as Arch, imageId, builtAt, sha256, active: imageId === active, hasLiveIso });
+    }
+    return out.sort((a, b) => b.builtAt.localeCompare(a.builtAt));
+  }
+
+  /** Retained builds across every arch, newest first. */
+  async allBuilds(): Promise<ArchBuild[]> {
+    const out: ArchBuild[] = [];
+    for (const arch of ARCHES) out.push(...(await this.builds(arch)));
+    return out.sort((a, b) => b.builtAt.localeCompare(a.builtAt));
+  }
+
+  /**
+   * Fold a depot that predates POL-45 — artifacts loose at the arch root, no `builds/` — into the
+   * new layout by hardlinking the current image into `builds/<its id>/`. Idempotent, and a no-op
+   * when the arch has no published image. Also adopts a build the hook just wrote to the root.
+   */
+  async adopt(arch: string): Promise<void> {
+    const m = await this.manifest(arch);
+    if (!m) return;
+    const dir = this.buildDir(arch, m.imageId);
+    if (await stat(join(dir, "polyptic.iso")).then(() => true, () => false)) return; // already adopted
+    await mkdir(dir, { recursive: true });
+    const root = join(this.imageDistDir, arch);
+    for (const name of [...BUILD_ARTIFACTS, LIVE_ISO]) {
+      const src = join(root, name);
+      if (!(await stat(src).then((st) => st.isFile(), () => false))) continue;
+      await this.place(name, src, join(dir, name));
+    }
+    this.log.info({ event: "image.build.adopted", arch, imageId: m.imageId }, "adopted the published image into builds/");
+  }
+
+  /**
+   * Serve a retained build: relink the arch root at it and publish its id. Every netbooted box on a
+   * different image reboots into it on its next 5-minute poll (urgent → minutes, else the nightly
+   * window), so activating an OLDER build rolls the fleet back. Throws when the build is unknown.
+   */
+  async activate(arch: string, imageId: string): Promise<ArchBuild[]> {
+    if (!(ARCHES as readonly string[]).includes(arch)) throw new Error(`unknown architecture: ${arch}`);
+    const dir = this.buildDir(arch, imageId);
+    if (!(await stat(join(dir, "polyptic.iso")).then((st) => st.isFile(), () => false))) {
+      throw new Error(`no retained build ${imageId} for ${arch}`);
+    }
+    const root = join(this.imageDistDir, arch);
+    for (const name of [...BUILD_ARTIFACTS, LIVE_ISO]) {
+      const src = join(dir, name);
+      if (!(await stat(src).then((st) => st.isFile(), () => false))) {
+        // This build has no such artifact (e.g. no live ISO) — drop any stale root link for it.
+        await unlink(join(root, name)).catch(() => {});
+        continue;
+      }
+      await this.place(name, src, join(root, name));
+    }
+    // Last, so a crash mid-relink leaves the OLD id published rather than claiming a partial swap.
+    await writeFile(join(root, "image-id.txt"), `${imageId}\n`, "utf8");
+    this.log.info(
+      { event: "image.build.activated", arch, imageId },
+      "activated image — netbooted boxes on another image reboot into it per the roll-out policy",
+    );
+    await this.prune(arch);
+    return this.builds(arch);
+  }
+
+  /** Adopt + prune every arch. Best-effort: depot bookkeeping must never fail a serve or a build. */
+  async retain(): Promise<void> {
+    for (const arch of ARCHES) {
+      try {
+        await this.adopt(arch);
+        await this.prune(arch);
+      } catch (err) {
+        this.log.error({ event: "image.build.retain_error", arch, err: (err as Error).message }, "build retention failed");
+      }
+    }
+  }
+
+  /** Drop all but the newest `retainBuilds` builds for one arch. The active build is never pruned. */
+  async prune(arch: string): Promise<void> {
+    const builds = await this.builds(arch);
+    // `builds` is newest-first, so everything past the cut is a pruning candidate.
+    const doomed = builds.slice(this.retainBuilds).filter((b) => !b.active);
+    for (const b of doomed) {
+      await rm(this.buildDir(arch, b.imageId), { recursive: true, force: true });
+      this.log.info({ event: "image.build.pruned", arch, imageId: b.imageId, retain: this.retainBuilds }, "pruned old build");
+    }
   }
 
   /**
@@ -245,6 +433,10 @@ export class ImageUpdates {
       lastBuildKind: kind,
     };
     await this.store.setImageRollout(finished);
+    // The hook writes the new artifacts to the arch root and stamps image-id.txt; take a retained
+    // copy of what it just published, then drop anything past the retention window (POL-45).
+    // Never fatal: a depot we cannot file is still a depot we can serve.
+    if (status === "success") await this.retain();
     this.running = false;
     this.log.info(
       { event: "image.rebuild.done", trigger, kind, status, imageIds: (await this.manifests()).map((m) => `${m.arch}:${m.imageId}`) },
@@ -256,6 +448,9 @@ export class ImageUpdates {
   /** Start the schedule ticker (idempotent). Fires at most once per matching minute. */
   start(): void {
     if (this.timer) return;
+    // Fold a pre-POL-45 depot (artifacts loose at the arch root) into builds/ so history starts
+    // with whatever is already published, rather than staying empty until the next rebuild.
+    void this.retain();
     this.timer = setInterval(() => {
       void this.tick();
     }, TICK_MS);

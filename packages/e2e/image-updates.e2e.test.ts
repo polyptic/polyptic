@@ -247,3 +247,97 @@ describe("image updates (POL-41)", () => {
     TEST_TIMEOUT,
   );
 });
+
+/**
+ * Build retention over HTTP (POL-45). The filesystem semantics — hardlink vs copy, prune order,
+ * rollback — are pinned in packages/server/test/image-updates.builds.test.ts; here we only prove the
+ * routes exist, are shaped right, and cannot be walked out of.
+ */
+describe("image build history (POL-45)", () => {
+  test(
+    "GET /api/v1/settings/image carries the retained builds, exactly one active per arch",
+    async () => {
+      const body = (await (await fetch(`${BASE}/api/v1/settings/image`)).json()) as Record<string, unknown>;
+      const builds = body.builds as Array<{ arch: string; imageId: string; active: boolean; liveIsoUrl: string | null }>;
+      expect(Array.isArray(builds)).toBe(true);
+      expect(builds.length).toBeGreaterThan(0);
+      // The server adopted the depot on boot, so the published image is a retained build.
+      expect(builds.filter((b) => b.arch === "arm64" && b.active)).toHaveLength(1);
+      // No live ISO was fabricated, so no build offers one.
+      expect(builds.every((b) => b.liveIsoUrl === null)).toBe(true);
+      expect(body.retainBuilds).toBe(3);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "GET /dist/image/:arch/builds/:imageId/:file serves a retained artifact, UNGATED",
+    async () => {
+      const body = (await (await fetch(`${BASE}/api/v1/settings/image`)).json()) as Record<string, unknown>;
+      const active = (body.builds as Array<{ arch: string; imageId: string; active: boolean }>).find(
+        (b) => b.arch === "arm64" && b.active,
+      )!;
+      const res = await fetch(`${BASE}/dist/image/arm64/builds/${active.imageId}/polyptic.iso`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("fake-iso");
+
+      expect((await fetch(`${BASE}/dist/image/arm64/builds/${active.imageId}/manifest.json`)).status).toBe(404);
+      expect((await fetch(`${BASE}/dist/image/arm64/builds/20260101T000000Z-nosuchhh/polyptic.iso`)).status).toBe(404);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a build id cannot traverse out of the depot",
+    async () => {
+      // The WHATWG URL parser collapses any segment that IS a double-dot — `..`, `%2e%2e`, `.%2e` —
+      // before fetch() sends it, so those never reach the route as a param and prove nothing here.
+      // Only an encoded SLASH keeps the segment intact; it lands on the handler as the id, where
+      // IMAGE_ID_RE rejects it. (safeResolve is the second line of defence, unit-tested separately.)
+      for (const id of ["..%2f..", "%2e%2e%2f%2e%2e"]) {
+        const res = await fetch(`${BASE}/dist/image/arm64/builds/${id}/polyptic.iso`);
+        expect(res.status).toBe(404);
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "POST /api/v1/settings/image/activate 404s on an unknown build and on a junk arch",
+    async () => {
+      const post = (body: unknown) =>
+        fetch(`${BASE}/api/v1/settings/image/activate`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      expect((await post({ arch: "arm64", imageId: "20260101T000000Z-nosuchhh" })).status).toBe(404);
+      // A junk arch fails the protocol's enum before it reaches the depot.
+      expect((await post({ arch: "riscv", imageId: "20260101T000000Z-nosuchhh" })).status).toBeGreaterThanOrEqual(400);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "activating a retained build republishes its id to the fleet's manifest",
+    async () => {
+      const before = (await (await fetch(`${BASE}/api/v1/settings/image`)).json()) as Record<string, unknown>;
+      const builds = before.builds as Array<{ arch: string; imageId: string; active: boolean }>;
+      const older = builds.find((b) => b.arch === "arm64" && !b.active);
+      // The earlier rebuild tests each stamped a new image id, so history has more than one entry.
+      expect(older).toBeDefined();
+
+      const res = await fetch(`${BASE}/api/v1/settings/image/activate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ arch: "arm64", imageId: older!.imageId }),
+      });
+      expect(res.status).toBe(200);
+
+      // This is the rollback: every netbooted box compares THIS id against its own every 5 minutes.
+      const manifest = (await (await fetch(`${BASE}/dist/image/arm64/manifest.json`)).json()) as Record<string, unknown>;
+      expect(manifest.imageId).toBe(older!.imageId);
+    },
+    TEST_TIMEOUT,
+  );
+});

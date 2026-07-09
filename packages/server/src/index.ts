@@ -14,7 +14,7 @@ import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
-import { ImageUpdateInfo, RebuildImageBody, UpdateImageSettingsBody } from "@polyptic/protocol";
+import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettingsBody } from "@polyptic/protocol";
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
@@ -24,9 +24,9 @@ import { CaptureCoordinator, ThumbnailStore } from "./capture";
 import { Enrollment } from "./enroll";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
-import { ImageUpdates } from "./image-updates";
+import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
 import { registerOpsRoutes } from "./ops";
-import { provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
+import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
 import { registerRestRoutes } from "./rest";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
@@ -238,6 +238,9 @@ const imageUpdates = new ImageUpdates(
   process.env.IMAGE_REBUILD_CMD?.trim() || undefined,
   fastify.log,
   process.env.IMAGE_FULL_REBUILD_CMD?.trim() || undefined,
+  // Builds retained per arch (POL-45). Each retained build costs ~1.5GB of ISO on the depot volume,
+  // so the chart exposes this as imageUpdates.retainBuilds and sizes the PVC from it.
+  Math.max(1, Number(process.env.IMAGE_RETAIN_BUILDS?.trim() || DEFAULT_RETAIN_BUILDS)),
 );
 imageUpdates.start();
 
@@ -246,8 +249,10 @@ imageUpdates.start();
 registerProvisionRoutes(fastify, provisionConfig, enrollment, imageUpdates);
 
 // ── Image-updates operator surface (POL-41), GATED under /api/v1. ──
-const imageUpdateInfo = async () => {
+const imageUpdateInfo = async (request: FastifyRequest) => {
   const st = await imageUpdates.state();
+  // The live ISO's URL is per-request (proxy-aware), same as everything else the console downloads.
+  const base = computeBaseUrl(request, provisionConfig.publicBaseUrl);
   return ImageUpdateInfo.parse({
     scheduleEnabled: st.scheduleEnabled,
     scheduleTime: st.scheduleTime,
@@ -267,18 +272,38 @@ const imageUpdateInfo = async () => {
         }
       : null,
     images: (await imageUpdates.manifests()).map((m) => ({ ...m, urgent: st.urgent })),
+    builds: (await imageUpdates.allBuilds()).map((b) => ({
+      arch: b.arch,
+      imageId: b.imageId,
+      builtAt: b.builtAt,
+      sha256: b.sha256,
+      active: b.active,
+      liveIsoUrl: b.hasLiveIso ? `${base}/dist/image/${b.arch}/builds/${b.imageId}/polyptic-live.iso` : null,
+    })),
+    retainBuilds: imageUpdates.retainBuilds,
   });
 };
-fastify.get("/api/v1/settings/image", async () => imageUpdateInfo());
+fastify.get("/api/v1/settings/image", async (request) => imageUpdateInfo(request));
 fastify.put("/api/v1/settings/image", async (request) => {
   const body = UpdateImageSettingsBody.parse(request.body ?? {});
   await imageUpdates.updateSettings(body);
-  return imageUpdateInfo();
+  return imageUpdateInfo(request);
 });
 fastify.post("/api/v1/settings/image/rebuild", async (request) => {
   const { kind } = RebuildImageBody.parse(request.body ?? {});
   await imageUpdates.trigger("manual", kind);
-  return imageUpdateInfo();
+  return imageUpdateInfo(request);
+});
+// Serve a retained build (POL-45). Fleet-wide: boxes on another image reboot into this one per the
+// roll-out policy, so activating an older build is the rollback path. 404 when the build is gone.
+fastify.post("/api/v1/settings/image/activate", async (request, reply) => {
+  const { arch, imageId } = ActivateImageBody.parse(request.body ?? {});
+  try {
+    await imageUpdates.activate(arch, imageId);
+  } catch (err) {
+    return reply.code(404).send({ error: (err as Error).message });
+  }
+  return imageUpdateInfo(request);
 });
 attachWebSockets({
   server: fastify.server,
