@@ -126,6 +126,8 @@ interface PkgSet {
   fonts: string[];
   /** Boot-splash: Plymouth + its script AND label plugins + an SVG rasteriser (rsvg-convert) — POL-7. */
   splash: string[];
+  /** Video decode for the kiosk browser's <video> (Phase 7 media). See the comment below. */
+  codecs: string[];
 }
 
 // POL-7 (D43): our theme uses the `script` plugin and draws text via `Image.Text` (the live status
@@ -135,6 +137,13 @@ interface PkgSet {
 // boot, killing the splash. So the label plugin is REQUIRED, not optional. On Ubuntu it's a separate
 // package (`plymouth-label`, which also pulls pango/fontconfig + a font); dracut's plymouth module
 // then bundles the whole text-render closure into the initramfs for early boot.
+// VIDEO (Phase 7 media). WebKitGTK (`surf`/`cog`) and Chromium-on-Linux decode <video> through
+// GStreamer. `surf` pulls plugins-base + plugins-good as hard deps, which cover WebM/VP8/VP9 and
+// Opus/Vorbis — but NOT H.264/AAC, i.e. the .mp4 almost everyone uploads. Those live in
+// `gstreamer1.0-libav` (the ffmpeg-backed decoder), which is only a *recommends* — and setup installs
+// with --no-install-recommends. Result, found on a real wall: uploaded MP4s silently never play,
+// while WebM does. The decoders are ~130 MB uncompressed (~40 MB in the squashfs); a display-wall
+// product that cannot show a video is not worth 40 MB of savings, so they are a hard dependency here.
 const PACKAGES: Record<PkgManager, PkgSet> = {
   apt: {
     base: ["greetd", "dbus-user-session", "ca-certificates", "curl"],
@@ -144,6 +153,7 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // Debian/Ubuntu: `script` plugin ships inside `plymouth`; `plymouth-label` = the text renderer
     // (REQUIRED, see above); `librsvg2-bin` = rsvg-convert.
     splash: ["plymouth", "plymouth-label", "librsvg2-bin"],
+    codecs: ["gstreamer1.0-libav", "gstreamer1.0-plugins-good"],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -153,6 +163,8 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // Fedora splits the script plugin, `plymouth-set-default-theme`, and the label renderer into
     // separate packages; `plymouth-plugin-label` is the text renderer (REQUIRED, see above).
     splash: ["plymouth", "plymouth-scripts", "plymouth-plugin-script", "plymouth-plugin-label", "librsvg2-tools"],
+    // Fedora ships the ffmpeg-backed decoders in `gstreamer1-libav` (RPMFusion on stock Fedora).
+    codecs: ["gstreamer1-libav", "gstreamer1-plugins-good"],
   },
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -161,6 +173,7 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     fonts: ["ttf-dejavu", "ttf-liberation"],
     // Arch's `plymouth` bundles ALL plugins (script, label, set-default-theme); `librsvg` = rsvg-convert.
     splash: ["plymouth", "librsvg"],
+    codecs: ["gst-libav", "gst-plugins-good"],
   },
 };
 
@@ -172,7 +185,9 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
 export function corePackages(pm: PkgManager, backend: Backend, splash = true): string[] {
   const set = PACKAGES[pm];
   const splashPkgs = splash ? set.splash : [];
-  if (backend === "wayland-sway") return [...set.base, ...set.wayland, ...set.fonts, ...splashPkgs];
-  if (backend === "x11-i3") return [...set.base, ...set.x11, ...set.fonts, ...splashPkgs];
+  // Codecs ride with the real kiosk backends: a wall shows video, and without the ffmpeg-backed
+  // GStreamer decoders an uploaded MP4 renders as nothing at all (POL-46, found on real hardware).
+  if (backend === "wayland-sway") return [...set.base, ...set.wayland, ...set.fonts, ...splashPkgs, ...set.codecs];
+  if (backend === "x11-i3") return [...set.base, ...set.x11, ...set.fonts, ...splashPkgs, ...set.codecs];
   return [...set.base]; // dev-open
 }

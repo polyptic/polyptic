@@ -5,13 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <title>Polyptic Player</title>
-    <!-- Idle-splash typography (POL-27). Enhances when reachable; the font stack falls back to
-         system-ui / ui-monospace on an offline wall box, so the splash still renders cleanly. -->
+    <!-- Idle-splash typography (POL-27). A PROGRESSIVE ENHANCEMENT, and it must never gate the
+         first paint: a wall box on an isolated VLAN cannot reach Google, and a plain
+         `rel="stylesheet"` is render-blocking — the screen stays WHITE until the request times out
+         (seen on real hardware: "white for ages", every boot). Loading it as `media="print"` makes
+         the browser fetch it without blocking rendering; the onload swap applies it if and when it
+         arrives. Offline boxes paint instantly on the system fallback (system-ui / ui-monospace),
+         which is exactly what the stack in styles.css already declares.
+         Self-hosting these two faces would remove the third-party dependency entirely — tracked
+         separately; this fix makes the wall correct offline either way. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
       rel="stylesheet"
+      media="print"
+      onload="this.media='all'; this.onload=null;"
     />
   </head>
   <body>
