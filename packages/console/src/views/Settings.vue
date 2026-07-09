@@ -285,7 +285,7 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- Onboard Screens (POL-33 netboot + POL-45 builds) --------------------- -->
-      <section id="sec-netboot" class="card">
+      <section id="sec-netboot" class="card pad-lg">
         <div class="title-row">
           <h2 class="card-title">Onboard Screens</h2>
           <div class="spacer" />
@@ -490,9 +490,9 @@ async function onSignOut(): Promise<void> {
         </button>
         <div v-if="advOpen && store.netboot" class="adv">
           <div>
-            <div class="adv-label">Boot URI</div>
+            <div class="adv-label"><b>Boot URI</b></div>
             <div class="field-row">
-              <div class="mono-field ellipsis">{{ store.netboot.baseUrl }}/dist/boot/shimx64.efi</div>
+              <div class="mono-field muted ellipsis">{{ store.netboot.baseUrl }}/dist/boot/shimx64.efi</div>
               <button
                 type="button"
                 class="btn-ghost-sm"
@@ -501,24 +501,18 @@ async function onSignOut(): Promise<void> {
                 Copy
               </button>
             </div>
-            <p class="adv-note">
-              Type this into the box's UEFI setup as the HTTP Boot URI (arm64: <code class="code">shimaa64.efi</code>).
-            </p>
+            <p class="adv-note">Type this into the box's UEFI setup as the HTTP Boot URI (arm64: shimaa64.efi).</p>
           </div>
           <div>
-            <div class="adv-label">Control-plane URL</div>
+            <div class="adv-label"><b>Control-plane URL</b></div>
             <div class="field-row">
-              <div class="mono-field ellipsis">{{ store.netboot.baseUrl }}</div>
+              <div class="mono-field muted ellipsis">{{ store.netboot.baseUrl }}</div>
               <button type="button" class="btn-ghost-sm" @click="copy(store.netboot.baseUrl, 'Control-plane URL copied')">
                 Copy
               </button>
             </div>
             <p class="adv-note">The base the bootloader dials. Also what a DHCP option-67 rule hands out.</p>
           </div>
-          <p class="adv-note">
-            Some firmware has no HTTP-Boot driver and offers only PXE — see <code class="code">docs/NETBOOT.md</code>
-            for the DHCP option-67 rule that covers both.
-          </p>
         </div>
       </section>
 
@@ -576,7 +570,7 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- Update schedule ------------------------------------------------------ -->
-      <section id="sec-image" class="card">
+      <section id="sec-image" class="card pad-lg">
         <h2 class="card-title">Update schedule</h2>
         <p class="card-sub wrap gap">
           When the live image is refreshed. A nightly in-place refresh picks up userspace fixes; a weekly full rebuild
@@ -839,6 +833,10 @@ async function onSignOut(): Promise<void> {
 }
 .card:last-of-type {
   margin-bottom: 0;
+}
+/* The two dense cards the design pads a touch taller than the rest. */
+.card.pad-lg {
+  padding: 22px;
 }
 .row-card {
   display: flex;
@@ -1196,19 +1194,18 @@ async function onSignOut(): Promise<void> {
   align-items: center;
   gap: 7px;
   width: 100%;
-  margin-top: 18px;
+  margin-top: 20px;
   padding: 16px 0 0;
   border: none;
   border-top: 1px solid var(--line);
   background: none;
-  font-family: inherit;
+  font: inherit;
   font-size: 12.5px;
-  font-weight: 500;
   color: var(--muted);
   cursor: pointer;
 }
 .disclosure:hover {
-  color: var(--fg);
+  color: var(--fg2);
 }
 .caret {
   display: inline-block;
@@ -1226,8 +1223,7 @@ async function onSignOut(): Promise<void> {
   animation: fadein 0.2s ease;
 }
 .adv-label {
-  font-size: 11.5px;
-  font-weight: 600;
+  font-size: 12px;
   color: var(--muted);
   margin-bottom: 6px;
 }
@@ -1262,6 +1258,10 @@ async function onSignOut(): Promise<void> {
   padding: 9px 12px;
   border-radius: 9px;
   overflow: hidden;
+}
+.mono-field.muted {
+  font-size: 12px;
+  color: var(--muted);
 }
 .ellipsis {
   white-space: nowrap;
