@@ -1,0 +1,13 @@
+# Polyptic boot dongle (POL-33/D47). TOKENLESS: carries only the control-plane address. The
+# enrolment token is baked by the server into /boot/grub.cfg at chain time. Secure Boot stays ON.
+set net=(http,@@POLYPTIC_BASE_HOSTPORT@@)
+echo "Polyptic: bringing the network up (DHCP on all NICs) ..."
+net_dhcp
+echo "Polyptic: chaining $net/boot/grub.cfg ..."
+configfile $net/boot/grub.cfg
+# Only reached when DHCP or the chain failed:
+set timeout=10
+set default=retry
+menuentry "Retry (DHCP + chain again)" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
+menuentry "Reboot" { reboot }
+menuentry "Firmware setup" { fwsetup }

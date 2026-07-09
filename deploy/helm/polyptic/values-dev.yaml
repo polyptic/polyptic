@@ -1,0 +1,55 @@
+# Dev overrides for a LOCAL cluster (OrbStack / Docker Desktop Kubernetes / kind).
+#
+#   docker build -f deploy/server.Dockerfile -t polyptic-server:dev .
+#   helm upgrade --install polyptic deploy/helm/polyptic -f deploy/helm/polyptic/values-dev.yaml \
+#     --namespace polyptic --create-namespace
+#   kubectl -n polyptic port-forward svc/polyptic 8080:8080   # http://localhost:8080
+#
+# The daily loop for APP code stays on the host (`bun run dev` — sub-second, no
+# images). This file is for the INTEGRATION ring: chart/template changes redeploy
+# in seconds with no image build; only code-into-cluster needs the docker build.
+# (kind users: `kind load docker-image polyptic-server:dev` after building —
+# OrbStack/Docker Desktop share the local image store, so they skip that step.)
+#
+# The rebuild Jobs run on your cluster's LINUX nodes, so the full image build
+# works here even though the host is macOS.
+
+image:
+  repository: polyptic-server
+  tag: dev
+  # Use the locally-built image; never ask a registry for it.
+  pullPolicy: Never
+
+config:
+  # Ephemeral registry — no Postgres to stand up. Wall/screen state resets on
+  # pod restart; fine for chart iteration, wrong for anything real.
+  store: memory
+  corsOrigin: "http://localhost:8080"
+  playerBaseUrl: "http://localhost:8080"
+  nodeEnv: development
+  # Port-forwarded plain HTTP — secure cookies would never come back.
+  secureCookies: false
+  logLevel: info
+
+media:
+  publicBase: "http://localhost:8080"
+  persistence:
+    enabled: false
+
+netboot:
+  persistence:
+    # Keep the depot on a PVC even in dev: a full rebuild takes ~15 minutes and
+    # caches the ~3GB base ISO — you do not want that redone on every pod roll.
+    enabled: true
+    size: 15Gi
+
+imageUpdates:
+  enabled: true
+  # Match your machine: Apple Silicon → arm64, Intel → amd64.
+  arch: arm64
+
+secrets:
+  adminEmail: dev@example.com
+  adminPassword: polyptic-dev
+  # Gated enrollment even in dev, so the approve flow is exercised.
+  bootstrapToken: dev-lab-token

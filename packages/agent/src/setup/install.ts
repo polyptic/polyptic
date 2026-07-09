@@ -318,13 +318,35 @@ function writeAgentConfig(sys: Sys, opts: SetupOptions, log: Logger, needsVerifi
       { example: true },
     );
     sys.writeFile(`${opts.configPath}.example`, example, { mode: 0o644, desc: "agent.toml.example" });
-    log.warn(
-      `no --server-url given: wrote ${opts.configPath}.example. The agent will NOT connect until you ` +
-        `create ${opts.configPath} (copy the example; set server_url + bootstrap_token).`,
-    );
-    needsVerification.push(
-      `Create ${opts.configPath} from the .example (server_url + bootstrap_token) before the agent can enrol.`,
-    );
+    if (sys.exists(opts.configPath)) {
+      // Re-run on a configured box: never clobber the live agent.toml (it holds server_url + token).
+      log.skip(`${opts.configPath} already exists — left untouched`);
+    } else {
+      // No server URL is a real deployment shape, not just a half-done install: the netboot live
+      // image (POL-33/POL-38) receives server_url + token per boot from the kernel cmdline via
+      // /run/polyptic/agent.env. The DISPLAY config must still land in a real agent.toml, otherwise
+      // POLYPTIC_BACKEND stays unset and the agent silently falls back to dev-open — sway comes up
+      // but no browser is ever launched (found live in the POL-38 UTM boot). The empty
+      // server_url/bootstrap_token here are ignored by applyConfigFileToEnv, and real env wins.
+      const toml = renderAgentToml(
+        { backend: opts.backend, browser: opts.browser, connector: opts.connector },
+        { example: false },
+      );
+      sys.writeFile(opts.configPath, toml, {
+        mode: 0o640,
+        owner: "root",
+        group: opts.user,
+        desc: "agent.toml (display config; server_url arrives via cmdline env or a later edit)",
+      });
+      log.warn(
+        `no --server-url given: wrote ${opts.configPath} with the display config only. The agent ` +
+          `will NOT connect until server_url + bootstrap_token arrive (edit the file, or boot a live ` +
+          `image with polyptic.server_url=/polyptic.token= on the kernel cmdline).`,
+      );
+      needsVerification.push(
+        `Provide server_url + bootstrap_token (edit ${opts.configPath}, or the kernel cmdline on a live image) before the agent can enrol.`,
+      );
+    }
   }
 }
 
@@ -493,6 +515,22 @@ function applyPlymouthTheme(sys: Sys, log: Logger, state: SetupState, needsVerif
   if (sys.which("plymouth-set-default-theme")) {
     sys.exec("plymouth-set-default-theme", [PLYMOUTH_THEME_NAME], {
       desc: "set default plymouth theme (alternative)",
+      allowFail: true,
+    });
+  } else if (sys.which("update-alternatives")) {
+    // 2b ─ 26.04 dropped plymouth-set-default-theme, but Ubuntu's initramfs-tools plymouth HOOK
+    //      still resolves the boot theme via the `default.plymouth` ALTERNATIVE, ignoring
+    //      plymouthd.conf entirely — with none registered the hook silently harvests NOTHING and
+    //      the initrd boots text-only (found live in the POL-38 UTM boot; the live image's initrd
+    //      starts plymouthd long before the rootfs theme is reachable). Register + pin it directly.
+    const themePlymouth = `${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.plymouth`;
+    sys.exec(
+      "update-alternatives",
+      ["--install", "/usr/share/plymouth/themes/default.plymouth", "default.plymouth", themePlymouth, "200"],
+      { desc: "register default.plymouth alternative (initramfs-tools hook reads this)", allowFail: true },
+    );
+    sys.exec("update-alternatives", ["--set", "default.plymouth", themePlymouth], {
+      desc: "pin default.plymouth to the Polyptic theme",
       allowFail: true,
     });
   }

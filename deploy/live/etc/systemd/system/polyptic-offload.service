@@ -1,0 +1,21 @@
+[Unit]
+Description=Polyptic, one-shot offload: install the boot loader to this box's ESP + a UEFI entry (POL-33)
+Documentation=file:///usr/local/lib/polyptic/offload.sh
+# Only runs when the boot menu's offload entry (served by GET /boot/grub.cfg) was chosen, which
+# tagged the kernel cmdline. Ordered before greetd so it finishes before the kiosk session comes up.
+ConditionKernelCommandLine=polyptic.offload=1
+Before=greetd.service
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/lib/polyptic/offload.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Offload is best-effort: a failure (no ESP, BIOS-mode, no network) must never block the box from
+# booting diskless as a dongle, so the unit does not fail the boot.
+ExecStart=/usr/local/lib/polyptic/offload.sh
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
+
+import * as auth from "../auth";
 import { useConsoleStore } from "../stores/console";
 
 // The real Settings view (Phase 3f — D29): signed-in account, change password, logout, the
@@ -11,8 +13,12 @@ const router = useRouter();
 onMounted(() => {
   // Load the enrollment-token info (open vs gated) so the card can render the real value.
   void store.fetchEnrollment();
+  // Load the netboot info (control-plane base + boot config URL + boot-medium download) for the Netboot card.
+  void store.fetchNetboot();
   // Load the fleet-wide badge toggle so the card is correct even before the admin/state snapshot lands.
   void store.fetchDisplaySettings();
+  // Load the image-updates state (schedule, urgency, last rebuild, published images) (POL-41).
+  void store.fetchImageUpdates();
 });
 
 function setTheme(theme: "light" | "dark"): void {
@@ -67,6 +73,68 @@ async function regenerate(): Promise<void> {
   regenerating.value = true;
   await store.regenerateEnrollment();
   regenerating.value = false;
+}
+
+// ── Netboot (POL-33) ──────────────────────────────────────────────────────────
+// A per-field copy indicator (which URL was last copied), one helper for the base + boot config URLs.
+const nbCopied = ref<string | null>(null);
+
+async function copyNetboot(text: string, which: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    nbCopied.value = which;
+    window.setTimeout(() => {
+      if (nbCopied.value === which) nbCopied.value = null;
+    }, 1600);
+  } catch {
+    /* clipboard unavailable (non-secure context), Copy is best-effort */
+  }
+}
+
+// ── Image updates (POL-41 daily refresh + POL-43 weekly full rebuild) ───────────
+const imgSaving = ref(false);
+const imgTime = ref("");
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+async function applyImageSettings(patch: {
+  scheduleEnabled?: boolean;
+  scheduleTime?: string;
+  fullScheduleEnabled?: boolean;
+  fullScheduleDay?: number;
+  fullScheduleTime?: string;
+  urgent?: boolean;
+}): Promise<void> {
+  if (imgSaving.value) return;
+  imgSaving.value = true;
+  try {
+    store.imageUpdates = await auth.updateImageSettings(patch);
+  } catch (err) {
+    console.error("[console] image settings update failed", err);
+  } finally {
+    imgSaving.value = false;
+  }
+}
+
+async function rebuildNow(kind: "refresh" | "full" = "refresh"): Promise<void> {
+  if (imgSaving.value) return;
+  imgSaving.value = true;
+  try {
+    store.imageUpdates = await auth.rebuildImageNow(kind);
+  } catch (err) {
+    console.error("[console] rebuild trigger failed", err);
+  } finally {
+    imgSaving.value = false;
+  }
+}
+
+function saveScheduleTime(): void {
+  const t = imgTime.value.trim();
+  if (/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) void applyImageSettings({ scheduleTime: t });
+}
+
+function saveFullScheduleTime(value: string): void {
+  const t = value.trim();
+  if (/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) void applyImageSettings({ fullScheduleTime: t });
 }
 
 // ── Change password ─────────────────────────────────────────────────────────────
@@ -180,6 +248,236 @@ async function onChangePassword(): Promise<void> {
             </button>
           </div>
           <div class="token-hint">New machines must present this token to dial in.</div>
+        </template>
+      </div>
+
+      <!-- Netboot (POL-33) ------------------------------------------------------ -->
+      <div class="card panel">
+        <div class="panel-title">Netboot</div>
+        <div class="panel-sub">
+          Boot a bare machine straight into Polyptic over the network with Secure Boot ON, no OS install,
+          no disk. Write the ready-made boot medium to a USB stick; it chains the boot config URL below.
+        </div>
+
+        <template v-if="store.netboot === null">
+          <div class="token-empty">Loading…</div>
+        </template>
+
+        <template v-else>
+          <label class="field-label">Control-plane URL</label>
+          <div class="token-row">
+            <code class="token">{{ store.netboot.baseUrl }}</code>
+            <button class="btn-ghost-sm" @click="copyNetboot(store.netboot.baseUrl, 'base')">
+              {{ nbCopied === "base" ? "Copied ✓" : "Copy" }}
+            </button>
+          </div>
+
+          <label class="field-label nb-gap">Boot config URL</label>
+          <div class="token-row">
+            <code class="token">{{ store.netboot.bootConfigUrl }}</code>
+            <button class="btn-ghost-sm" @click="copyNetboot(store.netboot.bootConfigUrl, 'config')">
+              {{ nbCopied === "config" ? "Copied ✓" : "Copy" }}
+            </button>
+          </div>
+
+          <div class="nb-steps">
+            <div class="nb-step">
+              <span class="nb-num">1</span> Download the boot medium and write it to a USB stick
+              (<code class="inline-code">dd if=polyptic-boot.img of=/dev/sdX bs=4M</code>); one stick boots
+              amd64 and arm64 alike.
+            </div>
+            <div class="nb-step">
+              <span class="nb-num">2</span> Plug it into the bare box and boot from USB, leaving Secure
+              Boot ON. The signed loader streams the live image from this server into RAM.
+            </div>
+            <div class="nb-step">
+              <span class="nb-num">3</span> The box appears in Machines,
+              <template v-if="store.netboot.mode === 'gated'">approve it there.</template>
+              <template v-else>it is auto-approved (open mode).</template>
+            </div>
+          </div>
+
+          <div class="token-hint">
+            Choosing "offload" in the boot menu installs the loader on the box once; after that it
+            self-boots over the network without the USB stick.
+          </div>
+
+          <a
+            v-if="store.netboot.bootMediumUrl"
+            class="btn btn-primary save nb-download"
+            :href="store.netboot.bootMediumUrl"
+            download
+            >Download boot medium</a
+          >
+          <div v-else class="token-hint nb-gap">
+            No prebuilt boot medium bundled yet, build one into
+            <code class="inline-code">BOOT_DIST_DIR</code> with
+            <code class="inline-code">deploy/build-boot-medium.sh</code>, or point DHCP option 67 / UEFI
+            HTTP Boot at <code class="inline-code">{{ store.netboot.baseUrl }}/dist/boot/shimx64.efi</code>
+            (see <code class="inline-code">docs/NETBOOT.md</code> for the recipe and the arm64 name).
+          </div>
+
+          <template v-if="store.netboot.liveIsos.length > 0">
+            <div class="token-hint nb-gap">
+              Prefer no netboot? Download the self-contained live ISO instead: write it to a USB stick
+              (or attach it to a UEFI VM) and the box boots straight into Polyptic and enrols — nothing
+              installed, nothing on the disk. It bakes the current enrolment token, so treat the file
+              like a credential; regenerate the token above and rebuild to revoke old copies.
+            </div>
+            <a
+              v-for="iso in store.netboot.liveIsos"
+              :key="iso.arch"
+              class="btn btn-primary save nb-download"
+              :href="iso.url"
+              download
+              >Download live ISO ({{ iso.arch }})</a
+            >
+          </template>
+
+          <div v-if="store.netboot.mode === 'gated'" class="nb-note">
+            Ownership of the fleet is the enrolment token, which the boot flow above bakes in, so multiple
+            Polyptic instances can share a network without collision. Keep the netboot network
+            operator-only, and regenerate the token (card above) to revoke.
+          </div>
+          <div v-else class="nb-note">
+            Open mode: any machine that netboots is auto-enrolled. Set an enrolment token to gate access and
+            bind boxes to this server by key.
+          </div>
+        </template>
+      </div>
+
+      <!-- Image updates (POL-41) ------------------------------------------------ -->
+      <div class="card panel">
+        <div class="panel-title">Image updates</div>
+        <div class="panel-sub">
+          Two update cycles keep the live image current: a nightly in-place refresh (userspace
+          bug/security fixes) and a weekly full rebuild from the base ISO (kernel fixes included).
+          Netbooted boxes compare image ids with this server every 5 minutes and reboot to re-pull —
+          overnight by default, within minutes when marked urgent.
+        </div>
+
+        <template v-if="store.imageUpdates === null">
+          <div class="token-hint">Loading image-update state…</div>
+        </template>
+        <template v-else>
+          <div class="token-hint" v-if="store.imageUpdates.images.length > 0">
+            Published image<span v-if="store.imageUpdates.images.length > 1">s</span>:
+            <code class="inline-code" v-for="img in store.imageUpdates.images" :key="img.arch">
+              {{ img.arch }} · {{ img.imageId }}
+            </code>
+          </div>
+          <div class="token-hint" v-else>
+            No published image carries an id yet — rebuild once with the current
+            <code class="inline-code">deploy/build-live-image.sh</code> to start tracking updates.
+          </div>
+
+          <div class="pill-group">
+            <div
+              class="pill"
+              :class="{ active: store.imageUpdates.scheduleEnabled }"
+              :aria-disabled="imgSaving"
+              @click="applyImageSettings({ scheduleEnabled: true })"
+            >
+              ● Nightly refresh at
+            </div>
+            <input
+              class="nb-time"
+              type="time"
+              :value="store.imageUpdates.scheduleTime"
+              :disabled="imgSaving"
+              @change="imgTime = ($event.target as HTMLInputElement).value; saveScheduleTime()"
+            />
+            <div
+              class="pill"
+              :class="{ active: !store.imageUpdates.scheduleEnabled }"
+              :aria-disabled="imgSaving"
+              @click="applyImageSettings({ scheduleEnabled: false })"
+            >
+              ○ Off
+            </div>
+          </div>
+          <div class="token-hint" v-if="!store.imageUpdates.rebuildConfigured">
+            This server has no refresh hook (<code class="inline-code">IMAGE_REBUILD_CMD</code>), so the
+            schedule and “Refresh now” cannot build from here — set it to e.g.
+            <code class="inline-code">deploy/rebuild-image-docker.sh arm64</code>.
+          </div>
+
+          <!-- Weekly FULL rebuild (POL-43): the cycle that rolls kernel CVEs. -->
+          <div class="pill-group">
+            <div
+              class="pill"
+              :class="{ active: store.imageUpdates.fullScheduleEnabled }"
+              :aria-disabled="imgSaving"
+              @click="applyImageSettings({ fullScheduleEnabled: true })"
+            >
+              ● Full rebuild (kernel) every
+            </div>
+            <select
+              class="nb-time"
+              :value="store.imageUpdates.fullScheduleDay"
+              :disabled="imgSaving"
+              @change="applyImageSettings({ fullScheduleDay: Number(($event.target as HTMLSelectElement).value) })"
+            >
+              <option v-for="(d, i) in WEEKDAYS" :key="d" :value="i">{{ d }}</option>
+            </select>
+            <input
+              class="nb-time"
+              type="time"
+              :value="store.imageUpdates.fullScheduleTime"
+              :disabled="imgSaving"
+              @change="saveFullScheduleTime(($event.target as HTMLInputElement).value)"
+            />
+            <div
+              class="pill"
+              :class="{ active: !store.imageUpdates.fullScheduleEnabled }"
+              :aria-disabled="imgSaving"
+              @click="applyImageSettings({ fullScheduleEnabled: false })"
+            >
+              ○ Off
+            </div>
+          </div>
+          <div class="token-hint" v-if="!store.imageUpdates.fullRebuildConfigured">
+            The nightly refresh holds the kernel, so kernel fixes need this weekly full rebuild —
+            configure <code class="inline-code">IMAGE_FULL_REBUILD_CMD</code> (e.g.
+            <code class="inline-code">deploy/full-rebuild-image-docker.sh arm64</code>) to enable it.
+          </div>
+
+          <div class="nb-btn-row">
+            <button
+              class="btn btn-primary save nb-download"
+              :disabled="imgSaving || !store.imageUpdates.rebuildConfigured || store.imageUpdates.lastBuild?.status === 'running'"
+              @click="rebuildNow('refresh')"
+            >
+              {{ store.imageUpdates.lastBuild?.status === "running" ? "Rebuilding…" : "Refresh now" }}
+            </button>
+            <button
+              class="btn save nb-download"
+              :disabled="imgSaving || !store.imageUpdates.fullRebuildConfigured || store.imageUpdates.lastBuild?.status === 'running'"
+              @click="rebuildNow('full')"
+            >
+              Full rebuild now
+            </button>
+          </div>
+          <div class="token-hint" v-if="store.imageUpdates.lastBuild">
+            Last rebuild: {{ store.imageUpdates.lastBuild.status
+            }}<span v-if="store.imageUpdates.lastBuild.kind"> ({{ store.imageUpdates.lastBuild.kind === "full" ? "full rebuild" : "refresh" }})</span>
+            ({{ new Date(store.imageUpdates.lastBuild.startedAt).toLocaleString() }})
+          </div>
+
+          <div class="nb-note" v-if="store.imageUpdates.urgent">
+            <strong>Urgent roll-out is ON:</strong> any netbooted box running a different image reboots
+            within minutes. Switch it off once the fleet has converged.
+            <button class="btn-ghost-sm" :disabled="imgSaving" @click="applyImageSettings({ urgent: false })">
+              Clear urgent
+            </button>
+          </div>
+          <div class="nb-note" v-else>
+            New images roll out in the nightly window (03:00–05:00 on each box). For a critical fix,
+            <button class="btn-ghost-sm" :disabled="imgSaving" @click="applyImageSettings({ urgent: true })">
+              mark urgent
+            </button>
+            — stale boxes reboot within minutes (splayed).
+          </div>
         </template>
       </div>
 
@@ -324,6 +622,61 @@ async function onChangePassword(): Promise<void> {
   font-size: 11.5px;
   color: var(--muted2);
   margin-top: 10px;
+}
+/* ── Image updates card (POL-41) ── */
+.nb-time {
+  border: 1px solid var(--border, #d0d4dc);
+  background: var(--bg, transparent);
+  color: inherit;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font: inherit;
+}
+.nb-btn-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ── Netboot card (POL-33) ── */
+.nb-gap {
+  margin-top: 14px;
+}
+.nb-steps {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.nb-step {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.nb-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--muted-bg);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg2);
+}
+.nb-download {
+  display: inline-block;
+  margin-top: 16px;
+  text-decoration: none;
+}
+.nb-note {
+  margin-top: 14px;
+  font-size: 11.5px;
+  color: var(--muted2);
+  line-height: 1.5;
 }
 .inline-code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;

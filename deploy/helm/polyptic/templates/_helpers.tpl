@@ -147,3 +147,39 @@ Returns empty string when STORE=memory or nothing is configured.
 {{- .Values.externalDatabase.url -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+The name of the PVC backing the netboot depot (live image + signed loaders).
+*/}}
+{{- define "polyptic.depot.pvcName" -}}
+{{- if .Values.netboot.persistence.existingClaim -}}
+{{- .Values.netboot.persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-depot" (include "polyptic.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Depot subdirectories the server serves from (IMAGE_DIST_DIR / BOOT_DIST_DIR).
+*/}}
+{{- define "polyptic.imageDistDir" -}}
+{{- printf "%s/image" .Values.netboot.depotDir -}}
+{{- end }}
+{{- define "polyptic.bootDistDir" -}}
+{{- printf "%s/boot" .Values.netboot.depotDir -}}
+{{- end }}
+
+{{/*
+The base-ISO URL for the weekly full rebuild: explicit value, or the official
+Ubuntu live-server URL derived from ubuntuRelease + arch (arm64 lives on
+cdimage.ubuntu.com, amd64 on releases.ubuntu.com).
+*/}}
+{{- define "polyptic.baseIsoUrl" -}}
+{{- if .Values.imageUpdates.baseIsoUrl -}}
+{{- .Values.imageUpdates.baseIsoUrl -}}
+{{- else if eq .Values.imageUpdates.arch "arm64" -}}
+{{- printf "https://cdimage.ubuntu.com/releases/%s/release/ubuntu-%s-live-server-arm64.iso" .Values.imageUpdates.ubuntuRelease .Values.imageUpdates.ubuntuRelease -}}
+{{- else -}}
+{{- printf "https://releases.ubuntu.com/%s/ubuntu-%s-live-server-amd64.iso" .Values.imageUpdates.ubuntuRelease .Values.imageUpdates.ubuntuRelease -}}
+{{- end -}}
+{{- end }}

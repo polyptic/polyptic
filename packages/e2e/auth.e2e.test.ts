@@ -27,6 +27,7 @@
  * (capture Set-Cookie → send Cookie back).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { connect } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -50,6 +51,31 @@ const repoRoot = resolve(here, "..", "..");
 const serverEntry = resolve(repoRoot, "packages", "server", "src", "index.ts");
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Send a RAW HTTP/1.1 request line verbatim and return the response status. `fetch()` (and every WHATWG
+ * client) normalises the path before it hits the wire, so it CANNOT express a `//api/v1/...` target,
+ * but UEFI firmware / shim can, and do. This raw socket is the only way to prove the gate handles the
+ * literal duplicate-slash path a boot client actually sends. Resolves with the numeric status code.
+ */
+function rawStatus(rawPath: string): Promise<number> {
+  return new Promise((resolvePromise, reject) => {
+    const sock = connect(PORT, "localhost", () => {
+      sock.write(`GET ${rawPath} HTTP/1.1\r\nHost: localhost:${PORT}\r\nConnection: close\r\n\r\n`);
+    });
+    let buf = "";
+    sock.setEncoding("utf8");
+    sock.on("data", (chunk) => {
+      buf += chunk;
+    });
+    sock.on("end", () => {
+      const m = /^HTTP\/1\.\d (\d{3})/.exec(buf);
+      if (m && m[1]) resolvePromise(Number(m[1]));
+      else reject(new Error(`no status line in response: ${buf.slice(0, 120)}`));
+    });
+    sock.on("error", reject);
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // A tiny cookie jar.
@@ -208,6 +234,20 @@ describe("phase 3f local operator auth (gate ON)", () => {
       const res = await getJson("/api/v1/machines");
       expect(res.status).toBe(401);
       await drain(res);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a raw duplicate-slash variant of a protected route is STILL gated (no ignoreDuplicateSlashes bypass)",
+    async () => {
+      // The server sets Fastify ignoreDuplicateSlashes (for shim's `<dir>//grubx64.efi` HTTP-boot
+      // fetch), so `//api/v1/machines` ROUTES to the real handler; the gate must collapse the same
+      // slashes or it sees a leading `//`, fails its startsWith check, and skips auth entirely. Must be
+      // sent raw over a socket, since fetch normalises the path away and would not exercise the bug.
+      expect(await rawStatus("/api/v1/machines")).toBe(401); // sanity: the raw client itself is gated
+      expect(await rawStatus("//api/v1/machines")).toBe(401); // the bypass path (200 before the fix)
+      expect(await rawStatus("///api/v1/machines")).toBe(401);
     },
     TEST_TIMEOUT,
   );

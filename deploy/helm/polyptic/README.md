@@ -9,25 +9,52 @@ channels on `:8080`) to Kubernetes. This mirrors `deploy/docker-compose.yml`,
 > it is never run in Kubernetes. Agents connect *out* to the server over a WebSocket; expose
 > the server (Ingress / LoadBalancer) so the fleet can reach it.
 
-## TL;DR
+## TL;DR — install a release (GHCR-hosted)
+
+Every `v*` tag publishes **both halves to GHCR** (`.github/workflows/release.yml`):
+the multi-arch server image (`ghcr.io/polyptic/polyptic-server`) and this chart as
+an **OCI chart** (also attached to the GitHub Release as a `.tgz`):
 
 ```sh
-# 1. Pull the Postgres subchart dependency (once, or after bumping Chart.yaml deps).
-helm dependency update deploy/helm/polyptic
+helm install polyptic oci://ghcr.io/polyptic/charts/polyptic --version <x.y.z> \
+  --namespace polyptic --create-namespace
+```
 
-# 2. Install with the in-cluster Postgres subchart (default).
-helm install polyptic deploy/helm/polyptic \
+The chart's `appVersion` is pinned to the same tag, so the default image tag
+always matches the release you installed. From a working tree instead (no
+release), `helm install polyptic deploy/helm/polyptic …` works the same way.
+
+## K3s quick start
+
+K3s fits this chart unusually well: it **ships Traefik** (so `ingressRoute.*`
+works out of the box — the `web`/`websecure` entryPoints below are K3s's
+defaults) and its `local-path` StorageClass satisfies both PVCs.
+
+```sh
+helm install polyptic oci://ghcr.io/polyptic/charts/polyptic --version <x.y.z> \
   --namespace polyptic --create-namespace \
-  --set image.repository=ghcr.io/polyptic/polyptic-server \
-  --set image.tag=0.1.0
+  --set ingressRoute.enabled=true \
+  --set ingressRoute.host=polyptic.your-domain \
+  --set ingressRoute.tls.certResolver=letsencrypt \
+  --set ingressRoute.bootHost=boot.polyptic.your-domain \
+  --set config.corsOrigin=https://polyptic.your-domain \
+  --set config.playerBaseUrl=https://polyptic.your-domain \
+  --set media.publicBase=https://polyptic.your-domain \
+  --set imageUpdates.arch=<amd64|arm64 — your BOXES' arch> \
+  --set secrets.bootstrapToken="$(openssl rand -hex 24)" \
+  --set secrets.adminEmail=you@example.com \
+  --set secrets.adminPassword="$(openssl rand -base64 18)"
 ```
 
-The server image is built from `deploy/server.Dockerfile`:
+Two K3s-specific notes:
 
-```sh
-docker build -f deploy/server.Dockerfile -t ghcr.io/polyptic/polyptic-server:0.1.0 .
-docker push ghcr.io/polyptic/polyptic-server:0.1.0
-```
+- **`imageUpdates.arch` must have a matching Linux node** — the rebuild Jobs
+  carry a `kubernetes.io/arch` selector *and* a pod-affinity to the server's
+  node (the depot PVC is RWO). On a single-node K3s VM that means: the VM's
+  arch is the arch you can build images for.
+- **The boot path stays plain HTTP.** K3s Traefik listens on :80 (`web`) by
+  default, so `bootHost` works immediately; point DNS for both hosts at the VM
+  and bake `http://<bootHost>` into your boot media.
 
 ## Production install (HTTPS + Ingress + external Postgres)
 
@@ -111,6 +138,108 @@ helm install polyptic deploy/helm/polyptic \
   --set media.persistence.size=50Gi \
   --set media.persistence.storageClass=fast-rwo
 ```
+
+## Traefik IngressRoutes: stable names, no more baked IPs
+
+On a Traefik cluster, prefer `ingressRoute.enabled=true` over the generic Ingress
+(enable one, not both). It creates **two routers**:
+
+- **`ingressRoute.host`** (HTTPS, `websecure`, `certResolver` or `secretName`) —
+  console + player + REST + all three WebSocket channels. Deliberately **one
+  same-origin host**: the operator session is an http-only cookie, so splitting
+  console/api across subdomains would break sign-in. Traefik proxies the
+  WebSockets natively.
+- **`ingressRoute.bootHost`** (plain HTTP, `web`) — the boot depot only
+  (`/boot`, `/grub`, `/dist`, `/install`), because shim/GRUB/casper have no TLS
+  stack. **This is the address you bake into boot media**:
+
+```sh
+POLYPTIC_BASE=http://boot.polyptic.example.com deploy/build-boot-medium.sh
+POLYPTIC_BASE=http://boot.polyptic.example.com POLYPTIC_TOKEN=… BASE_ISO=… deploy/build-live-iso.sh arm64
+```
+
+Media bake their control-plane address at build time — dongles, offloaded disks,
+and live ISOs all go stale the moment a bare-IP server moves (see NETBOOT.md's
+troubleshooting section for the symptoms). A stable `bootHost` name ends that
+class of failure: the control plane can move freely behind the name. One caveat
+carried over from D47: GRUB resolves DNS fine, but casper's busybox `wget` is
+more reliable with IPs on some releases — verify a name-based boot on your
+target release before a fleet-wide rollout.
+
+```sh
+helm upgrade --install polyptic deploy/helm/polyptic \
+  --set ingressRoute.enabled=true \
+  --set ingressRoute.host=polyptic.example.com \
+  --set ingressRoute.tls.certResolver=letsencrypt \
+  --set ingressRoute.bootHost=boot.polyptic.example.com \
+  --set config.corsOrigin=https://polyptic.example.com \
+  --set config.playerBaseUrl=https://polyptic.example.com \
+  --set media.publicBase=https://polyptic.example.com
+```
+
+## Netboot depot + automated image updates (POL-33…43)
+
+The server serves the netboot artifacts — the live image (`GET /dist/image/<arch>/…`)
+and the signed boot loaders (`GET /dist/boot/<file>`) — from a **depot volume**
+(`netboot.persistence`, PVC by default, `helm.sh/resource-policy: keep`). GRUB and
+casper speak **plain HTTP**: netbooting boxes must reach the server over `http://`
+(a LoadBalancer/NodePort on the management LAN), not the HTTPS Ingress. Console and
+players keep using HTTPS; only the boot path is http-by-contract.
+
+With `imageUpdates.enabled=true` (default) the chart wires the two POL-41/POL-43
+update cycles **Kubernetes-natively** — the server keeps its scheduler and the
+console keeps its buttons, but the hook commands create privileged **Jobs** instead
+of running docker:
+
+| Cycle | Default | What it does |
+| --- | --- | --- |
+| Nightly refresh (`IMAGE_REBUILD_CMD` → `bun deploy/k8s-run-job.ts refresh`) | 01:00 | In-place `apt upgrade` of the existing image (kernel held, D47). Exits untouched when there is nothing to upgrade — no image-id churn, no pointless fleet reboots. |
+| Weekly full rebuild (`IMAGE_FULL_REBUILD_CMD` → `bun deploy/k8s-run-job.ts full`) | Sundays 02:00 | Rebuild from the base ISO (`imageUpdates.baseIsoUrl`, default the official Ubuntu `imageUpdates.ubuntuRelease` live-server ISO, downloaded once and cached on the depot volume). **This is the cycle that rolls kernel CVEs.** |
+
+How a rebuild runs: the server POSTs a Job rendered from the
+`<fullname>-rebuild-jobs` ConfigMap, waits, and relays the log tail to
+Console ▸ Settings ▸ Image updates. The Job's initContainer copies the rebuild
+scripts **out of the server image** (version-locked; nothing is duplicated into the
+chart), and the build itself runs privileged (chroot + loop mounts) in a plain
+`imageUpdates.jobImage` container on a Linux node of `imageUpdates.arch`. Because
+the depot PVC is ReadWriteOnce, the Jobs carry a required pod-affinity to the
+server's node; RWX storage lifts that constraint. Finished Jobs are GC'd after
+`imageUpdates.ttlSecondsAfterFinished`.
+
+RBAC (namespace-scoped, created by the chart): `jobs` create/get, `pods` list,
+`pods/log` get — no delete, no exec, no secrets.
+
+**Day-0 bootstrap:** the depot starts empty. Click **Full rebuild now** in
+Console ▸ Settings ▸ Image updates (or wait for Sunday) — the Job downloads the
+base ISO and publishes the first image straight onto the depot volume. For the
+signed loaders, build the boot medium once on any machine
+(`POLYPTIC_BASE=http://<server-lan> deploy/build-boot-medium.sh`) and copy it in:
+`kubectl cp deploy/dist/boot <pod>:/var/lib/polyptic/depot/`.
+
+## Dev workflow (local cluster)
+
+Keep the fast inner loop **on the host** (`bun run dev` — sub-second, no images).
+Use the chart for the integration ring on OrbStack / Docker Desktop Kubernetes /
+kind:
+
+```sh
+# once per code change you want in-cluster (chart-only changes skip this):
+docker build -f deploy/server.Dockerfile -t polyptic-server:dev .
+# kind only: kind load docker-image polyptic-server:dev
+
+# every chart/values iteration (seconds, no image build):
+helm upgrade --install polyptic deploy/helm/polyptic \
+  -f deploy/helm/polyptic/values-dev.yaml \
+  --namespace polyptic --create-namespace
+
+kubectl -n polyptic port-forward svc/polyptic 8080:8080   # http://localhost:8080
+```
+
+`values-dev.yaml` uses the local `polyptic-server:dev` image (`pullPolicy: Never`),
+an in-memory store, plain-HTTP cookies, a seeded `dev@example.com` operator, and
+keeps the depot PVC (a full rebuild caches the ~3GB base ISO — don't redo it per
+pod roll). Note the bonus: your cluster's nodes are **Linux**, so the image
+rebuild Jobs work here even though the host is macOS.
 
 ## Database options
 

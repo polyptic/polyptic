@@ -1,0 +1,89 @@
+{{- /*
+The two rebuild Job templates (POL-41/POL-43), rendered as JSON for the server's
+k8s hook (`bun deploy/k8s-run-job.ts refresh|full`, see deploy/k8s-run-job.ts):
+the server POSTs one of these to the API when its schedule fires or the operator
+clicks Refresh/Full-rebuild-now, then waits and relays the logs.
+
+  refresh.json — nightly in-place apt refresh of the existing image (kernel
+                 held, D47; exits untouched when apt has nothing to upgrade).
+  full.json    — weekly rebuild from the base ISO: the cycle that rolls KERNEL
+                 CVEs. Downloads + caches the base ISO on the depot volume.
+
+Both run PRIVILEGED (chroot + loop mounts) in a plain ubuntu container on a
+Linux node of imageUpdates.arch. The scripts come from an initContainer running
+the SERVER image (version-locked, no chart-side copies); artifacts land on the
+shared depot PVC the server serves from. Scratch space (an unsquashed rootfs is
+several GB) is an emptyDir at /var/tmp.
+*/ -}}
+{{- define "polyptic.rebuildJob" -}}
+{{- /* args: root ctx, payload/volumes/mounts/nodeSelector dicts, kind, cmd, deadline */ -}}
+{{- $a := . -}}
+{{- toJson (dict
+    "apiVersion" "batch/v1"
+    "kind" "Job"
+    "metadata" (dict "labels" (dict "app.kubernetes.io/part-of" "polyptic" "app.kubernetes.io/component" (printf "image-%s" $a.kind)))
+    "spec" (dict
+      "backoffLimit" 0
+      "activeDeadlineSeconds" $a.deadline
+      "ttlSecondsAfterFinished" $a.ttl
+      "template" (dict
+        "metadata" (dict "labels" (dict "app.kubernetes.io/part-of" "polyptic" "app.kubernetes.io/component" (printf "image-%s" $a.kind)))
+        "spec" (dict
+          "restartPolicy" "Never"
+          "nodeSelector" $a.nodeSelector
+          "tolerations" $a.tolerations
+          "affinity" $a.affinity
+          "initContainers" (list $a.payload)
+          "containers" (list (dict
+            "name" "rebuild"
+            "image" $a.jobImage
+            "command" (list "bash" "-c" $a.cmd)
+            "securityContext" (dict "privileged" true)
+            "resources" $a.resources
+            "volumeMounts" $a.mounts))
+          "volumes" $a.volumes))))
+-}}
+{{- end }}
+{{- if .Values.imageUpdates.enabled }}
+{{- $arch := .Values.imageUpdates.arch }}
+{{- $depotImage := printf "/depot/image/%s" $arch }}
+{{- $nodeSelector := merge (dict "kubernetes.io/arch" $arch) .Values.imageUpdates.nodeSelector }}
+{{- $payload := dict
+      "name" "payload"
+      "image" (include "polyptic.image" .)
+      "imagePullPolicy" .Values.image.pullPolicy
+      "command" (list "sh" "-c" "mkdir -p /repo/deploy && cp -r /app/deploy/refresh-live-image.sh /app/deploy/build-live-image.sh /app/deploy/live /app/deploy/dist /repo/deploy/")
+      "volumeMounts" (list (dict "name" "repo" "mountPath" "/repo"))
+}}
+{{- $volumes := list
+      (dict "name" "repo" "emptyDir" (dict))
+      (dict "name" "scratch" "emptyDir" (dict))
+      (dict "name" "depot" "persistentVolumeClaim" (dict "claimName" (include "polyptic.depot.pvcName" .)))
+}}
+{{- $mounts := list
+      (dict "name" "repo" "mountPath" "/repo")
+      (dict "name" "scratch" "mountPath" "/var/tmp")
+      (dict "name" "depot" "mountPath" "/depot")
+}}
+{{- /* The depot PVC is ReadWriteOnce by default: the Job MUST land on the node
+       already holding the volume (the server's node), or it wedges unschedulable.
+       Required pod affinity to the server pod guarantees that; RWX storage makes
+       it merely redundant. */}}
+{{- $affinity := dict "podAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (list (dict
+      "labelSelector" (dict "matchLabels" (dict "app.kubernetes.io/name" (include "polyptic.name" .) "app.kubernetes.io/instance" .Release.Name))
+      "topologyKey" "kubernetes.io/hostname")))
+}}
+{{- $refreshCmd := printf "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y -qq squashfs-tools rsync xorriso cpio zstd python3 >/dev/null; OUT_DIR=%s bash /repo/deploy/refresh-live-image.sh %s" $depotImage $arch }}
+{{- $fullCmd := printf "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y -qq squashfs-tools rsync xorriso cpio zstd python3 sbsigntool curl ca-certificates >/dev/null; mkdir -p /depot/cache; ISO=/depot/cache/$(basename %s); [ -f \"$ISO\" ] || { echo \"downloading %s\"; curl -fL -o \"$ISO.part\" %s && mv \"$ISO.part\" \"$ISO\"; }; OUT_DIR=%s BASE_ISO=\"$ISO\" bash /repo/deploy/build-live-image.sh %s" (include "polyptic.baseIsoUrl" .) (include "polyptic.baseIsoUrl" .) (include "polyptic.baseIsoUrl" .) $depotImage $arch }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "polyptic.fullname" . }}-rebuild-jobs
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+data:
+  refresh.json: |-
+    {{ include "polyptic.rebuildJob" (dict "kind" "refresh" "cmd" $refreshCmd "deadline" 1800 "ttl" (int .Values.imageUpdates.ttlSecondsAfterFinished) "jobImage" .Values.imageUpdates.jobImage "payload" $payload "volumes" $volumes "mounts" $mounts "nodeSelector" $nodeSelector "tolerations" .Values.imageUpdates.tolerations "affinity" $affinity "resources" .Values.imageUpdates.jobResources) }}
+  full.json: |-
+    {{ include "polyptic.rebuildJob" (dict "kind" "full" "cmd" $fullCmd "deadline" 2400 "ttl" (int .Values.imageUpdates.ttlSecondsAfterFinished) "jobImage" .Values.imageUpdates.jobImage "payload" $payload "volumes" $volumes "mounts" $mounts "nodeSelector" $nodeSelector "tolerations" .Values.imageUpdates.tolerations "affinity" $affinity "resources" .Values.imageUpdates.jobResources) }}
+{{- end }}

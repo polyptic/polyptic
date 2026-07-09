@@ -14,8 +14,11 @@ spec:
   template:
     metadata:
       annotations:
-        # Roll pods when the non-secret config changes.
+        # Roll pods when the non-secret config or the rebuild Job templates change.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.imageUpdates.enabled }}
+        checksum/rebuild-jobs: {{ include (print $.Template.BasePath "/rebuild-jobs.yaml") . | sha256sum }}
+        {{- end }}
         {{- if .Values.metrics.enabled }}
         prometheus.io/scrape: "true"
         prometheus.io/path: {{ .Values.metrics.path | quote }}
@@ -92,6 +95,16 @@ spec:
             # Phase 7: uploaded media lives on a disk volume mounted at MEDIA_DIR.
             - name: media
               mountPath: {{ .Values.media.dir | quote }}
+            # Netboot depot (POL-33…41): the live image + loaders the server
+            # serves and the rebuild Jobs write. Shared with the Jobs via PVC.
+            - name: depot
+              mountPath: {{ .Values.netboot.depotDir | quote }}
+            {{- if .Values.imageUpdates.enabled }}
+            # The rebuild Job templates for the k8s hook (deploy/k8s-run-job.ts).
+            - name: rebuild-jobs
+              mountPath: /etc/polyptic/jobs
+              readOnly: true
+            {{- end }}
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
@@ -115,6 +128,20 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        # Netboot depot (POL-33…41). Persistent by default — losing it means no
+        # box can netboot until a full rebuild finishes.
+        - name: depot
+          {{- if .Values.netboot.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "polyptic.depot.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.imageUpdates.enabled }}
+        - name: rebuild-jobs
+          configMap:
+            name: {{ include "polyptic.fullname" . }}-rebuild-jobs
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

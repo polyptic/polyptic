@@ -23,12 +23,14 @@ import type {
   LoginBody,
   MachineView,
   Mural,
+  NetbootInfo,
   Placement,
   Scene,
   ScreenView,
   UpdateContentSourceBody,
   UpdateSceneBody,
   VideoWall,
+  ImageUpdateInfo,
 } from "@polyptic/protocol";
 
 import * as api from "../api";
@@ -38,7 +40,11 @@ import * as auth from "../auth";
  *  contract's SetContentBody refinement). The ad-hoc URL path is the Phase-3b behaviour. */
 export type ContentAssignment = { sourceId: string } | { url: string };
 
-const ADMIN_WS_URL = "ws://localhost:8080/admin";
+// Same split as api.ts BASE: cross-port in dev (Vite :5175 -> server :8080), same-origin in a
+// production build served by the server itself (ws/wss follows the page protocol).
+const ADMIN_WS_URL = import.meta.env.DEV
+  ? "ws://localhost:8080/admin"
+  : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/admin`;
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
 const THEME_KEY = "polyptic.theme";
@@ -95,6 +101,11 @@ export interface ConsoleState {
   sessionChecked: boolean;
   /** Enrollment-token visibility for Settings + the cold-start wizard (open mode vs gated token). */
   enrollment: EnrollmentInfo | null;
+  /** Netboot info for Settings (POL-33): control-plane base, the `/boot/grub.cfg` boot config URL,
+   *  and the optional boot-medium download. Null until the Settings view fetches it. */
+  netboot: NetbootInfo | null;
+  /** Image-updates settings + published images (POL-41): schedule, urgency, last rebuild. */
+  imageUpdates: ImageUpdateInfo | null;
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
@@ -138,6 +149,8 @@ export const useConsoleStore = defineStore("console", {
     currentUser: null,
     sessionChecked: false,
     enrollment: null,
+    netboot: null,
+    imageUpdates: null,
     settings: null,
     connected: false,
     revision: 0,
@@ -509,6 +522,24 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] regenerateEnrollment failed", err);
         return false;
+      }
+    },
+
+    /** Load image-updates info for the Settings card (POL-41). Non-throwing, like fetchNetboot. */
+    async fetchImageUpdates(): Promise<void> {
+      try {
+        this.imageUpdates = await auth.getImageUpdates();
+      } catch (err) {
+        console.error("[console] fetchImageUpdates failed", err);
+      }
+    },
+
+    /** Load netboot info for the Settings card (POL-33). Non-throwing, like fetchEnrollment. */
+    async fetchNetboot(): Promise<void> {
+      try {
+        this.netboot = await auth.getNetboot();
+      } catch (err) {
+        console.error("[console] fetchNetboot failed", err);
       }
     },
 

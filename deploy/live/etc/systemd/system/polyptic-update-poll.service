@@ -1,0 +1,12 @@
+# Polyptic update poll (POL-41): one comparison of the booted image id against the control plane's
+# served manifest. Driven by polyptic-update-poll.timer (every 5 minutes); the script self-guards
+# (netboot-only via iso-url=, no-op when ids match, urgency/window policy, per-box splay).
+[Unit]
+Description=Polyptic - check the control plane for a newer live image (reboot = re-pull)
+Documentation=https://github.com/polyptic/polyptic/blob/main/docs/NETBOOT.md
+Wants=network-online.target
+After=network-online.target polyptic-agent-env.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/polyptic/update-poll.sh

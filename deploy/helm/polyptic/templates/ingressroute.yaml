@@ -1,0 +1,61 @@
+{{- /*
+Traefik IngressRoutes (POL-43). Two routers, two jobs:
+
+1. HTTPS (`host`, websecure): console + player + REST + the three WebSocket
+   channels — ONE same-origin host on purpose (the operator session is an
+   http-only cookie; subdomain-per-service would break it). Traefik proxies
+   WebSockets natively, no extra config.
+2. PLAIN HTTP (`bootHost`, web): the boot depot only. GRUB and casper cannot
+   speak TLS — this router is the stable, bakeable address for boot media
+   (POLYPTIC_BASE=http://<bootHost>), which is the durable fix for baked
+   server IPs going stale when the control plane moves.
+
+Requires the Traefik CRDs (traefik.io/v1alpha1). Enable EITHER this OR the
+generic `ingress:`, not both.
+*/ -}}
+{{- if .Values.ingressRoute.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "polyptic.fullname" . }}
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    {{- toYaml .Values.ingressRoute.entryPoints | nindent 4 }}
+  routes:
+    - match: Host(`{{ .Values.ingressRoute.host }}`)
+      kind: Rule
+      services:
+        - name: {{ include "polyptic.fullname" . }}
+          port: {{ .Values.service.port }}
+  {{- if or .Values.ingressRoute.tls.certResolver .Values.ingressRoute.tls.secretName }}
+  tls:
+    {{- if .Values.ingressRoute.tls.certResolver }}
+    certResolver: {{ .Values.ingressRoute.tls.certResolver }}
+    {{- end }}
+    {{- if .Values.ingressRoute.tls.secretName }}
+    secretName: {{ .Values.ingressRoute.tls.secretName }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.ingressRoute.bootHost }}
+---
+# The boot depot, plain HTTP by contract (shim/GRUB/casper have no TLS stack).
+# Path-scoped so nothing operator-facing is ever served over http.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "polyptic.fullname" . }}-boot
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    {{- toYaml .Values.ingressRoute.bootEntryPoints | nindent 4 }}
+  routes:
+    - match: Host(`{{ .Values.ingressRoute.bootHost }}`) && (PathPrefix(`/boot`) || PathPrefix(`/grub`) || PathPrefix(`/dist`) || Path(`/install`) || Path(`/healthz`))
+      kind: Rule
+      services:
+        - name: {{ include "polyptic.fullname" . }}
+          port: {{ .Values.service.port }}
+{{- end }}
+{{- end }}

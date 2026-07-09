@@ -25,3 +25,17 @@ data:
   MEDIA_DIR: {{ .Values.media.dir | quote }}
   MEDIA_PUBLIC_BASE: {{ .Values.media.publicBase | quote }}
   MEDIA_MAX_BYTES: {{ .Values.media.maxBytes | quote }}
+  # ── Netboot depot (POL-33…41) ───────────────────────────────────────────────
+  # The live image + signed loaders, served ungated from the depot volume
+  # (GET /dist/image/<arch>/… and GET /dist/boot/<file>). Plain HTTP by contract.
+  IMAGE_DIST_DIR: {{ include "polyptic.imageDistDir" . | quote }}
+  BOOT_DIST_DIR: {{ include "polyptic.bootDistDir" . | quote }}
+  {{- if .Values.imageUpdates.enabled }}
+  # ── Image updates (POL-41/POL-43) ───────────────────────────────────────────
+  # The two rebuild hooks: in-cluster they create a privileged Job from the
+  # chart-rendered templates (see rebuild-jobs.yaml) and wait — the server pod
+  # itself never chroots or mounts anything.
+  IMAGE_REBUILD_CMD: "bun deploy/k8s-run-job.ts refresh"
+  IMAGE_FULL_REBUILD_CMD: "bun deploy/k8s-run-job.ts full"
+  POLYPTIC_JOB_TEMPLATE_DIR: "/etc/polyptic/jobs"
+  {{- end }}

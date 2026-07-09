@@ -79,9 +79,23 @@ export function installBrowser(
   log.step(`install browser (${opts.browser})`);
 
   if (opts.browser === "surf") {
-    const surf = installCmd(distro.pm, ["surf"]);
+    // surf is an X11 (WebKitGTK/Xlib) client: under the wayland-sway backend it renders through
+    // XWAYLAND, and sway only starts Xwayland when the binary exists — without the package sway
+    // logs `Cannot find Xwayland binary` and the browser can never open, so the wall sits on a
+    // black compositor forever (found live in the POL-38 UTM boot).
+    const pkgs = ["surf"];
+    if (opts.backend === "wayland-sway") {
+      pkgs.push(
+        distro.pm === "pacman"
+          ? "xorg-xwayland"
+          : distro.pm === "dnf"
+            ? "xorg-x11-server-Xwayland"
+            : "xwayland",
+      );
+    }
+    const surf = installCmd(distro.pm, pkgs);
     sys.exec(surf.cmd, surf.args, {
-      desc: "install surf (suckless WebKitGTK kiosk browser)",
+      desc: "install surf (suckless WebKitGTK kiosk browser) + Xwayland for the sway backend",
       allowFail: distro.pm !== "apt",
       env: distro.pm === "apt" ? { DEBIAN_FRONTEND: "noninteractive" } : undefined,
     });

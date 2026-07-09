@@ -195,6 +195,104 @@ media:
     # provisioning (bind to a pre-created PV).
     storageClass: ""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Traefik IngressRoute (the CRD), the recommended exposure on a Traefik cluster
+# — an alternative to the generic `ingress:` above (enable one, not both).
+#
+# TWO hosts by design:
+#   * `host` (HTTPS, websecure) — console + player + REST + the three WS
+#     channels. These are deliberately ONE same-origin host: the operator
+#     session is an http-only cookie, and splitting console/api onto different
+#     subdomains would break it. WebSockets pass through Traefik natively.
+#   * `bootHost` (PLAIN HTTP, web) — the boot depot only (/boot, /grub, /dist,
+#     /install). GRUB and casper speak no TLS, so this router must stay http.
+#     THIS hostname is what you bake into boot media and live ISOs:
+#         POLYPTIC_BASE=http://boot.polyptic.example.com deploy/build-boot-medium.sh
+#         POLYPTIC_BASE=http://boot.polyptic.example.com ... deploy/build-live-iso.sh arm64
+#     A stable name here is the fix for "the server's IP changed and every
+#     baked medium went stale."
+# ─────────────────────────────────────────────────────────────────────────────
+ingressRoute:
+  enabled: false
+  host: polyptic.example.com
+  entryPoints:
+    - websecure
+  tls:
+    # Traefik ACME resolver name (e.g. letsencrypt) — or set secretName instead.
+    certResolver: ""
+    # Pre-provisioned TLS secret for `host`.
+    secretName: ""
+  # The plain-HTTP boot-depot host. Empty disables the boot router.
+  bootHost: boot.polyptic.example.com
+  bootEntryPoints:
+    - web
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Netboot depot (POL-33…41).
+#   The server serves the live image (GET /dist/image/<arch>/…) and the signed
+#   boot loaders (GET /dist/boot/<file>) from two directories; both live on one
+#   depot volume so the rebuild Jobs and the server share the artifacts.
+#   NOTE: GRUB + casper speak PLAIN HTTP (no TLS) — netbooting boxes must reach
+#   the server over http:// (a LoadBalancer/NodePort on the management LAN), not
+#   the HTTPS Ingress. Consoles/players keep HTTPS; only the boot path is
+#   http-by-contract.
+# ─────────────────────────────────────────────────────────────────────────────
+netboot:
+  # Mount path of the depot volume; IMAGE_DIST_DIR/BOOT_DIST_DIR derive from it
+  # (<depotDir>/image and <depotDir>/boot).
+  depotDir: /var/lib/polyptic/depot
+  persistence:
+    # Back the depot with a PVC. The live image is rebuilt nightly/weekly and
+    # must survive pod restarts — without persistence every restart would need a
+    # fresh full rebuild before boxes could netboot.
+    enabled: true
+    existingClaim: ""
+    accessModes:
+      - ReadWriteOnce
+    # A live image is ~1.5–2GB and the weekly full rebuild caches the ~3GB base
+    # ISO alongside it; 15Gi leaves room for both plus a build in flight.
+    size: 15Gi
+    storageClass: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Automated image updates (POL-41/POL-43), Kubernetes-native.
+#   The server keeps its two scheduled cycles (Console ▸ Settings ▸ Image
+#   updates): the NIGHTLY in-place apt refresh (kernel held, D47) and the WEEKLY
+#   full rebuild from the base ISO — the cycle that rolls kernel CVEs. In-cluster
+#   the rebuild hooks become `bun deploy/k8s-run-job.ts refresh|full`: the server
+#   creates a privileged Job from a chart-rendered template on a Linux node,
+#   waits for it, and surfaces the outcome in the console. The heavy privileged
+#   work never runs in the server pod.
+# ─────────────────────────────────────────────────────────────────────────────
+imageUpdates:
+  # Render the RBAC + Job templates and wire IMAGE_REBUILD_CMD /
+  # IMAGE_FULL_REBUILD_CMD in the server's env.
+  enabled: true
+  # Architecture the in-cluster Jobs build for. Must match your boxes; the Jobs
+  # get a kubernetes.io/arch nodeSelector so they land on a matching node.
+  arch: arm64
+  # Base ISO for the weekly full rebuild. Empty derives the official Ubuntu
+  # live-server URL from ubuntuRelease + arch. Downloaded once onto the depot
+  # volume and cached under cache/.
+  baseIsoUrl: ""
+  ubuntuRelease: "26.04"
+  # Image the rebuild Jobs run in (needs apt; the scripts install their tools).
+  jobImage: ubuntu:24.04
+  # Finished Jobs are garbage-collected after this many seconds (kept for log
+  # inspection until then; the hook already relayed the log tail to the console).
+  ttlSecondsAfterFinished: 21600
+  # Rebuilds are CPU-bound (mksquashfs zstd-19); give them room but cap them.
+  jobResources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 6Gi
+  # Extra scheduling constraints for the rebuild Jobs (merged with the arch selector).
+  nodeSelector: {}
+  tolerations: []
+
 secrets:
   # COOKIE_SECRET — signs the http-only session cookies. MUST be a long random
   # value in production. If left empty AND existingSecret is unset, the chart

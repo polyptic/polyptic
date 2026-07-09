@@ -1,0 +1,40 @@
+{{- /*
+RBAC for the image-update hooks (POL-43): the server's ServiceAccount creates a
+rebuild Job when its schedule fires (or the operator clicks Refresh/Full-rebuild
+now), polls its status, and relays the pod logs to the console. Namespace-scoped
+and minimal — no delete (ttlSecondsAfterFinished garbage-collects), no exec, no
+secrets.
+*/ -}}
+{{- if .Values.imageUpdates.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "polyptic.fullname" . }}-image-updates
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "polyptic.fullname" . }}-image-updates
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "polyptic.fullname" . }}-image-updates
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "polyptic.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

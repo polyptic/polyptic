@@ -1,0 +1,32 @@
+{{- /*
+PersistentVolumeClaim for the netboot depot (POL-33…43): the live image the fleet
+netboots (rebuilt nightly/weekly by the rebuild Jobs) plus the signed boot
+loaders, served ungated at GET /dist/image/… and /dist/boot/…. Durable by
+requirement — losing it means no box can netboot until a full rebuild finishes.
+
+resource-policy: keep prevents `helm uninstall` from deleting a multi-gigabyte
+image an operator would otherwise have to rebuild.
+*/ -}}
+{{- if and .Values.netboot.persistence.enabled (not .Values.netboot.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "polyptic.depot.pvcName" . }}
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.netboot.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.netboot.persistence.size | quote }}
+  {{- if .Values.netboot.persistence.storageClass }}
+  {{- if (eq "-" .Values.netboot.persistence.storageClass) }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.netboot.persistence.storageClass | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

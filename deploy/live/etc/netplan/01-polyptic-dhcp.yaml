@@ -1,0 +1,22 @@
+# Polyptic live image (POL-38): the rootfs must manage its OWN network. The ubuntu-server-minimal
+# squashfs ships NO netplan config (the installer environment normally handles it), so a booted
+# live box left every NIC DOWN/unmanaged: netboot masked it because the initramfs `ip=dhcp` only
+# configures the link long enough to FETCH the image, and after switch-root the agent could never
+# reach the control plane (found in the POL-38 UTM boot: enp0s1 DOWN, wait-online hanging ~2min).
+# DHCP every ethernet; `optional: true` so boot never blocks on link-up (the agent retries forever;
+# pairs with the wait-online --any drop-in).
+network:
+  version: 2
+  ethernets:
+    polyptic-en:
+      match:
+        name: "en*"
+      dhcp4: true
+      dhcp6: true
+      optional: true
+    polyptic-eth:
+      match:
+        name: "eth*"
+      dhcp4: true
+      dhcp6: true
+      optional: true

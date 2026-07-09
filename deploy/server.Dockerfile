@@ -110,6 +110,18 @@ COPY --from=build /app/packages/player/dist ./packages/player/dist
 COPY --from=build /app/deploy/install.sh ./deploy/install.sh
 COPY --from=build /app/deploy/dist ./deploy/dist
 
+# The image-update machinery (POL-41/POL-43): the rebuild scripts + the diskless-identity overlay
+# ship IN the server image so Kubernetes rebuild Jobs can copy them out of an initContainer (no
+# chart-side script duplication — scripts stay version-locked to the server) and so the k8s hook
+# (`bun deploy/k8s-run-job.ts refresh|full`) is runnable in place. The privileged work itself never
+# runs in THIS container — the scripts execute inside the rebuild Job's ubuntu container (k8s) or a
+# privileged docker run (compose/laptop).
+COPY --from=build /app/deploy/refresh-live-image.sh ./deploy/refresh-live-image.sh
+COPY --from=build /app/deploy/build-live-image.sh ./deploy/build-live-image.sh
+COPY --from=build /app/deploy/build-live-iso.sh ./deploy/build-live-iso.sh
+COPY --from=build /app/deploy/k8s-run-job.ts ./deploy/k8s-run-job.ts
+COPY --from=build /app/deploy/live ./deploy/live
+
 # ── Runtime env ──────────────────────────────────────────────────────────────
 # The server binds HOST:PORT and serves the console + player from these dirs,
 # same-origin on :8080. STORE / DATABASE_URL / MEDIA_* come from compose or

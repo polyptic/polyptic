@@ -171,6 +171,31 @@ export interface PersistedBootstrap {
 }
 
 /**
+ * Image-updates state (POL-41): the scheduled-rebuild settings, the urgent roll-out switch, and the
+ * last rebuild-hook run. One row; absent until first mutated (defaults: schedule on at 01:00,
+ * urgent off).
+ */
+export interface PersistedImageRollout {
+  scheduleEnabled: boolean;
+  /** Server-local `HH:MM` the daily refresh hook fires at. */
+  scheduleTime: string;
+  /** Weekly FULL rebuild cycle (POL-43): the daily refresh holds the kernel (D47), so this second
+   *  cycle — a rebuild from the base ISO — is what actually rolls kernel CVEs. */
+  fullScheduleEnabled: boolean;
+  /** Day-of-week the full rebuild fires (0 = Sunday … 6 = Saturday). */
+  fullScheduleDay: number;
+  /** Server-local `HH:MM` the full rebuild fires at. */
+  fullScheduleTime: string;
+  urgent: boolean;
+  lastBuildStartedAt: string | null;
+  lastBuildFinishedAt: string | null;
+  lastBuildStatus: "running" | "success" | "failure" | null;
+  lastBuildLog: string | null;
+  /** Which cycle the last run was: the daily in-place refresh or the weekly full rebuild. */
+  lastBuildKind: "refresh" | "full" | null;
+}
+
+/**
  * Fleet-wide display settings (POL-6): the operator-toggleable on-screen badge visibility, persisted
  * so a runtime choice survives a restart. Absent until the setting is first changed — the control
  * plane then falls back to its env-derived default (prod off / dev on).
@@ -299,6 +324,12 @@ export interface Store {
 
   // ── Display settings (POL-6) ───────────────────────────────────────────────
   /** The persisted fleet-wide display settings (badge toggle). Undefined until first changed. */
+  // ── Image updates (POL-41) ─────────────────────────────────────────────────
+  /** The persisted image-updates state (schedule + urgency + last build). Undefined until first set. */
+  getImageRollout(): Promise<PersistedImageRollout | undefined>;
+  /** Replace the image-updates state. */
+  setImageRollout(rollout: PersistedImageRollout): Promise<void>;
+
   getDisplaySettings(): Promise<PersistedDisplaySettings | undefined>;
   /** Persist the fleet-wide display settings (single row). */
   setDisplaySettings(settings: PersistedDisplaySettings): Promise<void>;

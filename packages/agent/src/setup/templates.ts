@@ -229,8 +229,11 @@ seat * hide_cursor 5000
 # LIBGL_ALWAYS_SOFTWARE is imported so the kiosk browser inherits the launcher's software-GL choice
 # on a 3D-less GPU (else WebKit/Chromium tries hardware GL and dies with no window). Unset on a real
 # GPU, so this is a no-op there — never forces software rendering on hardware that can do GL.
-exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR LIBGL_ALWAYS_SOFTWARE
-exec dbus-update-activation-environment --systemd WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP LIBGL_ALWAYS_SOFTWARE
+# DISPLAY is imported too: sway defines it at startup for its (lazy-started) Xwayland, and X11-only
+# kiosk browsers (surf) launched by the agent's user unit die with "Can't open default display"
+# without it (found live in the POL-38 UTM boot). Unset when xwayland is unavailable — harmless.
+exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR LIBGL_ALWAYS_SOFTWARE
+exec dbus-update-activation-environment --systemd WAYLAND_DISPLAY SWAYSOCK DISPLAY XDG_CURRENT_DESKTOP LIBGL_ALWAYS_SOFTWARE
 exec systemctl --user start ${p.sessionTarget}
 `;
 }

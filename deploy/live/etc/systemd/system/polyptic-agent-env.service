@@ -1,0 +1,15 @@
+[Unit]
+Description=Polyptic, derive stable machine-id + parse boot cmdline into /run/polyptic/agent.env (POL-33)
+Documentation=file:///usr/local/lib/polyptic/write-agent-env.sh
+# Must complete before autologin so the kiosk session + agent see the identity + control-plane target.
+# DMI (sysfs) and /proc/cmdline are available by sysinit; default deps give that ordering.
+Before=greetd.service systemd-user-sessions.service
+ConditionPathExists=/usr/local/lib/polyptic/write-agent-env.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/polyptic/write-agent-env.sh
+
+[Install]
+WantedBy=multi-user.target
