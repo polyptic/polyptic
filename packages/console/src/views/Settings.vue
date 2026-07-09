@@ -28,6 +28,7 @@ function onKeydown(e: KeyboardEvent): void {
   if (e.key !== "Escape") return;
   if (usbModal.value) usbModal.value = false;
   else if (menuOpen.value) menuOpen.value = false;
+  else if (rowMenu.value) rowMenu.value = null;
 }
 
 // ── Toast ──────────────────────────────────────────────────────────────────────
@@ -160,8 +161,12 @@ function onDownloadBootloader(): void {
 }
 
 const activating = ref<string | null>(null);
+/** Which build row has its overflow menu open, by `<arch>-<imageId>` (ids repeat across arches). */
+const rowMenu = ref<string | null>(null);
+const rowKey = (b: ImageBuild): string => `${b.arch}-${b.imageId}`;
 
 async function activate(build: ImageBuild): Promise<void> {
+  rowMenu.value = null;
   if (activating.value || build.active) return;
   if (
     !window.confirm(
@@ -446,32 +451,77 @@ async function onSignOut(): Promise<void> {
             <span class="build-id">{{ formatImageId(b.imageId) }}</span>
             <span class="build-when">{{ formatRelativeShort(b.builtAt, nowMs) }}</span>
             <span class="tag" :class="b.active ? 'tag-ok' : 'tag-muted'">{{ b.active ? "Active" : "Superseded" }}</span>
-            <button
-              v-if="!b.active"
-              type="button"
-              class="row-btn text"
-              :disabled="activating !== null"
-              title="Serve this build to the fleet"
-              @click="activate(b)"
-            >
-              {{ activating === b.imageId ? "Activating…" : "Activate" }}
-            </button>
-            <a
-              v-if="b.liveIsoUrl"
-              class="row-btn"
-              :href="b.liveIsoUrl"
-              download
-              :title="`Download the bootable live ISO for ${b.imageId}`"
-            >
-              <svg
-                width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
-                stroke-linecap="round" stroke-linejoin="round"
+
+            <!-- The active build has nothing to activate, so its single action stays a plain icon.
+                 Every other row folds Download + Activate into an overflow menu. -->
+            <template v-if="b.active">
+              <a
+                v-if="b.liveIsoUrl"
+                class="row-btn"
+                :href="b.liveIsoUrl"
+                download
+                :title="`Download the bootable live ISO for ${b.imageId}`"
               >
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" />
-                <line x1="12" x2="12" y1="15" y2="3" />
-              </svg>
-            </a>
-            <span v-else class="row-btn empty" title="This build has no standalone live ISO" />
+                <svg
+                  width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+                  stroke-linecap="round" stroke-linejoin="round"
+                >
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" />
+                  <line x1="12" x2="12" y1="15" y2="3" />
+                </svg>
+              </a>
+              <span v-else class="row-btn empty" title="This build has no standalone live ISO" />
+            </template>
+
+            <div v-else class="menu-wrap">
+              <button
+                type="button"
+                class="row-btn"
+                :class="{ open: rowMenu === rowKey(b) }"
+                :aria-label="`Actions for build ${b.imageId}`"
+                :aria-expanded="rowMenu === rowKey(b)"
+                :disabled="activating !== null"
+                @click="rowMenu = rowMenu === rowKey(b) ? null : rowKey(b)"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                  <circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" />
+                </svg>
+              </button>
+              <template v-if="rowMenu === rowKey(b)">
+                <div class="menu-scrim" @click="rowMenu = null" />
+                <div class="menu menu-row">
+                  <a
+                    v-if="b.liveIsoUrl"
+                    class="menu-item"
+                    :href="b.liveIsoUrl"
+                    download
+                    @click="rowMenu = null"
+                  >
+                    <svg
+                      width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                      stroke-linecap="round" stroke-linejoin="round" class="menu-icon"
+                    >
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" />
+                      <line x1="12" x2="12" y1="15" y2="3" />
+                    </svg>
+                    <span class="menu-text"><span class="menu-title">Download live ISO</span></span>
+                  </a>
+                  <button type="button" class="menu-item" :disabled="activating !== null" @click="activate(b)">
+                    <svg
+                      width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                      stroke-linecap="round" stroke-linejoin="round" class="menu-icon"
+                    >
+                      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" />
+                      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" />
+                    </svg>
+                    <span class="menu-text">
+                      <span class="menu-title">{{ activating === b.imageId ? "Activating…" : "Activate" }}</span>
+                      <span class="menu-sub">Serve this build to the fleet.</span>
+                    </span>
+                  </button>
+                </div>
+              </template>
+            </div>
           </div>
         </div>
         <p v-else class="hint">
@@ -1100,7 +1150,8 @@ async function onSignOut(): Promise<void> {
 .builds {
   border: 1px solid var(--line);
   border-radius: 11px;
-  overflow: hidden;
+  /* NOT overflow:hidden — a row's overflow menu has to escape this box. The rows round their own
+     outer corners instead, so the active row's tint still stops at the border radius. */
 }
 .build-row {
   display: flex;
@@ -1110,6 +1161,15 @@ async function onSignOut(): Promise<void> {
 }
 .build-row + .build-row {
   border-top: 1px solid var(--line);
+}
+.build-row:first-child {
+  border-radius: 10px 10px 0 0;
+}
+.build-row:last-child {
+  border-radius: 0 0 10px 10px;
+}
+.build-row:only-child {
+  border-radius: 10px;
 }
 .build-row.active {
   background: var(--accent-soft);
@@ -1172,13 +1232,13 @@ async function onSignOut(): Promise<void> {
   background: var(--muted-bg);
   color: var(--fg);
 }
-.row-btn.text {
-  width: auto;
-  padding: 0 9px;
-  font-family: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--accent-fg);
+.row-btn.open {
+  background: var(--muted-bg);
+  color: var(--fg);
+}
+.build-row.active .row-btn:hover {
+  /* --muted-bg over the row's accent tint is muddy; the card behind it reads cleaner. */
+  background: var(--card);
 }
 .row-btn.empty {
   cursor: default;
@@ -1186,6 +1246,18 @@ async function onSignOut(): Promise<void> {
 .row-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+/* A row's menu is narrower than the card's, and hangs just under its trigger. */
+.menu.menu-row {
+  top: 32px;
+  min-width: 208px;
+}
+.menu-row .menu-item {
+  align-items: center;
+  text-decoration: none;
+}
+.menu-row .menu-title {
+  font-size: 12.5px;
 }
 
 /* ── Disclosure: boot without a USB stick ──────────────────────────────────── */
