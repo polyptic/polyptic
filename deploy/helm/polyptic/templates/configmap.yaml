@@ -10,7 +10,8 @@ data:
   HOST: "0.0.0.0"
   STORE: {{ .Values.config.store | quote }}
   CORS_ORIGIN: {{ .Values.config.corsOrigin | quote }}
-  PLAYER_BASE_URL: {{ .Values.config.playerBaseUrl | quote }}
+  # The player lives under /player/ in the single image — the helper appends it (see _helpers.tpl).
+  PLAYER_BASE_URL: {{ include "polyptic.playerBaseUrl" . | quote }}
   LOG_LEVEL: {{ .Values.config.logLevel | quote }}
   NODE_ENV: {{ .Values.config.nodeEnv | quote }}
   AUTH_ENABLED: {{ .Values.config.authEnabled | quote }}

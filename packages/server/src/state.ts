@@ -79,6 +79,12 @@ function playerUrlFor(screenId: string): string {
   return `${PLAYER_BASE_URL}/?screen=${encodeURIComponent(screenId)}`;
 }
 
+/** POL-46 — the page a PENDING machine shows on every output until an operator approves it. Same
+ *  player app, same base URL; no screen id, because a pending machine has no screens yet. */
+export function pendingUrlFor(machineId: string): string {
+  return `${PLAYER_BASE_URL}/?pending=${encodeURIComponent(machineId)}`;
+}
+
 /** One entry of the `server/apply` payload: which screen an output is, and where to point its player. */
 export interface ScreenAssignment {
   connector: string;
