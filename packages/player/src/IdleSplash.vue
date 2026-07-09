@@ -12,15 +12,22 @@
  */
 import type { ConnState } from "./ws";
 
-defineProps<{
-  /** The screen's friendly name (as named in the console), falling back to its id pre-first-render.
-   *  Labelled exactly as typed — never the raw `screen-N` id once the console has named it (POL-29). */
-  name: string;
-  /** Drives the status-dot colour: live (green) vs connecting (amber) vs offline (red). */
-  connState: ConnState;
-  /** Build version string, injected from package.json at build time. */
-  version: string;
-}>();
+withDefaults(
+  defineProps<{
+    /** The screen's friendly name (as named in the console), falling back to its id pre-first-render.
+     *  Labelled exactly as typed — never the raw `screen-N` id once the console has named it (POL-29). */
+    name: string;
+    /** Drives the status-dot colour: live (green) vs connecting (amber) vs offline (red). */
+    connState: ConnState;
+    /** Build version string, injected from package.json at build time. */
+    version: string;
+    /** The headline under the wordmark. POL-46 reuses this board for "Pending Approval". */
+    sub?: string;
+    /** An optional second line telling the operator what to do next (POL-46). */
+    caption?: string;
+  }>(),
+  { sub: "No Content Assigned", caption: "" },
+);
 </script>
 
 <template>
@@ -34,7 +41,8 @@ defineProps<{
         </svg>
       </div>
       <div class="idle-wordmark">Polyptic</div>
-      <div class="idle-sub">No Content Assigned</div>
+      <div class="idle-sub">{{ sub }}</div>
+      <div v-if="caption" class="idle-caption">{{ caption }}</div>
     </div>
 
     <div class="idle-status">
@@ -74,6 +82,13 @@ defineProps<{
   flex-direction: column;
   align-items: center;
   justify-content: center;
+}
+
+.idle-caption {
+  margin-top: 10px;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+  color: var(--idle-faint);
 }
 
 .idle-mark {

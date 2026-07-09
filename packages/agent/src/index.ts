@@ -256,7 +256,7 @@ class Agent {
         this.onEnrolled(msg);
         break;
       case "server/pending":
-        this.onPending(msg);
+        await this.onPending(msg);
         break;
       case "server/rejected":
         this.onRejected(msg);
@@ -364,11 +364,26 @@ class Agent {
     }
   }
 
-  /** `server/pending` — recognised but awaiting operator approval. Keep the WS open; no apply yet. */
-  private onPending(msg: PendingMsg): void {
+  /** `server/pending` — recognised but awaiting operator approval. Keep the WS open; no apply yet.
+   *
+   *  POL-46: a pending machine has no screens, so nothing was ever placed and the wall sat BLACK —
+   *  indistinguishable from a dead box, and the operator had no on-screen clue what to do. Show the
+   *  server-supplied pending board on EVERY output instead. `showScreen` is the same call `apply`
+   *  makes, so the eventual approval simply swaps the URL in place (no remount, no flash). */
+  private async onPending(msg: PendingMsg): Promise<void> {
     log(
       `awaiting operator approval${msg.reason ? ` — ${msg.reason}` : ""} (connection kept open; will receive server/apply once approved)`,
     );
+    if (!msg.pendingUrl) return; // older server: nothing to show, keep the previous behaviour
+    for (const output of this.outputs) {
+      if (this.placed.get(output.connector) === msg.pendingUrl) continue;
+      try {
+        await this.backend.showScreen(output.connector, msg.pendingUrl);
+        this.placed.set(output.connector, msg.pendingUrl);
+      } catch (err) {
+        logError(`failed to show the pending board on ${output.connector}: ${(err as Error).message}`);
+      }
+    }
   }
 
   /**

@@ -135,7 +135,9 @@ config:
   # this is typically your HTTPS console origin.
   corsOrigin: "https://polyptic.example.com"
 
-  # Public base URL of the player app (used when the server pushes render URLs).
+  # Public ORIGIN of this deployment (scheme://host[:port], no path). The server hands each wall box
+  # a player URL derived from it — the chart appends the /player path the single image serves the
+  # player app under, so do NOT add it yourself. Must be reachable from the wall boxes.
   playerBaseUrl: "https://polyptic.example.com"
 
   # Fastify log level: trace|debug|info|warn|error|fatal.

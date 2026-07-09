@@ -219,6 +219,12 @@ export const ServerToAgentEnrolled = z.object({
 export const ServerToAgentPending = z.object({
   t: z.literal("server/pending"),
   reason: z.string().optional(),
+  /** The machine's id, so the pending board can show the operator what to approve. */
+  machineId: z.string().optional(),
+  /** POL-46 — a player page to show fullscreen on every output WHILE pending, instead of leaving the
+   *  wall black. Optional: an older agent simply ignores it, and a server that cannot resolve a
+   *  player base omits it. */
+  pendingUrl: z.string().optional(),
 });
 
 /** Authentication failed (bad/absent token or credential, or the machine was rejected). The server

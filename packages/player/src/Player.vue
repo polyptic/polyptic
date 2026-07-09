@@ -47,6 +47,14 @@ function readScreenId(): string {
   return (params.get("screen") ?? "").trim();
 }
 
+/** POL-46 — `?pending=<machineId>`: the board a machine shows on every output while it waits for an
+ *  operator to approve it. It has no screen (and so no player WS) yet; this page is purely a sign. */
+function readPendingMachineId(): string {
+  const params = new URLSearchParams(window.location.search);
+  return (params.get("pending") ?? "").trim();
+}
+
+const pendingMachineId = readPendingMachineId();
 const screenId = readScreenId();
 
 // The screen's friendly name (as named in the console). The server stamps it onto every render, so
@@ -187,7 +195,21 @@ function connLabel(state: ConnState): string {
 </script>
 
 <template>
-  <div v-if="!screenId" class="notice">
+  <!--
+    POL-46 — awaiting approval. Same board as the idle splash so a waiting wall reads as intentional
+    rather than dead, and tells the operator exactly what to do. No WS: a pending machine has no
+    screen to subscribe to. The amber dot says "waiting", not "broken".
+  -->
+  <IdleSplash
+    v-if="pendingMachineId"
+    :name="pendingMachineId"
+    conn-state="connecting"
+    :version="APP_VERSION"
+    sub="Pending Approval"
+    caption="Approve this machine in Console ▸ Machines"
+  />
+
+  <div v-else-if="!screenId" class="notice">
     <p>
       No screen specified. Append <code>?screen=screen-1</code> to the URL.
     </p>

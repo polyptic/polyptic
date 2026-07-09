@@ -46,6 +46,7 @@ import { hashCredential } from "./enroll";
 import type { Enrollment } from "./enroll";
 import type { AuthService } from "./auth-local";
 import type { CaptureCoordinator } from "./capture";
+import { pendingUrlFor } from "./state";
 import type { ControlPlane, RegisterMachineInput, ScreenAssignment } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
@@ -180,10 +181,16 @@ function handleAgent(
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(enrolled));
   }
 
-  function sendPending(reason?: string): void {
-    const pending = ServerToAgentPending.parse(
-      reason ? { t: "server/pending", reason } : { t: "server/pending" },
-    );
+  /** POL-46 — a pending machine keeps its WS open but has no screens, so nothing was ever shown and
+   *  the wall sat BLACK (indistinguishable from a dead box). Hand the agent a player page to display
+   *  on every output until an operator approves it. */
+  function sendPending(reason?: string, targetMachineId?: string): void {
+    const pending = ServerToAgentPending.parse({
+      t: "server/pending",
+      ...(reason ? { reason } : {}),
+      ...(targetMachineId ? { machineId: targetMachineId } : {}),
+      ...(targetMachineId ? { pendingUrl: pendingUrlFor(targetMachineId) } : {}),
+    });
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(pending));
   }
 
@@ -273,7 +280,7 @@ function handleAgent(
           const credential = decision.credential ?? "";
           await control.enrollPending(input, hashCredential(credential));
           sendEnrolled(msg.machineId, credential, "pending");
-          sendPending(decision.reason);
+          sendPending(decision.reason, msg.machineId);
           log.info(
             {
               event: "agent.enrolled",
@@ -299,7 +306,7 @@ function handleAgent(
           } else {
             await control.touchMachine(msg.machineId, msg.outputs);
           }
-          sendPending(decision.reason);
+          sendPending(decision.reason, msg.machineId);
           log.info(
             {
               event: "agent.pending",

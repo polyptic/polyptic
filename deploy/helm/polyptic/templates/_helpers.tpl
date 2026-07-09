@@ -183,3 +183,21 @@ cdimage.ubuntu.com, amd64 on releases.ubuntu.com).
 {{- printf "https://releases.ubuntu.com/%s/ubuntu-%s-live-server-amd64.iso" .Values.imageUpdates.ubuntuRelease .Values.imageUpdates.ubuntuRelease -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+The URL the server hands each wall box to open (PLAYER_BASE_URL).
+
+The single image serves the CONSOLE at / and the PLAYER at /player/ (server/src/spa.ts), so the
+player base is the public origin + /player. Getting this wrong points every wall screen at the
+operator's LOGIN PAGE — which is exactly what happened on the first real deployment. Operators
+therefore set `config.playerBaseUrl` to the plain origin (same as corsOrigin) and the chart appends
+the path. Idempotent: an origin that already ends in /player is left alone.
+*/}}
+{{- define "polyptic.playerBaseUrl" -}}
+{{- $base := trimSuffix "/" .Values.config.playerBaseUrl -}}
+{{- if hasSuffix "/player" $base -}}
+{{- $base -}}
+{{- else -}}
+{{- printf "%s/player" $base -}}
+{{- end -}}
+{{- end }}
