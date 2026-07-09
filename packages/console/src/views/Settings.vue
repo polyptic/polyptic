@@ -398,7 +398,8 @@ async function onSignOut(): Promise<void> {
                 <div class="step-gutter"><span class="step-num">2</span><span class="step-line" /></div>
                 <div class="step-body">
                   Boot the bare box from USB with Secure Boot left <b>ON</b>. The signed loader streams the live
-                  image from the server into RAM.
+                  image from the server into RAM, so the box needs <b>~4&nbsp;GB of RAM</b> — for anything less,
+                  use the live ISO instead.
                 </div>
               </li>
               <li class="step">
@@ -427,9 +428,10 @@ async function onSignOut(): Promise<void> {
             </div>
 
             <p v-if="store.netboot.liveIsos.length > 0" class="hint gap-sm">
-              The live ISO needs no netboot at all — write it to a stick, boot, and the box enrols itself. It bakes
-              the current enrolment token, so treat the file as a credential: regenerate the token above and rebuild
-              to revoke old copies.
+              The live ISO needs no netboot at all — write it to a stick, boot, and the box enrols itself. It runs
+              the OS off the stick rather than out of RAM, so <b>~2&nbsp;GB</b> is enough (netboot needs ~4&nbsp;GB).
+              It bakes the current enrolment token, so treat the file as a credential: regenerate the token above and
+              rebuild to revoke old copies. A box booted this way does not auto-update — reflash it after a rebuild.
             </p>
 
             <button type="button" class="disclosure" :class="{ open: advOpen }" @click="advOpen = !advOpen">

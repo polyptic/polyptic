@@ -229,8 +229,47 @@ exit 0
 NOOP
   chmod 0755 "$WORK/ply-harvest/scripts/$hook/multipath"
 done
-# Append the extras (splash closure + multipath no-ops) as an extra cpio segment (zstd like the
-# main segment; the kernel unpacks concatenated segments in order and later files win).
+# RAM pre-flight + tmpfs headroom (POL-46). casper's `iso-url=` does `wget URL -O $(basename URL)`
+# into the INITRAMFS ROOT, which the kernel caps at 50% of RAM. Our image is ~1.4 GiB, so a 3.3 GiB
+# box gets a 1.65 GiB ceiling and dies with a bare `wget: short write: No space left on device` —
+# found live on real hardware. Two fixes, both here because init-premount runs BEFORE casper's
+# mountroot: raise the cap to 90% (which alone makes a 3-4 GiB box boot), and, when the box truly
+# cannot hold the image, say so in words instead of dropping the operator into busybox.
+mkdir -p "$WORK/ply-harvest/scripts/init-premount"
+cat > "$WORK/ply-harvest/scripts/init-premount/polyptic-ram" <<'RAMCHK'
+#!/bin/sh
+# Polyptic live image (POL-46) — see deploy/build-live-image.sh.
+case "$1" in prereqs) echo ""; exit 0 ;; esac
+
+# Netboot only: an ISO/USB boot mounts the squashfs off the medium and needs no RAM headroom.
+grep -q ' iso-url=' /proc/cmdline 2>/dev/null || exit 0
+
+mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+
+# Give the download room: the ISO lives in this tmpfs for the whole session, so 50% is never enough.
+mount -o remount,size=90% / 2>/dev/null || true
+
+# Below ~2.5 GiB even 90% cannot hold a ~1.4 GiB image plus a working system. Tell the operator what
+# to do rather than letting wget fail 90 seconds later with a cryptic ENOSPC.
+if [ "${mem_kb:-0}" -gt 0 ] && [ "$mem_kb" -lt 2621440 ]; then
+    mem_gb=$((mem_kb / 1048576))
+    echo "" >/dev/console 2>/dev/null || true
+    echo "  ##############################################################" >/dev/console 2>/dev/null || true
+    echo "  ## Polyptic: this machine has ~${mem_gb} GB RAM." >/dev/console 2>/dev/null || true
+    echo "  ## Netbooting streams the whole OS image into RAM and needs ~4 GB." >/dev/console 2>/dev/null || true
+    echo "  ##" >/dev/console 2>/dev/null || true
+    echo "  ## Use the LIVE ISO instead (Console > Settings > Netboot):" >/dev/console 2>/dev/null || true
+    echo "  ## it runs the OS straight off the USB stick and needs ~1-2 GB." >/dev/console 2>/dev/null || true
+    echo "  ##############################################################" >/dev/console 2>/dev/null || true
+    echo "" >/dev/console 2>/dev/null || true
+    sleep 10
+fi
+exit 0
+RAMCHK
+chmod 0755 "$WORK/ply-harvest/scripts/init-premount/polyptic-ram"
+
+# Append the extras (splash closure + multipath no-ops + the RAM pre-flight) as an extra cpio segment
+# (zstd like the main segment; the kernel unpacks concatenated segments in order and later files win).
 if [ -d "$WORK/ply-harvest" ]; then
   # The hook resolves the theme via the `default.plymouth` update-alternatives entry (setup
   # registers it); if the harvest is missing the theme dir, the registration didn't happen (e.g.
