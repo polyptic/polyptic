@@ -375,8 +375,9 @@ async function onSignOut(): Promise<void> {
         </div>
         <p class="card-sub wrap gap">
           Enrol a machine straight into Polyptic over the network (no OS install, no disk). Write the bootloader to a
-          USB stick and it streams the current image into RAM. The control-plane URL and enrolment token are baked
-          into the image.
+          USB stick and it streams the current image into RAM — so the box needs <b>~4&nbsp;GB of RAM</b>. For less,
+          download a build's live ISO below: it runs off the stick and needs <b>~2&nbsp;GB</b>. The control-plane URL
+          and enrolment token are baked into the image.
         </p>
 
         <!-- Network boot loader ---------------------------------------------- -->

@@ -415,6 +415,33 @@ whole image into a RAM tmpfs.)
 
 ---
 
+## RAM: netboot needs ~4 GB, the live ISO needs ~2 GB
+
+The two media differ in *where the operating system lives*, and that decides the memory floor:
+
+| Medium | Where the OS runs from | RAM needed |
+| --- | --- | --- |
+| Boot medium / netboot (`polyptic-boot.img`) | the whole `polyptic.iso` (~1.4 GiB) is streamed into a **RAM tmpfs** and stays there | **~4 GB** |
+| Live ISO (`polyptic-live.iso`) | the squashfs is read **straight off the USB stick** | **~1–2 GB** |
+
+Why 4 GB and not 1.4: casper's `iso-url=` runs `wget URL -O $(basename URL)` into the **initramfs
+root**, a tmpfs the kernel caps at **50 % of RAM** by default. A 3.3 GB box therefore has a 1.65 GiB
+ceiling for a 1.4 GiB image — and then still has to run a desktop out of what remains.
+
+Polyptic's initrd raises that cap to 90 % (`scripts/init-premount/polyptic-ram`, appended by
+`build-live-image.sh`), which is what makes a 3–4 GB box boot at all. Below ~2.5 GB it prints a
+plain-English message naming the live ISO as the fix, instead of failing later inside busybox with:
+
+```
+wget: short write: No space left on device
+Unable to find a live file system on the network
+```
+
+If you see that, the box is out of RAM — nothing is wrong with the network or the image. Use the
+live ISO for that box, or fit more memory. (Shrinking the image is tracked separately.)
+
+---
+
 ## Troubleshooting: the control-plane address is BAKED into boot media
 
 Seen live (2026-07-09): the dev host moved to a different network, its IP changed, and **every
