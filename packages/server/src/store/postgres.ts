@@ -30,6 +30,7 @@ import type {
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
+  PersistedCredentialProfile,
   PersistedDisplaySettings,
   PersistedImageRollout,
   PersistedMachine,
@@ -102,6 +103,19 @@ interface ContentSourceRow {
   name: string;
   kind: string;
   url: string;
+  credential_profile_id: string | null;
+}
+
+interface CredentialProfileRow {
+  id: string;
+  name: string;
+  strategy: string;
+  token_endpoint: string;
+  client_id: string;
+  client_secret: string;
+  scope: string | null;
+  audience: string | null;
+  token_param: string;
 }
 
 interface SceneRow {
@@ -238,6 +252,24 @@ export class PostgresStore implements Store {
         url  text NOT NULL
       )
     `;
+    // Idempotent migration for databases created before POL-24: which credential profile (if any)
+    // authenticates this source. NULL = unauthenticated.
+    await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS credential_profile_id text`;
+    // Credential profiles (POL-24): centrally-held OAuth clients for Bucket-A content auth. The
+    // client secret's ONLY durable home — never broadcast, never returned by REST, never logged.
+    await sql`
+      CREATE TABLE IF NOT EXISTS credential_profiles (
+        id             text PRIMARY KEY,
+        name           text NOT NULL,
+        strategy       text NOT NULL DEFAULT 'oauth-client-credentials',
+        token_endpoint text NOT NULL,
+        client_id      text NOT NULL,
+        client_secret  text NOT NULL,
+        scope          text,
+        audience       text,
+        token_param    text NOT NULL DEFAULT 'auth_token'
+      )
+    `;
     // Scenes (Phase 3d). A named SNAPSHOT of a mural's whole wall — layout + grouping + content live
     // in the `snapshot` jsonb. `schedule_at` is the illustrative "HH:MM" time (stored, NOT fired).
     await sql`
@@ -322,6 +354,7 @@ export class PostgresStore implements Store {
       videoWallRows,
       contentSourceRows,
       sceneRows,
+      credentialProfileRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
@@ -330,8 +363,9 @@ export class PostgresStore implements Store {
       sql<MuralRow[]>`SELECT id, name FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
-      sql<ContentSourceRow[]>`SELECT id, name, kind, url FROM content_sources`,
+      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
+      sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -399,8 +433,28 @@ export class PostgresStore implements Store {
       const kind = ContentKind.safeParse(row.kind);
       // Drop a row with an unrecognised kind rather than crash the boot.
       if (!kind.success) return [];
-      return [{ id: row.id, name: row.name, kind: kind.data, url: row.url }];
+      return [
+        {
+          id: row.id,
+          name: row.name,
+          kind: kind.data,
+          url: row.url,
+          credentialProfileId: row.credential_profile_id ?? null,
+        },
+      ];
     });
+
+    const credentialProfiles: PersistedCredentialProfile[] = credentialProfileRows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      strategy: row.strategy,
+      tokenEndpoint: row.token_endpoint,
+      clientId: row.client_id,
+      clientSecret: row.client_secret,
+      scope: row.scope ?? null,
+      audience: row.audience ?? null,
+      tokenParam: row.token_param,
+    }));
 
     const scenes: PersistedScene[] = sceneRows.map((row) => {
       // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
@@ -431,6 +485,7 @@ export class PostgresStore implements Store {
       videoWalls,
       contentSources,
       scenes,
+      credentialProfiles,
     };
   }
 
@@ -630,12 +685,13 @@ export class PostgresStore implements Store {
   async upsertContentSource(source: PersistedContentSource): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO content_sources (id, name, kind, url)
-      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url})
+      INSERT INTO content_sources (id, name, kind, url, credential_profile_id)
+      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url}, ${source.credentialProfileId ?? null})
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         kind = EXCLUDED.kind,
-        url  = EXCLUDED.url
+        url  = EXCLUDED.url,
+        credential_profile_id = EXCLUDED.credential_profile_id
     `;
   }
 
@@ -650,12 +706,73 @@ export class PostgresStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     const sql = this.sql;
-    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url FROM content_sources`;
+    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id FROM content_sources`;
     return rows.flatMap((row) => {
       const kind = ContentKind.safeParse(row.kind);
       if (!kind.success) return [];
-      return [{ id: row.id, name: row.name, kind: kind.data, url: row.url }];
+      return [
+        {
+          id: row.id,
+          name: row.name,
+          kind: kind.data,
+          url: row.url,
+          credentialProfileId: row.credential_profile_id ?? null,
+        },
+      ];
     });
+  }
+
+  // ── Credential profiles (POL-24) ─────────────────────────────────────────────
+
+  async upsertCredentialProfile(profile: PersistedCredentialProfile): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO credential_profiles (id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param)
+      VALUES (
+        ${profile.id},
+        ${profile.name},
+        ${profile.strategy},
+        ${profile.tokenEndpoint},
+        ${profile.clientId},
+        ${profile.clientSecret},
+        ${profile.scope ?? null},
+        ${profile.audience ?? null},
+        ${profile.tokenParam}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        name           = EXCLUDED.name,
+        strategy       = EXCLUDED.strategy,
+        token_endpoint = EXCLUDED.token_endpoint,
+        client_id      = EXCLUDED.client_id,
+        client_secret  = EXCLUDED.client_secret,
+        scope          = EXCLUDED.scope,
+        audience       = EXCLUDED.audience,
+        token_param    = EXCLUDED.token_param
+    `;
+  }
+
+  async deleteCredentialProfile(id: string): Promise<void> {
+    const sql = this.sql;
+    // Detach from any sources that referenced it (defensive — the control plane refuses to delete an
+    // in-use profile, so this only matters for rows mutated outside the API).
+    await sql`UPDATE content_sources SET credential_profile_id = NULL WHERE credential_profile_id = ${id}`;
+    await sql`DELETE FROM credential_profiles WHERE id = ${id}`;
+  }
+
+  async listCredentialProfiles(): Promise<PersistedCredentialProfile[]> {
+    const sql = this.sql;
+    const rows = await sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`;
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      strategy: row.strategy,
+      tokenEndpoint: row.token_endpoint,
+      clientId: row.client_id,
+      clientSecret: row.client_secret,
+      scope: row.scope ?? null,
+      audience: row.audience ?? null,
+      tokenParam: row.token_param,
+    }));
   }
 
   // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────

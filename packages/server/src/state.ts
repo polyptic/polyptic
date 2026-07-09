@@ -33,6 +33,8 @@ import {
 import type {
   ContentKind,
   CreateContentSourceBody,
+  CreateCredentialProfileBody,
+  CredentialProfileView,
   DesiredState,
   DisplayBackend,
   DisplaySettings,
@@ -46,10 +48,17 @@ import type {
   ScreenSlice,
   Surface,
   UpdateContentSourceBody,
+  UpdateCredentialProfileBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 
-import type { PersistedMachine, PersistedScene, Store } from "./store/types";
+import type {
+  PersistedCredentialProfile,
+  PersistedMachine,
+  PersistedScene,
+  Store,
+} from "./store/types";
+import type { TokenService } from "./tokens";
 import type { ActivityLog } from "./activity";
 
 /** Where players live. The agent points each output's Chromium/browser at this base + ?screen=<id>. */
@@ -190,6 +199,15 @@ export class ControlPlane {
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
   private sceneCounter = 0;
+
+  /** POL-24 — credential profiles keyed by id. Held as the FULL persisted row (incl. the client
+   *  secret) because the control plane is where the secret is written through; every outward-facing
+   *  read goes via `getCredentialProfileViews`, which never carries it. */
+  private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
+  private credentialCounter = 0;
+  /** POL-24 — wired after construction (the TokenService needs the control plane's profiles first).
+   *  When absent (unit tests), URLs simply go out unstamped. */
+  private tokenProvider?: Pick<TokenService, "getToken" | "statusFor">;
 
   /** POL-6 — fleet-wide display settings (on-screen badge visibility) pushed to every player. Starts
    *  at the env default; `init()` loads any persisted operator override on top. */
@@ -413,6 +431,27 @@ export class ControlPlane {
       }
     }
     this.sceneCounter = maxScene;
+
+    // ── Credential profiles (POL-24) ──────────────────────────────────────────
+    for (const cp of persisted.credentialProfiles) {
+      this.credentialProfiles.set(cp.id, cp);
+    }
+    // Resume the counter past the highest persisted "credential-N" so new ids stay unique.
+    let maxCredential = 0;
+    for (const cp of this.credentialProfiles.values()) {
+      const match = /^credential-(\d+)$/.exec(cp.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxCredential = Math.max(maxCredential, n);
+      }
+    }
+    this.credentialCounter = maxCredential;
+    // Drop a dangling profile reference off any source whose profile no longer exists (defensive).
+    for (const source of this.contentSources.values()) {
+      if (source.credentialProfileId && !this.credentialProfiles.has(source.credentialProfileId)) {
+        source.credentialProfileId = null;
+      }
+    }
 
     // Seed a default mural the first time a deployment boots, so the Wall view always has a canvas.
     if (this.murals.size === 0) {
@@ -1538,37 +1577,64 @@ export class ControlPlane {
     return `source-${this.sourceCounter}`;
   }
 
-  /** Create a new library source with a server-assigned id. Write-through. */
-  async createContentSource(body: CreateContentSourceBody): Promise<ContentSource> {
+  /** Create a new library source with a server-assigned id. Write-through. Rejects a reference to a
+   *  credential profile that doesn't exist (POL-24). */
+  async createContentSource(
+    body: CreateContentSourceBody,
+  ): Promise<{ ok: true; source: ContentSource } | { ok: false; error: "unknown-profile" }> {
+    const credentialProfileId = body.credentialProfileId ?? null;
+    if (credentialProfileId && !this.credentialProfiles.has(credentialProfileId)) {
+      return { ok: false, error: "unknown-profile" };
+    }
     const id = this.nextSourceId();
-    const source = ContentSource.parse({ id, name: body.name, kind: body.kind, url: body.url });
+    const source = ContentSource.parse({
+      id,
+      name: body.name,
+      kind: body.kind,
+      url: body.url,
+      credentialProfileId,
+    });
     this.contentSources.set(id, source);
     await this.store.upsertContentSource({
       id: source.id,
       name: source.name,
       kind: source.kind,
       url: source.url,
+      credentialProfileId,
     });
-    return source;
+    return { ok: true, source };
   }
 
   /**
-   * Update a library source (any subset of name/kind/url). If the source is currently assigned to any
-   * screen(s) or wall(s), each is RE-RESOLVED against the new kind/url and the touched slices are
-   * returned (one revision bump, write-through) for the caller to push live. Returns null if unknown.
+   * Update a library source (any subset of name/kind/url/credentialProfileId — null DETACHES the
+   * profile). If the source is currently assigned to any screen(s) or wall(s), each is RE-RESOLVED
+   * against the new kind/url and the touched slices are returned (one revision bump, write-through)
+   * for the caller to push live.
    */
   async updateContentSource(
     id: string,
     patch: UpdateContentSourceBody,
-  ): Promise<{ source: ContentSource; slices: ScreenSlice[] } | null> {
+  ): Promise<
+    | { ok: true; source: ContentSource; slices: ScreenSlice[] }
+    | { ok: false; error: "unknown-source" | "unknown-profile" }
+  > {
     const existing = this.contentSources.get(id);
-    if (existing === undefined) return null;
+    if (existing === undefined) return { ok: false, error: "unknown-source" };
+
+    const credentialProfileId =
+      patch.credentialProfileId !== undefined
+        ? patch.credentialProfileId
+        : (existing.credentialProfileId ?? null);
+    if (credentialProfileId && !this.credentialProfiles.has(credentialProfileId)) {
+      return { ok: false, error: "unknown-profile" };
+    }
 
     const source = ContentSource.parse({
       id: existing.id,
       name: patch.name ?? existing.name,
       kind: patch.kind ?? existing.kind,
       url: patch.url ?? existing.url,
+      credentialProfileId,
     });
     this.contentSources.set(id, source);
     await this.store.upsertContentSource({
@@ -1576,6 +1642,7 @@ export class ControlPlane {
       name: source.name,
       kind: source.kind,
       url: source.url,
+      credentialProfileId,
     });
 
     // Re-resolve every screen + wall currently showing this source.
@@ -1618,7 +1685,7 @@ export class ControlPlane {
       await this.store.setRevision(this.state.revision);
     }
 
-    return { source, slices };
+    return { ok: true, source, slices };
   }
 
   /**
@@ -1670,6 +1737,180 @@ export class ControlPlane {
     }
 
     return { slices };
+  }
+
+  // ── Credential profiles (POL-24) ─────────────────────────────────────────────
+  //
+  // A credential profile is a centrally-held OAuth client (Bucket-A content auth, D11/D17): the
+  // server exchanges it for short-lived JWT tokens (TokenService) and STAMPS the current token into
+  // a referencing source's URL at send time — `decorateSliceForSend`, called at the two
+  // `server/render` sites. Stored slices and the DB always keep the CLEAN url (same pattern as
+  // `friendlyName`, POL-29), so a reconnecting/cold-booting screen always loads with a live token
+  // and a routine token refresh never rewrites (= reloads) a live iframe.
+
+  /** Wire the token cache after construction (the TokenService is seeded from these profiles). */
+  setTokenProvider(provider: Pick<TokenService, "getToken" | "statusFor">): void {
+    this.tokenProvider = provider;
+  }
+
+  /** FULL rows incl. the client secret — for seeding the TokenService only. Never leaves process. */
+  getCredentialProfilesInternal(): PersistedCredentialProfile[] {
+    return [...this.credentialProfiles.values()];
+  }
+
+  /** One FULL row incl. the secret — for the TokenService on create/update. */
+  getCredentialProfileInternal(id: string): PersistedCredentialProfile | undefined {
+    return this.credentialProfiles.get(id);
+  }
+
+  /** How many library sources reference a profile (drives the delete guard + console copy). */
+  private profileInUseCount(id: string): number {
+    let count = 0;
+    for (const source of this.contentSources.values()) {
+      if (source.credentialProfileId === id) count += 1;
+    }
+    return count;
+  }
+
+  /** The outward-facing views: profile config + live token health, NEVER the client secret. */
+  getCredentialProfileViews(): CredentialProfileView[] {
+    return [...this.credentialProfiles.values()].map((p) => {
+      const status = this.tokenProvider?.statusFor(p.id) ?? { tokenStatus: "pending" as const };
+      return {
+        id: p.id,
+        name: p.name,
+        strategy: "oauth-client-credentials" as const,
+        tokenEndpoint: p.tokenEndpoint,
+        clientId: p.clientId,
+        ...(p.scope ? { scope: p.scope } : {}),
+        ...(p.audience ? { audience: p.audience } : {}),
+        tokenParam: p.tokenParam,
+        tokenStatus: status.tokenStatus,
+        ...(status.tokenExpiresAt ? { tokenExpiresAt: status.tokenExpiresAt } : {}),
+        ...(status.lastError ? { lastError: status.lastError } : {}),
+        inUseBy: this.profileInUseCount(p.id),
+      };
+    });
+  }
+
+  private nextCredentialId(): string {
+    this.credentialCounter += 1;
+    return `credential-${this.credentialCounter}`;
+  }
+
+  /** Create a profile with a server-assigned id. Write-through. The caller seeds the TokenService. */
+  async createCredentialProfile(body: CreateCredentialProfileBody): Promise<PersistedCredentialProfile> {
+    const profile: PersistedCredentialProfile = {
+      id: this.nextCredentialId(),
+      name: body.name,
+      strategy: "oauth-client-credentials",
+      tokenEndpoint: body.tokenEndpoint,
+      clientId: body.clientId,
+      clientSecret: body.clientSecret,
+      scope: body.scope ?? null,
+      audience: body.audience ?? null,
+      tokenParam: body.tokenParam ?? "auth_token",
+    };
+    this.credentialProfiles.set(profile.id, profile);
+    await this.store.upsertCredentialProfile(profile);
+    this.emit("good", `Credential profile ${profile.name} added`);
+    return profile;
+  }
+
+  /** Update a profile (secret omitted = unchanged; scope/audience null = cleared). Null if unknown. */
+  async updateCredentialProfile(
+    id: string,
+    patch: UpdateCredentialProfileBody,
+  ): Promise<PersistedCredentialProfile | null> {
+    const existing = this.credentialProfiles.get(id);
+    if (existing === undefined) return null;
+    const profile: PersistedCredentialProfile = {
+      id: existing.id,
+      name: patch.name ?? existing.name,
+      strategy: existing.strategy,
+      tokenEndpoint: patch.tokenEndpoint ?? existing.tokenEndpoint,
+      clientId: patch.clientId ?? existing.clientId,
+      clientSecret: patch.clientSecret ?? existing.clientSecret,
+      scope: patch.scope !== undefined ? patch.scope : (existing.scope ?? null),
+      audience: patch.audience !== undefined ? patch.audience : (existing.audience ?? null),
+      tokenParam: patch.tokenParam ?? existing.tokenParam,
+    };
+    this.credentialProfiles.set(id, profile);
+    await this.store.upsertCredentialProfile(profile);
+    this.emit("info", `Credential profile ${profile.name} updated`);
+    return profile;
+  }
+
+  /**
+   * Delete a profile. REFUSED while any source references it (`in-use`) — silently de-authing live
+   * screens is worse than making the operator reassign first. The caller drops it from the
+   * TokenService on success.
+   */
+  async deleteCredentialProfile(
+    id: string,
+  ): Promise<{ ok: true } | { ok: false; error: "unknown-profile" | "in-use"; inUseBy?: number }> {
+    const existing = this.credentialProfiles.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown-profile" };
+    const inUseBy = this.profileInUseCount(id);
+    if (inUseBy > 0) return { ok: false, error: "in-use", inUseBy };
+    this.credentialProfiles.delete(id);
+    await this.store.deleteCredentialProfile(id);
+    this.emit("warn", `Credential profile ${existing.name} removed`);
+    return { ok: true };
+  }
+
+  /** Every screen currently showing content authenticated by this profile (directly or via a wall) —
+   *  the set to re-push when the profile's token becomes usable again. */
+  screenIdsUsingProfile(profileId: string): string[] {
+    const ids = new Set<string>();
+    for (const [screenId, sid] of this.screenSourceIds) {
+      if (this.contentSources.get(sid)?.credentialProfileId === profileId) ids.add(screenId);
+    }
+    for (const [wallId, sid] of this.wallSourceIds) {
+      if (this.contentSources.get(sid)?.credentialProfileId !== profileId) continue;
+      const wall = this.videoWalls.get(wallId);
+      for (const screenId of wall?.memberScreenIds ?? []) ids.add(screenId);
+    }
+    return [...ids];
+  }
+
+  /** Append `param=token` to a URL, preserving any existing query/fragment. Falls back to the clean
+   *  url if it doesn't parse (it was validated at the edge, so this is belt-and-braces). */
+  private static stampToken(url: string, param: string, token: string): string {
+    try {
+      const parsed = new URL(url);
+      parsed.searchParams.set(param, token);
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * The send-time auth stamp: if this slice's screen is showing a library source that references a
+   * credential profile with a usable token, return a COPY with the token appended to the web/dashboard
+   * surface URLs. Otherwise return the slice untouched (no token yet → the target app's login page
+   * shows until the token-usable edge re-pushes). Never mutates stored state.
+   */
+  decorateSliceForSend(slice: ScreenSlice): ScreenSlice {
+    if (!this.tokenProvider || slice.surfaces.length === 0) return slice;
+    const wall = this.getWallForScreen(slice.screenId);
+    const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(slice.screenId);
+    if (!sourceId) return slice;
+    const source = this.contentSources.get(sourceId);
+    const profileId = source?.credentialProfileId;
+    if (!profileId) return slice;
+    const profile = this.credentialProfiles.get(profileId);
+    if (!profile) return slice;
+    const token = this.tokenProvider.getToken(profileId);
+    if (!token) return slice;
+    return {
+      ...slice,
+      surfaces: slice.surfaces.map((surface) => {
+        if (surface.type !== "web" && surface.type !== "dashboard") return surface;
+        return { ...surface, url: ControlPlane.stampToken(surface.url, profile.tokenParam, token) };
+      }),
+    };
   }
 
   /**

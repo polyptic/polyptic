@@ -16,6 +16,7 @@ export type {
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
+  PersistedCredentialProfile,
   PersistedMachine,
   PersistedMural,
   PersistedPlacement,

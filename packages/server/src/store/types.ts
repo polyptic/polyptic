@@ -71,6 +71,31 @@ export interface PersistedContentSource {
   name: string;
   kind: ContentKind;
   url: string;
+  /**
+   * POL-24 — the credential profile whose token is stamped into this source's URL at send time.
+   * `null`/undefined = unauthenticated (also the value on legacy rows persisted before the column).
+   */
+  credentialProfileId?: string | null;
+}
+
+/**
+ * POL-24 — a credential profile row: a centrally-held OAuth client for Bucket-A content auth
+ * (strategy `oauth-client-credentials`). This is the ONLY place the client secret lives; it is never
+ * broadcast, never returned by REST, and never logged. Tokens themselves are NOT persisted — they are
+ * short-lived and re-fetched on boot.
+ */
+export interface PersistedCredentialProfile {
+  id: string;
+  name: string;
+  /** The D11 strategy seam; "oauth-client-credentials" today. */
+  strategy: string;
+  tokenEndpoint: string;
+  clientId: string;
+  clientSecret: string;
+  scope?: string | null;
+  audience?: string | null;
+  /** Query parameter the token is delivered in at send time (default "auth_token"). */
+  tokenParam: string;
 }
 
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
@@ -219,6 +244,8 @@ export interface PersistedState {
   contentSources: PersistedContentSource[];
   /** Phase 3d — saved wall snapshots (scenes). */
   scenes: PersistedScene[];
+  /** POL-24 — credential profiles (content auth). */
+  credentialProfiles: PersistedCredentialProfile[];
 }
 
 /**
@@ -284,6 +311,14 @@ export interface Store {
   deleteContentSource(id: string): Promise<void>;
   /** All persisted content sources. */
   listContentSources(): Promise<PersistedContentSource[]>;
+
+  // ── Credential profiles (POL-24) ───────────────────────────────────────────
+  /** Insert-or-update a credential-profile row (the only home of the client secret). */
+  upsertCredentialProfile(profile: PersistedCredentialProfile): Promise<void>;
+  /** Delete a credential-profile row. No-op if absent. */
+  deleteCredentialProfile(id: string): Promise<void>;
+  /** All persisted credential profiles. */
+  listCredentialProfiles(): Promise<PersistedCredentialProfile[]>;
 
   // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
   /** Insert-or-update a scene row (id + name + mural + snapshot jsonb + schedule_at). */

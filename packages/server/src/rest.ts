@@ -22,6 +22,7 @@ import { z } from "zod";
 import {
   CombineScreensBody,
   CreateContentSourceBody,
+  CreateCredentialProfileBody,
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
@@ -37,6 +38,7 @@ import {
   SetContentBody,
   Surface,
   UpdateContentSourceBody,
+  UpdateCredentialProfileBody,
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
@@ -50,6 +52,7 @@ import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster } from "./admin";
 import type { MediaStore } from "./media";
+import type { TokenService } from "./tokens";
 
 /** Phase 7 — where uploaded media lands + how its serve URL is built. Wired from env in index.ts. */
 export interface MediaConfig {
@@ -65,6 +68,7 @@ const MuralParams = z.object({ id: z.string().min(1) });
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
 const ContentSourceParams = z.object({ id: z.string().min(1) });
+const CredentialProfileParams = z.object({ id: z.string().min(1) });
 const SceneParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
 const DemoWebBody = z.object({ screenId: z.string().min(1), url: z.string().url() });
@@ -79,6 +83,7 @@ export function registerRestRoutes(
   capture: CaptureCoordinator,
   media: MediaStore,
   mediaConfig: MediaConfig,
+  tokens: TokenService,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -86,7 +91,9 @@ export function registerRestRoutes(
       revision: control.state.revision,
       // Stamp the screen's current friendly name so the player labels itself with it, not the raw id.
       friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
-      slice,
+      // POL-24: stamp the current auth token into web/dashboard URLs at SEND time (stored slices keep
+      // the clean url, so the DB never holds a token and every load gets a live one).
+      slice: control.decorateSliceForSend(slice),
     });
     const delivered = hub.send(screenId, message);
     fastify.log.info(
@@ -896,7 +903,11 @@ export function registerRestRoutes(
       return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
     }
 
-    const source = await control.createContentSource(body.data);
+    const result = await control.createContentSource(body.data);
+    if (!result.ok) {
+      return reply.code(404).send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
+    }
+    const source = result.source;
     fastify.log.info(
       { event: "content-source.create", sourceId: source.id, kind: source.kind, name: source.name },
       "content source created",
@@ -917,8 +928,12 @@ export function registerRestRoutes(
     }
 
     const result = await control.updateContentSource(params.data.id, body.data);
-    if (!result) {
-      return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+    if (!result.ok) {
+      const detail =
+        result.error === "unknown-source"
+          ? `unknown content source: ${params.data.id}`
+          : `unknown credential profile: ${body.data.credentialProfileId}`;
+      return reply.code(404).send({ error: detail });
     }
 
     // Re-resolved every screen/wall showing this source — push the new render to each affected player.
@@ -971,6 +986,108 @@ export function registerRestRoutes(
     return { ok: true, sourceId: params.data.id, screens: result.slices.map((s) => s.screenId) };
   });
 
+  // ── POL-24 routes (credential profiles — content auth) ────────────────────────
+  //
+  // CRUD over the centrally-held OAuth clients (Bucket A / D11). The client secret crosses the wire
+  // INBOUND ONLY: every response and the admin/state broadcast carry CredentialProfileView (config +
+  // live token health, never the secret). Create/update (re)seed the TokenService so the token cache
+  // reflects the new config immediately; /test forces one exchange NOW and returns the IdP's answer.
+
+  // GET /api/v1/credential-profiles -> CredentialProfileView[]
+  fastify.get("/api/v1/credential-profiles", async () => control.getCredentialProfileViews());
+
+  // POST /api/v1/credential-profiles  { name, tokenEndpoint, clientId, clientSecret, … } -> View (201)
+  fastify.post("/api/v1/credential-profiles", async (request, reply) => {
+    const body = CreateCredentialProfileBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const profile = await control.createCredentialProfile(body.data);
+    tokens.upsertProfile(profile); // fetch the first token immediately
+    fastify.log.info(
+      { event: "credential-profile.create", profileId: profile.id, name: profile.name },
+      "credential profile created",
+    );
+    broadcaster.broadcast();
+    const view = control.getCredentialProfileViews().find((v) => v.id === profile.id);
+    return reply.code(201).send({ ok: true, profile: view });
+  });
+
+  // PATCH /api/v1/credential-profiles/:id  (clientSecret omitted = unchanged) -> View
+  fastify.patch("/api/v1/credential-profiles/:id", async (request, reply) => {
+    const params = CredentialProfileParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = UpdateCredentialProfileBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const profile = await control.updateCredentialProfile(params.data.id, body.data);
+    if (!profile) {
+      return reply.code(404).send({ error: `unknown credential profile: ${params.data.id}` });
+    }
+    tokens.upsertProfile(profile); // re-fetch with the new config
+    fastify.log.info(
+      { event: "credential-profile.update", profileId: profile.id, name: profile.name },
+      "credential profile updated",
+    );
+    broadcaster.broadcast();
+    const view = control.getCredentialProfileViews().find((v) => v.id === profile.id);
+    return { ok: true, profile: view };
+  });
+
+  // DELETE /api/v1/credential-profiles/:id -> 409 while any source references it (reassign first)
+  fastify.delete("/api/v1/credential-profiles/:id", async (request, reply) => {
+    const params = CredentialProfileParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.deleteCredentialProfile(params.data.id);
+    if (!result.ok) {
+      if (result.error === "unknown-profile") {
+        return reply.code(404).send({ error: `unknown credential profile: ${params.data.id}` });
+      }
+      return reply
+        .code(409)
+        .send({ error: "in-use", inUseBy: result.inUseBy ?? 0 });
+    }
+    tokens.removeProfile(params.data.id);
+    fastify.log.info(
+      { event: "credential-profile.delete", profileId: params.data.id },
+      "credential profile deleted",
+    );
+    broadcaster.broadcast();
+    return { ok: true, profileId: params.data.id };
+  });
+
+  // POST /api/v1/credential-profiles/:id/test -> force a token exchange NOW; the IdP's answer, never
+  // the token. (The exchange also updates the cached token/status, so a fixed IdP heals immediately.)
+  fastify.post("/api/v1/credential-profiles/:id/test", async (request, reply) => {
+    const params = CredentialProfileParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    if (!control.getCredentialProfileInternal(params.data.id)) {
+      return reply.code(404).send({ error: `unknown credential profile: ${params.data.id}` });
+    }
+
+    const result = await tokens.testProfile(params.data.id);
+    fastify.log.info(
+      { event: "credential-profile.test", profileId: params.data.id, ok: result.ok },
+      "credential profile tested",
+    );
+    broadcaster.broadcast(); // status likely changed either way
+    return {
+      ok: result.ok,
+      ...(result.expiresIn !== undefined ? { expiresIn: result.expiresIn } : {}),
+      ...(result.error !== undefined ? { error: result.error } : {}),
+    };
+  });
+
   // ── Phase 7 routes (media upload) ─────────────────────────────────────────────
   //
   // POST /api/v1/media — GATED (operator only; it lives under /api/v1, behind the session gate). A
@@ -1015,7 +1132,12 @@ export function registerRestRoutes(
     }
 
     const url = `${mediaConfig.publicBase}/media/${record.id}`;
-    const source = await control.createContentSource({ name, kind, url });
+    const created = await control.createContentSource({ name, kind, url });
+    if (!created.ok) {
+      // Unreachable (no profile is referenced), but keep the union honest rather than assert.
+      return reply.code(500).send({ error: "failed to create content source for upload" });
+    }
+    const source = created.source;
     await media.attachSource(record.id, source.id);
 
     fastify.log.info(

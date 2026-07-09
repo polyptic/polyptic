@@ -18,6 +18,9 @@ import type {
   ContentKind,
   ContentSource,
   CreateContentSourceBody,
+  CreateCredentialProfileBody,
+  CredentialProfileTestResult,
+  CredentialProfileView,
   DisplaySettings,
   EnrollmentInfo,
   LoginBody,
@@ -28,6 +31,7 @@ import type {
   Scene,
   ScreenView,
   UpdateContentSourceBody,
+  UpdateCredentialProfileBody,
   UpdateSceneBody,
   VideoWall,
   ImageUpdateInfo,
@@ -117,6 +121,10 @@ export interface ConsoleState {
   videoWalls: VideoWall[];
   /** The content LIBRARY (Phase 3c) — reusable named sources, mirrored from admin/state. */
   contentSources: ContentSource[];
+  /** Credential profiles (POL-24) — content-auth OAuth clients + live token health, mirrored from
+   *  admin/state.credentialProfiles (optional on the wire → [] against an older server). Never
+   *  carries a client secret. */
+  credentialProfiles: CredentialProfileView[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
   /** The Live Activity feed (D25) — bounded, newest-first human event log, mirrored from
@@ -159,6 +167,7 @@ export const useConsoleStore = defineStore("console", {
     placements: [],
     videoWalls: [],
     contentSources: [],
+    credentialProfiles: [],
     scenes: [],
     activity: [],
     activeSceneId: null,
@@ -388,6 +397,15 @@ export const useConsoleStore = defineStore("console", {
 
     sourceById(): (id: string) => ContentSource | undefined {
       return (id: string) => this.contentSources.find((s) => s.id === id);
+    },
+
+    /** Every credential profile (POL-24), in the order the server keeps them. */
+    profiles(state): CredentialProfileView[] {
+      return state.credentialProfiles;
+    },
+
+    profileById(): (id: string) => CredentialProfileView | undefined {
+      return (id: string) => this.credentialProfiles.find((p) => p.id === id);
     },
 
     /** The library source currently armed for click-to-assign on the canvas, if any. */
@@ -657,6 +675,8 @@ export const useConsoleStore = defineStore("console", {
         this.placements = msg.placements;
         this.videoWalls = msg.videoWalls;
         this.contentSources = msg.contentSources;
+        // POL-24 — credential profiles are optional on the wire (older servers omit them).
+        this.credentialProfiles = msg.credentialProfiles ?? [];
         this.scenes = msg.scenes;
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
@@ -1092,6 +1112,62 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] deleteSource failed", err);
         return false;
+      }
+    },
+
+    // ── Credential profiles (POL-24) ────────────────────────────────────────────
+
+    /** Create a credential profile. Like createSource, the authoritative broadcast adds it (no
+     *  optimistic insert — the id is server-assigned). */
+    async createProfile(body: CreateCredentialProfileBody): Promise<boolean> {
+      try {
+        await api.createCredentialProfile(body);
+        return true;
+      } catch (err) {
+        console.error("[console] createProfile failed", err);
+        return false;
+      }
+    },
+
+    /** Update a profile (clientSecret omitted = unchanged). Optimistic on the non-secret fields. */
+    async updateProfile(id: string, body: UpdateCredentialProfileBody): Promise<boolean> {
+      const existing = this.credentialProfiles.find((p) => p.id === id);
+      if (existing) {
+        const { clientSecret: _secret, ...visible } = body; // the view never holds the secret
+        Object.assign(existing, visible);
+      }
+      try {
+        await api.updateCredentialProfile(id, body);
+        return true;
+      } catch (err) {
+        console.error("[console] updateProfile failed", err);
+        return false;
+      }
+    },
+
+    /**
+     * Delete a profile. The server REFUSES (409) while any source references it; that surfaces here
+     * as `"in-use"` so the view can tell the operator to reassign first, distinct from a plain failure.
+     */
+    async deleteProfile(id: string): Promise<true | "in-use" | false> {
+      try {
+        await api.deleteCredentialProfile(id);
+        this.credentialProfiles = this.credentialProfiles.filter((p) => p.id !== id);
+        return true;
+      } catch (err) {
+        if (err instanceof api.ApiError && err.status === 409) return "in-use";
+        console.error("[console] deleteProfile failed", err);
+        return false;
+      }
+    },
+
+    /** Force a token exchange NOW and return the IdP's live answer (the modal's Test button). */
+    async testProfile(id: string): Promise<CredentialProfileTestResult> {
+      try {
+        return await api.testCredentialProfile(id);
+      } catch (err) {
+        console.error("[console] testProfile failed", err);
+        return { ok: false, error: "Request failed — is the server reachable?" };
       }
     },
 

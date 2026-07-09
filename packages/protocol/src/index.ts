@@ -376,6 +376,50 @@ export type VideoWall = z.infer<typeof VideoWall>;
 export const ContentKind = z.enum(["web", "dashboard", "image", "video"]);
 export type ContentKind = z.infer<typeof ContentKind>;
 
+// ── Credential profiles (POL-24) ─────────────────────────────────────────────
+// Bucket-A content auth (D11/D17), first real strategy through the seam: a CREDENTIAL PROFILE is a
+// centrally-managed OAuth client (id + secret + token endpoint at the operator's IdP). The server
+// exchanges it for short-lived JWT access tokens via the client-credentials grant and stamps the
+// current token into content URLs at SEND time (`?{tokenParam}=<jwt>` — Grafana `url_login` style),
+// so an unattended screen always loads already-authenticated. Many sources share one profile.
+
+/** The auth strategy a profile implements. One value today; the enum IS the D11 seam. */
+export const CredentialStrategy = z.enum(["oauth-client-credentials"]);
+export type CredentialStrategy = z.infer<typeof CredentialStrategy>;
+
+/** A credential profile as configured. The client SECRET is intentionally NOT part of this shape —
+ *  it is write-only (accepted on create/update, held server-side, never broadcast or returned). */
+export const CredentialProfile = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(120),
+  strategy: CredentialStrategy,
+  /** The IdP's OAuth token endpoint, e.g. https://idp/realms/x/protocol/openid-connect/token. */
+  tokenEndpoint: z.string().url(),
+  clientId: z.string().min(1).max(200),
+  /** Optional `scope` sent with the grant (Entra requires "api://…/.default"). */
+  scope: z.string().min(1).max(500).optional(),
+  /** Optional `audience` param for IdPs that take one (Auth0 etc.). */
+  audience: z.string().min(1).max(500).optional(),
+  /** Query parameter the token is delivered in at send time (Grafana [auth.jwt] url_login default). */
+  tokenParam: z.string().min(1).max(64).default("auth_token"),
+});
+export type CredentialProfile = z.infer<typeof CredentialProfile>;
+
+export const CredentialTokenStatus = z.enum(["ok", "pending", "error"]);
+export type CredentialTokenStatus = z.infer<typeof CredentialTokenStatus>;
+
+/** A profile plus its live token health, denormalized for the console (never any secret). */
+export const CredentialProfileView = CredentialProfile.extend({
+  tokenStatus: CredentialTokenStatus,
+  /** When the currently-cached token expires (absent while pending/error). */
+  tokenExpiresAt: z.string().datetime().optional(),
+  /** The IdP's last error, verbatim, when tokenStatus is "error". */
+  lastError: z.string().optional(),
+  /** How many content sources reference this profile (drives the delete guard + console copy). */
+  inUseBy: z.number().int().nonnegative(),
+});
+export type CredentialProfileView = z.infer<typeof CredentialProfileView>;
+
 /** A reusable, named entry in the content LIBRARY. A screen or video wall is assigned a source by id;
  *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
  *  media served from a disk volume (an upload becomes a source whose url points at the media route). */
@@ -384,6 +428,9 @@ export const ContentSource = z.object({
   name: z.string().min(1).max(120),
   kind: ContentKind,
   url: z.string().url(),
+  /** POL-24 — the credential profile whose token is stamped into this source's URL at send time.
+   *  null/undefined = unauthenticated. Meaningful for web/dashboard kinds. */
+  credentialProfileId: z.string().nullable().optional(),
 });
 export type ContentSource = z.infer<typeof ContentSource>;
 
@@ -455,6 +502,7 @@ export const ServerToAdminState = z.object({
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
+  credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -516,16 +564,54 @@ export const CreateContentSourceBody = z.object({
   name: z.string().min(1).max(120),
   kind: ContentKind,
   url: z.string().url(),
+  /** POL-24 — attach a credential profile (null/omitted = unauthenticated). */
+  credentialProfileId: z.string().nullable().optional(),
 });
 export type CreateContentSourceBody = z.infer<typeof CreateContentSourceBody>;
 
-/** Partial update of a library source (any subset of fields). */
+/** Partial update of a library source (any subset of fields; credentialProfileId null DETACHES). */
 export const UpdateContentSourceBody = z.object({
   name: z.string().min(1).max(120).optional(),
   kind: ContentKind.optional(),
   url: z.string().url().optional(),
+  credentialProfileId: z.string().nullable().optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
+
+// REST bodies — credential profiles (POL-24). The clientSecret crosses the wire INBOUND ONLY.
+export const CreateCredentialProfileBody = z.object({
+  name: z.string().min(1).max(120),
+  tokenEndpoint: z.string().url(),
+  clientId: z.string().min(1).max(200),
+  clientSecret: z.string().min(1).max(500),
+  scope: z.string().min(1).max(500).optional(),
+  audience: z.string().min(1).max(500).optional(),
+  tokenParam: z.string().min(1).max(64).optional(),
+});
+export type CreateCredentialProfileBody = z.infer<typeof CreateCredentialProfileBody>;
+
+/** Partial update. `clientSecret` omitted = unchanged; provided = replaced (and the token re-fetched).
+ *  `scope`/`audience` null = cleared. */
+export const UpdateCredentialProfileBody = z.object({
+  name: z.string().min(1).max(120).optional(),
+  tokenEndpoint: z.string().url().optional(),
+  clientId: z.string().min(1).max(200).optional(),
+  clientSecret: z.string().min(1).max(500).optional(),
+  scope: z.string().min(1).max(500).nullable().optional(),
+  audience: z.string().min(1).max(500).nullable().optional(),
+  tokenParam: z.string().min(1).max(64).optional(),
+});
+export type UpdateCredentialProfileBody = z.infer<typeof UpdateCredentialProfileBody>;
+
+/** Result of POST /credential-profiles/:id/test — the IdP's live answer, never the token itself. */
+export const CredentialProfileTestResult = z.object({
+  ok: z.boolean(),
+  /** Seconds of life the fetched token reported (ok only). */
+  expiresIn: z.number().int().positive().optional(),
+  /** The IdP's error, verbatim (failure only). */
+  error: z.string().optional(),
+});
+export type CredentialProfileTestResult = z.infer<typeof CredentialProfileTestResult>;
 
 // REST bodies — scenes (Phase 3d)
 /** Save the CURRENT state of a mural as a new scene — the server snapshots placements + walls +

@@ -1,24 +1,32 @@
 <!--
-  Content.vue — the content LIBRARY (Phase 3c).
+  Content.vue — the content LIBRARY (Phase 3c) + ACCESS CREDENTIALS (POL-24).
 
   A managed, reusable set of named sources you assign to screens / video walls instead of typing an
   ad-hoc URL each time. Mirrors docs/design/console.dc.html's CONTENT VIEW: a list of sources (glyph
   badge · name · "kind · url") with Add / Edit / Delete, plus a modal for creating & editing.
 
-  A ContentSource is {id, name, kind, url} (the contract). The design's prototype also showed an
-  "Authentication" picker, but the 3c contract carries no auth field, so this view manages name/kind/url
-  only — auth lands in a later phase. All reads/writes go through the Pinia store.
+  POL-24 lands the design's deferred "Authentication" picker: a web/dashboard source can reference a
+  CREDENTIAL PROFILE (a centrally-held OAuth client the server exchanges for short-lived tokens and
+  stamps into the URL at send time). Profiles are managed in the "Access credentials" section below
+  the library — the secret is write-only; rows show live token health. All reads/writes go through
+  the Pinia store.
 -->
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import { CreateContentSourceBody } from "@polyptic/protocol";
-import type { ContentKind, ContentSource } from "@polyptic/protocol";
+import { CreateContentSourceBody, CreateCredentialProfileBody } from "@polyptic/protocol";
+import type {
+  ContentKind,
+  ContentSource,
+  CredentialProfileView,
+  UpdateCredentialProfileBody,
+} from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
 
 const store = useConsoleStore();
 
 const sources = computed(() => store.sources);
+const profiles = computed(() => store.profiles);
 
 // ── modal state ──────────────────────────────────────────────────────────────
 const modalOpen = ref(false);
@@ -26,8 +34,12 @@ const editingId = ref<string | null>(null); // null = creating
 const draftName = ref("");
 const draftKind = ref<ContentKind>("web");
 const draftUrl = ref("");
+const draftProfileId = ref(""); // "" = no authentication (POL-24)
 const errorMsg = ref<string | null>(null);
 const saving = ref(false);
+
+/** Auth applies to browser-loaded sources; images/videos are fetched directly by the player. */
+const authPickable = computed(() => draftKind.value === "web" || draftKind.value === "dashboard");
 
 const modalTitle = computed(() => (editingId.value ? "Edit source" : "Add content source"));
 const saveLabel = computed(() => (editingId.value ? "Save changes" : "Add source"));
@@ -37,6 +49,7 @@ function openAdd() {
   draftName.value = "";
   draftKind.value = "web";
   draftUrl.value = "";
+  draftProfileId.value = "";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -46,6 +59,7 @@ function openEdit(s: ContentSource) {
   draftName.value = s.name;
   draftKind.value = s.kind;
   draftUrl.value = s.url;
+  draftProfileId.value = s.credentialProfileId ?? "";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -62,6 +76,8 @@ async function save() {
     name: draftName.value.trim(),
     kind: draftKind.value,
     url: draftUrl.value.trim(),
+    // Auth only rides on browser-loaded kinds; "" (None) and a non-authable kind both mean detach.
+    credentialProfileId: authPickable.value && draftProfileId.value ? draftProfileId.value : null,
   });
   if (!parsed.success) {
     errorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
@@ -90,6 +106,151 @@ async function remove(s: ContentSource) {
 /** A compact, scheme-stripped address for the list row (matches the design's "address" read-out). */
 function pretty(url: string): string {
   return url.replace(/^https?:\/\//, "");
+}
+
+/** The profile a source references, for the library row's auth read-out. */
+function profileName(s: ContentSource): string | null {
+  if (!s.credentialProfileId) return null;
+  return store.profileById(s.credentialProfileId)?.name ?? null;
+}
+
+// ── credential profiles (POL-24) ──────────────────────────────────────────────
+// The "Access credentials" section: centrally-held OAuth clients (client-credentials grant) the
+// server exchanges for short-lived tokens. The secret is WRITE-ONLY: it is sent on create (and on
+// edit only when the operator types a replacement) and never comes back — rows show token health.
+const profileModalOpen = ref(false);
+const editingProfileId = ref<string | null>(null); // null = creating
+const pDraftName = ref("");
+const pDraftEndpoint = ref("");
+const pDraftClientId = ref("");
+const pDraftSecret = ref(""); // on edit: "" = keep the stored secret
+const pDraftScope = ref("");
+const pDraftAudience = ref("");
+const pDraftTokenParam = ref("auth_token");
+const pErrorMsg = ref<string | null>(null);
+const pSaving = ref(false);
+/** Per-profile Test state: id → "running", or the last inline result line. */
+const testState = ref<Record<string, string>>({});
+
+const profileModalTitle = computed(() =>
+  editingProfileId.value ? "Edit credential profile" : "Add credential profile",
+);
+const profileSaveLabel = computed(() => (editingProfileId.value ? "Save changes" : "Add profile"));
+
+function openAddProfile() {
+  editingProfileId.value = null;
+  pDraftName.value = "";
+  pDraftEndpoint.value = "";
+  pDraftClientId.value = "";
+  pDraftSecret.value = "";
+  pDraftScope.value = "";
+  pDraftAudience.value = "";
+  pDraftTokenParam.value = "auth_token";
+  pErrorMsg.value = null;
+  profileModalOpen.value = true;
+}
+
+function openEditProfile(p: CredentialProfileView) {
+  editingProfileId.value = p.id;
+  pDraftName.value = p.name;
+  pDraftEndpoint.value = p.tokenEndpoint;
+  pDraftClientId.value = p.clientId;
+  pDraftSecret.value = ""; // never echoed back; blank = unchanged
+  pDraftScope.value = p.scope ?? "";
+  pDraftAudience.value = p.audience ?? "";
+  pDraftTokenParam.value = p.tokenParam;
+  pErrorMsg.value = null;
+  profileModalOpen.value = true;
+}
+
+function closeProfileModal() {
+  profileModalOpen.value = false;
+  pSaving.value = false;
+}
+
+async function saveProfile() {
+  if (pSaving.value) return;
+  pErrorMsg.value = null;
+
+  const common = {
+    name: pDraftName.value.trim(),
+    tokenEndpoint: pDraftEndpoint.value.trim(),
+    clientId: pDraftClientId.value.trim(),
+    ...(pDraftScope.value.trim() ? { scope: pDraftScope.value.trim() } : {}),
+    ...(pDraftAudience.value.trim() ? { audience: pDraftAudience.value.trim() } : {}),
+    tokenParam: pDraftTokenParam.value.trim() || "auth_token",
+  };
+
+  let ok: boolean;
+  if (editingProfileId.value) {
+    const patch: UpdateCredentialProfileBody = {
+      ...common,
+      // Blank secret = keep the stored one; scope/audience blank = clear (null on the wire).
+      ...(pDraftSecret.value ? { clientSecret: pDraftSecret.value } : {}),
+      scope: pDraftScope.value.trim() || null,
+      audience: pDraftAudience.value.trim() || null,
+    };
+    pSaving.value = true;
+    ok = await store.updateProfile(editingProfileId.value, patch);
+  } else {
+    const parsed = CreateCredentialProfileBody.safeParse({
+      ...common,
+      clientSecret: pDraftSecret.value,
+    });
+    if (!parsed.success) {
+      pErrorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
+      return;
+    }
+    pSaving.value = true;
+    ok = await store.createProfile(parsed.data);
+  }
+  pSaving.value = false;
+  if (ok) {
+    profileModalOpen.value = false;
+  } else {
+    pErrorMsg.value = "Couldn't save. Check the endpoint and try again.";
+  }
+}
+
+async function removeProfile(p: CredentialProfileView) {
+  if (p.inUseBy > 0) {
+    window.alert(
+      `"${p.name}" authenticates ${p.inUseBy} content source${p.inUseBy === 1 ? "" : "s"}. ` +
+        `Reassign or remove their authentication first.`,
+    );
+    return;
+  }
+  const yes = window.confirm(`Delete credential profile "${p.name}"?`);
+  if (!yes) return;
+  const result = await store.deleteProfile(p.id);
+  if (result === "in-use") {
+    window.alert(`"${p.name}" is in use by one or more content sources — reassign them first.`);
+  }
+}
+
+/** Run a live token exchange for a profile and surface the IdP's answer inline on its row. */
+async function runTest(p: CredentialProfileView) {
+  testState.value = { ...testState.value, [p.id]: "running" };
+  const result = await store.testProfile(p.id);
+  const line = result.ok
+    ? `✓ Token issued (expires in ${result.expiresIn ?? "?"}s)`
+    : `✕ ${result.error ?? "Failed"}`;
+  testState.value = { ...testState.value, [p.id]: line };
+}
+
+/** The host of a profile's token endpoint, for the compact row read-out. */
+function endpointHost(p: CredentialProfileView): string {
+  try {
+    return new URL(p.tokenEndpoint).host;
+  } catch {
+    return p.tokenEndpoint;
+  }
+}
+
+function statusLabel(p: CredentialProfileView): string {
+  if (p.tokenStatus === "ok") return "token ok";
+  if (p.tokenStatus === "pending") return "pending";
+  return "auth failing";
 }
 
 // ── upload modal (Phase 7) ─────────────────────────────────────────────────────
@@ -208,7 +369,10 @@ function isImage(s: ContentSource): boolean {
           </span>
           <div class="row-meta">
             <div class="row-name">{{ c.name }}</div>
-            <div class="row-sub">{{ kindLabel(c.kind) }} · {{ pretty(c.url) }}</div>
+            <div class="row-sub">
+              {{ kindLabel(c.kind) }} · {{ pretty(c.url) }}
+              <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
+            </div>
           </div>
           <span class="kind-badge">{{ kindLabel(c.kind) }}</span>
           <button class="edit-btn" @click="openEdit(c)">Edit</button>
@@ -226,6 +390,61 @@ function isImage(s: ContentSource): boolean {
         <div class="empty-actions">
           <button class="add-btn ghost" @click="openUpload">⤓ Upload a file</button>
           <button class="add-btn ghost" @click="openAdd">+ Add by URL</button>
+        </div>
+      </div>
+
+      <!-- ── access credentials (POL-24) ─────────────────────────────────────── -->
+      <header class="head section-head">
+        <div class="head-text">
+          <h1 class="title">Access credentials</h1>
+          <p class="subtitle">
+            Sign screens into protected content. A profile is an OAuth client at your identity
+            provider — the server keeps a short-lived token fresh and every source that uses the
+            profile loads already authenticated.
+          </p>
+        </div>
+        <div class="head-actions">
+          <button class="add-btn ghost compact" @click="openAddProfile">+ Add profile</button>
+        </div>
+      </header>
+
+      <div v-if="profiles.length" class="list">
+        <div v-for="p in profiles" :key="p.id" class="row">
+          <span class="glyph" :style="{ color: 'var(--accent)' }">🔒</span>
+          <div class="row-meta">
+            <div class="row-name">{{ p.name }}</div>
+            <div class="row-sub">
+              {{ endpointHost(p) }} · client {{ p.clientId }} ·
+              {{ p.inUseBy }} source{{ p.inUseBy === 1 ? "" : "s" }}
+              <template v-if="testState[p.id] && testState[p.id] !== 'running'">
+                · {{ testState[p.id] }}
+              </template>
+            </div>
+            <div v-if="p.tokenStatus === 'error' && p.lastError" class="row-err">
+              {{ p.lastError }}
+            </div>
+          </div>
+          <span class="status-pill" :class="p.tokenStatus">
+            {{ p.tokenStatus === "ok" ? "●" : p.tokenStatus === "pending" ? "○" : "⚠" }}
+            {{ statusLabel(p) }}
+          </span>
+          <button class="edit-btn" :disabled="testState[p.id] === 'running'" @click="runTest(p)">
+            {{ testState[p.id] === "running" ? "Testing…" : "Test" }}
+          </button>
+          <button class="edit-btn" @click="openEditProfile(p)">Edit</button>
+          <button class="del-btn" title="Delete profile" @click="removeProfile(p)">✕</button>
+        </div>
+      </div>
+
+      <div v-else class="empty">
+        <span class="empty-glyph">🔒</span>
+        <span class="empty-title">No credential profiles yet</span>
+        <span class="empty-sub">
+          Showing dashboards that need a sign-in? Register a client at your identity provider, add
+          its details here once, and any number of screens share the session.
+        </span>
+        <div class="empty-actions">
+          <button class="add-btn ghost" @click="openAddProfile">+ Add credential profile</button>
         </div>
       </div>
     </div>
@@ -265,11 +484,85 @@ function isImage(s: ContentSource): boolean {
           @keyup.enter="save"
         />
 
+        <!-- POL-24 — the design's deferred "Authentication" picker. Web/dashboard only: images and
+             videos are fetched directly by the player, not loaded as an authenticated page. -->
+        <template v-if="authPickable">
+          <label class="field-label">Authentication</label>
+          <select v-model="draftProfileId" class="field select">
+            <option value="">None — public or anonymous access</option>
+            <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+          </select>
+          <p v-if="!profiles.length" class="field-hint">
+            Protected content? Add a credential profile under Access credentials below, then pick it
+            here.
+          </p>
+        </template>
+
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>
 
         <div class="modal-actions">
           <button class="btn-secondary" @click="closeModal">Cancel</button>
           <button class="btn-primary" :disabled="saving" @click="save">{{ saveLabel }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── credential profile modal (POL-24) ────────────────────────────────── -->
+    <div v-if="profileModalOpen" class="scrim" @mousedown.self="closeProfileModal">
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="modal-title">{{ profileModalTitle }}</div>
+
+        <label class="field-label">Name</label>
+        <input
+          v-model="pDraftName"
+          class="field"
+          placeholder="e.g. Grafana — works IdP"
+          @keyup.enter="saveProfile"
+        />
+
+        <label class="field-label">Token endpoint</label>
+        <input
+          v-model="pDraftEndpoint"
+          class="field mono"
+          placeholder="https://idp.example.com/realms/…/protocol/openid-connect/token"
+          @keyup.enter="saveProfile"
+        />
+
+        <label class="field-label">Client ID</label>
+        <input v-model="pDraftClientId" class="field mono" placeholder="polyptic-kiosk" />
+
+        <label class="field-label">
+          Client secret
+          <span v-if="editingProfileId" class="optional">(leave blank to keep the current one)</span>
+        </label>
+        <input
+          v-model="pDraftSecret"
+          type="password"
+          class="field mono"
+          autocomplete="new-password"
+          :placeholder="editingProfileId ? '••••••••  (unchanged)' : ''"
+        />
+
+        <label class="field-label">Scope <span class="optional">(optional — Entra needs api://…/.default)</span></label>
+        <input v-model="pDraftScope" class="field mono" placeholder="" />
+
+        <label class="field-label">Audience <span class="optional">(optional — for IdPs that take one)</span></label>
+        <input v-model="pDraftAudience" class="field mono" placeholder="" />
+
+        <label class="field-label">Token URL parameter</label>
+        <input v-model="pDraftTokenParam" class="field mono" placeholder="auth_token" />
+        <p class="field-hint">
+          The query parameter the token is delivered in when a screen loads the content — Grafana's
+          JWT sign-in reads <code>auth_token</code>.
+        </p>
+
+        <div v-if="pErrorMsg" class="error">⚠ {{ pErrorMsg }}</div>
+
+        <div class="modal-actions">
+          <button class="btn-secondary" @click="closeProfileModal">Cancel</button>
+          <button class="btn-primary" :disabled="pSaving" @click="saveProfile">
+            {{ profileSaveLabel }}
+          </button>
         </div>
       </div>
     </div>
@@ -718,6 +1011,56 @@ function isImage(s: ContentSource): boolean {
 .field:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* access credentials (POL-24) */
+.section-head {
+  margin-top: 40px;
+  padding-top: 28px;
+  border-top: 1px solid var(--line2);
+}
+.status-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.status-pill.ok {
+  color: var(--ok, #1d8a4e);
+  background: var(--ok-soft, var(--muted-bg));
+}
+.status-pill.pending {
+  color: var(--muted);
+  background: var(--muted-bg);
+}
+.status-pill.error {
+  color: var(--bad);
+  background: var(--bad-soft);
+}
+.row-err {
+  font-size: 11px;
+  color: var(--bad);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.field.select {
+  appearance: auto;
+  cursor: pointer;
+}
+.field-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin: -10px 0 16px;
+}
+.field-hint code {
+  font-size: 11px;
+  background: var(--muted-bg);
+  padding: 1px 4px;
+  border-radius: 4px;
 }
 
 /* upload progress */

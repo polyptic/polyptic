@@ -11,6 +11,7 @@ import type {
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
+  PersistedCredentialProfile,
   PersistedDisplaySettings,
   PersistedImageRollout,
   PersistedMachine,
@@ -42,6 +43,8 @@ export class MemoryStore implements Store {
   private readonly contentSources = new Map<string, PersistedContentSource>();
   /** Keyed by scene id — saved wall snapshots (Phase 3d). */
   private readonly scenes = new Map<string, PersistedScene>();
+  /** Keyed by profile id — credential profiles for content auth (POL-24). */
+  private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
@@ -67,6 +70,7 @@ export class MemoryStore implements Store {
       videoWalls: [...this.videoWalls.values()].map(clone),
       contentSources: [...this.contentSources.values()].map(clone),
       scenes: [...this.scenes.values()].map(clone),
+      credentialProfiles: [...this.credentialProfiles.values()].map(clone),
     };
   }
 
@@ -179,6 +183,25 @@ export class MemoryStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     return [...this.contentSources.values()].map(clone);
+  }
+
+  // ── Credential profiles (POL-24) ─────────────────────────────────────────────
+
+  async upsertCredentialProfile(profile: PersistedCredentialProfile): Promise<void> {
+    this.credentialProfiles.set(profile.id, clone(profile));
+  }
+
+  async deleteCredentialProfile(id: string): Promise<void> {
+    this.credentialProfiles.delete(id);
+    // Detach the profile from any sources that referenced it (defensive — the control plane refuses
+    // to delete an in-use profile, so this only matters for rows mutated outside the API).
+    for (const source of this.contentSources.values()) {
+      if (source.credentialProfileId === id) source.credentialProfileId = null;
+    }
+  }
+
+  async listCredentialProfiles(): Promise<PersistedCredentialProfile[]> {
+    return [...this.credentialProfiles.values()].map(clone);
   }
 
   // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────

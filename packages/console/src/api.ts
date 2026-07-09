@@ -9,6 +9,7 @@
 import {
   CombineScreensBody,
   CreateContentSourceBody,
+  CreateCredentialProfileBody,
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
@@ -18,9 +19,16 @@ import {
   RenameVideoWallBody,
   SetContentBody,
   UpdateContentSourceBody,
+  UpdateCredentialProfileBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
-import type { ContentSource, Scene, VideoWall } from "@polyptic/protocol";
+import type {
+  ContentSource,
+  CredentialProfileTestResult,
+  CredentialProfileView,
+  Scene,
+  VideoWall,
+} from "@polyptic/protocol";
 
 /** Dev runs the console on Vite (:5175) against the server on :8080 (CORS_ORIGIN covers it).
  *  A production build is served BY the server itself (single image, D28/D31), so the API is
@@ -317,6 +325,45 @@ export function updateContentSource(
 /** DELETE /api/v1/content-sources/:sourceId — remove a source from the library. */
 export function deleteContentSource(sourceId: string): Promise<unknown> {
   return send("DELETE", `/content-sources/${encodeURIComponent(sourceId)}`);
+}
+
+// ── Credential profiles (POL-24) ─────────────────────────────────────────────
+// Centrally-held OAuth clients for content auth. The clientSecret crosses the wire INBOUND ONLY —
+// every response carries a CredentialProfileView (config + live token health, never the secret).
+
+/** POST /api/v1/credential-profiles — create a profile; the server fetches its first token at once. */
+export async function createCredentialProfile(
+  body: CreateCredentialProfileBody,
+): Promise<CredentialProfileView | undefined> {
+  const res = await send<{ profile?: CredentialProfileView }>(
+    "POST",
+    "/credential-profiles",
+    CreateCredentialProfileBody.parse(body),
+  );
+  return res?.profile;
+}
+
+/** PATCH /api/v1/credential-profiles/:id — partial update (clientSecret omitted = unchanged). */
+export async function updateCredentialProfile(
+  profileId: string,
+  body: UpdateCredentialProfileBody,
+): Promise<CredentialProfileView | undefined> {
+  const res = await send<{ profile?: CredentialProfileView }>(
+    "PATCH",
+    `/credential-profiles/${encodeURIComponent(profileId)}`,
+    UpdateCredentialProfileBody.parse(body),
+  );
+  return res?.profile;
+}
+
+/** DELETE /api/v1/credential-profiles/:id — 409 (in-use) while any source still references it. */
+export function deleteCredentialProfile(profileId: string): Promise<unknown> {
+  return send("DELETE", `/credential-profiles/${encodeURIComponent(profileId)}`);
+}
+
+/** POST /api/v1/credential-profiles/:id/test — force a token exchange NOW; the IdP's live answer. */
+export function testCredentialProfile(profileId: string): Promise<CredentialProfileTestResult> {
+  return send("POST", `/credential-profiles/${encodeURIComponent(profileId)}/test`) as Promise<CredentialProfileTestResult>;
 }
 
 // ── Media uploads (Phase 7) ──────────────────────────────────────────────────

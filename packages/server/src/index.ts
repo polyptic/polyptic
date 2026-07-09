@@ -31,7 +31,10 @@ import { registerRestRoutes } from "./rest";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
 import { createStore } from "./store";
+import { TokenService } from "./tokens";
 import { attachWebSockets } from "./ws";
+
+import { ServerToPlayerRender } from "@polyptic/protocol";
 
 import type { PersistedBootstrap } from "./store";
 import type { FastifyReply, FastifyRequest } from "fastify";
@@ -111,6 +114,35 @@ const adminHub = new AdminHub();
 const presence = new Presence();
 const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, log: fastify.log });
 
+// ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
+// profiles; refreshes in the background at ~75% of each token's lifetime. When a profile's token
+// becomes usable again (first fetch / recovery), re-push renders to the screens showing content it
+// authenticates — a screen stuck on a login page heals itself. Routine refreshes push nothing (a URL
+// rewrite would reload a live iframe; the running page is carried by the target app's own session). ──
+const tokens = new TokenService({
+  log: fastify.log,
+  onStatusChange: () => broadcaster.broadcast(),
+  onTokenUsable: (profileId) => {
+    for (const screenId of control.screenIdsUsingProfile(profileId)) {
+      const slice = control.getSlice(screenId);
+      if (!slice) continue;
+      const message = ServerToPlayerRender.parse({
+        t: "server/render",
+        revision: control.state.revision,
+        friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
+        slice: control.decorateSliceForSend(slice),
+      });
+      const delivered = hub.send(screenId, message);
+      fastify.log.info(
+        { event: "render.push.token", screenId, profileId, delivered },
+        "re-pushed render after credential token became usable",
+      );
+    }
+  },
+});
+control.setTokenProvider(tokens);
+tokens.setProfiles(control.getCredentialProfilesInternal());
+
 // ── Live preview (Phase 5): bounded thumbnail store + capture coordinator. ──
 const thumbnails = new ThumbnailStore(
   Number.isFinite(THUMBNAIL_CAPACITY) && THUMBNAIL_CAPACITY > 0 ? THUMBNAIL_CAPACITY : 300,
@@ -162,10 +194,20 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
 });
 
 registerAuthRoutes(fastify, auth, enrollment);
-registerRestRoutes(fastify, control, hub, agentHub, broadcaster, capture, media, {
-  publicBase: MEDIA_PUBLIC_BASE,
-  maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
-});
+registerRestRoutes(
+  fastify,
+  control,
+  hub,
+  agentHub,
+  broadcaster,
+  capture,
+  media,
+  {
+    publicBase: MEDIA_PUBLIC_BASE,
+    maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
+  },
+  tokens,
+);
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).
 registerMediaServeRoute(fastify, media);
@@ -347,6 +389,7 @@ if (enrollment.open) {
 async function shutdown(signal: string): Promise<void> {
   fastify.log.info({ event: "server.shutdown", signal }, "shutting down");
   capture.stop();
+  tokens.stop();
   try {
     await fastify.close();
   } catch (err) {

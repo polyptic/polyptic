@@ -399,7 +399,9 @@ function handlePlayer(
         const name = control.getScreen(screenId)?.friendlyName ?? screenId;
         activity.push("good", `${name} connected`);
       }
-      const slice = control.sliceForPlayer(screenId);
+      // POL-24: stamp the current auth token into web/dashboard URLs at SEND time — a reconnecting or
+      // cold-booting screen always loads with a live token (the stored slice keeps the clean url).
+      const slice = control.decorateSliceForSend(control.sliceForPlayer(screenId));
       const render = ServerToPlayerRender.parse({
         t: "server/render",
         revision: control.state.revision,
