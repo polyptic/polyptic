@@ -196,6 +196,38 @@ media:
     storageClass: ""
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Traefik IngressRoute (the CRD), the recommended exposure on a Traefik cluster
+# — an alternative to the generic `ingress:` above (enable one, not both).
+#
+# TWO hosts by design:
+#   * `host` (HTTPS, websecure) — console + player + REST + the three WS
+#     channels. These are deliberately ONE same-origin host: the operator
+#     session is an http-only cookie, and splitting console/api onto different
+#     subdomains would break it. WebSockets pass through Traefik natively.
+#   * `bootHost` (PLAIN HTTP, web) — the boot depot only (/boot, /grub, /dist,
+#     /install). GRUB and casper speak no TLS, so this router must stay http.
+#     THIS hostname is what you bake into boot media and live ISOs:
+#         POLYPTIC_BASE=http://boot.polyptic.example.com deploy/build-boot-medium.sh
+#         POLYPTIC_BASE=http://boot.polyptic.example.com ... deploy/build-live-iso.sh arm64
+#     A stable name here is the fix for "the server's IP changed and every
+#     baked medium went stale."
+# ─────────────────────────────────────────────────────────────────────────────
+ingressRoute:
+  enabled: false
+  host: polyptic.example.com
+  entryPoints:
+    - websecure
+  tls:
+    # Traefik ACME resolver name (e.g. letsencrypt) — or set secretName instead.
+    certResolver: ""
+    # Pre-provisioned TLS secret for `host`.
+    secretName: ""
+  # The plain-HTTP boot-depot host. Empty disables the boot router.
+  bootHost: boot.polyptic.example.com
+  bootEntryPoints:
+    - web
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Netboot depot (POL-33…41).
 #   The server serves the live image (GET /dist/image/<arch>/…) and the signed
 #   boot loaders (GET /dist/boot/<file>) from two directories; both live on one

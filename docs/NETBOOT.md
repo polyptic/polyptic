@@ -378,6 +378,48 @@ whole image into a RAM tmpfs.)
 
 ---
 
+## Troubleshooting: the control-plane address is BAKED into boot media
+
+Seen live (2026-07-09): the dev host moved to a different network, its IP changed, and **every
+previously-built medium went stale at once**. Know the symptoms:
+
+| Medium | Symptom when the baked address is dead |
+| --- | --- |
+| Dongle / offloaded disk | GRUB drops to the fallback menu — `Retry (DHCP + chain again) / Reboot / Firmware setup` — because `configfile $net/boot/grub.cfg` can't fetch the server menu. |
+| Downloadable live ISO | Boots normally all the way to the splash, then sits at **"Starting up"** forever: the agent can't reach `polyptic.server_url` on its cmdline. The box never appears in the console. |
+| Server env `PLAYER_BASE_URL` | The sneakiest one: the box boots, **enrols, and shows Online in the console** — but the screen shows a white page reading **"Operation was cancelled"** (WebKit's error page). The agent reached the server fine; the *browser* couldn't load the player from the stale `PLAYER_BASE_URL` the server advertises. The agent's own capture thumbnail (Machines view) shows the same white page — that's how you tell it's the guest's browser, not the display. Restart the server with the corrected `PLAYER_BASE_URL`; agents re-apply on reconnect. |
+
+What carries a baked address (goes stale when the server moves):
+
+- the **dongle**'s stage-1 `grub/<arch>-efi/grub.cfg` (`set net=(http,HOST:PORT)`),
+- an **offloaded disk's ESP** (the same stage-1, copied at offload time),
+- the **live ISO**'s kernel cmdline (`polyptic.base` / `polyptic.server_url` / token).
+
+What does **not** (server-derived per request, immune to moves): the netboot payload
+(`polyptic.iso`), `/boot/grub.cfg` menu URLs, the update-poll manifest — all derive from the HTTP
+`Host` header of the request that fetched them.
+
+Fixes, fastest first:
+
+1. **Re-bake the media** for the new address: `POLYPTIC_BASE=http://<new-host>:8080
+   deploy/build-boot-medium.sh` and re-download/rebuild the live ISO (`deploy/build-live-iso.sh`);
+   reflash sticks, re-attach ISOs.
+2. **Patch an offloaded ESP in place** (no reflash — handy for VMs): find the ESP partition offset
+   in the disk image (GPT LBA×512), then
+   `mcopy -i "<disk.img>@@<offset>" ::/grub/arm64-efi/grub.cfg /tmp/g && sed -i '' 's/OLD:8080/NEW:8080/' /tmp/g && mcopy -o -i "<disk.img>@@<offset>" /tmp/g ::/grub/arm64-efi/grub.cfg`.
+3. **The real fix: bake a NAME, not an IP.** Give the control plane a stable DNS name (in
+   Kubernetes: the chart's `ingressRoute.bootHost`, a plain-HTTP Traefik router for the boot
+   paths) and build all media against `http://boot.your-domain`. Media then survive any move of
+   the control plane. Caveat: GRUB resolves DNS fine, but the casper initrd's busybox `wget`
+   resolves **IPs more reliably than names** on some releases — verify a name-based `iso-url=`
+   boots on your target release before fleet-wide rollout (the D47 note).
+
+Related black-screen gotcha (not address-related): a UTM VM whose display is `virtio-gpu-pci`
+(no GL) boots to the splash and then goes **black** — sway has no GL renderer. Use
+`virtio-gpu-gl-pci` ("GPU Supported"), the same D48 lesson.
+
+---
+
 ## Secure Boot
 
 **It stays on.** That is the point of the signed chain, and the reason the loader is Ubuntu's shim + GRUB rather than anything Polyptic compiles.
