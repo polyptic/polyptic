@@ -50,7 +50,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/polyptic.iso | grep -i accept-ran
 
 **5. Make a box boot it**, pick **one**:
 
-- **USB dongle (simplest):** Console ▸ Settings ▸ Netboot ▸ **Download boot medium**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and choose **boot now** or **offload** at the menu. See [The boot medium](#the-boot-medium-dongle-or-offload).
+- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and choose **boot now** or **offload** at the menu. See [The boot medium](#the-boot-medium-dongle-or-offload).
 - **No medium, UEFI HTTP Boot:** point the box's firmware Boot URI at `http://10.0.0.5:8080/dist/boot/shimx64.efi` (arm64: `shimaa64.efi`). See [No medium at all](#no-medium-at-all-uefi-http-boot).
 - **No medium, site DHCP:** add one option-67 rule to the DHCP you already run. See [Site DHCP option 67](#site-dhcp-option-67-one-change-to-the-dhcp-you-already-run).
 
@@ -113,9 +113,11 @@ All in [`packages/server/src/provision.ts`](../packages/server/src/provision.ts)
 |---|---|---|
 | `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu (boot now / offload). Bakes the control-plane base from the request `Host` (like `/install`) and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
 | `GET /grub/grub.cfg` (+ `/grub/x86_64-efi/grub.cfg`, `/grub/arm64-efi/grub.cfg`) | **ungated** | **Aliases of the same menu**, at the paths an HTTP-booted GRUB actually asks for: grubnet's baked-in prefix is `/grub`, resolved against the **server root** of the host it was fetched from. See [the appendix](#no-medium-at-all-uefi-http-boot). |
-| `GET /dist/image/:arch/{vmlinuz,initrd,polyptic.iso}` | **ungated** | The live-image artifacts, streamed with real HTTP **Range** (206/416); the ISO is hundreds of MB and streamed into RAM. |
+| `GET /dist/image/:arch/{vmlinuz,initrd,polyptic.iso}` | **ungated** | The **active** live-image artifacts, streamed with real HTTP **Range** (206/416); the ISO is hundreds of MB and streamed into RAM. |
+| `GET /dist/image/:arch/builds/:imageId/:file` | **ungated** | The same artifacts for any **retained** build ([Build history](#build-history-and-rollback)). Same Range streaming, same secret-free content; `:imageId` is whitelisted so it cannot walk out of the depot. |
 | `GET /dist/boot/:file` | **ungated** | The universal boot medium `polyptic-boot.img`, plus the four signed loaders `shim{x64,aa64}.efi` / `grub{x64,aa64}.efi` (fetched by the offload flow and UEFI HTTP Boot). All **tokenless**, so ungated like `/dist/agent`. |
-| `GET /api/v1/settings/netboot` | **gated** | Operator-facing, secret-free `NetbootInfo{baseUrl, mode, bootConfigUrl, bootMediumUrl}` that drives the Console ▸ Settings ▸ Netboot card. |
+| `GET /api/v1/settings/netboot` | **gated** | Operator-facing, secret-free `NetbootInfo{baseUrl, mode, bootConfigUrl, bootMediumUrl}` that drives the Console ▸ Settings ▸ Onboard Screens card. |
+| `POST /api/v1/settings/image/activate` | **gated** | Make a retained build the active one — the fleet **rollback** ([Build history](#build-history-and-rollback)). |
 
 **The boot depot is plain HTTP, by contract.** Neither GRUB's HTTP client nor casper's busybox wget can do TLS, redirects, or chunked encoding; every boot asset must be a direct `200` with a `Content-Length` (the depot also tolerates shim's double-slash request shape, see [the appendix](#no-medium-at-all-uefi-http-boot)). This is deliberate, not an oversight, and it does not weaken the signature chain (the kernel is verified after download, whatever carried it). Treat the depot like any provisioning service: keep it on the LAN / management VLAN the boxes live on. The only secret in the whole flow is the enrolment token, and a leaked token **cannot self-admit** a box, a new machine lands PENDING until an operator approves it; regenerating the token re-keys the fleet (see [Ownership](#ownership-keys-and-rotation)). If operators reach the control plane over HTTPS via a proxy, the boxes still need a plain-HTTP path to these routes.
 
@@ -176,7 +178,7 @@ FILE is a credential — share it like one (a leaked token still only lands new 
 
 The default output path (`deploy/dist/image/<arch>/polyptic-live.iso`) is inside the image
 depot, so the server serves it at `GET /dist/image/<arch>/polyptic-live.iso` and **Console ▸
-Settings ▸ Netboot** shows a per-arch "Download live ISO" button whenever the artifact exists. The baked
+Settings ▸ Onboard Screens** lists it under **Recent builds**, one downloadable row per retained build that has one. The baked
 cmdline carries `quiet splash plymouth.ignore-serial-consoles`, so the boot shows the Polyptic
 Plymouth splash instead of scrolling kernel text. Three load-bearing details behind that (D49): the
 theme rides INSIDE the initrd (an extra cpio segment appended by `build-live-image.sh`, harvested
@@ -229,7 +231,7 @@ Notes that matter:
 
 ## The boot medium: dongle or offload
 
-Download it from **Console ▸ Settings ▸ Netboot ▸ Download boot medium** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **byte-identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box. It is only read for a few seconds at power-on.
+Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloader** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **byte-identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box. It is only read for a few seconds at power-on.
 
 Plug it in and the server-side menu offers:
 
@@ -342,6 +344,41 @@ for the full story, including the dev workflow against a local OrbStack/kind clu
 Boxes booted from the **live ISO / USB stick never auto-reboot** — they would re-boot the same
 stale medium (the poll guards on the netboot-only `iso-url=` kernel arg). Refresh those by
 regenerating and re-flashing the ISO (`deploy/build-live-iso.sh`).
+
+---
+
+## Build history and rollback
+
+The depot keeps the last few builds per architecture, and **one of them is active**. The active build's
+artifacts sit at the arch root — exactly where they always have — so `grub.cfg`, the `/dist/image/<arch>/…`
+routes, and every USB stick already in a drawer keep working without knowing history exists:
+
+```
+<IMAGE_DIST_DIR>/<arch>/
+  builds/<imageId>/{polyptic.iso,vmlinuz,initrd,SHA256SUMS[,polyptic-live.iso]}   every retained build
+  {polyptic.iso,vmlinuz,initrd,SHA256SUMS[,polyptic-live.iso]}                    the ACTIVE build
+  image-id.txt                                                                    the active build's id
+```
+
+**Rolling back is activating an older build.** In **Console ▸ Settings ▸ Onboard Screens ▸ Recent builds**,
+press **Activate** on any retained row (or `POST /api/v1/settings/image/activate {arch, imageId}`). The server
+repoints the arch root and republishes `image-id.txt`. Nothing else has to happen: every netbooted box already
+compares `manifest.json`'s `imageId` against its own `/etc/polyptic/image-id` every five minutes (POL-41), so
+the fleet re-pulls the older image on the normal policy — within minutes if the roll-out is marked urgent
+("Deploy latest to fleet immediately"), otherwise in each box's 03:00–05:00 window.
+
+**Retention** is `IMAGE_RETAIN_BUILDS` (Helm: `imageUpdates.retainBuilds`, default **3**). Pruning drops the
+oldest first and never removes the active build, so a fleet parked on an old image cannot have that image
+deleted out from under it. Each retained build costs roughly one ISO (~1.5–2 GB) on the depot volume; size
+`netboot.persistence.size` accordingly (the chart defaults to 30Gi for 3 builds × 2 arches + the cached base
+ISO). A depot built before this existed is folded into `builds/` automatically when the server starts.
+
+> **One inode rule worth knowing if you touch the build scripts.** The root and the active build directory
+> *share* `polyptic.iso` and `polyptic-live.iso` by hardlink — that is why retention is nearly free. They do
+> **not** share `vmlinuz`, `initrd`, or `SHA256SUMS`: `refresh-live-image.sh` writes those with `>` and `cp`,
+> which truncate the existing inode in place, and through a hardlink that would silently rewrite a *retained*
+> build's artifacts. If you add an artifact that is replaced by `mv`/`rm`+create, it can be shared; anything
+> written in place must be copied. See `SHAREABLE` in `packages/server/src/image-updates.ts`.
 
 ---
 

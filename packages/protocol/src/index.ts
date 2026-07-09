@@ -690,9 +690,29 @@ export const ImageManifest = z.object({
 });
 export type ImageManifest = z.infer<typeof ImageManifest>;
 
+/** One retained build in the depot (POL-45). Every rebuild lands in `<arch>/builds/<imageId>/`; the
+ *  newest `retainBuilds` survive and the rest are pruned. Exactly one build per arch is `active`:
+ *  its artifacts are hardlinked at the arch root, so the boot chain (`/dist/image/<arch>/…`, baked
+ *  into every `grub.cfg`) always serves it, and `manifest.json` publishes its id. Activating an
+ *  older build is therefore a fleet ROLLBACK — boxes see an id they don't match on their 5-minute
+ *  poll and reboot into it per the urgency policy. `liveIsoUrl` is the standalone bootable ISO for
+ *  that build when one was built (`polyptic-live.iso`, D49), which is NOT the same artifact as the
+ *  netboot payload `polyptic.iso` that casper streams into RAM. */
+export const ImageBuild = z.object({
+  arch: z.enum(["arm64", "amd64"]),
+  imageId: z.string(),
+  builtAt: z.string(),
+  sha256: z.string().nullable(),
+  /** True for the one build per arch the depot currently serves and publishes. */
+  active: z.boolean(),
+  /** Absolute URL of this build's standalone live ISO, or null when it has none. */
+  liveIsoUrl: z.string().nullable(),
+});
+export type ImageBuild = z.infer<typeof ImageBuild>;
+
 /** The image-updates surface for Console ▸ Settings (POL-41): the rebuild schedule (server-local
- *  HH:MM, default 01:00), the urgent roll-out switch, the last hook run's outcome, and the
- *  currently published per-arch images. GATED under /api/v1. */
+ *  HH:MM, default 01:00), the urgent roll-out switch, the last hook run's outcome, the currently
+ *  published per-arch images, and the retained build history (POL-45). GATED under /api/v1. */
 export const ImageUpdateInfo = z.object({
   scheduleEnabled: z.boolean(),
   /** Server-local `HH:MM` the daily refresh hook fires at (default "01:00"). */
@@ -722,6 +742,10 @@ export const ImageUpdateInfo = z.object({
     })
     .nullable(),
   images: z.array(ImageManifest),
+  /** Retained builds across all arches, newest first (POL-45). At most `retainBuilds` per arch. */
+  builds: z.array(ImageBuild).default([]),
+  /** How many builds per arch the depot keeps before pruning (IMAGE_RETAIN_BUILDS, default 3). */
+  retainBuilds: z.number().int().min(1).default(3),
 });
 export type ImageUpdateInfo = z.infer<typeof ImageUpdateInfo>;
 
@@ -741,6 +765,14 @@ export const RebuildImageBody = z.object({
   kind: z.enum(["refresh", "full"]).default("refresh"),
 });
 export type RebuildImageBody = z.infer<typeof RebuildImageBody>;
+
+/** Make a retained build the one the depot serves (POL-45). A fleet-wide action: every netbooted
+ *  box on a different image reboots into this one (urgent → minutes, else the nightly window). */
+export const ActivateImageBody = z.object({
+  arch: z.enum(["arm64", "amd64"]),
+  imageId: z.string().min(1),
+});
+export type ActivateImageBody = z.infer<typeof ActivateImageBody>;
 
 /** Update the fleet-wide display settings from the console (POL-6). Currently just the badge toggle. */
 export const UpdateDisplaySettingsBody = z.object({

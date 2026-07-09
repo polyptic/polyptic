@@ -98,6 +98,9 @@ const ARCH_RE = /^(arm64|amd64)$/;
  *  does, and a leaked token still cannot self-admit a NEW box past the operator). Nothing else is
  *  servable. */
 const IMAGE_FILE_RE = /^(vmlinuz|initrd|polyptic\.iso|polyptic-live\.iso)$/;
+/** A build's image id, as stamped by the build scripts: `<UTC timestamp>-<8 hex>`. The leading
+ *  alphanumeric rules out `.`/`..`, so it can never escape the builds/ directory (POL-45). */
+const IMAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** The boot-depot files (POL-33/D47): `polyptic-boot.img` is the universal `dd`-able FAT32 dongle (both
  *  arches on one stick); the four `.efi` files are the SIGNED loaders (shim + network GRUB per arch) for
  *  UEFI HTTP Boot and the offload flow. All TOKENLESS (they only chain `/boot/grub.cfg`), so this route
@@ -537,6 +540,28 @@ export function registerProvisionRoutes(
     const { urgent } = await imageUpdates.state();
     reply.header("Cache-Control", "no-store");
     return { ...m, urgent };
+  });
+
+  // ── GET /dist/image/:arch/builds/:imageId/:file — one RETAINED build's artifacts (POL-45).
+  //    Ungated like the active artifacts above and equally secret-free. This is what the console's
+  //    "Recent builds" rows download, and what an operator can grab for a build that is no longer
+  //    the active one. `imageId` is whitelisted to the depot's own naming so it cannot traverse. ──
+  fastify.get("/dist/image/:arch/builds/:imageId/:file", async (request, reply) => {
+    const { arch, imageId, file } = request.params as { arch?: string; imageId?: string; file?: string };
+    if (!arch || !ARCH_RE.test(arch)) return reply.code(404).send({ error: "unknown architecture" });
+    if (!imageId || !IMAGE_ID_RE.test(imageId)) return reply.code(404).send({ error: "unknown build" });
+    if (!file || !IMAGE_FILE_RE.test(file)) return reply.code(404).send({ error: "unknown image file" });
+    const abs = safeResolve(imageDistDir, arch, "builds", imageId, file);
+    if (!abs) return reply.code(404).send({ error: "not found" });
+
+    let st;
+    try {
+      st = await stat(abs);
+    } catch {
+      return reply.code(404).send({ error: "build artifact not retained" });
+    }
+    if (!st.isFile()) return reply.code(404).send({ error: "build artifact not retained" });
+    return sendBootAsset(reply, abs, st.size, request.headers.range);
   });
 
   fastify.get("/dist/image/:arch/:file", async (request, reply) => {
