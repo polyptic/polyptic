@@ -119,6 +119,8 @@ COPY --from=build /app/deploy/dist ./deploy/dist
 COPY --from=build /app/deploy/refresh-live-image.sh ./deploy/refresh-live-image.sh
 COPY --from=build /app/deploy/build-live-image.sh ./deploy/build-live-image.sh
 COPY --from=build /app/deploy/build-live-iso.sh ./deploy/build-live-iso.sh
+COPY --from=build /app/deploy/build-boot-medium.sh ./deploy/build-boot-medium.sh
+COPY --from=build /app/deploy/dongle-grub.cfg.tmpl ./deploy/dongle-grub.cfg.tmpl
 COPY --from=build /app/deploy/k8s-run-job.ts ./deploy/k8s-run-job.ts
 COPY --from=build /app/deploy/live ./deploy/live
 
