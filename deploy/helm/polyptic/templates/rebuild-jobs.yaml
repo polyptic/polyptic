@@ -53,7 +53,7 @@ several GB) is an emptyDir at /var/tmp.
       "name" "payload"
       "image" (include "polyptic.image" .)
       "imagePullPolicy" .Values.image.pullPolicy
-      "command" (list "sh" "-c" "mkdir -p /repo/deploy && cp -r /app/deploy/refresh-live-image.sh /app/deploy/build-live-image.sh /app/deploy/live /app/deploy/dist /repo/deploy/")
+      "command" (list "sh" "-c" "mkdir -p /repo/deploy && cp -a /app/deploy/. /repo/deploy/ && ls /repo/deploy")
       "volumeMounts" (list (dict "name" "repo" "mountPath" "/repo"))
 }}
 {{- $volumes := list
