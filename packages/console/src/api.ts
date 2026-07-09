@@ -28,6 +28,14 @@ import type { ContentSource, Scene, VideoWall } from "@polyptic/protocol";
  *  (found live: the in-cluster console called the operator's :8080 dev stack instead of its pod). */
 const BASE = import.meta.env.DEV ? "http://localhost:8080/api/v1" : `${window.location.origin}/api/v1`;
 
+/** Ungated GET /healthz — lives at the SERVER root (not /api/v1). The sign-in footer shows the
+ *  deployed version from it (baked into the image via POLYPTIC_VERSION at release build). */
+export async function serverHealth(): Promise<{ version?: string; revision?: string }> {
+  const res = await fetch(BASE.replace(/\/api\/v1$/, "/healthz"));
+  if (!res.ok) throw new Error(`GET /healthz -> ${res.status}`);
+  return (await res.json()) as { version?: string; revision?: string };
+}
+
 /** A non-2xx REST response, with the parsed error payload (if any) for diagnostics. */
 export class ApiError extends Error {
   constructor(

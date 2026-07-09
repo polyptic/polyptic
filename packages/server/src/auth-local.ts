@@ -113,8 +113,12 @@ export function authConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AuthCon
   const rawSecret = env.COOKIE_SECRET?.trim();
   const usingDevCookieSecret = !rawSecret || rawSecret.length === 0;
   const cookieSecret = usingDevCookieSecret ? DEV_COOKIE_SECRET : rawSecret;
-  const secureCookies =
-    (env.SECURE_COOKIES ?? "").toLowerCase() === "true" || env.NODE_ENV === "production";
+  // An EXPLICIT SECURE_COOKIES always wins (either way); NODE_ENV=production is only the
+  // default when it is unset. The old `|| production` forced Secure cookies on plain-HTTP
+  // production deploys, where the browser silently drops them — login "succeeds" but no
+  // session ever persists (found live on the first in-cluster deploy, POL-43).
+  const rawSecure = env.SECURE_COOKIES?.trim().toLowerCase();
+  const secureCookies = rawSecure ? rawSecure === "true" : env.NODE_ENV === "production";
   return { enabled, cookieSecret, usingDevCookieSecret, secureCookies };
 }
 

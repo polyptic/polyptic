@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useConsoleStore } from "../stores/console";
-import { ApiError } from "../api";
+import { ApiError, serverHealth } from "../api";
 import Logo from "../components/Logo.vue";
 
 // Real local-account sign-in (Phase 3f — D29). Credentials POST to /auth/login over the credentialed
@@ -20,6 +20,18 @@ const errorMessage = ref<string | null>(null);
 const loading = ref(false);
 
 const themeIcon = computed(() => (store.theme === "light" ? "☾ Dark" : "☼ Light"));
+
+// The REAL deployed version (was a hardcoded "v3.0" leftover from the Console-v2 design adoption).
+// /healthz is ungated so this works pre-auth; dev builds ("0.0.0") show no number at all.
+const version = ref<string | null>(null);
+onMounted(() => {
+  void serverHealth()
+    .then((h) => {
+      const v = h.version?.replace(/^v/, "");
+      if (v && v !== "0.0.0") version.value = v;
+    })
+    .catch(() => {});
+});
 
 async function onSignIn(): Promise<void> {
   if (loading.value) return;
@@ -89,7 +101,7 @@ async function onSignIn(): Promise<void> {
       </button>
 
       <div class="foot">
-        <span class="version">Self-hosted · v3.0</span>
+        <span class="version">Self-hosted{{ version ? ` · v${version}` : "" }}</span>
         <span class="theme" @click="store.toggleTheme()">{{ themeIcon }}</span>
       </div>
     </div>
