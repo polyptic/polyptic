@@ -1,13 +1,38 @@
 # Polyptic boot dongle (POL-33/D47). TOKENLESS: carries only the control-plane address. The
 # enrolment token is baked by the server into /boot/grub.cfg at chain time. Secure Boot stays ON.
+#
+# The gfx block below is the stage-1 half of the boot splash (POL-47) and must stay identical to what
+# `bootGfxPreamble()` emits in packages/server/src/boot-theme.ts — an e2e test compares them. There is
+# no network yet here, so it gets the Polyptic dark but not the themed menu: that arrives with
+# /boot/grub.cfg, and the two screens share a background so the hand-off does not flash.
+# Paint the Polyptic splash rather than a text console (POL-47). The signed grubnet carries the
+# font + the gfx modules in its memdisk, so this costs no fetch. Guarded: a GRUB that cannot do
+# any of it keeps the plain console and boots identically.
+if loadfont (memdisk)/fonts/unicode.pf2 ; then
+  insmod all_video
+  insmod gfxterm
+  insmod gfxterm_background
+  insmod png
+  set gfxmode=auto
+  set gfxpayload=keep
+  terminal_output gfxterm
+  background_color "#0b0b0d"
+  clear
+fi
 set net=(http,@@POLYPTIC_BASE_HOSTPORT@@)
-echo "Polyptic: bringing the network up (DHCP on all NICs) ..."
+echo "Starting Polyptic ..."
 net_dhcp
-echo "Polyptic: chaining $net/boot/grub.cfg ..."
 configfile $net/boot/grub.cfg
-# Only reached when DHCP or the chain failed:
+# Only reached when DHCP or the chain failed — THIS is where the technical detail belongs: nobody
+# reads a boot screen until it stops working. It cannot be conditional: `configfile` reports no
+# testable status, and an `if ! configfile …` never takes its branch (checked under OVMF).
+# The `sleep` is load-bearing: GRUB paints the fallback menu below over the console the instant this
+# script ends, so without a beat to read it the message may as well not have been printed.
+echo ""
+echo "Could not reach the Polyptic control plane at $net over the network."
+sleep -i 8
 set timeout=10
 set default=retry
-menuentry "Retry (DHCP + chain again)" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
-menuentry "Reboot" { reboot }
+menuentry "Try again" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
+menuentry "Restart this screen" { reboot }
 menuentry "Firmware setup" { fwsetup }
