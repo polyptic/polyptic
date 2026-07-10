@@ -316,14 +316,19 @@ if (stamp.image.GetHeight() > 0) {
   stamp.sprite.SetZ(11);
 }
 
+# ONE status line, two sources (POL-53). systemd pushes raw unit names ("dracut-initqueue.service")
+# through SetUpdateStatusFunction; our own narration — the dracut hooks in deploy/live/, the agent —
+# arrives as \`plymouth display-message --text="…"\` through SetMessageFunction. These used to be two
+# separate sprites, so the wall showed the unit name AND "Downloading the OS image ..." stacked on top
+# of each other. Now they share the line and our narration wins: it is written for a human looking at
+# a public screen, and while it is up systemd has nothing more useful to say. \`plymouth hide-message\`
+# takes it back down and the systemd status reappears (see polyptic-progress-done.sh, which clears the
+# narration before switch-root so the retained final frame cannot lie about what the box is doing).
 status.sprite = Sprite(Image.Text(initial_status, ${toPlymouthRgb(COLORS.status)}));
 status.sprite.SetZ(11);
+status.system = initial_status;
+status.message = "";
 status.text = initial_status;
-
-# operator/agent pushes: \`plymouth message --text="…"\` show just under the status line. The sprite is
-# created lazily on the first message — on a normal boot none ever arrives.
-message.have = 0;
-message.text = "";
 
 target_progress = 0;
 progress = 0;
@@ -351,9 +356,18 @@ fun draw_fill(p) {
   }
 }
 
+# Our narration outranks systemd's unit names; falls back to them once it is hidden.
+fun status_line() {
+  if (status.message != "") {
+    return status.message;
+  }
+  return status.system;
+}
+
 fun draw_status() {
-  if (status.text != "") {
-    img = scale_text(Image.Text(status.text, ${toPlymouthRgb(COLORS.status)}), sh / 620);
+  line = status_line();
+  if (line != "") {
+    img = scale_text(Image.Text(line, ${toPlymouthRgb(COLORS.status)}), sh / 620);
     # Never hand a sprite a null/zero image: systemd pushes an empty status when a job settles, and an
     # image-less sprite segfaults the script plugin on the next frame (POL-7). Keep the last good line.
     if (img.GetHeight() > 0) {
@@ -364,23 +378,7 @@ fun draw_status() {
       status.sprite.SetImage(img);
       status.sprite.SetX(cx - img.GetWidth() / 2);
       status.sprite.SetY(status.y);
-    }
-  }
-}
-
-fun draw_message() {
-  if (message.text != "") {
-    img = scale_text(Image.Text(message.text, ${toPlymouthRgb(COLORS.status)}), sh / 700);
-    if (img.GetHeight() > 0) {
-      if (message.have == 0) {
-        message.sprite = Sprite(img);
-        message.have = 1;
-        message.sprite.SetZ(11);
-      } else {
-        message.sprite.SetImage(img);
-      }
-      message.sprite.SetX(cx - img.GetWidth() / 2);
-      message.sprite.SetY(message.y);
+      status.text = line;
     }
   }
 }
@@ -420,13 +418,9 @@ fun layout() {
     draw_fill(progress);
   }
 
-  # live boot-status line, and any operator message just under it
+  # the single live status line
   status.y = bar.y + sh * 0.055;
   draw_status();
-  message.y = status.y + sh * 0.05;
-  if (message.have == 1) {
-    draw_message();
-  }
 
   # hostname / version stamp: sized by height (~2.6% of screen) so it reads the same on any panel
   if (stamp.have == 1) {
@@ -448,17 +442,26 @@ Plymouth.SetBootProgressFunction(fun (duration, prog) {
 # instead of blinking the splash's only live element in and out on every unit transition.
 Plymouth.SetUpdateStatusFunction(fun (text) {
   if (text != "") {
-    if (text != status.text) {
-      status.text = text;
+    status.system = text;
+    if (status.message == "") {
       draw_status();
     }
   }
 });
 
+# \`plymouth display-message --text="…"\` — our narration, and it holds the line until hidden.
 Plymouth.SetMessageFunction(fun (text) {
   if (text != "") {
-    message.text = text;
-    draw_message();
+    status.message = text;
+    draw_status();
+  }
+});
+
+# \`plymouth hide-message --text="…"\` — hand the line back to systemd's status.
+Plymouth.SetHideMessageFunction(fun (text) {
+  if (text == status.message) {
+    status.message = "";
+    draw_status();
   }
 });
 

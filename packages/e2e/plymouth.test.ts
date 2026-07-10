@@ -143,19 +143,32 @@ describe("plymouthScript — the live splash program", () => {
   });
 
   test("text is scaled up for wall legibility and never shrunk", () => {
-    expect(script).toContain("scale_text(Image.Text(status.text");
+    expect(script).toContain("scale_text(Image.Text(line");
     expect(script).toContain("sh / 620");
-    expect(script).toContain("sh / 700");
     expect(script).toMatch(/fun scale_text\(img, factor\) \{\n\s*if \(factor < 1\) \{/);
+  });
+
+  test("ONE status line: our narration outranks systemd's unit names, and can be taken back down", () => {
+    // Two sprites meant the wall showed systemd's raw unit name AND "Downloading the OS image ..."
+    // stacked. One line now, sourced from `plymouth display-message` when there is one, else systemd.
+    expect(script).toMatch(/fun status_line\(\) \{\n\s*if \(status\.message != ""\) \{\n\s*return status\.message;/);
+    expect(script).toContain("return status.system;");
+    // a systemd status must not paint over a message that is still up
+    expect(script).toMatch(/status\.system = text;\n\s*if \(status\.message == ""\) \{\n\s*draw_status\(\);/);
+    // hide-message hands the line back
+    expect(script).toMatch(/SetHideMessageFunction\(fun \(text\) \{\n\s*if \(text == status\.message\) \{\n\s*status\.message = "";/);
+    // and there is exactly one text sprite
+    expect(script).not.toContain("message.sprite");
+    expect(script.match(/Sprite\(Image\.Text/g)?.length).toBe(1);
   });
 
   test("an empty status never blanks the line or hands a sprite a null image (POL-7 segfault)", () => {
     // systemd pushes an empty status when a job settles. Image.Text("") has nothing to draw, and a
     // sprite left image-less segfaults the script plugin on the next frame.
-    expect(script).toMatch(/fun draw_status\(\) \{\n\s*if \(status\.text != ""\) \{/);
-    expect(script).toMatch(/fun draw_message\(\) \{\n\s*if \(message\.text != ""\) \{/);
+    expect(script).toMatch(/fun draw_status\(\) \{\n\s*line = status_line\(\);\n\s*if \(line != ""\) \{/);
     expect(script).toMatch(/if \(img\.GetHeight\(\) > 0\) \{/);
     expect(script).toMatch(/SetUpdateStatusFunction\(fun \(text\) \{\n\s*if \(text != ""\) \{/);
+    expect(script).toMatch(/SetMessageFunction\(fun \(text\) \{\n\s*if \(text != ""\) \{/);
   });
 });
 

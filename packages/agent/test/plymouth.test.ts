@@ -91,15 +91,18 @@ describe("plymouthDracutConf — force the theme into the dracut initramfs", () 
 describe("plymouthScript — must never hold an image-less sprite (plymouth 5.x segfault, POL-7)", () => {
   const script = plymouthScript();
 
-  test("does not eagerly create an empty message sprite", () => {
-    // The bug: `message.sprite = Sprite();` with no image → plymouth 5.x crashes in
-    // script_lib_sprite_refresh on the first frame of a normal boot (no message ever arrives).
-    expect(script).not.toContain("message.sprite = Sprite();");
+  test("no sprite is ever created without an image", () => {
+    // The bug: `Sprite();` with no image → plymouth 5.x crashes in script_lib_sprite_refresh on the
+    // first frame of a normal boot. Every sprite is born with one, and nothing sets a null image.
+    const code = script
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(code).not.toContain("Sprite();");
   });
 
-  test("creates the message sprite lazily, WITH an image, on the first message", () => {
-    expect(script).toContain("message.have = 0");
-    expect(script).toContain("Sprite(img)");
+  test("guards SetImage behind a real, non-empty rendered image", () => {
+    expect(script).toContain("if (img.GetHeight() > 0) {");
   });
 });
 
