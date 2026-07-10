@@ -96,7 +96,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
   // Returned so REST (arm/disarm) can close a box's sessions the moment it is disarmed.
-  const shellRelay = new ShellRelay(agentHub, control, activity, log);
+  const shellRelay = new ShellRelay(agentHub, control, activity, broadcaster, log);
 
   const agentWss = new WebSocketServer({ noServer: true });
   const playerWss = new WebSocketServer({ noServer: true });

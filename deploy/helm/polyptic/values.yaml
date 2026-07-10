@@ -126,6 +126,14 @@ affinity: {}
 # valueFrom maps). Use for anything not surfaced as a first-class value below.
 extraEnv: []
 
+# Remote shell (POL-59) — an operator can open a terminal on an ARMED box from
+# Console ▸ Machines. Arming is off by default per box and this bounds how long a
+# forgotten armed box stays shell-openable: the server auto-disarms a box left
+# armed-and-idle this many seconds (a box with a live session keeps extending).
+# 0 disables the sweep, leaving arming sticky until a manual disarm.
+remoteShell:
+  armTtlSeconds: 3600
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Application configuration (mirrors deploy/.env.example).
 # Non-secret values land in a ConfigMap; secret values land in a Secret.

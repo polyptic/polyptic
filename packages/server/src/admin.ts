@@ -207,6 +207,7 @@ export function buildAdminState(
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       rebooting: presence.isMachineRebooting(machine.id),
+      shellArmedAt: machine.shellArmedAt,
       screens: machineScreens,
     } satisfies MachineView;
   });

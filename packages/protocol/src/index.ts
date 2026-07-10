@@ -69,6 +69,9 @@ export const Machine = z.object({
   /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
    *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
   shellEnabled: z.boolean().default(false),
+  /** POL-59 — when the shell was armed / last used. A sweep auto-disarms a box idle past the TTL
+   *  (SHELL_ARM_TTL_MS) so a forgotten armed box is not a standing shell-openable target. */
+  shellArmedAt: z.string().datetime().optional(),
 });
 export type Machine = z.infer<typeof Machine>;
 
@@ -642,6 +645,8 @@ export const MachineView = z.object({
    *  not reconnected yet. Live-only (never persisted) and bounded server-side, so a box that dies
    *  mid-reboot doesn't read "rebooting…" forever. Optional = back-compat. */
   rebooting: z.boolean().optional(),
+  /** POL-59 — when the arming was set / last refreshed (for the "auto-disarms in N min" hint). */
+  shellArmedAt: z.string().datetime().optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;

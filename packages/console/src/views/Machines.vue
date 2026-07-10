@@ -172,6 +172,14 @@ function closeMenus(): void {
   consoleMenuFor.value = null;
 }
 
+// The auto-disarm TTL is enforced server-side (SHELL_ARM_TTL_MS, default 60 min); the console can't
+// read it, so the hint just reassures the operator that arming is not permanent. `now` keeps it live.
+function shellArmedHint(m: MachineView): string {
+  if (!m.shellArmedAt) return "The console is enabled on this box";
+  const mins = Math.round((now.value - new Date(m.shellArmedAt).getTime()) / 60000);
+  return `Console enabled ${mins < 1 ? "just now" : `${mins} min ago`} — auto-disables when idle`;
+}
+
 const toast = ref("");
 let toastTimer: number | undefined;
 function showToast(message: string): void {
@@ -270,7 +278,7 @@ function showToast(message: string): void {
 
                 <!-- status chips: Shell armed is a passive security indicator, always visible while
                      armed, independent of the console button state (POL-68 §2). -->
-                <span v-if="m.shellEnabled" class="chip-armed">Shell armed</span>
+                <span v-if="m.shellEnabled" class="chip-armed" :title="shellArmedHint(m)">Shell armed</span>
                 <span class="status-badge" :class="m.online ? 'online' : 'offline'">
                   {{ m.online ? "Online" : "Offline" }}
                 </span>

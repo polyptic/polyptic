@@ -56,6 +56,9 @@ const BUILD_VERSION = process.env.POLYPTIC_VERSION?.trim() || "0.0.0";
 const BUILD_REVISION = process.env.POLYPTIC_REVISION?.trim() || process.env.GIT_SHA?.trim() || "dev";
 // Live-preview capture sweep cadence (ms). 0 disables the periodic sweep (on-demand still works).
 const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS ?? 4000);
+// POL-59 — auto-disarm a remote shell left armed-and-idle this long (default 60 min). 0 disables the
+// sweep (arming stays sticky until a manual disarm). Guards against a forgotten armed box.
+const SHELL_ARM_TTL_MS = Number(process.env.SHELL_ARM_TTL_MS ?? 60 * 60 * 1000);
 // Max thumbnails held in memory at once (LRU cap).
 const THUMBNAIL_CAPACITY = Number(process.env.CAPTURE_THUMBNAIL_CAP ?? 300);
 const CORS_ORIGIN = (
@@ -218,6 +221,7 @@ const shellRelay = attachWebSockets({
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
 });
+shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
 registerRestRoutes(
   fastify,
   control,
