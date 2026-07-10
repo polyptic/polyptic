@@ -201,11 +201,27 @@ export const AgentRebootAck = z.object({
   reason: z.string().optional(),
 });
 
+/** POL-50 — the agent's answer to `server/inspect`: whether the wall's Web Inspector is now open.
+ *  This ack, not the operator's click, is what the console displays — only the box knows whether
+ *  surf relaunched and took the keystroke. `ok: false` means the screen is un-inspected and carries
+ *  why (nothing placed on that output, no `xdotool`, or a backend that owns no browser). */
+export const AgentInspectAck = z.object({
+  t: z.literal("agent/inspect-ack"),
+  machineId: z.string(),
+  connector: z.string(),
+  /** The inspector state the agent actually reached (false on any failure). */
+  on: z.boolean(),
+  ok: z.boolean(),
+  /** Why the agent could not honour the request, when `ok` is false. */
+  reason: z.string().optional(),
+});
+
 export const AgentMessage = z.discriminatedUnion("t", [
   AgentHello,
   AgentStatus,
   AgentThumbnail,
   AgentRebootAck,
+  AgentInspectAck,
 ]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
 
@@ -244,6 +260,26 @@ export const ServerToAgentReboot = z.object({
   reason: z.string().optional(),
 });
 
+/**
+ * POL-50 — show/hide the kiosk browser's Web Inspector ON the panel driven by `connector`.
+ *
+ * A wall you can only debug by photographing it is a wall you can't debug. surf (WebKitGTK, D63)
+ * exposes NO browser-openable remote inspector — its `WEBKIT_INSPECTOR_SERVER` port speaks WebKit's
+ * own protocol, not HTTP or WebSocket — so there is nothing to tunnel to an operator's browser and
+ * the inspector is shown where the page is. The operator clicks in the console; someone at the
+ * screen reads the console/network.
+ *
+ * surf only takes its inspector at launch (`-N`), so honouring this RELAUNCHES that output's browser
+ * and the page reloads. Turning it off relaunches without `-N`, re-sealing the kiosk. The agent
+ * answers `agent/inspect-ack`.
+ */
+export const ServerToAgentInspect = z.object({
+  t: z.literal("server/inspect"),
+  /** Which output to pop the inspector on. */
+  connector: z.string(),
+  on: z.boolean(),
+});
+
 /** Issued after a valid first-contact enrollment: the durable credential the agent persists and
  * presents on every reconnect (instead of the bootstrap token). `status` tells the agent whether
  * it still needs operator approval. */
@@ -279,6 +315,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentIdent,
   ServerToAgentCapture,
   ServerToAgentReboot,
+  ServerToAgentInspect,
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
@@ -371,6 +408,15 @@ export const ScreenView = Screen.extend({
     })
     .nullable()
     .optional(),
+  /** POL-50 — is the kiosk browser's Web Inspector currently open ON this panel? Ephemeral (never
+   *  persisted, cleared when the machine drops) and set only from the agent's `agent/inspect-ack`,
+   *  so the console reflects the wall rather than the last click. Optional = back-compat. */
+  inspecting: z.boolean().optional(),
+  /** POL-50 — why the box last refused to show its inspector (no `xdotool`, nothing placed on that
+   *  output, a backend that owns no browser). Ephemeral: cleared when a new request is delivered, on
+   *  success, and when the machine drops. A refusal leaves `inspecting` false, i.e. UNCHANGED, so
+   *  without this the console cannot tell "the wall said no" from "the wall hasn't answered yet". */
+  inspectError: z.string().optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -608,6 +654,10 @@ export type IdentBody = z.infer<typeof IdentBody>;
 /** Reboot request for one machine (POL-55). The reason rides through to the box's journal. */
 export const RebootBody = z.object({ reason: z.string().max(200).optional() });
 export type RebootBody = z.infer<typeof RebootBody>;
+
+/** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
+export const InspectBody = z.object({ on: z.boolean() });
+export type InspectBody = z.infer<typeof InspectBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

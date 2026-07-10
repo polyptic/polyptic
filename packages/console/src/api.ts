@@ -13,6 +13,7 @@ import {
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
+  InspectBody,
   PlaceScreenBody,
   RenameMuralBody,
   RenameScreenBody,
@@ -240,6 +241,16 @@ export function renameScreen(screenId: string, friendlyName: string): Promise<un
 /** POST /api/v1/screens/:screenId/ident { on, ttlMs? } — flash the screen on the wall. */
 export function identScreen(screenId: string, body: IdentBody): Promise<unknown> {
   return send("POST", `/screens/${encodeURIComponent(screenId)}/ident`, IdentBody.parse(body));
+}
+
+/**
+ * POST /api/v1/screens/:screenId/inspect { on } — show/hide the kiosk browser's Web Inspector ON that
+ * panel (POL-50). Answers 202: the request was delivered to the agent, not applied — the screen's
+ * `inspecting` flag (or `inspectError`) arrives later on an admin/state broadcast, once the box acks.
+ * Rejects with an ApiError on 409 (machine offline or not approved).
+ */
+export function inspectScreen(screenId: string, body: InspectBody): Promise<unknown> {
+  return send("POST", `/screens/${encodeURIComponent(screenId)}/inspect`, InspectBody.parse(body));
 }
 
 /**

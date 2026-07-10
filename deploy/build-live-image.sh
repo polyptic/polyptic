@@ -40,7 +40,6 @@
 #     env: UBUNTU_RELEASE  (default 26.04) the ubuntu-base release + archive suite
 #          SUITE           (default derived: 26.04 → resolute)
 #          MIRROR          (default archive.ubuntu.com on amd64, ports.ubuntu.com on arm64)
-#          BROWSER         (default surf; the kiosk browser `setup` installs)
 #          FULL_FIRMWARE=1 ship the whole `linux-firmware` (~600 MB) instead of the curated set —
 #                          the escape hatch for hardware whose blobs we did not anticipate
 #          FIRMWARE_PACKAGES  override the curated set outright (space-separated; "" = none)
@@ -65,7 +64,6 @@ esac
 SUITE="${SUITE:-$DEFAULT_SUITE}"
 [ -n "$SUITE" ] || { echo "build-live-image: unknown UBUNTU_RELEASE '$UBUNTU_RELEASE' — set SUITE=<codename>" >&2; exit 2; }
 MIRROR="${MIRROR:-$DEFAULT_MIRROR}"
-BROWSER="${BROWSER:-surf}"
 SQUASHFS_BLOCK="${SQUASHFS_BLOCK:-1M}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/deploy/dist/image/$ARCH}"
 CACHE_DIR="${CACHE_DIR:-$REPO_ROOT/deploy/dist/cache}"
@@ -181,10 +179,10 @@ echo '==> [4/8] chroot: the substrate, via the compiled agent setup'
 install -m0755 "$AGENT_BIN" "$ROOTFS/usr/local/bin/polyptic-agent"
 # No --server-url/--bootstrap-token/--start: those arrive on the kernel cmdline at boot; greetd starts
 # the agent. `setup` writes greetd autologin, the compositor launcher, sway/i3 config + the user unit,
-# installs the browser, and (POL-7/D45) writes /etc/dracut.conf.d/polyptic-splash.conf so the Plymouth
+# installs the browser (surf, D63), and (POL-7/D45) writes /etc/dracut.conf.d/polyptic-splash.conf so the Plymouth
 # theme lands in the initramfs step 6 builds. That drop-in is why this runs BEFORE dracut.
 chroot "$ROOTFS" /usr/local/bin/polyptic-agent setup \
-  --backend wayland-sway --user kiosk --browser "$BROWSER" --render auto
+  --backend wayland-sway --user kiosk --render auto
 chroot "$ROOTFS" /bin/sh -c 'apt-get clean'
 
 echo '==> [5/8] overlay diskless identity + offload layer'

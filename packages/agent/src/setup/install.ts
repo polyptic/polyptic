@@ -5,7 +5,7 @@
  * logged; `--dry-run` previews without touching anything. The cold-boot chain it wires:
  *
  *   greetd autologin (user=kiosk) -> sway (or i3) -> systemd --user polyptic-session.target
- *     -> polyptic-agent.service (Restart=always) -> Chromium-per-output
+ *     -> polyptic-agent.service (Restart=always) -> surf-per-output
  *
  * The agent then reads /etc/polyptic/agent.toml, enrols over WSS (2b), and an operator approves it
  * in the console. "apt = the box is a display; console = what it shows." (D26)
@@ -91,7 +91,7 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   // Resolve the effective render mode up front so the compositor launcher AND the browser agree.
   // An explicit --render wins; `auto` on a virtual GPU is pinned to `software` here (see
   // resolveRenderMode) — the launcher's runtime crash-fallback alone misses a virtio-gpu, whose
-  // wlroots GLES compositor survives yet needs software cursors and whose Chromium needs --disable-gpu.
+  // wlroots GLES compositor survives yet needs software cursors and whose browser needs software GL.
   opts.render = resolveRenderMode(sys, opts.render, log);
 
   // 1 ─ dependencies
@@ -338,7 +338,6 @@ function writeAgentConfig(sys: Sys, opts: SetupOptions, log: Logger, needsVerifi
         serverUrl: opts.serverUrl,
         bootstrapToken: opts.bootstrapToken,
         backend: opts.backend,
-        browser: opts.browser,
         connector: opts.connector,
       },
       { example: false },
@@ -352,7 +351,7 @@ function writeAgentConfig(sys: Sys, opts: SetupOptions, log: Logger, needsVerifi
     });
   } else {
     const example = renderAgentToml(
-      { backend: opts.backend, browser: opts.browser, connector: opts.connector },
+      { backend: opts.backend, connector: opts.connector },
       { example: true },
     );
     sys.writeFile(`${opts.configPath}.example`, example, { mode: 0o644, desc: "agent.toml.example" });
@@ -367,7 +366,7 @@ function writeAgentConfig(sys: Sys, opts: SetupOptions, log: Logger, needsVerifi
       // but no browser is ever launched (found live in the POL-38 UTM boot). The empty
       // server_url/bootstrap_token here are ignored by applyConfigFileToEnv, and real env wins.
       const toml = renderAgentToml(
-        { backend: opts.backend, browser: opts.browser, connector: opts.connector },
+        { backend: opts.backend, connector: opts.connector },
         { example: false },
       );
       sys.writeFile(opts.configPath, toml, {
@@ -807,8 +806,8 @@ function startNow(sys: Sys, log: Logger): void {
 
 // DRM driver / PCI-vendor signatures of GPUs with no reliable hardware 3D (GL). A kiosk on these
 // must render in software: the compositor's wlroots GLES path may *survive* (so the launcher's
-// runtime crash-fallback never trips) yet the hardware cursor plane is broken and Chromium's GPU
-// process fails on the missing 3D — so we pin `software` at setup time instead.
+// runtime crash-fallback never trips) yet the hardware cursor plane is broken and WebKit's GL path
+// fails on the missing 3D — so we pin `software` at setup time instead.
 const VIRTUAL_GPU_DRIVERS = ["virtio", "vmwgfx", "qxl", "bochs", "cirrus", "simpledrm", "vboxvideo"];
 // virtio(1af4), VMware(15ad), Red Hat/QEMU(1b36), QEMU stdvga/Bochs(1234), VirtualBox(80ee).
 const VIRTUAL_GPU_PCI_VENDORS = ["1af4", "15ad", "1b36", "1234", "80ee"];
@@ -863,13 +862,13 @@ function collectBackendVerification(opts: SetupOptions, isX11: boolean, needsVer
     );
   } else {
     needsVerification.push(
-      "wayland-sway: verify sway + .deb Chromium actually render on the target GPU. A virtual GPU may " +
-        "need WLR_NO_HARDWARE_CURSORS=1; NVIDIA on wlroots needs `nvidia-drm.modeset=1` (else use --backend x11-i3).",
+      "wayland-sway: verify sway + surf (through XWayland) actually render on the target GPU. A virtual " +
+        "GPU may need WLR_NO_HARDWARE_CURSORS=1; NVIDIA on wlroots needs `nvidia-drm.modeset=1` (else use --backend x11-i3).",
     );
   }
   needsVerification.push(
     "Cold-boot DoD is visual: power-cycle a VM with a real virtual display (Parallels/UTM) and confirm " +
-      "greetd -> sway -> agent -> Chromium-per-output with zero interaction; OrbStack (headless) only " +
+      "greetd -> sway -> agent -> surf-per-output with zero interaction; OrbStack (headless) only " +
       "verifies the install/systemd/enrolment plumbing.",
   );
   if (opts.render === "auto") {

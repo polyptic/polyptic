@@ -15,7 +15,7 @@
   first-class and named; machines are plumbing — so the rich, per-screen affordances live here.
 
   Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine, and via
-  ScreenRow: identScreen / renameScreen). No new endpoints, no direct fetch.
+  ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints, no direct fetch.
 -->
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
@@ -235,6 +235,8 @@ function drives(m: MachineView): string {
                   :key="s.id"
                   :screen="s"
                   :machine-label="m.label"
+                  :machine-online="m.online"
+                  @notify="showToast"
                 />
               </div>
               <div v-else class="no-screens">

@@ -208,6 +208,7 @@ registerRestRoutes(
   },
   tokens,
   activity,
+  presence,
 );
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).

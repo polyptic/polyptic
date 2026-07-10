@@ -155,7 +155,7 @@ The image is built **up from `ubuntu-base`**, not trimmed down from Ubuntu's liv
 - **The root image is a bare `rootfs.squashfs`.** dracut's netboot mechanism is `root=live:<url>`: `livenet` curls the squashfs into the initramfs tmpfs and `dmsquash-live` loop-mounts it under an overlayfs. No ISO wrapper, no `xorriso`, no casper metadata.
 - **Firmware is curated, not complete.** 26.04 splits `linux-firmware` into per-vendor packages; the image ships `linux-firmware-minimal` plus the two GPU vendors and Realtek NICs. Note that `linux-image-generic` **Depends** on the full `linux-firmware` (~600 MB) — which `--no-install-recommends` cannot decline — so the build installs the *concrete* `linux-image-<abi>-generic` instead. A box with unanticipated hardware gets a black screen or a dead NIC: rebuild with `FULL_FIRMWARE=1`, or extend `FIRMWARE_PACKAGES`.
 - **RAM sizing:** the squashfs lands in a tmpfs, so a box needs roughly **the image size plus the running system's working set**. The initrd's `polyptic-live` dracut module raises the tmpfs cap from the kernel's default 50% of RAM to 90%, and prints a plain-English message below the floor. Never pass `rd.live.ram=1` — it `dd`s a *second* full copy of the image into RAM.
-- The kiosk browser is **surf** (`BROWSER=` overrides). Ubuntu's Chromium is snap-only; `cog` was dropped from the archive after 25.04.
+- The kiosk browser is **surf**, the only one Polyptic ships (D63). It is installed with `xwayland` (surf is an X11 client) and `xdotool` (the on-screen Web Inspector, POL-50).
 
 ### The live ISO (macOS or Linux)
 

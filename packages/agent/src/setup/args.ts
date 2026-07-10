@@ -6,7 +6,6 @@
  */
 
 export type Backend = "wayland-sway" | "x11-i3" | "dev-open";
-export type BrowserChoice = "chromium" | "cog" | "surf";
 /** Renderer the compositor launcher uses (POLYPTIC_RENDER). `auto` picks empirically at boot. */
 export type RenderMode = "auto" | "hardware" | "software";
 
@@ -35,9 +34,6 @@ export interface SetupOptions {
   outputs: OutputPin[];
   /** Renderer baked into the compositor launcher (POLYPTIC_RENDER). Default `auto`. */
   render: RenderMode;
-  browser: BrowserChoice;
-  chromiumDeb?: string;
-  chromiumPpa?: string;
   /** Path the systemd unit launches (the installed single binary). */
   agentBin: string;
   /** agent.toml path. */
@@ -80,7 +76,6 @@ export function parseArgs(argv: string[]): SetupOptions {
     user: "kiosk",
     outputs: [],
     render: "auto",
-    browser: "chromium",
     agentBin: "/usr/local/bin/polyptic-agent",
     configPath: "/etc/polyptic/agent.toml",
     start: false,
@@ -154,23 +149,6 @@ export function parseArgs(argv: string[]): SetupOptions {
         opts.render = v;
         break;
       }
-      case "--browser": {
-        const v = need(i, a);
-        i++;
-        if (v !== "chromium" && v !== "cog" && v !== "surf") {
-          throw new Error(`--browser must be chromium | cog | surf (got "${v}")`);
-        }
-        opts.browser = v;
-        break;
-      }
-      case "--chromium-deb":
-        opts.chromiumDeb = need(i, a);
-        i++;
-        break;
-      case "--chromium-ppa":
-        opts.chromiumPpa = need(i, a);
-        i++;
-        break;
       case "--agent-bin":
         opts.agentBin = need(i, a);
         i++;
@@ -210,19 +188,19 @@ export function parseArgs(argv: string[]): SetupOptions {
 }
 
 export function usage(): string {
-  return `polyptic-agent setup — provision a stock box into a Polyptic kiosk (D26/D27)
+  return `polyptic-agent setup — provision a stock box into a Polyptic kiosk (D26/D63)
 
 USAGE
   polyptic-agent setup [options]              provision (idempotent)
   polyptic-agent setup uninstall [--purge]    tear down / restore the prior display manager
 
 WHAT IT DOES (each step idempotent + logged; --dry-run previews without changes)
-  distro-detect (apt/dnf/pacman) -> install deps (greetd, sway, .deb Chromium, grim, wayvnc, fonts,
+  distro-detect (apt/dnf/pacman) -> install deps (greetd, sway, surf, xwayland, xdotool, grim, fonts,
   plymouth) -> create the kiosk user -> write /etc/greetd/config.toml (autologin -> compositor)
   -> write the sway/i3 config (pin outputs, no idle/blank, dpms on, hand off to systemd)
   -> write the systemd user unit(s) (polyptic-agent, Restart=always) -> write /etc/polyptic/agent.toml
   -> install the Polyptic boot splash (branded Plymouth theme + quiet/splash kernel cmdline, POL-7)
-  -> make greetd the display manager. Cold boot: splash -> greetd -> sway -> agent -> Chromium.
+  -> make greetd the display manager. Cold boot: splash -> greetd -> sway -> agent -> surf.
 
 OPTIONS
   --server-url <wss://host/agent>   control-plane URL (-> agent.toml). Omit to write agent.toml.example.
@@ -235,10 +213,6 @@ OPTIONS
                                     compositor crashes fast (virtual GPUs with no working 3D),
                                     so real GPUs are never handicapped; hardware/software force it.
   --connector <name>                single-output connector override (-> agent.toml).
-  --browser <chromium|cog|surf>     kiosk browser (default chromium; surf = suckless WebKitGTK, the
-                                    Ubuntu .deb kiosk browser; cog = WPE/WebKit fallback, D27).
-  --chromium-deb <path|url>         install a specific .deb Chromium (Ubuntu snap avoidance).
-  --chromium-ppa <ppa>              add a PPA that ships a real .deb Chromium (Ubuntu).
   --agent-bin <path>                binary the unit launches (default: /usr/local/bin/polyptic-agent).
   --config <path>                   agent.toml path (default: /etc/polyptic/agent.toml).
   --start                           also \`systemctl restart greetd\` now (default: take effect on reboot).
