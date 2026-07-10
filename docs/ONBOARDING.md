@@ -17,14 +17,23 @@ wizard** walks you through the last four; below is each step, plus the manual eq
 
 - A reachable **control plane** (the server) — e.g. `http://CONTROL_PLANE:8080`. The new box must be
   able to reach it; it does **not** need the internet (see *Provisioning* in the README / `docs/DEPLOY.md`).
-- An **enrollment token** if the server runs in **gated** mode (recommended). Get it in the console under
-  **Settings → Enrollment** (copy or regenerate it), or it's whatever you set as `POLYPTIC_BOOTSTRAP_TOKEN`
-  at server boot. In **open** mode (no token, dev/lab) machines auto-approve and skip steps 1–3's gate —
-  the server logs a loud warning when open.
+- An **enrollment token** if the server runs in **gated** mode (recommended). A netbooted box gets it
+  automatically with its boot menu; you only need it by hand for the agent one-liner below. Read or
+  regenerate it in the console under **Settings → Enrolment token**, or it's whatever you set as
+  `POLYPTIC_BOOTSTRAP_TOKEN` at server boot. In **open** mode (no token, dev/lab) machines auto-approve
+  and skip steps 1–3's gate — the server logs a loud warning when open.
 
-## 1 · Provision the box (install the agent)
+## 1 · Provision the box
 
-Recommended — air-gapped, from the control plane:
+Recommended — **network boot**, no OS install and nothing typed on the box (D46/D47). Download the
+bootloader from **Settings → Onboard Screens** (or the cold-start wizard), flash it to a USB stick with
+Balena Etcher or Rufus, and boot the box from it with Secure Boot **on**. It streams the current live
+image into RAM over HTTP, brings up the kiosk stack, and enrols; the control-plane URL and the
+enrolment token come down with the boot menu the control plane serves. Netbooted boxes also pick up
+image updates on their own (D51). Booting without a stick — UEFI HTTP Boot, or DHCP option 67 — is
+behind the *Boot without a USB stick* disclosure in the same card.
+
+Alternative — the box **already runs Ubuntu** and you want the agent on that OS:
 
 ```bash
 # agent only (enrols; no display yet — good for proving the swarm first):
@@ -36,10 +45,12 @@ curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -s -- --
 
 The script bakes the control-plane URL in from the host you curled, writes `/etc/polyptic/agent.toml`
 (`server_url`, `bootstrap_token`), installs a `systemd` service, and starts the agent. It is the **only**
-supported way to install the agent (D41) — there is no standalone package to `apt install`.
+supported way to install the agent onto an existing OS (D41) — there is no standalone package to
+`apt install` — and unlike a netbooted box it takes no image updates.
 
-The agent identifies the machine by **`/etc/machine-id`**, so every box is distinct automatically. To
-advertise more than one output, set `POLYPTIC_OUTPUTS="HDMI-1,HDMI-2"` (or repeat `--output` in `setup`).
+The agent identifies the machine by **`/etc/machine-id`** (netbooted boxes: a stable DMI/MAC-derived id,
+since a diskless box has no persistent one), so every box is distinct automatically. To advertise more
+than one output, set `POLYPTIC_OUTPUTS="HDMI-1,HDMI-2"` (or repeat `--output` in `setup`).
 
 ## 2 · The machine dials in → **pending**
 
@@ -87,7 +98,7 @@ A screen starts **unplaced** (in the left tray on the Wall view). To put it on t
 4. **Save a scene (optional)** — *Save scene* snapshots the whole mural (layout + grouping + content) so
    you can re-apply the entire arrangement in one click, or schedule it.
 
-If the box was provisioned `--kiosk`, that screen is now showing the content for real; reboot it to
+If the box netbooted (or was provisioned `--kiosk`), that screen is now showing the content for real; reboot it to
 confirm the **zero-click cold boot** (power on → autologin → sway → agent reconnects on its credential →
 the wall renders its scene, no clicks, survives an end-of-day smart-plug cut).
 
@@ -98,7 +109,8 @@ the wall renders its scene, no clicks, survives an end-of-day smart-plug cut).
 The console's **Cold-start wizard** (launch it from **Machines → Connect a machine**, or the first-run
 empty state) bundles steps 2–5 into a flow:
 
-- **Step 1 · Connect** — shows the enrol command + token (and notes when the server is in open mode), then
+- **Step 1 · Connect** — offers the **bootloader download** and how to boot from it (and notes when the
+  server is in open mode; the agent one-liner is behind *The box already runs Ubuntu*), then
   **live-watches** for the new machine to appear pending and lets you **Approve** inline.
 - **Step 2 · Map screens** — for each new screen: **Ident** (flash the panel), **name** it, and **place**
   it on a mural. Finish → straight to the Wall.

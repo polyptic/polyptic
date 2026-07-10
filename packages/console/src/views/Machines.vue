@@ -110,8 +110,8 @@ function drives(m: MachineView): string {
         <span class="empty-glyph">▤</span>
         <span class="empty-title">No machines yet</span>
         <span class="empty-sub">
-          Bring a PC online behind your screens and it appears here for approval. The guided
-          first-run setup walks you through it.
+          Boot a PC behind your screens from the Polyptic bootloader and it appears here for
+          approval. The guided first-run setup walks you through it.
         </span>
         <button class="connect-btn ghost" @click="wizardOpen = true">Start first-run setup →</button>
       </div>
@@ -122,9 +122,9 @@ function drives(m: MachineView): string {
           <div class="enrol-text">
             <div class="enrol-title">Enrolling a machine</div>
             <div class="enrol-sub">
-              New machines dial in and present the operator-configured enrolment secret (the agent's
-              bootstrap token); if the server runs in open mode, none is required. Once connected, a
-              machine appears below as Pending — approve it to admit its screens.
+              Boot a box from the Polyptic bootloader and it streams the live image into RAM — no OS
+              install, nothing to type — then dials in and appears below as Pending. Approve it to
+              admit its screens.
             </div>
           </div>
           <button class="connect-btn ghost" @click="wizardOpen = true">Guided setup →</button>
