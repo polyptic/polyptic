@@ -18,6 +18,9 @@ has() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "contains: $2" "$3" ;; esac;
 hasnt() { case "$3" in *"$2"*) bad "$1" "must NOT contain: $2" "$3" ;; *) ok "$1" ;; esac; }
 
 conf() { printf '%s\n' "$@" > "$ROOT/wifi.conf"; }
+# Octal permissions, portably: GNU stat first (`-c`), BSD/macOS second (`-f`). The order matters —
+# GNU's `-f` is *filesystem* mode, which succeeds with a multi-line blob instead of failing over.
+perms() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 parse() { sh "$LIB/wifi-conf.sh" "$ROOT/wifi.conf" 2>"$ROOT/err"; }
 render() { POLYPTIC_WIFI_CERT_DIR="${CERTS:-/run/polyptic}" sh "$LIB/wifi-supplicant-conf.sh" "$ROOT/wifi.conf" 2>"$ROOT/err"; }
 
@@ -288,7 +291,7 @@ sw "$STUB"; rc=$?
 eq "handoff rc" 0 "$rc"
 has "handoff renders supplicant conf" "ssid=4d794e6574" "$(cat "$STUB/wpa/wpa_supplicant-wlan0.conf" 2>/dev/null)"
 has "handoff starts the unit" "start wpa_supplicant@wlan0.service" "$(cat "$STUB/systemctl.log" 2>/dev/null)"
-eq "supplicant conf is root-only" "600" "$(stat -f %Lp "$STUB/wpa/wpa_supplicant-wlan0.conf" 2>/dev/null || stat -c %a "$STUB/wpa/wpa_supplicant-wlan0.conf")"
+eq "supplicant conf is root-only" "600" "$(perms "$STUB/wpa/wpa_supplicant-wlan0.conf")"
 
 # 29) live-ISO path: creds under $LIVE_DIR/polyptic are staged (certs included) with tight perms.
 STUB="$ROOT/case29"; mkdir -p "$STUB/run" "$STUB/by-label" "$STUB/live/polyptic/certs"
@@ -297,7 +300,7 @@ printf 'WIFI_SSID=Corp\nWIFI_EAP=peap\nWIFI_IDENTITY=u\nWIFI_PASSWORD=p\nWIFI_CA
 printf 'PEM\n' > "$STUB/live/polyptic/certs/ca.pem"
 sw "$STUB"; rc=$?
 eq "iso path rc" 0 "$rc"
-eq "iso path staged conf" "600" "$(stat -f %Lp "$STUB/run/wifi.conf" 2>/dev/null || stat -c %a "$STUB/run/wifi.conf")"
+eq "iso path staged conf" "600" "$(perms "$STUB/run/wifi.conf")"
 eq "iso path staged cert" "PEM" "$(cat "$STUB/run/certs/ca.pem")"
 has "iso ca path points at the staging dir" "ca_cert=\"$STUB/run/certs/ca.pem\"" "$(cat "$STUB/wpa/wpa_supplicant-wlan0.conf")"
 
