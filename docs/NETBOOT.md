@@ -4,7 +4,7 @@ Boot a bare machine straight into Polyptic **over the network, into RAM**, no op
 
 This is the answer to two problems at once (POL-33 / [D46](DECISIONS.md), loader pivoted to the signed chain in [D47](DECISIONS.md)):
 
-1. **No hidden install step.** The old `curl … | sh` one-liner needed an OS on the box first, and it is gone (D57). Netboot removes the step entirely: the box has no OS until it fetches one, and it fetches a *live* one that never touches disk.
+1. **No hidden install step.** The old `curl … | sh` one-liner needed an OS on the box first, and it is gone (D58). Netboot removes the step entirely: the box has no OS until it fetches one, and it fetches a *live* one that never touches disk.
 2. **Who owns a booting box on a shared LAN?** **Ownership is by key, not by who-answered-the-network-first.** A box belongs to the server whose **enrolment token** its boot chain carries. So Polyptic never runs DHCP, and two control planes on one VLAN (staging next to production) coexist for free, each box carries exactly one server's key.
 
 And it does both **without touching Secure Boot**: the first boot stage is Ubuntu's already-signed shim + network GRUB, the exact binaries Canonical ships for its own netboot installer. Polyptic signs nothing and manages no keys. See [Secure Boot](#secure-boot) for precisely what is verified and what is not.

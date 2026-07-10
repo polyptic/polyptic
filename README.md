@@ -81,7 +81,7 @@ Per-output **JPEG thumbnails** (`grim`/`scrot`) flow up the agent channel and pa
 
 The control plane *is* the depot, and a machine needs to reach **only your server**. It never touches
 the internet, and nothing is installed on it: it **network-boots a live Polyptic image into RAM** and
-runs from there, Secure Boot left on (D46/D47/D57).
+runs from there, Secure Boot left on (D46/D47/D58).
 
 1. In the console, open **Settings → Onboard Screens** and download the network bootloader.
 2. Flash it to a USB stick (2 GB or larger) with Balena Etcher or Rufus.

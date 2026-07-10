@@ -1,5 +1,5 @@
 {{- /*
-Helm-hook Job (POL-35): build the downloadable boot medium (polyptic-boot.img +
+Boot-medium Job (POL-35): build the downloadable boot medium (polyptic-boot.img +
 the four signed loaders) onto the depot PVC at install/upgrade time, so the
 console's "Download bootloader" button works from minute one instead of waiting
 for the first weekly full rebuild (which also builds it, and keeps doing so).
@@ -13,13 +13,26 @@ Renders only when BOTH hold:
     on a volume no other pod can even see).
 
 The build is UNPRIVILEGED (curl + ar/tar/zstd + mtools, no root requirement
-beyond the container default) and takes ~30 s: it downloads the four pinned
-signed loader debs, verifies their sha256 pins, and assembles one FAT32 image.
-A re-run is deterministic, so post-upgrade simply re-bakes — which is what you
-want when bootHost changes. The scripts come from an initContainer running the
-SERVER image (version-locked, no chart-side copies), the same pattern as the
-rebuild Jobs. Pod affinity to the server pins the Job to the node holding the
+beyond the container default): it downloads the four pinned signed loader
+debs, verifies their sha256 pins, and assembles one FAT32 image. A re-run is
+deterministic, so an upgrade simply re-bakes — which is what you want when
+bootHost changes. The scripts come from an initContainer running the SERVER
+image (version-locked, no chart-side copies), the same pattern as the rebuild
+Jobs. Pod affinity to the server pins the Job to the node holding the
 ReadWriteOnce depot PVC.
+
+Deliberately NOT a helm hook. The first release shipped this as
+post-install/post-upgrade, and helm then BLOCKS the upgrade waiting for the
+hook: on a slow apt mirror the Job outlived helm's 5-minute default and the
+operator's upgrade reported "post-upgrade hooks failed: timed out" even
+though both the upgrade and (eventually) the Job succeeded (fpd-ago,
+2026-07-10). A plain Job named per release revision gets a fresh run on every
+install/upgrade without helm ever waiting on it; ttlSecondsAfterFinished
+garbage-collects the old ones.
+
+The Job chowns its output to the server's runtime uid (1000, `bun` in the
+server image): it writes as root, and a root-owned depot is what stopped the
+server from creating builds/ for retention (EACCES, same incident).
 
 Opt out with netboot.autoBuildMedium=false (the weekly full rebuild still
 builds the medium as before).
@@ -32,13 +45,12 @@ builds the medium as before).
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "polyptic.fullname" . }}-boot-medium
+  # Revision-suffixed: each helm install/upgrade creates a NEW Job (Job specs are immutable, and a
+  # fixed name would make the second upgrade a no-op). Old revisions are TTL-reaped.
+  name: {{ include "polyptic.fullname" . }}-boot-medium-r{{ .Release.Revision }}
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
     app.kubernetes.io/component: boot-medium
-  annotations:
-    helm.sh/hook: post-install,post-upgrade
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 2
   activeDeadlineSeconds: 600
@@ -82,6 +94,7 @@ spec:
               POLYPTIC_BASE={{ $bakeBase | quote }} bash /repo/deploy/build-boot-medium.sh;
               mkdir -p /depot/boot;
               cp -f /repo/deploy/dist/boot/* /depot/boot/;
+              chown -R 1000:1000 /depot/boot;
               echo "boot medium published to /depot/boot"
           volumeMounts:
             - name: repo

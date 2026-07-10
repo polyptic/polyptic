@@ -48,8 +48,11 @@ const TEST_TIMEOUT = 10_000;
 // (unknown-size) kernel with "big file signature isn't implemented yet", so the route must buffer it.
 const VMLINUZ_BYTES = "FAKE_POLYPTIC_VMLINUZ\x00" + "K".repeat(5_000_000) + "\nkernel-marker\n";
 const INITRD_BYTES = "FAKE_POLYPTIC_INITRD\x00initrd-marker\n";
+// Also LARGE (~5MB): Bun silently buffers SMALL streamed bodies and emits a Content-Length for
+// them, so only an above-threshold body makes the "root image is streamed, never buffered"
+// regression guard actually observe streaming.
 const ROOTFS_BYTES =
-  "FAKE_POLYPTIC_ROOTFS_SQUASHFS_" + "0123456789abcdef".repeat(8) + "\x00rootfs-marker\n";
+  "FAKE_POLYPTIC_ROOTFS_SQUASHFS_" + "R".repeat(5_000_000) + "\x00rootfs-marker\n";
 // A decoy by the OLD casper artifact name: proves the /dist/image 404 is the whitelist, not mere absence.
 const SQUASHFS_DECOY_BYTES = "FAKE_POLYPTIC_SQUASHFS_DECOY_MUST_NOT_BE_SERVED\n";
 const BOOT_MEDIUM_NAME = "polyptic-boot.img";
@@ -316,11 +319,17 @@ describe("netboot: GET /boot/grub.cfg", () => {
 
 describe("netboot: GET /dist/image/:arch/:file", () => {
   test(
-    "streams the full ISO (200) with Accept-Ranges",
+    "streams the full root image (200) with Accept-Ranges — and NEVER buffers it",
     async () => {
       const res = await fetch(`${OPEN_BASE}/dist/image/amd64/rootfs.squashfs`);
       expect(res.status).toBe(200);
       expect((res.headers.get("accept-ranges") ?? "").toLowerCase()).toBe("bytes");
+      // Streamed = chunked under Bun = no Content-Length. This is a REGRESSION GUARD, not an
+      // implementation detail: a Content-Length here means the route readFile()'d the whole image
+      // into a Buffer, which OOM-killed a 512Mi control-plane pod on every dracut fetch the day
+      // the image (486 MiB) dipped under the old 512 MiB buffer cap (fpd-ago, 2026-07-10). The
+      // fetchers of this artifact (dracut's curl, browsers) are chunked-capable by contract.
+      expect(res.headers.get("content-length")).toBeNull();
       expect(await res.text()).toBe(ROOTFS_BYTES);
     },
     TEST_TIMEOUT,

@@ -25,7 +25,7 @@ wizard** walks you through the last four; below is each step, plus the manual eq
 
 ## 1 · Boot the machine
 
-**Network boot is the only supported way to put Polyptic on a machine** (D57). There is no OS to
+**Network boot is the only supported way to put Polyptic on a machine** (D58). There is no OS to
 install and no agent to install: the machine boots the live image the control plane serves.
 
 1. Download the network bootloader from **Settings → Onboard Screens** (or the cold-start wizard) and

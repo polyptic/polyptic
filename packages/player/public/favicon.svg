@@ -1,0 +1,25 @@
+<!--
+  Polyptic mark — the FAVICON variant: ONE file that follows the browser's colour scheme.
+  Source of truth: packages/console/src/components/Logo.vue. Keep in sync with that component.
+
+  Same geometry as icon.svg / icon-dark.svg; the only difference is that the holder/panel fills are
+  driven by `prefers-color-scheme` instead of being baked in, so a single tab icon stays legible on
+  both a light and a dark browser tab strip. Browsers that ignore SVG favicons (Safari) fall back to
+  favicon.ico, which carries the canonical light-background mark.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="Polyptic">
+  <style>
+    .holder { fill: #18181b; }
+    .panel  { fill: #fafafa; }
+    @media (prefers-color-scheme: dark) {
+      .holder { fill: #fafafa; }
+      .panel  { fill: #18181b; }
+    }
+  </style>
+  <rect class="holder" width="32" height="32" rx="8.64"/>
+  <g transform="translate(3.84 3.84) scale(0.76)">
+    <polygon class="panel" points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" opacity=".62"/>
+    <polygon class="panel" points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" opacity=".62"/>
+    <rect class="panel" x="13.1" y="8" width="5.8" height="16"/>
+  </g>
+</svg>

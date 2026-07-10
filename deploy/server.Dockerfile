@@ -45,7 +45,7 @@ RUN cd packages/player && bun run build
 
 # ── Zero-touch depot: compile the agent single binary for BOTH arches ─────────
 # build-live-image.sh installs the matching binary into the live image's rootfs (the ONLY way an agent
-# reaches a machine, D57), and the control plane also streams them at GET /dist/agent/<arch>. Bun
+# reaches a machine, D58), and the control plane also streams them at GET /dist/agent/<arch>. Bun
 # cross-compiles the runtime INTO each binary, so this one image build produces amd64 AND arm64 — no
 # per-arch build host. (Same `bun build --compile` as deploy/build-agent.sh, inlined here.)
 # The version is baked in at compile time (POLYPTIC_VERSION build-arg → `--define`): the standalone

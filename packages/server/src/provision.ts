@@ -9,7 +9,7 @@
  *                                                   No boot path fetches it: the live image bakes the
  *                                                   binary in at build time. Kept for agent OTA (POL-28).
  *
- * NETBOOT (POL-33/D47) is the ONLY supported way a machine becomes a screen (D57). A bare machine boots
+ * NETBOOT (POL-33/D47) is the ONLY supported way a machine becomes a screen (D58). A bare machine boots
  * Ubuntu's SIGNED shim+GRUB chain over the network into a live Polyptic image in RAM, Secure Boot stays
  * ON, no OS install:
  *   GET /boot/grub.cfg                            → the generated GRUB menu with the control-plane base
@@ -280,29 +280,41 @@ export function parseRange(
 }
 
 /**
- * Cap under which a boot asset is served as a fully-buffered body (so it carries a Content-Length)
- * rather than a stream. GRUB's shim_lock verifier and UEFI reject an unknown-size / chunked body
- * (`verifiers.c`: an unknown size trips the "big file signature isn't implemented yet" guard, so a
- * Secure-Boot box will NOT load a chunked kernel), and Bun's HTTP server forces
- * `Transfer-Encoding: chunked` for ANY streamed body EVEN with an explicit Content-Length header, so
- * a complete Buffer is the only way to emit Content-Length. Every boot-critical artifact (vmlinuz,
- * initrd, the signed `.efi` loaders, the dongle `.img`) is comfortably under this; only the root image
- * and the downloadable live ISO can exceed it, and those are fetched by dracut's curl inside the
- * initramfs (chunked-capable) or by a browser, never by GRUB, so streaming them is fine. 512 MiB.
+ * Whether a boot asset must be served FULLY BUFFERED so the response carries a Content-Length.
+ * GRUB's shim_lock verifier and UEFI reject an unknown-size / chunked body (`verifiers.c`: an
+ * unknown size trips the "big file signature isn't implemented yet" guard, so a Secure-Boot box
+ * will NOT load a chunked kernel), and Bun's HTTP server forces `Transfer-Encoding: chunked` for
+ * ANY streamed body EVEN with an explicit Content-Length header — so a complete Buffer is the only
+ * way to emit Content-Length, and the GRUB/firmware-fetched artifacts must take it.
+ *
+ * The decision is BY FETCHER, never by size. The old rule (buffer anything under a 512 MiB cap)
+ * OOM-killed the control plane in the field the day the root image shrank below the cap: a 486 MiB
+ * `rootfs.squashfs` suddenly qualified for `readFile()` into a 512Mi-limited pod, every dracut
+ * fetch crash-looped the server, and the netbooting box saw 502/503 (fpd-ago, 2026-07-10). What
+ * GRUB fetches (vmlinuz, initrd, the signed `.efi` loaders, the dongle `.img`) is tens of MB and
+ * safe to buffer; what userspace fetches (`rootfs.squashfs` via dracut's curl, `polyptic-live.iso`
+ * via a browser) is chunked-capable and streams, whatever its size.
  */
-const BOOT_ASSET_BUFFER_MAX = 512 * 1024 * 1024;
+const GRUB_FETCHED_IMAGE_FILES = new Set(["vmlinuz", "initrd"]);
+
+/** Range slices up to this many bytes are buffered so the 206 carries an exact Content-Length
+ *  (GRUB and the firmware only ever range small files); larger slices stream. Keeps a resuming
+ *  browser download of the live ISO — `Range: bytes=N-` over hundreds of MB — from re-creating
+ *  the whole-file-buffer OOM through the side door. 8 MiB. */
+const RANGE_BUFFER_MAX = 8 * 1024 * 1024;
 
 /**
- * Serve `abs` (a known-`size` regular file) as a boot asset: honour a byte Range, and for a non-range
- * response emit a Content-Length so GRUB/UEFI can verify + size it. Buffers the body up to
- * {@link BOOT_ASSET_BUFFER_MAX} (Bun only emits Content-Length for a complete Buffer, not a stream);
- * larger files (the root image) stream. Callers set any extra headers (e.g. Content-Disposition) first.
+ * Serve `abs` (a known-`size` regular file) as a boot asset: honour a byte Range, and — when
+ * `buffer` is set because GRUB/the firmware is the fetcher — emit a Content-Length by sending a
+ * complete Buffer. Everything else streams (Bun sends streams chunked; curl and browsers are
+ * fine with that). Callers set any extra headers (e.g. Content-Disposition) first.
  */
 async function sendBootAsset(
   reply: FastifyReply,
   abs: string,
   size: number,
   rangeHeader: string | string[] | undefined,
+  buffer: boolean,
 ): Promise<unknown> {
   reply.header("Cache-Control", "no-store");
   reply.header("X-Content-Type-Options", "nosniff");
@@ -318,25 +330,29 @@ async function sendBootAsset(
   if (range) {
     const { start, end } = range;
     const len = end - start + 1;
-    // Read the (bounded) slice into a Buffer so the 206 carries a real Content-Length, not chunked.
-    const buf = Buffer.allocUnsafe(len);
-    const fh = await open(abs, "r");
-    try {
-      await fh.read(buf, 0, len, start);
-    } finally {
-      await fh.close();
-    }
     reply.code(206);
     reply.header("Content-Range", `bytes ${start}-${end}/${size}`);
-    reply.header("Content-Length", String(len));
-    return reply.send(buf);
+    if (len <= RANGE_BUFFER_MAX) {
+      // Small slice: buffer it so the 206 carries a real Content-Length, not chunked.
+      const buf = Buffer.allocUnsafe(len);
+      const fh = await open(abs, "r");
+      try {
+        await fh.read(buf, 0, len, start);
+      } finally {
+        await fh.close();
+      }
+      reply.header("Content-Length", String(len));
+      return reply.send(buf);
+    }
+    // Big slice (a browser resuming the live ISO): stream the window, never allocate it.
+    return reply.send(createReadStream(abs, { start, end }));
   }
-  if (size <= BOOT_ASSET_BUFFER_MAX) {
+  if (buffer) {
     // A Buffer body (not a stream) is what makes Bun emit Content-Length; GRUB requires it.
     reply.header("Content-Length", String(size));
     return reply.send(await readFile(abs));
   }
-  // Only the large root images land here: streamed (chunked), fetched by curl, never by GRUB.
+  // Userspace-fetched artifacts (root image, live ISO): streamed, chunked, O(1) memory.
   return reply.send(createReadStream(abs));
 }
 
@@ -464,7 +480,7 @@ export function registerProvisionRoutes(
       return reply.code(404).send({ error: "build artifact not retained" });
     }
     if (!st.isFile()) return reply.code(404).send({ error: "build artifact not retained" });
-    return sendBootAsset(reply, abs, st.size, request.headers.range);
+    return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 
   fastify.get("/dist/image/:arch/:file", async (request, reply) => {
@@ -483,8 +499,9 @@ export function registerProvisionRoutes(
     if (!st.isFile()) return reply.code(404).send({ error: "image not bundled" });
 
     // vmlinuz + initrd are fetched (and vmlinuz shim_lock-verified) by GRUB, which needs Content-Length;
-    // sendBootAsset buffers them for that. The ~1.5GB ISO streams (wget fetches it). Range-aware (206/416).
-    return sendBootAsset(reply, abs, st.size, request.headers.range);
+    // sendBootAsset buffers those two. The root image + live ISO stream (curl/browser fetch them,
+    // and buffering a ~500 MB body OOM-killed the pod in the field). Range-aware (206/416).
+    return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 
   // ── GET /dist/boot/:file, UNGATED download of the boot depot: the universal dd-able dongle
@@ -506,9 +523,9 @@ export function registerProvisionRoutes(
     if (!st.isFile()) return reply.code(404).send({ error: "boot file not bundled" });
 
     // The signed .efi loaders (offload + UEFI HTTP Boot fetch these via shim/firmware) and the dongle
-    // .img all need Content-Length; sendBootAsset buffers them (all well under the cap). Range-aware.
+    // .img all need Content-Length; sendBootAsset buffers them (a few MB to ~64 MB). Range-aware.
     reply.header("Content-Disposition", `attachment; filename="${file}"`);
-    return sendBootAsset(reply, abs, st.size, request.headers.range);
+    return sendBootAsset(reply, abs, st.size, request.headers.range, true);
   });
 
   // ── GET /api/v1/settings/netboot, GATED (auto: /api/v1 prefix → the global preHandler). Secret-free

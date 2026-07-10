@@ -100,7 +100,7 @@ Set on `docker run -e …`, the compose `environment:` / `.env`, or Helm `config
 
 The per-machine agent is **not** in the server image, and there is **no standalone `.deb`/`.rpm` to
 `apt install`**. There is also no `curl … | sh` installer any more: **`GET /install` and the substrate
-bundle routes were removed in D57**, superseding D41. A machine becomes a Polyptic display exactly one
+bundle routes were removed in D58**, superseding D41. A machine becomes a Polyptic display exactly one
 way, by **network-booting the live image the control plane serves**:
 
 1. Console → **Settings → Onboard Screens** → **Download bootloader**.

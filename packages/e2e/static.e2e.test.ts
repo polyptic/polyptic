@@ -50,6 +50,10 @@ const TEST_TIMEOUT = 10_000;
 const CONSOLE_INDEX_HTML = "<!doctype html><html><head><title>polyptic-console</title></head><body><div id=\"app\">CONSOLE_INDEX_MARKER</div></body></html>";
 const CONSOLE_APP_JS = "/* CONSOLE_APP_JS_MARKER */ window.__polyptic_console__ = true;\n";
 const PLAYER_INDEX_HTML = "<!doctype html><html><head><title>polyptic-player</title></head><body><div id=\"app\">PLAYER_INDEX_MARKER</div></body></html>";
+// Favicons (POL-56) live at each SPA's dist ROOT, not under assets/ — a placement @fastify/static's
+// boot-time glob has to pick up for the browser's bare /favicon.ico request to be answered.
+const CONSOLE_FAVICON_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><!-- CONSOLE_FAVICON_MARKER --></svg>";
+const PLAYER_FAVICON_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><!-- PLAYER_FAVICON_MARKER --></svg>";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -62,7 +66,9 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 //
 //   consoleDir/index.html
 //   consoleDir/assets/app.js
+//   consoleDir/favicon.svg
 //   playerDir/index.html
+//   playerDir/favicon.svg
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -77,9 +83,11 @@ function fabricateSpaRoots(): void {
   mkdirSync(join(consoleDir, "assets"), { recursive: true });
   writeFileSync(join(consoleDir, "index.html"), CONSOLE_INDEX_HTML, "utf8");
   writeFileSync(join(consoleDir, "assets", "app.js"), CONSOLE_APP_JS, "utf8");
+  writeFileSync(join(consoleDir, "favicon.svg"), CONSOLE_FAVICON_SVG, "utf8");
 
   mkdirSync(playerDir, { recursive: true });
   writeFileSync(join(playerDir, "index.html"), PLAYER_INDEX_HTML, "utf8");
+  writeFileSync(join(playerDir, "favicon.svg"), PLAYER_FAVICON_SVG, "utf8");
 }
 
 function removeSpaRoots(): void {
@@ -211,6 +219,53 @@ describe("phase 8 static SPA serving", () => {
         expect(body).not.toContain("CONSOLE_INDEX_MARKER");
         expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("html");
       }
+    },
+    TEST_TIMEOUT,
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Favicons (POL-56): served from each SPA's dist root, each under its own base.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  test(
+    "GET /favicon.svg serves the Console favicon from the dist root",
+    async () => {
+      const res = await fetch(`${BASE}/favicon.svg`);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain("CONSOLE_FAVICON_MARKER");
+      // The real icon bytes, NOT the SPA fallback html — a browser would silently drop an HTML icon.
+      expect(body).not.toContain("CONSOLE_INDEX_MARKER");
+      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/svg+xml");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "GET /player/favicon.svg serves the PLAYER favicon, not the Console's",
+    async () => {
+      const res = await fetch(`${BASE}/player/favicon.svg`);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      // Each SPA root carries its own copy; /player/ must resolve within the player dist.
+      expect(body).toContain("PLAYER_FAVICON_MARKER");
+      expect(body).not.toContain("CONSOLE_FAVICON_MARKER");
+      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/svg+xml");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "GET /favicon.ico with no such file is a real 404, NOT the SPA fallback html",
+    async () => {
+      // The regression this pins: `looksLikeNavigation` must treat an icon request as an ASSET fetch.
+      // Answering it with index.html would make a missing favicon look like a 200 to every crawler
+      // and bury the real breakage.
+      const res = await fetch(`${BASE}/favicon.ico`);
+      expect(res.status).toBe(404);
+      const body = await res.text();
+      expect(body).not.toContain("CONSOLE_INDEX_MARKER");
+      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("json");
     },
     TEST_TIMEOUT,
   );

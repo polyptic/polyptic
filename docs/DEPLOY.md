@@ -8,7 +8,7 @@ How a bare Linux box becomes a Polyptic display. This is the **device** guide (t
 
 ---
 
-## The model — "just boot it" (D26 / D27 / D35 / D57)
+## The model — "just boot it" (D26 / D27 / D35 / D58)
 
 Polyptic deliberately splits the machine from the brain:
 
@@ -17,7 +17,7 @@ Polyptic deliberately splits the machine from the brain:
 
 That split is the whole point — it replaces "a fragile per-machine boot script that clicks here, waits, opens a browser, and types a password in plaintext" with **one declarative control plane + thin reconciling agents**.
 
-**Netboot is the ONLY provisioning path (D57, superseding D41).** The agent is a Bun single binary baked into the live image at build time; the machine streams that image from the one server it can reach and nothing else. There is **no** standalone `.deb`/`.rpm` to `apt install`, no first-boot package hook, and no `curl … | sh` installer (the `GET /install` route and the substrate-bundle routes were removed). The provisioning logic still lives in the binary (`polyptic-agent setup`), one source of truth — it just runs when the *image* is built, not when a box is touched.
+**Netboot is the ONLY provisioning path (D58, superseding D41).** The agent is a Bun single binary baked into the live image at build time; the machine streams that image from the one server it can reach and nothing else. There is **no** standalone `.deb`/`.rpm` to `apt install`, no first-boot package hook, and no `curl … | sh` installer (the `GET /install` route and the substrate-bundle routes were removed). The provisioning logic still lives in the binary (`polyptic-agent setup`), one source of truth — it just runs when the *image* is built, not when a box is touched.
 
 **The substrate is borrowed, not built (D27).** The image is built up from `ubuntu-base` — the kernel's DRM/KMS already drives the panel. We add only a **compositor** (`sway`) and a **browser** (a **`.deb` Chromium**, *not* the snap — see [Troubleshooting](#snap-chromium-avoid-it)), no desktop environment, no GDM/GNOME to fight. `cog` / WPE WebKit is the documented fallback for low-power clients.
 
@@ -39,7 +39,7 @@ server generates per request, so nothing is typed on the machine.
 
 ## Zero-touch, air-gapped netboot from the control plane
 
-This is the one and only way to provision a machine (D57): the machine **network-boots a live image into
+This is the one and only way to provision a machine (D58): the machine **network-boots a live image into
 RAM**, nothing is installed and nothing is written to disk. It suits everything from a normal LAN box to
 a machine that reaches **ONLY the server** — a locked-down VLAN, a shop-floor panel, a kiosk behind a
 captive firewall — because it pulls every byte from the one server it can see.
