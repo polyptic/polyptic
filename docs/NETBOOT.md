@@ -49,7 +49,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 
 **5. Make a box boot it**, pick **one**:
 
-- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and choose **Polyptic (Live)** or **Polyptic (Offload Bootloader)** at the menu. See [The boot medium](#the-boot-medium-dongle-or-offload).
+- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and take the default (**Polyptic**) or pick **Set up this screen to start without the USB stick** to offload the loader onto the box. See [The boot medium](#the-boot-medium-dongle-or-offload).
 - **No medium, UEFI HTTP Boot:** point the box's firmware Boot URI at `http://10.0.0.5:8080/dist/boot/shimx64.efi` (arm64: `shimaa64.efi`). See [No medium at all](#no-medium-at-all-uefi-http-boot).
 - **No medium, site DHCP:** add one option-67 rule to the DHCP you already run. See [Site DHCP option 67](#site-dhcp-option-67-one-change-to-the-dhcp-you-already-run).
 
@@ -63,7 +63,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 - Boots GRUB but stalls fetching → GRUB speaks minimal plain HTTP/1.1: **no TLS, no redirects, no chunked responses**, direct 200s with `Content-Length` only. Also expect the GRUB-stage kernel+initrd fetch to run at a few MB/s (tens of seconds); the big ISO fetch happens later, in Linux, at wire speed.
 - Downloads the root image then dies in the initramfs → **not enough RAM**. dracut pulls the whole squashfs into a RAM tmpfs; budget roughly **the image size plus the running system's working set** (the initrd raises the tmpfs cap to 90% and warns below the floor).
 - Boots the image but never appears in Machines → check the box reaches the control plane, and `journalctl -u polyptic-agent-env` (the identity/cmdline oneshot) on the box.
-- **Need a shell on a box?** Power-cycle and pick **Polyptic (Debug Console)** at the GRUB menu — the normal live boot plus a **passwordless root shell on tty9** (`Ctrl+Alt+F9`; `Ctrl+Alt+F1` returns to the wall). This is the *only* interactive access the image has: it ships no passwords and no SSH, so a running box is sealed and a debug boot is always a deliberate power-cycle away. It grants nothing an attacker with keyboard + power didn't already have (GRUB configs are unverified in the shim model, so the cmdline was always editable at the menu). The image carries `procps` (`top`, `ps`, `free`) for exactly this: diagnosing a hot or struggling box.
+- **Need a shell on a box?** Power-cycle and pick **Debug console** at the GRUB menu — the normal live boot plus a **passwordless root shell on tty9** (`Ctrl+Alt+F9`; `Ctrl+Alt+F1` returns to the wall). This is the *only* interactive access the image has: it ships no passwords and no SSH, so a running box is sealed and a debug boot is always a deliberate power-cycle away. It grants nothing an attacker with keyboard + power didn't already have (GRUB configs are unverified in the shim model, so the cmdline was always editable at the menu). The image carries `procps` (`top`, `ps`, `free`) for exactly this: diagnosing a hot or struggling box.
 - A box re-appears as a *new* PENDING machine each boot → its firmware reports no stable DMI UUID and the id fell back to a MAC hash that changed (multi-NIC); see [stable identity](#the-life-of-a-box-power-on-to-pixels).
 
 ---
@@ -110,9 +110,10 @@ All in [`packages/server/src/provision.ts`](../packages/server/src/provision.ts)
 
 | Route | Gate | What |
 |---|---|---|
-| `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu: `Polyptic (Live)` / `Polyptic (Offload Bootloader)` / `Polyptic (Debug Console)`, three flat entries. Bakes the control-plane base from the request `Host` and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
+| `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu: `Polyptic` / `Set up this screen to start without the USB stick` / `Debug console`, three flat entries (addressed by `--id live|offload|debug`). Bakes the control-plane base from the request `Host` and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
 | `POST /boot/report` | **token** | How a box's bootloader install went (POL-58) → one line in the Live Activity feed. The reporter is mid-boot with no agent session, hence not under `/api/v1`; in gated mode it must present the fleet enrolment token it netbooted with, in open mode it is ungated like the rest of the depot. Read-only against the registry, throttled, and the body can only produce one bounded line. |
 | `GET /grub/grub.cfg` (+ `/grub/x86_64-efi/grub.cfg`, `/grub/arm64-efi/grub.cfg`) | **ungated** | **Aliases of the same menu**, at the paths an HTTP-booted GRUB actually asks for: grubnet's baked-in prefix is `/grub`, resolved against the **server root** of the host it was fetched from. See [the appendix](#no-medium-at-all-uefi-http-boot). |
+| `GET /boot/theme.txt`, `GET /boot/logo.png` | **ungated** | The GRUB theme that makes the menu the [Polyptic boot splash](#the-boot-splash) rather than a text console. Secret-free; if either fails, GRUB shows its plain menu and the box still boots. |
 | `GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs}` | **ungated** | The **active** live-image artifacts, streamed with real HTTP **Range** (206/416); the root image is hundreds of MB and streamed into RAM. |
 | `GET /dist/image/:arch/builds/:imageId/:file` | **ungated** | The same artifacts for any **retained** build ([Build history](#build-history-and-rollback)). Same Range streaming, same secret-free content; `:imageId` is whitelisted so it cannot walk out of the depot. |
 | `GET /dist/boot/:file` | **ungated** | The universal boot medium `polyptic-boot.img`, plus the four signed loaders `shim{x64,aa64}.efi` / `grub{x64,aa64}.efi` (fetched by the offload flow and UEFI HTTP Boot). All **tokenless**, so ungated like `/dist/agent`. |
@@ -220,7 +221,7 @@ EFI/BOOT/BOOTX64.EFI    shim, amd64 (Microsoft-signed)
 EFI/BOOT/grubx64.efi    network GRUB, amd64 (Canonical-signed; shim loads it by this name from its own directory)
 EFI/BOOT/BOOTAA64.EFI   shim, arm64
 EFI/BOOT/grubaa64.efi   network GRUB, arm64
-grub/grub.cfg           stage 1: DHCP all NICs, then chain the server's /boot/grub.cfg (retry menu on failure)
+grub/grub.cfg           stage 1: paint the splash, DHCP all NICs, then chain the server's /boot/grub.cfg (retry menu on failure)
 ```
 
 Notes that matter:
@@ -232,14 +233,65 @@ Notes that matter:
 
 ---
 
+## The boot splash
+
+A wall screen is public signage. From power-on to content it shows one continuous dark, branded
+screen — no console text, no version numbers, no protocol names — because everything in the room can
+read it.
+
+The splash has **two painters**, and knowing which is which is the whole trick:
+
+| Who paints | When | What it draws |
+|---|---|---|
+| **GRUB** | from the moment the loader starts, while it fetches the kernel + initrd | The theme at `GET /boot/theme.txt` + `GET /boot/logo.png`: the Polyptic lockup on `#0b0b0d`, the boot menu, a countdown. |
+| **Plymouth** | from early kernel, through the image download, until the player paints | The `polyptic` theme baked into the initrd (D45), with the live status line the dracut module narrates. |
+
+**Plymouth cannot paint the first screen**, however much you want it to (POL-47). It is a userspace
+daemon inside the initramfs — the very thing GRUB is busy fetching when GRUB prints. So the fix runs
+the other way: GRUB paints a screen made to look like the splash, and hands its video mode to the
+kernel (`gfxpayload=keep`) so Plymouth takes over from the same dark, at the same resolution.
+
+That it costs nothing is a happy accident of what Canonical ships. The **signed** network GRUB we pin
+(D47) carries a squashfs memdisk holding `fonts/unicode.pf2` plus the `gfxterm`, `gfxmenu` and `png`
+modules — on both arches. So `loadfont (memdisk)/fonts/unicode.pf2` needs no network round trip and
+no new file on the boot medium; the control plane only has to serve the theme and the logo beside it.
+Secure Boot is untouched: a `grub.cfg` is not signature-verified, and the loaders are unchanged.
+
+**Everything graphical is guarded.** The block hangs off `if loadfont …; then`, so a GRUB that cannot
+find the font, the modules, or a video mode keeps its text console and boots identically. A theme that
+fails to parse, or a `logo.png` that 404s, degrades to GRUB's plain menu. None of it can stop a boot.
+
+Two places to keep in step, because neither can import the other and both end up on a wall:
+
+- `deploy/dongle-grub.cfg.tmpl` and the heredoc inside
+  [`offload.sh`](../deploy/live/usr/local/lib/polyptic/offload.sh) carry the stage-1 half verbatim
+  (the boot medium has no network yet, so it gets the background but not the themed menu).
+- `packages/server/assets/boot-logo.png` is rendered from the **same** `logoSvg()` the Plymouth theme
+  uses — GRUB has no SVG renderer, and there is nowhere to rasterise on a box with no OS. Rebuild it
+  with `bun deploy/render-boot-logo.ts` whenever the logo or the palette changes.
+
+`packages/e2e/boot-splash.test.ts` diffs all of it: the two shell copies against each other, the theme's
+dark against Plymouth's, and the committed PNG against the size the theme asks GRUB to draw.
+
+> **Resolution.** `set gfxmode=auto` makes GRUB **keep the mode the firmware is already in**, consulting
+> EDID only if it must change modes and falling back to 800x600 if that fails too. GRUB's mode only has
+> to be *something sane*: what the Plymouth splash renders at is settled later, by the real KMS driver
+> in the initramfs ([D64](DECISIONS.md)), which mode-sets the connector's preferred mode. Pinning a
+> resolution here would be the same mistake D64 rejected — no generic image knows the panel's size.
+> Under OVMF/QEMU the whole chain resolves to 800x600 because its GOP starts there and exposes no EDID;
+> that is a VM artifact, not what a panel does.
+
+---
+
 ## The boot medium: dongle or offload
 
 Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloader** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **byte-identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box. It is only read for a few seconds at power-on.
 
-Plug it in and the server-side menu offers:
+Plug it in and the server-side menu offers three flat entries (default after 5 s: the first):
 
-- **Boot Polyptic now**, leave the USB in. The box is fully **diskless**; nothing whatsoever is written locally. Best for disposable / hot-swap panels.
-- **Polyptic (Offload Bootloader)** writes *just the signed shim + GRUB pair* (the pointer, not the OS) into the box's **existing EFI System Partition** under `EFI/polyptic/`, drops the same stage-1 config at the ESP's `/grub/<arch>-efi/grub.cfg` (and `/grub/grub.cfg` when that path is free), and makes a UEFI boot entry (`efibootmgr`, "Polyptic Netboot") the firmware's **first** boot option. Pull the USB and the box self-boots the identical HTTP flow forever, **Secure Boot still ON** (the installed loaders are the same signed binaries). One USB can walk a rack, installing on each box.
+- **`Polyptic`** (`--id live`) — boot now, leave the USB in. The box is fully **diskless**; nothing whatsoever is written locally. Best for disposable / hot-swap panels.
+- **`Set up this screen to start without the USB stick`** (`--id offload`) writes *just the signed shim + GRUB pair* (the pointer, not the OS) into the box's **existing EFI System Partition** under `EFI/polyptic/`, drops the same stage-1 config at the ESP's `/grub/<arch>-efi/grub.cfg` (and `/grub/grub.cfg` when that path is free), and makes a UEFI boot entry (`efibootmgr`, "Polyptic Netboot") the firmware's **first** boot option. Pull the USB and the box self-boots the identical HTTP flow forever, **Secure Boot still ON** (the installed loaders are the same signed binaries). One USB can walk a rack, installing on each box.
+- **`Debug console`** (`--id debug`) — the live boot plus a passwordless root shell on tty9 (Ctrl+Alt+F9). The only interactive way into a sealed kiosk image. Never the default.
 
 > **The dongle depends on the firmware bringing the NIC up (POL-39).** GRUB carries no NIC
 > drivers of its own — `efinet` can only use a card the firmware has already initialised. Most
@@ -434,7 +486,7 @@ whole root image into a RAM tmpfs.)
   of PXE, and the boot-order NIC is still initialised, so dongle-GRUB is online. Verified: ~30 s
   to content.
 - **Offload flow:** attach an additional VirtIO disk that has a GPT + FAT32 ESP, boot the dongle and
-  pick **Polyptic (Offload Bootloader)**; the live boot writes the signed loaders + boot entry on the
+  pick **Set up this screen to start without the USB stick**; the live boot writes the signed loaders + boot entry on the
   disk, after which the box boots the same chain with the dongle removed.
   A VM's blank ESP exercises none of the firmware states that broke this on real hardware, which is
   what `deploy/live/test/offload.test.sh` is for: it drives the whole decision tree (removable media,
@@ -483,7 +535,7 @@ previously-built medium went stale at once**. Know the symptoms:
 
 | Medium | Symptom when the baked address is dead |
 | --- | --- |
-| Dongle / offloaded disk | GRUB drops to the fallback menu — `Retry (DHCP + chain again) / Reboot / Firmware setup` — because `configfile $net/boot/grub.cfg` can't fetch the server menu. |
+| Dongle / offloaded disk | GRUB says **`Could not reach the Polyptic control plane at …`** and drops to the fallback menu — `Try again / Restart this screen / Firmware setup` — because `configfile $net/boot/grub.cfg` can't fetch the server menu. |
 | Downloadable live ISO | Boots normally all the way to the splash, then sits at **"Starting up"** forever: the agent can't reach `polyptic.server_url` on its cmdline. The box never appears in the console. |
 | Server env `PLAYER_BASE_URL` | The sneakiest one: the box boots, **enrols, and shows Online in the console** — but the screen shows a white page reading **"Operation was cancelled"** (WebKit's error page). The agent reached the server fine; the *browser* couldn't load the player from the stale `PLAYER_BASE_URL` the server advertises. The agent's own capture thumbnail (Machines view) shows the same white page — that's how you tell it's the guest's browser, not the display. Restart the server with the corrected `PLAYER_BASE_URL`; agents re-apply on reconnect. |
 

@@ -18,6 +18,8 @@
  *   GET /grub/grub.cfg (+ per-arch aliases)       → the SAME menu where an HTTP-booted grubnet looks:
  *                                                   its baked prefix resolves to (http,host:port)/grub
  *                                                   at the server root, not next to the shim URL.
+ *   GET /boot/theme.txt, GET /boot/logo.png       → the GRUB theme that makes that menu the Polyptic
+ *                                                   splash rather than a text console (POL-47).
  *   GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
  *                                                   the four signed loaders (shim + GRUB .efi), TOKENLESS
@@ -39,8 +41,15 @@ import { BootReportBody, NetbootInfo } from "@polyptic/protocol";
 import type { BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
 import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
+
+/** The GRUB boot theme's one image (POL-47), committed beside the server sources and copied wholesale
+ *  into the Docker image. Resolved off this module rather than the repo root so it is found from any
+ *  CWD and in the container alike. Rebuild it with `bun deploy/render-boot-logo.ts`. */
+const BOOT_LOGO_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "assets", "boot-logo.png");
+
 
 /** Repo root (…/packages/server/src → repo) so the dev defaults find `deploy/dist` regardless of the
  *  server's CWD. In the Docker image the env (AGENT_DIST_DIR=/app/deploy/dist, etc.) overrides these. */
@@ -226,6 +235,13 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
  * carried belongs in the console, where the operator reads it before walking to the box, not in a GRUB
  * menu they are trying to get past. Offload is non-destructive by construction; nothing here needs a
  * safety interlock.
+ *
+ * The menu is also GRAPHICAL (POL-47/D65): see ./boot-theme.ts. Titles and the one line each entry
+ * echoes are written for whoever walks past the wall, not for whoever built the boot chain — this
+ * screen is on a public panel every time the box powers on, which is why D61's entry names do not
+ * survive here. `$arch` still selects the artifacts; it is no longer announced. The debug entry keeps
+ * its tty9 detail: it is the one line nobody sees unless they deliberately chose it. `set net=` must
+ * precede the preamble, which interpolates `$net` into the theme URL.
  */
 export function buildBootGrubCfg(base: string, token: string | undefined): string {
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
@@ -253,20 +269,23 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
     // safe to nest; a plain top-level menuentry never opened a context and always worked.
     "export arch",
     "export net",
+    ...bootGfxPreamble("$net/boot/theme.txt"),
     "set timeout=5",
     "set default=live",
-    'menuentry "Polyptic (Live)" --id live {',
-    '  echo "Polyptic: streaming the $arch live image into RAM ..."',
+    'menuentry "Polyptic" --id live {',
+    '  echo "Starting Polyptic ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
-    'menuentry "Polyptic (Offload Bootloader)" --id offload {',
-    '  echo "Polyptic: offload mode, the live image will install the loader, then keep booting ..."',
+    'menuentry "Set up this screen to start without the USB stick" --id offload {',
+    '  echo "Setting up this screen ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
-    'menuentry "Polyptic (Debug Console)" --id debug {',
-    '  echo "Polyptic: live boot + root shell on tty9 (Ctrl+Alt+F9) ..."',
+    // The one entry whose line may stay technical: nobody reads it unless they chose it deliberately,
+    // and by then `tty9` is the fact they walked to the box for.
+    'menuentry "Debug console" --id debug {',
+    '  echo "Starting Polyptic with a root shell on tty9 (Ctrl+Alt+F9) ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} systemd.debug-shell=1`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
@@ -513,6 +532,34 @@ export function registerProvisionRoutes(
   fastify.get("/grub/grub.cfg", serveBootConfig);
   fastify.get("/grub/x86_64-efi/grub.cfg", serveBootConfig);
   fastify.get("/grub/arm64-efi/grub.cfg", serveBootConfig);
+
+  // ── GET /boot/theme.txt + GET /boot/logo.png, the GRUB boot theme (POL-47). UNGATED and secret-free
+  //    for the same reason the menu above is: the box has no operator session at power-on. GRUB fetches
+  //    the theme named in `set theme=`, then resolves the theme's `logo.png` against the theme's own
+  //    directory — which is why the theme carries no base URL. Neither is on a 404-sensitive boot path:
+  //    if either fails, GRUB falls back to its plain text menu and the box still boots. ──
+  fastify.get("/boot/theme.txt", async (_request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    // A string reply makes Fastify set Content-Length; GRUB's http client rejects chunked encoding.
+    reply.type("text/plain; charset=utf-8");
+    return buildBootThemeTxt();
+  });
+
+  fastify.get("/boot/logo.png", async (_request, reply) => {
+    let png: Buffer;
+    try {
+      png = await readFile(BOOT_LOGO_PATH);
+    } catch {
+      return reply.code(404).send({ error: "boot logo not bundled" });
+    }
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    // A complete Buffer (not a stream) is the only way Bun emits Content-Length; GRUB requires it.
+    reply.header("Content-Length", String(png.length));
+    reply.type("image/png");
+    return reply.send(png);
+  });
 
   // ── POST /boot/report — the box tells the control plane how its bootloader install went (POL-58).
   //    The reporter is a diskless box mid-boot, before any agent session exists, so this lives beside

@@ -110,6 +110,13 @@ const COLORS = {
   accent: "#2563eb", // progress-bar fill
 } as const;
 
+/**
+ * The same palette, exported for the ONE other thing that paints a Polyptic screen: the GRUB boot
+ * menu (POL-47). GRUB runs before Plymouth exists, so it renders its own splash from a theme the
+ * control plane serves — and the two screens must be the same dark, or the hand-off flashes.
+ */
+export const SPLASH_COLORS = COLORS;
+
 /** #rrggbb → "r, g, b" as Plymouth 0..1 floats (its colour args are normalised). */
 function toPlymouthRgb(hex: string): string {
   const h = hex.replace("#", "");
@@ -144,17 +151,24 @@ export interface StampParams {
  * rounded holder, matching packages/console Logo.vue) plus the wordmark + "display node" subtitle.
  * This is THE swappable asset (POL-7): replace logo.svg (or logo.png) with the final designed lockup
  * and re-run setup. Vector, so it scales to any panel.
+ *
+ * Plymouth composites the lockup over its own background and wants it transparent; GRUB's theme
+ * engine is happier with an opaque tile, so `background` paints the field behind it (POL-47, used by
+ * `deploy/render-boot-logo.ts` to bake the server's `boot-logo.png`).
  */
-export function logoSvg(): string {
+export function logoSvg(opts: { background?: string } = {}): string {
   const holder = 136;
   const holderX = (640 - holder) / 2; // 252
   // glyph: the 32×32 Logo.vue viewBox scaled to 98px, centred in the 136px holder.
   const glyphScale = 98 / 32;
   const glyphX = holderX + (holder - 98) / 2;
   const glyphY = (holder - 98) / 2;
+  const field = opts.background
+    ? `\n  <rect x="0" y="0" width="640" height="280" fill="${opts.background}"/>`
+    : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!-- ${MANAGED} Placeholder Polyptic logo lockup — swap for the final designed asset (keep it SVG). -->
-<svg xmlns="http://www.w3.org/2000/svg" width="640" height="280" viewBox="0 0 640 280" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="280" viewBox="0 0 640 280" fill="none">${field}
   <rect x="${holderX}" y="0" width="${holder}" height="${holder}" rx="33" fill="${COLORS.holder}"/>
   <g transform="translate(${glyphX} ${glyphY}) scale(${glyphScale})">
     <polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" fill="${COLORS.glyph}" opacity="${COLORS.glyphOpacity}"/>
