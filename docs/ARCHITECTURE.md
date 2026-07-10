@@ -53,11 +53,11 @@ POST   /api/v1/machines/:id/reboot {reason?} # power-cycle one box (409 offline 
 POST   /api/v1/scenes                        # create immutable versioned scene
 POST   /api/v1/fleet:activate-scene {sceneId}
 GET    /api/v1/screens/:id/preview            # latest grim thumbnail
-POST   /api/v1/screens/:id:vnc                # open on-demand wayvnc tunnel
+POST   /api/v1/screens/:id/inspect {on}       # show the browser's Web Inspector ON that panel
 GET    /metrics                               # Prometheus
 WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack, reboot
 WS     /ui         (browser → server)          live layout, thumbnails, health
-WS     /player?screen=<id>  (Chromium → server) desired surfaces for this screen
+WS     /player?screen=<id>  (browser → server)  desired surfaces for this screen
 ```
 Transport: agents dial **outbound `wss://` only**. ~10s lease, full status on change / ~60s, ~40s grace, reconnect backoff+jitter. Each agent **caches its last-good slice** and keeps rendering through any controller outage.
 
@@ -69,8 +69,8 @@ power on
   → exec sway   (outputs pinned: `output DP-1 position 0 0 resolution 1920x1080`)
        └─ plymouth quit --retain-splash   ← splash frame held until sway paints (no console flash)
   → systemctl --user start sway-session.target
-       ├─ polyptic-agent.service          (Restart=always)
-       └─ chromium@<screen>.service × N     (Restart=always; one per output)
+       └─ polyptic-agent.service          (Restart=always)
+            └─ surf × N                    (one per output; the agent owns + respawns them)
   no swayidle · output * dpms on · power is the smart plug's job
 ```
 ### Boot splash (POL-7)
@@ -78,14 +78,18 @@ Instead of raw kernel/systemd console text, the wall shows a branded **Plymouth*
 ### Reboot from the control plane (POL-55)
 An operator can power-cycle one box from Console ▸ Machines (`POST /api/v1/machines/:id/reboot` → `server/reboot` on that machine's live agent socket). The agent is **unprivileged** and the live image ships neither `sudo` nor polkit, so it does not reboot the box itself: `polyptic-agent setup` writes a root-owned pair whose only capability is rebooting — `polyptic-reboot.path` watches `/run/polyptic/requests/reboot`, and `polyptic-reboot.service` consumes that file and runs `systemctl --no-block reboot`. The agent's whole escalation is creating an empty file in the one directory (`0770 root:kiosk`, made each boot by a `tmpfiles.d` drop-in) it may write into — no command string, no argument to smuggle. `/run` is tmpfs, so a request can never survive the reboot it caused. The agent answers `agent/reboot-ack` **before** going down; a box that declines (dev backend, non-Linux, no helper) stays up and its reason lands in the console's activity feed. Distinct from the fleet-wide image roll-out (D51), where each box polls the manifest and reboots *itself*.
 
-### Chromium launch (per output)
-`chromium --ozone-platform=wayland --app=<player-url?screen=ID> --user-data-dir=/home/kiosk/profiles/<ID> --password-store=basic --force-device-scale-factor=1 --no-first-run --no-default-browser-check --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars --noerrdialogs --disable-component-update --check-for-update-interval=31536000 --disable-features=Translate,InfobarUI`
-Before launch: sed-reset `exit_type`/`exited_cleanly` in `<profile>/Default/Preferences` so power cuts never show "Restore pages".
+### Browser launch (per output)
+`surf [-N] <player-url?screen=ID>` — one process per output (D63). surf is chromeless and fullscreen by nature, takes the URL as a **positional** argument, and has no profile/geometry flags: isolation is separate pids, placement is the compositor's job. `-N` enables the Web Inspector and is passed **only** when an operator asks for it (see below), so developer extras are never a keypress from a public panel.
+
+### On-screen inspector (POL-50)
+`POST /api/v1/screens/:id/inspect {on}` → `server/inspect` on that machine's agent socket. surf (WebKitGTK) exposes **no** browser-openable remote inspector — `WEBKIT_INSPECTOR_SERVER` answers neither HTTP nor a WebSocket upgrade, and its only client is another WebKitGTK app opening `inspector://`, which surf cannot load — so there is nothing to tunnel and the dev tools are shown *where the page is*. The agent relaunches that output's surf with `-N`, focuses the window, then sends **Ctrl+Shift+O** and a reload. Opening it is part of the launch, so a browser that crashes and respawns while being inspected comes back inspected. It answers `agent/inspect-ack`, and that ack alone sets `ScreenView.inspecting`, so the console never badges an inspector that isn't on the glass. A refusal leaves `inspecting` unchanged, so its reason rides back on `ScreenView.inspectError` — otherwise the console cannot tell "the wall said no" from "the wall hasn't answered". Turning it off relaunches without `-N`.
 
 ## Gotchas (don't relearn these)
 - **Wayland forbids client self-positioning** — `--window-position` is a no-op natively; placement goes through `sway` (config or `swaymsg` IPC). X11 + i3 is the fallback if a GPU/app misbehaves.
-- **Multiple Chromium share `app_id="chromium"`** under Wayland → `for_window [app_id]` can't disambiguate. Match on distinct **title**, run an **IPC placer** keyed on launch order, or force **XWayland** (`--ozone-platform=x11` + `--class=screen-a`).
-- **Each Chromium needs its own `--user-data-dir`** or a second launch just opens a tab in the first.
+- **surf is an X11 client**, so under sway it renders through **XWayland** — which sway starts lazily and only if the `xwayland` binary exists. Without the package the browser never opens and the wall sits black. The sway config must also import `DISPLAY` into the systemd user environment, or surf dies with `Can't open default display`.
+- **Placement is keyed on the child's PID**, matched off the `swaymsg -t subscribe` window-event stream: surf has no flag to set a per-output WM class, so matching on class alone would pick an arbitrary sibling.
+- **`xdotool key --window <id>` does nothing to a GTK app** — it delivers via `XSendEvent`, which GTK ignores. Synthetic input must go through **XTEST** (`xdotool key`, no `--window`) against the *focused* window. This is why the on-screen inspector focuses the surf window first.
+- **WebKit's Web Inspector does not backfill.** Opened after a page has loaded, its Console and Network tabs are empty — so the agent reloads the page right after opening it, which is the only way a failing *load* is observable.
 - **NVIDIA on wlroots** needs `nvidia-drm.modeset=1` (maybe `WLR_NO_HARDWARE_CURSORS`); verify hardware before committing to Wayland.
 - **Plymouth needs an initramfs rebuild + the right cmdline** — a theme dropped in `/usr/share/plymouth/themes` does nothing until `plymouth-set-default-theme -R` (rebuilds the initrd) AND `quiet splash` is on the kernel cmdline. Plymouth renders **PNG**, not SVG, so the vector logo is rasterised at install (needs `rsvg-convert`/`librsvg2-bin`). Without `plymouth quit --retain-splash`, quitting Plymouth blanks the VT before sway paints → a flash of console; retain-splash holds the last frame. Serial consoles can slow/garble the splash → `plymouth.ignore-serial-consoles`.
 - **Embedding a dashboard:** the source must permit framing (no `X-Frame-Options: deny`; if CSP is on, list the player origin in `frame-ancestors`). Keep player + content on **one registrable domain** so `SameSite=Lax` cookies survive in the iframe. If the dashboard tool has an embedding / anonymous-access setting, enable it; prefer a single-panel embed URL and bake **every** parameter (including any kiosk / full-screen flag) into the URL, since an in-iframe refresh can drop query state. Pin the source version and re-test embedding on upgrade.

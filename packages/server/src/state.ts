@@ -62,7 +62,7 @@ import type {
 import type { TokenService } from "./tokens";
 import type { ActivityLog } from "./activity";
 
-/** Where players live. The agent points each output's Chromium/browser at this base + ?screen=<id>. */
+/** Where players live. The agent points each output's browser at this base + ?screen=<id>. */
 const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
 
 /** Fallback canvas for a player that connects before its screen is known. */

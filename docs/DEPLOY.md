@@ -12,14 +12,14 @@ How a bare Linux box becomes a Polyptic display. This is the **device** guide (t
 
 Polyptic deliberately splits the machine from the brain:
 
-- **Booting the control plane's live image makes the machine a Polyptic display.** That is the entire on-device story. There is no OS to install and no agent to install: the machine network-boots a live image into RAM and runs a zero-click kiosk from there — passwordless autologin → a Wayland compositor → a supervised agent that runs a kiosk Chromium per output and dials home over `wss://`.
+- **Booting the control plane's live image makes the machine a Polyptic display.** That is the entire on-device story. There is no OS to install and no agent to install: the machine network-boots a live image into RAM and runs a zero-click kiosk from there — passwordless autologin → a Wayland compositor → a supervised agent that runs a kiosk browser per output and dials home over `wss://`.
 - **The console decides what it shows.** Nothing about *what content appears* is configured on the device. Once the box is enrolled and approved, the operator drags screens onto a mural and assigns content from the console; it arrives live over the player WebSocket. The device never holds a layout, a credential for any dashboard, or a per-machine boot script.
 
 That split is the whole point — it replaces "a fragile per-machine boot script that clicks here, waits, opens a browser, and types a password in plaintext" with **one declarative control plane + thin reconciling agents**.
 
 **Netboot is the ONLY provisioning path (D58, superseding D41).** The agent is a Bun single binary baked into the live image at build time; the machine streams that image from the one server it can reach and nothing else. There is **no** standalone `.deb`/`.rpm` to `apt install`, no first-boot package hook, and no `curl … | sh` installer (the `GET /install` route and the substrate-bundle routes were removed). The provisioning logic still lives in the binary (`polyptic-agent setup`), one source of truth — it just runs when the *image* is built, not when a box is touched.
 
-**The substrate is borrowed, not built (D27).** The image is built up from `ubuntu-base` — the kernel's DRM/KMS already drives the panel. We add only a **compositor** (`sway`) and a **browser** (a **`.deb` Chromium**, *not* the snap — see [Troubleshooting](#snap-chromium-avoid-it)), no desktop environment, no GDM/GNOME to fight. `cog` / WPE WebKit is the documented fallback for low-power clients.
+**The substrate is borrowed, not built (D27, D63).** The image is built up from `ubuntu-base` — the kernel's DRM/KMS already drives the panel. We add only a **compositor** (`sway`) and a **browser** (`surf`, the suckless WebKitGTK browser, plus `xwayland` and `xdotool`), no desktop environment, no GDM/GNOME to fight. There is exactly one supported kiosk browser.
 
 ---
 
@@ -28,7 +28,7 @@ That split is the whole point — it replaces "a fragile per-machine boot script
 In the console: **Settings → Onboard Screens → Download bootloader**. Flash `polyptic-boot.img` to a USB
 stick (2 GB or larger) with Balena Etcher or Rufus. Boot the target machine from it, Secure Boot on.
 
-It streams the current live image into RAM, comes up as a Chromium-per-output kiosk, and dials home. It
+It streams the current live image into RAM, comes up as a surf-per-output kiosk, and dials home. It
 shows **PENDING** in the console until an operator **Approves** it (Phase 2b). After approval its screens
 flip to the active scene. Done, and there are no on-device steps, ever.
 
@@ -67,7 +67,7 @@ The machine never touches the internet. Every byte it needs comes from the one s
 
 `deploy/build-live-image.sh` builds the rootfs up from `ubuntu-base`, installs the substrate, drops the
 agent binary in, and runs **`polyptic-agent setup`** inside the chroot to wire greetd autologin → sway →
-Chromium-per-output → the agent user unit, plus the boot splash (POL-7). The result is a bare
+surf-per-output → the agent user unit, plus the boot splash (POL-7). The result is a bare
 `rootfs.squashfs` that dracut boots with `root=live:<url>` (D55). Nothing is installed on the machine at
 boot; the whole OS lives in RAM and is re-pulled next power-on, which is what makes image updates
 automatic (D51).
@@ -105,52 +105,46 @@ power on
   → systemd --user             sway-session.target
        └─ polyptic-agent.service        (Restart=always)   ← the ONLY supervised unit
               ├─ enrols / reconnects over outbound wss://
-              └─ spawns + supervises  kiosk Chromium × N     (one --app window per output)
+              └─ spawns + supervises  surf × N               (one fullscreen window per output)
   zero clicks · zero sleeps · zero typed passwords
 ```
 
-**Model A — the agent owns its Chromium children.** systemd supervises *the agent*; the agent spawns one kiosk Chromium per output, places it on the right connector via `swaymsg` IPC, and **respawns** it if it dies. (An earlier sketch in `ARCHITECTURE.md`/`README.md` showed `chromium@<screen>.service × N` as separate systemd units; Phase 4 folds that supervision into the agent so a single process owns placement + lifecycle. The greetd → sway → systemd-supervised-agent spine is unchanged.)
+**Model A — the agent owns its browser children.** systemd supervises *the agent*; the agent spawns one `surf` per output, places it on the right connector via `swaymsg` IPC, and **respawns** it if it dies. (An earlier sketch showed one systemd unit per screen; Phase 4 folds that supervision into the agent so a single process owns placement + lifecycle. The greetd → sway → systemd-supervised-agent spine is unchanged.)
 
-**Why content changes don't relaunch the browser.** The Chromium URL is **fixed per screen** — it points at the player page for that screen (`…/player?screen=<id>`). `showScreen(connector, url)` only (re)launches or repoints Chromium **when the URL changes**; everything else (which dashboard, which scene) changes *inside* the player over its own WebSocket, with no reload (< ~150 ms, the "instant" non-negotiable). So a scene switch never touches the device's window stack.
+**Why content changes don't relaunch the browser.** The browser's URL is **fixed per screen** — it points at the player page for that screen (`…/player?screen=<id>`). `showScreen(connector, url)` only (re)launches or repoints surf **when the URL changes**; everything else (which dashboard, which scene) changes *inside* the player over its own WebSocket, with no reload (< ~150 ms, the "instant" non-negotiable). So a scene switch never touches the device's window stack.
 
-### Kiosk Chromium launch (per output)
+### Kiosk browser launch (per output)
 
-The backend launches Chromium with the **exact** flags from `ARCHITECTURE.md` → "Chromium launch (per output)":
+Polyptic ships exactly one kiosk browser: **`surf`**, the suckless WebKitGTK browser (D63). It is chromeless and fullscreen by nature, so the launch is as small as it looks:
 
 ```
-chromium \
-  --ozone-platform=wayland \
-  --app=<player-url?screen=ID> \
-  --user-data-dir=/home/kiosk/profiles/<ID> \
-  --password-store=basic \
-  --force-device-scale-factor=1 \
-  --no-first-run \
-  --no-default-browser-check \
-  --disable-session-crashed-bubble \
-  --hide-crash-restore-bubble \
-  --disable-infobars \
-  --noerrdialogs \
-  --disable-component-update \
-  --check-for-update-interval=31536000 \
-  --disable-features=Translate,InfobarUI
+surf [-N] <player-url?screen=ID>
 ```
 
-- `--ozone-platform=wayland` runs Chromium natively on sway (the x11/i3 fallback uses `--ozone-platform=x11`).
-- `--app=<url>` gives a frameless, chrome-less window; **sway** makes it fullscreen on its assigned output (Wayland forbids the client positioning itself — see below). The `x11-i3` backend can use `--kiosk` plus a `--class=screen-<id>` so i3 can match and fullscreen it.
-- `--user-data-dir=/home/kiosk/profiles/<ID>` is **mandatory and distinct per output** — a second Chromium sharing a profile just opens a *tab* in the first, not a new window.
-- `--password-store=basic` stops Chromium blocking on a GNOME-keyring/secret-service prompt that doesn't exist on a headless server.
-- The popup-suppression set (`--disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars --noerrdialogs`) plus the Preferences reset below is what keeps an unattended panel clean after a power cut.
+- The URL is a **positional** argument and must come last — surf has no `--app=`.
+- **No profile flag.** surf has no `--user-data-dir`; per-output isolation is simply one process per output. Nothing to reset, nothing to share.
+- **No geometry flags.** Wayland forbids a client positioning itself anyway: sway fullscreens and places each window on its output via `swaymsg` IPC, matched on the child's **pid**.
+- **`-N` enables the Web Inspector**, and is passed only when an operator asks for it (see below). A sealed kiosk does not carry developer extras by default.
+- `POLYPTIC_BROWSER_ARGS` appends extra flags for a lab; `POLYPTIC_SURF` overrides the binary path.
 
-**Before each launch, reset the crash flags.** Power cuts (the EOD smart-plug) leave Chromium thinking it crashed, which pops a "Restore pages" bar over the content. The backend `sed`-resets `exit_type` → `"Normal"` and `exited_cleanly` → `true` in `/home/kiosk/profiles/<ID>/Default/Preferences` *before* relaunch, so the wall comes up clean every time.
+surf is an **X11** client, so under the `wayland-sway` backend it renders through **XWayland**. `setup` therefore installs `xwayland` alongside it (sway starts XWayland lazily, but only if the binary exists — without it the wall stays black), and the sway config imports `DISPLAY` into the systemd user environment (without it surf dies with `Can't open default display`).
+
+### Debugging what a screen is actually rendering (POL-50)
+
+A wall you can only debug by photographing it is a wall you can't debug. WebKitGTK exposes **no** browser-openable remote inspector — `WEBKIT_INSPECTOR_SERVER` opens a port that answers neither HTTP nor a WebSocket upgrade, and its only client is another WebKitGTK app opening `inspector://host:port`, which surf itself cannot load. There is nothing to tunnel to your laptop, so the inspector is shown **on the panel**:
+
+**Console ▸ Machines ▸ (a screen) ▸ Inspect.** The agent relaunches that output's surf with `-N`, focuses it, and sends `Ctrl+Shift+O` followed by a reload — the reload matters, because WebKit's inspector does not backfill a load that already finished, which is exactly the kind of failure you are usually chasing. Elements / Console / **Network** / Sources appear on the screen; walk over and read them. Press **Inspect** again to close it and re-seal the box.
+
+Requires `xdotool` on the box (`setup` installs it). If a screen's machine is offline the button is disabled — the request rides the agent socket, not the player's.
 
 ### Crash hardening (don't relearn these)
 
 | Hardening | Where | Why |
 |---|---|---|
-| `Restart=always` on `polyptic-agent.service` | systemd unit | agent (and via Model A, its Chromium children) always comes back |
-| agent respawns dead Chromium children | agent / backend | a crashed tab never leaves a black output |
-| `exit_type` / `exited_cleanly` reset before launch | backend, in `Preferences` | no "Restore pages" bar after a power cut |
-| popup-suppression flags | Chromium launch | no infobars / crash bubbles / error dialogs on an unattended screen |
+| `Restart=always` on `polyptic-agent.service` | systemd unit | agent (and via Model A, its browser children) always comes back |
+| agent respawns dead browser children | agent / backend | a crashed page never leaves a black output |
+| stale-instance reap keyed on the player URL | agent / backend | an orphan surf from a crashed agent never fights the new one |
+| chromeless by construction | `surf` | no infobars, no crash bubbles, no restore prompts on an unattended screen |
 | **no** `swayidle` installed | sway session | the wall never blanks itself |
 | `output * dpms on` | sway config | outputs forced on at session start |
 | autologin via greetd `initial_session` | greetd config | no login prompt, no typed password on cold boot |
@@ -170,7 +164,7 @@ chromium \
 
 ## The provisioner under the hood (`polyptic-agent setup`)
 
-`deploy/build-live-image.sh` runs this inside the image's chroot — you don't normally call it by hand. `setup` is the idempotent provisioner baked into the agent binary (D7 — the binary embeds no npm runtime and shells out to `swaymsg`/`chromium`/`grim` via `node:child_process`, so there is nothing to `npm install` on the device). It detects the distro, ensures the substrate deps (`greetd`, `sway`, a **`.deb`** Chromium not the snap, `grim`, plus `scrot`/`imagemagick` for the x11 path), creates the **`kiosk`** user, writes the greetd autologin config, the sway config (outputs, `dpms on`, no idle), the systemd unit(s), the **boot splash** (POL-7), and `/etc/polyptic/agent.toml`, then enables them.
+`deploy/build-live-image.sh` runs this inside the image's chroot — you don't normally call it by hand. `setup` is the idempotent provisioner baked into the agent binary (D7 — the binary embeds no npm runtime and shells out to `swaymsg`/`surf`/`grim` via `node:child_process`, so there is nothing to `npm install` on the device). It detects the distro, ensures the substrate deps (`greetd`, `sway`, `surf`, `xwayland`, `xdotool`, `grim`, plus `scrot`/`imagemagick` for the x11 path), creates the **`kiosk`** user, writes the greetd autologin config, the sway config (outputs, `dpms on`, no idle), the systemd unit(s), the **boot splash** (POL-7), and `/etc/polyptic/agent.toml`, then enables them.
 
 You'd call it when building a custom image, or on a running machine to switch backend, pin outputs, or swap the splash logo. It converges without piling up duplicate state:
 
@@ -206,7 +200,7 @@ These map onto the agent's environment knobs (the systemd unit exports them): `P
 
 1. The machine booted the live image straight into the chain above. There is no install step and no reboot to remember.
 2. The agent dials out, sends `agent/hello` with the bootstrap token, and the server replies `server/enrolled` + `server/pending`. It now shows up **PENDING** in the console's enrollment view. The connection stays open; a rejected/unknown machine backs off and retries slowly (~60 s) rather than hammering.
-3. An operator **Approves** the machine in the console. The server sends `server/apply` and the agent points each output's Chromium at its player URL. (Approval admits the *machine*; in Phase 3 an approved screen still has to be **dragged onto a mural** before it shows scene content — until then the player shows its idle/unplaced state.)
+3. An operator **Approves** the machine in the console. The server sends `server/apply` and the agent points each output's browser at its player URL. (Approval admits the *machine*; in Phase 3 an approved screen still has to be **dragged onto a mural** before it shows scene content — until then the player shows its idle/unplaced state.)
 4. From then on the device reconnects automatically with its durable credential on every cold boot — no token, no clicks.
 
 ---
@@ -222,8 +216,8 @@ The agent selects a `DisplayBackend` at boot (override with `--backend` / `POLYP
 A few Wayland realities the backend has to handle (from `ARCHITECTURE.md` → "Gotchas"):
 
 - **Wayland forbids client self-positioning.** `--window-position` is a no-op; *all* geometry goes through sway (config or `swaymsg`). This is a feature — one authoritative place for placement.
-- **The app_id / title gotcha.** Every Chromium shares `app_id="chromium"` under Wayland, so a `for_window [app_id="chromium"]` rule can't tell two outputs' windows apart. The backend disambiguates by matching a **distinct window title** (or runs an **IPC placer keyed on launch order**, or forces XWayland with `--ozone-platform=x11 --class=screen-<id>`). This is exactly why placement is IPC-driven per launch rather than a static config rule.
-- **Per-output `--user-data-dir`** is non-negotiable (see the launch flags) or the second window is just a tab in the first.
+- **Windows are matched by pid, not class.** surf has no flag to set a per-output WM class, so `for_window [app_id=…]` can't tell two outputs' windows apart. The backend subscribes to sway's `window` events *before* spawning and matches the new window on the child's **pid** (falling back to `app_id`/launch order). This is exactly why placement is IPC-driven per launch rather than a static config rule.
+- **surf reaches sway through XWayland.** It is an X11 client; sway starts XWayland lazily and only if the binary is installed.
 
 `ident()` on the agent is **best-effort / secondary** — the *visible* "which panel is this?" flash is server → player (the player overlay), so the agent's `ident` may just log. `capture()` returns a JPEG via `grim` (wayland) / `scrot`|`import` (x11), or `null` where unavailable.
 
@@ -231,7 +225,7 @@ A few Wayland realities the backend has to handle (from `ARCHITECTURE.md` → "G
 
 ## UTM test walkthrough (visual cold-boot)
 
-OrbStack/Docker verifies the boot → systemd → agent → enrolment *plumbing* headlessly and fast, but it has **no display** — it can't prove the visual DoD. For that you need a desktop-virtualization VM with a **real virtual output** where sway + Chromium actually render. Below is **UTM** on Apple Silicon (Parallels works too); the load-bearing detail is the GPU.
+OrbStack/Docker verifies the boot → systemd → agent → enrolment *plumbing* headlessly and fast, but it has **no display** — it can't prove the visual DoD. For that you need a desktop-virtualization VM with a **real virtual output** where sway + the browser actually render. Below is **UTM** on Apple Silicon (Parallels works too); the load-bearing detail is the GPU.
 
 ### Create the VM (the critical settings)
 
@@ -260,7 +254,7 @@ Then give the VM something to boot. Two options:
 
 ### Watch the cold boot
 
-On reboot you should see, **with zero interaction**: the **Polyptic boot splash** (branded logo + version + hostname + a live status line, *instead of* kernel/systemd console text — POL-7) → greetd autologin → sway comes up (the splash's last frame is held until sway paints, so there's no flash of console) → the agent service starts and connects → a fullscreen kiosk Chromium appears on the virtual output. In the console the machine shows **PENDING**; **Approve** it, drag its screen onto a mural, assign content → the VM's screen flips to the **active scene**, instantly.
+On reboot you should see, **with zero interaction**: the **Polyptic boot splash** (branded logo + version + hostname + a live status line, *instead of* kernel/systemd console text — POL-7) → greetd autologin → sway comes up (the splash's last frame is held until sway paints, so there's no flash of console) → the agent service starts and connects → a fullscreen kiosk browser appears on the virtual output. In the console the machine shows **PENDING**; **Approve** it, drag its screen onto a mural, assign content → the VM's screen flips to the **active scene**, instantly.
 
 > **Boot splash check (POL-7):** the splash must be visible from *early* boot (right after the bootloader), show the live status line advancing, and hand off to sway with **no raw console text** at any point. Then check the **way down**: `sudo reboot` (and `sudo poweroff`) must show the same splash reading "Restarting"/"Shutting down" — no kernel/systemd console text on shutdown either. If you see kernel messages on boot, `quiet splash` didn't reach the cmdline — check `cat /proc/cmdline` and `/etc/default/grub` (then `sudo update-grub`), and that `plymouth-set-default-theme` reports `polyptic` (`sudo plymouth-set-default-theme`). If shutdown shows text, confirm the shutdown units are enabled (`systemctl is-enabled plymouth-poweroff.service plymouth-reboot.service`). To swap in the final logo later: replace `/usr/share/plymouth/themes/polyptic/logo.svg` and re-run `sudo polyptic-agent setup`.
 
@@ -270,12 +264,12 @@ Tail the agent while you watch:
 journalctl --user -u polyptic-agent -f      # agent logs (connect, enrol, apply, placement)
 # system-level (greetd/sway): journalctl -b -u greetd
 swaymsg -t get_outputs                        # confirm sway sees the virtual output
-swaymsg -t get_tree                           # confirm the Chromium window is placed on it
+swaymsg -t get_tree                           # confirm the surf window is placed on it
 ```
 
 ### VM caveats (what the VM **cannot** prove)
 
-- **~1 virtual output.** A VM typically presents a single virtual display, so the VM validates **single-output** placement + the whole cold-boot chain. **Multi-output-per-client placement** (two+ Chromium windows on two+ connectors via the app_id/title disambiguation) and the **real multi-screen wall** stay a **real-hardware** test.
+- **~1 virtual output.** A VM typically presents a single virtual display, so the VM validates **single-output** placement + the whole cold-boot chain. **Multi-output-per-client placement** (two+ surf windows on two+ connectors via the pid-keyed placer) and the **real multi-screen wall** stay a **real-hardware** test.
 - **Virtual GPU quirks.** The virtual GPU often needs `WLR_NO_HARDWARE_CURSORS=1` (above). If sway still won't render, that *usefully* exercises the **x11-i3 fallback** (`sudo polyptic-agent setup --backend x11-i3 …`) — the same path you'd use for NVIDIA on real hardware.
 - **Arch.** The VM proves the **arm64** build; your thin clients are almost certainly **amd64** — build and smoke-test that binary separately (the server image bakes both).
 - **No GPU-accelerated video.** Heavy `video` surfaces may be soft-rendered in the VM; judge media performance on real hardware.
@@ -284,15 +278,6 @@ swaymsg -t get_tree                           # confirm the Chromium window is p
 
 ## Troubleshooting
 
-### snap Chromium — avoid it
-Ubuntu's default `chromium` is a **snap**: confined, slow to cold-start, and awkward about external `--user-data-dir` profile paths (exactly what per-output kiosks need). Use a **`.deb` Chromium** (D27). `polyptic-agent setup` installs a `.deb` Chromium; if a snap got in first, remove it and install the deb:
-```bash
-snap list | grep chromium && sudo snap remove chromium
-# install a .deb Chromium (e.g. the Ubuntu chromium .deb / a PPA / vendor .deb), then re-run setup
-sudo polyptic-agent setup --server-url … --bootstrap-token …
-```
-If a `.deb` Chromium isn't available for the platform, **`cog` / WPE WebKit** is the documented low-power fallback.
-
 ### NVIDIA + Wayland
 wlroots (sway) on NVIDIA needs `nvidia-drm.modeset=1` on the kernel cmdline and may need `WLR_NO_HARDWARE_CURSORS=1`. If sway is flaky or won't start, **switch to the x11/i3 fallback** (D9) — that's what it's for:
 ```bash
@@ -300,21 +285,13 @@ sudo polyptic-agent setup --backend x11-i3 --server-url … --bootstrap-token �
 ```
 Verify the GPU/compositor on the **real hardware** before committing a fleet to Wayland.
 
-### "Restore pages" bar appears after a power cut
-The `exit_type`/`exited_cleanly` reset isn't taking. Confirm the agent owns the profile path and resets it *before* launch:
-```bash
-ls /home/kiosk/profiles/                                  # one dir per output ID
-grep -o '"exit_type":"[^"]*"' /home/kiosk/profiles/<ID>/Default/Preferences
-```
-After a clean agent restart it should read `"Normal"`. If a stray snap Chromium is running, its profile is elsewhere — see above.
-
-### Black / blank output, or no Chromium window
+### Black / blank output, or no browser window
 ```bash
 swaymsg -t get_outputs        # is the connector present + active + dpms on?
-swaymsg -t get_tree           # is there a Chromium window, and is it on the right output?
+swaymsg -t get_tree           # is there a surf window, and is it on the right output?
 journalctl --user -u polyptic-agent -e   # placement errors, respawn loops
 ```
-Common causes: a wrong/absent `--user-data-dir` (second window opened as a tab — should not happen with the per-output dirs), the app_id/title placer not matching (Wayland app_id gotcha), or `swayidle` somehow installed and blanking the screen (it must **not** be present).
+Common causes: **`xwayland` not installed** (sway logs `Cannot find Xwayland binary` and surf never opens — the classic black wall), `DISPLAY` not imported into the systemd user environment (surf dies with `Can't open default display`), the pid placer not matching, or `swayidle` somehow installed and blanking the screen (it must **not** be present).
 
 ### Boot splash — console text still shows, or the logo is blank
 - **Splash never shows and `journalctl -b` has `plymouth-start.service: Failed with result 'signal'` (plymouthd SEGFAULT):** the plymouth **label plugin** (text renderer) is missing. Our theme draws text via `Image.Text`; with no `label-*.so`, plymouth disables text rendering, never creates the console viewer, and the `script` plugin then dereferences that NULL viewer (`ply_console_viewer_hide`) and crashes every boot. Fix: install the label plugin and rebuild — `sudo apt install plymouth-label && sudo polyptic-agent setup` (Fedora: `plymouth-plugin-label`; Arch bundles it). Confirm text rendering is up by running plymouth in a debug harness (frees the DRM from the kiosk): `sudo systemctl stop greetd; sudo plymouthd --debug --debug-file=/tmp/ply.log; sudo plymouth show-splash; sleep 2; sudo plymouth --ping && echo ALIVE || echo CRASHED; sudo plymouth quit; sudo systemctl start greetd` — grep `/tmp/ply.log` for `Not using console viewer because text renderering isn't working` (that line = label plugin missing).
@@ -358,7 +335,7 @@ swaymsg -t get_outputs ; swaymsg -t get_tree
 
 ## Uninstall / teardown
 
-`setup` has an inverse. `teardown` disables the kiosk chain (greetd autologin, the units, the sway/Chromium session) and returns the box toward a normal server, idempotently:
+`setup` has an inverse. `teardown` disables the kiosk chain (greetd autologin, the units, the sway/surf session) and returns the box toward a normal server, idempotently:
 
 ```bash
 sudo polyptic-agent teardown            # disable + remove the wiring, keep the binary + config
@@ -374,15 +351,15 @@ Tick these on the VM ([UTM walkthrough](#utm-test-walkthrough-visual-cold-boot))
 
 - [ ] The machine boots the medium and streams the live image into RAM: signed shim → GRUB → kernel → dracut `root=live:` → systemd, Secure Boot **on**.
 - [ ] `polyptic-agent setup …` is idempotent — running it twice converges, no duplicate/broken state.
-- [ ] **Cold boot is zero-click:** power on → greetd autologin → sway → agent → kiosk Chromium, **no login prompt, no sleep, no typed password**.
+- [ ] **Cold boot is zero-click:** power on → greetd autologin → sway → agent → kiosk surf, **no login prompt, no sleep, no typed password**.
 - [ ] **Boot splash (POL-7):** branded splash (logo + version + host + live status) from early boot → player with **no console text**; `sudo reboot` / `sudo poweroff` shows it on the way **down** too ("Restarting"/"Shutting down").
 - [ ] The agent connects outbound and the machine appears **PENDING** in the console; **Approve** → its screen renders.
 - [ ] Assigning content / switching scenes in the console updates the screen **live, with no browser reload** (< ~150 ms).
-- [ ] No "Restore pages" bar, no infobars, no crash bubble on the screen.
-- [ ] **Power-cut survival:** hard-kill the VM (simulating the EOD smart-plug) → on next boot the wall returns **clean** to the active scene (no restore bar).
-- [ ] **Restart=always:** `systemctl --user kill polyptic-agent` → it (and its Chromium) comes back; manually `kill` a Chromium child → the agent respawns it.
+- [ ] No infobars, no crash bubble, no browser chrome of any kind on the screen.
+- [ ] **Power-cut survival:** hard-kill the VM (simulating the EOD smart-plug) → on next boot the wall returns **clean** to the active scene.
+- [ ] **Restart=always:** `systemctl --user kill polyptic-agent` → it (and its browser) comes back; manually `kill` a surf child → the agent respawns it.
 - [ ] No `swayidle` present; `swaymsg -t get_outputs` shows the output **dpms on**; the screen never blanks itself.
-- [ ] ⚠ **Multi-output (hardware):** a client with 2+ outputs places a distinct kiosk Chromium on **each** connector (app_id/title disambiguation), each pointed at its own player URL.
+- [ ] ⚠ **Multi-output (hardware):** a client with 2+ outputs places a distinct surf on **each** connector (pid-keyed placement), each pointed at its own player URL.
 - [ ] ⚠ **GPU path (hardware):** the chosen backend renders correctly on the real GPU — Wayland/sway on Intel/AMD, or the x11/i3 fallback on NVIDIA (with `nvidia-drm.modeset=1`, `WLR_NO_HARDWARE_CURSORS` as needed).
 - [ ] ⚠ **Full wall (hardware):** the real N-screen wall cold-boots to the active scene end-to-end.
 ```

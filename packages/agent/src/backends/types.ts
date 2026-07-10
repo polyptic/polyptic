@@ -33,6 +33,14 @@ export interface DisplayBackend {
   /** Toggle an operator "which panel is this?" overlay across the host's outputs. */
   ident(on: boolean): Promise<void>;
 
+  /**
+   * Show/hide the browser's Web Inspector ON the panel driven by `connector` (POL-50) — the only
+   * way to see a wall's console/network, since WebKitGTK exposes no browser-openable remote
+   * inspector (D63). Relaunches that output's browser, so the page reloads. Throws when the
+   * connector has nothing placed on it, or when this backend has no inspector to show.
+   */
+  inspect(connector: string, on: boolean): Promise<void>;
+
   /** Grab a thumbnail of `connector`, or `null` if this backend can't capture. */
   capture(connector: string): Promise<Buffer | null>;
 }

@@ -124,6 +124,7 @@ type ApplyMsg = Extract<ServerToAgentMessage, { t: "server/apply" }>;
 type IdentMsg = Extract<ServerToAgentMessage, { t: "server/ident" }>;
 type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
 type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
+type InspectMsg = Extract<ServerToAgentMessage, { t: "server/inspect" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
@@ -257,6 +258,9 @@ class Agent {
       case "server/reboot":
         await this.onReboot(msg);
         break;
+      case "server/inspect":
+        await this.onInspect(msg);
+        break;
       case "server/enrolled":
         this.onEnrolled(msg);
         break;
@@ -373,6 +377,40 @@ class Agent {
     });
     if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
     else logError(`refused to reboot: ${outcome.reason}`);
+  }
+
+  /**
+   * `server/inspect` — pop (or dismiss) the kiosk browser's Web Inspector ON the wall (POL-50).
+   *
+   * Honouring this relaunches that output's browser, because surf only takes `-N` at launch, so the
+   * page reloads. The ack carries the state we ACTUALLY reached: a failure here must never leave the
+   * console showing an inspector that isn't on the panel, and the operator needs to know it was the
+   * box that refused (nothing placed on that connector, no `xdotool`, a dev backend).
+   */
+  private async onInspect(msg: InspectMsg): Promise<void> {
+    log(`server/inspect received (connector=${msg.connector} on=${msg.on})`);
+    try {
+      await this.backend.inspect(msg.connector, msg.on);
+      this.send({
+        t: "agent/inspect-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: msg.on,
+        ok: true,
+      });
+      log(`inspector ${msg.on ? "opened on" : "closed on"} ${msg.connector}`);
+    } catch (err) {
+      const reason = (err as Error).message;
+      this.send({
+        t: "agent/inspect-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: false,
+        ok: false,
+        reason,
+      });
+      logError(`inspect(${msg.connector}, ${msg.on}) failed: ${reason}`);
+    }
   }
 
   /**
@@ -501,7 +539,7 @@ class Agent {
 
 async function main(): Promise<void> {
   // Subcommand dispatch: `polyptic-agent setup …` provisions/tears down the on-device stack
-  // (greetd autologin → sway → systemd-supervised agent → Chromium-per-output). The setup CLI and
+  // (greetd autologin → sway → systemd-supervised agent → surf-per-output). The setup CLI and
   // its (heavier) provisioning machinery are loaded lazily so the normal agent boot path never pays
   // for them. Anything other than `setup` runs the existing reconciler loop below, unchanged.
   if (process.argv[2] === "setup") {

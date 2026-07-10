@@ -20,6 +20,11 @@
  * POL-55 operator route:
  *   POST /api/v1/machines/:machineId/reboot   -> server/reboot to a connected, approved agent;
  *                                                404 unknown; 409 not-approved or offline
+ *
+ * POL-50 operator route:
+ *   POST /api/v1/screens/:screenId/inspect    -> server/inspect: pop the kiosk browser's Web Inspector
+ *                                                ON that panel; 202 delivered (the agent's ack decides
+ *                                                the outcome), 404 unknown, 409 not-approved or offline
  */
 import { z } from "zod";
 
@@ -30,12 +35,14 @@ import {
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
+  InspectBody,
   PlaceScreenBody,
   RebootBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
   ServerToAgentApply,
+  ServerToAgentInspect,
   ServerToAgentReboot,
   ServerToAgentRejected,
   ServerToPlayerIdent,
@@ -58,7 +65,7 @@ import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
-import type { AdminBroadcaster } from "./admin";
+import type { AdminBroadcaster, Presence } from "./admin";
 import type { MediaStore } from "./media";
 import type { TokenService } from "./tokens";
 
@@ -93,6 +100,7 @@ export function registerRestRoutes(
   mediaConfig: MediaConfig,
   tokens: TokenService,
   activity: ActivityLog,
+  presence: Presence,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -414,6 +422,70 @@ export function registerRestRoutes(
       "pushed reboot to agent",
     );
     return { ok: true, machineId: machine.id, delivered };
+  });
+
+  // POST /api/v1/screens/:screenId/inspect  { on }  -> pop the Web Inspector ON that panel (POL-50)
+  //
+  // Not a remote dev-tools tunnel, because there is nothing to tunnel: surf (WebKitGTK, D63) exposes
+  // no browser-openable remote inspector. So the operator asks from here and someone at the wall
+  // reads the console/network. Honouring it RELAUNCHES that output's browser (surf takes `-N` only at
+  // launch), so the page reloads — which is also what makes a failing page load observable at all.
+  //
+  // 202, not 200: the request has been delivered, not applied. The agent's `agent/inspect-ack` (ws.ts)
+  // is what sets the screen's `inspecting` flag, because only the box knows whether surf came back and
+  // took the keystroke. A REFUSAL surfaces there too, in the activity feed.
+  fastify.post("/api/v1/screens/:screenId/inspect", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = InspectBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = control.getScreen(params.data.screenId);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+    const machine = control.getMachine(screen.machineId);
+    if (!machine || machine.status !== "approved") {
+      return reply.code(409).send({
+        error: `screen ${screen.id} belongs to a machine that is not approved — cannot inspect it`,
+      });
+    }
+
+    const delivered = agentHub.send(
+      machine.id,
+      ServerToAgentInspect.parse({
+        t: "server/inspect",
+        connector: screen.connector,
+        on: body.data.on,
+      }),
+    );
+    if (delivered === 0) {
+      return reply
+        .code(409)
+        .send({ error: `${machine.label} is offline — nothing to show an inspector on` });
+    }
+
+    // Drop any previous refusal now that a fresh request is in flight, so the console shows this
+    // attempt's outcome rather than re-reporting the last one.
+    presence.setScreenInspectError(screen.id, null);
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.inspect",
+        screenId: screen.id,
+        machineId: machine.id,
+        connector: screen.connector,
+        on: body.data.on,
+        delivered,
+      },
+      "pushed inspector request to agent",
+    );
+    return reply.code(202).send({ ok: true, screenId: screen.id, on: body.data.on, delivered });
   });
 
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────
