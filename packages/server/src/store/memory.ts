@@ -93,6 +93,11 @@ export class MemoryStore implements Store {
     if (machine) machine.status = status;
   }
 
+  async setMachineShellEnabled(id: string, enabled: boolean): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) machine.shellEnabled = enabled;
+  }
+
   async deleteMachine(id: string): Promise<void> {
     this.machines.delete(id);
     // Cascade the machine's screens + their content + placements (defensive — the control plane also

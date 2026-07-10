@@ -62,6 +62,7 @@ import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
 import { rebootHost } from "./host";
+import { ShellManager } from "./shell";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
@@ -124,9 +125,14 @@ type ApplyMsg = Extract<ServerToAgentMessage, { t: "server/apply" }>;
 type IdentMsg = Extract<ServerToAgentMessage, { t: "server/ident" }>;
 type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
 type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
+type InspectMsg = Extract<ServerToAgentMessage, { t: "server/inspect" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
+type ShellOpenMsg = Extract<ServerToAgentMessage, { t: "server/shell-open" }>;
+type ShellDataMsg = Extract<ServerToAgentMessage, { t: "server/shell-data" }>;
+type ShellResizeMsg = Extract<ServerToAgentMessage, { t: "server/shell-resize" }>;
+type ShellCloseMsg = Extract<ServerToAgentMessage, { t: "server/shell-close" }>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent
@@ -143,6 +149,10 @@ class Agent {
 
   /** Durable app-level identity. Loaded from disk at boot; (re)issued via `server/enrolled`. */
   private credential: string | null;
+
+  /** Remote-shell PTYs (POL-59), created on first `server/shell-open`. A dev/non-Linux backend
+   *  reports it can't provide a real terminal, and every open on such a box is refused. */
+  private shell: ShellManager | null = null;
 
   private lastAppliedRevision = 0;
   /** connector → player URL currently placed (dedupes repeat opens on reconnect/re-apply). */
@@ -209,6 +219,9 @@ class Agent {
     ws.on("close", (code: number) => {
       log(`agent channel closed (code ${code})`);
       this.stopHeartbeat();
+      // A remote shell is authorised by the live connection; kill every PTY when it drops so a
+      // session can never outlive the socket that carried it (POL-59).
+      this.shell?.closeAll();
       if (!this.closing) this.scheduleReconnect();
     });
   }
@@ -257,6 +270,9 @@ class Agent {
       case "server/reboot":
         await this.onReboot(msg);
         break;
+      case "server/inspect":
+        await this.onInspect(msg);
+        break;
       case "server/enrolled":
         this.onEnrolled(msg);
         break;
@@ -265,6 +281,18 @@ class Agent {
         break;
       case "server/rejected":
         this.onRejected(msg);
+        break;
+      case "server/shell-open":
+        this.onShellOpen(msg);
+        break;
+      case "server/shell-data":
+        this.shellMgr().data(msg.sessionId, msg.dataBase64);
+        break;
+      case "server/shell-resize":
+        this.shellMgr().resize(msg.sessionId, msg.cols, msg.rows);
+        break;
+      case "server/shell-close":
+        this.shellMgr().close(msg.sessionId, msg.reason);
         break;
     }
   }
@@ -373,6 +401,78 @@ class Agent {
     });
     if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
     else logError(`refused to reboot: ${outcome.reason}`);
+  }
+
+  /** Lazily build the shell manager. `canPty` is false on the dev/non-Linux backends so every open
+   *  is refused with a legible reason rather than a dead terminal. */
+  private shellMgr(): ShellManager {
+    if (!this.shell) {
+      const canPty = process.platform === "linux" && this.backend.id !== "dev-open";
+      this.shell = new ShellManager(
+        {
+          onData: (sessionId, dataBase64) =>
+            this.send({ t: "agent/shell-data", machineId: this.machineId, sessionId, dataBase64 }),
+          onClosed: (sessionId, reason, exitCode) =>
+            this.send({ t: "agent/shell-closed", machineId: this.machineId, sessionId, reason, exitCode }),
+        },
+        "/bin/bash",
+        canPty,
+      );
+    }
+    return this.shell;
+  }
+
+  /**
+   * `server/shell-open` — an operator opened a terminal on this box (POL-59). The server only sends
+   * this to an ARMED box, so policy is already enforced upstream; here we just try to allocate the
+   * PTY and report whether it came up. The shell is the unprivileged kiosk user (whatever the agent
+   * runs as) and cannot touch what the wall displays.
+   */
+  private onShellOpen(msg: ShellOpenMsg): void {
+    const res = this.shellMgr().open(msg.sessionId, msg.cols, msg.rows);
+    this.send({
+      t: "agent/shell-opened",
+      machineId: this.machineId,
+      sessionId: msg.sessionId,
+      ok: res.ok,
+      reason: res.reason,
+    });
+    if (res.ok) log(`shell-open ${msg.sessionId} (${msg.cols}x${msg.rows})`);
+    else logError(`shell-open ${msg.sessionId} refused: ${res.reason}`);
+  }
+
+  /**
+   * `server/inspect` — pop (or dismiss) the kiosk browser's Web Inspector ON the wall (POL-50).
+   *
+   * Honouring this relaunches that output's browser, because surf only takes `-N` at launch, so the
+   * page reloads. The ack carries the state we ACTUALLY reached: a failure here must never leave the
+   * console showing an inspector that isn't on the panel, and the operator needs to know it was the
+   * box that refused (nothing placed on that connector, no `xdotool`, a dev backend).
+   */
+  private async onInspect(msg: InspectMsg): Promise<void> {
+    log(`server/inspect received (connector=${msg.connector} on=${msg.on})`);
+    try {
+      await this.backend.inspect(msg.connector, msg.on);
+      this.send({
+        t: "agent/inspect-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: msg.on,
+        ok: true,
+      });
+      log(`inspector ${msg.on ? "opened on" : "closed on"} ${msg.connector}`);
+    } catch (err) {
+      const reason = (err as Error).message;
+      this.send({
+        t: "agent/inspect-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: false,
+        ok: false,
+        reason,
+      });
+      logError(`inspect(${msg.connector}, ${msg.on}) failed: ${reason}`);
+    }
   }
 
   /**
@@ -501,7 +601,7 @@ class Agent {
 
 async function main(): Promise<void> {
   // Subcommand dispatch: `polyptic-agent setup …` provisions/tears down the on-device stack
-  // (greetd autologin → sway → systemd-supervised agent → Chromium-per-output). The setup CLI and
+  // (greetd autologin → sway → systemd-supervised agent → surf-per-output). The setup CLI and
   // its (heavier) provisioning machinery are loaded lazily so the normal agent boot path never pays
   // for them. Anything other than `setup` runs the existing reconciler loop below, unchanged.
   if (process.argv[2] === "setup") {

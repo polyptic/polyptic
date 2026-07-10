@@ -229,6 +229,49 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
+    "the menu is the Polyptic splash, and everything graphical is guarded (POL-47)",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      // `set net=` must precede the preamble, which interpolates $net into the theme URL.
+      expect(body.indexOf("set net=(http,")).toBeLessThan(body.indexOf("if loadfont "));
+      expect(body).toContain("loadfont (memdisk)/fonts/unicode.pf2");
+      expect(body).toContain("set theme=$net/boot/theme.txt");
+      expect(body).toContain("terminal_output gfxterm");
+      // A GRUB that cannot do any of it must still boot: nothing graphical outside the guard.
+      const guarded = body.slice(body.indexOf("if loadfont "), body.indexOf("\nfi\n"));
+      for (const cmd of ["terminal_output", "set theme=", "insmod gfxterm", "background_color"]) {
+        expect(guarded).toContain(cmd);
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the boot screen speaks to whoever walks past the wall, not to whoever built the chain",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      const echoes = body.split("\n").filter((l) => l.trim().startsWith("echo "));
+      expect(echoes.length).toBe(3);
+      expect(echoes[0]).toContain("Starting Polyptic");
+      expect(echoes[1]).toContain("Setting up this screen");
+      // The POL-47 complaint, verbatim: no RAM, no arch, no "offload", no "image" on a public panel.
+      // The debug entry is exempt: nobody sees its line unless they deliberately chose it, and by
+      // then `tty9` is the fact they walked to the box for.
+      for (const line of echoes.slice(0, 2)) {
+        expect(line).not.toContain("RAM");
+        expect(line).not.toContain("$arch");
+        expect(line).not.toContain("offload");
+        expect(line).not.toContain("image");
+      }
+      // The titles too — `$arch` still SELECTS the artifacts, it is just never announced.
+      expect(body).not.toContain("Bootloader");
+      expect(body).not.toContain("into RAM");
+      expect(body).toContain("$net/dist/image/$arch/vmlinuz");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "the menu speaks noble GRUB: plain linux/initrd, no `---` terminator, no iPXE remnants",
     async () => {
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
@@ -270,13 +313,15 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
-    "the menu is three flat entries with the names operators know, and no submenu",
+    "the menu is three flat entries, addressed by --id, and no submenu",
     async () => {
+      // The names are POL-47's (D65 supersedes D61's on the signage argument); the `--id`s are the
+      // stable handle, and the flatness is D61's — a submenu opens a fresh GRUB environment context,
+      // which is what broke `$net`/`$arch` below.
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
-      expect(body).toContain('menuentry "Polyptic (Live)" --id live');
-      expect(body).toContain('menuentry "Polyptic (Offload Bootloader)" --id offload');
-      expect(body).toContain('menuentry "Polyptic (Debug Console)" --id debug');
-      // A submenu opens a fresh GRUB environment context, which is what broke `$net`/`$arch` below.
+      expect(body).toContain('menuentry "Polyptic" --id live');
+      expect(body).toContain('menuentry "Set up this screen to start without the USB stick" --id offload');
+      expect(body).toContain('menuentry "Debug console" --id debug');
       expect(body).not.toContain("submenu ");
     },
     TEST_TIMEOUT,
@@ -515,6 +560,43 @@ describe("netboot: POST /boot/report", () => {
       expect(codes).toContain(429);
       // …and the throttle is not an outage: the first few still got through.
       expect(codes.filter((c) => c === 204).length).toBeGreaterThan(0);
+    },
+    TEST_TIMEOUT,
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /boot/theme.txt + /boot/logo.png, the GRUB boot theme (POL-47)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("netboot: the GRUB boot theme", () => {
+  test(
+    "serves the theme UNGATED, with a Content-Length (GRUB rejects chunked)",
+    async () => {
+      // The box has no operator session at power-on — same reason /boot/grub.cfg is ungated. Both
+      // GATED and OPEN control planes must hand it over, and it carries nothing secret.
+      for (const base of [OPEN_BASE, GATED_BASE]) {
+        const res = await fetch(`${base}/boot/theme.txt`);
+        expect(res.status).toBe(200);
+        expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("text/plain");
+        const body = await res.text();
+        expect(res.headers.get("content-length")).toBe(String(Buffer.byteLength(body)));
+        expect(body).toContain("desktop-color:");
+        expect(body).toContain('file = "logo.png"');
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "serves the logo GRUB resolves relative to the theme, as a real PNG with a Content-Length",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/logo.png`);
+      expect(res.status).toBe(200);
+      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/png");
+      const png = Buffer.from(await res.arrayBuffer());
+      expect(res.headers.get("content-length")).toBe(String(png.length));
+      expect(png.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     },
     TEST_TIMEOUT,
   );

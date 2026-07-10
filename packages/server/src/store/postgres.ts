@@ -57,6 +57,7 @@ interface MachineRow {
   status: string | null;
   credential_hash: string | null;
   last_seen: Date | null;
+  shell_enabled: boolean | null;
 }
 
 interface ScreenRow {
@@ -189,6 +190,7 @@ export class PostgresStore implements Store {
     // Idempotent migration for databases created before Phase 2b: existing rows default to 'approved'.
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'approved'`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS credential_hash text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_enabled boolean NOT NULL DEFAULT false`;
     await sql`
       CREATE TABLE IF NOT EXISTS screens (
         id            text PRIMARY KEY,
@@ -374,7 +376,7 @@ export class PostgresStore implements Store {
       credentialProfileRows,
       zoomPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
@@ -401,6 +403,7 @@ export class PostgresStore implements Store {
         status: status.success ? status.data : "approved",
         credentialHash: row.credential_hash ?? undefined,
         lastSeen: row.last_seen ? row.last_seen.toISOString() : undefined,
+        shellEnabled: row.shell_enabled ?? false,
       };
     });
 
@@ -518,7 +521,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -527,7 +530,8 @@ export class PostgresStore implements Store {
         ${sql.json(machine.outputs)},
         ${machine.status ?? "approved"},
         ${machine.credentialHash ?? null},
-        ${machine.lastSeen ? new Date(machine.lastSeen) : null}
+        ${machine.lastSeen ? new Date(machine.lastSeen) : null},
+        ${machine.shellEnabled ?? false}
       )
       ON CONFLICT (id) DO UPDATE SET
         label           = EXCLUDED.label,
@@ -536,13 +540,19 @@ export class PostgresStore implements Store {
         outputs         = EXCLUDED.outputs,
         status          = EXCLUDED.status,
         credential_hash = EXCLUDED.credential_hash,
-        last_seen       = EXCLUDED.last_seen
+        last_seen       = EXCLUDED.last_seen,
+        shell_enabled   = EXCLUDED.shell_enabled
     `;
   }
 
   async setMachineStatus(id: string, status: EnrollmentStatus): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE machines SET status = ${status} WHERE id = ${id}`;
+  }
+
+  async setMachineShellEnabled(id: string, enabled: boolean): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET shell_enabled = ${enabled} WHERE id = ${id}`;
   }
 
   async deleteMachine(id: string): Promise<void> {

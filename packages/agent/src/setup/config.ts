@@ -22,7 +22,6 @@ const KEY_TO_ENV: Readonly<Record<string, string>> = {
   server_url: "POLYPTIC_SERVER_URL",
   bootstrap_token: "POLYPTIC_BOOTSTRAP_TOKEN",
   backend: "POLYPTIC_BACKEND",
-  browser: "POLYPTIC_BROWSER",
   connector: "POLYPTIC_CONNECTOR",
   machine_id: "POLYPTIC_MACHINE_ID",
   state_dir: "POLYPTIC_STATE_DIR",
@@ -32,7 +31,6 @@ export interface AgentTomlValues {
   serverUrl?: string;
   bootstrapToken?: string;
   backend?: string;
-  browser?: string;
   connector?: string;
 }
 
@@ -96,7 +94,6 @@ export function renderAgentToml(v: AgentTomlValues, opts: { example: boolean }):
   const serverUrl = v.serverUrl ?? (opts.example ? "wss://control.example.com/agent" : "");
   const bootstrapToken = v.bootstrapToken ?? "";
   const backend = v.backend ?? "wayland-sway";
-  const browser = v.browser ?? "chromium";
   const header = opts.example
     ? "# EXAMPLE — copy to /etc/polyptic/agent.toml and fill in, then restart the agent."
     : "# Written by `polyptic-agent setup`. Edit, then restart the agent.";
@@ -116,9 +113,6 @@ export function renderAgentToml(v: AgentTomlValues, opts: { example: boolean }):
     "",
     '# Display backend (D9): "wayland-sway" (default) | "x11-i3" (NVIDIA/fallback) | "dev-open".',
     `backend = "${backend}"`,
-    "",
-    '# Kiosk browser (D27): "chromium" (default) | "cog" (WPE/WebKit; Ubuntu/arm64 where Chromium is snap-only).',
-    `browser = "${browser}"`,
     "",
     "# Optional: advertised output connector for a single-output override (usually auto-detected).",
     v.connector ? `connector = "${v.connector}"` : '# connector = "DP-1"',

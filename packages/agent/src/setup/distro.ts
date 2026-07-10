@@ -77,7 +77,7 @@ export function detectDistro(sys: Sys): Distro {
 // A FRESH Ubuntu/Debian box runs `unattended-upgrades` on first boot, which holds the dpkg lock;
 // a plain `apt-get install` then dies immediately with "Could not get lock /var/lib/dpkg/lock-frontend".
 // Tell apt to WAIT for the lock (up to 10 min) instead of failing, so zero-touch provisioning survives
-// that race. Exported so browser.ts's direct apt-get calls use the same wait.
+// that race. Exported so callers doing direct apt-get calls use the same wait.
 export const APT_LOCK_WAIT = ["-o", "DPkg::Lock::Timeout=600"] as const;
 
 export function refreshCmd(pm: PkgManager): { cmd: string; args: string[] } {
@@ -116,8 +116,8 @@ export function isInstalled(sys: Sys, pm: PkgManager, pkg: string): boolean {
 
 // ── package name maps ──────────────────────────────────────────────────────────
 //
-// Generic capability → concrete package name per manager. The browser is handled separately
-// (browser.ts) because of the Ubuntu snap-Chromium gotcha (D27).
+// Generic capability → concrete package name per manager. The browser (surf) and the two tools it
+// needs — xwayland, xdotool — are handled separately in browser.ts (D63).
 
 interface PkgSet {
   base: string[];
@@ -137,8 +137,8 @@ interface PkgSet {
 // boot, killing the splash. So the label plugin is REQUIRED, not optional. On Ubuntu it's a separate
 // package (`plymouth-label`, which also pulls pango/fontconfig + a font); dracut's plymouth module
 // then bundles the whole text-render closure into the initramfs for early boot.
-// VIDEO (Phase 7 media). WebKitGTK (`surf`/`cog`) and Chromium-on-Linux decode <video> through
-// GStreamer. `surf` pulls plugins-base + plugins-good as hard deps, which cover WebM/VP8/VP9 and
+// VIDEO (Phase 7 media). WebKitGTK (`surf`) decodes <video> through GStreamer. `surf` pulls
+// plugins-base + plugins-good as hard deps, which cover WebM/VP8/VP9 and
 // Opus/Vorbis — but NOT H.264/AAC, i.e. the .mp4 almost everyone uploads. Those live in
 // `gstreamer1.0-libav` (the ffmpeg-backed decoder), which is only a *recommends* — and setup installs
 // with --no-install-recommends. Result, found on a real wall: uploaded MP4s silently never play,

@@ -13,7 +13,8 @@
 #      on the first real-hardware boot). One online link is all netboot needs: --any, bounded.
 #   3. polyptic-progress-*.sh — narrate the initramfs on the splash (waiting for DHCP / downloading
 #      from which host / what is failing), so a stuck boot says WHY without alt-tab console
-#      archaeology. plymouth's display-message feeds the theme's live status line (D45).
+#      archaeology. plymouth's display-message feeds the theme's live status line (D45), which our
+#      narration owns while it is up; `-done` hands it back to systemd before switch-root (POL-53).
 #
 # `check()` returns 0 unconditionally: the module is never auto-detected, only `--add`ed.
 
@@ -36,6 +37,8 @@ install() {
     inst_hook initqueue/settled 05 "$moddir/polyptic-progress-wait.sh"
     inst_hook initqueue/online 94 "$moddir/polyptic-progress-online.sh"
     inst_hook initqueue/timeout 10 "$moddir/polyptic-progress-timeout.sh"
+    # `pre-pivot` is the last hook that runs with plymouthd still owning the initramfs' screen.
+    inst_hook pre-pivot 50 "$moddir/polyptic-progress-done.sh"
     # Sorts AFTER dracut's own 99-dracut.conf (d < p), so these settings win.
     inst_simple "$moddir/polyptic-wait-online.conf" \
         "$systemdsystemunitdir/systemd-networkd-wait-online.service.d/99-polyptic.conf"

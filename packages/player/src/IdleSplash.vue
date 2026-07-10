@@ -10,7 +10,7 @@
  * renders cleanly. The status dot reflects the live connection so an operator can tell a waiting
  * screen (green) from one that never reached the control plane (amber/red).
  *
- * DELIBERATELY STATIC (POL-62, D63) — no animations, and nothing here may depend on the browser's
+ * DELIBERATELY STATIC (POL-62, D66) — no animations, and nothing here may depend on the browser's
  * compositor. Real walls run surf/WebKitGTK, and on a box without working GL, WebKit's DMABUF
  * compositing path silently drops elements promoted to their own layer — an infinite opacity
  * animation is exactly such a promotion, and it made the brand mark vanish while the plain-painted

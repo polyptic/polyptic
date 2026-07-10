@@ -59,10 +59,15 @@ export class AdminHub {
  * Live, non-persisted connection state.
  *  - machine online: an agent WS is currently connected (ref-counted so overlapping sockets are safe).
  *  - screen observed revision: the last revision a screen's player acked.
+ *  - screen inspecting: the wall's Web Inspector is open on that panel (POL-50).
  */
 export class Presence {
   private readonly agentConns = new Map<string, number>();
   private readonly screenRevision = new Map<string, number>();
+  /** screenIds whose panel currently shows the browser's Web Inspector (POL-50). */
+  private readonly inspecting = new Set<string>();
+  /** screenId → why the box last refused to show it (POL-50). */
+  private readonly inspectErrors = new Map<string, string>();
 
   agentConnected(machineId: string): void {
     this.agentConns.set(machineId, (this.agentConns.get(machineId) ?? 0) + 1);
@@ -84,6 +89,45 @@ export class Presence {
 
   screenObservedRevision(screenId: string): number {
     return this.screenRevision.get(screenId) ?? 0;
+  }
+
+  /**
+   * Record whether a screen's panel is showing the Web Inspector (POL-50). Only ever called from the
+   * agent's `agent/inspect-ack` — the operator's click is a request, the ack is the truth.
+   */
+  setScreenInspecting(screenId: string, on: boolean): void {
+    if (on) this.inspecting.add(screenId);
+    else this.inspecting.delete(screenId);
+  }
+
+  isScreenInspecting(screenId: string): boolean {
+    return this.inspecting.has(screenId);
+  }
+
+  /**
+   * Record (or clear, with `null`) why the box refused to show its inspector. A refusal leaves
+   * `inspecting` false — i.e. UNCHANGED — so this is the only thing that distinguishes "the wall said
+   * no" from "the wall hasn't answered yet", and it is what un-sticks the console's pending button.
+   */
+  setScreenInspectError(screenId: string, reason: string | null): void {
+    if (reason === null) this.inspectErrors.delete(screenId);
+    else this.inspectErrors.set(screenId, reason);
+  }
+
+  screenInspectError(screenId: string): string | undefined {
+    return this.inspectErrors.get(screenId);
+  }
+
+  /**
+   * Forget the inspector state for these screens — their machine dropped, so whatever was on those
+   * panels is gone. Without this a box that reboots while being inspected comes back showing a stale
+   * "inspecting" badge for a wall that is once again a sealed kiosk.
+   */
+  clearScreensInspecting(screenIds: readonly string[]): void {
+    for (const id of screenIds) {
+      this.inspecting.delete(id);
+      this.inspectErrors.delete(id);
+    }
   }
 }
 
@@ -114,6 +158,8 @@ export function buildAdminState(
           revision: presence.screenObservedRevision(s.id),
           surfaceCount: slice ? slice.surfaces.length : 0,
           content: control.screenContentSummary(s.id),
+          inspecting: presence.isScreenInspecting(s.id),
+          inspectError: presence.screenInspectError(s.id),
         } satisfies ScreenView;
       });
 
@@ -127,6 +173,7 @@ export function buildAdminState(
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,
       lastSeen: machine.lastSeen,
+      shellEnabled: machine.shellEnabled ?? false,
       screens: machineScreens,
     } satisfies MachineView;
   });

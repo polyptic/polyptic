@@ -108,7 +108,7 @@ way, by **network-booting the live image the control plane serves**:
 3. Boot the machine from it, Secure Boot on. It streams the current image into RAM and enrols.
 
 The image already contains the agent binary and the whole kiosk substrate (greetd autologin → sway →
-agent → Chromium per output, plus the boot splash), wired at **build** time by `polyptic-agent setup`
+agent → surf per output, plus the boot splash), wired at **build** time by `polyptic-agent setup`
 running inside the image's chroot. The control-plane address and, in gated mode, the enrolment token
 arrive on the kernel command line from the boot menu the server generates per request, so nothing is
 typed on the machine and no config file is edited. It dials home and shows **PENDING** in the console

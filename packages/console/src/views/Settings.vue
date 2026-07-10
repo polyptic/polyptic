@@ -835,7 +835,7 @@ async function onSignOut(): Promise<void> {
               <div class="step-body">
                 <div class="step-title">Optional: install the bootloader, then take the USB back</div>
                 <div class="step-text">
-                  At the boot menu choose <b>Polyptic (Offload Bootloader)</b>. The screen then boots Polyptic on its
+                  At the boot menu choose <b>Set up this screen to start without the USB stick</b>. The screen then boots Polyptic on its
                   own, and the same stick can walk down the rack.
                 </div>
                 <div class="step-aside">
