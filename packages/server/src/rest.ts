@@ -16,6 +16,10 @@
  *                                                if the agent is connected; broadcast; 404 unknown
  *   POST /api/v1/machines/:machineId/reject   -> status→rejected; server/rejected + close if connected;
  *                                                broadcast; optional body {reason?}; 404 unknown
+ *
+ * POL-55 operator route:
+ *   POST /api/v1/machines/:machineId/reboot   -> server/reboot to a connected, approved agent;
+ *                                                404 unknown; 409 not-approved or offline
  */
 import { z } from "zod";
 
@@ -27,10 +31,12 @@ import {
   CreateSceneBody,
   IdentBody,
   PlaceScreenBody,
+  RebootBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
   ServerToAgentApply,
+  ServerToAgentReboot,
   ServerToAgentRejected,
   ServerToPlayerIdent,
   ServerToPlayerRender,
@@ -47,6 +53,7 @@ import type { Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
 
+import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
@@ -84,6 +91,7 @@ export function registerRestRoutes(
   media: MediaStore,
   mediaConfig: MediaConfig,
   tokens: TokenService,
+  activity: ActivityLog,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -354,6 +362,57 @@ export function registerRestRoutes(
       screens: screens.map((s) => s.id),
       delivered,
     };
+  });
+
+  // POST /api/v1/machines/:machineId/reboot  { reason? }  -> power-cycle one wedged box (POL-55)
+  //
+  // The fleet-wide image roll-out already reboots stale boxes, but each box decides that for itself by
+  // polling the manifest. This is the opposite direction and the reason it needs its own route: a box
+  // that has wedged (compositor dead, browser hung) still holds a live agent socket, so the control
+  // plane can reach it even though nothing on the wall has moved for an hour.
+  //
+  // 409 rather than 202 when the agent is not connected: a reboot that was never delivered must not
+  // look like one that was. The agent answers `agent/reboot-ack` (handled in ws.ts) — which is where
+  // a REFUSAL (dev backend, no privileged helper) surfaces, since only the box knows that.
+  fastify.post("/api/v1/machines/:machineId/reboot", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = RebootBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = control.getMachine(params.data.machineId);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+    if (machine.status !== "approved") {
+      return reply
+        .code(409)
+        .send({ error: `machine ${machine.id} is ${machine.status}, not approved — cannot reboot it` });
+    }
+
+    const reason = body.data.reason?.trim() || "requested by an operator from the console";
+    const delivered = agentHub.send(
+      machine.id,
+      ServerToAgentReboot.parse({ t: "server/reboot", reason }),
+    );
+    if (delivered === 0) {
+      return reply.code(409).send({ error: `machine ${machine.id} is offline — nothing to reboot` });
+    }
+
+    // The feed only reaches the console folded into an admin/state, and a reboot mutates no state that
+    // would otherwise trigger one — so broadcast, or the operator's click leaves no trace until the
+    // box drops off the network seconds later.
+    activity.push("warn", `Rebooting ${machine.label}`);
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.reboot", machineId: machine.id, reason, delivered },
+      "pushed reboot to agent",
+    );
+    return { ok: true, machineId: machine.id, delivered };
   });
 
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────

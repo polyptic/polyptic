@@ -181,7 +181,23 @@ export const AgentThumbnail = z.object({
   dataBase64: z.string(),
 });
 
-export const AgentMessage = z.discriminatedUnion("t", [AgentHello, AgentStatus, AgentThumbnail]);
+/** POL-55 — the agent's answer to `server/reboot`, sent BEFORE it triggers the reboot (the socket
+ *  dies moments later). `accepted: false` means the agent declined and the box stays up: a dev
+ *  backend, a non-Linux host, or no way to reach the privileged reboot helper. */
+export const AgentRebootAck = z.object({
+  t: z.literal("agent/reboot-ack"),
+  machineId: z.string(),
+  accepted: z.boolean(),
+  /** Why the agent declined, when `accepted` is false. */
+  reason: z.string().optional(),
+});
+
+export const AgentMessage = z.discriminatedUnion("t", [
+  AgentHello,
+  AgentStatus,
+  AgentThumbnail,
+  AgentRebootAck,
+]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
 
 export const ServerToAgentApply = z.object({
@@ -202,6 +218,21 @@ export const ServerToAgentIdent = z.object({
 export const ServerToAgentCapture = z.object({
   t: z.literal("server/capture"),
   connector: z.string().optional(), // omit = all outputs
+});
+
+/**
+ * POL-55 — reboot this machine now, on an operator's say-so. The fleet-wide image roll-out already
+ * reboots stale boxes (each box polls the manifest and reboots itself); this is the other direction:
+ * the control plane pushing a reboot at ONE named machine, for the box that has wedged itself.
+ *
+ * The agent is unprivileged, so it does not call `reboot` — it asks a root-owned systemd helper to
+ * (see the agent's ./host.ts). It answers `agent/reboot-ack` first, then triggers; a machine that
+ * cannot reboot (dev backend, non-Linux, no helper) declines and stays up.
+ */
+export const ServerToAgentReboot = z.object({
+  t: z.literal("server/reboot"),
+  /** Advisory, logged on the box (e.g. "requested by an operator from the console"). */
+  reason: z.string().optional(),
 });
 
 /** Issued after a valid first-contact enrollment: the durable credential the agent persists and
@@ -238,6 +269,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentApply,
   ServerToAgentIdent,
   ServerToAgentCapture,
+  ServerToAgentReboot,
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
@@ -523,6 +555,10 @@ export const IdentBody = z.object({
   ttlMs: z.number().int().positive().optional(), // optional auto-off, for fire-and-forget pulses
 });
 export type IdentBody = z.infer<typeof IdentBody>;
+
+/** Reboot request for one machine (POL-55). The reason rides through to the box's journal. */
+export const RebootBody = z.object({ reason: z.string().max(200).optional() });
+export type RebootBody = z.infer<typeof RebootBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

@@ -209,6 +209,14 @@ export function identMachine(machineId: string, body: IdentBody): Promise<unknow
 }
 
 /**
+ * POST /api/v1/machines/:machineId/reboot — power-cycle one box (POL-55). Rejects with an ApiError on
+ * 409 when the machine is offline or not approved, so the caller can tell the operator what happened.
+ */
+export function rebootMachine(machineId: string): Promise<unknown> {
+  return send("POST", `/machines/${encodeURIComponent(machineId)}/reboot`);
+}
+
+/**
  * DELETE /api/v1/machines/:machineId — permanently forget a machine (POL-14). Unlike reject/revoke,
  * this deletes the machine, all its screens, their placement + content, and its credential; the server
  * closes its agent socket. A removed machine must re-enrol to return.

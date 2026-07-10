@@ -61,6 +61,7 @@ import { hostname as osHostname } from "node:os";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import { rebootHost } from "./host";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
@@ -122,6 +123,7 @@ function readAgentVersion(): string {
 type ApplyMsg = Extract<ServerToAgentMessage, { t: "server/apply" }>;
 type IdentMsg = Extract<ServerToAgentMessage, { t: "server/ident" }>;
 type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
+type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
@@ -252,6 +254,9 @@ class Agent {
       case "server/capture":
         await this.onCapture(msg);
         break;
+      case "server/reboot":
+        await this.onReboot(msg);
+        break;
       case "server/enrolled":
         this.onEnrolled(msg);
         break;
@@ -344,6 +349,30 @@ class Agent {
         log(`capture(${connector}) failed: ${(err as Error).message}`);
       }
     }
+  }
+
+  /**
+   * `server/reboot` — an operator asked the control plane to power-cycle this box (POL-55).
+   *
+   * We answer BEFORE the box goes down, so the console can distinguish "rebooting" from "fell off the
+   * network". The trigger itself (see ./host.ts) returns long before systemd starts tearing the system
+   * down — `systemctl --no-block` and the path-unit handshake are both asynchronous — so the ack is
+   * both truthful about the outcome and still has time to reach the wire.
+   *
+   * A refusal (dev backend, non-Linux, no privileged helper) leaves the box up and running: the reason
+   * rides back on the ack and surfaces in the console's activity feed.
+   */
+  private async onReboot(msg: RebootMsg): Promise<void> {
+    log(`server/reboot received${msg.reason ? ` — ${msg.reason}` : ""}`);
+    const outcome = await rebootHost(this.backend.id);
+    this.send({
+      t: "agent/reboot-ack",
+      machineId: this.machineId,
+      accepted: outcome.accepted,
+      reason: outcome.reason,
+    });
+    if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
+    else logError(`refused to reboot: ${outcome.reason}`);
   }
 
   /**

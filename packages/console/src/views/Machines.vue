@@ -7,7 +7,8 @@
                  (with an optional reason). Surfaced first, with a warning treatment.
     • Approved — admitted machines, online first. Each shows its screens (connectivity dot, inline
                  rename, connector, "Driven by {machine}", per-screen Ident) plus a per-machine
-                 "Ident all" and a Revoke. (Revoke reuses the reject endpoint.)
+                 "Ident all", a Reboot (online only — it rides the live agent socket), and a Revoke.
+                 (Revoke reuses the reject endpoint.)
     • Rejected — denied/revoked boxes, kept listed so access can be restored (Re-approve).
 
   A "Connect a machine" button (and a first-run empty state) opens the cold-start wizard. Screens are
@@ -41,6 +42,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (clock) clearInterval(clock);
+  window.clearTimeout(toastTimer);
 });
 
 function approve(m: MachineView): void {
@@ -81,6 +83,29 @@ function remove(m: MachineView): void {
 
 function identAll(m: MachineView): void {
   void store.identMachine(m.id);
+}
+
+/**
+ * Power-cycle a wedged box (POL-55). Offered only while the machine is online, because the reboot
+ * rides its live agent socket — an offline box has nothing to receive it.
+ */
+async function reboot(m: MachineView): Promise<void> {
+  const n = m.screens.length;
+  const what = n > 0 ? `Its ${countLabel(n, "screen")} go dark` : "It goes dark";
+  const yes = window.confirm(
+    `Reboot "${m.label}"? ${what} until it boots back up and reconnects — about a minute.`,
+  );
+  if (!yes) return;
+  const error = await store.rebootMachine(m.id);
+  showToast(error ?? `Rebooting ${m.label}…`);
+}
+
+const toast = ref("");
+let toastTimer: number | undefined;
+function showToast(message: string): void {
+  window.clearTimeout(toastTimer);
+  toast.value = message;
+  toastTimer = window.setTimeout(() => (toast.value = ""), 2600);
 }
 
 /** A comma-joined list of a machine's screen names (or its output count if none registered yet). */
@@ -192,6 +217,14 @@ function drives(m: MachineView): string {
                 >
                   <span class="ident-dot"></span>Ident all
                 </button>
+                <button
+                  v-if="m.online"
+                  class="btn-ghost-sm"
+                  title="Power-cycle this machine"
+                  @click="reboot(m)"
+                >
+                  Reboot
+                </button>
                 <button class="btn-revoke" @click="revoke(m)">Revoke</button>
                 <button class="btn-remove" @click="remove(m)">Remove</button>
               </div>
@@ -241,6 +274,10 @@ function drives(m: MachineView): string {
 
     <!-- cold-start wizard overlay -->
     <ColdStartWizard :open="wizardOpen" :now="now" @close="wizardOpen = false" />
+
+    <Transition name="toast">
+      <div v-if="toast" class="toast">{{ toast }}</div>
+    </Transition>
   </div>
 </template>
 
@@ -580,5 +617,30 @@ function drives(m: MachineView): string {
   margin-top: 12px;
   font-size: 12px;
   color: var(--muted2);
+}
+
+/* toast (reboot feedback) */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  background: var(--primary);
+  color: var(--primary-fg);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 10px 16px;
+  border-radius: 9px;
+  box-shadow: var(--shadow-lg);
+  z-index: 70;
+}
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 8px);
 }
 </style>
