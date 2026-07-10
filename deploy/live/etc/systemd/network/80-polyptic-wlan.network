@@ -1,0 +1,17 @@
+# Polyptic live image (POL-63): DHCP every wireless interface, the wl* counterpart of the netplan
+# ethernets config (01-polyptic-dhcp.yaml). Deliberately plain networkd rather than netplan: the
+# association itself is wpa_supplicant@<iface> fed from the boot medium's polyptic/wifi.conf
+# (polyptic-wifi.service), and netplan's wifis: would try to own that supplicant config — one owner,
+# not two. networkd reads /etc/systemd/network alongside netplan's /run output, so the two coexist.
+# The higher route metric keeps a wired link preferred whenever a box has both.
+[Match]
+Name=wl*
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+RouteMetric=600
+
+[IPv6AcceptRA]
+RouteMetric=600

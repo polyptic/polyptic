@@ -52,6 +52,7 @@ STATUS_FILE="$RUN_DIR/bootloader-status"
 base=""
 token=""
 mnt=""
+mnt_medium=""
 
 # ─── Telling the operator what happened ─────────────────────────────────────────────────────────────
 # Whoever runs an offload is standing at the box watching the splash, so the screen is the primary
@@ -123,6 +124,7 @@ fail() {
 cleanup() {
   if [ -n "$mnt" ] && mountpoint -q "$mnt" 2>/dev/null; then umount "$mnt" 2>/dev/null || true; fi
   if [ -n "$mnt" ]; then rmdir "$mnt" 2>/dev/null || true; fi
+  if [ -n "$mnt_medium" ]; then umount "$mnt_medium" 2>/dev/null || true; rmdir "$mnt_medium" 2>/dev/null || true; fi
   rm -f "${tmp_shim:-}" "${tmp_grub:-}" "${tmp_cfg:-}" 2>/dev/null || true
   return 0
 }
@@ -145,6 +147,7 @@ cmdline_value() {
 base="$(cmdline_value polyptic.base)"
 token="$(cmdline_value polyptic.token)"
 want_disk="$(cmdline_value polyptic.offload_disk)"
+want_wifi="$(cmdline_value polyptic.offload_wifi)"
 [ -n "$base" ] || fail no-base "the kernel cmdline carries no polyptic.base=, so there is no control plane to fetch the signed loaders from"
 # GRUB wants the control-plane address as a bare host:port.
 hostport="${base#http://}"; hostport="${hostport%%/*}"
@@ -171,10 +174,25 @@ efibootmgr >/dev/null 2>&1 \
 # sources FIRST (before the plain $prefix/grub.cfg), so writing our config there always wins over a
 # foreign lower-precedence config left on a repurposed ESP.
 case "$(uname -m)" in
-  x86_64)  efiarch=x64;  fbname=BOOTX64.EFI;  grubdir=x86_64-efi ;;
-  aarch64) efiarch=aa64; fbname=BOOTAA64.EFI; grubdir=arm64-efi  ;;
+  x86_64)  efiarch=x64;  fbname=BOOTX64.EFI;  grubdir=x86_64-efi; debarch=amd64 ;;
+  aarch64) efiarch=aa64; fbname=BOOTAA64.EFI; grubdir=arm64-efi;  debarch=arm64 ;;
   *) fail unsupported-arch "unsupported machine architecture '$(uname -m)'" ;;
 esac
+
+# ─── Does this install carry the LOCAL Wi-Fi payload? (POL-63) ───────────────────────────────────────
+# A pointer-only ESP (the D47 install) netboots over ETHERNET at every power-on — dead weight on a box
+# that lives on Wi-Fi, whose GRUB can never associate. So when this very boot reached the control
+# plane over a WIRELESS default route, the install also copies the booted medium's local payload
+# (kernel + initrd-wifi + menus + wifi.conf) onto the ESP: the box then self-boots the LOCAL chain,
+# joins Wi-Fi from the initrd, and streams the OS image — no stick left in. Overrides:
+# polyptic.offload_wifi=1 forces the payload (a wired install for a box moving to Wi-Fi),
+# =0 forces pointer-only (press `e` at the GRUB menu, same as polyptic.offload_disk=).
+wifi_payload=0
+default_dev="$(ip route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+if [ -n "$default_dev" ] && [ -d "${POLYPTIC_NET_DIR:-/sys/class/net}/$default_dev/wireless" ]; then
+  wifi_payload=1
+fi
+case "$want_wifi" in 1) wifi_payload=1 ;; 0) wifi_payload=0 ;; esac
 
 # ─── Choose the ESP, deliberately ───────────────────────────────────────────────────────────────────
 # `lsblk` order is kernel enumeration order, which on a box with a USB stick in it and two internal
@@ -244,6 +262,27 @@ disk="/dev/$(lsblk -no PKNAME "/dev/$esp_part" 2>/dev/null | head -n1)"
 partnum="$(cat "$SYS_BLOCK/$esp_part/partition" 2>/dev/null || true)"
 [ -n "$partnum" ] || fail no-partnum "cannot read the partition number of /dev/$esp_part (nothing was erased)"
 
+# ─── Stage the local Wi-Fi payload from the BOOTED medium (POL-63; before anything downloads) ────────
+# The payload is copied medium → ESP, never through RAM: initrd-wifi is hundreds of MB and the live
+# root is a RAM overlay. The medium's CURRENT slot is read out of its own local-<arch>.cfg header
+# (that file is the single source of truth for slot + image id, written only by the renderer).
+slot=""; imgid=""; payload_src=""
+fsize() { wc -c < "$1" | tr -d '[:space:]'; }
+if [ "$wifi_payload" = 1 ]; then
+  mnt_medium="$(mktemp -d)"
+  medium_dev="$(sh "$LIB_DIR/find-boot-medium.sh" "$mnt_medium" ro 2>/dev/null || true)"
+  [ -n "$medium_dev" ] \
+    || fail no-local-payload "this boot is on Wi-Fi but no Polyptic boot medium is attached to copy the local payload from (leave the USB stick in during the offload)"
+  lcfg="$mnt_medium/grub/local-$debarch.cfg"
+  [ -f "$lcfg" ] \
+    || fail no-local-payload "the boot medium carries no local payload for $debarch, so an offloaded ESP could never boot this box over Wi-Fi (rebuild the medium with this arch's image)"
+  slot="$(sed -n '1s/.* slot=\([a-z]\).*/\1/p' "$lcfg")"; [ -n "$slot" ] || slot=a
+  imgid="$(sed -n '1s/.* image=\([^ ]*\).*/\1/p' "$lcfg")"
+  payload_src="$mnt_medium/polyptic/boot/$debarch/$slot"
+  { [ -f "$payload_src/vmlinuz" ] && [ -f "$payload_src/initrd" ]; } \
+    || fail no-local-payload "the boot medium's $debarch payload (slot $slot) is incomplete (rebuild the medium)"
+fi
+
 # ─── Fetch the signed loaders (TOKENLESS, from the ungated depot: the box has no operator session) ───
 
 tmp_shim="$(mktemp)"; tmp_grub="$(mktemp)"; tmp_cfg="$(mktemp)"
@@ -252,12 +291,14 @@ if ! curl -fsSL "$base/dist/boot/shim$efiarch.efi" -o "$tmp_shim" \
   fail no-loaders "could not download the signed loaders from $base/dist/boot/ (nothing was erased)"
 fi
 
-# The stage-1 config, same content as the dongle's (deploy/dongle-grub.cfg.tmpl) plus our marker line.
+# The stage-1 config, same content as the medium's (deploy/dongle-grub.cfg.tmpl) plus our marker line.
 # $net is GRUB RUNTIME syntax: the heredoc delimiter is quoted so the shell expands NOTHING, then sed
-# fills in the one build-time value.
+# fills in the one build-time value. The local-fallback lines only ever fire when a local payload was
+# copied below (a pointer-only ESP has no /grub/local.cfg, so `[ -e ]` is false and the flow is the
+# pre-POL-63 one exactly).
 sed "s|@@POLYPTIC_BASE_HOSTPORT@@|$hostport|g" > "$tmp_cfg" <<'EOF'
 # polyptic-offload
-# Polyptic boot dongle (POL-33/D47). TOKENLESS: carries only the control-plane address. The
+# Polyptic boot medium stage 1 (POL-33/D47; local fallback POL-63). TOKENLESS network path: the
 # enrolment token is baked by the server into /boot/grub.cfg at chain time. Secure Boot stays ON.
 set net=(http,@@POLYPTIC_BASE_HOSTPORT@@)
 echo "Polyptic: bringing the network up (DHCP on all NICs) ..."
@@ -265,9 +306,15 @@ net_dhcp
 echo "Polyptic: chaining $net/boot/grub.cfg ..."
 configfile $net/boot/grub.cfg
 # Only reached when DHCP or the chain failed:
+if [ -e /grub/local.cfg ]; then
+  echo "Polyptic: no wired path to the control plane - booting from the local payload ..."
+  configfile /grub/local.cfg
+fi
+# Only reached when there is ALSO no local payload: keep offering retries.
 set timeout=10
 set default=retry
 menuentry "Retry (DHCP + chain again)" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
+menuentry "Boot from local payload (Wi-Fi boxes)" --id local { configfile /grub/local.cfg }
 menuentry "Reboot" { reboot }
 menuentry "Firmware setup" { fwsetup }
 EOF
@@ -277,9 +324,24 @@ EOF
 mnt="$(mktemp -d)"
 mount "/dev/$esp_part" "$mnt" || fail mount-failed "cannot mount the EFI System Partition /dev/$esp_part (nothing was erased)"
 
+# The payload needs room for TWO slots — the one written now and the spare update-poll refreshes
+# into later — plus the loaders and slack. Checked BEFORE any write: a box that installs and can
+# never update is a half-install with a delay on it, exactly what POL-58 banned.
+if [ "$wifi_payload" = 1 ]; then
+  need_kb=$(( ( $(fsize "$payload_src/vmlinuz") + $(fsize "$payload_src/initrd") ) * 2 / 1024 + 24576 ))
+  avail_kb="$(df -Pk "$mnt" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
+    fail esp-too-small "the EFI System Partition on $disk has $(( ${avail_kb:-0} / 1024 )) MB free but the Wi-Fi local payload needs ~$(( need_kb / 1024 )) MB (kernel + initrd-wifi, twice: a live slot and an update slot). Nothing was written; keep this box booting from the USB medium, or grow the ESP"
+  fi
+fi
+
 # A file at one of OUR paths that lacks the marker belongs to someone else and is NEVER clobbered.
 ours_or_absent() {
   [ ! -f "$1" ] || grep -q '^# polyptic-offload$' "$1"
+}
+# Same rule for the local-payload menus, which carry their own marker (written by render-local-grub).
+ours_or_absent_local() {
+  [ ! -f "$1" ] || grep -q '^# polyptic-local' "$1"
 }
 
 # grubnet's baked-in prefix is /grub ON THE DEVICE IT LOADED FROM; it will NOT read a config beside the
@@ -309,6 +371,33 @@ if [ ! -e "$mnt/EFI/BOOT/$fbname" ] && [ ! -e "$mnt/EFI/BOOT/grub$efiarch.efi" ]
   put "$tmp_shim" "$mnt/EFI/BOOT/$fbname"
   put "$tmp_grub" "$mnt/EFI/BOOT/grub$efiarch.efi"
   fallback="yes"
+fi
+
+# ─── The local Wi-Fi payload (POL-63): medium → ESP, so the box boots with no stick in ───────────────
+if [ "$wifi_payload" = 1 ]; then
+  ours_or_absent_local "$mnt/grub/local.cfg" \
+    || fail foreign-grub-cfg "$mnt/grub/local.cfg on /dev/$esp_part is a GRUB config Polyptic did not write; refusing to overwrite it (the loaders were updated; the payload was not)"
+  ours_or_absent_local "$mnt/grub/local-$debarch.cfg" \
+    || fail foreign-grub-cfg "$mnt/grub/local-$debarch.cfg on /dev/$esp_part is a GRUB config Polyptic did not write; refusing to overwrite it (the loaders were updated; the payload was not)"
+  say "copying the $debarch local payload (image ${imgid:-?}) onto the ESP; this reads a few hundred MB from the USB medium ..."
+  mkdir -p "$mnt/polyptic/boot/$debarch/a" "$mnt/grub"
+  cp "$payload_src/vmlinuz" "$mnt/polyptic/boot/$debarch/a/vmlinuz"
+  cp "$payload_src/initrd"  "$mnt/polyptic/boot/$debarch/a/initrd"
+  # The menus: the dispatcher travels as-is; the arch menu is REGENERATED for slot `a` (the medium's
+  # active slot may be `b`, and the header line is what update-poll reads back later).
+  cp "$mnt_medium/grub/local.cfg" "$mnt/grub/local.cfg"
+  sh "$LIB_DIR/render-local-grub.sh" "$debarch" a "$hostport" "${imgid:-unknown}" "$token" > "$mnt/grub/local-$debarch.cfg"
+  # Credentials + the marker that makes this ESP *be* the boot medium from now on (find-boot-medium
+  # proves identity by this file's presence, which is how update-poll finds the ESP to refresh).
+  if [ -f "$mnt_medium/polyptic/wifi.conf" ]; then
+    cp "$mnt_medium/polyptic/wifi.conf" "$mnt/polyptic/wifi.conf"
+  fi
+  if [ -d "$mnt_medium/polyptic/certs" ]; then
+    mkdir -p "$mnt/polyptic/certs"
+    cp -R "$mnt_medium/polyptic/certs/." "$mnt/polyptic/certs/"
+  fi
+  printf 'medium-esp-%s\n' "$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)" > "$mnt/polyptic/medium-id"
+  umount "$mnt_medium" 2>/dev/null || true; rmdir "$mnt_medium" 2>/dev/null || true; mnt_medium=""
 fi
 
 umount "$mnt"; rmdir "$mnt"; mnt=""
@@ -352,6 +441,7 @@ first="${final%%,*}"
 
 mkdir -p "$(dirname "$STAMP")"; : > "$STAMP"
 detail="installed the signed loaders on $disk (partition $partnum) and made '$LABEL' the first UEFI boot option"
+if [ "$wifi_payload" = 1 ]; then detail="$detail, with the Wi-Fi local payload (image ${imgid:-unknown})"; fi
 if [ "$fallback" = "yes" ]; then detail="$detail, plus the removable-media fallback path"; fi
 report true installed "$detail"
 say "bootloader installed on $disk. Remove the USB stick and reboot — nothing was erased, and the previous OS is still on this disk and bootable from the firmware boot menu."

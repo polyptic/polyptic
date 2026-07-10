@@ -101,6 +101,9 @@ mv -f "$WORK/rootfs.squashfs" "$PAYLOAD"
 
 echo '==> [5/5] publish image id + checksums'
 printf '%s\n' "$IMAGE_ID" > "$OUT_DIR/image-id.txt"
-( cd "$OUT_DIR" && sha256sum vmlinuz initrd rootfs.squashfs > SHA256SUMS && cat SHA256SUMS )
+# initrd-wifi (POL-63) exists on post-Wi-Fi builds only; the refresh carries it through unchanged
+# (the kernel is held, so both initrds stay matched) and its checksum is what the boxes' update-poll
+# verifies a medium refresh against.
+( cd "$OUT_DIR" && sha256sum vmlinuz initrd $([ -f initrd-wifi ] && echo initrd-wifi) rootfs.squashfs > SHA256SUMS && cat SHA256SUMS )
 echo "==> refreshed -> $PAYLOAD (image id $IMAGE_ID, $(du -h "$PAYLOAD" | cut -f1))"
 echo "    Boxes on the 5-minute update poll will reboot per policy (urgent: now; else the nightly window)."

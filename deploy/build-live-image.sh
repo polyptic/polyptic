@@ -84,6 +84,21 @@ if [ "${FULL_FIRMWARE:-0}" = "1" ]; then
 else
   FIRMWARE_PACKAGES="${FIRMWARE_PACKAGES-$DEFAULT_FIRMWARE}"
 fi
+# The Wi-Fi stack (POL-63): every major vendor's wlan blobs (the fleet's chipsets are not known up
+# front, and a Wi-Fi box that boots with a dead radio has no other path to the control plane;
+# Realtek rtw88/89 already rides the wired set) plus the supplicant. INSTALLED BETWEEN THE TWO
+# DRACUT RUNS in step 6, deliberately: dracut's kernel-network-modules pulls all of =drivers/net in
+# --no-hostonly mode and bundles firmware for every module it installs, so any wlan firmware present
+# when the LEAN initrd builds would silently ride the wired GRUB fetch (+74 MB measured; and
+# --omit-drivers can't exclude a subtree, its entries are ^anchored$ module names). Under
+# FULL_FIRMWARE=1 the wireless blobs are already in `linux-firmware` from step 3 — the lean initrd
+# absorbs them exactly as it did pre-POL-63; that escape hatch has always traded size for coverage.
+WIFI_PACKAGES="wpasupplicant wireless-regdb iw"
+if [ "${FULL_FIRMWARE:-0}" = "1" ]; then
+  WIFI_FIRMWARE_PACKAGES="${WIFI_FIRMWARE_PACKAGES-}"
+else
+  WIFI_FIRMWARE_PACKAGES="${WIFI_FIRMWARE_PACKAGES-linux-firmware-intel-wireless linux-firmware-qualcomm-wireless linux-firmware-mediatek linux-firmware-broadcom-wireless linux-firmware-marvell-wireless}"
+fi
 
 [ "$(uname -s)" = "Linux" ] || { echo "Linux build host required (got $(uname -s))" >&2; exit 1; }
 [ "$(id -u)" = 0 ]          || { echo "must run as root (chroot + mounts)" >&2; exit 1; }
@@ -161,6 +176,8 @@ kernel="\$(apt-cache depends linux-image-generic | sed -n 's/.*Depends: \(linux-
 echo "    kernel package: \$kernel"
 # procps (top/ps/free/vmstat) is deliberate, not bloat (~1.5 MB): the first hot box in the field
 # had NO way to answer "what is eating this CPU" from its debug shell (POL-35, 2026-07-10).
+# The Wi-Fi stack (wpasupplicant + wlan firmware, POL-63) is NOT here — it lands between the two
+# dracut runs in step 6, so the lean wired initrd never absorbs it (see WIFI_PACKAGES above).
 apt-get install -y --no-install-recommends \
   systemd-sysv systemd-resolved libpam-systemd udev dbus kmod dmsetup \
   iproute2 netplan.io ca-certificates curl efibootmgr procps \
@@ -191,11 +208,12 @@ echo '==> [5/8] overlay diskless identity + offload layer'
 rsync -a "$OVERLAY"/ "$ROOTFS"/ --exclude test
 chmod 0755 "$ROOTFS"/usr/local/lib/polyptic/*.sh
 chmod 0755 "$ROOTFS"/usr/lib/dracut/modules.d/50polyptic-live/*.sh
+chmod 0755 "$ROOTFS"/usr/lib/dracut/modules.d/51polyptic-wifi/*.sh
 chmod 0600 "$ROOTFS"/etc/netplan/01-polyptic-dhcp.yaml   # netplan refuses/warns on world-readable configs
 # Enable the system units OFFLINE via the same .wants symlinks `systemctl enable` would create (which
 # is a no-op/warn inside a chroot).
 mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
-for unit in polyptic-agent-env.service polyptic-offload.service; do
+for unit in polyptic-agent-env.service polyptic-offload.service polyptic-wifi.service; do
   ln -sf "../$unit" "$ROOTFS/etc/systemd/system/multi-user.target.wants/$unit"
 done
 # The update-poll timer (POL-41) is a timer unit, so it enables under timers.target.
@@ -220,7 +238,7 @@ chmod 0644 "$ROOTFS/etc/polyptic/image-id"
 # NEWER than /usr (we are past every apt operation here) marks the image up to date.
 touch "$ROOTFS/etc/.updated" "$ROOTFS/var/.updated"
 
-echo '==> [6/8] chroot: dracut initramfs (--no-hostonly), matched to this kernel'
+echo '==> [6/8] chroot: dracut initramfs ×2 (--no-hostonly), matched to this kernel'
 # dmsquash-live + livenet are the `root=live:<url>` pair; polyptic-live (deploy/live/) is our own
 # module and carries the netboot RAM pre-flight, the bounded wait-online, and the splash narration.
 # `systemd-resolved` is LOAD-BEARING, not decoration: networkd gets the DHCP lease, but nothing
@@ -230,18 +248,47 @@ echo '==> [6/8] chroot: dracut initramfs (--no-hostonly), matched to this kernel
 # files, no dbus needed). The omitted modules are storage stacks a diskless kiosk never has —
 # multipath in particular used to spray "fatal configuration error" across the console before
 # plymouth owned the screen (POL-38).
+#
+# TWO initrds come out of one kernel (POL-63). The LEAN `initrd` is what a WIRED netboot fetches
+# through GRUB's few-MB/s HTTP client — byte-compatible with the pre-Wi-Fi chain, and it must stay
+# small because that fetch is on every wired power-on's critical path. `initrd-wifi` adds the
+# polyptic-wifi module: wpa_supplicant plus EVERY major vendor's wlan drivers AND their firmware
+# (the fleet's chipsets are unknown at build time), far too heavy for the GRUB fetch — and it never
+# takes it: initrd-wifi is only ever loaded from fast LOCAL media (the universal USB medium or an
+# offloaded ESP), where its bulk costs a second of USB read instead of minutes of HTTP.
+# ORDER IS THE MECHANISM here: the lean initrd builds BEFORE the Wi-Fi stack is installed, so it is
+# byte-for-byte the pre-POL-63 wired initrd (dracut has always bundled every wlan MODULE via its
+# =drivers/net sweep — 26.04 kernel-network-modules — but with no firmware present they cost ~0 and
+# never probe usefully). Then the Wi-Fi packages land, and the fat initrd-wifi picks up supplicant +
+# firmware. Installing them any earlier grew the lean initrd 92 → 166 MB (measured), a minute-plus
+# on GRUB's few-MB/s wired HTTP fetch every power-on.
 chroot "$ROOTFS" /bin/sh -eux <<CHROOT
+export DEBIAN_FRONTEND=noninteractive
 dracut --force --no-hostonly --no-hostonly-cmdline \
   --add "dmsquash-live livenet polyptic-live plymouth systemd-resolved" \
   --omit "multipath lvm mdraid crypt btrfs iscsi nfs nbd" \
   --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop" \
   --kver "$KVER" "/boot/initrd.img-$KVER"
+# The Wi-Fi stack (POL-63): supplicant + regulatory db + every major vendor's wlan firmware. The
+# same apt-cache guard as the step-3 firmware: a package absent for this arch is skipped, loudly.
+want=""
+for p in $WIFI_PACKAGES $WIFI_FIRMWARE_PACKAGES; do
+  if apt-cache policy "\$p" 2>/dev/null | grep -qE 'Candidate: [0-9]'; then want="\$want \$p"; else echo "    wifi: no \$p for $ARCH, skipping"; fi
+done
+[ -n "\$want" ] && apt-get install -y --no-install-recommends \$want || echo "    wifi: none installed"
+apt-get clean
+dracut --force --no-hostonly --no-hostonly-cmdline \
+  --add "dmsquash-live livenet polyptic-live polyptic-wifi plymouth systemd-resolved" \
+  --omit "multipath lvm mdraid crypt btrfs iscsi nfs nbd" \
+  --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop" \
+  --kver "$KVER" "/boot/initrd-wifi.img-$KVER"
 CHROOT
 
-echo '==> [7/8] Secure Boot guard + publish kernel/initrd'
+echo '==> [7/8] Secure Boot guard + publish kernel/initrds'
 VMLINUZ="$ROOTFS/boot/vmlinuz-$KVER"
 INITRD="$ROOTFS/boot/initrd.img-$KVER"
-[ -f "$VMLINUZ" ] && [ -f "$INITRD" ] || { echo "chroot produced no $VMLINUZ / $INITRD" >&2; exit 1; }
+INITRD_WIFI="$ROOTFS/boot/initrd-wifi.img-$KVER"
+[ -f "$VMLINUZ" ] && [ -f "$INITRD" ] && [ -f "$INITRD_WIFI" ] || { echo "chroot produced no $VMLINUZ / $INITRD / $INITRD_WIFI" >&2; exit 1; }
 # shim_lock verifies the KERNEL at GRUB's `linux` command, so an unsigned vmlinuz builds fine here and
 # then dies on the box with "bad shim signature". `sbverify --list` ALWAYS exits 0, so grep its output;
 # without sbsigntool, fall back to requiring a non-empty PE cert table (data-directory entry 4).
@@ -253,13 +300,15 @@ else
     || { echo "$VMLINUZ has an empty PE certificate table (unsigned); install sbsigntool to check the signer" >&2; exit 1; }
 fi
 cp -f "$VMLINUZ" "$OUT_DIR/vmlinuz"; cp -f "$INITRD" "$OUT_DIR/initrd"; chmod u+w "$OUT_DIR/initrd"
+cp -f "$INITRD_WIFI" "$OUT_DIR/initrd-wifi"; chmod u+w "$OUT_DIR/initrd-wifi"
 
 echo "==> [8/8] mksquashfs (zstd, -b $SQUASHFS_BLOCK)"
 for m in dev/pts dev proc sys run; do umount -lf "$ROOTFS/$m"; done; trap - EXIT
 rm -f "$ROOTFS/etc/resolv.conf"
-# The kernel + initrd reach the box over the boot chain, never out of the root image; carrying a second
-# ~130 MB copy inside the squashfs would ride in RAM for the whole session for nothing.
-rm -f "$ROOTFS"/boot/vmlinuz-* "$ROOTFS"/boot/initrd.img-* "$ROOTFS"/boot/System.map-* "$ROOTFS"/boot/config-*
+# The kernel + initrds reach the box over the boot chain, never out of the root image; carrying a
+# second copy inside the squashfs would ride in RAM for the whole session for nothing.
+rm -f "$ROOTFS"/boot/vmlinuz-* "$ROOTFS"/boot/initrd.img-* "$ROOTFS"/boot/initrd-wifi.img-* \
+      "$ROOTFS"/boot/System.map-* "$ROOTFS"/boot/config-*
 # Translations we never render. `path-exclude` (step 2) already kept docs/man out.
 find "$ROOTFS/usr/share/locale" -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$ROOTFS"/var/lib/apt/lists/* "$ROOTFS"/var/cache/apt/archives/*.deb "$ROOTFS"/usr/share/i18n
@@ -268,8 +317,8 @@ rm -rf "$ROOTFS"/var/lib/apt/lists/* "$ROOTFS"/var/cache/apt/archives/*.deb "$RO
 rm -f "$OUT_DIR/squashfs" "$OUT_DIR/polyptic.iso" "$OUT_DIR/rootfs.squashfs"
 mksquashfs "$ROOTFS" "$OUT_DIR/rootfs.squashfs" -noappend -comp zstd -Xcompression-level 19 -b "$SQUASHFS_BLOCK" -no-progress
 printf '%s\n' "$IMAGE_ID" > "$OUT_DIR/image-id.txt"   # published in /dist/image/<arch>/manifest.json (POL-41)
-( cd "$OUT_DIR" && sha256sum vmlinuz initrd rootfs.squashfs > SHA256SUMS && cat SHA256SUMS )
-echo "    rootfs.squashfs: $(du -h "$OUT_DIR/rootfs.squashfs" | cut -f1)  initrd: $(du -h "$OUT_DIR/initrd" | cut -f1)  vmlinuz: $(du -h "$OUT_DIR/vmlinuz" | cut -f1)"
+( cd "$OUT_DIR" && sha256sum vmlinuz initrd initrd-wifi rootfs.squashfs > SHA256SUMS && cat SHA256SUMS )
+echo "    rootfs.squashfs: $(du -h "$OUT_DIR/rootfs.squashfs" | cut -f1)  initrd: $(du -h "$OUT_DIR/initrd" | cut -f1)  initrd-wifi: $(du -h "$OUT_DIR/initrd-wifi" | cut -f1)  vmlinuz: $(du -h "$OUT_DIR/vmlinuz" | cut -f1)"
 rm -rf "$WORK"
 
 cat <<EOF

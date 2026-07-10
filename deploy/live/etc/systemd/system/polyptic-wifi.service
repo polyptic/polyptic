@@ -1,0 +1,17 @@
+[Unit]
+Description=Polyptic, bring up Wi-Fi from the boot medium's polyptic/wifi.conf (POL-63)
+Documentation=file:///usr/local/lib/polyptic/start-wifi.sh
+# The supplicant must be up for the association to count toward wait-online's --any (the drop-in in
+# this overlay); networkd must already be managing links so the DHCP fires the moment we associate.
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+Before=systemd-networkd-wait-online.service
+ConditionPathExists=/usr/local/lib/polyptic/start-wifi.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/polyptic/start-wifi.sh
+
+[Install]
+WantedBy=multi-user.target

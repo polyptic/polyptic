@@ -41,6 +41,16 @@
 #          IMAGE_DIR      the netboot payload dir holding vmlinuz/initrd/rootfs.squashfs
 #                         (default deploy/dist/image/<arch>, from build-live-image.sh)
 #          OUT            output path (default deploy/dist/image/<arch>/polyptic-live.iso)
+#          POLYPTIC_WIFI_SSID / POLYPTIC_WIFI_PSK
+#                         (optional, POL-63) bake Wi-Fi credentials: the booted box associates and
+#                         enrols over Wi-Fi with no wired network at all. PSK networks only via the
+#                         shorthand; for WPA-Enterprise (or hidden SSIDs, country, EAP certs) point
+#                         POLYPTIC_WIFI_CONF at a full wifi.conf instead (schema: docs/NETBOOT.md).
+#          POLYPTIC_WIFI_CONF   (optional) path to a complete wifi.conf to bake verbatim
+#          POLYPTIC_WIFI_CERTS  (optional) directory of EAP cert files, baked as polyptic/certs/
+#                         An ISO is read-only, so credentials CANNOT be edited after the build (that
+#                         is the universal USB medium's trick) — rebake to change them. Like the
+#                         token, baked Wi-Fi secrets make the FILE a credential.
 #
 # UTM notes (POL-38): give the VM a GPU display card (virtio-gpu-gl-pci, "GPU Supported") or sway
 # has no GL renderer and the screen stays black; leave the drive as a USB CD (auto-boots once the
@@ -104,7 +114,36 @@ install -m0644 "$IMAGE_DIR/initrd"  "$TREE/boot/initrd"
 mkdir -p "$TREE/LiveOS"
 cp -f "$IMAGE_DIR/rootfs.squashfs" "$TREE/LiveOS/squashfs.img"
 
-echo '==> [3/5] bake the enrolment cmdline into /boot/grub/grub.cfg'
+echo '==> [3/6] bake Wi-Fi credentials (optional, POL-63)'
+# The booted rootfs looks for polyptic/wifi.conf on the mounted live medium (dracut keeps the ISO at
+# /run/initramfs/live), so credentials ride the ISO tree, not the cmdline — SSIDs and passphrases
+# with spaces/quotes need no cmdline escaping, and EAP cert FILES can ride along. Validated HERE with
+# the same parser the box runs (deploy/live/.../wifi-conf.sh): a typo'd config must fail the build,
+# not a box that is already mounted on a wall.
+WIFI_SUMMARY="none (wired provisioning)"
+if [ -n "${POLYPTIC_WIFI_CONF:-}" ] || [ -n "${POLYPTIC_WIFI_SSID:-}" ]; then
+  mkdir -p "$TREE/polyptic"
+  if [ -n "${POLYPTIC_WIFI_CONF:-}" ]; then
+    [ -f "$POLYPTIC_WIFI_CONF" ] || { echo "POLYPTIC_WIFI_CONF not found: $POLYPTIC_WIFI_CONF" >&2; exit 1; }
+    install -m0644 "$POLYPTIC_WIFI_CONF" "$TREE/polyptic/wifi.conf"
+  else
+    : "${POLYPTIC_WIFI_PSK:?POLYPTIC_WIFI_SSID is set, so POLYPTIC_WIFI_PSK is required (open networks / EAP need a full POLYPTIC_WIFI_CONF)}"
+    printf 'WIFI_SSID=%s\nWIFI_PSK=%s\n' "$POLYPTIC_WIFI_SSID" "$POLYPTIC_WIFI_PSK" > "$TREE/polyptic/wifi.conf"
+  fi
+  if [ -n "${POLYPTIC_WIFI_CERTS:-}" ]; then
+    [ -d "$POLYPTIC_WIFI_CERTS" ] || { echo "POLYPTIC_WIFI_CERTS is not a directory: $POLYPTIC_WIFI_CERTS" >&2; exit 1; }
+    mkdir -p "$TREE/polyptic/certs"
+    cp -R "$POLYPTIC_WIFI_CERTS/." "$TREE/polyptic/certs/"
+  fi
+  sh "$REPO_ROOT/deploy/live/usr/local/lib/polyptic/wifi-conf.sh" "$TREE/polyptic/wifi.conf" >/dev/null \
+    || { echo "build-live-iso: the Wi-Fi config is invalid (message above); nothing was built" >&2; exit 1; }
+  WIFI_SUMMARY="$(sed -n 's/^WIFI_SSID=//p' "$TREE/polyptic/wifi.conf" | head -n1) (credentials baked, read-only)"
+  echo "    Wi-Fi: $WIFI_SUMMARY"
+else
+  echo '    Wi-Fi: none requested'
+fi
+
+echo '==> [4/6] bake the enrolment cmdline into /boot/grub/grub.cfg'
 # `quiet splash` (POL-7/POL-38): the squashfs carries the Polyptic Plymouth theme and dracut bundled
 # it into the initrd; these flags are what replace the scrolling kernel/systemd text with it.
 # `plymouth.ignore-serial-consoles` is load-bearing on arm64 VMs (implicit devicetree serial console).
@@ -120,7 +159,7 @@ menuentry "Polyptic" {
 menuentry 'UEFI Firmware Settings' { fwsetup }
 EOF
 
-echo '==> [4/5] rebuild the ISO with the ESP appended (El Torito -> appended GPT partition)'
+echo '==> [5/6] rebuild the ISO with the ESP appended (El Torito -> appended GPT partition)'
 rm -f "$OUT"
 xorriso -as mkisofs -r -V "$VOLID" -J -joliet-long -l \
   -o "$OUT" \
@@ -130,7 +169,7 @@ xorriso -as mkisofs -r -V "$VOLID" -J -joliet-long -l \
   -c boot.catalog -e '--interval:appended_partition_2:all::' -no-emul-boot \
   "$TREE"
 
-echo '==> [5/5] self-verify: El Torito must point at the appended ESP, and its FAT must be whole'
+echo '==> [6/6] self-verify: El Torito must point at the appended ESP, and its FAT must be whole'
 REP="$(xorriso -indev "$OUT" -report_el_torito plain -report_system_area plain 2>/dev/null)"
 NEW_LBA="$(echo "$REP" | grep -E '^El Torito boot img.* UEFI ' | awk '{print $NF}')"
 ESP_START="$(echo "$REP" | awk '/^GPT start and size/{if ($(NF-1) != "") last2=$(NF-1)" "$NF} /GPT type GUID.*28732ac1/{want=1} want && /^GPT start and size/{print $(NF-1); exit}')"
@@ -148,5 +187,5 @@ Attach $OUT to a UEFI VM as a (USB) CD and it auto-boots: GRUB (5s) -> dracut mo
 with the baked token. UTM: set the display card to virtio-gpu-gl-pci ("GPU Supported"), RAM >= 2 GiB
 (nothing is copied into RAM). For a real box: write it to a USB stick (dd if=<iso> of=/dev/<usb-disk>
 bs=4M) and boot with Secure Boot ON. The baked token makes the FILE a credential: share it like one
-(a leaked token still only lands new boxes as PENDING).
+(a leaked token still only lands new boxes as PENDING). Wi-Fi: $WIFI_SUMMARY.
 EOF

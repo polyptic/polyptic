@@ -121,14 +121,26 @@ printf '%s\n' "fake-payload-of $url" >> "$STUB/fetched"
 exit 0
 EOF
 
-# mount/umount/mountpoint: `mount <dev> <dir>` replaces <dir> with a symlink to the fake ESP tree.
+# mount/umount/mountpoint: `mount [-o opts] <dev> <dir>` replaces <dir> with a symlink to a fixture:
+# $STUB/vol-<basename(dev)> when that exists (the POL-63 boot medium), else the fake ESP tree.
 cat > "$BIN/mount" <<'EOF'
 #!/bin/sh
 case "${1:-}" in -t) exit 0 ;; esac        # `mount -t efivarfs ...` is a no-op here
 [ -f "$STUB/mount_fails" ] && exit 32
-rmdir "$2" 2>/dev/null || true
-ln -s "$STUB/esp" "$2"
-printf '%s\n' "$2" >> "$STUB/mounted"
+dev=""; dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift ;;
+    -*) ;;
+    *) if [ -z "$dev" ]; then dev="$1"; else dir="$1"; fi ;;
+  esac
+  shift
+done
+src="$STUB/vol-$(basename "$dev")"
+[ -d "$src" ] || src="$STUB/esp"
+rmdir "$dir" 2>/dev/null || true
+ln -s "$src" "$dir"
+printf '%s\n' "$dir" >> "$STUB/mounted"
 exit 0
 EOF
 cat > "$BIN/umount" <<'EOF'
@@ -137,13 +149,32 @@ rm -f "$1" 2>/dev/null; mkdir -p "$1" 2>/dev/null; exit 0
 EOF
 printf '#!/bin/sh\nexit 1\n' > "$BIN/mountpoint"      # never "already mounted"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/plymouth"
+# The POL-63 Wi-Fi payload path: `ip route show default` decides payload-vs-pointer, `df -Pk` is the
+# ESP space check, `blkid` backs find-boot-medium's scan.
+cat > "$BIN/ip" <<'EOF'
+#!/bin/sh
+case "$*" in *"route show default"*) cat "$STUB/default_route" 2>/dev/null ;; esac
+exit 0
+EOF
+cat > "$BIN/df" <<'EOF'
+#!/bin/sh
+avail="$(cat "$STUB/df_avail_kb" 2>/dev/null || echo 999999999)"
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted-on\n'
+printf 'stub 1 1 %s 1%% /\n' "$avail"
+exit 0
+EOF
+cat > "$BIN/blkid" <<'EOF'
+#!/bin/sh
+cat "$STUB/vfat_devs" 2>/dev/null
+exit 0
+EOF
 chmod +x "$BIN"/*
 
 # ─── Fixture builder ────────────────────────────────────────────────────────────────────────────────
 # new_case <name> → prints the case dir; the caller tweaks it, then calls `offload <dir>`.
 new_case() {
   d="$ROOT/$1"
-  mkdir -p "$d/esp" "$d/efi/efivars" "$d/run" "$d/var" \
+  mkdir -p "$d/esp" "$d/efi/efivars" "$d/run" "$d/var" "$d/by-label" "$d/netdir" \
            "$d/sysblock/sda" "$d/sysblock/sda1" "$d/sysblock/nvme0n1" "$d/sysblock/nvme0n1p1"
   printf '1\n' > "$d/sysblock/sda1/partition"
   printf '1\n' > "$d/sysblock/nvme0n1p1/partition"
@@ -162,6 +193,7 @@ offload() {
   POLYPTIC_CMDLINE_FILE="$d/cmdline" POLYPTIC_EFI_DIR="$d/efi" POLYPTIC_SYS_BLOCK="$d/sysblock" \
   POLYPTIC_RUN_DIR="$d/run" POLYPTIC_OFFLOAD_STAMP="$d/var/offloaded" POLYPTIC_LIB_DIR="$LIB" \
   POLYPTIC_CONSOLE="$d/console" POLYPTIC_HOLD_SECONDS=0 POLYPTIC_HOLD_SECONDS_OK=0 \
+  POLYPTIC_BYLABEL_DIR="$d/by-label" POLYPTIC_NET_DIR="$d/netdir" \
   STUB_ARCH="${STUB_ARCH:-x86_64}" \
     sh "$LIB/offload.sh" 2>&1
   printf 'exit=%s\n' "$?"
@@ -326,6 +358,78 @@ eq "arm64: BOOTAA64.EFI fallback"         "yes" "$([ -f "$d/esp/EFI/BOOT/BOOTAA6
 # ─── 15) The report never leaks the fleet token into its body ───────────────────────────────────────
 d="$(new_case token-hygiene)"; out="$(offload "$d")"
 eq "token stays in the header, not the body" "" "$(posted "$d" | cut -f3 | grep -o 'secret-fleet-token' || true)"
+
+# ─── 16) POL-63: a Wi-Fi boot also offloads the LOCAL payload ───────────────────────────────────────
+# wifi_case <name>: a box whose default route rides wlan0, booted from a medium whose amd64 payload
+# sits in slot `b` (proving the ESP copy re-renders for slot `a`).
+wifi_case() {
+  d="$(new_case "$1")"
+  mkdir -p "$d/netdir/wlan0/wireless"
+  printf 'default via 10.0.0.1 dev wlan0 proto dhcp\n' > "$d/default_route"
+  m="$d/vol-POLYPTIC-BT"
+  mkdir -p "$m/grub" "$m/polyptic/boot/amd64/b" "$m/polyptic/certs"
+  : > "$d/by-label/POLYPTIC-BT"
+  printf 'medium-2026-test\n' > "$m/polyptic/medium-id"
+  printf 'WIFI_SSID=SiteNet\nWIFI_PSK=hunter2hunter2\n' > "$m/polyptic/wifi.conf"
+  printf 'PEM\n' > "$m/polyptic/certs/ca.pem"
+  printf '# polyptic-local dispatcher (POL-63)\nconfigfile /grub/local-$arch.cfg\n' > "$m/grub/local.cfg"
+  sh "$LIB/render-local-grub.sh" amd64 b 10.0.0.10 20260701T000000Z-cafe secret-fleet-token > "$m/grub/local-amd64.cfg"
+  printf 'FAKE-KERNEL\n' > "$m/polyptic/boot/amd64/b/vmlinuz"
+  printf 'FAKE-INITRD-WIFI\n' > "$m/polyptic/boot/amd64/b/initrd"
+  printf '%s' "$d"
+}
+
+d="$(wifi_case wifi-happy)"
+out="$(offload "$d")"
+eq "wifi: succeeds"                        "0" "$(exit_of "$out")"
+eq "wifi: payload kernel on the ESP"       "FAKE-KERNEL" "$(cat "$d/esp/polyptic/boot/amd64/a/vmlinuz" 2>/dev/null)"
+eq "wifi: payload initrd on the ESP"       "FAKE-INITRD-WIFI" "$(cat "$d/esp/polyptic/boot/amd64/a/initrd" 2>/dev/null)"
+has "wifi: menu re-rendered for slot a"    "slot=a image=20260701T000000Z-cafe" "$(head -n1 "$d/esp/grub/local-amd64.cfg" 2>/dev/null)"
+eq "wifi: dispatcher copied"               "# polyptic-local dispatcher (POL-63)" "$(head -n1 "$d/esp/grub/local.cfg" 2>/dev/null)"
+eq "wifi: credentials travel"              "WIFI_SSID=SiteNet" "$(head -n1 "$d/esp/polyptic/wifi.conf" 2>/dev/null)"
+eq "wifi: certs travel"                    "PEM" "$(cat "$d/esp/polyptic/certs/ca.pem" 2>/dev/null)"
+eq "wifi: the ESP becomes the medium"      "yes" "$([ -f "$d/esp/polyptic/medium-id" ] && echo yes || echo no)"
+has "wifi: stage-1 gains the local fallback" "configfile /grub/local.cfg" "$(cat "$d/esp/grub/x86_64-efi/grub.cfg")"
+has "wifi: reported with the payload"      "Wi-Fi local payload" "$(posted "$d")"
+
+# The ESP is too small for two slots: fail BEFORE anything is written, with the honest code.
+d="$(wifi_case wifi-esp-too-small)"; printf '1024\n' > "$d/df_avail_kb"
+out="$(offload "$d")"
+eq "esp-too-small: fails"                  "1" "$(exit_of "$out")"
+eq "esp-too-small: code"                   "esp-too-small" "$(code_of "$d")"
+eq "esp-too-small: ESP untouched"          "" "$(ls "$d/esp")"
+has "esp-too-small: names the numbers"     "MB free" "$out"
+
+# On Wi-Fi with no medium attached (stick already pulled): refuse, name the fix.
+d="$(new_case wifi-no-medium)"
+mkdir -p "$d/netdir/wlan0/wireless"
+printf 'default via 10.0.0.1 dev wlan0 proto dhcp\n' > "$d/default_route"
+out="$(offload "$d")"
+eq "wifi no medium: fails"                 "1" "$(exit_of "$out")"
+eq "wifi no medium: code"                  "no-local-payload" "$(code_of "$d")"
+has "wifi no medium: names the fix"        "leave the USB stick in" "$out"
+
+# A medium with no payload for this box's arch: refuse rather than install an unbootable chain.
+d="$(wifi_case wifi-wrong-arch)"
+out="$(STUB_ARCH=aarch64 offload "$d")"
+eq "wifi wrong arch: fails"                "1" "$(exit_of "$out")"
+eq "wifi wrong arch: code"                 "no-local-payload" "$(code_of "$d")"
+
+# polyptic.offload_wifi=0 forces the old pointer-only install even on a Wi-Fi route.
+d="$(wifi_case wifi-forced-off)"
+sed 's|polyptic.offload=1|polyptic.offload_wifi=0 polyptic.offload=1|' "$d/cmdline" > "$d/cmdline.new"
+mv "$d/cmdline.new" "$d/cmdline"
+out="$(offload "$d")"
+eq "forced pointer-only: succeeds"         "0" "$(exit_of "$out")"
+eq "forced pointer-only: no payload"       "no" "$([ -d "$d/esp/polyptic" ] && echo yes || echo no)"
+
+# A WIRED offload from the same payload-carrying medium stays pointer-only (the pre-POL-63 flow).
+d="$(wifi_case wired-stays-pointer)"
+rm -rf "$d/netdir/wlan0"; printf 'default via 10.0.0.1 dev eth0 proto dhcp\n' > "$d/default_route"
+out="$(offload "$d")"
+eq "wired: succeeds"                       "0" "$(exit_of "$out")"
+eq "wired: no payload copied"              "no" "$([ -d "$d/esp/polyptic" ] && echo yes || echo no)"
+eq "wired: still pointer-installed"        "installed" "$(code_of "$d")"
 
 printf '\n'
 if [ "$fails" -eq 0 ]; then printf 'ALL PASS\n'; exit 0; fi

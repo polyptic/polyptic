@@ -1,13 +1,26 @@
-# Polyptic boot dongle (POL-33/D47). TOKENLESS: carries only the control-plane address. The
+# Polyptic boot medium, stage 1 (POL-33/D47; local fallback POL-63). TOKENLESS network path: the
 # enrolment token is baked by the server into /boot/grub.cfg at chain time. Secure Boot stays ON.
+#
+# NETWORK FIRST: DHCP + chain the server's live menu — always-current entries, fresh token, active
+# image; the wired flow is byte-compatible with the pre-Wi-Fi chain. Only when that fails (no wire,
+# no DHCP, control plane unreachable) fall back to the medium's LOCAL payload: local kernel +
+# initrd-wifi, which then associates from polyptic/wifi.conf and streams the OS image over the
+# radio. That fallback IS the Wi-Fi boot path — GRUB itself can never join a WPA network, so a
+# Wi-Fi-only box must reach Linux on local files first.
 set net=(http,@@POLYPTIC_BASE_HOSTPORT@@)
 echo "Polyptic: bringing the network up (DHCP on all NICs) ..."
 net_dhcp
 echo "Polyptic: chaining $net/boot/grub.cfg ..."
 configfile $net/boot/grub.cfg
 # Only reached when DHCP or the chain failed:
+if [ -e /grub/local.cfg ]; then
+  echo "Polyptic: no wired path to the control plane - booting from the local payload ..."
+  configfile /grub/local.cfg
+fi
+# Only reached when there is ALSO no local payload (the LEAN medium): keep offering retries.
 set timeout=10
 set default=retry
 menuentry "Retry (DHCP + chain again)" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
+menuentry "Boot from local payload (Wi-Fi boxes)" --id local { configfile /grub/local.cfg }
 menuentry "Reboot" { reboot }
 menuentry "Firmware setup" { fwsetup }
