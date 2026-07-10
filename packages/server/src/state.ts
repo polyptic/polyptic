@@ -268,6 +268,7 @@ export class ControlPlane {
       status: machine.status,
       credentialHash: this.credentialHashes.get(machine.id),
       lastSeen: machine.lastSeen,
+      shellEnabled: machine.shellEnabled ?? false,
     };
   }
 
@@ -290,6 +291,7 @@ export class ControlPlane {
         // Legacy rows without a status load as `approved` (Phase 2a parity).
         status: m.status ?? "approved",
         lastSeen: m.lastSeen,
+        shellEnabled: m.shellEnabled ?? false,
       });
       if (m.credentialHash) this.credentialHashes.set(m.id, m.credentialHash);
     }
@@ -641,6 +643,7 @@ export class ControlPlane {
       outputs: input.outputs,
       status: "approved",
       lastSeen: new Date().toISOString(),
+      shellEnabled: existing?.shellEnabled ?? false,
     };
     this.machines.set(input.machineId, machine);
 
@@ -672,6 +675,7 @@ export class ControlPlane {
       outputs: input.outputs,
       status: "pending",
       lastSeen: new Date().toISOString(),
+      shellEnabled: existing?.shellEnabled ?? false,
     };
     this.machines.set(input.machineId, machine);
     await this.store.upsertMachine(this.toPersistedMachine(machine));
@@ -740,6 +744,28 @@ export class ControlPlane {
     await this.store.setMachineStatus(machineId, "rejected");
     this.emit("bad", `${machine.label} rejected`);
     return true;
+  }
+
+  /**
+   * Arm/disarm a machine for the remote shell (POL-59). Returns the machine when it exists (so the
+   * caller can broadcast the new state), else null. Disarming does NOT itself kill a live session —
+   * the WS relay checks `shellEnabled` on every frame, so a disarm is enforced on the next byte and
+   * the caller also closes any open session explicitly.
+   */
+  async setShellEnabled(machineId: string, enabled: boolean): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+    if (machine.shellEnabled !== enabled) {
+      machine.shellEnabled = enabled;
+      await this.store.setMachineShellEnabled(machineId, enabled);
+      this.emit(enabled ? "warn" : "info", `Remote shell ${enabled ? "armed" : "disarmed"} for ${machine.label}`);
+    }
+    return machine;
+  }
+
+  /** Whether a machine is currently armed for the remote shell (the WS relay's gate). */
+  isShellEnabled(machineId: string): boolean {
+    return this.machines.get(machineId)?.shellEnabled === true;
   }
 
   /**

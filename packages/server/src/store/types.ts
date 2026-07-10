@@ -39,6 +39,8 @@ export interface PersistedMachine {
   credentialHash?: string;
   /** ISO-8601 timestamp of the last agent hello. */
   lastSeen?: string;
+  /** POL-59 — operator armed this box for a remote shell. Undefined on legacy rows → false. */
+  shellEnabled?: boolean;
 }
 
 /** A screen row: the first-class, named entity, stable per (machineId, connector). */
@@ -261,6 +263,8 @@ export interface Store {
   upsertMachine(machine: PersistedMachine): Promise<void>;
   /** Update only a machine's enrollment status (operator approve/reject). No-op if the row is absent. */
   setMachineStatus(id: string, status: EnrollmentStatus): Promise<void>;
+  /** Arm/disarm a machine for the remote shell (POL-59). No-op if the row is absent. */
+  setMachineShellEnabled(id: string, enabled: boolean): Promise<void>;
   /**
    * Permanently forget a machine: delete its row AND cascade its screens, their content, and their
    * placements (defensive — the control plane also removes each in memory + dissolves walls first, so

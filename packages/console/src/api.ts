@@ -216,6 +216,11 @@ export function rebootMachine(machineId: string): Promise<unknown> {
   return send("POST", `/machines/${encodeURIComponent(machineId)}/reboot`);
 }
 
+/** Arm or disarm a box for the remote shell (POL-59). */
+export function setMachineShell(machineId: string, enabled: boolean): Promise<unknown> {
+  return send("POST", `/machines/${encodeURIComponent(machineId)}/shell`, { enabled });
+}
+
 /**
  * DELETE /api/v1/machines/:machineId — permanently forget a machine (POL-14). Unlike reject/revoke,
  * this deletes the machine, all its screens, their placement + content, and its credential; the server

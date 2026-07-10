@@ -62,6 +62,7 @@ import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
 import { rebootHost } from "./host";
+import { ShellManager } from "./shell";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
@@ -127,6 +128,10 @@ type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
+type ShellOpenMsg = Extract<ServerToAgentMessage, { t: "server/shell-open" }>;
+type ShellDataMsg = Extract<ServerToAgentMessage, { t: "server/shell-data" }>;
+type ShellResizeMsg = Extract<ServerToAgentMessage, { t: "server/shell-resize" }>;
+type ShellCloseMsg = Extract<ServerToAgentMessage, { t: "server/shell-close" }>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent
@@ -143,6 +148,10 @@ class Agent {
 
   /** Durable app-level identity. Loaded from disk at boot; (re)issued via `server/enrolled`. */
   private credential: string | null;
+
+  /** Remote-shell PTYs (POL-59), created on first `server/shell-open`. A dev/non-Linux backend
+   *  reports it can't provide a real terminal, and every open on such a box is refused. */
+  private shell: ShellManager | null = null;
 
   private lastAppliedRevision = 0;
   /** connector → player URL currently placed (dedupes repeat opens on reconnect/re-apply). */
@@ -209,6 +218,9 @@ class Agent {
     ws.on("close", (code: number) => {
       log(`agent channel closed (code ${code})`);
       this.stopHeartbeat();
+      // A remote shell is authorised by the live connection; kill every PTY when it drops so a
+      // session can never outlive the socket that carried it (POL-59).
+      this.shell?.closeAll();
       if (!this.closing) this.scheduleReconnect();
     });
   }
@@ -265,6 +277,18 @@ class Agent {
         break;
       case "server/rejected":
         this.onRejected(msg);
+        break;
+      case "server/shell-open":
+        this.onShellOpen(msg);
+        break;
+      case "server/shell-data":
+        this.shellMgr().data(msg.sessionId, msg.dataBase64);
+        break;
+      case "server/shell-resize":
+        this.shellMgr().resize(msg.sessionId, msg.cols, msg.rows);
+        break;
+      case "server/shell-close":
+        this.shellMgr().close(msg.sessionId, msg.reason);
         break;
     }
   }
@@ -373,6 +397,44 @@ class Agent {
     });
     if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
     else logError(`refused to reboot: ${outcome.reason}`);
+  }
+
+  /** Lazily build the shell manager. `canPty` is false on the dev/non-Linux backends so every open
+   *  is refused with a legible reason rather than a dead terminal. */
+  private shellMgr(): ShellManager {
+    if (!this.shell) {
+      const canPty = process.platform === "linux" && this.backend.id !== "dev-open";
+      this.shell = new ShellManager(
+        {
+          onData: (sessionId, dataBase64) =>
+            this.send({ t: "agent/shell-data", machineId: this.machineId, sessionId, dataBase64 }),
+          onClosed: (sessionId, reason, exitCode) =>
+            this.send({ t: "agent/shell-closed", machineId: this.machineId, sessionId, reason, exitCode }),
+        },
+        "/bin/bash",
+        canPty,
+      );
+    }
+    return this.shell;
+  }
+
+  /**
+   * `server/shell-open` — an operator opened a terminal on this box (POL-59). The server only sends
+   * this to an ARMED box, so policy is already enforced upstream; here we just try to allocate the
+   * PTY and report whether it came up. The shell is the unprivileged kiosk user (whatever the agent
+   * runs as) and cannot touch what the wall displays.
+   */
+  private onShellOpen(msg: ShellOpenMsg): void {
+    const res = this.shellMgr().open(msg.sessionId, msg.cols, msg.rows);
+    this.send({
+      t: "agent/shell-opened",
+      machineId: this.machineId,
+      sessionId: msg.sessionId,
+      ok: res.ok,
+      reason: res.reason,
+    });
+    if (res.ok) log(`shell-open ${msg.sessionId} (${msg.cols}x${msg.rows})`);
+    else logError(`shell-open ${msg.sessionId} refused: ${res.reason}`);
   }
 
   /**
