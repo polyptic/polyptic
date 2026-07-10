@@ -49,7 +49,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 
 **5. Make a box boot it**, pick **one**:
 
-- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and take the default (**Polyptic**) or pick **Set up this screen to start without the USB stick** to offload the loader onto the box. See [The boot medium](#the-boot-medium-dongle-or-offload).
+- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes — and **Wi-Fi-only boxes too**, once you put the network's credentials in `polyptic/wifi.conf` on the flashed stick (wired boxes ignore the file). Plug it in, boot from USB with Secure Boot ON, and take the default (**Polyptic**) or pick **Set up this screen to start without the USB stick** to offload the loader onto the box. See [The boot medium](#the-boot-medium-dongle-or-offload) and [Wi-Fi](#wi-fi-boxes-with-no-wire).
 - **No medium, UEFI HTTP Boot:** point the box's firmware Boot URI at `http://10.0.0.5:8080/dist/boot/shimx64.efi` (arm64: `shimaa64.efi`). See [No medium at all](#no-medium-at-all-uefi-http-boot).
 - **No medium, site DHCP:** add one option-67 rule to the DHCP you already run. See [Site DHCP option 67](#site-dhcp-option-67-one-change-to-the-dhcp-you-already-run).
 
@@ -65,6 +65,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 - Boots the image but never appears in Machines → check the box reaches the control plane, and `journalctl -u polyptic-agent-env` (the identity/cmdline oneshot) on the box.
 - **Need a shell on a box?** Power-cycle and pick **Debug console** at the GRUB menu — the normal live boot plus a **passwordless root shell on tty9** (`Ctrl+Alt+F9`; `Ctrl+Alt+F1` returns to the wall). This is the *only* interactive access the image has: it ships no passwords and no SSH, so a running box is sealed and a debug boot is always a deliberate power-cycle away. It grants nothing an attacker with keyboard + power didn't already have (GRUB configs are unverified in the shim model, so the cmdline was always editable at the menu). The image carries `procps` (`top`, `ps`, `free`) for exactly this: diagnosing a hot or struggling box.
 - A box re-appears as a *new* PENDING machine each boot → its firmware reports no stable DMI UUID and the id fell back to a MAC hash that changed (multi-NIC); see [stable identity](#the-life-of-a-box-power-on-to-pixels).
+- A **Wi-Fi box** lands at the "Could not reach the Polyptic control plane" fallback menu → the medium has no local payload for its arch (built LEAN, or without that arch's image), so there is nothing to fall back to. Rebuild the medium after building the arch's live image. If it boots the local payload but never associates → the splash names a rejected `wifi.conf` outright; otherwise check tty9 (`Ctrl+Alt+F9`, debug boot) with `iw dev` — no wlan device means the adapter's firmware isn't in the curated set (see [Wi-Fi](#wi-fi-boxes-with-no-wire), `FULL_FIRMWARE=1`).
 
 ---
 
@@ -285,7 +286,7 @@ dark against Plymouth's, and the committed PNG against the size the theme asks G
 
 ## The boot medium: dongle or offload
 
-Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloader** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **byte-identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box. It is only read for a few seconds at power-on.
+Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloader** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box beyond, optionally, [dropping the site's Wi-Fi credentials](#wi-fi-boxes-with-no-wire) onto the FAT partition. Besides the signed loaders the medium carries a **local boot payload** — kernel + `initrd-wifi` per built arch, in A/B slots the booted box refreshes itself — which is only touched when the wired chain is unreachable; a wired box reads the stick for a few seconds at power-on, exactly as before.
 
 Plug it in and the server-side menu offers three flat entries (default after 5 s: the first):
 
@@ -318,6 +319,100 @@ Nothing is called installed until it has been **verified**: the script re-reads 
 | `foreign-grub-cfg` | A GRUB config Polyptic didn't write already sits at its path. | Nothing was changed. Move or remove that file if the ESP is genuinely yours to use. |
 
 On a multi-ESP box the install picks the ESP the **firmware already boots from** (matched by `PARTUUID` against the existing UEFI boot entries) and says which one it chose; it aborts rather than guess when that is still a tie.
+
+---
+
+## Wi-Fi: boxes with no wire
+
+**The short version:** flash the same universal medium, open its FAT partition on any laptop, put the
+network's credentials in `polyptic/wifi.conf`, and boot. A wired box ignores the file entirely; a
+Wi-Fi-only box boots the medium's local payload, joins the network from the initramfs, and streams
+the same live image — one stick serves the whole fleet.
+
+### Why Wi-Fi needs a local boot stage at all
+
+| Boot stage | Can it do Wi-Fi? |
+|---|---|
+| Firmware + GRUB (fetch grub.cfg / kernel / initrd) | **No — physically.** GRUB has no WPA supplicant and UEFI network boot is wired-only across the industry; nothing Polyptic does can change this stage. |
+| dracut initramfs (stream `rootfs.squashfs`) | **Yes**: `initrd-wifi` carries wpa_supplicant + every major vendor's wlan drivers and firmware, and associates from the medium's `wifi.conf` before livenet fetches the image. |
+| The live rootfs (agent, browser, update poll) | **Yes**: `polyptic-wifi.service` re-reads the same credentials and runs its own supplicant — required even after the initrd associated, because a supplicant must keep running for WPA rekeying. |
+
+So the only stage that needs a wire is the first hop — and that is exactly the stage that already
+rides local media. The universal medium's stage 1 is **network-first**: it DHCPs and chains the
+server's live menu when a wire works (byte-compatible with the wired flow, fresh token, active
+image), and only on failure boots the **local payload**: the medium's own Canonical-signed kernel +
+`initrd-wifi`, with `root=live:` **pinned to the build the kernel came from** so kernel and
+`/lib/modules` always match. Secure Boot verifies the kernel identically whether GRUB read it from
+HTTP or from the FAT.
+
+Everything netboot buys survives on Wi-Fi: the OS still streams from the control plane into RAM at
+every boot, the box stays diskless and generic, and updates stay automatic — the 5-minute poll
+**refreshes the medium itself** (new build's kernel + initrd-wifi into the inactive A/B slot,
+verified against the depot's `SHA256SUMS`, menu rewritten last so power loss mid-update leaves the
+old slot bootable) before rebooting. A box offline longer than the depot's retention boots the
+menu's recovery entry (newest image, possibly mismatched kernel) and heals itself on the next poll.
+
+### The credentials file: `polyptic/wifi.conf`
+
+Plain `KEY=value`, one per line; values run from the first `=` to the end of the line, so SSIDs and
+passphrases with spaces/quotes need **no escaping**; Windows Notepad line endings are fine. The
+flashed medium ships an all-comments template of exactly this schema (`deploy/wifi.conf.example`):
+
+```
+WIFI_SSID=Your Network Name
+WIFI_PSK=your passphrase                  # WPA2/WPA3-Personal (8–63 chars, or the raw 64-hex key)
+
+# WPA-Enterprise (username + password) instead of a PSK:
+WIFI_IDENTITY=user@example.org
+WIFI_PASSWORD=account password
+WIFI_EAP=peap                             # peap (default) | ttls | tls
+WIFI_PHASE2=mschapv2                      # mschapv2 (default) | pap (ttls only)
+WIFI_ANONYMOUS_IDENTITY=anonymous@example.org
+WIFI_CA_CERT=certs/ca.pem                 # optional; the file rides the medium at polyptic/certs/
+WIFI_CLIENT_CERT=certs/box.pem            # EAP-TLS: client certificate + key instead of a password
+WIFI_CLIENT_KEY=certs/box.key
+
+WIFI_HIDDEN=1                             # SSID not broadcast
+WIFI_COUNTRY=GB                           # regulatory domain
+```
+
+The file is parsed (never sourced) by the same validated helpers at every stage, and a
+present-but-invalid file fails **loudly** — the boot splash names the problem, because a Wi-Fi box
+with a typo'd config must say so on the screen the operator is standing at. Bake credentials at
+build time instead with `POLYPTIC_WIFI_SSID`/`POLYPTIC_WIFI_PSK` (or `POLYPTIC_WIFI_CONF=<file>` +
+`POLYPTIC_WIFI_CERTS=<dir>`) on `deploy/build-boot-medium.sh` — also how the read-only **live ISO**
+gets Wi-Fi (`deploy/build-live-iso.sh`, same variables; an ISO can't be edited after the fact).
+
+**Treat a credentialed medium like a key.** `wifi.conf` holds the network secret in cleartext, and
+a payload medium also bakes the enrolment token (the local path can never fetch the server's menu,
+so gated fleets must build with `POLYPTIC_TOKEN=`; without it the local path only enrols on an
+open-enrolment control plane). Same trust model as the live ISO has always had: a leaked token
+still only lands new boxes as PENDING. The EAP identity is fleet-wide per medium — per-box
+enterprise identities would need per-box media, which is out of scope today.
+
+### Offload for Wi-Fi boxes
+
+**Set up this screen to start without the USB stick** on a box that came up over Wi-Fi copies the
+loaders **and** the local payload + credentials onto the internal ESP, so the box self-boots the
+whole Wi-Fi chain with no stick in. The ESP must fit **two** payload slots (live + update spare) — roughly 2× the kernel +
+initrd-wifi, checked **before anything is written**; a too-small ESP fails with `esp-too-small` in
+**Console ▸ Activity** and the box keeps booting from the stick. A wired boot keeps today's
+pointer-only install; `polyptic.offload_wifi=1/0` on the cmdline (press `e` at the menu) forces
+either behaviour.
+
+### What Wi-Fi costs, honestly
+
+- **The medium grows** from ~64 MiB to a few hundred MB per built arch (the wlan firmware is most
+  of it — the fleet's chipsets are unknown, so Intel/Realtek/MediaTek/Qualcomm-Atheros/Broadcom/
+  Marvell all ride along). `LEAN=1` still builds the old tiny, tokenless, wired-only dongle.
+- **Two initrds per build.** The lean `initrd` keeps the wired GRUB-HTTP fetch fast (that fetch runs
+  at a few MB/s and is on every wired power-on's critical path); `initrd-wifi` only ever loads from
+  fast local media. Both come from the same dracut run against the same kernel.
+- **No zero-media option.** UEFI HTTP Boot / PXE / DHCP option 67 remain wired-only, forever — see
+  the table above. A Wi-Fi box needs the stick (kept in, or offloaded once to its ESP).
+- **First association is only VM-testable in plumbing** (QEMU emulates no Wi-Fi NIC; the helpers are
+  fully covered by `deploy/live/test/wifi.test.sh` and a `mac80211_hwsim` pass); real radios, real
+  APs and the curated firmware set get their first exercise on the pending real-hardware pass.
 
 ---
 
@@ -495,18 +590,21 @@ whole root image into a RAM tmpfs.)
 
 ---
 
-## RAM: netboot needs ~2 GB, the live ISO needs ~1 GB
+## RAM: netboot needs ~2.5 GB, the live ISO needs ~1 GB
 
 The two media differ in *where the operating system lives*, and that decides the memory floor:
 
 | Medium | Where the OS runs from | RAM needed |
 | --- | --- | --- |
-| Boot medium / netboot (`polyptic-boot.img`) | the whole `rootfs.squashfs` (~500 MiB) is streamed into a **RAM tmpfs** and stays there, alongside the unpacked initrd | **~2 GB** |
+| Boot medium / netboot (`polyptic-boot.img`) | the whole `rootfs.squashfs` (~700 MiB) is streamed into a **RAM tmpfs** and stays there, alongside the unpacked initrd | **~2.5 GB** |
 | Live ISO (`polyptic-live.iso`) | the squashfs is read **straight off the USB stick** | **~1 GB** |
 
 Both floors dropped by roughly a factor of two in POL-35/[D55](DECISIONS.md), when the root image
-stopped being a 1.4 GiB casper ISO and became a ~500 MiB bare squashfs. Measured on the 26.04 arm64
-build: `rootfs.squashfs` **491.8 MiB**, `initrd` **91.7 MiB**, `vmlinuz` **22.7 MiB**.
+stopped being a 1.4 GiB casper ISO and became a bare squashfs; POL-63 then raised the netboot floor
+~half a GB by shipping every major vendor's Wi-Fi firmware in the root image. Measured on the 26.04
+arm64 build (POL-63): `rootfs.squashfs` **689 MiB**, lean `initrd` **113 MiB** (wired GRUB fetch,
+wlan-firmware-free by construction), `initrd-wifi` **177 MiB** (local media only), `vmlinuz`
+**24 MiB**; the universal medium with one arch's payload is a **~424 MiB** image file.
 
 POL-53/[D64](DECISIONS.md) then grew the initrd again — it now carries the real KMS drivers, without
 which the boot splash is stuck at the firmware's framebuffer resolution. Expect roughly **+13 MiB on
@@ -516,7 +614,7 @@ floors above are unchanged: an initrd of that size is noise next to the ~500 MiB
 The image still lands in the initramfs tmpfs, which the kernel caps at **50 % of RAM** by default —
 so the naive ceiling would be twice the image. The initrd's `polyptic-live` dracut module
 (`deploy/live/usr/lib/dracut/modules.d/50polyptic-live/`) raises that cap to 90 % before livenet
-fetches anything, and below ~1.5 GB of RAM it prints a plain-English message naming the live ISO as
+fetches anything, and below ~2 GB of RAM it prints a plain-English message naming the live ISO as
 the fix, rather than failing minutes later with a bare `No space left on device`.
 
 If you see that message, the box is out of RAM — nothing is wrong with the network or the image. Use
@@ -612,5 +710,5 @@ The unverified rows are **not a Polyptic shortcut; they are the standard shim mo
 ## Ownership, keys, and rotation
 
 - **Ownership = the boot key.** Whoever can make a box chain `<base>/boot/grub.cfg`, via dongle, offloaded entry, UEFI HTTP Boot, or site DHCP, enrols it against that server. Multiple Polyptic instances on one network = different keys, zero collision.
-- **The netboot key is a standing fleet secret, by design.** It lives in the boot chain (USB / offloaded ESP / DHCP), not on a wiped disk. **Regenerate** the enrolment token (Console ▸ Settings ▸ Enrolment token) to re-key the fleet, the change is live on the next `agent/hello` *and* the next `GET /boot/grub.cfg`, so boxes re-pend until re-keyed. The media themselves are tokenless, so nothing needs reflashing on rotation.
+- **The netboot key is a standing fleet secret, by design.** It lives in the boot chain (USB / offloaded ESP / DHCP), not on a wiped disk. **Regenerate** the enrolment token (Console ▸ Settings ▸ Enrolment token) to re-key the fleet, the change is live on the next `agent/hello` *and* the next `GET /boot/grub.cfg`, so boxes re-pend until re-keyed. The **wired** path stays tokenless on the media (the token arrives with the server's menu), so wired sticks never need reflashing on rotation. A medium built with a **local Wi-Fi payload** bakes the token into its local menu (POL-63): after a rotation, rebuild those media (`deploy/build-boot-medium.sh`) or edit the `polyptic.token=` value in `/grub/local-<arch>.cfg` on the FAT — offloaded Wi-Fi ESPs likewise carry it and want the same edit.
 - **Token exposure is bounded and matches today's trust model.** `GET /boot/grub.cfg` serves the token ungated, and it appears in `/proc/cmdline` on the booted kiosk, the same exposure as the `curl … | sh` one-liner passing it via env. It is only a *coarse* filter: a valid token on a **new** box lands it **PENDING**, and an operator still approves it under Machines before it renders anything. Keep the provisioning network operator-only. The downloadable medium is tokenless, so possession of a stick grants nothing beyond "reach `/boot/grub.cfg`".

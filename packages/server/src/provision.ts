@@ -90,9 +90,10 @@ const ARCH_RE = /^(arm64|amd64)$/;
  *  the dracut initrd, and the BARE `rootfs.squashfs` that dracut's `root=live:` pulls whole into RAM
  *  (POL-35/D55 — casper's `iso-url=` wanted a whole `.iso` around the same squashfs) — plus the
  *  self-contained bootable live ISO (POL-38/D49, `build-live-iso.sh`; it bakes the token like
- *  `/boot/grub.cfg` does, and a leaked token still cannot self-admit a NEW box past the operator).
- *  Nothing else is servable. */
-const IMAGE_FILE_RE = /^(vmlinuz|initrd|rootfs\.squashfs|polyptic-live\.iso)$/;
+ *  `/boot/grub.cfg` does, and a leaked token still cannot self-admit a NEW box past the operator),
+ *  the fat `initrd-wifi` + `SHA256SUMS` a box's update-poll fetches to refresh its local boot medium
+ *  (POL-63/D67; the sums file is secret-free), and nothing else. */
+const IMAGE_FILE_RE = /^(vmlinuz|initrd|initrd-wifi|rootfs\.squashfs|polyptic-live\.iso|SHA256SUMS)$/;
 /** A build's image id, as stamped by the build scripts: `<UTC timestamp>-<8 hex>`. The leading
  *  alphanumeric rules out `.`/`..`, so it can never escape the builds/ directory (POL-45). */
 const IMAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;

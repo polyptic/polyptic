@@ -824,6 +824,24 @@ async function onSignOut(): Promise<void> {
             <li class="step">
               <div class="step-gutter"><span class="step-num">3</span><span class="step-line" /></div>
               <div class="step-body">
+                <div class="step-title">Wi-Fi screens: add the network credentials</div>
+                <div class="step-text">
+                  Re-open the flashed stick in your file manager and edit
+                  <code class="code">polyptic/wifi.conf</code> — set <code class="code">WIFI_SSID</code> and
+                  <code class="code">WIFI_PSK</code> (the WPA-Enterprise username/password fields are explained
+                  inside the file). Screens with a network cable ignore the file, so <b>one stick serves the
+                  whole fleet</b>.
+                </div>
+                <div class="step-aside">
+                  Without a cable the screen boots the system copy carried on the stick, joins your Wi-Fi, and
+                  streams everything else — it keeps that copy fresh on its own. The file holds the Wi-Fi
+                  password in plain text: treat the stick like a key to the network.
+                </div>
+              </div>
+            </li>
+            <li class="step">
+              <div class="step-gutter"><span class="step-num">4</span><span class="step-line" /></div>
+              <div class="step-body">
                 <div class="step-title">Boot the screen from USB</div>
                 <div class="step-text">
                   Leave Secure Boot <b>ON</b>. It streams the latest image and appears in <b>Machines</b> to approve.
@@ -831,7 +849,7 @@ async function onSignOut(): Promise<void> {
               </div>
             </li>
             <li class="step">
-              <div class="step-gutter"><span class="step-num">4</span></div>
+              <div class="step-gutter"><span class="step-num">5</span></div>
               <div class="step-body">
                 <div class="step-title">Optional: install the bootloader, then take the USB back</div>
                 <div class="step-text">
@@ -839,8 +857,9 @@ async function onSignOut(): Promise<void> {
                   own, and the same stick can walk down the rack.
                 </div>
                 <div class="step-aside">
-                  <b>Nothing is erased.</b> This copies a signed 4 MB loader to the EFI partition and puts Polyptic first
-                  in the UEFI boot order; disks, partitions and any OS already installed are left exactly as they are.
+                  <b>Nothing is erased.</b> This copies a signed 4 MB loader — plus, on Wi-Fi screens, the local boot
+                  files and Wi-Fi credentials — to the EFI partition and puts Polyptic first in the UEFI boot order;
+                  disks, partitions and any OS already installed are left exactly as they are.
                   The result — installed, or why not — appears in <b>Activity</b>.
                 </div>
               </div>

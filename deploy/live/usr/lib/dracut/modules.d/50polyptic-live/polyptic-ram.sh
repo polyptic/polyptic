@@ -28,14 +28,15 @@ case " $(cat /proc/cmdline 2>/dev/null) " in
         mount -o remount,size=90% / 2>/dev/null || :
 
         polyptic_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-        # 1.5 GiB. Below this, 90% of RAM cannot hold a ~500 MiB squashfs plus a running sway+browser.
-        if [ "${polyptic_mem_kb:-0}" -gt 0 ] && [ "$polyptic_mem_kb" -lt 1572864 ]; then
+        # 2 GiB. Below this, 90% of RAM cannot hold a ~700 MiB squashfs plus a running sway+browser
+        # (the floor rose with POL-63: the image carries every major vendor's Wi-Fi firmware).
+        if [ "${polyptic_mem_kb:-0}" -gt 0 ] && [ "$polyptic_mem_kb" -lt 2097152 ]; then
             polyptic_mem_gb=$((polyptic_mem_kb / 1048576))
             {
                 echo ""
                 echo "  ##############################################################"
                 echo "  ## Polyptic: this machine has ~${polyptic_mem_gb} GB RAM."
-                echo "  ## Netbooting streams the whole OS image into RAM and needs ~2 GB."
+                echo "  ## Netbooting streams the whole OS image into RAM and needs ~2.5 GB."
                 echo "  ##"
                 echo "  ## Use the LIVE ISO instead (Console > Settings > Onboard Screens):"
                 echo "  ## it runs the OS straight off the USB stick and needs ~1 GB."

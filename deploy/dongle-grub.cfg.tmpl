@@ -1,5 +1,5 @@
-# Polyptic boot dongle (POL-33/D47). TOKENLESS: carries only the control-plane address. The
-# enrolment token is baked by the server into /boot/grub.cfg at chain time. Secure Boot stays ON.
+# Polyptic boot medium, stage 1 (POL-33/D47; local Wi-Fi fallback POL-63). TOKENLESS network path:
+# the enrolment token is baked by the server into /boot/grub.cfg at chain time. Secure Boot stays ON.
 #
 # The gfx block below is the stage-1 half of the boot splash (POL-47) and must stay identical to what
 # `bootGfxPreamble()` emits in packages/server/src/boot-theme.ts — an e2e test compares them. There is
@@ -23,7 +23,15 @@ set net=(http,@@POLYPTIC_BASE_HOSTPORT@@)
 echo "Starting Polyptic ..."
 net_dhcp
 configfile $net/boot/grub.cfg
-# Only reached when DHCP or the chain failed — THIS is where the technical detail belongs: nobody
+# Only reached when DHCP or the chain failed. A medium carrying the POL-63 local payload boots it
+# instead of complaining: local kernel + initrd-wifi, which joins Wi-Fi from polyptic/wifi.conf and
+# streams the OS image over the radio — the Wi-Fi boot path (GRUB itself can never join a WPA
+# network, so a wireless-only screen must reach Linux on local files first).
+if [ -e /grub/local.cfg ]; then
+  echo "No wired connection - starting Polyptic from this drive ..."
+  configfile /grub/local.cfg
+fi
+# Only reached when there is ALSO no local payload — THIS is where the technical detail belongs: nobody
 # reads a boot screen until it stops working. It cannot be conditional: `configfile` reports no
 # testable status, and an `if ! configfile …` never takes its branch (checked under OVMF).
 # The `sleep` is load-bearing: GRUB paints the fallback menu below over the console the instant this
@@ -34,5 +42,6 @@ sleep -i 8
 set timeout=10
 set default=retry
 menuentry "Try again" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
+menuentry "Start from this drive (Wi-Fi screens)" --id local { configfile /grub/local.cfg }
 menuentry "Restart this screen" { reboot }
 menuentry "Firmware setup" { fwsetup }

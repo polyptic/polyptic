@@ -79,9 +79,11 @@ export interface ArchBuild extends ArchManifest {
   hasLiveIso: boolean;
 }
 
-/** The artifacts a build owns. The first four are what the netboot chain streams; the live ISO is
- *  the standalone bootable alternative (D49) and is absent unless `build-live-iso.sh` ran. */
-const BUILD_ARTIFACTS = ["rootfs.squashfs", "vmlinuz", "initrd", "SHA256SUMS"] as const;
+/** The artifacts a build owns. The first four are what the netboot chain streams; `initrd-wifi`
+ *  (POL-63) is the fat Wi-Fi initramfs that only ever boots from LOCAL media (fetched by the boxes'
+ *  update-poll to refresh their boot medium, absent on pre-POL-63 builds); the live ISO is the
+ *  standalone bootable alternative (D49) and is absent unless `build-live-iso.sh` ran. */
+const BUILD_ARTIFACTS = ["rootfs.squashfs", "vmlinuz", "initrd", "initrd-wifi", "SHA256SUMS"] as const;
 const LIVE_ISO = "polyptic-live.iso";
 /** The artifact whose presence *defines* a build directory, and whose mtime is its build time. */
 const BUILD_PAYLOAD = "rootfs.squashfs";
@@ -93,11 +95,11 @@ const BUILD_PAYLOAD = "rootfs.squashfs";
  *  - `rootfs.squashfs` and the live ISO are always replaced by `mv`/`rm`+create, which allocates a
  *    NEW inode. Old builds keep the one they hold, so sharing is safe — and these are the big
  *    files, so sharing is the whole point of the layout.
- *  - `SHA256SUMS` is written with shell `>` (`refresh-live-image.sh`), and `vmlinuz`/`initrd` with
- *    `cp`. Both TRUNCATE THE EXISTING INODE IN PLACE, which through a hardlink would silently
- *    rewrite a retained build's artifact to the new build's bytes. So these are copied. It costs
- *    ~100 MB per retained build against the shared root image, and it cannot be corrupted by a
- *    script that writes in place.
+ *  - `SHA256SUMS` is written with shell `>` (`refresh-live-image.sh`), and `vmlinuz`/`initrd`/
+ *    `initrd-wifi` with `cp`. Both TRUNCATE THE EXISTING INODE IN PLACE, which through a hardlink
+ *    would silently rewrite a retained build's artifact to the new build's bytes. So these are
+ *    copied. It costs a few hundred MB per retained build against the shared root image, and it
+ *    cannot be corrupted by a script that writes in place.
  */
 const SHAREABLE = new Set<string>([ BUILD_PAYLOAD, LIVE_ISO ]);
 /** Default builds retained per arch before the oldest are pruned (IMAGE_RETAIN_BUILDS). */

@@ -1,0 +1,29 @@
+# Polyptic Wi-Fi credentials (POL-63) — polyptic/wifi.conf on the boot medium.
+#
+# Edit this file on any laptop (the medium's first partition is plain FAT32), save, eject, boot.
+# A box with no Wi-Fi adapter simply ignores it, so ONE medium serves the whole fleet. Values run
+# from the first '=' to the end of the line: spaces, quotes and '=' need NO escaping. Windows
+# Notepad line endings are fine. Full schema + examples: docs/NETBOOT.md.
+#
+# This file holds network secrets in cleartext — treat the medium like a key to your Wi-Fi.
+
+# ── The network (required for Wi-Fi) ────────────────────────────────────────────────────────────
+#WIFI_SSID=Your Network Name
+
+# ── WPA2/WPA3 Personal (a shared passphrase) ────────────────────────────────────────────────────
+#WIFI_PSK=your passphrase here
+
+# ── WPA Enterprise (username + password; sets WIFI_SECURITY=eap automatically) ──────────────────
+#WIFI_IDENTITY=user@example.org
+#WIFI_PASSWORD=account password
+#WIFI_EAP=peap                        # peap (default) | ttls | tls
+#WIFI_PHASE2=mschapv2                 # mschapv2 (default) | pap (ttls only)
+#WIFI_ANONYMOUS_IDENTITY=anonymous@example.org
+#WIFI_CA_CERT=certs/ca.pem            # optional; put the file in polyptic/certs/ on this medium
+# EAP-TLS (client certificate instead of a password):
+#WIFI_CLIENT_CERT=certs/box.pem
+#WIFI_CLIENT_KEY=certs/box.key
+
+# ── Extras ──────────────────────────────────────────────────────────────────────────────────────
+#WIFI_HIDDEN=1                        # the SSID is not broadcast
+#WIFI_COUNTRY=GB                      # ISO 3166-1 alpha-2 regulatory domain

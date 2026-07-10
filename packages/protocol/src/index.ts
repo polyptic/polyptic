@@ -765,6 +765,8 @@ export const BootReportCode = z.enum([
   "nvram-entry-missing", // it accepted the entry, then dropped it
   "nvram-not-persisted",
   "boot-order-not-first", // the entry exists but the firmware still boots something else first
+  "esp-too-small", // POL-63: the Wi-Fi local payload (kernel + initrd-wifi + spare slot) won't fit
+  "no-local-payload", // POL-63: a Wi-Fi box's offload found no payload for its arch on the medium
 ]);
 export type BootReportCode = z.infer<typeof BootReportCode>;
 

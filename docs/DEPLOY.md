@@ -26,14 +26,18 @@ That split is the whole point — it replaces "a fragile per-machine boot script
 ## TL;DR
 
 In the console: **Settings → Onboard Screens → Download bootloader**. Flash `polyptic-boot.img` to a USB
-stick (2 GB or larger) with Balena Etcher or Rufus. Boot the target machine from it, Secure Boot on.
+stick (2 GB or larger) with Balena Etcher or Rufus. **Wi-Fi machine?** Re-open the flashed stick and put
+the network's credentials in `polyptic/wifi.conf` (wired machines ignore the file — one stick serves
+everything; POL-63/D67). Boot the target machine from it, Secure Boot on.
 
 It streams the current live image into RAM, comes up as a surf-per-output kiosk, and dials home. It
 shows **PENDING** in the console until an operator **Approves** it (Phase 2b). After approval its screens
 flip to the active scene. Done, and there are no on-device steps, ever.
 
 The control-plane address and (in gated mode) the enrolment token are baked into the boot menu the
-server generates per request, so nothing is typed on the machine.
+server generates per request, so nothing is typed on the machine. (A stick that must also boot Wi-Fi-only
+machines carries the token in its local menu — build it with `POLYPTIC_TOKEN=`; see
+[NETBOOT.md ▸ Wi-Fi](NETBOOT.md#wi-fi-boxes-with-no-wire).)
 
 ---
 
