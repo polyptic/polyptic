@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <title>Polyptic Player</title>
+    <!-- Favicons (brand/, synced by brand/generate.sh). Never seen on a wall screen — the player runs
+         fullscreen with no tab strip — but it's what identifies the tab when a human opens the page to
+         debug. These absolute paths are rewritten to the `/player/` base at build (vite.config.ts). -->
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <!-- Idle-splash typography (POL-27). A PROGRESSIVE ENHANCEMENT, and it must never gate the
          first paint: a wall box on an isolated VLAN cannot reach Google, and a plain
          `rel="stylesheet"` is render-blocking — the screen stays WHITE until the request times out
