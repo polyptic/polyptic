@@ -18,6 +18,7 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
@@ -263,6 +264,12 @@ export function setScreenContent(screenId: string, body: SetContentBody): Promis
   );
 }
 
+/** PUT /api/v1/screens/:screenId/zoom { zoom } — zoom the page this screen is framing (POL-57). The
+ *  server remembers it for this (screen, page) pair, so the page returns at this zoom next time. */
+export function setScreenZoom(screenId: string, zoom: number): Promise<unknown> {
+  return send("PUT", `/screens/${encodeURIComponent(screenId)}/zoom`, SetZoomBody.parse({ zoom }));
+}
+
 // ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
 
 /** POST /api/v1/murals/:muralId/walls { muralId, memberScreenIds } — combine ≥2 adjacent screens. */
@@ -290,6 +297,12 @@ export function setWallContent(wallId: string, body: SetContentBody): Promise<un
     `/walls/${encodeURIComponent(wallId)}/content`,
     SetContentBody.parse(body),
   );
+}
+
+/** PUT /api/v1/walls/:wallId/zoom { zoom } — zoom the page spanning a combined surface (POL-57).
+ *  Every member takes the same zoom, so the wall stays one continuous page. */
+export function setWallZoom(wallId: string, zoom: number): Promise<unknown> {
+  return send("PUT", `/walls/${encodeURIComponent(wallId)}/zoom`, SetZoomBody.parse({ zoom }));
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */

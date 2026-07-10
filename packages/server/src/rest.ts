@@ -42,6 +42,7 @@ import {
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetZoomBody,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -911,6 +912,92 @@ export function registerRestRoutes(
     pushRender(params.data.screenId, result.slice);
     broadcaster.broadcast(); // surfaceCount changed
     return { ok: true, revision: control.state.revision, slice: result.slice };
+  });
+
+  // ── Page zoom (POL-57) ───────────────────────────────────────────────────────
+  //
+  // Zoom the framed page on a screen or a combined surface. The server remembers the value against
+  // the (target, page) pair, so re-assigning that page there restores it. The push is a re-styled
+  // surface with the SAME id — the player rescales the existing iframe, it does not reload.
+
+  // PUT /api/v1/screens/:screenId/zoom  { zoom }  -> restyle + push (409 if wall member / not framed)
+  fastify.put("/api/v1/screens/:screenId/zoom", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenZoom(params.data.screenId, body.data.zoom);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; zoom the wall`,
+          wallId: result.wallId,
+        });
+      }
+      // no-content / not-zoomable are conflicts with the screen's current state, not bad requests.
+      if (result.error === "no-content" || result.error === "not-zoomable") {
+        return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.zoom",
+        screenId: params.data.screenId,
+        zoom: body.data.zoom,
+        revision: control.state.revision,
+      },
+      "screen zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's content read-out carries the live zoom
+    return { ok: true, revision: control.state.revision, zoom: body.data.zoom };
+  });
+
+  // PUT /api/v1/walls/:wallId/zoom  { zoom }  -> restyle + push to every member
+  fastify.put("/api/v1/walls/:wallId/zoom", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallZoom(params.data.wallId, body.data.zoom);
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.zoom",
+        wallId: params.data.wallId,
+        zoom: body.data.zoom,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      revision: control.state.revision,
+      zoom: body.data.zoom,
+      screens: result.slices.map((s) => s.screenId),
+    };
   });
 
   // POST /api/v1/walls/:wallId/ident  { on, ttlMs? }  -> ident-pulse to every member

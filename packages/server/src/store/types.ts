@@ -98,6 +98,18 @@ export interface PersistedCredentialProfile {
   tokenParam: string;
 }
 
+/**
+ * POL-57 — a remembered page zoom for one (target, content) pair. `targetId` is a screen id or a
+ * video-wall id; `sourceKey` identifies the page shown there (`source:<id>` for a library source,
+ * `url:<url>` for an ad-hoc link). Assigning that content to that target again restores this zoom,
+ * so an operator dials a dashboard in once per screen and it sticks.
+ */
+export interface PersistedZoomPreference {
+  targetId: string;
+  sourceKey: string;
+  zoom: number;
+}
+
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
 export interface PersistedMural {
   id: string;
@@ -246,6 +258,8 @@ export interface PersistedState {
   scenes: PersistedScene[];
   /** POL-24 — credential profiles (content auth). */
   credentialProfiles: PersistedCredentialProfile[];
+  /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
+  zoomPreferences: PersistedZoomPreference[];
 }
 
 /**
@@ -311,6 +325,14 @@ export interface Store {
   deleteContentSource(id: string): Promise<void>;
   /** All persisted content sources. */
   listContentSources(): Promise<PersistedContentSource[]>;
+
+  // ── Page zoom preferences (POL-57) ─────────────────────────────────────────
+  /** Insert-or-update the remembered zoom for one (target, content) pair. */
+  upsertZoomPreference(pref: PersistedZoomPreference): Promise<void>;
+  /** Forget every remembered zoom for a screen or wall that no longer exists. No-op if none. */
+  deleteZoomPreferencesForTarget(targetId: string): Promise<void>;
+  /** All persisted zoom preferences. */
+  listZoomPreferences(): Promise<PersistedZoomPreference[]>;
 
   // ── Credential profiles (POL-24) ───────────────────────────────────────────
   /** Insert-or-update a credential-profile row (the only home of the client secret). */

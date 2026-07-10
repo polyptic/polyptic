@@ -29,6 +29,7 @@ import {
   VideoSurface,
   VideoWall,
   WebSurface,
+  Zoom,
 } from "@polyptic/protocol";
 import type {
   ContentKind,
@@ -74,6 +75,37 @@ const DEFAULT_CANVAS = { x: 0, y: 0, w: 1920, h: 1080 } as const;
  * supersedes this; absent an override, a deployment simply follows its `NODE_ENV` on each boot.
  */
 const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
+
+/** POL-57 — an unzoomed page: 100%, the same scale a browser opens a tab at. */
+const DEFAULT_ZOOM = 1;
+
+/** The two surface kinds that frame a page, and so are the only ones that can be zoomed. */
+type FramedSurface = Extract<Surface, { type: "web" | "dashboard" }>;
+
+function isFramed(surface: Surface): surface is FramedSurface {
+  return surface.type === "web" || surface.type === "dashboard";
+}
+
+/** Composite key for a remembered zoom — the (target, page) pair. The NUL separator can appear in
+ *  neither half, so no screen/URL combination can collide with another. */
+function zoomKey(targetId: string, sourceKey: string): string {
+  return `${targetId}\u0000${sourceKey}`;
+}
+
+/** "125%" — how a zoom factor reads in the activity feed. */
+function zoomLabel(zoom: number): string {
+  return `${Math.round(zoom * 100)}%`;
+}
+
+/** A copy of `slice` whose FIRST surface carries `zoom`. The surface keeps its id and url, so the
+ *  player restyles the element it already has rather than remounting it (the INSTANT property, D5). */
+function withZoomedFirstSurface(
+  slice: ScreenSlice,
+  surface: FramedSurface,
+  zoom: number,
+): ScreenSlice {
+  return { ...slice, surfaces: [{ ...surface, zoom }, ...slice.surfaces.slice(1)] };
+}
 
 function playerUrlFor(screenId: string): string {
   return `${PLAYER_BASE_URL}/?screen=${encodeURIComponent(screenId)}`;
@@ -136,6 +168,16 @@ export type SetWallContentResult =
 export type SetScreenContentResult =
   | { ok: true; slice: ScreenSlice }
   | { ok: false; error: "unknown-screen" | "wall-member" | "unknown-source"; wallId?: string };
+
+/** Result of `setScreenZoom` / `setWallZoom` (POL-57): the re-styled slices to push, or why not.
+ *  `not-zoomable` = the target shows media, which has no page to zoom. */
+export type SetZoomResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error: "unknown-screen" | "unknown-wall" | "wall-member" | "no-content" | "not-zoomable";
+      wallId?: string;
+    };
 
 /**
  * An assignment of content to a screen or wall (Phase 3c): EITHER a library source (`sourceId`) OR an
@@ -201,6 +243,10 @@ export class ControlPlane {
   private readonly screenSourceIds = new Map<string, string>();
   /** wallId → the library source it currently spans (only present for library-assigned walls). */
   private readonly wallSourceIds = new Map<string, string>();
+
+  /** POL-57 — remembered page zoom, keyed by `zoomKey(targetId, sourceKey)`. A target is a screen or
+   *  a wall; a sourceKey identifies the page. Assigning that page there again restores this zoom. */
+  private readonly zoomPrefs = new Map<string, number>();
 
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
@@ -388,6 +434,14 @@ export class ControlPlane {
       }
     }
     this.wallCounter = maxWall;
+
+    // ── Page zoom preferences (POL-57) ────────────────────────────────────────
+    for (const p of persisted.zoomPreferences) {
+      // Re-validate at the edge; a row outside the allowed range is simply ignored (the target falls
+      // back to 100%) rather than pushed to a player as an unrenderable scale.
+      const zoom = Zoom.safeParse(p.zoom);
+      if (zoom.success) this.zoomPrefs.set(zoomKey(p.targetId, p.sourceKey), zoom.data);
+    }
 
     // ── Content library (Phase 3c) ────────────────────────────────────────────
     for (const cs of persisted.contentSources) {
@@ -613,6 +667,7 @@ export class ControlPlane {
     for (const screenId of result.prunedScreenIds) {
       await this.store.deleteContent(screenId);
       await this.store.deleteScreen(screenId);
+      await this.forgetZooms(screenId);
     }
   }
 
@@ -770,6 +825,7 @@ export class ControlPlane {
       this.videoWalls.delete(wall.id);
       this.wallSourceIds.delete(wall.id);
       await this.store.deleteVideoWall(wall.id);
+      await this.forgetZooms(wall.id);
       for (const s of this.clearSlices(wall.memberScreenIds)) touched.set(s.screenId, s);
     }
 
@@ -780,6 +836,7 @@ export class ControlPlane {
       delete this.state.slices[id];
       const idx = this.state.screens.findIndex((s) => s.id === id);
       if (idx >= 0) this.state.screens.splice(idx, 1);
+      await this.forgetZooms(id);
     }
 
     // Drop the machine itself (+ its off-band credential). deleteMachine cascades screens/content/placements.
@@ -999,6 +1056,7 @@ export class ControlPlane {
       this.videoWalls.delete(w.id);
       this.wallSourceIds.delete(w.id);
       await this.store.deleteVideoWall(w.id);
+      await this.forgetZooms(w.id);
       memberIds.push(...w.memberScreenIds);
     }
     const slices = this.clearSlices(memberIds);
@@ -1076,6 +1134,7 @@ export class ControlPlane {
     this.videoWalls.delete(wall.id);
     this.wallSourceIds.delete(wall.id);
     await this.store.deleteVideoWall(wall.id);
+    await this.forgetZooms(wall.id);
     const slices = this.clearSlices(wall.memberScreenIds); // includes the just-unplaced screen
     this.bumpRevision();
     for (const slice of slices) {
@@ -1115,6 +1174,7 @@ export class ControlPlane {
       this.videoWalls.delete(wall.id);
       this.wallSourceIds.delete(wall.id);
       await this.store.deleteVideoWall(wall.id);
+      await this.forgetZooms(wall.id);
       for (const s of this.clearSlices(wall.memberScreenIds)) touched.set(s.screenId, s);
     }
 
@@ -1130,6 +1190,7 @@ export class ControlPlane {
     await this.store.deleteContent(screenId);
     await this.store.deletePlacement(screenId);
     await this.store.deleteScreen(screenId);
+    await this.forgetZooms(screenId);
 
     this.bumpRevision();
     // Persist the cleared content of SURVIVING screens only — the removed one's row is already gone.
@@ -1174,18 +1235,22 @@ export class ControlPlane {
 
   /** What's on a screen now, for the console's tiles/inspector: the library source's name+kind (a
    *  wall member shows the wall's source), an ad-hoc URL's derived name, or null when nothing's on air. */
-  screenContentSummary(screenId: string): { name: string; kind: ContentKind } | null {
+  screenContentSummary(screenId: string): { name: string; kind: ContentKind; zoom?: number } | null {
+    const surface = this.state.slices[screenId]?.surfaces[0];
+    // POL-57 — the live zoom, present only for framed content. Its absence is how the console knows
+    // this screen has nothing to zoom (media, or no content at all) and hides the control.
+    const zoom = surface && isFramed(surface) ? surface.zoom : undefined;
+
     const wall = this.getWallForScreen(screenId);
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind };
+      if (src) return { name: src.name, kind: src.kind, zoom };
     }
-    const surface = this.state.slices[screenId]?.surfaces[0];
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -1238,9 +1303,15 @@ export class ControlPlane {
    * → URL-bearing; image/video → src-bearing); zod fills the type-specific defaults. `span` (when set)
    * makes the surface render only its slice of a larger spanning content (video walls). The surface id
    * is caller-supplied and STABLE so consecutive pushes reconcile to the same keyed tile (in-place swap,
-   * the INSTANT property — D5).
+   * the INSTANT property — D5). `zoom` (POL-57) rides on framed kinds only; media has no page to zoom.
    */
-  private buildSurface(spec: ResolvedSpec, id: string, region: Geometry, span?: Span): Surface {
+  private buildSurface(
+    spec: ResolvedSpec,
+    id: string,
+    region: Geometry,
+    span?: Span,
+    zoom: number = DEFAULT_ZOOM,
+  ): Surface {
     const base = span ? { id, region, span } : { id, region };
     switch (spec.kind) {
       case "web":
@@ -1250,14 +1321,127 @@ export class ControlPlane {
           url: spec.url,
           placement: "iframe",
           interactive: false,
+          zoom,
         });
       case "dashboard":
-        return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url });
+        return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url, zoom });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
       case "video":
         return VideoSurface.parse({ ...base, type: "video", src: spec.url, loop: true, muted: true });
     }
+  }
+
+  // ── Page zoom (POL-57) ──────────────────────────────────────────────────────
+  //
+  // Zoom is a property of the (target, page) PAIR, not of the screen and not of the library source:
+  // the same dashboard wants different zoom on a 4K panel than on a 1080p one, and one panel wants
+  // different zoom for each page it cycles through. So we remember it against both, and re-apply it
+  // whenever that page lands on that target again — including after a scene switch or a server
+  // restart. The live value additionally rides on the surface itself, which is what the player reads.
+
+  /** The remembered zoom for a (target, page) pair, or 100% when the operator has never set one. */
+  private zoomFor(targetId: string, sourceKey: string): number {
+    return this.zoomPrefs.get(zoomKey(targetId, sourceKey)) ?? DEFAULT_ZOOM;
+  }
+
+  /** Remember the zoom for a pair, write-through. An explicit 100% is stored rather than dropped: a
+   *  reset is a choice the operator made and must survive a restart, not the absence of one. */
+  private async rememberZoom(targetId: string, sourceKey: string, zoom: number): Promise<void> {
+    this.zoomPrefs.set(zoomKey(targetId, sourceKey), zoom);
+    await this.store.upsertZoomPreference({ targetId, sourceKey, zoom });
+  }
+
+  /** Forget every remembered zoom for a screen/wall that is being removed. Ids are never reused, so a
+   *  pref that outlived its target could only ever be dead weight. */
+  private async forgetZooms(targetId: string): Promise<void> {
+    for (const key of [...this.zoomPrefs.keys()]) {
+      if (key.startsWith(`${targetId}\u0000`)) this.zoomPrefs.delete(key);
+    }
+    await this.store.deleteZoomPreferencesForTarget(targetId);
+  }
+
+  /** The page identity a zoom is remembered against: a library source by id, else the ad-hoc URL. */
+  private sourceKeyFor(sourceId: string | null, url: string): string {
+    return sourceId ? `source:${sourceId}` : `url:${url}`;
+  }
+
+  /**
+   * Set the page zoom on a single screen's framed content. Zoom changes the surface and nothing else,
+   * so we patch the EXISTING surface rather than re-resolve it: the keyed id is untouched, the player
+   * restyles the same iframe in place, and the page never reloads (D5). Rejected if the screen is a
+   * wall member (zoom belongs to the combined surface), shows nothing, or shows media.
+   *
+   * Bumps the revision, persists the slice, and remembers the zoom against (screen, page).
+   */
+  async setScreenZoom(screenId: string, zoom: number): Promise<SetZoomResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slice = this.state.slices[screenId];
+    const surface = slice?.surfaces[0];
+    if (slice === undefined || surface === undefined) return { ok: false, error: "no-content" };
+    if (!isFramed(surface)) return { ok: false, error: "not-zoomable" };
+
+    // Zoom the screen's content surface (the first one); anything else on the slice rides along
+    // untouched. Assigned content is always a single surface, but the slice shape allows more.
+    const next: ScreenSlice = withZoomedFirstSurface(slice, surface, zoom);
+    this.state.slices[screenId] = next;
+    this.bumpRevision();
+
+    await this.rememberZoom(screenId, this.sourceKeyFor(this.screenSourceIds.get(screenId) ?? null, surface.url), zoom);
+    await this.store.upsertContent({
+      screenId,
+      canvas: next.canvas,
+      surfaces: next.surfaces,
+      sourceId: this.screenSourceIds.get(screenId) ?? null,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${screen.friendlyName} zoom ${zoomLabel(zoom)}`);
+    return { ok: true, slices: [next] };
+  }
+
+  /**
+   * Set the page zoom on a combined surface: every member frames the same page, so they all take the
+   * same zoom. The span math is untouched — zoom scales the page INSIDE each member's window onto the
+   * spanning content, so the wall still reads as one continuous, larger page.
+   */
+  async setWallZoom(wallId: string, zoom: number): Promise<SetZoomResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices: ScreenSlice[] = [];
+    let sourceKey: string | undefined;
+    for (const screenId of wall.memberScreenIds) {
+      const slice = this.state.slices[screenId];
+      const surface = slice?.surfaces[0];
+      if (slice === undefined || surface === undefined) continue;
+      if (!isFramed(surface)) return { ok: false, error: "not-zoomable" };
+      sourceKey ??= this.sourceKeyFor(this.wallSourceIds.get(wallId) ?? null, surface.url);
+      const next: ScreenSlice = withZoomedFirstSurface(slice, surface, zoom);
+      this.state.slices[screenId] = next;
+      slices.push(next);
+    }
+    if (slices.length === 0 || sourceKey === undefined) return { ok: false, error: "no-content" };
+
+    this.bumpRevision();
+    await this.rememberZoom(wallId, sourceKey, zoom);
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: this.wallSourceIds.get(wallId) ?? null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${wall.name ?? wall.id} zoom ${zoomLabel(zoom)}`);
+    return { ok: true, slices };
   }
 
   /**
@@ -1300,8 +1484,10 @@ export class ControlPlane {
    * Recompute every member's span slice for a wall showing `spec` and apply it in memory. Reuses the
    * Phase 3b union-bbox span math (works for ANY surface kind). Returns the touched member slices (empty
    * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
+   *
+   * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
    */
-  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec): ScreenSlice[] {
+  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
     const members: { screenId: string; placement: Placement }[] = [];
     for (const screenId of wall.memberScreenIds) {
       const placement = this.placements.get(screenId);
@@ -1339,6 +1525,7 @@ export class ControlPlane {
           offsetX: placement.x - unionMinX,
           offsetY: placement.y - unionMinY,
         },
+        zoom,
       );
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
@@ -1459,6 +1646,7 @@ export class ControlPlane {
     this.videoWalls.delete(wallId);
     this.wallSourceIds.delete(wallId);
     await this.store.deleteVideoWall(wallId);
+    await this.forgetZooms(wallId);
 
     const slices = this.clearSlices(wall.memberScreenIds);
     this.bumpRevision();
@@ -1491,8 +1679,11 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
+    // POL-57 — restore the zoom this wall last used FOR THIS PAGE (100% if it never has).
+    const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, resolved.spec.url));
+
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
-    const slices = this.computeWallSlices(wall, resolved.spec);
+    const slices = this.computeWallSlices(wall, resolved.spec, zoom);
     if (slices.length === 0) return { ok: false, error: "no-placements" };
 
     // Record which library source (if any) this wall now spans, persisting the wall row.
@@ -1535,13 +1726,18 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
+    // POL-57 — restore the zoom this screen last used FOR THIS PAGE (100% if it never has), so the
+    // operator dials a dashboard in once per screen and it comes back that way every time.
+    const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, resolved.spec.url));
+
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
-    const surface = this.buildSurface(resolved.spec, "content-web", {
-      x: 0,
-      y: 0,
-      w: slice.canvas.w,
-      h: slice.canvas.h,
-    });
+    const surface = this.buildSurface(
+      resolved.spec,
+      "content-web",
+      { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
+      undefined,
+      zoom,
+    );
     const next: ScreenSlice = { ...slice, surfaces: [surface] };
     this.state.slices[screenId] = next;
     this.setScreenSourceAssignment(screenId, resolved.sourceId);
@@ -1651,20 +1847,23 @@ export class ControlPlane {
       credentialProfileId,
     });
 
-    // Re-resolve every screen + wall currently showing this source.
+    // Re-resolve every screen + wall currently showing this source. The zoom is remembered against the
+    // SOURCE ID, not its URL, so re-pointing a source at a new URL keeps each target's dialled-in zoom.
     const spec: ResolvedSpec = { kind: source.kind, url: source.url };
+    const sourceKey = this.sourceKeyFor(id, source.url);
     const byScreen = new Map<string, ScreenSlice>();
 
     for (const [screenId, sid] of this.screenSourceIds) {
       if (sid !== id) continue;
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
-      const surface = this.buildSurface(spec, "content-web", {
-        x: 0,
-        y: 0,
-        w: slice.canvas.w,
-        h: slice.canvas.h,
-      });
+      const surface = this.buildSurface(
+        spec,
+        "content-web",
+        { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
+        undefined,
+        this.zoomFor(screenId, sourceKey),
+      );
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
       byScreen.set(screenId, next);
@@ -1674,7 +1873,8 @@ export class ControlPlane {
       if (sid !== id) continue;
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
-      for (const next of this.computeWallSlices(wall, spec)) byScreen.set(next.screenId, next);
+      const zoom = this.zoomFor(wallId, sourceKey);
+      for (const next of this.computeWallSlices(wall, spec, zoom)) byScreen.set(next.screenId, next);
     }
 
     const slices = [...byScreen.values()];

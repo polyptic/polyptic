@@ -90,18 +90,27 @@ const SurfaceBase = z.object({
     .optional(),
 });
 
+/** Page zoom for a FRAMED surface (web/dashboard), as a scale factor — 1 = 100%, like a browser's
+ *  zoom control (POL-57). The player renders the frame at 1/zoom of its region and scales it up, so
+ *  the embedded page sees a proportionally smaller CSS viewport and lays itself out bigger. Bounds
+ *  match a browser's practical range; only framed surfaces carry it (media has `fit`/native size). */
+export const Zoom = z.number().min(0.25).max(4);
+export type Zoom = z.infer<typeof Zoom>;
+
 export const WebSurface = SurfaceBase.extend({
   type: z.literal("web"),
   url: z.string().url(),
   /** "iframe" (default) or "window" — a top-level OS window placed by the agent (framing-blocked/native escape hatch). */
   placement: z.enum(["iframe", "window"]).default("iframe"),
   interactive: z.boolean().default(false),
+  zoom: Zoom.default(1),
 });
 
 export const DashboardSurface = SurfaceBase.extend({
   type: z.literal("dashboard"),
   url: z.string().url(), // adapter-built (e.g. a single-panel dashboard embed URL)
   refreshSeconds: z.number().int().positive().optional(),
+  zoom: Zoom.default(1),
 });
 
 export const ImageSurface = SurfaceBase.extend({
@@ -353,7 +362,13 @@ export const ScreenView = Screen.extend({
   /** What's on the screen now — a library source's name+kind, an ad-hoc URL's derived name, or null.
    *  Lets the console tiles + inspector show the actual content, not just a surface count. */
   content: z
-    .object({ name: z.string(), kind: z.enum(["web", "dashboard", "image", "video"]) })
+    .object({
+      name: z.string(),
+      kind: z.enum(["web", "dashboard", "image", "video"]),
+      /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
+       *  Absent for media, which has no zoom, so the console knows when to offer the control. */
+      zoom: Zoom.optional(),
+    })
     .nullable()
     .optional(),
 });
@@ -634,6 +649,12 @@ export const SetContentBody = z
     message: "provide exactly one of sourceId or url",
   });
 export type SetContentBody = z.infer<typeof SetContentBody>;
+
+/** Set the page zoom on a single screen's OR a video wall's framed content (POL-57). The server
+ *  remembers the value against the (target, content) pair, so re-assigning the same page to the same
+ *  screen later restores the zoom the operator last dialled in. */
+export const SetZoomBody = z.object({ zoom: Zoom });
+export type SetZoomBody = z.infer<typeof SetZoomBody>;
 
 // REST bodies — content library (Phase 3c)
 export const CreateContentSourceBody = z.object({

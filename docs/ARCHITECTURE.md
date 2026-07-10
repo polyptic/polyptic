@@ -18,6 +18,8 @@ FleetState{ desiredRevision, scenes, activeSceneId }
 
 **Surface types:** `web-url | dashboard-panel | dashboard-page` (player iframes) · `web-window | native-app` (agent places top-level windows via `swaymsg`) · `image | video | slideshow`.
 
+**Page zoom (POL-57/D62):** framed surfaces carry a `zoom` scale factor (0.25–4, default 1). The player lays the iframe out at `1/zoom` of the box it must fill and scales it back up, so the page sees a smaller CSS viewport and re-lays-out — a browser's zoom, not a magnifying glass. The control plane remembers the value per `(screen-or-wall, page)` pair and re-applies it whenever that page lands on that target again.
+
 **Reconcile:** activating a scene bumps one global `desiredRevision`; the controller recomputes each machine's slice (its screens' regions + surfaces) and fans out `apply`; agents report `observedRevision`. Mirrors a Kubernetes controller's `generation`/`observedGeneration`. Optional PREPARE/COMMIT barrier for tear-free flips across all screens at once. Health is exposed as Prometheus metrics on the server and per-agent status over WSS — no external bus required.
 
 ## Content adapters (the extensibility seam)

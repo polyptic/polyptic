@@ -23,11 +23,18 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedZoomPreference,
   Store,
 } from "./types";
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+/** Composite key for a zoom preference — the pair (target, content) it is remembered against. The
+ *  separator can't appear in an id, so no pair can collide with another. */
+function zoomKey(targetId: string, sourceKey: string): string {
+  return `${targetId}\u0000${sourceKey}`;
 }
 
 export class MemoryStore implements Store {
@@ -45,6 +52,8 @@ export class MemoryStore implements Store {
   private readonly scenes = new Map<string, PersistedScene>();
   /** Keyed by profile id — credential profiles for content auth (POL-24). */
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
+  /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
+  private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
@@ -71,6 +80,7 @@ export class MemoryStore implements Store {
       contentSources: [...this.contentSources.values()].map(clone),
       scenes: [...this.scenes.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
+      zoomPreferences: [...this.zoomPreferences.values()].map(clone),
     };
   }
 
@@ -92,6 +102,7 @@ export class MemoryStore implements Store {
       this.screens.delete(screenId);
       this.content.delete(screenId);
       this.placements.delete(screenId);
+      this.dropZoomPreferences(screenId);
     }
   }
 
@@ -183,6 +194,26 @@ export class MemoryStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     return [...this.contentSources.values()].map(clone);
+  }
+
+  // ── Page zoom preferences (POL-57) ───────────────────────────────────────────
+
+  async upsertZoomPreference(pref: PersistedZoomPreference): Promise<void> {
+    this.zoomPreferences.set(zoomKey(pref.targetId, pref.sourceKey), clone(pref));
+  }
+
+  async deleteZoomPreferencesForTarget(targetId: string): Promise<void> {
+    this.dropZoomPreferences(targetId);
+  }
+
+  async listZoomPreferences(): Promise<PersistedZoomPreference[]> {
+    return [...this.zoomPreferences.values()].map(clone);
+  }
+
+  private dropZoomPreferences(targetId: string): void {
+    for (const [key, pref] of this.zoomPreferences) {
+      if (pref.targetId === targetId) this.zoomPreferences.delete(key);
+    }
   }
 
   // ── Credential profiles (POL-24) ─────────────────────────────────────────────

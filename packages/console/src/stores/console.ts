@@ -1002,6 +1002,32 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Zoom the page on a single screen (POL-57). The authoritative zoom comes back on the next
+     * `admin/state`, but we patch the screen's content read-out optimistically so repeated clicks on
+     * the − / + buttons step from the value the operator can see rather than from a stale one.
+     */
+    async setScreenZoom(screenId: string, zoom: number): Promise<void> {
+      this.patchScreenZoom([screenId], zoom);
+      try {
+        await api.setScreenZoom(screenId, zoom);
+      } catch (err) {
+        console.error("[console] setScreenZoom failed", err);
+      }
+    },
+
+    /** Write a zoom onto the given screens' content read-outs in place (optimistic; the server's
+     *  broadcast overwrites it moments later). Screens with no framed content are left alone. */
+    patchScreenZoom(screenIds: readonly string[], zoom: number): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content) continue;
+          if (screen.content.zoom === undefined) continue;
+          screen.content = { ...screen.content, zoom };
+        }
+      }
+    },
+
     // ── Combined surfaces (video walls, Phase 3b) ───────────────────────────────
 
     /** Combine ≥2 placed screens on a mural into one spanning surface. Optimistically shows the
@@ -1061,6 +1087,18 @@ export const useConsoleStore = defineStore("console", {
         await api.setWallContent(wallId, body);
       } catch (err) {
         console.error("[console] setWallContent failed", err);
+      }
+    },
+
+    /** Zoom the page spanning a combined surface (POL-57) — every member takes the same zoom. */
+    async setWallZoom(wallId: string, zoom: number): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchScreenZoom(wall.memberScreenIds, zoom);
+      try {
+        await api.setWallZoom(wallId, zoom);
+      } catch (err) {
+        console.error("[console] setWallZoom failed", err);
       }
     },
 
