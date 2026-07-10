@@ -269,6 +269,27 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
+    "installing the bootloader sits behind a confirmation submenu that defaults to NO (POL-58)",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      // A single keypress must never install anything: the install lives inside a submenu whose
+      // default entry is the cancel entry (a stray Enter, or the timeout, boots the wall instead).
+      expect(body).toContain('submenu "Install the Polyptic bootloader on this machine ..." --id install');
+      const submenu = body.slice(body.indexOf("--id install"));
+      expect(submenu).toContain("set default=cancel");
+      expect(submenu.indexOf("--id cancel")).toBeLessThan(submenu.indexOf("--id offload"));
+      // The operator asked to be told what installing does. It does not erase; say so where they look.
+      expect(body).toContain("Nothing is erased");
+      expect(body).toContain("--id note-1");
+      // And the top-level entry that changes nothing says so too.
+      expect(body).toContain('menuentry "Boot Polyptic now (this machine is not touched)" --id live');
+      // Cancel re-sources the menu, so backing out lands you exactly where you started.
+      expect(submenu).toContain("configfile $net/boot/grub.cfg");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "only the offload entry tags the cmdline with polyptic.offload=1",
     async () => {
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
@@ -308,6 +329,158 @@ describe("netboot: GET /boot/grub.cfg", () => {
         expect(res.status).toBe(200);
         expect(await res.text()).toBe(canonical);
       }
+    },
+    TEST_TIMEOUT,
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /boot/report — how the bootloader install went (POL-58)
+//
+// The box that reports is diskless and mid-boot: no agent session exists yet, and on failure it will
+// never get one. Before this route, an install that could not make the firmware boot Polyptic failed
+// into a journal on a RAM disk — the operator learned about it by rebooting and landing back in the
+// machine's old OS. Each report becomes exactly one Live Activity line in the console.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Open `/admin`, read the first `admin/state`, close. A fresh client's snapshot is current state. */
+async function readAdminActivity(base: string): Promise<{ severity: string; text: string }[]> {
+  const ws = new WebSocket(`${base.replace("http://", "ws://")}/admin`);
+  try {
+    const message = await new Promise<string>((resolvePromise, reject) => {
+      const timer = setTimeout(() => reject(new Error("no admin/state within 5s")), 5_000);
+      ws.onmessage = (ev) => {
+        clearTimeout(timer);
+        resolvePromise(String(ev.data));
+      };
+      ws.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error("admin socket error"));
+      };
+    });
+    return JSON.parse(message).activity ?? [];
+  } finally {
+    ws.close();
+  }
+}
+
+const goodReport = {
+  ok: true,
+  code: "installed",
+  detail: "installed the signed loaders on /dev/nvme0n1 (partition 1)",
+  machineId: "dmi-4c4c4544-0031",
+};
+
+describe("netboot: POST /boot/report", () => {
+  test(
+    "OPEN mode: a successful install lands one `good` line in the Live Activity feed",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(goodReport),
+      });
+      expect(res.status).toBe(204);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      const line = activity.find((e) => e.text.includes("installed the Polyptic bootloader"));
+      expect(line).toBeDefined();
+      expect(line?.severity).toBe("good");
+      expect(line?.text).toContain("dmi-4c4c4544-0031");
+      expect(line?.text).toContain("/dev/nvme0n1");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a FAILED install is reported as `bad` and names the reason — the whole point of POL-58",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ok: false,
+          code: "boot-order-not-first",
+          detail: "the firmware would not make 'Polyptic Netboot' the first boot option",
+          machineId: "dmi-deadbeef",
+        }),
+      });
+      expect(res.status).toBe(204);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      const line = activity.find((e) => e.text.includes("boot-order-not-first"));
+      expect(line).toBeDefined();
+      expect(line?.severity).toBe("bad");
+      expect(line?.text).toContain("could not install the Polyptic bootloader");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "an unknown code or an oversized detail is a 400, never an activity line",
+    async () => {
+      const bad = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ok: false, code: "definitely-not-a-code", detail: "x" }),
+      });
+      expect(bad.status).toBe(400);
+
+      const huge = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ok: false, code: "no-esp", detail: "z".repeat(201) }),
+      });
+      expect(huge.status).toBe(400);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      expect(activity.some((e) => e.text.includes("definitely-not-a-code"))).toBe(false);
+      expect(activity.some((e) => e.text.includes("zzzzzzzzzz"))).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "GATED mode: the box must present the fleet enrolment token it netbooted with",
+    async () => {
+      const anon = await fetch(`${GATED_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(goodReport),
+      });
+      expect(anon.status).toBe(401);
+
+      const wrong = await fetch(`${GATED_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer not-the-token" },
+        body: JSON.stringify(goodReport),
+      });
+      expect(wrong.status).toBe(401);
+
+      const right = await fetch(`${GATED_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${FLEET_TOKEN}` },
+        body: JSON.stringify(goodReport),
+      });
+      expect(right.status).toBe(204);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a flood of reports is throttled, so a hostile boot network cannot drown the feed",
+    async () => {
+      const post = (): Promise<Response> =>
+        fetch(`${GATED_BASE}/boot/report`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${FLEET_TOKEN}` },
+          body: JSON.stringify({ ...goodReport, ok: false, code: "no-esp" }),
+        });
+      const codes: number[] = [];
+      for (let i = 0; i < 20; i++) codes.push((await post()).status);
+      expect(codes).toContain(429);
+      // …and the throttle is not an outage: the first few still got through.
+      expect(codes.filter((c) => c === 204).length).toBeGreaterThan(0);
     },
     TEST_TIMEOUT,
   );

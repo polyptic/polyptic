@@ -49,7 +49,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 
 **5. Make a box boot it**, pick **one**:
 
-- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and choose **boot now** or **offload** at the menu. See [The boot medium](#the-boot-medium-dongle-or-offload).
+- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes. Plug it in, boot from USB with Secure Boot ON, and choose **boot now** or **install the bootloader** at the menu. See [The boot medium](#the-boot-medium-dongle-or-offload).
 - **No medium, UEFI HTTP Boot:** point the box's firmware Boot URI at `http://10.0.0.5:8080/dist/boot/shimx64.efi` (arm64: `shimaa64.efi`). See [No medium at all](#no-medium-at-all-uefi-http-boot).
 - **No medium, site DHCP:** add one option-67 rule to the DHCP you already run. See [Site DHCP option 67](#site-dhcp-option-67-one-change-to-the-dhcp-you-already-run).
 
@@ -109,7 +109,8 @@ All in [`packages/server/src/provision.ts`](../packages/server/src/provision.ts)
 
 | Route | Gate | What |
 |---|---|---|
-| `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu (boot now / offload). Bakes the control-plane base from the request `Host` (like `/install`) and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
+| `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu (boot now / install-the-bootloader, the latter behind a confirmation submenu). Bakes the control-plane base from the request `Host` (like `/install`) and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
+| `POST /boot/report` | **token** | How a box's bootloader install went (POL-58) → one line in the Live Activity feed. The reporter is mid-boot with no agent session, hence not under `/api/v1`; in gated mode it must present the fleet enrolment token it netbooted with, in open mode it is ungated like the rest of the depot. Read-only against the registry, throttled, and the body can only produce one bounded line. |
 | `GET /grub/grub.cfg` (+ `/grub/x86_64-efi/grub.cfg`, `/grub/arm64-efi/grub.cfg`) | **ungated** | **Aliases of the same menu**, at the paths an HTTP-booted GRUB actually asks for: grubnet's baked-in prefix is `/grub`, resolved against the **server root** of the host it was fetched from. See [the appendix](#no-medium-at-all-uefi-http-boot). |
 | `GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs}` | **ungated** | The **active** live-image artifacts, streamed with real HTTP **Range** (206/416); the root image is hundreds of MB and streamed into RAM. |
 | `GET /dist/image/:arch/builds/:imageId/:file` | **ungated** | The same artifacts for any **retained** build ([Build history](#build-history-and-rollback)). Same Range streaming, same secret-free content; `:imageId` is whitelisted so it cannot walk out of the depot. |
@@ -236,8 +237,8 @@ Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloa
 
 Plug it in and the server-side menu offers:
 
-- **Boot now (diskless)**, leave the USB in. The box is fully **diskless**; nothing whatsoever is written locally. Best for disposable / hot-swap panels.
-- **Offload to this box, then boot**, writes *just the signed shim + GRUB pair* (the pointer, not the OS) into the box's **existing EFI System Partition** under `EFI/polyptic/`, drops the same stage-1 config at the ESP's `/grub/grub.cfg`, and adds a UEFI boot entry (`efibootmgr`, "Polyptic Netboot"). Pull the USB and the box self-boots the identical HTTP flow forever, **Secure Boot still ON** (the offloaded loaders are the same signed binaries). One USB can walk a rack, offloading each box.
+- **Boot Polyptic now**, leave the USB in. The box is fully **diskless**; nothing whatsoever is written locally. Best for disposable / hot-swap panels.
+- **Install the Polyptic bootloader on this machine**, behind a confirmation submenu that defaults to *No*. It writes *just the signed shim + GRUB pair* (the pointer, not the OS) into the box's **existing EFI System Partition** under `EFI/polyptic/`, drops the same stage-1 config at the ESP's `/grub/<arch>-efi/grub.cfg` (and `/grub/grub.cfg` when that path is free), and makes a UEFI boot entry (`efibootmgr`, "Polyptic Netboot") the firmware's **first** boot option. Pull the USB and the box self-boots the identical HTTP flow forever, **Secure Boot still ON** (the installed loaders are the same signed binaries). One USB can walk a rack, installing on each box.
 
 > **The dongle depends on the firmware bringing the NIC up (POL-39).** GRUB carries no NIC
 > drivers of its own — `efinet` can only use a card the firmware has already initialised. Most
@@ -248,7 +249,22 @@ Plug it in and the server-side menu offers:
 > [UEFI HTTP Boot / DHCP option 67](#no-medium-at-all-uefi-http-boot), where the firmware fetches
 > the loader itself and the NIC is up by construction.
 
-**Offload never repartitions, formats, or wipes.** It only adds files to the ESP that's already there plus one boot entry, and it **refuses to overwrite a `/grub/grub.cfg` it didn't write itself** (its own file carries a `# polyptic-offload` marker; a foreign file aborts the offload loudly). The full live OS still streams from the control plane into RAM on every boot, what lands on disk is the few-MB signed loader pair, never an OS, identity, or state. (Mechanically: the offload menu entry adds `polyptic.offload=1` to the kernel cmdline; the live image's `polyptic-offload.service` does the ESP install once, from Linux userland where `efibootmgr` exists, fetching the loaders tokenlessly from `/dist/boot/`.)
+**Installing the bootloader never repartitions, formats, or wipes.** It only adds files to the ESP that's already there plus one boot entry. The box's previous OS stays on its disk and stays bootable — pick it from the firmware's boot menu, or delete the "Polyptic Netboot" entry in firmware setup to hand the machine back. The install **refuses to overwrite any GRUB config it didn't write itself** (its own file carries a `# polyptic-offload` marker; a foreign file aborts it loudly), and it claims the removable-media fallback path `EFI/BOOT/BOOT<arch>.EFI` **only when that path is empty** — another vendor's default loader is never displaced. The full live OS still streams from the control plane into RAM on every boot; what lands on disk is the few-MB signed loader pair, never an OS, identity, or state. (Mechanically: the confirmation entry adds `polyptic.offload=1` to the kernel cmdline; the live image's `polyptic-offload.service` does the ESP install once, from Linux userland where `efibootmgr` exists, fetching the loaders tokenlessly from `/dist/boot/`.)
+
+### When the install doesn't take (POL-58)
+
+Nothing is called installed until it has been **verified**: the script re-reads the UEFI boot variables after writing them and asserts that "Polyptic Netboot" exists *and leads* `BootOrder`. If the firmware disagrees, the install fails, says why on the screen you are standing in front of, and posts the reason to **Console ▸ Activity** (`POST /boot/report`). No success stamp, no silent half-install. The `polyptic-offload.service` unit fails too, so `systemctl status polyptic-offload` tells the truth.
+
+| Reported code | What happened | What to do |
+| --- | --- | --- |
+| `boot-order-not-first` | The firmware stored the entry but keeps booting something else first. | Move **Polyptic Netboot** to the top of the boot order in firmware setup. |
+| `nvram-write-failed` / `nvram-entry-missing` | The firmware refused the boot variable, or accepted and dropped it (often full variable storage). | Clear unused boot entries in firmware setup, then install again. The loaders are already on the ESP — a manual entry for `\EFI\polyptic\shim<arch>.efi` also works. |
+| `not-uefi` | The box booted in legacy BIOS/CSM mode, which has no UEFI boot entries. | Enable UEFI boot in firmware setup (this is also why a legacy-installed Ubuntu has no ESP to chain from). |
+| `no-esp` | No EFI System Partition on any **internal** disk. An ESP on removable media is deliberately ignored: pointing the boot entry at the stick you are about to pull is exactly how a box "installs" and then boots its old OS. | Boot the box's existing OS in UEFI mode once, or create an ESP, then install again. |
+| `ambiguous-esp` | Several internal ESPs and none is clearly the one the firmware boots. | Re-run with `polyptic.offload_disk=/dev/<disk>` appended to the kernel command line (press `e` at the GRUB menu). |
+| `foreign-grub-cfg` | A GRUB config Polyptic didn't write already sits at its path. | Nothing was changed. Move or remove that file if the ESP is genuinely yours to use. |
+
+On a multi-ESP box the install picks the ESP the **firmware already boots from** (matched by `PARTUUID` against the existing UEFI boot entries) and says which one it chose; it aborts rather than guess when that is still a tie.
 
 ---
 
@@ -416,9 +432,13 @@ whole root image into a RAM tmpfs.)
 - **Dongle flow:** attach `polyptic-boot.img` as a USB **disk** drive; the firmware boots it ahead
   of PXE, and the boot-order NIC is still initialised, so dongle-GRUB is online. Verified: ~30 s
   to content.
-- **Offload flow:** attach an additional VirtIO disk that has a GPT + FAT32 ESP, boot the dongle,
-  pick the "offload" menu entry; the live boot installs the signed loaders + boot entry on the
-  disk, after which the box boots the same chain with the dongle removed.
+- **Install-the-bootloader flow:** attach an additional VirtIO disk that has a GPT + FAT32 ESP, boot
+  the dongle, open the install submenu and confirm; the live boot writes the signed loaders + boot
+  entry on the disk, after which the box boots the same chain with the dongle removed.
+  A VM's blank ESP exercises none of the firmware states that broke this on real hardware, which is
+  what `deploy/live/test/offload.test.sh` is for: it drives the whole decision tree (removable media,
+  several ESPs, a firmware that keeps the entry but refuses to reorder, one that forgets it, a
+  foreign default loader) against stubs, on any host.
 
 ---
 

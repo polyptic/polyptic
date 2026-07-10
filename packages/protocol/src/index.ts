@@ -496,6 +496,40 @@ export const ActivityEvent = z.object({
 });
 export type ActivityEvent = z.infer<typeof ActivityEvent>;
 
+/** Why a bootloader install (the netboot "offload") ended the way it did (POL-58). The box posts one
+ *  of these to `POST /boot/report` the moment it knows, so the outcome reaches the operator instead of
+ *  dying in a journal on a diskless box. `installed` is the only success. */
+export const BootReportCode = z.enum([
+  "installed", // the loaders are on the ESP and the firmware boots them first — verified, not assumed
+  "not-uefi", // booted in legacy BIOS/CSM mode: no UEFI boot entries exist to add
+  "no-base", // no polyptic.base= on the kernel cmdline
+  "no-efibootmgr", // the tool is missing from the image
+  "no-efivars", // the firmware's boot variables are unreadable
+  "unsupported-arch",
+  "no-esp", // no EFI System Partition on any internal disk
+  "ambiguous-esp", // several ESPs and none is clearly the boot one — needs polyptic.offload_disk=
+  "no-partnum",
+  "no-loaders", // the signed shim/GRUB pair could not be downloaded from the depot
+  "mount-failed",
+  "foreign-grub-cfg", // a GRUB config we did not write sits at our path; never clobbered
+  "nvram-write-failed", // the firmware refused the boot entry (variable storage full?)
+  "nvram-entry-missing", // it accepted the entry, then dropped it
+  "nvram-not-persisted",
+  "boot-order-not-first", // the entry exists but the firmware still boots something else first
+]);
+export type BootReportCode = z.infer<typeof BootReportCode>;
+
+/** The body of `POST /boot/report`. `detail` is a human sentence composed on the box; the server
+ *  renders it into one Live Activity line and never interprets it. */
+export const BootReportBody = z.object({
+  ok: z.boolean(),
+  code: BootReportCode,
+  detail: z.string().max(200).default(""),
+  /** The box's stable netboot identity (`dmi-…` / `mac-…`), when it could derive one. */
+  machineId: z.string().max(128).default(""),
+});
+export type BootReportBody = z.infer<typeof BootReportBody>;
+
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
   t: z.literal("admin/state"),

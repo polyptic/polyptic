@@ -786,8 +786,8 @@ async function onSignOut(): Promise<void> {
             <div class="min-w-0 modal-titles">
               <div id="usb-title" class="modal-title">Make a bootable USB</div>
               <div class="modal-sub">
-                The bootloader fetches the latest Polyptic image every reboot. Keep the USB inserted for live boot or
-                install it to disk.
+                The bootloader fetches the latest Polyptic image every reboot. Keep the USB inserted, or install the
+                bootloader to the screen so it boots on its own.
               </div>
             </div>
             <button type="button" class="icon-btn" aria-label="Close" @click="usbModal = false">
@@ -822,11 +822,26 @@ async function onSignOut(): Promise<void> {
               </div>
             </li>
             <li class="step">
-              <div class="step-gutter"><span class="step-num">3</span></div>
+              <div class="step-gutter"><span class="step-num">3</span><span class="step-line" /></div>
               <div class="step-body">
                 <div class="step-title">Boot the screen from USB</div>
                 <div class="step-text">
                   Leave Secure Boot <b>ON</b>. It streams the latest image and appears in <b>Machines</b> to approve.
+                </div>
+              </div>
+            </li>
+            <li class="step">
+              <div class="step-gutter"><span class="step-num">4</span></div>
+              <div class="step-body">
+                <div class="step-title">Optional: install the bootloader, then take the USB back</div>
+                <div class="step-text">
+                  At the boot menu choose <b>Install the Polyptic bootloader on this machine</b> and confirm. The screen
+                  then boots Polyptic on its own, and the same stick can walk down the rack.
+                </div>
+                <div class="step-aside">
+                  <b>Nothing is erased.</b> This copies a signed 4 MB loader to the EFI partition and puts Polyptic first
+                  in the UEFI boot order; disks, partitions and any OS already installed are left exactly as they are.
+                  The result — installed, or why not — appears in <b>Activity</b>.
                 </div>
               </div>
             </li>

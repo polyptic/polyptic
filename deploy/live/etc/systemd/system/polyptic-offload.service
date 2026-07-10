@@ -2,7 +2,8 @@
 Description=Polyptic, one-shot offload: install the boot loader to this box's ESP + a UEFI entry (POL-33)
 Documentation=file:///usr/local/lib/polyptic/offload.sh
 # Only runs when the boot menu's offload entry (served by GET /boot/grub.cfg) was chosen, which
-# tagged the kernel cmdline. Ordered before greetd so it finishes before the kiosk session comes up.
+# tagged the kernel cmdline. Ordered before greetd so it finishes — and its verdict is on the screen —
+# before the kiosk session paints over it.
 ConditionKernelCommandLine=polyptic.offload=1
 Before=greetd.service
 Wants=network-online.target
@@ -12,10 +13,12 @@ ConditionPathExists=/usr/local/lib/polyptic/offload.sh
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Offload is best-effort: a failure (no ESP, BIOS-mode, no network) must never block the box from
-# booting diskless as a dongle, so the unit does not fail the boot.
+# A failed offload is a FAILED unit (POL-58). It used to be laundered into success by
+# `SuccessExitStatus=0 1`, so `systemctl status polyptic-offload` said the install had worked on a box
+# that never got a boot entry — which is how a box that "claimed to offload" booted straight back into
+# its old OS. Nothing here Requires= this unit, so failing is loud without being fatal: the box still
+# boots diskless and renders its wall, exactly as it did before the operator asked for an install.
 ExecStart=/usr/local/lib/polyptic/offload.sh
-SuccessExitStatus=0 1
 
 [Install]
 WantedBy=multi-user.target

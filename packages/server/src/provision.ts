@@ -43,9 +43,11 @@ import { open, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { NetbootInfo } from "@polyptic/protocol";
+import { BootReportBody, NetbootInfo } from "@polyptic/protocol";
+import type { BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
 
 /** Built-in fallback install template, shipped beside this module (served when the deploy file is absent). */
@@ -119,6 +121,11 @@ const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._+~:-]{0,255}$/;
 
 /** The placeholder substituted with the computed control-plane base in the install template. */
 const BASE_PLACEHOLDER = "{{POLYPTIC_BASE}}";
+
+/** `POST /boot/report` throttle (POL-58): a rack being offloaded posts a handful of lines a minute, so
+ *  a burst of 10 with one token back every 6s is generous for real boxes and useless for a flooder. */
+const REPORT_BURST = 10;
+const REPORT_REFILL_MS = 6_000;
 
 /**
  * Resolve `segments` under `root`, asserting the result stays INSIDE `root` (no traversal). Returns
@@ -235,6 +242,11 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
  * `$var` in the emitted config is GRUB runtime syntax, written literally (never JS interpolation); the
  * commands are plain `linux`/`initrd` (noble's signed GRUB has no linuxefi). When the computed base is
  * https, http is emitted anyway: GRUB has no TLS, the boot depot is plain-HTTP by contract.
+ *
+ * POL-58: the install now sits behind a CONFIRMATION SUBMENU that defaults to "no". The operator who
+ * hit this expected to be asked "are you sure you want to erase this disk?", and the honest answer —
+ * Polyptic never erases anything — is exactly what is worth saying at the moment of choosing. GRUB
+ * paints its menu over any `echo`, so the explanation has to live in the entry titles themselves.
  */
 export function buildBootGrubCfg(base: string, token: string | undefined): string {
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
@@ -256,18 +268,69 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
     `set net=(http,${hostPort})`,
     "set timeout=5",
     "set default=live",
-    'menuentry "Polyptic (Live Bootloader)" --id live {',
+    'menuentry "Boot Polyptic now (this machine is not touched)" --id live {',
     '  echo "Polyptic: streaming the $arch live image into RAM ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
-    'menuentry "Polyptic (Install Bootloader)" --id offload {',
-    '  echo "Polyptic: offload mode, the live image will install the loader, then keep booting ..."',
-    `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1`,
-    "  initrd $net/dist/image/$arch/initrd",
+    // The confirmation gate. `default=cancel` means a stray Enter (or the 60s timeout, which reloads
+    // this menu and boots the wall) can never install anything; the operator has to choose "Yes".
+    'submenu "Install the Polyptic bootloader on this machine ..." --id install {',
+    "  set timeout=60",
+    "  set default=cancel",
+    '  menuentry "No - go back, change nothing (or press Escape)" --id cancel {',
+    "    configfile $net/boot/grub.cfg",
+    "  }",
+    '  menuentry "Yes - add Polyptic to the UEFI boot menu and boot it first from now on" --id offload {',
+    '    echo "Polyptic: installing the signed bootloader onto this machine\'s EFI partition ..."',
+    `    linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1`,
+    "    initrd $net/dist/image/$arch/initrd",
+    "  }",
+    '  menuentry "Nothing is erased: your disks, partitions and existing OS are left as they are" --id note-1 { true }',
+    '  menuentry "It copies a signed 4 MB loader to the EFI partition; the OS still streams from the network" --id note-2 { true }',
+    `  menuentry 'To undo: delete the "Polyptic Netboot" boot entry in your firmware setup' --id note-3 { true }`,
     "}",
   );
   return lines.join("\n") + "\n";
+}
+
+/** A netbooted box has no operator watching its journal, so a bootloader install that fails has, until
+ *  POL-58, failed in silence. `POST /boot/report` turns each outcome into ONE Live Activity line. */
+export type ActivitySink = (severity: "info" | "good" | "warn" | "bad", text: string) => void;
+
+/** How the operator is addressed: the stable netboot id when the box derived one, else "a machine". */
+function reporterName(machineId: string): string {
+  const id = machineId.trim();
+  if (id.length === 0) return "A machine";
+  return `Machine ${id.length > 24 ? `${id.slice(0, 24)}…` : id}`;
+}
+
+/**
+ * Render a boot report as one activity line + its severity (POL-58). `detail` is a sentence the box
+ * composed about its own firmware and disks; the server never parses it, only quotes it — the codes
+ * are the machine-readable half of the contract, and they are what tests pin.
+ *
+ * `installed` is `good`. Everything else is `bad` except the two "the operator has to decide" cases —
+ * an ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human.
+ */
+export function bootReportLine(report: BootReport): { severity: "good" | "warn" | "bad"; text: string } {
+  const who = reporterName(report.machineId);
+  const detail = report.detail.trim();
+  if (report.ok && report.code === "installed") {
+    return { severity: "good", text: `${who} installed the Polyptic bootloader${detail ? `: ${detail}` : ""}` };
+  }
+  const severity = report.code === "ambiguous-esp" || report.code === "not-uefi" ? "warn" : "bad";
+  return {
+    severity,
+    text: `${who} could not install the Polyptic bootloader (${report.code})${detail ? `: ${detail}` : ""}`,
+  };
+}
+
+/** The bearer token on a boot report, if any. Boxes send the fleet enrolment token they netbooted with. */
+function bearerToken(request: FastifyRequest): string | undefined {
+  const raw = headerFirst(request.headers.authorization);
+  const m = /^Bearer\s+(.+)$/i.exec(raw);
+  return m?.[1]?.trim() || undefined;
 }
 
 /**
@@ -420,6 +483,7 @@ export function registerProvisionRoutes(
   config: ProvisionConfig,
   enrollment: Enrollment,
   imageUpdates?: ImageManifestSource,
+  onBootReport?: ActivitySink,
 ): void {
   const { installScriptPath, agentDistDir, depsDistDir, imageDistDir, bootDistDir, publicBaseUrl } =
     config;
@@ -536,6 +600,43 @@ export function registerProvisionRoutes(
   fastify.get("/grub/grub.cfg", serveBootConfig);
   fastify.get("/grub/x86_64-efi/grub.cfg", serveBootConfig);
   fastify.get("/grub/arm64-efi/grub.cfg", serveBootConfig);
+
+  // ── POST /boot/report — the box tells the control plane how its bootloader install went (POL-58).
+  //    The reporter is a diskless box mid-boot, before any agent session exists, so this lives beside
+  //    the boot depot rather than under /api/v1. In GATED mode it must present the fleet enrolment
+  //    token it netbooted with (same secret already baked into its cmdline); in OPEN mode — the dev
+  //    default, where that token does not exist — it is ungated like the rest of the depot. The body
+  //    can only ever produce ONE bounded activity line: the code is a closed enum, `detail` is capped
+  //    at 200 chars by the contract, and the bucket below stops a hostile boot network from flooding
+  //    the feed. Nothing here mutates the registry. ──
+  const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
+  fastify.post("/boot/report", async (request, reply) => {
+    if (!enrollment.open) {
+      const provided = bearerToken(request);
+      const expected = enrollment.currentToken;
+      if (expected === undefined || provided === undefined || !constantTimeEqual(provided, expected)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+    }
+
+    const parsed = BootReportBody.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid boot report" });
+
+    // Leaky bucket: refill one token per REPORT_REFILL_MS, never above the burst size.
+    const now = Date.now();
+    const gained = Math.floor((now - reportBucket.refilledAt) / REPORT_REFILL_MS);
+    if (gained > 0) {
+      reportBucket.tokens = Math.min(REPORT_BURST, reportBucket.tokens + gained);
+      reportBucket.refilledAt = now;
+    }
+    if (reportBucket.tokens <= 0) return reply.code(429).send({ error: "too many boot reports" });
+    reportBucket.tokens -= 1;
+
+    const { severity, text } = bootReportLine(parsed.data);
+    fastify.log.info({ event: "boot.report", code: parsed.data.code, ok: parsed.data.ok }, text);
+    onBootReport?.(severity, text);
+    return reply.code(204).send();
+  });
 
   // ── GET /dist/image/:arch/:file, the live-image artifacts (vmlinuz|initrd|rootfs.squashfs),
   //    Range-aware (the squashfs is large and streamed into RAM). 404 → the box's boot cleanly stalls. ──
