@@ -222,8 +222,8 @@ registerOpsRoutes(fastify, {
   revision: BUILD_REVISION,
   startedAt: STARTED_AT,
 });
-// TOP-LEVEL, UNGATED zero-touch provisioning routes (GET /install, /dist/agent/:arch, /dist/deps/**) —
-// NOT /api/v1, so an edge box with no operator session can bootstrap itself entirely from the server.
+// TOP-LEVEL, UNGATED provisioning routes (the netboot depot + GET /dist/agent/:arch) — NOT /api/v1,
+// so a machine with no operator session can boot and enrol entirely from the server.
 const provisionConfig = provisionConfigFromEnv();
 
 // ── Image updates (POL-41): the scheduled rebuild hooks + the published manifest + urgency. The
@@ -339,21 +339,17 @@ if (spaServed.length > 0) {
   );
 }
 
-// Provisioning boot banner: report which zero-touch artifacts are present on disk (install template,
-// agent binaries per arch, deps bundle root, netboot image + boot medium + signed loaders) so a
-// misconfigured AGENT_DIST_DIR/DEPS_DIST_DIR/IMAGE_DIST_DIR/BOOT_DIST_DIR is obvious.
+// Provisioning boot banner: report which zero-touch artifacts are present on disk (agent binaries per
+// arch, netboot image + boot medium + signed loaders) so a misconfigured
+// AGENT_DIST_DIR/IMAGE_DIST_DIR/BOOT_DIST_DIR is obvious.
 const provisionSummary = await provisionBootSummary(provisionConfig);
 fastify.log.info(
   {
     event: "provision.dist",
-    installScriptPath: provisionConfig.installScriptPath,
-    installTemplate: provisionSummary.installTemplate ? "file" : "built-in-fallback",
     agentDistDir: provisionConfig.agentDistDir,
     agentDistDirExists: provisionSummary.agentDistDir,
     agentArm64: provisionSummary.agentArm64,
     agentAmd64: provisionSummary.agentAmd64,
-    depsDistDir: provisionConfig.depsDistDir,
-    depsDistDirExists: provisionSummary.depsDistDir,
     imageDistDir: provisionConfig.imageDistDir,
     imageDistDirExists: provisionSummary.imageDistDir,
     imageAmd64: provisionSummary.imageAmd64,
@@ -361,9 +357,7 @@ fastify.log.info(
     bootMedium: provisionSummary.bootMedium,
     signedLoaders: provisionSummary.signedLoaders,
   },
-  `provisioning: install=${provisionSummary.installTemplate ? "template" : "fallback"} ` +
-    `agent[arm64=${provisionSummary.agentArm64} amd64=${provisionSummary.agentAmd64}] ` +
-    `deps-dir=${provisionSummary.depsDistDir} ` +
+  `provisioning: agent[arm64=${provisionSummary.agentArm64} amd64=${provisionSummary.agentAmd64}] ` +
     `netboot[iso-amd64=${provisionSummary.imageAmd64} medium=${provisionSummary.bootMedium} ` +
     `signed-loaders=${provisionSummary.signedLoaders}] (Secure Boot: supported)`,
 );

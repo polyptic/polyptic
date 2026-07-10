@@ -1,19 +1,17 @@
 /**
  * Zero-touch, AIR-GAPPED edge provisioning — served by the control plane (k3s-style).
  *
- * An edge box that can reach ONLY the server (no internet) bootstraps itself entirely from these
- * TOP-LEVEL, UNGATED routes (registered OUTSIDE the /api/v1 operator gate, like /healthz — the box
+ * A machine that can reach ONLY the server (no internet) boots and enrols entirely from these
+ * TOP-LEVEL, UNGATED routes (registered OUTSIDE the /api/v1 operator gate, like /healthz — the machine
  * carries no operator session):
  *
- *   GET /install                                  → the install shell script, with the control-plane
- *                                                   base URL BAKED IN from THIS request (so the box
- *                                                   targets the exact host it curled). text/x-shellscript.
  *   GET /dist/agent/:arch                         → the prebuilt agent BINARY for arm64|amd64, streamed.
- *   GET /dist/deps/:distro/:arch/manifest.json    → the bundled substrate package manifest.
- *   GET /dist/deps/:distro/:arch/:file            → one bundled substrate package (.deb) by name.
+ *                                                   No boot path fetches it: the live image bakes the
+ *                                                   binary in at build time. Kept for agent OTA (POL-28).
  *
- * NETBOOT (POL-33/D47), a bare box boots Ubuntu's SIGNED shim+GRUB chain over the network into a live
- * Polyptic image in RAM, Secure Boot stays ON, no OS install:
+ * NETBOOT (POL-33/D47) is the ONLY supported way a machine becomes a screen (D57). A bare machine boots
+ * Ubuntu's SIGNED shim+GRUB chain over the network into a live Polyptic image in RAM, Secure Boot stays
+ * ON, no OS install:
  *   GET /boot/grub.cfg                            → the generated GRUB menu with the control-plane base
  *                                                   (and, in GATED mode, the enrolment token) baked in
  *                                                   from THIS request. Ungated, the box has no session.
@@ -27,16 +25,10 @@
  *   GET /api/v1/settings/netboot                  → operator-facing netboot info for the console (GATED,
  *                                                   under /api/v1; secret-free, points at the URLs above).
  *
- * The install flow (the script): detect arch+distro → download the agent binary → write
- * /etc/polyptic/agent.toml + a systemd unit → enrol now (Stage A, fully air-gapped). With --kiosk it
- * additionally pulls the bundled .debs (offline-first; falls back to the distro package manager only if
- * the box has internet) and runs `polyptic-agent setup --skip-deps …` for the greetd/sway/Chromium
- * wiring (Stage B).
- *
  * SAFETY: every path segment is matched against a strict whitelist (no '/', no '..'), and the resolved
  * absolute path is asserted to stay INSIDE its configured root before any file is touched — the same
- * traversal-safety contract as the media serve route. Missing artifacts are a clean 404 (the script's
- * offline-first logic depends on the 404 to fall back), never a traversal or a 500.
+ * traversal-safety contract as the media serve route. A missing artifact is a clean 404, never a
+ * traversal or a 500.
  */
 import { createReadStream } from "node:fs";
 import { open, readFile, stat } from "node:fs/promises";
@@ -48,9 +40,6 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Enrollment } from "./enroll";
 
-/** Built-in fallback install template, shipped beside this module (served when the deploy file is absent). */
-const FALLBACK_TEMPLATE_PATH = join(dirname(fileURLToPath(import.meta.url)), "install.default.sh");
-
 /** Repo root (…/packages/server/src → repo) so the dev defaults find `deploy/dist` regardless of the
  *  server's CWD. In the Docker image the env (AGENT_DIST_DIR=/app/deploy/dist, etc.) overrides these. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -60,12 +49,8 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface ProvisionConfig {
-  /** Path to the install-script template (the deploy agent writes deploy/install.sh). */
-  installScriptPath: string;
   /** Directory holding the prebuilt agent binaries `polyptic-agent-<arch>`. */
   agentDistDir: string;
-  /** Directory holding bundled substrate packages: `<distro>/<arch>/{manifest.json,*.deb}`. */
-  depsDistDir: string;
   /** Directory holding the netboot live-image artifacts: `<arch>/{vmlinuz,initrd,rootfs.squashfs}` (POL-33). */
   imageDistDir: string;
   /** Directory holding the boot depot: `polyptic-boot.img` + the four signed loaders (POL-33/D47). */
@@ -77,9 +62,7 @@ export interface ProvisionConfig {
 /** Resolve provisioning config from the environment, with sensible repo-relative defaults. */
 export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ProvisionConfig {
   return {
-    installScriptPath: env.INSTALL_SCRIPT_PATH?.trim() || resolve(REPO_ROOT, "deploy/install.sh"),
     agentDistDir: env.AGENT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist"),
-    depsDistDir: env.DEPS_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/deps"),
     imageDistDir: env.IMAGE_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/image"),
     bootDistDir: env.BOOT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/boot"),
     publicBaseUrl: (env.PUBLIC_BASE_URL?.trim() || "http://localhost:8080").replace(/\/+$/, ""),
@@ -109,17 +92,6 @@ const IMAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const BOOT_FILE_RE = /^(polyptic-boot\.img|shimx64\.efi|shimaa64\.efi|grubx64\.efi|grubaa64\.efi)$/;
 /** The four signed loaders the depot serves and the offload flow installs (for the boot summary). */
 const SIGNED_LOADER_FILES = ["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grubaa64.efi"] as const;
-/** A distro slug: `<id>` or `<id>-<version>` (e.g. `ubuntu`, `ubuntu-24.04`, `debian-12`). */
-const DISTRO_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-/** A bundle file name (.deb etc.): no path separators, no leading dot, bounded charset. `:` is allowed
- * because Debian version epochs put a colon in the filename (e.g. `chromium_2:1snap1_arm64.deb`), which
- * the installer URL-encodes as `%3a`; the traversal guard (resolved path inside the root) is the real
- * safety check, so the charset just has to exclude separators. */
-const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._+~:-]{0,255}$/;
-
-/** The placeholder substituted with the computed control-plane base in the install template. */
-const BASE_PLACEHOLDER = "{{POLYPTIC_BASE}}";
-
 /**
  * Resolve `segments` under `root`, asserting the result stays INSIDE `root` (no traversal). Returns
  * null if the join escapes the root — callers turn that into a 404, never a leak. Mirrors the media
@@ -405,28 +377,7 @@ export function registerProvisionRoutes(
   enrollment: Enrollment,
   imageUpdates?: ImageManifestSource,
 ): void {
-  const { installScriptPath, agentDistDir, depsDistDir, imageDistDir, bootDistDir, publicBaseUrl } =
-    config;
-
-  // ── GET /install — the install script, with the control-plane base baked in from THIS request. ──
-  fastify.get("/install", async (request, reply) => {
-    const base = computeBaseUrl(request, publicBaseUrl);
-
-    let template: string;
-    try {
-      template = await readFile(installScriptPath, "utf8");
-    } catch {
-      // The deploy agent hasn't written deploy/install.sh yet — serve the built-in fallback that ships
-      // beside this module so the route is never broken (identical contract: one {{POLYPTIC_BASE}}).
-      template = await readFile(FALLBACK_TEMPLATE_PATH, "utf8");
-    }
-
-    const script = template.split(BASE_PLACEHOLDER).join(base);
-    reply.header("Cache-Control", "no-store");
-    reply.header("X-Content-Type-Options", "nosniff");
-    reply.type("text/x-shellscript; charset=utf-8");
-    return script;
-  });
+  const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
 
   // ── GET /dist/agent/:arch — the prebuilt agent binary. 404 when not bundled. ──
   fastify.get("/dist/agent/:arch", async (request, reply) => {
@@ -452,52 +403,6 @@ export function registerProvisionRoutes(
     reply.header("Content-Disposition", `attachment; filename="${filename}"`);
     reply.header("Content-Length", String(st.size));
     reply.type("application/octet-stream");
-    return reply.send(createReadStream(abs));
-  });
-
-  // ── GET /dist/deps/:distro/:arch/manifest.json — the bundled substrate manifest. 404 → script falls back. ──
-  fastify.get("/dist/deps/:distro/:arch/manifest.json", async (request, reply) => {
-    const { distro, arch } = request.params as { distro?: string; arch?: string };
-    const abs = await resolveDepsPath(depsDistDir, distro, arch, "manifest.json");
-    if (!abs) return reply.code(404).send({ error: "no bundle for this distro/arch" });
-
-    let body: Buffer;
-    try {
-      body = await readFile(abs);
-    } catch {
-      return reply.code(404).send({ error: "no bundle for this distro/arch" });
-    }
-
-    reply.header("Cache-Control", "no-store");
-    reply.header("X-Content-Type-Options", "nosniff");
-    reply.type("application/json; charset=utf-8");
-    return reply.send(body);
-  });
-
-  // ── GET /dist/deps/:distro/:arch/:file — one bundled substrate package. 404 when absent. ──
-  fastify.get("/dist/deps/:distro/:arch/:file", async (request, reply) => {
-    const { distro, arch, file } = request.params as {
-      distro?: string;
-      arch?: string;
-      file?: string;
-    };
-    const abs = await resolveDepsPath(depsDistDir, distro, arch, file);
-    if (!abs) return reply.code(404).send({ error: "package not bundled" });
-
-    const st = await stat(abs);
-
-    // manifest.json is JSON; everything else in the bundle is a Debian package.
-    const isManifest = file === "manifest.json";
-    reply.header("Cache-Control", "no-store");
-    reply.header("X-Content-Type-Options", "nosniff");
-    reply.header("Accept-Ranges", "bytes");
-    reply.header("Content-Length", String(st.size));
-    if (isManifest) {
-      reply.type("application/json; charset=utf-8");
-    } else {
-      reply.header("Content-Disposition", `attachment; filename="${file}"`);
-      reply.type("application/vnd.debian.binary-package");
-    }
     return reply.send(createReadStream(abs));
   });
 
@@ -632,40 +537,6 @@ export function registerProvisionRoutes(
   });
 }
 
-/**
- * Validate distro+arch+file against the whitelists and resolve to an EXISTING traversal-safe file under
- * the deps root, trying both supported on-disk layouts:
- *   - `${DEPS_DIST_DIR}/<distro>/<arch>/<file>`         (DEPS_DIST_DIR points AT the deps root — the
- *                                                        bundle-deps.sh / default `./deploy/dist/deps` layout)
- *   - `${DEPS_DIST_DIR}/deps/<distro>/<arch>/<file>`    (DEPS_DIST_DIR is the dist root with a `deps/` subdir)
- * Both candidates are independently traversal-checked. Returns the first that is a regular file, or null
- * on validation failure / escape / absence (caller → 404 so the install script falls back cleanly).
- */
-async function resolveDepsPath(
-  depsDistDir: string,
-  distro: string | undefined,
-  arch: string | undefined,
-  file: string | undefined,
-): Promise<string | null> {
-  if (!distro || !DISTRO_RE.test(distro)) return null;
-  if (!arch || !ARCH_RE.test(arch)) return null;
-  if (!file || !FILE_RE.test(file) || file.includes("..")) return null;
-
-  const candidates = [
-    safeResolve(depsDistDir, distro, arch, file),
-    safeResolve(depsDistDir, "deps", distro, arch, file),
-  ];
-  for (const abs of candidates) {
-    if (!abs) continue;
-    try {
-      if ((await stat(abs)).isFile()) return abs;
-    } catch {
-      // try the next candidate layout
-    }
-  }
-  return null;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Boot diagnostics
 // ─────────────────────────────────────────────────────────────────────────────
@@ -690,9 +561,7 @@ async function isFile(path: string): Promise<boolean> {
 
 /** A boot-time summary of which provisioning artifacts are present, for the boot banner. */
 export async function provisionBootSummary(config: ProvisionConfig): Promise<{
-  installTemplate: boolean;
   agentDistDir: boolean;
-  depsDistDir: boolean;
   agentArm64: boolean;
   agentAmd64: boolean;
   imageDistDir: boolean;
@@ -700,11 +569,9 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
   bootMedium: boolean;
   signedLoaders: boolean;
 }> {
-  const [installTemplate, agentDir, depsDir, arm64, amd64, imageDir, imageAmd64, medium, loaders] =
+  const [agentDir, arm64, amd64, imageDir, imageAmd64, medium, loaders] =
     await Promise.all([
-      isFile(config.installScriptPath),
       isDir(config.agentDistDir),
-      isDir(config.depsDistDir),
       isFile(resolve(config.agentDistDir, "polyptic-agent-arm64")),
       isFile(resolve(config.agentDistDir, "polyptic-agent-amd64")),
       isDir(config.imageDistDir),
@@ -716,9 +583,7 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
       ).then((present) => present.every(Boolean)),
     ]);
   return {
-    installTemplate,
     agentDistDir: agentDir,
-    depsDistDir: depsDir,
     agentArm64: arm64,
     agentAmd64: amd64,
     imageDistDir: imageDir,

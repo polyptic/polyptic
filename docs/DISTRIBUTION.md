@@ -9,8 +9,8 @@ Polyptic is two deployable things plus an optional one:
 | What | Artifact | How you install it | Lives where |
 |---|---|---|---|
 | **Server** (control plane + console + player) | one **Docker image** `ghcr.io/<owner>/polyptic-server` | `docker run` / compose / Helm | your cluster or Docker host |
-| **Agent** (per display box) | the agent **single binary**, served by the control-plane depot (D35/D41) | `curl -sfL http://SERVER:8080/install \| sh -` | each kiosk machine |
-| **Netboot** (diskless box, *no OS install*) | a **live image** + a universal **boot medium** `polyptic-boot.img` (Ubuntu's **signed shim + GRUB**, so **Secure Boot stays ON**), served by the depot (D46/D47) | UEFI HTTP Boot / a USB dongle → the box streams into RAM | nothing persists on the box, see [NETBOOT.md](NETBOOT.md) |
+| **Agent** (per display machine) | the agent **single binary**, baked into the netboot live image at build time | you never install it by hand; it arrives with the image | inside the live image |
+| **Netboot** (diskless machine, *no OS install*) | a **live image** + a universal **boot medium** `polyptic-boot.img` (Ubuntu's **signed shim + GRUB**, so **Secure Boot stays ON**), served by the depot (D46/D47) | UEFI HTTP Boot / a USB dongle → the machine streams into RAM | nothing persists on the machine, see [NETBOOT.md](NETBOOT.md) |
 | **Workspace packages** (`@polyptic/*`) | npm tarballs | *optional* — internal to the product; you almost never need these | a private registry, only if you want one |
 
 Throughout, replace `<owner>` with your GitHub org/user (the chart default is `ghcr.io/polyptic/polyptic-server`, i.e. `<owner>` = `polyptic`).
@@ -96,86 +96,77 @@ Set on `docker run -e …`, the compose `environment:` / `.env`, or Helm `config
 
 ---
 
-## (b) The agent — zero-touch install from the control-plane depot
+## (b) The agent — baked into the netboot image, never installed by hand
 
-The per-box agent is **not** in the server image, and there is **no standalone `.deb`/`.rpm` to `apt install`** (removed in **D41**). The agent is a Bun single binary that the control plane itself serves; a box installs it with a k3s-style one-liner and nothing else — the box needs to reach **only the server** (D35). This is the **one** supported way to put an agent on a box.
+The per-machine agent is **not** in the server image, and there is **no standalone `.deb`/`.rpm` to
+`apt install`**. There is also no `curl … | sh` installer any more: **`GET /install` and the substrate
+bundle routes were removed in D57**, superseding D41. A machine becomes a Polyptic display exactly one
+way, by **network-booting the live image the control plane serves**:
 
-On a target box (Ubuntu Server-minimal), as a sudo user:
+1. Console → **Settings → Onboard Screens** → **Download bootloader**.
+2. Flash `polyptic-boot.img` to a USB stick (2 GB or larger) with Balena Etcher or Rufus.
+3. Boot the machine from it, Secure Boot on. It streams the current image into RAM and enrols.
 
-```bash
-# agent only (headless enrol; fully air-gapped) — downloads the binary, writes config, enrols:
-curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN="$POLYPTIC_BOOTSTRAP_TOKEN" sh -
+The image already contains the agent binary and the whole kiosk substrate (greetd autologin → sway →
+agent → Chromium per output, plus the boot splash), wired at **build** time by `polyptic-agent setup`
+running inside the image's chroot. The control-plane address and, in gated mode, the enrolment token
+arrive on the kernel command line from the boot menu the server generates per request, so nothing is
+typed on the machine and no config file is edited. It dials home and shows **PENDING** in the console
+until an operator **Approves** it.
 
-# agent + the greetd/sway/Chromium kiosk substrate (the visual wall) — auto-reboots into it when done:
-curl -sfL http://control.example.com:8080/install | POLYPTIC_TOKEN="$POLYPTIC_BOOTSTRAP_TOKEN" sh -s -- --kiosk
-#   add --no-reboot to wire the kiosk but reboot yourself later
-```
+Because a diskless machine re-pulls its whole OS at every boot, "update the agent" and "update the
+image" are the same operation, and it is automatic (see **D51** and *Update schedule* in Settings).
 
-The installer downloads the arch-matched binary from `GET /dist/agent/<arch>`, installs it, and (with `--kiosk`) runs `polyptic-agent setup` to wire the zero-click chain (greetd autologin → sway → agent → Chromium-per-output, plus the boot splash), then **auto-reboots** so the box cold-boots straight into the kiosk (`--no-reboot`/`POLYPTIC_NO_REBOOT=1` opts out; the agent-only install never reboots). The box cold-boots and dials home; it shows **PENDING** in the console until an operator **Approves** it. Per-box config lives in `/etc/polyptic/agent.toml` (`systemctl restart polyptic-agent` or re-run the installer / `sudo polyptic-agent setup` to apply). Drop `POLYPTIC_TOKEN=` only if the server runs OPEN mode. The full device story — backends, multi-output placement, crash hardening, troubleshooting, the UTM/VM walkthrough — is in **`docs/DEPLOY.md`**; the depot internals (what the server serves, how the binary is baked, air-gap bundles) are in **(b2)** below.
+The full device story — backends, multi-output placement, crash hardening, troubleshooting, the UTM/VM
+walkthrough — is in **`docs/DEPLOY.md`**; the boot chain itself is in **`docs/NETBOOT.md`**.
 
-> **Build the binary yourself** (to seed a depot without building the whole server image, or for an arch CI doesn't build): `bash deploy/build-agent.sh amd64` on a host with `bun` produces `deploy/dist/polyptic-agent-amd64`; point the server's `AGENT_DIST_DIR` at `deploy/dist`.
+> **Build the binary yourself** (to seed a depot without building the whole server image, or for an
+> arch CI doesn't build): `bash deploy/build-agent.sh amd64` on a host with `bun` produces
+> `deploy/dist/polyptic-agent-amd64`. `deploy/build-live-image.sh` picks it up from there when it bakes
+> the rootfs, and the server streams it at `GET /dist/agent/<arch>` if you point `AGENT_DIST_DIR` at
+> `deploy/dist`.
 
 ---
 
 ## (b2) The depot internals — what the server serves and how it's baked
 
-For an **edge box that can reach ONLY the control plane**, the server itself is the depot: it serves the agent binary and (with `--kiosk`) the visual substrate, so the box pulls everything from the one server it can see, and nothing else. Section (b) is the operator command; this section is the *packaging* side — what the depot serves and how the artifacts get there.
-
-The operator command is in (b) above; the operator-facing flow, Stage A (agent, offline) vs Stage B (`--kiosk`, substrate offline-first), and the flags live in **`docs/DEPLOY.md` → "Zero-touch, air-gapped install"**.
+For a **machine that can reach ONLY the control plane**, the server itself is the depot: it serves the
+boot loaders, the boot menu and the live image, so the machine pulls everything from the one server it
+can see and nothing else.
 
 ### The artifacts the depot serves (all top-level, ungated, like `/healthz`)
 
 | Route | What | Source on disk |
 |---|---|---|
-| `GET /install` | `deploy/install.sh` with `{{POLYPTIC_BASE}}` replaced by the URL the box curled (from `Host` / `X-Forwarded-*`) | `INSTALL_SCRIPT_PATH` (default `./deploy/install.sh`) |
-| `GET /dist/agent/:arch` | the prebuilt agent **binary** (`arch` ∈ `arm64`\|`amd64`), streamed; `404` if not bundled | `AGENT_DIST_DIR/polyptic-agent-<arch>` (default `./deploy/dist`) |
-| `GET /dist/deps/:distro/:arch/manifest.json` | the substrate **bundle manifest** (file list); `404` → the script tries its online fallback | `DEPS_DIST_DIR/<distro>/<arch>/manifest.json` (default `./deploy/dist/deps`) |
-| `GET /dist/deps/:distro/:arch/:file` | one bundled `.deb` from the closure | `DEPS_DIST_DIR/<distro>/<arch>/<file>` |
+| `GET /boot/grub.cfg` (+ `/grub` aliases) | the generated GRUB menu, with the control-plane base and (gated) the enrolment token baked into the kernel cmdline | generated per request |
+| `GET /dist/boot/:file` | the universal `polyptic-boot.img` dongle and the four **signed** loaders (shim + network GRUB, both arches) | `BOOT_DIST_DIR` (default `./deploy/dist/boot`) |
+| `GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs}` | the live-image artifacts, Range-streamed into RAM | `IMAGE_DIST_DIR/<arch>/` (default `./deploy/dist/image`) |
+| `GET /dist/image/:arch/manifest.json` | the published image id + roll-out urgency, polled every 5 min by every netbooted machine | `IMAGE_DIST_DIR/<arch>/` |
+| `GET /dist/agent/:arch` | the prebuilt agent **binary** (`arch` ∈ `arm64`\|`amd64`), streamed; `404` if not bundled. **No boot path fetches this** — the image bakes the binary in. Kept for agent OTA (POL-28) | `AGENT_DIST_DIR/polyptic-agent-<arch>` (default `./deploy/dist`) |
 
-`:arch` is `arm64`/`amd64`; `:distro` is a slug like `ubuntu-24.04` (`/etc/os-release` `ID-VERSION_ID`). All paths are traversal-safe and 404 cleanly when an artifact is absent.
+All paths are traversal-safe and 404 cleanly when an artifact is absent.
 
 ### How the artifacts get baked in (the server image)
 
 `deploy/server.Dockerfile` is the normal way to fill the depot — no extra steps for the common case:
 
-- **Agent binaries, both arches.** The build stage cross-compiles the agent with `bun build --compile --target=bun-linux-x64` **and** `--target=bun-linux-arm64` into `/app/deploy/dist/polyptic-agent-{amd64,arm64}`. One image build serves every box, no per-arch build host (Bun bakes the runtime into each binary — see **D7**).
-- **Substrate bundle (optional, gated).** `--build-arg BUNDLE_DEPS=1` runs `deploy/bundle-deps.sh` for the **image's** arch into `/app/deploy/dist/deps`. It's best-effort — a failed bundle never sinks the server build (the substrate is only needed for `--kiosk`, and bundles can be added later).
-- The runtime stage copies `deploy/install.sh` + `deploy/dist`, and sets `AGENT_DIST_DIR=/app/deploy/dist` + `DEPS_DIST_DIR=/app/deploy/dist/deps`.
+- **Agent binaries, both arches.** The build stage cross-compiles the agent with `bun build --compile --target=bun-linux-x64` **and** `--target=bun-linux-arm64` into `/app/deploy/dist/polyptic-agent-{amd64,arm64}`. One image build serves every machine, no per-arch build host (Bun bakes the runtime into each binary — see **D7**). `build-live-image.sh` installs the matching one into the live rootfs.
+- The runtime stage copies `deploy/dist` and the image-rebuild scripts, and sets `AGENT_DIST_DIR=/app/deploy/dist`.
+- **The live image + boot medium** are built by `deploy/build-live-image.sh` and `deploy/build-boot-medium.sh`, on a schedule or from the console's ⋯ menu (**D51/D52/D54**), into `IMAGE_DIST_DIR` / `BOOT_DIST_DIR`.
 
-```bash
-# build the server image WITH a baked substrate bundle for the image's arch:
-docker build -f deploy/server.Dockerfile --build-arg BUNDLE_DEPS=1 -t polyptic-server .
-```
-
-### Adding a distro/arch bundle with `bundle-deps.sh`
-
-A bundle is the **full `.deb` dependency closure** for the substrate (`sway`, `greetd`, a `.deb` Chromium — never the snap — `grim`, `wayvnc`, `dbus-user-session`, fonts) for one Ubuntu point-release + arch. Run it **on an Ubuntu host of the target arch**:
-
-```bash
-# on an amd64 Ubuntu host (or container):
-bash deploy/bundle-deps.sh
-#   → deploy/dist/deps/ubuntu-24.04/amd64/{manifest.json, *.deb}
-```
-
-**Cross-arch caveat:** `apt-get` resolves the closure for the **host's** arch — there is no reliable foreign-arch `apt-get download`. To bundle a different arch, run it in a target-arch container (binfmt/qemu makes this work from any host):
-
-```bash
-docker run --rm --platform linux/arm64 -v "$PWD":/repo -w /repo ubuntu:24.04 \
-  bash -c 'apt-get update && apt-get install -y --no-install-recommends ca-certificates && deploy/bundle-deps.sh'
-#   → deploy/dist/deps/ubuntu-24.04/arm64/{manifest.json, *.deb}
-```
-
-Drop the resulting `deploy/dist/deps/<distro>/<arch>/` directory into the server's `DEPS_DIST_DIR` (it's baked into the image, or mount it as a volume) and the offline `--kiosk` path lights up for that distro+arch. `bundle-deps.sh` is idempotent (clean rebuild each run) and writes a `manifest.json` whose `files` array the install script reads; install order is left to `apt-get install ./*.deb`, which resolves the closure itself.
+---
 
 ### Dev/lab without Docker
 
-The dev server serves the depot from local files too — build the binary and point the server at it:
+The dev server serves the depot from local files too — build the artifacts and point the server at them:
 
 ```bash
 bash deploy/build-agent.sh arm64                       # → deploy/dist/polyptic-agent-arm64
+bash deploy/build-live-image.sh arm64                  # → deploy/dist/image/arm64/ (Linux build host)
+bash deploy/build-boot-medium.sh                       # → deploy/dist/boot/polyptic-boot.img
 AGENT_DIST_DIR=deploy/dist bun packages/server/src/index.ts
-# on a VM that can reach your Mac:
-curl -sfL http://<mac-ip>:8080/install | POLYPTIC_TOKEN=$TOKEN sh -
+# then boot a VM from deploy/dist/boot/polyptic-boot.img, or point its UEFI HTTP Boot at
+# http://<mac-ip>:8080/dist/boot/shimx64.efi
 ```
 
 ---

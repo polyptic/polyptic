@@ -44,8 +44,8 @@ RUN cd packages/console && bun run build
 RUN cd packages/player && bun run build
 
 # ── Zero-touch depot: compile the agent single binary for BOTH arches ─────────
-# The agent is delivered ONLY via this depot (D35/D41): the control plane serves these at
-# GET /dist/agent/<arch> and deploy/install.sh downloads the one matching the box's uname -m. Bun
+# build-live-image.sh installs the matching binary into the live image's rootfs (the ONLY way an agent
+# reaches a machine, D57), and the control plane also streams them at GET /dist/agent/<arch>. Bun
 # cross-compiles the runtime INTO each binary, so this one image build produces amd64 AND arm64 — no
 # per-arch build host. (Same `bun build --compile` as deploy/build-agent.sh, inlined here.)
 # The version is baked in at compile time (POLYPTIC_VERSION build-arg → `--define`): the standalone
@@ -58,22 +58,6 @@ RUN mkdir -p /app/deploy/dist \
  && bun build --compile --minify --define "process.env.POLYPTIC_BUILD_VERSION=\"$AGENT_VER\"" --target=bun-linux-arm64 \
       --outfile /app/deploy/dist/polyptic-agent-arm64 packages/agent/src/index.ts \
  && chmod 0755 /app/deploy/dist/polyptic-agent-amd64 /app/deploy/dist/polyptic-agent-arm64
-
-# ── Optional: bundle the visual substrate (.deb closure) for THIS image's arch ─
-# Gated by --build-arg BUNDLE_DEPS=1. Best-effort: a failed bundle (e.g. no Chromium .deb in the
-# base image's apt index) must NOT sink the server build — the substrate is only needed for the
-# --kiosk path, and a bundle can always be added later with deploy/bundle-deps.sh. When it succeeds
-# the depot serves GET /dist/deps/<distro>/<arch>/{manifest.json,*.deb} offline to edge boxes.
-ARG BUNDLE_DEPS=0
-RUN if [ "$BUNDLE_DEPS" = "1" ]; then \
-      echo "==> BUNDLE_DEPS=1: bundling substrate for this image arch"; \
-      apt-get update \
-        && apt-get install -y --no-install-recommends ca-certificates \
-        && bash deploy/bundle-deps.sh \
-        || echo "WARN: bundle-deps failed; continuing without a baked substrate bundle"; \
-    else \
-      echo "==> BUNDLE_DEPS not set; skipping substrate bundle (add later with deploy/bundle-deps.sh)"; \
-    fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — runtime: slim image with just what the server needs at run time.
@@ -103,11 +87,9 @@ COPY --from=build /app/packages/server ./packages/server
 COPY --from=build /app/packages/console/dist ./packages/console/dist
 COPY --from=build /app/packages/player/dist ./packages/player/dist
 
-# The air-gap depot: the served install script + the compiled agent binaries (both arches) and any
-# baked substrate bundle. The server reads ./deploy/install.sh (INSTALL_SCRIPT_PATH) and bakes the
-# control-plane base into its {{POLYPTIC_BASE}} placeholder per request; it streams the binaries +
-# bundle from AGENT_DIST_DIR / DEPS_DIST_DIR at GET /dist/agent/<arch> and /dist/deps/….
-COPY --from=build /app/deploy/install.sh ./deploy/install.sh
+# The air-gap depot: the compiled agent binaries (both arches). build-live-image.sh reads the one it
+# needs straight off this path when a rebuild Job bakes a live image; the server also streams them
+# from AGENT_DIST_DIR at GET /dist/agent/<arch>.
 COPY --from=build /app/deploy/dist ./deploy/dist
 
 # The image-update machinery (POL-41/POL-43): the rebuild scripts + the diskless-identity overlay
@@ -134,7 +116,6 @@ ENV PORT=8080 \
     PLAYER_DIR=/app/packages/player/dist \
     MEDIA_DIR=/var/lib/polyptic/media \
     AGENT_DIST_DIR=/app/deploy/dist \
-    DEPS_DIST_DIR=/app/deploy/dist/deps \
     POLYPTIC_VERSION=${POLYPTIC_VERSION} \
     POLYPTIC_REVISION=${POLYPTIC_REVISION}
 

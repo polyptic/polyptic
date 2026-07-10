@@ -3,8 +3,8 @@ name: polyptic
 description: >-
   Polyptic control plane (server) — a generic, self-hostable display-wall /
   kiosk-fleet orchestrator. This chart deploys ONLY the server (REST + WebSocket
-  control plane on :8080). On-device agents are installed per-box from the
-  control-plane depot (curl|sh; see deploy/install.sh / D41), NOT in Kubernetes.
+  control plane on :8080). On-device agents arrive in the netboot live image the
+  control plane serves (see docs/ONBOARDING.md / D57), NOT in Kubernetes.
 type: application
 
 # Chart version — bump on any change to the chart itself.
