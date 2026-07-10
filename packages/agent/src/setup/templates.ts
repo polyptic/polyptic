@@ -3,10 +3,10 @@
  *
  *   power on -> systemd -> greetd [initial_session] autologin user=kiosk -> compositor (sway / i3)
  *            -> systemctl --user start polyptic-session.target
- *                  -> polyptic-agent.service (Restart=always) -> Chromium-per-output
- *   no swayidle | output * dpms on | popup/exit_type suppression (the agent does the per-profile bit)
+ *                  -> polyptic-agent.service (Restart=always) -> surf-per-output
+ *   no swayidle | output * dpms on | no decorations
  *
- * Model A: the agent OWNS its Chromium children (launches/respawns them via the wayland-sway/x11-i3
+ * Model A: the agent OWNS its surf children (launches/respawns them via the wayland-sway/x11-i3
  * DisplayBackend); systemd supervises the agent. So there is exactly ONE service unit here.
  */
 import type { Backend, OutputPin, RenderMode } from "./args";
@@ -214,24 +214,25 @@ output * dpms on
 ### No idle / no blank / no lock. A wall runs unattended for days.
 # (intentionally NO \`exec swayidle\` and NO lock — never blank the content)
 
-### Chromium app windows fill each output: no decorations, borders, or gaps.
+### Browser windows fill each output: no decorations, borders, or gaps.
 default_border none
 default_floating_border none
 hide_edge_borders both
 focus_follows_mouse no
 # hide the pointer; no operator stands at the panel
 seat * hide_cursor 5000
-# Gotcha: every Chromium shares app_id="chromium" under Wayland, so the agent's wayland-sway
-# backend disambiguates by window title / launch order and places each on its output via swaymsg
-# IPC (Wayland forbids client self-positioning — --window-position is a no-op).
+# Gotcha: Wayland forbids client self-positioning, and surf has no geometry flags anyway, so the
+# agent's wayland-sway backend matches each new window by the child's PID on the swaymsg event
+# stream and moves it onto its output via swaymsg IPC.
 
 ### Hand off to the systemd user session, which supervises polyptic-agent (Restart=always).
 # LIBGL_ALWAYS_SOFTWARE is imported so the kiosk browser inherits the launcher's software-GL choice
-# on a 3D-less GPU (else WebKit/Chromium tries hardware GL and dies with no window). Unset on a real
-# GPU, so this is a no-op there — never forces software rendering on hardware that can do GL.
-# DISPLAY is imported too: sway defines it at startup for its (lazy-started) Xwayland, and X11-only
-# kiosk browsers (surf) launched by the agent's user unit die with "Can't open default display"
-# without it (found live in the POL-38 UTM boot). Unset when xwayland is unavailable — harmless.
+# on a 3D-less GPU (else WebKit tries hardware GL and dies with no window). Unset on a real GPU, so
+# this is a no-op there — never forces software rendering on hardware that can do GL.
+# DISPLAY is imported too: sway defines it at startup for its (lazy-started) Xwayland, and surf is an
+# X11-only client, so launched by the agent's user unit it dies with "Can't open default display"
+# without it (found live in the POL-38 UTM boot). It is also what lets the agent drive the on-screen
+# inspector with xdotool (POL-50). Unset when xwayland is unavailable — harmless.
 exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR LIBGL_ALWAYS_SOFTWARE
 exec dbus-update-activation-environment --systemd WAYLAND_DISPLAY SWAYSOCK DISPLAY XDG_CURRENT_DESKTOP LIBGL_ALWAYS_SOFTWARE
 exec systemctl --user start ${p.sessionTarget}
@@ -384,7 +385,7 @@ export interface AgentServiceParams {
 export function agentServiceUnit(p: AgentServiceParams): string {
   return `# /etc/systemd/user/${AGENT_SERVICE} — ${MANAGED}
 [Unit]
-Description=Polyptic agent — display reconciler + Chromium-per-output supervisor
+Description=Polyptic agent — display reconciler + surf-per-output supervisor
 Documentation=file:///etc/polyptic/agent.toml
 # Runs INSIDE the kiosk's Wayland/X session; needs the compositor env imported by the compositor
 # before it starts ${SESSION_TARGET}.
@@ -400,8 +401,6 @@ Restart=always
 RestartSec=2
 # Config (control-plane URL + bootstrap token + backend) lives in agent.toml, written by setup.
 Environment=POLYPTIC_CONFIG=${p.configPath}
-# Crash/restore hardening: a power cut must never leave Chromium showing "Restore pages". The agent
-# resets exit_type/exited_cleanly in each profile's Preferences before (re)launch (per ARCHITECTURE).
 
 [Install]
 WantedBy=${SESSION_TARGET}

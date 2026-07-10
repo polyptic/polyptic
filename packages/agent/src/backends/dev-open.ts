@@ -65,6 +65,18 @@ export class DevOpenBackend implements DisplayBackend {
     console.log(`[dev-open] ident ${on ? "on" : "off"} — no-op in dev`);
   }
 
+  /**
+   * The host's default browser is not ours to drive, so there is no inspector to pop. Throw rather
+   * than log-and-succeed: the console shows this as a refusal, which is the truth — and on a dev
+   * box the operator already has their own dev tools one keystroke away.
+   */
+  async inspect(connector: string, on: boolean): Promise<void> {
+    throw new Error(
+      `the dev-open backend cannot show an inspector on ${connector} ` +
+        `(it does not own the browser) — open your own dev tools on the player tab instead`,
+    );
+  }
+
   async capture(): Promise<Buffer | null> {
     // No screenshot facility without a compositor (grim/grim-equivalent lands in Phase 5).
     return null;

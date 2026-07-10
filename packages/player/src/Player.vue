@@ -19,6 +19,14 @@
  * WITHOUT span fills its region exactly as before. The span numbers are computed server-side from
  * the union bounding box of the members' placements; player and server must agree — so we consume
  * them verbatim.
+ *
+ * POL-57 — page zoom: a framed surface (web/dashboard) may carry `zoom`. We do what a browser's zoom
+ * control does: render the iframe at 1/zoom of the space it must fill, then `scale(zoom)` it back up.
+ * The embedded page therefore sees a proportionally SMALLER CSS viewport and lays itself out bigger —
+ * media queries, `vw` units and `rem` sizing all respond as they would at that browser zoom, which a
+ * naive `transform: scale()` on a full-size frame would not achieve. Zoom composes with span (the
+ * scale is applied before the span's translate), so a video wall zooms as one continuous page. It is
+ * a pure restyle of the SAME keyed element: the iframe rescales without navigating or reloading (D5).
  */
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import type { CSSProperties } from "vue";
@@ -133,38 +141,63 @@ function regionStyle(region: Geometry, c: Geometry): CSSProperties {
 /**
  * The size/transform of the CONTENT element (iframe/img/video) inside a surface.
  *
- * No span → empty (CSS makes the element fill 100%×100% of the region, as before).
+ * No span, no zoom → empty (CSS makes the element fill 100%×100% of the region, as before).
+ *
  * With span → the content is sized to the FULL spanning content (contentW×contentH px) and shifted
  * by -(offsetX,offsetY) px, so the region (overflow:hidden) reveals only this screen's slice. In a
  * production deployment the player runs fullscreen at the screen's native resolution, so canvas px
  * == viewport px and these literal pixels line up exactly; the region→viewport mapping above places
  * the slice. transform-origin:top-left keeps the offset anchored to the region's top-left corner.
+ *
+ * With zoom (framed surfaces only, POL-57) → the element is laid out at 1/zoom of the box it must end
+ * up filling and scaled back up, so the page inside sees a proportionally smaller CSS viewport. The
+ * two compose: transforms apply right-to-left, so `translate(…) scale(…)` scales the frame FIRST and
+ * then shifts the already-full-size result by the span offset — the translate stays in un-scaled
+ * region pixels, exactly as the server's span math assumes.
  */
-function spanStyle(surface: Surface): CSSProperties {
+function contentStyle(surface: Surface, zoom = 1): CSSProperties {
   const span = surface.span;
-  if (!span) return {};
+  if (!span) {
+    if (zoom === 1) return {};
+    return {
+      width: `${100 / zoom}%`,
+      height: `${100 / zoom}%`,
+      transform: `scale(${zoom})`,
+      transformOrigin: "top left",
+    };
+  }
+  const shift = `translate(${-span.offsetX}px, ${-span.offsetY}px)`;
   return {
-    width: `${span.contentW}px`,
-    height: `${span.contentH}px`,
+    width: `${span.contentW / zoom}px`,
+    height: `${span.contentH / zoom}px`,
     maxWidth: "none",
     maxHeight: "none",
-    transform: `translate(${-span.offsetX}px, ${-span.offsetY}px)`,
+    transform: zoom === 1 ? shift : `${shift} scale(${zoom})`,
     transformOrigin: "top left",
   };
 }
 
-/** Style for an image/video element: span sizing (if any) plus the image's object-fit. */
+/** Style for an image/video element: span sizing (if any) plus the image's object-fit. Media has no
+ *  page to zoom — an image is already scaled to its region by `fit`. */
 function mediaStyle(surface: Surface): CSSProperties {
-  const style = spanStyle(surface);
+  const style = contentStyle(surface);
   if (surface.type === "image") style.objectFit = surface.fit;
   return style;
 }
 
-function isFrame(surface: Surface): boolean {
+/** Style for a web/dashboard iframe: span sizing plus the operator's page zoom (POL-57). */
+function frameStyle(surface: Surface): CSSProperties {
+  return contentStyle(surface, isFrame(surface) ? surface.zoom : 1);
+}
+
+/** The two surface kinds rendered in an iframe — the only ones that carry a url and a zoom. */
+type FramedSurface = Extract<Surface, { type: "web" | "dashboard" }>;
+
+function isFrame(surface: Surface): surface is FramedSurface {
   return surface.type === "web" || surface.type === "dashboard";
 }
 function frameUrl(surface: Surface): string {
-  return surface.type === "web" || surface.type === "dashboard" ? surface.url : "";
+  return isFrame(surface) ? surface.url : "";
 }
 function mediaSrc(surface: Surface): string {
   const raw = surface.type === "image" || surface.type === "video" ? surface.src : "";
@@ -242,7 +275,7 @@ function connLabel(state: ConnState): string {
         class="surface-frame"
         :class="{ 'is-interactive': isInteractive(surface) }"
         :src="frameUrl(surface)"
-        :style="spanStyle(surface)"
+        :style="frameStyle(surface)"
         allow="autoplay; encrypted-media; fullscreen; clipboard-read; clipboard-write"
       />
       <img

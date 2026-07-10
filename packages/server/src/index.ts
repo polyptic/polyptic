@@ -225,6 +225,7 @@ registerRestRoutes(
   },
   tokens,
   activity,
+  presence,
   shellRelay,
 );
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall

@@ -121,7 +121,7 @@ Use it for the first few boxes; the manual Machines view is faster once you know
 | Machine never appears | The machine can't reach the server (`curl http://CONTROL_PLANE:8080/healthz` from it) or a wrong/expired token. Check `journalctl --user -u polyptic-agent`. |
 | Appears pending, won't approve | You're in gated mode — that's expected; **Approve** it. A *rejected* machine must be **Re-approved**. |
 | Screen shows "Machine unreachable" | The agent/player isn't connected for that screen — the box is off, the kiosk session didn't start, or (dev) no player tab is open at `…:5173/?screen=<id>`. |
-| Content tile shows a framing/CSP error | The target site refuses to be embedded (`X-Frame-Options` / `frame-ancestors`). Use an embed-friendly URL/dashboard, or the kiosk Chromium's trusted-content flags. |
+| Content tile shows a framing/CSP error | The target site refuses to be embedded (`X-Frame-Options` / `frame-ancestors`). Use an embed-friendly URL/dashboard, or make the source a top-level `window` surface. |
 | Nothing renders on the panel (kiosk) | `sway` likely didn't start on that GPU — try `WLR_NO_HARDWARE_CURSORS=1`, or provision with `--backend x11-i3` (NVIDIA / virtual-GPU fallback). See `docs/DEPLOY.md`. |
 
 See also: **`docs/DEPLOY.md`** (device-side detail, backends, the VM walkthrough) and the README's

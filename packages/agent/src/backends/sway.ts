@@ -1,27 +1,27 @@
 /**
  * wayland-sway — the real Wayland/sway placement backend (D9 default).
  *
- * Phase 4. Replaces the throwing stub. For each output the control plane assigns, it ensures a
- * kiosk Chromium is running and pinned to that physical connector, supervises/respawns it, and
- * can grab a `grim` thumbnail.
+ * Phase 4. For each output the control plane assigns, it ensures a kiosk surf is running and pinned
+ * to that physical connector, supervises/respawns it, and can grab a `grim` thumbnail.
  *
- * Placement gotcha (docs/ARCHITECTURE.md): Wayland forbids client self-positioning, and every
- * Chromium reports `app_id="chromium"`, so `for_window [app_id]` can't disambiguate multiple
- * browsers. We therefore subscribe to sway's `window` events BEFORE spawning, then move the
- * matching new window onto the target output via `swaymsg` IPC — keyed on the child's pid, with
- * launch-order / `app_id` as the fallback (the agent applies screens sequentially, so a fresh
- * `new` Chromium window is unambiguous). Forcing XWayland (`--ozone-platform=x11 --class=…`) is
- * the documented escape hatch if pid matching proves unreliable on a given GPU/build.
+ * Placement gotcha (docs/ARCHITECTURE.md): Wayland forbids client self-positioning, so we subscribe
+ * to sway's `window` events BEFORE spawning, then move the matching new window onto the target output
+ * via `swaymsg` IPC — keyed on the child's pid, with `app_id` / launch order as the fallback (the
+ * agent applies screens sequentially, so a fresh `new` window is unambiguous). surf is an X11 client,
+ * so under sway it arrives through XWayland (D48: the `xwayland` package must exist, and the sway
+ * config imports DISPLAY into the systemd user environment).
  *
- * Content never changes the Chromium URL here — that is fixed per screen; content flips happen
- * inside the player over its own WS channel. So `showScreen` only (re)launches/repoints when the
- * URL actually changes (handled by SupervisedChromium).
+ * Content never changes surf's URL here — that is fixed per screen; content flips happen inside the
+ * player over its own WS channel. So `showScreen` only (re)launches when the URL actually changes
+ * (handled by SupervisedBrowser). The one other reason to relaunch is the Web Inspector (POL-50),
+ * which surf can only be given at launch.
  */
 import type { ChildProcess } from "node:child_process";
 import type { DisplayBackend } from "./types";
-import type { Browser } from "./browser";
-import { profileDirFor, SupervisedChromium } from "./chromium";
-import { selectBrowser } from "./browser";
+import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
+import { buildSurfArgs, matchesSurfWindow, prelaunchSurf, resolveSurf } from "./surf";
+import { SupervisedBrowser } from "./supervise";
+import type { LaunchTarget } from "./supervise";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
 
 /** How long to wait for the freshly-launched browser window to appear on the sway tree. */
@@ -133,15 +133,15 @@ export class SwayBackend implements DisplayBackend {
   readonly id = "wayland-sway" as const;
 
   /** connector → supervised kiosk browser. */
-  private readonly browsers = new Map<string, SupervisedChromium>();
-
-  /** The kiosk browser (chromium default, or cog via POLYPTIC_BROWSER=cog). */
-  private readonly browser: Browser = selectBrowser();
+  private readonly browsers = new Map<string, SupervisedBrowser>();
 
   /** Latched once `grim` is found missing, so we log the remediation hint once and then skip. */
   private captureUnavailable = false;
   /** Resolved once; reused for every (re)launch. */
   private browserBin: string | null = null;
+  /** connector → why the last inspector-opening attempt failed (null = it worked). Read by `inspect`
+   *  so the operator's ack carries the real reason, since the opening happens inside the launch. */
+  private readonly inspectErrors = new Map<string, string | null>();
 
   private log(msg: string): void {
     console.log(`[${ts()}] [sway] ${msg}`);
@@ -149,7 +149,7 @@ export class SwayBackend implements DisplayBackend {
 
   private async ensureBin(): Promise<string> {
     if (this.browserBin) return this.browserBin;
-    this.browserBin = await this.browser.resolveBin();
+    this.browserBin = await resolveSurf();
     return this.browserBin;
   }
 
@@ -229,31 +229,28 @@ export class SwayBackend implements DisplayBackend {
   }
 
   /**
-   * Launch + place the browser for one (connector, url). `target` is the real sway output the
-   * window is moved onto (it may differ from the requested `connector` under the single-output
-   * fallback). Returns the live child for supervision.
+   * Launch + place surf for one (connector, target). `output` is the real sway output the window is
+   * moved onto (it may differ from the requested `connector` under the single-output fallback).
+   * Returns the live child for supervision.
    */
   private async launchAndPlace(
     connector: string,
-    target: string,
+    output: string,
     bin: string,
-    profileDir: string,
-    url: string,
+    target: LaunchTarget,
   ): Promise<ChildProcess> {
-    await this.browser.prelaunch(profileDir, url, (m) => this.log(m));
+    await prelaunchSurf(target.url, (m) => this.log(m));
 
     // Subscribe BEFORE spawning so we never miss the window's `new` event.
-    const sub = startSwayWindowSubscription((appId) => this.browser.matchesWindow(appId), (m) => this.log(m));
+    const sub = startSwayWindowSubscription(matchesSurfWindow, (m) => this.log(m));
     let child: ChildProcess;
     try {
-      // Chromium's GPU process needs an explicit --disable-gpu on a no-3D GPU. The compositor's
-      // software-render choice reaches us as LIBGL_ALWAYS_SOFTWARE=1 (the sway config imports it into
-      // the user session, which this agent service inherits), so key the browser's render off it.
-      // cog/surf buildArgs ignore `render`; on a real GPU wall this stays "hardware" (no handicap).
-      const render = process.env.LIBGL_ALWAYS_SOFTWARE === "1" ? "software" : "hardware";
-      const args = this.browser.buildArgs({ url, profileDir, platform: "wayland", scaleFactor: 1, render });
+      const args = buildSurfArgs({ url: target.url, inspector: target.inspector });
       child = spawnChild(bin, args, { stdio: "ignore" });
-      this.log(`spawned ${this.browser.name} pid=${child.pid ?? "?"} for ${connector} → ${url}`);
+      this.log(
+        `spawned surf pid=${child.pid ?? "?"} for ${connector} → ${target.url}` +
+          (target.inspector ? " (Web Inspector enabled)" : ""),
+      );
     } catch (err) {
       sub.close();
       throw err;
@@ -263,23 +260,50 @@ export class SwayBackend implements DisplayBackend {
     // placement failure logs but does NOT fail the launch (and never kills the supervised child).
     try {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
-      await this.moveToOutput(conId, target);
-      this.log(`placed ${this.browser.name} (con_id=${conId}) on ${target}`);
+      await this.moveToOutput(conId, output);
+      this.log(`placed surf (con_id=${conId}) on ${output}`);
     } catch (err) {
-      this.log(`placement on ${target} failed: ${(err as Error).message} (left on default output)`);
+      this.log(`placement on ${output} failed: ${(err as Error).message} (left on default output)`);
     } finally {
       sub.close();
     }
+
+    // Opening the inspector belongs to the LAUNCH, not to the operator's click: a supervised browser
+    // that crashes and respawns while being inspected must come back inspected, or the console would
+    // badge an inspector that is no longer on the panel. `inspect()` reads the outcome below.
+    if (target.inspector) await this.openInspector(connector, child.pid ?? -1);
     return child;
   }
 
-  private ensureBrowser(connector: string, target: string, bin: string): SupervisedChromium {
+  /**
+   * Focus this output's surf and pop its Web Inspector. Best-effort: it must never fail a launch —
+   * a wall rendering without an inspector still beats a wall rendering nothing — so the reason is
+   * stashed per connector for `inspect()` to report back to the operator.
+   */
+  private async openInspector(connector: string, pid: number): Promise<void> {
+    this.inspectErrors.set(connector, null);
+    try {
+      if (pid <= 0) throw new Error("the freshly launched surf reported no pid");
+      // XTEST input lands on whatever holds X focus, so focus surf's window first. Under sway the
+      // XWayland surface is an ordinary container; focusing it by pid focuses it for the seat.
+      const focus = await run("swaymsg", [`[pid=${pid}] focus`]);
+      if (focus.code !== 0) {
+        throw new Error(`could not focus surf: ${focus.stderr.trim() || `exit ${focus.code}`}`);
+      }
+      await openInspectorOnFocusedWindow((m) => this.log(m));
+    } catch (err) {
+      const reason = (err as Error).message;
+      this.inspectErrors.set(connector, reason);
+      this.log(`inspector on ${connector} not opened: ${reason}`);
+    }
+  }
+
+  private ensureBrowser(connector: string, output: string, bin: string): SupervisedBrowser {
     let b = this.browsers.get(connector);
     if (!b) {
-      const profileDir = profileDirFor(connector);
-      b = new SupervisedChromium(
+      b = new SupervisedBrowser(
         connector,
-        (url) => this.launchAndPlace(connector, target, bin, profileDir, url),
+        (target) => this.launchAndPlace(connector, output, bin, target),
         (m) => this.log(m),
       );
       this.browsers.set(connector, b);
@@ -290,8 +314,8 @@ export class SwayBackend implements DisplayBackend {
   async showScreen(connector: string, url: string): Promise<void> {
     const bin = await this.ensureBin();
     await requireSwaymsg();
-    const target = await this.resolveConnector(connector);
-    const supervised = this.ensureBrowser(connector, target, bin);
+    const output = await this.resolveConnector(connector);
+    const supervised = this.ensureBrowser(connector, output, bin);
     await supervised.setUrl(url);
   }
 
@@ -312,6 +336,35 @@ export class SwayBackend implements DisplayBackend {
    */
   async ident(on: boolean): Promise<void> {
     this.log(`ident ${on ? "on" : "off"} — visible ident is server→player; agent no-op`);
+  }
+
+  /**
+   * Pop surf's Web Inspector on the panel driven by `connector` (POL-50). Relaunches that output's
+   * surf with `-N` — the only way surf takes the inspector — which places it again and opens the
+   * inspector as part of the launch. Turning it off relaunches without `-N`, which both closes the
+   * inspector and re-seals the kiosk.
+   */
+  async inspect(connector: string, on: boolean): Promise<void> {
+    const supervised = this.browsers.get(connector);
+    if (!supervised) {
+      throw new Error(`nothing is placed on ${connector} — no page to inspect`);
+    }
+    if (supervised.inspector === on && supervised.running) {
+      this.log(`inspect(${connector}): already ${on ? "on" : "off"} — no-op`);
+      return;
+    }
+    if (on) await requireXdotool(); // fail before we disturb the wall
+
+    await supervised.setInspector(on);
+    if (!on) {
+      this.log(`inspect(${connector}): relaunched without the Web Inspector`);
+      return;
+    }
+
+    // The relaunch opened it (or tried to). Surface the real reason, so the operator's ack is honest.
+    const failure = this.inspectErrors.get(connector);
+    if (failure) throw new Error(failure);
+    this.log(`inspect(${connector}): Web Inspector open on the wall`);
   }
 
   /** Grab a thumbnail of `connector` via `grim`. Returns JPEG bytes (or PNG), `null` on failure. */

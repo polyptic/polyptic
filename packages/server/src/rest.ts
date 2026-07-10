@@ -20,6 +20,11 @@
  * POL-55 operator route:
  *   POST /api/v1/machines/:machineId/reboot   -> server/reboot to a connected, approved agent;
  *                                                404 unknown; 409 not-approved or offline
+ *
+ * POL-50 operator route:
+ *   POST /api/v1/screens/:screenId/inspect    -> server/inspect: pop the kiosk browser's Web Inspector
+ *                                                ON that panel; 202 delivered (the agent's ack decides
+ *                                                the outcome), 404 unknown, 409 not-approved or offline
  */
 import { z } from "zod";
 
@@ -32,6 +37,7 @@ import {
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
+  InspectBody,
   PlaceScreenBody,
   RebootBody,
   ShellArmBody,
@@ -39,12 +45,14 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   ServerToAgentApply,
+  ServerToAgentInspect,
   ServerToAgentReboot,
   ServerToAgentRejected,
   ServerToPlayerIdent,
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetZoomBody,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -60,7 +68,7 @@ import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
-import type { AdminBroadcaster } from "./admin";
+import type { AdminBroadcaster, Presence } from "./admin";
 import type { MediaStore } from "./media";
 import type { TokenService } from "./tokens";
 
@@ -95,6 +103,7 @@ export function registerRestRoutes(
   mediaConfig: MediaConfig,
   tokens: TokenService,
   activity: ActivityLog,
+  presence: Presence,
   shellRelay: ShellRelay,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
@@ -442,6 +451,70 @@ export function registerRestRoutes(
       body.data.enabled ? "remote shell armed" : "remote shell disarmed",
     );
     return { ok: true, machineId: machine.id, shellEnabled: machine.shellEnabled ?? false };
+  });
+
+  // POST /api/v1/screens/:screenId/inspect  { on }  -> pop the Web Inspector ON that panel (POL-50)
+  //
+  // Not a remote dev-tools tunnel, because there is nothing to tunnel: surf (WebKitGTK, D63) exposes
+  // no browser-openable remote inspector. So the operator asks from here and someone at the wall
+  // reads the console/network. Honouring it RELAUNCHES that output's browser (surf takes `-N` only at
+  // launch), so the page reloads — which is also what makes a failing page load observable at all.
+  //
+  // 202, not 200: the request has been delivered, not applied. The agent's `agent/inspect-ack` (ws.ts)
+  // is what sets the screen's `inspecting` flag, because only the box knows whether surf came back and
+  // took the keystroke. A REFUSAL surfaces there too, in the activity feed.
+  fastify.post("/api/v1/screens/:screenId/inspect", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = InspectBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = control.getScreen(params.data.screenId);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+    const machine = control.getMachine(screen.machineId);
+    if (!machine || machine.status !== "approved") {
+      return reply.code(409).send({
+        error: `screen ${screen.id} belongs to a machine that is not approved — cannot inspect it`,
+      });
+    }
+
+    const delivered = agentHub.send(
+      machine.id,
+      ServerToAgentInspect.parse({
+        t: "server/inspect",
+        connector: screen.connector,
+        on: body.data.on,
+      }),
+    );
+    if (delivered === 0) {
+      return reply
+        .code(409)
+        .send({ error: `${machine.label} is offline — nothing to show an inspector on` });
+    }
+
+    // Drop any previous refusal now that a fresh request is in flight, so the console shows this
+    // attempt's outcome rather than re-reporting the last one.
+    presence.setScreenInspectError(screen.id, null);
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.inspect",
+        screenId: screen.id,
+        machineId: machine.id,
+        connector: screen.connector,
+        on: body.data.on,
+        delivered,
+      },
+      "pushed inspector request to agent",
+    );
+    return reply.code(202).send({ ok: true, screenId: screen.id, on: body.data.on, delivered });
   });
 
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────
@@ -940,6 +1013,92 @@ export function registerRestRoutes(
     pushRender(params.data.screenId, result.slice);
     broadcaster.broadcast(); // surfaceCount changed
     return { ok: true, revision: control.state.revision, slice: result.slice };
+  });
+
+  // ── Page zoom (POL-57) ───────────────────────────────────────────────────────
+  //
+  // Zoom the framed page on a screen or a combined surface. The server remembers the value against
+  // the (target, page) pair, so re-assigning that page there restores it. The push is a re-styled
+  // surface with the SAME id — the player rescales the existing iframe, it does not reload.
+
+  // PUT /api/v1/screens/:screenId/zoom  { zoom }  -> restyle + push (409 if wall member / not framed)
+  fastify.put("/api/v1/screens/:screenId/zoom", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenZoom(params.data.screenId, body.data.zoom);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; zoom the wall`,
+          wallId: result.wallId,
+        });
+      }
+      // no-content / not-zoomable are conflicts with the screen's current state, not bad requests.
+      if (result.error === "no-content" || result.error === "not-zoomable") {
+        return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.zoom",
+        screenId: params.data.screenId,
+        zoom: body.data.zoom,
+        revision: control.state.revision,
+      },
+      "screen zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's content read-out carries the live zoom
+    return { ok: true, revision: control.state.revision, zoom: body.data.zoom };
+  });
+
+  // PUT /api/v1/walls/:wallId/zoom  { zoom }  -> restyle + push to every member
+  fastify.put("/api/v1/walls/:wallId/zoom", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallZoom(params.data.wallId, body.data.zoom);
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.zoom",
+        wallId: params.data.wallId,
+        zoom: body.data.zoom,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      revision: control.state.revision,
+      zoom: body.data.zoom,
+      screens: result.slices.map((s) => s.screenId),
+    };
   });
 
   // POST /api/v1/walls/:wallId/ident  { on, ttlMs? }  -> ident-pulse to every member

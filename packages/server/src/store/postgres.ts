@@ -42,6 +42,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedZoomPreference,
   Store,
 } from "./types";
 
@@ -117,6 +118,12 @@ interface CredentialProfileRow {
   scope: string | null;
   audience: string | null;
   token_param: string;
+}
+
+interface ZoomPreferenceRow {
+  target_id: string;
+  source_key: string;
+  zoom: number;
 }
 
 interface SceneRow {
@@ -257,6 +264,16 @@ export class PostgresStore implements Store {
     // Idempotent migration for databases created before POL-24: which credential profile (if any)
     // authenticates this source. NULL = unauthenticated.
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS credential_profile_id text`;
+    // Page zoom preferences (POL-57). One row per (screen-or-wall, content) pair, so re-assigning a
+    // page to a screen restores the zoom that screen last used FOR THAT PAGE.
+    await sql`
+      CREATE TABLE IF NOT EXISTS zoom_preferences (
+        target_id  text NOT NULL,
+        source_key text NOT NULL,
+        zoom       double precision NOT NULL,
+        PRIMARY KEY (target_id, source_key)
+      )
+    `;
     // Credential profiles (POL-24): centrally-held OAuth clients for Bucket-A content auth. The
     // client secret's ONLY durable home — never broadcast, never returned by REST, never logged.
     await sql`
@@ -357,6 +374,7 @@ export class PostgresStore implements Store {
       contentSourceRows,
       sceneRows,
       credentialProfileRows,
+      zoomPreferenceRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
@@ -368,6 +386,7 @@ export class PostgresStore implements Store {
       sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
+      sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -459,6 +478,12 @@ export class PostgresStore implements Store {
       tokenParam: row.token_param,
     }));
 
+    const zoomPreferences: PersistedZoomPreference[] = zoomPreferenceRows.map((row) => ({
+      targetId: row.target_id,
+      sourceKey: row.source_key,
+      zoom: Number(row.zoom),
+    }));
+
     const scenes: PersistedScene[] = sceneRows.map((row) => {
       // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
       const raw =
@@ -489,6 +514,7 @@ export class PostgresStore implements Store {
       contentSources,
       scenes,
       credentialProfiles,
+      zoomPreferences,
     };
   }
 
@@ -535,6 +561,7 @@ export class PostgresStore implements Store {
     // removes each in memory + dissolves walls first so memory + broadcasts stay correct).
     await sql`DELETE FROM screen_content WHERE screen_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM placements WHERE screen_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
+    await sql`DELETE FROM zoom_preferences WHERE target_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM screens WHERE machine_id = ${id}`;
     await sql`DELETE FROM machines WHERE id = ${id}`;
   }
@@ -730,6 +757,32 @@ export class PostgresStore implements Store {
         },
       ];
     });
+  }
+
+  // ── Page zoom preferences (POL-57) ───────────────────────────────────────────
+
+  async upsertZoomPreference(pref: PersistedZoomPreference): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO zoom_preferences (target_id, source_key, zoom)
+      VALUES (${pref.targetId}, ${pref.sourceKey}, ${pref.zoom})
+      ON CONFLICT (target_id, source_key) DO UPDATE SET zoom = EXCLUDED.zoom
+    `;
+  }
+
+  async deleteZoomPreferencesForTarget(targetId: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM zoom_preferences WHERE target_id = ${targetId}`;
+  }
+
+  async listZoomPreferences(): Promise<PersistedZoomPreference[]> {
+    const sql = this.sql;
+    const rows = await sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`;
+    return rows.map((row) => ({
+      targetId: row.target_id,
+      sourceKey: row.source_key,
+      zoom: Number(row.zoom),
+    }));
   }
 
   // ── Credential profiles (POL-24) ─────────────────────────────────────────────

@@ -2,19 +2,32 @@
   ScreenRow.vue — one screen under an approved machine in the Machines view.
 
   Mirrors the retired SolidJS admin's ScreenRow: a connectivity dot, an inline rename (committed on
-  Enter/blur, reverted on Escape), the screen's connector + "Driven by {machine}" line, and an Ident
-  pulse. The rename draft re-syncs from the authoritative admin/state on every snapshot UNLESS the
-  operator is mid-edit, so a live repaint never clobbers typed text or steals focus.
+  Enter/blur, reverted on Escape), the screen's connector + "Driven by {machine}" line, an Ident
+  pulse, and an Inspect toggle. The rename draft re-syncs from the authoritative admin/state on every
+  snapshot UNLESS the operator is mid-edit, so a live repaint never clobbers typed text or steals focus.
 
-  All mutations go through the Pinia store (renameScreen / identScreen) — no direct fetch here.
+  Inspect (POL-50) pops the kiosk browser's Web Inspector ON the panel itself — the kiosk browser has
+  no remote inspector to tunnel (D63), so the console asks and someone at the screen reads. The button
+  reflects `screen.inspecting`, which only ever comes from the agent's ack; while the box relaunches
+  its browser the button shows a pending label rather than lying about the wall.
+
+  All mutations go through the Pinia store (renameScreen / identScreen / inspectScreen) — no direct
+  fetch here. Failures are surfaced to the parent via `notify`, which toasts them.
 -->
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onUnmounted } from "vue";
 import type { ScreenView } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { useScreenThumbnail } from "./canvas/useThumbnails";
 
-const props = defineProps<{ screen: ScreenView; machineLabel: string }>();
+const props = defineProps<{
+  screen: ScreenView;
+  machineLabel: string;
+  /** Is the screen's machine reachable? The inspector rides the agent socket, not the player's. */
+  machineOnline: boolean;
+}>();
+
+const emit = defineEmits<{ notify: [message: string] }>();
 
 const store = useConsoleStore();
 
@@ -60,6 +73,81 @@ function ident(): void {
   identTimer = setTimeout(() => {
     identing.value = false;
   }, 3000);
+}
+
+// ── On-screen inspector (POL-50) ────────────────────────────────────────────────
+// `inspecting` is written only by the agent's ack, so the click leaves the button in a pending state
+// until the wall confirms. A stuck box therefore reads as "Opening…", never as a live inspector.
+const inspectPending = ref(false);
+let inspectTimer: ReturnType<typeof setTimeout> | null = null;
+
+const inspecting = computed(() => props.screen.inspecting === true);
+const inspectLabel = computed(() => {
+  if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
+  return inspecting.value ? "Inspecting" : "Inspect";
+});
+const inspectTitle = computed(() =>
+  props.machineOnline
+    ? inspecting.value
+      ? "Close the Web Inspector on this panel (reloads the page)"
+      : "Open the browser's Web Inspector ON this panel — read it at the screen (reloads the page)"
+    : `${props.machineLabel} is offline — the inspector rides its agent connection`,
+);
+
+/**
+ * Clear the pending state as soon as the wall's ack lands — on EITHER signal.
+ *
+ * A refusal leaves `inspecting` false, i.e. unchanged, so watching that alone would leave the button
+ * spinning on "Opening…" until its timeout for exactly the case the operator most needs to hear about.
+ * `inspectError` is the refusal edge; report it, because nobody is standing at that screen.
+ *
+ * `props.screen` is a fresh object on every admin/state broadcast, so this fires for unrelated
+ * changes too. Only the two transitions that actually mean "the box answered" may settle the button:
+ * the inspector flipping, or a NEW refusal. Notably, the server CLEARING a stale error at the start
+ * of a fresh request must not cancel the pending state that request just set.
+ */
+watch(
+  () => [props.screen.inspecting === true, props.screen.inspectError ?? ""] as const,
+  ([nowOn, error], [wasOn, prevError]) => {
+    const newRefusal = error !== "" && error !== prevError;
+    if (!newRefusal && nowOn === wasOn) return; // an unrelated broadcast, or a stale error cleared
+    inspectPending.value = false;
+    if (inspectTimer) clearTimeout(inspectTimer);
+    if (newRefusal) emit("notify", `Inspector: ${error}`);
+  },
+);
+onUnmounted(() => {
+  if (inspectTimer) clearTimeout(inspectTimer);
+  if (identTimer) clearTimeout(identTimer);
+});
+
+async function toggleInspect(): Promise<void> {
+  if (inspectPending.value || !props.machineOnline) return;
+  const on = !inspecting.value;
+  if (on) {
+    const yes = window.confirm(
+      `Open the Web Inspector on "${props.screen.friendlyName}"?\n\n` +
+        `It appears ON that panel, so anyone looking at the screen will see it, and the page reloads ` +
+        `so the inspector captures the whole load.`,
+    );
+    if (!yes) return;
+  }
+  inspectPending.value = true;
+  // The agent relaunches the browser, so the ack takes a few seconds. Give up waiting well after
+  // that, rather than leaving the button pending forever if the box never answers.
+  if (inspectTimer) clearTimeout(inspectTimer);
+  inspectTimer = setTimeout(() => {
+    if (!inspectPending.value) return;
+    inspectPending.value = false;
+    emit("notify", `${props.screen.friendlyName} did not confirm the inspector — check the screen.`);
+  }, 20_000);
+
+  const error = await store.inspectScreen(props.screen.id, on);
+  if (error) {
+    inspectPending.value = false;
+    if (inspectTimer) clearTimeout(inspectTimer);
+    emit("notify", error);
+  }
 }
 
 // Permanently forget this screen (POL-14) — deletes it, its placement + content. Aimed at stale
@@ -116,6 +204,17 @@ function remove(): void {
 
     <button class="ident-btn" :class="{ active: identing }" @click="ident">
       <span class="ident-dot"></span>{{ identing ? "Flashing…" : "Ident" }}
+    </button>
+
+    <button
+      class="inspect-btn"
+      :class="{ active: inspecting, pending: inspectPending }"
+      :disabled="!machineOnline || inspectPending"
+      :title="inspectTitle"
+      :aria-pressed="inspecting"
+      @click="toggleInspect"
+    >
+      <span class="inspect-glyph" aria-hidden="true">&lt;/&gt;</span>{{ inspectLabel }}
     </button>
 
     <button class="remove-btn" title="Remove this screen from the console" @click="remove">
@@ -249,6 +348,47 @@ function remove(): void {
   height: 6px;
   border-radius: 50%;
   background: var(--accent);
+}
+.inspect-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+.inspect-btn:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+/* Active = the inspector is genuinely on the panel (the agent said so), so make it look live. */
+.inspect-btn.active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.inspect-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.inspect-btn.pending {
+  cursor: progress;
+}
+.inspect-glyph {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  color: var(--muted2);
+}
+.inspect-btn.active .inspect-glyph {
+  color: var(--accent);
 }
 .remove-btn {
   padding: 7px 11px;

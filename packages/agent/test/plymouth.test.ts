@@ -10,6 +10,8 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  PLYMOUTH_THEMES_DIR,
+  PLYMOUTH_THEME_DIR,
   PLYMOUTH_THEME_NAME,
   SPLASH_CMDLINE_TOKENS,
   mergeCmdlineTxt,
@@ -32,6 +34,16 @@ describe("plymouthdConf — the portable, dracut-honoured theme selector", () =>
     // Regression guard: Ubuntu ships plymouthd.conf with a COMMENTED '#[Daemon]', which is why the
     // theme was never applied. Our generated file must have a live section header.
     expect(conf).toMatch(/^\[Daemon\]$/m);
+  });
+
+  test("pairs Theme with ThemeDir, so the initramfs theme does not ride on an alternative (POL-53)", () => {
+    // `plymouth-populate-initrd`'s set_theme_dir() only believes plymouthd.conf when BOTH keys are
+    // set and the directory exists; with Theme= alone it falls back to the default.plymouth
+    // alternative, which install.ts registers with allowFail. If that registration ever misses, the
+    // theme resolves to 'none' and the script exits 1 BEFORE installing plymouth's systemd units —
+    // so plymouthd would never start in the initramfs at all.
+    expect(conf).toMatch(/^ThemeDir=\/usr\/share\/plymouth\/themes$/m);
+    expect(`${PLYMOUTH_THEMES_DIR}/${PLYMOUTH_THEME_NAME}`).toBe(PLYMOUTH_THEME_DIR);
   });
 });
 
@@ -65,20 +77,32 @@ describe("plymouthDracutConf — force the theme into the dracut initramfs", () 
     expect(conf).toContain("/x/script.so");
     expect(conf).toContain("/t/polyptic.plymouth");
   });
+
+  test("requests the drm module, so the splash is not stuck at the firmware's resolution (POL-53)", () => {
+    // Ubuntu's plymouthd.defaults sets UseSimpledrm=1, which makes dracut's plymouth module depend on
+    // `simpledrm` rather than `drm`; `drm` is never auto-detected. Without this line the initramfs
+    // carries no real KMS driver, plymouth composes the splash on the firmware's ~1024x768 framebuffer
+    // and a 1440p panel upscales the result. `+=` (not `=`) so we add to, not replace, dracut's set.
+    const conf = plymouthDracutConf(["/etc/plymouth/plymouthd.conf"]);
+    expect(conf).toMatch(/^add_dracutmodules\+=" *drm *"$/m);
+  });
 });
 
 describe("plymouthScript — must never hold an image-less sprite (plymouth 5.x segfault, POL-7)", () => {
   const script = plymouthScript();
 
-  test("does not eagerly create an empty message sprite", () => {
-    // The bug: `message.sprite = Sprite();` with no image → plymouth 5.x crashes in
-    // script_lib_sprite_refresh on the first frame of a normal boot (no message ever arrives).
-    expect(script).not.toContain("message.sprite = Sprite();");
+  test("no sprite is ever created without an image", () => {
+    // The bug: `Sprite();` with no image → plymouth 5.x crashes in script_lib_sprite_refresh on the
+    // first frame of a normal boot. Every sprite is born with one, and nothing sets a null image.
+    const code = script
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(code).not.toContain("Sprite();");
   });
 
-  test("creates the message sprite lazily, WITH an image, on the first message", () => {
-    expect(script).toContain("message.have = 0");
-    expect(script).toContain("Sprite(img)");
+  test("guards SetImage behind a real, non-empty rendered image", () => {
+    expect(script).toContain("if (img.GetHeight() > 0) {");
   });
 });
 

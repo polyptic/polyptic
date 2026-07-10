@@ -20,7 +20,6 @@
 #   deploy/full-rebuild-image-docker.sh [amd64|arm64]
 #     env: UBUNTU_RELEASE  the ubuntu-base release + archive suite to build from (default 26.04)
 #          FULL_FIRMWARE=1 ship the whole linux-firmware set (see build-live-image.sh)
-#          BROWSER         the kiosk browser (default surf)
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -43,7 +42,6 @@ fi
 echo "==> [2/2] build-live-image.sh in a privileged $PLATFORM container"
 exec docker run --rm --privileged --platform "$PLATFORM" \
   -e UBUNTU_RELEASE="${UBUNTU_RELEASE:-26.04}" \
-  -e BROWSER="${BROWSER:-surf}" \
   -e FULL_FIRMWARE="${FULL_FIRMWARE:-0}" \
   -v "$REPO_ROOT:/repo" \
   ubuntu:24.04 bash -c '

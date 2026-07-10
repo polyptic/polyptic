@@ -3,13 +3,13 @@
  *
  * Phase 4. The agent stays a Bun single binary with NO new npm deps (D7); it drives the host
  * by shelling out to system tools (`swaymsg`, `grim`, `xrandr`, `xdotool`, `wmctrl`, `scrot`,
- * Chromium). These helpers wrap that uniformly:
+ * `surf`). These helpers wrap that uniformly:
  *   - `run`           — short-lived command, capture text stdout/stderr, never throws on a
  *                       non-zero exit (returns the code so callers can produce clear errors).
  *   - `runOk`         — same, but throws a descriptive error on non-zero / spawn failure.
  *   - `captureStdout` — short-lived command, capture BINARY stdout (screenshots), `null` on
  *                       any failure.
- *   - `spawnChild`    — long-lived child (Chromium, `swaymsg -t subscribe -m`).
+ *   - `spawnChild`    — long-lived child (the kiosk browser, `swaymsg -t subscribe -m`).
  *   - `which`         — PATH lookup with no subprocess (scans `$PATH` for an executable).
  *   - `requireTools`  — assert a set of tools is installed, else one clear error.
  *   - `makeJsonStreamSplitter` — incremental, string-aware brace-depth splitter for the
@@ -107,8 +107,8 @@ export function captureStdout(
 }
 
 /**
- * Spawn a long-lived child (Chromium, a sway event subscription). Defaults to piping stdio;
- * pass `{ stdio: "ignore" }` for noisy children (Chromium). The caller owns the returned handle
+ * Spawn a long-lived child (the kiosk browser, a sway event subscription). Defaults to piping stdio;
+ * pass `{ stdio: "ignore" }` for noisy children (the browser). The caller owns the returned handle
  * (supervision / kill).
  */
 export function spawnChild(cmd: string, args: string[] = [], opts: SpawnOptions = {}): ChildProcess {

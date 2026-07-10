@@ -4,8 +4,13 @@
   Three states, mirroring docs/design/console.dc.html:
     - empty   : nothing selected → prompt to pick a screen
     - single  : rename, Ident (flash on wall), status + "Driven by {machine}",
-                assign content (type a URL), layout read-out, remove from wall
+                assign content (type a URL), page zoom, layout read-out, remove from wall
     - multi   : count + member list + Ident-all; combining lands in 3b
+
+  The zoom control (POL-57) appears only when the selection frames a page — a web or dashboard
+  surface. Media has nothing to zoom, and an empty screen has nothing at all, so in both cases the
+  control is absent rather than disabled. The server remembers each value against the (screen-or-wall,
+  page) pair, which is what the "Remembered for this screen" caption is promising the operator.
 
   All reads/writes go through the Pinia store; ident uses the shared composable.
 -->
@@ -14,6 +19,7 @@ import { ref, computed, watch } from "vue";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
+import ZoomControl from "./ZoomControl.vue";
 
 const store = useConsoleStore();
 const { ident, identMany, flash, isIdenting } = useIdent();
@@ -64,6 +70,21 @@ const singleContentKind = computed(() =>
 const wallContentKind = computed(() =>
   wallContent.value ? `${kindLabel(wallContent.value.kind)} · spans all panels` : wallSurfaceText.value,
 );
+
+// ── page zoom (POL-57) ──────────────────────────────────────────────────────
+// The live zoom rides on the content read-out, and is present only for framed (web/dashboard)
+// content — so `zoom !== undefined` is exactly the question "can this selection be zoomed?".
+const singleZoom = computed(() => singleContent.value?.zoom);
+const wallZoom = computed(() => wallContent.value?.zoom);
+
+function zoomScreen(zoom: number) {
+  const s = single.value;
+  if (s) store.setScreenZoom(s.id, zoom);
+}
+function zoomWall(zoom: number) {
+  const w = wall.value;
+  if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
+}
 
 const wallUrlDraft = ref("");
 const wallSourcePick = ref("");
@@ -285,6 +306,16 @@ function selectOne(id: string) {
         A library source (or ad-hoc URL) spans across every panel, with bezel seams shown.
       </div>
 
+      <template v-if="wallZoom !== undefined">
+        <div class="section-label gap-top">Zoom</div>
+        <ZoomControl
+          :zoom="wallZoom"
+          :disabled="wallPending"
+          caption="Applies to the whole surface — the page zooms as one, across all panels."
+          @update="zoomWall"
+        />
+      </template>
+
       <div class="panels-head">
         <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
         <span class="panels-res">{{ wallRes }}</span>
@@ -353,6 +384,15 @@ function selectOne(id: string) {
         <button class="url-btn" :disabled="!urlDraft.trim()" @click="submitUrl">Show</button>
       </div>
       <div class="hint">Pick a library source above, or paste an ad-hoc URL to show it here.</div>
+
+      <template v-if="singleZoom !== undefined">
+        <div class="section-label gap-top">Zoom</div>
+        <ZoomControl
+          :zoom="singleZoom"
+          caption="Remembered for this screen and this page."
+          @update="zoomScreen"
+        />
+      </template>
 
       <div class="section-label gap-top">Layout</div>
       <div class="layout-grid">

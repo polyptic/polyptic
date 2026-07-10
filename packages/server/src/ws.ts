@@ -378,6 +378,49 @@ function handleAgent(
       shellRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
     } else if (msg.t === "agent/shell-closed") {
       shellRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
+    } else if (msg.t === "agent/inspect-ack") {
+      // POL-50 — the box's answer to `server/inspect`, and the ONLY writer of the `inspecting` flag:
+      // the operator's click is a request, but only the wall knows whether surf relaunched and took
+      // the keystroke. A refusal therefore CLEARS the flag rather than setting it, so the console can
+      // never claim an inspector that isn't on the panel.
+      const screen = control
+        .getScreens()
+        .find((s) => s.machineId === msg.machineId && s.connector === msg.connector);
+      if (screen) {
+        presence.setScreenInspecting(screen.id, msg.ok && msg.on);
+        // A refusal leaves `inspecting` false — unchanged — so the reason is what tells the console
+        // anything happened at all. Without it the operator's button spins until it times out.
+        presence.setScreenInspectError(
+          screen.id,
+          msg.ok ? null : (msg.reason ?? "the box did not say why"),
+        );
+        if (!msg.ok) {
+          activity.push(
+            "bad",
+            `Could not open the inspector on ${screen.friendlyName}: ${msg.reason ?? "no reason given"}`,
+          );
+        } else {
+          activity.push(
+            "info",
+            msg.on
+              ? `Inspector open on ${screen.friendlyName} — read it at the screen`
+              : `Inspector closed on ${screen.friendlyName}`,
+          );
+        }
+        broadcaster.broadcast();
+      }
+      log.info(
+        {
+          event: "agent.inspect_ack",
+          machineId: msg.machineId,
+          connector: msg.connector,
+          screenId: screen?.id,
+          on: msg.on,
+          ok: msg.ok,
+          reason: msg.reason,
+        },
+        msg.ok ? "agent applied inspector state" : "agent could not apply inspector state",
+      );
     } else {
       // agent/thumbnail — the frame is already AgentMessage-validated; hand it to the coordinator,
       // which resolves connector→screenId, decodes the payload and stores the latest preview (Phase 5).
@@ -396,6 +439,11 @@ function handleAgent(
       presence.agentDisconnected(machineId);
       if (machine && !presence.isMachineOnline(machineId)) {
         activity.push("bad", `${machine.label} went unreachable`);
+        // POL-50 — the box is gone, so its panels are no longer showing an inspector. Drop the flag,
+        // or a reboot-while-inspecting leaves the console badging a wall that came back sealed.
+        presence.clearScreensInspecting(
+          control.getScreens().filter((s) => s.machineId === machineId).map((s) => s.id),
+        );
       }
       broadcaster.broadcast();
     }

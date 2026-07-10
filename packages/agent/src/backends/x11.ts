@@ -2,11 +2,10 @@
  * x11-i3 — the real X11 placement backend (D9 fallback for hosts where Wayland misbehaves,
  * e.g. some NVIDIA + wlroots combos — see docs/ARCHITECTURE.md "Gotchas").
  *
- * Phase 4. Replaces the throwing stub. Under X11 a client CAN self-position, so we launch
- * Chromium with `--class=polyptic-<connector>` + `--window-position/-size` matching the
- * output's geometry, then defensively re-place it with `xdotool`/`wmctrl` once the window is
- * mapped (and assert EWMH fullscreen on the correct monitor). Geometry comes from `xrandr`,
- * capture from ImageMagick `import` (→ JPEG on stdout) or `scrot`.
+ * Phase 4. surf has no self-positioning flags (it is chromeless by design), so placement here is
+ * entirely external: launch it, find its window by pid, then move/size it onto the output's geometry
+ * with `xdotool`/`wmctrl` and assert EWMH fullscreen there. Geometry comes from `xrandr`, capture
+ * from ImageMagick `import` (→ JPEG on stdout) or `scrot`.
  *
  * Works under i3 or any EWMH-compliant window manager — we don't depend on i3 IPC, only on the
  * standard window-control tools, so the backend stays generic.
@@ -16,14 +15,18 @@ import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DisplayBackend } from "./types";
-import type { Browser } from "./browser";
-import { profileDirFor, sanitizeConnector, SupervisedChromium } from "./chromium";
-import { selectBrowser } from "./browser";
+import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
+import { buildSurfArgs, prelaunchSurf, resolveSurf } from "./surf";
+import { sanitizeConnector, SupervisedBrowser } from "./supervise";
+import type { LaunchTarget } from "./supervise";
 import { captureStdout, delay, run, spawnChild, which } from "./proc";
 
 /** How long to wait for the freshly-launched browser window to be mapped + named. */
 const PLACE_TIMEOUT_MS = 8_000;
 const WINDOW_POLL_MS = 150;
+
+/** surf's WM class, used only as a fallback when the pid lookup finds nothing. */
+const SURF_WM_CLASS = "surf";
 
 function ts(): string {
   return new Date().toISOString();
@@ -76,14 +79,15 @@ export function parseXrandrOutputs(xrandr: string): string[] {
 export class X11Backend implements DisplayBackend {
   readonly id = "x11-i3" as const;
 
-  private readonly browsers = new Map<string, SupervisedChromium>();
+  private readonly browsers = new Map<string, SupervisedBrowser>();
 
-  /** The kiosk browser (chromium default, or cog via POLYPTIC_BROWSER=cog). */
-  private readonly browser: Browser = selectBrowser();
   private browserBin: string | null = null;
 
   /** Latched once neither `import` nor `scrot` is found, so we log the hint once and then skip. */
   private captureUnavailable = false;
+  /** connector → why the last inspector-opening attempt failed (null = it worked). Read by `inspect`
+   *  so the operator's ack carries the real reason, since the opening happens inside the launch. */
+  private readonly inspectErrors = new Map<string, string | null>();
 
   private log(msg: string): void {
     console.log(`[${ts()}] [x11] ${msg}`);
@@ -91,7 +95,7 @@ export class X11Backend implements DisplayBackend {
 
   private async ensureBin(): Promise<string> {
     if (this.browserBin) return this.browserBin;
-    this.browserBin = await this.browser.resolveBin();
+    this.browserBin = await resolveSurf();
     return this.browserBin;
   }
 
@@ -147,23 +151,25 @@ export class X11Backend implements DisplayBackend {
     );
   }
 
-  /** Find the mapped window for `className`, preferring the one whose pid matches our child. */
-  private async findWindow(className: string, pid: number, timeoutMs: number): Promise<string> {
+  /**
+   * Find the mapped window belonging to `pid`. surf has no flag to set a per-output WM class, so the
+   * pid IS the identity: with one surf per output, matching on WM class alone would pick an arbitrary
+   * sibling. The class scan stays only as a last resort, for a window whose pid X never learned.
+   */
+  private async findWindow(pid: number, timeoutMs: number): Promise<string> {
     const hasXdotool = await which("xdotool");
     const hasWmctrl = await which("wmctrl");
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       if (hasXdotool) {
-        const res = await run("xdotool", ["search", "--class", className]);
-        if (res.code === 0) {
-          const ids = res.stdout.split(/\s+/).filter(Boolean);
-          if (pid > 0) {
-            for (const id of ids) {
-              const pidRes = await run("xdotool", ["getwindowpid", id]);
-              if (pidRes.code === 0 && pidRes.stdout.trim() === String(pid)) return id;
-            }
-          }
-          const first = ids[0];
+        if (pid > 0) {
+          const byPid = await run("xdotool", ["search", "--pid", String(pid)]);
+          const id = byPid.code === 0 ? byPid.stdout.split(/\s+/).filter(Boolean).pop() : undefined;
+          if (id) return id;
+        }
+        const byClass = await run("xdotool", ["search", "--class", SURF_WM_CLASS]);
+        if (byClass.code === 0) {
+          const first = byClass.stdout.split(/\s+/).filter(Boolean)[0];
           if (first) return first;
         }
       } else if (hasWmctrl) {
@@ -171,13 +177,13 @@ export class X11Backend implements DisplayBackend {
         if (res.code === 0) {
           const line = res.stdout
             .split("\n")
-            .find((l) => l.toLowerCase().includes(className.toLowerCase()));
+            .find((l) => l.toLowerCase().includes(SURF_WM_CLASS));
           const wid = line?.split(/\s+/)[0];
           if (wid) return wid;
         }
       }
       if (Date.now() >= deadline) {
-        throw new Error(`no window with class ${className} appeared within ${timeoutMs}ms`);
+        throw new Error(`no surf window for pid ${pid} appeared within ${timeoutMs}ms`);
       }
       await delay(WINDOW_POLL_MS);
     }
@@ -196,57 +202,70 @@ export class X11Backend implements DisplayBackend {
       // wmctrl -e: gravity,x,y,w,h
       await run("wmctrl", ["-i", "-r", wid, "-e", `0,${geom.x},${geom.y},${geom.w},${geom.h}`]);
     }
-    // Re-assert fullscreen; the window now lives on the target monitor so the WM fullscreens it
-    // there. Without wmctrl we rely on Chromium's own `--kiosk` fullscreen after the move.
+    // Re-assert fullscreen; the window now lives on the target monitor so the WM fullscreens it there.
     if (hasWmctrl) await run("wmctrl", ["-i", "-r", wid, "-b", "add,fullscreen"]);
   }
 
   private async launchAndPlace(
     connector: string,
     bin: string,
-    profileDir: string,
-    className: string,
-    url: string,
+    target: LaunchTarget,
   ): Promise<ChildProcess> {
-    // `target` may differ from the requested `connector` under the single-output fallback; X11
+    // `output` may differ from the requested `connector` under the single-output fallback; X11
     // placement is geometric, so we just use the resolved output's geometry.
-    const { name: target, geom } = await this.resolveConnector(connector);
-    await this.browser.prelaunch(profileDir, url, (m) => this.log(m));
+    const { name: output, geom } = await this.resolveConnector(connector);
+    await prelaunchSurf(target.url, (m) => this.log(m));
 
-    const args = this.browser.buildArgs({
-      url,
-      profileDir,
-      platform: "x11",
-      scaleFactor: 1,
-      className,
-      position: { x: geom.x, y: geom.y },
-      size: { w: geom.w, h: geom.h },
-    });
+    const args = buildSurfArgs({ url: target.url, inspector: target.inspector });
     const child = spawnChild(bin, args, { stdio: "ignore" });
-    this.log(`spawned ${this.browser.name} pid=${child.pid ?? "?"} class=${className} for ${target} → ${url}`);
+    this.log(
+      `spawned surf pid=${child.pid ?? "?"} for ${output} → ${target.url}` +
+        (target.inspector ? " (Web Inspector enabled)" : ""),
+    );
 
-    // Best-effort defensive placement (Chromium's launch flags usually suffice; this corrects
-    // misplacement without ever failing the launch).
+    // Placement is best-effort: it corrects misplacement without ever failing the launch.
     try {
-      const wid = await this.findWindow(className, child.pid ?? -1, PLACE_TIMEOUT_MS);
+      const wid = await this.findWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
       await this.placeWindow(wid, geom);
-      this.log(
-        `placed window ${wid} on ${target} @ ${geom.w}x${geom.h}+${geom.x}+${geom.y}`,
-      );
+      this.log(`placed window ${wid} on ${output} @ ${geom.w}x${geom.h}+${geom.x}+${geom.y}`);
     } catch (err) {
-      this.log(`placement on ${target} failed: ${(err as Error).message} (relying on launch flags)`);
+      this.log(`placement on ${output} failed: ${(err as Error).message}`);
     }
+
+    // Opening the inspector belongs to the LAUNCH, not to the operator's click: a supervised browser
+    // that crashes and respawns while being inspected must come back inspected, or the console would
+    // badge an inspector that is no longer on the panel. `inspect()` reads the outcome below.
+    if (target.inspector) await this.openInspector(connector, child.pid ?? -1);
     return child;
   }
 
-  private ensureBrowser(connector: string, bin: string): SupervisedChromium {
+  /**
+   * Focus this output's surf and pop its Web Inspector. Best-effort: it must never fail a launch —
+   * a wall rendering without an inspector still beats a wall rendering nothing — so the reason is
+   * stashed per connector for `inspect()` to report back to the operator.
+   */
+  private async openInspector(connector: string, pid: number): Promise<void> {
+    this.inspectErrors.set(connector, null);
+    try {
+      if (pid <= 0) throw new Error("the freshly launched surf reported no pid");
+      // XTEST input lands on whatever holds X focus, so focus surf's window first.
+      const wid = await this.findWindow(pid, PLACE_TIMEOUT_MS);
+      await run("xdotool", ["windowactivate", "--sync", wid]);
+      await run("xdotool", ["windowfocus", "--sync", wid]);
+      await openInspectorOnFocusedWindow((m) => this.log(m));
+    } catch (err) {
+      const reason = (err as Error).message;
+      this.inspectErrors.set(connector, reason);
+      this.log(`inspector on ${connector} not opened: ${reason}`);
+    }
+  }
+
+  private ensureBrowser(connector: string, bin: string): SupervisedBrowser {
     let b = this.browsers.get(connector);
     if (!b) {
-      const profileDir = profileDirFor(connector);
-      const className = `polyptic-${sanitizeConnector(connector)}`;
-      b = new SupervisedChromium(
+      b = new SupervisedBrowser(
         connector,
-        (url) => this.launchAndPlace(connector, bin, profileDir, className, url),
+        (target) => this.launchAndPlace(connector, bin, target),
         (m) => this.log(m),
       );
       this.browsers.set(connector, b);
@@ -277,6 +296,33 @@ export class X11Backend implements DisplayBackend {
 
   async ident(on: boolean): Promise<void> {
     this.log(`ident ${on ? "on" : "off"} — visible ident is server→player; agent no-op`);
+  }
+
+  /**
+   * Pop surf's Web Inspector on the panel driven by `connector` (POL-50). Same shape as the sway
+   * backend: relaunch with `-N`, which places the window and opens the inspector as part of the launch.
+   */
+  async inspect(connector: string, on: boolean): Promise<void> {
+    const supervised = this.browsers.get(connector);
+    if (!supervised) {
+      throw new Error(`nothing is placed on ${connector} — no page to inspect`);
+    }
+    if (supervised.inspector === on && supervised.running) {
+      this.log(`inspect(${connector}): already ${on ? "on" : "off"} — no-op`);
+      return;
+    }
+    if (on) await requireXdotool(); // fail before we disturb the wall
+
+    await supervised.setInspector(on);
+    if (!on) {
+      this.log(`inspect(${connector}): relaunched without the Web Inspector`);
+      return;
+    }
+
+    // The relaunch opened it (or tried to). Surface the real reason, so the operator's ack is honest.
+    const failure = this.inspectErrors.get(connector);
+    if (failure) throw new Error(failure);
+    this.log(`inspect(${connector}): Web Inspector open on the wall`);
   }
 
   /** Crop the output's region out of the root window via ImageMagick `import`, else `scrot`. */
@@ -340,7 +386,7 @@ export class X11Backend implements DisplayBackend {
   }
 }
 
-/** Assert the X11 placement tool-chain is present (Chromium + xrandr + a window controller). */
+/** Assert the X11 placement tool-chain is present (xrandr + a window controller). */
 async function requireX11Tools(): Promise<void> {
   if (!(await which("xrandr"))) {
     throw new Error(

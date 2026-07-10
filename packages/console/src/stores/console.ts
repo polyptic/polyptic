@@ -1008,6 +1008,29 @@ export const useConsoleStore = defineStore("console", {
     },
 
     /**
+     * Show/hide the kiosk browser's Web Inspector ON that screen's panel (POL-50). Returns an error
+     * sentence for the operator, or null when the request reached the box.
+     *
+     * Deliberately NOT optimistic: the screen's `inspecting` flag is written only by the agent's ack,
+     * arriving on the next admin/state. An optimistic flip would show an inspector on a wall where
+     * surf failed to relaunch — and the operator, who is not standing at that wall, would believe it.
+     */
+    async inspectScreen(screenId: string, on: boolean): Promise<string | null> {
+      try {
+        await api.inspectScreen(screenId, { on });
+        return null;
+      } catch (err) {
+        console.error("[console] inspectScreen failed", err);
+        // The server's 409s explain themselves ("… is offline — nothing to show an inspector on").
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "The control plane could not reach that screen's machine.";
+      }
+    },
+
+    /**
      * Permanently forget a single screen (POL-14): drop it from its machine, plus its placement, any
      * combined surface it belonged to, and any selection — optimistically; the authoritative
      * admin/state broadcast reconciles. If the screen's machine still reports the output, the screen
@@ -1047,6 +1070,32 @@ export const useConsoleStore = defineStore("console", {
         await api.setScreenContent(screenId, body);
       } catch (err) {
         console.error("[console] setScreenContent failed", err);
+      }
+    },
+
+    /**
+     * Zoom the page on a single screen (POL-57). The authoritative zoom comes back on the next
+     * `admin/state`, but we patch the screen's content read-out optimistically so repeated clicks on
+     * the − / + buttons step from the value the operator can see rather than from a stale one.
+     */
+    async setScreenZoom(screenId: string, zoom: number): Promise<void> {
+      this.patchScreenZoom([screenId], zoom);
+      try {
+        await api.setScreenZoom(screenId, zoom);
+      } catch (err) {
+        console.error("[console] setScreenZoom failed", err);
+      }
+    },
+
+    /** Write a zoom onto the given screens' content read-outs in place (optimistic; the server's
+     *  broadcast overwrites it moments later). Screens with no framed content are left alone. */
+    patchScreenZoom(screenIds: readonly string[], zoom: number): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content) continue;
+          if (screen.content.zoom === undefined) continue;
+          screen.content = { ...screen.content, zoom };
+        }
       }
     },
 
@@ -1109,6 +1158,18 @@ export const useConsoleStore = defineStore("console", {
         await api.setWallContent(wallId, body);
       } catch (err) {
         console.error("[console] setWallContent failed", err);
+      }
+    },
+
+    /** Zoom the page spanning a combined surface (POL-57) — every member takes the same zoom. */
+    async setWallZoom(wallId: string, zoom: number): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchScreenZoom(wall.memberScreenIds, zoom);
+      try {
+        await api.setWallZoom(wallId, zoom);
+      } catch (err) {
+        console.error("[console] setWallZoom failed", err);
       }
     },
 

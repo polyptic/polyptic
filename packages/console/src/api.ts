@@ -13,11 +13,13 @@ import {
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
+  InspectBody,
   PlaceScreenBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
@@ -247,6 +249,16 @@ export function identScreen(screenId: string, body: IdentBody): Promise<unknown>
 }
 
 /**
+ * POST /api/v1/screens/:screenId/inspect { on } — show/hide the kiosk browser's Web Inspector ON that
+ * panel (POL-50). Answers 202: the request was delivered to the agent, not applied — the screen's
+ * `inspecting` flag (or `inspectError`) arrives later on an admin/state broadcast, once the box acks.
+ * Rejects with an ApiError on 409 (machine offline or not approved).
+ */
+export function inspectScreen(screenId: string, body: InspectBody): Promise<unknown> {
+  return send("POST", `/screens/${encodeURIComponent(screenId)}/inspect`, InspectBody.parse(body));
+}
+
+/**
  * DELETE /api/v1/screens/:screenId — permanently forget a single screen (POL-14). Dissolves any
  * combined surface it belonged to and clears its player. If the screen's machine is still connected
  * and reports this output, it reappears on the machine's next reconnect.
@@ -266,6 +278,12 @@ export function setScreenContent(screenId: string, body: SetContentBody): Promis
     `/screens/${encodeURIComponent(screenId)}/content`,
     SetContentBody.parse(body),
   );
+}
+
+/** PUT /api/v1/screens/:screenId/zoom { zoom } — zoom the page this screen is framing (POL-57). The
+ *  server remembers it for this (screen, page) pair, so the page returns at this zoom next time. */
+export function setScreenZoom(screenId: string, zoom: number): Promise<unknown> {
+  return send("PUT", `/screens/${encodeURIComponent(screenId)}/zoom`, SetZoomBody.parse({ zoom }));
 }
 
 // ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
@@ -295,6 +313,12 @@ export function setWallContent(wallId: string, body: SetContentBody): Promise<un
     `/walls/${encodeURIComponent(wallId)}/content`,
     SetContentBody.parse(body),
   );
+}
+
+/** PUT /api/v1/walls/:wallId/zoom { zoom } — zoom the page spanning a combined surface (POL-57).
+ *  Every member takes the same zoom, so the wall stays one continuous page. */
+export function setWallZoom(wallId: string, zoom: number): Promise<unknown> {
+  return send("PUT", `/walls/${encodeURIComponent(wallId)}/zoom`, SetZoomBody.parse({ zoom }));
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */

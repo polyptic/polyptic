@@ -155,7 +155,7 @@ The image is built **up from `ubuntu-base`**, not trimmed down from Ubuntu's liv
 - **The root image is a bare `rootfs.squashfs`.** dracut's netboot mechanism is `root=live:<url>`: `livenet` curls the squashfs into the initramfs tmpfs and `dmsquash-live` loop-mounts it under an overlayfs. No ISO wrapper, no `xorriso`, no casper metadata.
 - **Firmware is curated, not complete.** 26.04 splits `linux-firmware` into per-vendor packages; the image ships `linux-firmware-minimal` plus the two GPU vendors and Realtek NICs. Note that `linux-image-generic` **Depends** on the full `linux-firmware` (~600 MB) — which `--no-install-recommends` cannot decline — so the build installs the *concrete* `linux-image-<abi>-generic` instead. A box with unanticipated hardware gets a black screen or a dead NIC: rebuild with `FULL_FIRMWARE=1`, or extend `FIRMWARE_PACKAGES`.
 - **RAM sizing:** the squashfs lands in a tmpfs, so a box needs roughly **the image size plus the running system's working set**. The initrd's `polyptic-live` dracut module raises the tmpfs cap from the kernel's default 50% of RAM to 90%, and prints a plain-English message below the floor. Never pass `rd.live.ram=1` — it `dd`s a *second* full copy of the image into RAM.
-- The kiosk browser is **surf** (`BROWSER=` overrides). Ubuntu's Chromium is snap-only; `cog` was dropped from the archive after 25.04.
+- The kiosk browser is **surf**, the only one Polyptic ships (D63). It is installed with `xwayland` (surf is an X11 client) and `xdotool` (the on-screen Web Inspector, POL-50).
 
 ### The live ISO (macOS or Linux)
 
@@ -455,6 +455,11 @@ The two media differ in *where the operating system lives*, and that decides the
 Both floors dropped by roughly a factor of two in POL-35/[D55](DECISIONS.md), when the root image
 stopped being a 1.4 GiB casper ISO and became a ~500 MiB bare squashfs. Measured on the 26.04 arm64
 build: `rootfs.squashfs` **491.8 MiB**, `initrd` **91.7 MiB**, `vmlinuz` **22.7 MiB**.
+
+POL-53/[D64](DECISIONS.md) then grew the initrd again — it now carries the real KMS drivers, without
+which the boot splash is stuck at the firmware's framebuffer resolution. Expect roughly **+13 MiB on
+arm64** and **+47 MiB on amd64** (where the Intel and AMD graphics firmware blobs ride along). The
+floors above are unchanged: an initrd of that size is noise next to the ~500 MiB root image.
 
 The image still lands in the initramfs tmpfs, which the kernel caps at **50 % of RAM** by default —
 so the naive ceiling would be twice the image. The initrd's `polyptic-live` dracut module

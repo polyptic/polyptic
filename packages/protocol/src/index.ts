@@ -93,18 +93,27 @@ const SurfaceBase = z.object({
     .optional(),
 });
 
+/** Page zoom for a FRAMED surface (web/dashboard), as a scale factor — 1 = 100%, like a browser's
+ *  zoom control (POL-57). The player renders the frame at 1/zoom of its region and scales it up, so
+ *  the embedded page sees a proportionally smaller CSS viewport and lays itself out bigger. Bounds
+ *  match a browser's practical range; only framed surfaces carry it (media has `fit`/native size). */
+export const Zoom = z.number().min(0.25).max(4);
+export type Zoom = z.infer<typeof Zoom>;
+
 export const WebSurface = SurfaceBase.extend({
   type: z.literal("web"),
   url: z.string().url(),
   /** "iframe" (default) or "window" — a top-level OS window placed by the agent (framing-blocked/native escape hatch). */
   placement: z.enum(["iframe", "window"]).default("iframe"),
   interactive: z.boolean().default(false),
+  zoom: Zoom.default(1),
 });
 
 export const DashboardSurface = SurfaceBase.extend({
   type: z.literal("dashboard"),
   url: z.string().url(), // adapter-built (e.g. a single-panel dashboard embed URL)
   refreshSeconds: z.number().int().positive().optional(),
+  zoom: Zoom.default(1),
 });
 
 export const ImageSurface = SurfaceBase.extend({
@@ -237,6 +246,21 @@ export const AgentShellClosed = z.object({
   reason: z.string().optional(),
 });
 
+/** POL-50 — the agent's answer to `server/inspect`: whether the wall's Web Inspector is now open.
+ *  This ack, not the operator's click, is what the console displays — only the box knows whether
+ *  surf relaunched and took the keystroke. `ok: false` means the screen is un-inspected and carries
+ *  why (nothing placed on that output, no `xdotool`, or a backend that owns no browser). */
+export const AgentInspectAck = z.object({
+  t: z.literal("agent/inspect-ack"),
+  machineId: z.string(),
+  connector: z.string(),
+  /** The inspector state the agent actually reached (false on any failure). */
+  on: z.boolean(),
+  ok: z.boolean(),
+  /** Why the agent could not honour the request, when `ok` is false. */
+  reason: z.string().optional(),
+});
+
 export const AgentMessage = z.discriminatedUnion("t", [
   AgentHello,
   AgentStatus,
@@ -245,6 +269,7 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentShellOpened,
   AgentShellData,
   AgentShellClosed,
+  AgentInspectAck,
 ]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
 
@@ -281,6 +306,26 @@ export const ServerToAgentReboot = z.object({
   t: z.literal("server/reboot"),
   /** Advisory, logged on the box (e.g. "requested by an operator from the console"). */
   reason: z.string().optional(),
+});
+
+/**
+ * POL-50 — show/hide the kiosk browser's Web Inspector ON the panel driven by `connector`.
+ *
+ * A wall you can only debug by photographing it is a wall you can't debug. surf (WebKitGTK, D63)
+ * exposes NO browser-openable remote inspector — its `WEBKIT_INSPECTOR_SERVER` port speaks WebKit's
+ * own protocol, not HTTP or WebSocket — so there is nothing to tunnel to an operator's browser and
+ * the inspector is shown where the page is. The operator clicks in the console; someone at the
+ * screen reads the console/network.
+ *
+ * surf only takes its inspector at launch (`-N`), so honouring this RELAUNCHES that output's browser
+ * and the page reloads. Turning it off relaunches without `-N`, re-sealing the kiosk. The agent
+ * answers `agent/inspect-ack`.
+ */
+export const ServerToAgentInspect = z.object({
+  t: z.literal("server/inspect"),
+  /** Which output to pop the inspector on. */
+  connector: z.string(),
+  on: z.boolean(),
 });
 
 /** Issued after a valid first-contact enrollment: the durable credential the agent persists and
@@ -349,6 +394,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentIdent,
   ServerToAgentCapture,
   ServerToAgentReboot,
+  ServerToAgentInspect,
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
@@ -436,9 +482,24 @@ export const ScreenView = Screen.extend({
   /** What's on the screen now — a library source's name+kind, an ad-hoc URL's derived name, or null.
    *  Lets the console tiles + inspector show the actual content, not just a surface count. */
   content: z
-    .object({ name: z.string(), kind: z.enum(["web", "dashboard", "image", "video"]) })
+    .object({
+      name: z.string(),
+      kind: z.enum(["web", "dashboard", "image", "video"]),
+      /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
+       *  Absent for media, which has no zoom, so the console knows when to offer the control. */
+      zoom: Zoom.optional(),
+    })
     .nullable()
     .optional(),
+  /** POL-50 — is the kiosk browser's Web Inspector currently open ON this panel? Ephemeral (never
+   *  persisted, cleared when the machine drops) and set only from the agent's `agent/inspect-ack`,
+   *  so the console reflects the wall rather than the last click. Optional = back-compat. */
+  inspecting: z.boolean().optional(),
+  /** POL-50 — why the box last refused to show its inspector (no `xdotool`, nothing placed on that
+   *  output, a backend that owns no browser). Ephemeral: cleared when a new request is delivered, on
+   *  success, and when the machine drops. A refusal leaves `inspecting` false, i.e. UNCHANGED, so
+   *  without this the console cannot tell "the wall said no" from "the wall hasn't answered yet". */
+  inspectError: z.string().optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -754,6 +815,10 @@ export type RebootBody = z.infer<typeof RebootBody>;
 export const ShellArmBody = z.object({ enabled: z.boolean() });
 export type ShellArmBody = z.infer<typeof ShellArmBody>;
 
+/** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
+export const InspectBody = z.object({ on: z.boolean() });
+export type InspectBody = z.infer<typeof InspectBody>;
+
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });
 export type CreateMuralBody = z.infer<typeof CreateMuralBody>;
@@ -794,6 +859,12 @@ export const SetContentBody = z
     message: "provide exactly one of sourceId or url",
   });
 export type SetContentBody = z.infer<typeof SetContentBody>;
+
+/** Set the page zoom on a single screen's OR a video wall's framed content (POL-57). The server
+ *  remembers the value against the (target, content) pair, so re-assigning the same page to the same
+ *  screen later restores the zoom the operator last dialled in. */
+export const SetZoomBody = z.object({ zoom: Zoom });
+export type SetZoomBody = z.infer<typeof SetZoomBody>;
 
 // REST bodies — content library (Phase 3c)
 export const CreateContentSourceBody = z.object({
