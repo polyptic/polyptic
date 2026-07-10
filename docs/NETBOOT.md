@@ -417,8 +417,25 @@ whole root image into a RAM tmpfs.)
   of PXE, and the boot-order NIC is still initialised, so dongle-GRUB is online. Verified: ~30 s
   to content.
 - **Offload flow:** attach an additional VirtIO disk that has a GPT + FAT32 ESP, boot the dongle,
-  pick the "offload" menu entry; the live boot installs the signed loaders + boot entry on the
-  disk, after which the box boots the same chain with the dongle removed.
+  and press `i` during the 3-second countdown to pick the "offload" entry (see below); the live
+  boot installs the signed loaders + boot entry on the disk, after which the box boots the same
+  chain with the dongle removed.
+
+---
+
+## The boot menu auto-selects the live entry after 3 seconds
+
+A wall boots with nobody at the keyboard, so `GET /boot/grub.cfg` sets `timeout=3`, `default=live`
+and — load-bearing — **`timeout_style=countdown`**. Under GRUB's default `menu` style, `run_menu()`
+unsets `timeout` on *any* key it reads, and that includes the negative error values a flaky EFI
+console hands back from `grub_getkey_noblock()`: one stray keystroke and the screen sits on the menu
+until a human arrives. The countdown loop only breaks on a menu hotkey or an interrupt key, so
+neither a bumped keyboard nor a chatty console can strand a screen.
+
+What an operator sees is a 3-second countdown rather than a menu. **Esc** opens the full menu, and
+**`i`** jumps straight to "Polyptic (Install Bootloader)" — it carries `--hotkey=i` precisely because
+the countdown hides the menu it would otherwise be selected from. The live ISO's menu
+(`deploy/build-live-iso.sh`) is configured the same way, for the same reason.
 
 ---
 

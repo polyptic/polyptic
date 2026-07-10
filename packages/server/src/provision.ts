@@ -235,6 +235,13 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
  * `$var` in the emitted config is GRUB runtime syntax, written literally (never JS interpolation); the
  * commands are plain `linux`/`initrd` (noble's signed GRUB has no linuxefi). When the computed base is
  * https, http is emitted anyway: GRUB has no TLS, the boot depot is plain-HTTP by contract.
+ *
+ * POL-52: `timeout_style=countdown` is LOAD-BEARING, not cosmetic. Under the default `menu` style
+ * GRUB's run_menu() unsets `timeout` on ANY key it reads — including the negative error values a
+ * flaky EFI console returns from grub_getkey_noblock() — so the menu parks forever and the wall
+ * never boots. The countdown loop only breaks on a menu hotkey or an interrupt key (Esc), so a
+ * stray keystroke or a console read error can no longer strand a screen. Esc still opens the menu,
+ * and `--hotkey=i` reaches the (rare, deliberate) offload entry straight from the countdown.
  */
 export function buildBootGrubCfg(base: string, token: string | undefined): string {
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
@@ -254,14 +261,15 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
   lines.push(
     'if [ "$grub_cpu" = "x86_64" ]; then set arch=amd64; else set arch=arm64; fi',
     `set net=(http,${hostPort})`,
-    "set timeout=5",
+    "set timeout=3",
+    "set timeout_style=countdown",
     "set default=live",
     'menuentry "Polyptic (Live Bootloader)" --id live {',
     '  echo "Polyptic: streaming the $arch live image into RAM ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
-    'menuentry "Polyptic (Install Bootloader)" --id offload {',
+    'menuentry "Polyptic (Install Bootloader)" --id offload --hotkey=i {',
     '  echo "Polyptic: offload mode, the live image will install the loader, then keep booting ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1`,
     "  initrd $net/dist/image/$arch/initrd",

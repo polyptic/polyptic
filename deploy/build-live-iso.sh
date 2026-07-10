@@ -108,9 +108,13 @@ echo '==> [3/5] bake the enrolment cmdline into /boot/grub/grub.cfg'
 # `quiet splash` (POL-7/POL-38): the squashfs carries the Polyptic Plymouth theme and dracut bundled
 # it into the initrd; these flags are what replace the scrolling kernel/systemd text with it.
 # `plymouth.ignore-serial-consoles` is load-bearing on arm64 VMs (implicit devicetree serial console).
+# POL-52: `countdown` (not the default `menu` style) is load-bearing — under `menu`, GRUB unsets
+# `timeout` on ANY key it reads, including a flaky EFI console's error returns, and the ISO then sits
+# on the menu forever. The countdown only breaks on a hotkey or Esc. Esc still opens the menu.
 mkdir -p "$TREE/boot/grub"
 cat > "$TREE/boot/grub/grub.cfg" <<EOF
-set timeout=5
+set timeout=3
+set timeout_style=countdown
 set default=0
 menuentry "Polyptic" {
     set gfxpayload=keep

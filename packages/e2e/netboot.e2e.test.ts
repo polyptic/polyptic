@@ -244,6 +244,23 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
+    "the menu auto-selects the live entry after 3s, and a stray keystroke cannot strand the box",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      // POL-52: a bare box boots with nobody at the keyboard, so the menu must fall through on its own.
+      expect(body).toMatch(/^set timeout=3$/m);
+      expect(body).toMatch(/^set default=live$/m);
+      // `countdown` is the whole fix, not decoration: under GRUB's default `menu` style run_menu()
+      // unsets `timeout` on ANY key it reads (a stray keystroke, or the negative error a flaky EFI
+      // console hands back from grub_getkey_noblock) and the wall then waits for a human forever.
+      expect(body).toMatch(/^set timeout_style=countdown$/m);
+      // Countdown hides the menu, so the deliberate install path needs a key that reaches it directly.
+      expect(body).toContain("--id offload --hotkey=i");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "a PORTLESS Host header (GRUB's http client) still bakes the socket's real port into the menu",
     async () => {
       // GRUB 2.12 sends `Host: <ip>` with no port; trusting it verbatim once baked port-80 URLs
