@@ -220,12 +220,17 @@ touch "$ROOTFS/etc/.updated" "$ROOTFS/var/.updated"
 
 echo '==> [6/8] chroot: dracut initramfs (--no-hostonly), matched to this kernel'
 # dmsquash-live + livenet are the `root=live:<url>` pair; polyptic-live (deploy/live/) is our own
-# module and carries the netboot RAM pre-flight. The omitted modules are storage stacks a diskless
-# kiosk never has — multipath in particular used to spray "fatal configuration error" across the
-# console before plymouth owned the screen (POL-38).
+# module and carries the netboot RAM pre-flight, the bounded wait-online, and the splash narration.
+# `systemd-resolved` is LOAD-BEARING, not decoration: networkd gets the DHCP lease, but nothing
+# else in the initramfs can resolve NAMES — without resolved, livenet's curl dies with "Could not
+# resolve host" against a DNS bootHost while a raw-IP URL works fine (found on the first
+# real-hardware boot, 2026-07-10; resolved reads the lease DNS straight from networkd's state
+# files, no dbus needed). The omitted modules are storage stacks a diskless kiosk never has —
+# multipath in particular used to spray "fatal configuration error" across the console before
+# plymouth owned the screen (POL-38).
 chroot "$ROOTFS" /bin/sh -eux <<CHROOT
 dracut --force --no-hostonly --no-hostonly-cmdline \
-  --add "dmsquash-live livenet polyptic-live plymouth" \
+  --add "dmsquash-live livenet polyptic-live plymouth systemd-resolved" \
   --omit "multipath lvm mdraid crypt btrfs iscsi nfs nbd" \
   --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop" \
   --kver "$KVER" "/boot/initrd.img-$KVER"
