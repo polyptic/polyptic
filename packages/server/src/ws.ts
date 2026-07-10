@@ -51,6 +51,7 @@ import type { ControlPlane, RegisterMachineInput, ScreenAssignment } from "./sta
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
+import { ShellRelay } from "./shell-relay";
 
 interface WsDeps {
   server: Server;
@@ -72,9 +73,13 @@ interface WsDeps {
   allowedOrigins: string[];
 }
 
-export function attachWebSockets(deps: WsDeps): void {
+export function attachWebSockets(deps: WsDeps): ShellRelay {
   const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, log, allowedOrigins } =
     deps;
+
+  // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
+  // Returned so REST (arm/disarm) can close a box's sessions the moment it is disarmed.
+  const shellRelay = new ShellRelay(agentHub, control, activity, log);
 
   const agentWss = new WebSocketServer({ noServer: true });
   const playerWss = new WebSocketServer({ noServer: true });
@@ -133,14 +138,16 @@ export function attachWebSockets(deps: WsDeps): void {
   });
 
   agentWss.on("connection", (ws: WebSocket) =>
-    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, log),
+    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, shellRelay, log),
   );
   playerWss.on("connection", (ws: WebSocket) =>
     handlePlayer(ws, control, hub, presence, broadcaster, activity, log),
   );
   adminWss.on("connection", (ws: WebSocket) =>
-    handleAdmin(ws, adminHub, broadcaster, log),
+    handleAdmin(ws, adminHub, broadcaster, control, shellRelay, log),
   );
+
+  return shellRelay;
 }
 
 function handleAgent(
@@ -152,6 +159,7 @@ function handleAgent(
   broadcaster: AdminBroadcaster,
   activity: ActivityLog,
   capture: CaptureCoordinator,
+  shellRelay: ShellRelay,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected" }, "agent socket opened");
@@ -364,6 +372,12 @@ function handleAgent(
         { event: "agent.reboot_ack", machineId: msg.machineId, accepted: msg.accepted, reason: msg.reason },
         msg.accepted ? "agent accepted reboot" : "agent refused reboot",
       );
+    } else if (msg.t === "agent/shell-opened") {
+      shellRelay.openedFromAgent(msg.machineId, msg.sessionId, msg.ok, msg.reason);
+    } else if (msg.t === "agent/shell-data") {
+      shellRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
+    } else if (msg.t === "agent/shell-closed") {
+      shellRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
     } else if (msg.t === "agent/inspect-ack") {
       // POL-50 — the box's answer to `server/inspect`, and the ONLY writer of the `inspecting` flag:
       // the operator's click is a request, but only the wall knows whether surf relaunched and took
@@ -415,6 +429,7 @@ function handleAgent(
   });
 
   ws.on("close", (code) => {
+    if (machineId) shellRelay.agentDisconnected(machineId);
     if (machineId && hubRegistered) agentHub.remove(machineId, ws);
     if (machineId && presenceMarked) {
       // Resolve the machine BEFORE dropping presence; emit only on the true online→offline edge — and
@@ -533,6 +548,8 @@ function handleAdmin(
   ws: WebSocket,
   adminHub: AdminHub,
   broadcaster: AdminBroadcaster,
+  control: ControlPlane,
+  shellRelay: ShellRelay,
   log: FastifyBaseLogger,
 ): void {
   adminHub.add(ws);
@@ -558,10 +575,20 @@ function handleAdmin(
         ws.send(JSON.stringify(broadcaster.snapshot()));
       }
       log.info({ event: "admin.hello" }, "admin registered");
+    } else if (msg.t === "admin/shell-open") {
+      // POL-59: the operator opened a terminal on a box. The relay enforces armed + approved + online.
+      shellRelay.openFromAdmin(ws, msg.machineId, msg.cols, msg.rows);
+    } else if (msg.t === "admin/shell-data") {
+      shellRelay.dataFromAdmin(ws, msg.machineId, msg.sessionId, msg.dataBase64);
+    } else if (msg.t === "admin/shell-resize") {
+      shellRelay.resizeFromAdmin(ws, msg.machineId, msg.sessionId, msg.cols, msg.rows);
+    } else if (msg.t === "admin/shell-close") {
+      shellRelay.closeFromAdmin(ws, msg.machineId, msg.sessionId);
     }
   });
 
   ws.on("close", (code) => {
+    shellRelay.adminDisconnected(ws);
     adminHub.remove(ws);
     log.info({ event: "admin.disconnected", code, admins: adminHub.count() }, "admin socket closed");
   });

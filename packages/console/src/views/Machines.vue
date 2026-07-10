@@ -24,6 +24,7 @@ import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
 import ScreenRow from "../components/ScreenRow.vue";
 import ColdStartWizard from "../components/ColdStartWizard.vue";
+import MachineTerminal from "../components/MachineTerminal.vue";
 
 const store = useConsoleStore();
 
@@ -98,6 +99,27 @@ async function reboot(m: MachineView): Promise<void> {
   if (!yes) return;
   const error = await store.rebootMachine(m.id);
   showToast(error ?? `Rebooting ${m.label}…`);
+}
+
+// ── Remote shell (POL-59) ────────────────────────────────────────────────────
+// A box must be ARMED before an operator can open a terminal; arming is off by default so a console
+// compromise can't silently reach a shell on the fleet. The terminal itself is a modal panel.
+const terminalFor = ref<MachineView | null>(null);
+
+async function toggleShell(m: MachineView): Promise<void> {
+  const enabling = !m.shellEnabled;
+  if (enabling && !window.confirm(
+    `Arm the remote shell for "${m.label}"? While armed, an operator can open a root-less terminal on ` +
+      `this box. It cannot change what the screen displays. Disarm it when you're done.`,
+  )) {
+    return;
+  }
+  await store.setMachineShell(m.id, enabling);
+  if (!enabling && terminalFor.value?.id === m.id) terminalFor.value = null;
+}
+
+function openTerminal(m: MachineView): void {
+  terminalFor.value = m;
 }
 
 const toast = ref("");
@@ -225,6 +247,23 @@ function drives(m: MachineView): string {
                 >
                   Reboot
                 </button>
+                <button
+                  v-if="m.online"
+                  class="btn-ghost-sm"
+                  :class="{ 'shell-armed': m.shellEnabled }"
+                  :title="m.shellEnabled ? 'Disarm the remote shell' : 'Arm the remote shell for debugging'"
+                  @click="toggleShell(m)"
+                >
+                  {{ m.shellEnabled ? "Shell armed" : "Arm shell" }}
+                </button>
+                <button
+                  v-if="m.online && m.shellEnabled"
+                  class="btn-ghost-sm"
+                  title="Open a terminal on this machine"
+                  @click="openTerminal(m)"
+                >
+                  Console
+                </button>
                 <button class="btn-revoke" @click="revoke(m)">Revoke</button>
                 <button class="btn-remove" @click="remove(m)">Remove</button>
               </div>
@@ -276,6 +315,15 @@ function drives(m: MachineView): string {
 
     <!-- cold-start wizard overlay -->
     <ColdStartWizard :open="wizardOpen" :now="now" @close="wizardOpen = false" />
+
+    <!-- remote-shell terminal (POL-59) -->
+    <MachineTerminal
+      v-if="terminalFor"
+      :key="terminalFor.id"
+      :machine-id="terminalFor.id"
+      :machine-label="terminalFor.label"
+      @close="terminalFor = null"
+    />
 
     <Transition name="toast">
       <div v-if="toast" class="toast">{{ toast }}</div>
@@ -619,6 +667,11 @@ function drives(m: MachineView): string {
   margin-top: 12px;
   font-size: 12px;
   color: var(--muted2);
+}
+
+.btn-ghost-sm.shell-armed {
+  color: #b45309;
+  border-color: #f59e0b;
 }
 
 /* toast (reboot feedback) */

@@ -194,6 +194,23 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
 });
 
 registerAuthRoutes(fastify, auth, enrollment);
+// The WS channels attach first so the remote-shell relay (POL-59) exists before REST — the
+// arm/disarm endpoint closes a box's live sessions the instant it is disarmed.
+const shellRelay = attachWebSockets({
+  server: fastify.server,
+  control,
+  enrollment,
+  auth,
+  hub,
+  agentHub,
+  adminHub,
+  presence,
+  broadcaster,
+  activity,
+  capture,
+  log: fastify.log,
+  allowedOrigins: CORS_ORIGIN,
+});
 registerRestRoutes(
   fastify,
   control,
@@ -209,6 +226,7 @@ registerRestRoutes(
   tokens,
   activity,
   presence,
+  shellRelay,
 );
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).
@@ -311,21 +329,6 @@ fastify.post("/api/v1/settings/image/activate", async (request, reply) => {
     return reply.code(404).send({ error: (err as Error).message });
   }
   return imageUpdateInfo(request);
-});
-attachWebSockets({
-  server: fastify.server,
-  control,
-  enrollment,
-  auth,
-  hub,
-  agentHub,
-  adminHub,
-  presence,
-  broadcaster,
-  activity,
-  capture,
-  log: fastify.log,
-  allowedOrigins: CORS_ORIGIN,
 });
 
 // ── Phase 8 — SPA HOSTING (opt-in): when CONSOLE_DIR / PLAYER_DIR point at built dists, serve them as

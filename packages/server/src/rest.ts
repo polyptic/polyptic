@@ -28,6 +28,8 @@
  */
 import { z } from "zod";
 
+import type { ShellRelay } from "./shell-relay";
+
 import {
   CombineScreensBody,
   CreateContentSourceBody,
@@ -38,6 +40,7 @@ import {
   InspectBody,
   PlaceScreenBody,
   RebootBody,
+  ShellArmBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
@@ -101,6 +104,7 @@ export function registerRestRoutes(
   tokens: TokenService,
   activity: ActivityLog,
   presence: Presence,
+  shellRelay: ShellRelay,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -422,6 +426,31 @@ export function registerRestRoutes(
       "pushed reboot to agent",
     );
     return { ok: true, machineId: machine.id, delivered };
+  });
+
+  // POST /api/v1/machines/:machineId/shell  { enabled }  -> arm/disarm the remote shell (POL-59)
+  //
+  // GATED (under /api/v1). Arming lets an operator open a terminal on the box over the agent WS;
+  // it is OFF by default per box so a console compromise can't silently reach a shell on the fleet.
+  // Disarming immediately closes any live session (the relay also re-checks armed on every byte).
+  fastify.post("/api/v1/machines/:machineId/shell", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    const body = ShellArmBody.safeParse(request.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+
+    const machine = await control.setShellEnabled(params.data.machineId, body.data.enabled);
+    if (!machine) return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+
+    // Disarming must not leave a terminal open on a box the operator just locked down.
+    if (!body.data.enabled) shellRelay.closeMachineSessions(machine.id, "remote shell disarmed");
+
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.shell", machineId: machine.id, enabled: body.data.enabled },
+      body.data.enabled ? "remote shell armed" : "remote shell disarmed",
+    );
+    return { ok: true, machineId: machine.id, shellEnabled: machine.shellEnabled ?? false };
   });
 
   // POST /api/v1/screens/:screenId/inspect  { on }  -> pop the Web Inspector ON that panel (POL-50)

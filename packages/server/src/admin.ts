@@ -173,6 +173,7 @@ export function buildAdminState(
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,
       lastSeen: machine.lastSeen,
+      shellEnabled: machine.shellEnabled ?? false,
       screens: machineScreens,
     } satisfies MachineView;
   });

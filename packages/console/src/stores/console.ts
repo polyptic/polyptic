@@ -61,6 +61,13 @@ const DEFAULT_PLACEMENT_H = 1080;
 // Socket + reconnect bookkeeping live at module scope (not in reactive state) — the store is a
 // singleton, and a WebSocket should never be made reactive.
 let socket: WebSocket | null = null;
+
+// Remote-shell frames (POL-59) bypass the strict admin-state parse: they are a hot byte stream the
+// terminal component consumes directly. The store owns the single admin socket, so it fans
+// `server/shell-*` frames out to whichever terminal subscribed, and lets the terminal push
+// `admin/shell-*` frames back over the same socket.
+type ShellFrame = { t: string; machineId?: string; sessionId?: string; ok?: boolean; reason?: string; dataBase64?: string };
+const shellListeners = new Set<(f: ShellFrame) => void>();
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let backoffMs = RECONNECT_MIN_MS;
 let stopped = false;
@@ -639,6 +646,18 @@ export const useConsoleStore = defineStore("console", {
       });
 
       ws.addEventListener("message", (ev) => {
+        // Peek at the type: remote-shell frames go straight to the terminal, everything else through
+        // the strict admin-state parse.
+        let raw: ShellFrame | undefined;
+        try {
+          raw = JSON.parse(ev.data as string) as ShellFrame;
+        } catch {
+          raw = undefined;
+        }
+        if (raw && typeof raw.t === "string" && raw.t.startsWith("server/shell-")) {
+          for (const cb of shellListeners) cb(raw);
+          return;
+        }
         let msg: ServerToAdminMessage;
         try {
           msg = parseMessage(ServerToAdminMessage, ev.data as string);
@@ -781,6 +800,35 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] identMachine failed", err);
       }
+    },
+
+    /**
+     * Arm or disarm a box's remote shell (POL-59). Optimistic so the toggle is snappy; the
+     * authoritative admin/state broadcast reconciles. Disarming a box the server-side closes any
+     * live session — the terminal component sees `server/shell-closed` and tears down.
+     */
+    async setMachineShell(id: string, enabled: boolean): Promise<void> {
+      const machine = this.machines.find((m) => m.id === id);
+      if (machine) machine.shellEnabled = enabled; // optimistic
+      try {
+        await api.setMachineShell(id, enabled);
+      } catch (err) {
+        if (machine) machine.shellEnabled = !enabled; // revert
+        console.error("[console] setMachineShell failed", err);
+      }
+    },
+
+    /** Send an `admin/shell-*` frame over the live admin socket (the terminal component's uplink). */
+    sendShellFrame(frame: Record<string, unknown>): boolean {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+      socket.send(JSON.stringify(frame));
+      return true;
+    },
+
+    /** Subscribe to `server/shell-*` frames (the terminal component's downlink). Returns unsubscribe. */
+    onShellFrame(cb: (f: ShellFrame) => void): () => void {
+      shellListeners.add(cb);
+      return () => shellListeners.delete(cb);
     },
 
     /**

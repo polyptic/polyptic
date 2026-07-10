@@ -57,6 +57,9 @@ export const Machine = z.object({
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
   lastSeen: z.string().datetime().optional(),
+  /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
+   *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
+  shellEnabled: z.boolean().default(false),
 });
 export type Machine = z.infer<typeof Machine>;
 
@@ -201,6 +204,48 @@ export const AgentRebootAck = z.object({
   reason: z.string().optional(),
 });
 
+// ── Remote shell (POL-59) ─────────────────────────────────────────────────────
+//
+// An operator-initiated, UNPRIVILEGED PTY on a running box, tunnelled over the agent's EXISTING
+// outbound WS. A kiosk box sits behind NAT and dials out (D12), so there is nothing to SSH *into*;
+// relaying a terminal over the channel we already authenticate reuses the whole trust model and
+// adds no inbound surface, no sshd, and no second key system.
+//
+// The shell is DISARMED by default and armed per box by an operator (`Machine.shellEnabled`), runs
+// as the unprivileged kiosk user, and cannot change what the wall displays. Bytes are base64 so a
+// PTY's raw output (which is not valid UTF-8 mid-sequence) survives a JSON frame intact.
+
+/** One shell session, scoped to one machine. Minted by the server when an operator opens a terminal. */
+export const ShellSessionId = z.string().min(1).max(64);
+
+/** Agent → server: the PTY started (or refused to). `ok: false` carries the reason for the operator. */
+export const AgentShellOpened = z.object({
+  t: z.literal("agent/shell-opened"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  ok: z.boolean(),
+  /** Why the agent declined: not armed, no PTY available, wrong backend, spawn failure. */
+  reason: z.string().optional(),
+});
+
+/** Agent → server: a chunk of PTY output (stdout+stderr, base64). */
+export const AgentShellData = z.object({
+  t: z.literal("agent/shell-data"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  dataBase64: z.string(),
+});
+
+/** Agent → server: the PTY exited; the session is over and must not be reused. */
+export const AgentShellClosed = z.object({
+  t: z.literal("agent/shell-closed"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  /** Process exit code, when the shell exited normally. */
+  exitCode: z.number().int().optional(),
+  reason: z.string().optional(),
+});
+
 /** POL-50 — the agent's answer to `server/inspect`: whether the wall's Web Inspector is now open.
  *  This ack, not the operator's click, is what the console displays — only the box knows whether
  *  surf relaunched and took the keystroke. `ok: false` means the screen is un-inspected and carries
@@ -221,6 +266,9 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentStatus,
   AgentThumbnail,
   AgentRebootAck,
+  AgentShellOpened,
+  AgentShellData,
+  AgentShellClosed,
   AgentInspectAck,
 ]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
@@ -310,6 +358,37 @@ export const ServerToAgentRejected = z.object({
   reason: z.string(),
 });
 
+/** Server → agent: start a PTY for this session. The agent REFUSES unless the box is armed. */
+export const ServerToAgentShellOpen = z.object({
+  t: z.literal("server/shell-open"),
+  sessionId: ShellSessionId,
+  /** Initial terminal size; a PTY with a wrong size makes `top` and editors unusable. */
+  cols: z.number().int().positive().max(1000).default(80),
+  rows: z.number().int().positive().max(1000).default(24),
+});
+
+/** Server → agent: operator keystrokes (base64, so control bytes survive JSON). */
+export const ServerToAgentShellData = z.object({
+  t: z.literal("server/shell-data"),
+  sessionId: ShellSessionId,
+  dataBase64: z.string(),
+});
+
+/** Server → agent: the operator's terminal was resized; SIGWINCH the PTY. */
+export const ServerToAgentShellResize = z.object({
+  t: z.literal("server/shell-resize"),
+  sessionId: ShellSessionId,
+  cols: z.number().int().positive().max(1000),
+  rows: z.number().int().positive().max(1000),
+});
+
+/** Server → agent: tear the PTY down (operator closed the terminal, disarmed the box, or dropped). */
+export const ServerToAgentShellClose = z.object({
+  t: z.literal("server/shell-close"),
+  sessionId: ShellSessionId,
+  reason: z.string().optional(),
+});
+
 export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentApply,
   ServerToAgentIdent,
@@ -319,6 +398,10 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
+  ServerToAgentShellOpen,
+  ServerToAgentShellData,
+  ServerToAgentShellResize,
+  ServerToAgentShellClose,
 ]);
 export type ServerToAgentMessage = z.infer<typeof ServerToAgentMessage>;
 
@@ -430,6 +513,8 @@ export const MachineView = z.object({
   status: EnrollmentStatus, // pending machines await operator approval
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
+  /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
+  shellEnabled: z.boolean().default(false),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;
@@ -577,8 +662,79 @@ export const AdminHello = z.object({
   t: z.literal("admin/hello"),
   protocol: z.literal(PROTOCOL_VERSION),
 });
-export const AdminMessage = z.discriminatedUnion("t", [AdminHello]);
+// ── Remote shell, operator half (POL-59) ─────────────────────────────────────
+// The console opens/feeds/closes a terminal over the SAME authenticated /admin socket it already
+// uses for state. The server relays to the machine's agent socket and back; it never interprets
+// the bytes. `machineId` is on every frame: the relay is scoped to one box, never broadcast.
+
+export const AdminShellOpen = z.object({
+  t: z.literal("admin/shell-open"),
+  machineId: z.string(),
+  cols: z.number().int().positive().max(1000).default(80),
+  rows: z.number().int().positive().max(1000).default(24),
+});
+
+export const AdminShellData = z.object({
+  t: z.literal("admin/shell-data"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  dataBase64: z.string(),
+});
+
+export const AdminShellResize = z.object({
+  t: z.literal("admin/shell-resize"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  cols: z.number().int().positive().max(1000),
+  rows: z.number().int().positive().max(1000),
+});
+
+export const AdminShellClose = z.object({
+  t: z.literal("admin/shell-close"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+});
+
+export const AdminMessage = z.discriminatedUnion("t", [
+  AdminHello,
+  AdminShellOpen,
+  AdminShellData,
+  AdminShellResize,
+  AdminShellClose,
+]);
 export type AdminMessage = z.infer<typeof AdminMessage>;
+
+/** Server → admin: the session the operator asked for is live (or was refused). */
+export const ServerToAdminShellOpened = z.object({
+  t: z.literal("server/shell-opened"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  ok: z.boolean(),
+  reason: z.string().optional(),
+});
+
+/** Server → admin: PTY output, relayed verbatim from the box. */
+export const ServerToAdminShellData = z.object({
+  t: z.literal("server/shell-data"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  dataBase64: z.string(),
+});
+
+/** Server → admin: the session ended (shell exited, box dropped, or the operator disarmed it). */
+export const ServerToAdminShellClosed = z.object({
+  t: z.literal("server/shell-closed"),
+  machineId: z.string(),
+  sessionId: ShellSessionId,
+  reason: z.string().optional(),
+});
+
+export const ServerToAdminShellMessage = z.discriminatedUnion("t", [
+  ServerToAdminShellOpened,
+  ServerToAdminShellData,
+  ServerToAdminShellClosed,
+]);
+export type ServerToAdminShellMessage = z.infer<typeof ServerToAdminShellMessage>;
 
 /** A line in the Live Activity feed — a human-readable record of a notable event. */
 export const ActivityEvent = z.object({
@@ -654,6 +810,10 @@ export type IdentBody = z.infer<typeof IdentBody>;
 /** Reboot request for one machine (POL-55). The reason rides through to the box's journal. */
 export const RebootBody = z.object({ reason: z.string().max(200).optional() });
 export type RebootBody = z.infer<typeof RebootBody>;
+
+/** POST /api/v1/machines/:id/shell — arm or disarm a box for the remote shell (POL-59). */
+export const ShellArmBody = z.object({ enabled: z.boolean() });
+export type ShellArmBody = z.infer<typeof ShellArmBody>;
 
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });
