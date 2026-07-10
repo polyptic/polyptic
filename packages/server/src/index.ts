@@ -207,6 +207,7 @@ registerRestRoutes(
     maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
   },
   tokens,
+  activity,
 );
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).
@@ -246,7 +247,12 @@ imageUpdates.start();
 
 // Pass the live enrollment singleton so GET /boot/grub.cfg (POL-33/D47) bakes the CURRENT token, the
 // same one the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
-registerProvisionRoutes(fastify, provisionConfig, enrollment, imageUpdates);
+// The last argument lands a box's bootloader-install verdict (POL-58) in the Live Activity feed: the
+// operator finds out whether the install took from the console, not by rebooting the box to see.
+registerProvisionRoutes(fastify, provisionConfig, enrollment, imageUpdates, (severity, text) => {
+  activity.push(severity, text);
+  broadcaster.broadcast();
+});
 
 // ── Image-updates operator surface (POL-41), GATED under /api/v1. ──
 const imageUpdateInfo = async (request: FastifyRequest) => {

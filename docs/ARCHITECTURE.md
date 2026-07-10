@@ -18,7 +18,7 @@ FleetState{ desiredRevision, scenes, activeSceneId }
 
 **Surface types:** `web-url | dashboard-panel | dashboard-page` (player iframes) · `web-window | native-app` (agent places top-level windows via `swaymsg`) · `image | video | slideshow`.
 
-**Page zoom (POL-57/D59):** framed surfaces carry a `zoom` scale factor (0.25–4, default 1). The player lays the iframe out at `1/zoom` of the box it must fill and scales it back up, so the page sees a smaller CSS viewport and re-lays-out — a browser's zoom, not a magnifying glass. The control plane remembers the value per `(screen-or-wall, page)` pair and re-applies it whenever that page lands on that target again.
+**Page zoom (POL-57/D62):** framed surfaces carry a `zoom` scale factor (0.25–4, default 1). The player lays the iframe out at `1/zoom` of the box it must fill and scales it back up, so the page sees a smaller CSS viewport and re-lays-out — a browser's zoom, not a magnifying glass. The control plane remembers the value per `(screen-or-wall, page)` pair and re-applies it whenever that page lands on that target again.
 
 **Reconcile:** activating a scene bumps one global `desiredRevision`; the controller recomputes each machine's slice (its screens' regions + surfaces) and fans out `apply`; agents report `observedRevision`. Mirrors a Kubernetes controller's `generation`/`observedGeneration`. Optional PREPARE/COMMIT barrier for tear-free flips across all screens at once. Health is exposed as Prometheus metrics on the server and per-agent status over WSS — no external bus required.
 
@@ -49,12 +49,13 @@ When we say "build the auth-strategy seam from day one," we mean Bucket A is a p
 GET    /api/v1/machines | /screens | /layouts | /scenes
 POST   /api/v1/screens/:id:ident            # flash name on the physical panel
 POST   /api/v1/screens/:id (rename, remap)
+POST   /api/v1/machines/:id/reboot {reason?} # power-cycle one box (409 offline / not approved)
 POST   /api/v1/scenes                        # create immutable versioned scene
 POST   /api/v1/fleet:activate-scene {sceneId}
 GET    /api/v1/screens/:id/preview            # latest grim thumbnail
 POST   /api/v1/screens/:id:vnc                # open on-demand wayvnc tunnel
 GET    /metrics                               # Prometheus
-WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack
+WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack, reboot
 WS     /ui         (browser → server)          live layout, thumbnails, health
 WS     /player?screen=<id>  (Chromium → server) desired surfaces for this screen
 ```
@@ -74,6 +75,9 @@ power on
 ```
 ### Boot splash (POL-7)
 Instead of raw kernel/systemd console text, the wall shows a branded **Plymouth** splash from early boot until the player paints — **and again through shutdown/reboot** (setup enables the shipped `plymouth-{poweroff,reboot,halt,kexec}` units; the script keys off `Plymouth.GetMode()` to show "Shutting down"/"Restarting"), so no console text shows at either end. `polyptic-agent setup` installs a `script`-plugin theme under `/usr/share/plymouth/themes/polyptic`, sets it default (`plymouth-set-default-theme -R`), and adds `quiet splash plymouth.ignore-serial-consoles` to the kernel cmdline (`/etc/default/grub` → `update-grub`, or `cmdline.txt` on Pi). It is **live**, not a static image: the script wires `SetUpdateStatusFunction` (systemd's "Starting …" messages), `SetBootProgressFunction` (a progress bar), and `SetMessageFunction` (anything the agent pushes with `plymouth message`). The **logo is a swappable SVG** (`logo.svg`, rasterised to PNG with `rsvg-convert` at install — vector, so it scales to any panel); the **version + hostname** are baked into a vector stamp from the build/host. Clean hand-off: a `plymouth-quit.service` drop-in + the compositor launcher both `quit --retain-splash`, so sway paints straight over the last frame with no flash. Disable with `setup --no-splash`; uninstall restores the prior theme + cmdline.
+### Reboot from the control plane (POL-55)
+An operator can power-cycle one box from Console ▸ Machines (`POST /api/v1/machines/:id/reboot` → `server/reboot` on that machine's live agent socket). The agent is **unprivileged** and the live image ships neither `sudo` nor polkit, so it does not reboot the box itself: `polyptic-agent setup` writes a root-owned pair whose only capability is rebooting — `polyptic-reboot.path` watches `/run/polyptic/requests/reboot`, and `polyptic-reboot.service` consumes that file and runs `systemctl --no-block reboot`. The agent's whole escalation is creating an empty file in the one directory (`0770 root:kiosk`, made each boot by a `tmpfiles.d` drop-in) it may write into — no command string, no argument to smuggle. `/run` is tmpfs, so a request can never survive the reboot it caused. The agent answers `agent/reboot-ack` **before** going down; a box that declines (dev backend, non-Linux, no helper) stays up and its reason lands in the console's activity feed. Distinct from the fleet-wide image roll-out (D51), where each box polls the manifest and reboots *itself*.
+
 ### Chromium launch (per output)
 `chromium --ozone-platform=wayland --app=<player-url?screen=ID> --user-data-dir=/home/kiosk/profiles/<ID> --password-store=basic --force-device-scale-factor=1 --no-first-run --no-default-browser-check --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars --noerrdialogs --disable-component-update --check-for-update-interval=31536000 --disable-features=Translate,InfobarUI`
 Before launch: sed-reset `exit_type`/`exited_cleanly` in `<profile>/Default/Preferences` so power cuts never show "Restore pages".

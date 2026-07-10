@@ -159,9 +159,11 @@ apt-get update -qq
 kernel="\$(apt-cache depends linux-image-generic | sed -n 's/.*Depends: \(linux-image-[0-9][^ ]*\)/\1/p' | head -n1)"
 [ -n "\$kernel" ] || { echo "cannot resolve the concrete kernel package behind linux-image-generic" >&2; exit 1; }
 echo "    kernel package: \$kernel"
+# procps (top/ps/free/vmstat) is deliberate, not bloat (~1.5 MB): the first hot box in the field
+# had NO way to answer "what is eating this CPU" from its debug shell (POL-35, 2026-07-10).
 apt-get install -y --no-install-recommends \
   systemd-sysv systemd-resolved libpam-systemd udev dbus kmod dmsetup \
-  iproute2 netplan.io ca-certificates curl efibootmgr \
+  iproute2 netplan.io ca-certificates curl efibootmgr procps \
   "\$kernel" dracut-core dracut-network
 # The curated firmware set. \`apt-cache policy\` guards each name so a package that does not exist for
 # this arch (the intel/amd graphics blobs on arm64) is skipped rather than failing the build.

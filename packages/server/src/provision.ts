@@ -35,9 +35,11 @@ import { open, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { NetbootInfo } from "@polyptic/protocol";
+import { BootReportBody, NetbootInfo } from "@polyptic/protocol";
+import type { BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
 
 /** Repo root (…/packages/server/src → repo) so the dev defaults find `deploy/dist` regardless of the
@@ -92,6 +94,11 @@ const IMAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const BOOT_FILE_RE = /^(polyptic-boot\.img|shimx64\.efi|shimaa64\.efi|grubx64\.efi|grubaa64\.efi)$/;
 /** The four signed loaders the depot serves and the offload flow installs (for the boot summary). */
 const SIGNED_LOADER_FILES = ["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grubaa64.efi"] as const;
+/** `POST /boot/report` throttle (POL-58): a rack being offloaded posts a handful of lines a minute, so
+ *  a burst of 10 with one token back every 6s is generous for real boxes and useless for a flooder. */
+const REPORT_BURST = 10;
+const REPORT_REFILL_MS = 6_000;
+
 /**
  * Resolve `segments` under `root`, asserting the result stays INSIDE `root` (no traversal). Returns
  * null if the join escapes the root — callers turn that into a 404, never a leak. Mirrors the media
@@ -203,10 +210,22 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
  * box has no operator session at boot, so the route is ungated; a leaked token cannot self-admit (a NEW
  * machine still lands PENDING for an operator to approve, see enroll.ts case 1). `$grub_cpu` selects
  * amd64/arm64 at boot so one menu serves both arches. The `--id offload` entry tags the cmdline so the
- * live image writes the signed loaders to the box's ESP once, then boots the same flow forever. Every
+ * live image writes the signed loaders to the box's ESP once, then boots the same flow forever. The
+ * `--id debug` entry is the live boot plus `systemd.debug-shell=1` — a passwordless root shell on tty9
+ * (Ctrl+Alt+F9), the ONLY interactive access a sealed kiosk image has (no passwords, no SSH). A menu
+ * item because hand-appending it in GRUB's editor (a wrapped multi-line `linux` line, a 5-second
+ * timeout) proved miserable at a hot box in the field. It grants nothing an attacker with keyboard +
+ * power didn't already have: GRUB configs are unverified in the shim model (D47), so anyone at the
+ * menu can already edit the cmdline; the entry never auto-boots (default stays `live`). Every
  * `$var` in the emitted config is GRUB runtime syntax, written literally (never JS interpolation); the
  * commands are plain `linux`/`initrd` (noble's signed GRUB has no linuxefi). When the computed base is
  * https, http is emitted anyway: GRUB has no TLS, the boot depot is plain-HTTP by contract.
+ *
+ * The menu is FLAT: three sibling entries, no submenu. A confirmation submenu was tried (POL-58) and
+ * reverted — it broke the very entry it guarded (see the `export` note below), and the reassurance it
+ * carried belongs in the console, where the operator reads it before walking to the box, not in a GRUB
+ * menu they are trying to get past. Offload is non-destructive by construction; nothing here needs a
+ * safety interlock.
  */
 export function buildBootGrubCfg(base: string, token: string | undefined): string {
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
@@ -226,20 +245,72 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
   lines.push(
     'if [ "$grub_cpu" = "x86_64" ]; then set arch=amd64; else set arch=arm64; fi',
     `set net=(http,${hostPort})`,
+    // `export` is LOAD-BEARING, not tidiness (POL-58). GRUB opens a fresh environment context for a
+    // `submenu` (`normal/menu.c`: `if (entry->submenu) grub_env_context_open()`), and ONLY exported
+    // variables cross a context boundary. A submenu wrapped around these entries therefore saw `$net`
+    // and `$arch` as empty and asked the firmware for `/dist/image//vmlinuz` — "file not found", on a
+    // box that had booted the identical top-level entry moments before. Exporting them makes the menu
+    // safe to nest; a plain top-level menuentry never opened a context and always worked.
+    "export arch",
+    "export net",
     "set timeout=5",
     "set default=live",
-    'menuentry "Polyptic (Live Bootloader)" --id live {',
+    'menuentry "Polyptic (Live)" --id live {',
     '  echo "Polyptic: streaming the $arch live image into RAM ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
-    'menuentry "Polyptic (Install Bootloader)" --id offload {',
+    'menuentry "Polyptic (Offload Bootloader)" --id offload {',
     '  echo "Polyptic: offload mode, the live image will install the loader, then keep booting ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
+    'menuentry "Polyptic (Debug Console)" --id debug {',
+    '  echo "Polyptic: live boot + root shell on tty9 (Ctrl+Alt+F9) ..."',
+    `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} systemd.debug-shell=1`,
+    "  initrd $net/dist/image/$arch/initrd",
+    "}",
   );
   return lines.join("\n") + "\n";
+}
+
+/** A netbooted box has no operator watching its journal, so a bootloader install that fails has, until
+ *  POL-58, failed in silence. `POST /boot/report` turns each outcome into ONE Live Activity line. */
+export type ActivitySink = (severity: "info" | "good" | "warn" | "bad", text: string) => void;
+
+/** How the operator is addressed: the stable netboot id when the box derived one, else "a machine". */
+function reporterName(machineId: string): string {
+  const id = machineId.trim();
+  if (id.length === 0) return "A machine";
+  return `Machine ${id.length > 24 ? `${id.slice(0, 24)}…` : id}`;
+}
+
+/**
+ * Render a boot report as one activity line + its severity (POL-58). `detail` is a sentence the box
+ * composed about its own firmware and disks; the server never parses it, only quotes it — the codes
+ * are the machine-readable half of the contract, and they are what tests pin.
+ *
+ * `installed` is `good`. Everything else is `bad` except the two "the operator has to decide" cases —
+ * an ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human.
+ */
+export function bootReportLine(report: BootReport): { severity: "good" | "warn" | "bad"; text: string } {
+  const who = reporterName(report.machineId);
+  const detail = report.detail.trim();
+  if (report.ok && report.code === "installed") {
+    return { severity: "good", text: `${who} installed the Polyptic bootloader${detail ? `: ${detail}` : ""}` };
+  }
+  const severity = report.code === "ambiguous-esp" || report.code === "not-uefi" ? "warn" : "bad";
+  return {
+    severity,
+    text: `${who} could not install the Polyptic bootloader (${report.code})${detail ? `: ${detail}` : ""}`,
+  };
+}
+
+/** The bearer token on a boot report, if any. Boxes send the fleet enrolment token they netbooted with. */
+function bearerToken(request: FastifyRequest): string | undefined {
+  const raw = headerFirst(request.headers.authorization);
+  const m = /^Bearer\s+(.+)$/i.exec(raw);
+  return m?.[1]?.trim() || undefined;
 }
 
 /**
@@ -392,6 +463,7 @@ export function registerProvisionRoutes(
   config: ProvisionConfig,
   enrollment: Enrollment,
   imageUpdates?: ImageManifestSource,
+  onBootReport?: ActivitySink,
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
 
@@ -441,6 +513,43 @@ export function registerProvisionRoutes(
   fastify.get("/grub/grub.cfg", serveBootConfig);
   fastify.get("/grub/x86_64-efi/grub.cfg", serveBootConfig);
   fastify.get("/grub/arm64-efi/grub.cfg", serveBootConfig);
+
+  // ── POST /boot/report — the box tells the control plane how its bootloader install went (POL-58).
+  //    The reporter is a diskless box mid-boot, before any agent session exists, so this lives beside
+  //    the boot depot rather than under /api/v1. In GATED mode it must present the fleet enrolment
+  //    token it netbooted with (same secret already baked into its cmdline); in OPEN mode — the dev
+  //    default, where that token does not exist — it is ungated like the rest of the depot. The body
+  //    can only ever produce ONE bounded activity line: the code is a closed enum, `detail` is capped
+  //    at 200 chars by the contract, and the bucket below stops a hostile boot network from flooding
+  //    the feed. Nothing here mutates the registry. ──
+  const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
+  fastify.post("/boot/report", async (request, reply) => {
+    if (!enrollment.open) {
+      const provided = bearerToken(request);
+      const expected = enrollment.currentToken;
+      if (expected === undefined || provided === undefined || !constantTimeEqual(provided, expected)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+    }
+
+    const parsed = BootReportBody.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid boot report" });
+
+    // Leaky bucket: refill one token per REPORT_REFILL_MS, never above the burst size.
+    const now = Date.now();
+    const gained = Math.floor((now - reportBucket.refilledAt) / REPORT_REFILL_MS);
+    if (gained > 0) {
+      reportBucket.tokens = Math.min(REPORT_BURST, reportBucket.tokens + gained);
+      reportBucket.refilledAt = now;
+    }
+    if (reportBucket.tokens <= 0) return reply.code(429).send({ error: "too many boot reports" });
+    reportBucket.tokens -= 1;
+
+    const { severity, text } = bootReportLine(parsed.data);
+    fastify.log.info({ event: "boot.report", code: parsed.data.code, ok: parsed.data.ok }, text);
+    onBootReport?.(severity, text);
+    return reply.code(204).send();
+  });
 
   // ── GET /dist/image/:arch/:file, the live-image artifacts (vmlinuz|initrd|rootfs.squashfs),
   //    Range-aware (the squashfs is large and streamed into RAM). 404 → the box's boot cleanly stalls. ──

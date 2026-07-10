@@ -209,6 +209,7 @@ describe("netboot: GET /boot/grub.cfg", () => {
       // Both menu entries by --id; dracut fetches the BARE squashfs; WS agent URL baked.
       expect(body).toContain("--id live");
       expect(body).toContain("--id offload");
+      expect(body).toContain("--id debug");
       expect(body).toContain(`root=live:http://${OPEN_HOST}/dist/image/$arch/rootfs.squashfs`);
       // The writable layer is an overlayfs in RAM. `rd.live.ram=1` must NEVER appear: it dd's a
       // SECOND full copy of the image into RAM on top of the one livenet already downloaded.
@@ -269,6 +270,43 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
+    "the menu is three flat entries with the names operators know, and no submenu",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      expect(body).toContain('menuentry "Polyptic (Live)" --id live');
+      expect(body).toContain('menuentry "Polyptic (Offload Bootloader)" --id offload');
+      expect(body).toContain('menuentry "Polyptic (Debug Console)" --id debug');
+      // A submenu opens a fresh GRUB environment context, which is what broke `$net`/`$arch` below.
+      expect(body).not.toContain("submenu ");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "`arch` and `net` are EXPORTED, so a nested entry can never resolve them to empty (POL-58)",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      // GRUB opens a new env context for a `submenu` and copies only EXPORTED variables into it. A
+      // confirmation submenu once wrapped the offload entry, so `$net` and `$arch` came out empty and
+      // GRUB asked for `/dist/image//vmlinuz` — file not found, on a box whose live entry booted fine.
+      // Both are set before any entry, and both are exported.
+      const archSet = body.indexOf("set arch=amd64");
+      const exportArch = body.indexOf("export arch");
+      const exportNet = body.indexOf("export net");
+      const firstEntry = body.indexOf("menuentry ");
+      expect(archSet).toBeGreaterThan(-1);
+      expect(exportArch).toBeGreaterThan(archSet);
+      expect(exportNet).toBeGreaterThan(-1);
+      expect(exportArch).toBeLessThan(firstEntry);
+      expect(exportNet).toBeLessThan(firstEntry);
+      // And no entry may hardcode an arch into the artifact path — `$arch` is the only selector.
+      expect(body).not.toContain("/dist/image/amd64/vmlinuz");
+      expect(body).not.toContain("/dist/image//vmlinuz");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "only the offload entry tags the cmdline with polyptic.offload=1",
     async () => {
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
@@ -280,6 +318,23 @@ describe("netboot: GET /boot/grub.cfg", () => {
       const offloadEntry = body.slice(offloadStart);
       expect(liveEntry).not.toContain("polyptic.offload=1");
       expect(offloadEntry).toContain("polyptic.offload=1");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the debug entry (and ONLY it) carries systemd.debug-shell=1, and never auto-boots",
+    async () => {
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      const debugStart = body.indexOf("--id debug");
+      expect(debugStart).toBeGreaterThan(-1);
+      const beforeDebug = body.slice(0, debugStart);
+      const debugEntry = body.slice(debugStart);
+      // The root-shell arg must not leak into the live/offload entries a wall boots unattended.
+      expect(beforeDebug).not.toContain("systemd.debug-shell=1");
+      expect(debugEntry).toContain("systemd.debug-shell=1");
+      // A debug boot is an operator CHOICE at the menu: the default entry stays the live boot.
+      expect(body).toContain("set default=live");
     },
     TEST_TIMEOUT,
   );
@@ -308,6 +363,158 @@ describe("netboot: GET /boot/grub.cfg", () => {
         expect(res.status).toBe(200);
         expect(await res.text()).toBe(canonical);
       }
+    },
+    TEST_TIMEOUT,
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /boot/report — how the bootloader install went (POL-58)
+//
+// The box that reports is diskless and mid-boot: no agent session exists yet, and on failure it will
+// never get one. Before this route, an install that could not make the firmware boot Polyptic failed
+// into a journal on a RAM disk — the operator learned about it by rebooting and landing back in the
+// machine's old OS. Each report becomes exactly one Live Activity line in the console.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Open `/admin`, read the first `admin/state`, close. A fresh client's snapshot is current state. */
+async function readAdminActivity(base: string): Promise<{ severity: string; text: string }[]> {
+  const ws = new WebSocket(`${base.replace("http://", "ws://")}/admin`);
+  try {
+    const message = await new Promise<string>((resolvePromise, reject) => {
+      const timer = setTimeout(() => reject(new Error("no admin/state within 5s")), 5_000);
+      ws.onmessage = (ev) => {
+        clearTimeout(timer);
+        resolvePromise(String(ev.data));
+      };
+      ws.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error("admin socket error"));
+      };
+    });
+    return JSON.parse(message).activity ?? [];
+  } finally {
+    ws.close();
+  }
+}
+
+const goodReport = {
+  ok: true,
+  code: "installed",
+  detail: "installed the signed loaders on /dev/nvme0n1 (partition 1)",
+  machineId: "dmi-4c4c4544-0031",
+};
+
+describe("netboot: POST /boot/report", () => {
+  test(
+    "OPEN mode: a successful install lands one `good` line in the Live Activity feed",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(goodReport),
+      });
+      expect(res.status).toBe(204);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      const line = activity.find((e) => e.text.includes("installed the Polyptic bootloader"));
+      expect(line).toBeDefined();
+      expect(line?.severity).toBe("good");
+      expect(line?.text).toContain("dmi-4c4c4544-0031");
+      expect(line?.text).toContain("/dev/nvme0n1");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a FAILED install is reported as `bad` and names the reason — the whole point of POL-58",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ok: false,
+          code: "boot-order-not-first",
+          detail: "the firmware would not make 'Polyptic Netboot' the first boot option",
+          machineId: "dmi-deadbeef",
+        }),
+      });
+      expect(res.status).toBe(204);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      const line = activity.find((e) => e.text.includes("boot-order-not-first"));
+      expect(line).toBeDefined();
+      expect(line?.severity).toBe("bad");
+      expect(line?.text).toContain("could not install the Polyptic bootloader");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "an unknown code or an oversized detail is a 400, never an activity line",
+    async () => {
+      const bad = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ok: false, code: "definitely-not-a-code", detail: "x" }),
+      });
+      expect(bad.status).toBe(400);
+
+      const huge = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ok: false, code: "no-esp", detail: "z".repeat(201) }),
+      });
+      expect(huge.status).toBe(400);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      expect(activity.some((e) => e.text.includes("definitely-not-a-code"))).toBe(false);
+      expect(activity.some((e) => e.text.includes("zzzzzzzzzz"))).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "GATED mode: the box must present the fleet enrolment token it netbooted with",
+    async () => {
+      const anon = await fetch(`${GATED_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(goodReport),
+      });
+      expect(anon.status).toBe(401);
+
+      const wrong = await fetch(`${GATED_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer not-the-token" },
+        body: JSON.stringify(goodReport),
+      });
+      expect(wrong.status).toBe(401);
+
+      const right = await fetch(`${GATED_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${FLEET_TOKEN}` },
+        body: JSON.stringify(goodReport),
+      });
+      expect(right.status).toBe(204);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a flood of reports is throttled, so a hostile boot network cannot drown the feed",
+    async () => {
+      const post = (): Promise<Response> =>
+        fetch(`${GATED_BASE}/boot/report`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${FLEET_TOKEN}` },
+          body: JSON.stringify({ ...goodReport, ok: false, code: "no-esp" }),
+        });
+      const codes: number[] = [];
+      for (let i = 0; i < 20; i++) codes.push((await post()).status);
+      expect(codes).toContain(429);
+      // …and the throttle is not an outage: the first few still got through.
+      expect(codes.filter((c) => c === 204).length).toBeGreaterThan(0);
     },
     TEST_TIMEOUT,
   );

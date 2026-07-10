@@ -349,6 +349,21 @@ function handleAgent(
         { event: "agent.status", machineId: msg.machineId, observedRevision: msg.observedRevision },
         "agent status",
       );
+    } else if (msg.t === "agent/reboot-ack") {
+      // POL-55 — the box's answer to `server/reboot`, sent just before it goes down. An ACCEPTED
+      // reboot needs no feed line: the socket close that follows already emits "went unreachable",
+      // then "connected" when it comes back. A REFUSAL is the interesting case — the box is still up
+      // and the operator's click did nothing, so say so, and say why.
+      const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+      if (!msg.accepted) {
+        activity.push("bad", `${label} refused to reboot: ${msg.reason ?? "no reason given"}`);
+        // Nothing else will broadcast: the box stayed up, so no presence edge follows.
+        broadcaster.broadcast();
+      }
+      log.info(
+        { event: "agent.reboot_ack", machineId: msg.machineId, accepted: msg.accepted, reason: msg.reason },
+        msg.accepted ? "agent accepted reboot" : "agent refused reboot",
+      );
     } else {
       // agent/thumbnail — the frame is already AgentMessage-validated; hand it to the coordinator,
       // which resolves connector→screenId, decodes the payload and stores the latest preview (Phase 5).

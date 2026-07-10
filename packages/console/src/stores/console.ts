@@ -784,6 +784,27 @@ export const useConsoleStore = defineStore("console", {
     },
 
     /**
+     * Power-cycle one box (POL-55). There is nothing to update optimistically — the machine goes
+     * offline of its own accord a moment later and the admin/state broadcast reflects it. Returns an
+     * operator-readable error when the server refused (offline, or not approved), else null.
+     */
+    async rebootMachine(id: string): Promise<string | null> {
+      try {
+        await api.rebootMachine(id);
+        return null;
+      } catch (err) {
+        console.error("[console] rebootMachine failed", err);
+        // The server's 409s explain themselves ("… is offline — nothing to reboot"); ApiError.message
+        // is only the method/path/status, so prefer the payload's own sentence when there is one.
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "Reboot failed — the control plane could not reach that machine.";
+      }
+    },
+
+    /**
      * Permanently forget a machine (POL-14): drop it, its screens, and anything derived from them
      * (placements, combined surfaces, selection) optimistically for a snappy feel; the authoritative
      * admin/state broadcast reconciles. Unlike rejectMachine (a remembered "rejected" state), this
