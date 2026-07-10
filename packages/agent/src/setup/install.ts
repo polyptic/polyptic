@@ -24,11 +24,19 @@ import { agentVersion } from "../version";
 import {
   AGENT_SERVICE,
   COMPOSITOR_LAUNCHER,
+  REBOOT_PATH_UNIT,
+  REBOOT_REQUEST_DIR,
+  REBOOT_SERVICE,
+  REBOOT_TMPFILES_PATH,
   SESSION_TARGET,
+  SYSTEM_UNIT_DIR,
   agentServiceUnit,
   compositorLauncher,
   greetdConfig,
   i3Config,
+  rebootPathUnit,
+  rebootServiceUnit,
+  rebootTmpfilesConf,
   sessionTargetUnit,
   swayConfig,
   xinitrc,
@@ -129,6 +137,10 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   assumptions.push(
     `the agent single binary is installed at ${opts.agentBin} (the .deb / installer places it; override with --agent-bin).`,
   );
+
+  // 5b ─ the privileged reboot helper (POL-55): reboot-from-the-control-plane needs root, the agent
+  // has none, and this image ships neither sudo nor polkit. See templates.ts for why a path unit.
+  writeRebootHelper(sys, opts, log, assumptions);
 
   // 6 ─ /etc/polyptic/agent.toml
   writeAgentConfig(sys, opts, log, needsVerification);
@@ -287,6 +299,32 @@ function writeCompositorConfig(
     COMPOSITOR_LAUNCHER,
     compositorLauncher({ backend: opts.backend, sessionCommand: compositorCommand, render: opts.render }),
     { mode: 0o755, desc: "compositor launcher" },
+  );
+}
+
+/**
+ * The one privileged host action (POL-55): a root-owned `.path` + `.service` pair whose only
+ * capability is rebooting, armed by the agent creating an empty file in a directory systemd-tmpfiles
+ * makes group-writable by the kiosk user. Written on EVERY setup (including the live-image build's
+ * chroot run), so a box either has the helper or falls back to `systemctl reboot` — never to sudo.
+ */
+function writeRebootHelper(sys: Sys, opts: SetupOptions, log: Logger, assumptions: string[]): void {
+  log.step("write the privileged reboot helper (systemd path unit)");
+  sys.writeFile(REBOOT_TMPFILES_PATH, rebootTmpfilesConf(opts.user), {
+    mode: 0o644,
+    desc: "reboot request dir (tmpfiles.d)",
+  });
+  sys.writeFile(`${SYSTEM_UNIT_DIR}/${REBOOT_PATH_UNIT}`, rebootPathUnit(), {
+    mode: 0o644,
+    desc: REBOOT_PATH_UNIT,
+  });
+  sys.writeFile(`${SYSTEM_UNIT_DIR}/${REBOOT_SERVICE}`, rebootServiceUnit(), {
+    mode: 0o644,
+    desc: REBOOT_SERVICE,
+  });
+  assumptions.push(
+    `the agent reboots the box by creating ${REBOOT_REQUEST_DIR}/reboot, which ${REBOOT_PATH_UNIT} ` +
+      `turns into a root \`systemctl reboot\` — no sudo, no polkit, and no command the agent can choose.`,
   );
 }
 
@@ -732,6 +770,13 @@ function enableServices(sys: Sys, log: Logger, state: SetupState): void {
   if (state.priorDefaultTarget === undefined && curTarget) state.priorDefaultTarget = curTarget;
 
   sys.exec("systemctl", ["enable", "greetd"], { desc: "enable greetd", allowFail: true });
+
+  // POL-55 — arm the reboot watcher. It must be enabled (not started): systemd starts .path units at
+  // boot, and a chroot install (the live-image build) has no manager to start anything anyway.
+  sys.exec("systemctl", ["enable", REBOOT_PATH_UNIT], {
+    desc: `enable ${REBOOT_PATH_UNIT} (control-plane reboot)`,
+    allowFail: true,
+  });
 
   // Free VT1 for greetd. greetdConfig runs on `vt = 1`, but systemd's getty.target also starts
   // getty@tty1 there. The getty's VT takeover (agetty's vhangup) SIGHUPs greetd's compositor session

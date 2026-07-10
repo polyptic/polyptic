@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-shot OFFLOAD (POL-33/D47, hardened by POL-58/D59): relocate the SIGNED loader pair (the POINTER,
+# One-shot OFFLOAD (POL-33/D47, hardened by POL-58/D60): relocate the SIGNED loader pair (the POINTER,
 # not the OS) onto THIS box's existing EFI System Partition + make it the firmware's first boot option,
 # so it self-boots the identical HTTP flow on every power-on with no dongle attached. The pair is
 # Ubuntu's Microsoft-signed shim + the Canonical-signed network GRUB, the same chain as the dongle, so

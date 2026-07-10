@@ -293,6 +293,71 @@ exec i3
 `;
 }
 
+// ── privileged reboot helper (POL-55) ──────────────────────────────────────────
+//
+// Reboot-from-the-control-plane needs root; the agent has none. Rather than install `sudo` (absent
+// from the live image) or polkit (likewise) and hand the kiosk user a general-purpose escalation,
+// setup writes a root-owned systemd pair whose ONLY capability is rebooting:
+//
+//   /run/polyptic/requests   0770 root:<kiosk>   the one thing the kiosk user may write into
+//   polyptic-reboot.path     watches it for a file named `reboot`
+//   polyptic-reboot.service  removes the file, then asks systemd to reboot
+//
+// The agent's escalation is therefore `touch` — no command string, no arguments, nothing to smuggle.
+// `/run` is tmpfs, so a request can never survive the reboot it caused and re-trigger on the next boot.
+
+export const REBOOT_PATH_UNIT = "polyptic-reboot.path";
+export const REBOOT_SERVICE = "polyptic-reboot.service";
+export const SYSTEM_UNIT_DIR = "/etc/systemd/system";
+export const REBOOT_TMPFILES_PATH = "/etc/tmpfiles.d/polyptic-reboot.conf";
+/** Must match `REBOOT_REQUEST_DIR` / `REBOOT_REQUEST_PATH` in ../host.ts. */
+export const REBOOT_REQUEST_DIR = "/run/polyptic/requests";
+export const REBOOT_REQUEST_PATH = `${REBOOT_REQUEST_DIR}/reboot`;
+
+/** systemd-tmpfiles creates the request directory on every boot (/run is tmpfs, so it must). */
+export function rebootTmpfilesConf(user: string): string {
+  return `# ${REBOOT_TMPFILES_PATH} — ${MANAGED}
+# The kiosk agent is unprivileged and cannot create anything under root-owned /run/polyptic (which
+# also holds agent.env and its bootstrap token, deliberately unreadable-by-write to the kiosk user).
+# This one sub-directory is group-writable by '${user}' so the agent can drop a reboot request in it.
+d /run/polyptic 0755 root root -
+d ${REBOOT_REQUEST_DIR} 0770 root ${user} -
+`;
+}
+
+export function rebootPathUnit(): string {
+  return `# ${SYSTEM_UNIT_DIR}/${REBOOT_PATH_UNIT} — ${MANAGED}
+[Unit]
+Description=Polyptic — watch for the agent's reboot request (POL-55)
+Documentation=https://github.com/polyptic/polyptic/blob/main/docs/ARCHITECTURE.md
+
+[Path]
+PathExists=${REBOOT_REQUEST_PATH}
+Unit=${REBOOT_SERVICE}
+
+[Install]
+WantedBy=paths.target
+`;
+}
+
+export function rebootServiceUnit(): string {
+  return `# ${SYSTEM_UNIT_DIR}/${REBOOT_SERVICE} — ${MANAGED}
+[Unit]
+Description=Polyptic — reboot this box, as asked by the control plane (POL-55)
+Documentation=https://github.com/polyptic/polyptic/blob/main/docs/ARCHITECTURE.md
+# Nothing may reorder us into the shutdown transaction we are about to start.
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+# Consume the request first: if the reboot itself fails, a stale file must not re-arm the .path unit
+# into a tight retrigger loop.
+ExecStartPre=-/usr/bin/rm -f ${REBOOT_REQUEST_PATH}
+# --no-block: enqueue the shutdown job and exit, rather than waiting for a transaction that stops us.
+ExecStart=/usr/bin/systemctl --no-block reboot
+`;
+}
+
 // ── systemd user units ─────────────────────────────────────────────────────────
 
 export const SESSION_TARGET = "polyptic-session.target";

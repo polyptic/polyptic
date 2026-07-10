@@ -11,7 +11,15 @@ import type { Sys } from "./system";
 import type { Logger } from "./log";
 import type { SetupOptions } from "./args";
 import type { SetupResult } from "./install";
-import { AGENT_SERVICE, COMPOSITOR_LAUNCHER, SESSION_TARGET } from "./templates";
+import {
+  AGENT_SERVICE,
+  COMPOSITOR_LAUNCHER,
+  REBOOT_PATH_UNIT,
+  REBOOT_SERVICE,
+  REBOOT_TMPFILES_PATH,
+  SESSION_TARGET,
+  SYSTEM_UNIT_DIR,
+} from "./templates";
 import {
   PLYMOUTHD_CONF_PATH,
   PLYMOUTH_DRACUT_CONF_PATH,
@@ -52,6 +60,18 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
   log.step("remove systemd user units");
   sys.remove(`${UNIT_DIR}/${AGENT_SERVICE}`);
   sys.remove(`${UNIT_DIR}/${SESSION_TARGET}`);
+  sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
+
+  // 3b ─ disarm + remove the privileged reboot helper (POL-55). Disable BEFORE deleting the unit,
+  // so systemctl can still resolve it and clear the paths.target symlink.
+  log.step("remove the privileged reboot helper");
+  sys.exec("systemctl", ["disable", "--now", REBOOT_PATH_UNIT], {
+    desc: `disable ${REBOOT_PATH_UNIT}`,
+    allowFail: true,
+  });
+  sys.remove(`${SYSTEM_UNIT_DIR}/${REBOOT_PATH_UNIT}`);
+  sys.remove(`${SYSTEM_UNIT_DIR}/${REBOOT_SERVICE}`);
+  sys.remove(REBOOT_TMPFILES_PATH);
   sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
 
   // 4 ─ greetd config: restore the original if we backed one up, else remove ours.
