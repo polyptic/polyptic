@@ -9,6 +9,14 @@
  * are Geist / Geist Mono (loaded in index.html) with a system fallback, so an offline wall box still
  * renders cleanly. The status dot reflects the live connection so an operator can tell a waiting
  * screen (green) from one that never reached the control plane (amber/red).
+ *
+ * DELIBERATELY STATIC (POL-62, D66) — no animations, and nothing here may depend on the browser's
+ * compositor. Real walls run surf/WebKitGTK, and on a box without working GL, WebKit's DMABUF
+ * compositing path silently drops elements promoted to their own layer — an infinite opacity
+ * animation is exactly such a promotion, and it made the brand mark vanish while the plain-painted
+ * text survived (photo on POL-62). Infinite animations also keep a software-rendered box permanently
+ * repainting (POL-59/POL-65 heat). If motion ever returns here, it must not animate opacity,
+ * transform or filter.
  */
 import type { ConnState } from "./ws";
 
@@ -34,10 +42,12 @@ withDefaults(
   <div class="idle">
     <div class="idle-center">
       <div class="idle-mark">
+        <!-- Fill comes from CSS, not a fill="var(…)" attribute — WebKit (the wall browser) doesn't
+             resolve var() inside SVG presentation attributes; Chromium does, which hid this. -->
         <svg width="98" height="98" viewBox="0 0 32 32" aria-hidden="true">
-          <polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" fill="var(--idle-glyph)" opacity=".55" />
-          <polygon points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" fill="var(--idle-glyph)" opacity=".55" />
-          <rect x="13.1" y="8" width="5.8" height="16" fill="var(--idle-glyph)" />
+          <polygon points="6.6,11 12.3,8.2 12.3,23.8 6.6,21" opacity=".55" />
+          <polygon points="25.4,11 19.7,8.2 19.7,23.8 25.4,21" opacity=".55" />
+          <rect x="13.1" y="8" width="5.8" height="16" />
         </svg>
       </div>
       <div class="idle-wordmark">Polyptic</div>
@@ -100,7 +110,10 @@ withDefaults(
   align-items: center;
   justify-content: center;
   box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
-  animation: idle-breathe 5s ease-in-out infinite;
+}
+
+.idle-mark svg {
+  fill: var(--idle-glyph);
 }
 
 .idle-wordmark {
@@ -141,7 +154,6 @@ withDefaults(
   height: 8px;
   border-radius: 50%;
   background: var(--idle-faint);
-  animation: idle-pulse 2.6s ease-in-out infinite;
 }
 
 .idle-dot--open {
@@ -170,31 +182,4 @@ withDefaults(
   color: var(--idle-faint);
 }
 
-@keyframes idle-breathe {
-  0%,
-  100% {
-    opacity: 0.82;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-@keyframes idle-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.35;
-  }
-}
-
-/* Kiosks run unattended; honour a reduced-motion preference where the host exposes one. */
-@media (prefers-reduced-motion: reduce) {
-  .idle-mark,
-  .idle-dot {
-    animation: none;
-  }
-}
 </style>
