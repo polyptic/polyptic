@@ -63,7 +63,7 @@
 | **NVIDIA (Wayland)** | detect `nvidia` DRM driver → route to **X11/i3** backend + native Chromium (`--ozone-platform=x11`); never wlroots-NVIDIA, never Flatpak (driver-matched GL extension = air-gap trap) |
 | **arm64** | **native packages only** (Debian/Fedora/ALARM real arm64; Ubuntu via xtradeb/Debian deb). Flatpak arm64 unselected until verified |
 | **headless server-minimal** | unchanged: greetd → launcher → sway/i3 → agent → Chromium-per-output; installs a compositor, never a DE |
-| **air-gapped** | native `.deb`/`.rpm`/pkg staged offline (extend `bundle-deps.sh` to ship a **real** Chromium, not surf/snap). Flatpak explicitly **out** unless operator runs a signed OSTree repo |
+| **air-gapped** | native `.deb`/`.rpm`/pkg baked into the live image (make `build-live-image.sh` install a **real** Chromium, not surf/snap). Flatpak explicitly **out** unless operator runs a signed OSTree repo |
 | **no-3D / software-GL** | GPU probe → `render=software` → Chromium `--disable-gpu` (2D/video) or SwANGLE (WebGL), **explicitly** |
 | **X11-only / legacy** | existing X11Backend (`--ozone-platform=x11 --window-position/-size`) — Chromium-on-X11 is the uniform X11 answer (drop surf/cog) |
 
@@ -87,7 +87,7 @@
    reads per launch (the probe largely pre-empts this by deciding before first launch).
 7. **`setup/browser.ts`** — Ubuntu path prefers a vendored real `.deb` (xtradeb/Debian), **never**
    the snap; add an online-only `flatpak` branch. **`setup/distro.ts`** — flatpak optional only.
-8. **`deploy/bundle-deps.sh`** — replace `surf` with a real Chromium deb; delete the snap-shim deb.
+8. **`deploy/build-live-image.sh`** — replace `surf` with a real Chromium deb in the image's apt set.
 9. **`docs/DECISIONS.md`** — supersede D27: "native Chromium deb (xtradeb/Debian) + Flatpak escape
    hatch; sway + X11/i3-for-NVIDIA; detect-and-branch render", drop "cog/surf is the Ubuntu answer".
 
@@ -95,7 +95,7 @@
 
 1. Render branch (no delivery change): `buildChromiumArgs` software flags. **Highest value.**
 2. GPU probe + cache the verdict; feed compositor env *and* Chromium flag; fix the auto-flip gap.
-3. Ubuntu native deb + bundle: vendor a real arm64 Chromium; rewrite `bundle-deps.sh`; drop the snap.
+3. Ubuntu native deb in the image: vendor a real arm64 Chromium; drop surf and the snap.
 4. Backend auto-detect + NVIDIA→X11 routing in `select.ts`.
 5. Demote surf/cog; add `flatpakChromium`; update D27.
 6. Later: dnf/pacman offline bundling; optional self-hosted OSTree repo for air-gapped Flatpak sites.

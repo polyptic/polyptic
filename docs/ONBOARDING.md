@@ -15,31 +15,31 @@ wizard** walks you through the last four; below is each step, plus the manual eq
 
 ## 0 · Prerequisites
 
-- A reachable **control plane** (the server) — e.g. `http://CONTROL_PLANE:8080`. The new box must be
-  able to reach it; it does **not** need the internet (see *Provisioning* in the README / `docs/DEPLOY.md`).
-- An **enrollment token** if the server runs in **gated** mode (recommended). Get it in the console under
-  **Settings → Enrollment** (copy or regenerate it), or it's whatever you set as `POLYPTIC_BOOTSTRAP_TOKEN`
-  at server boot. In **open** mode (no token, dev/lab) machines auto-approve and skip steps 1–3's gate —
-  the server logs a loud warning when open.
+- A reachable **control plane** (the server), e.g. `http://CONTROL_PLANE:8080`. The new machine must be
+  able to reach it. It does **not** need the internet (see *Provisioning* in the README / `docs/DEPLOY.md`).
+- An **enrollment token** if the server runs in **gated** mode (recommended). You never type it: it is
+  baked into the boot menu the control plane serves. Read or regenerate it in the console under
+  **Settings → Enrolment token**, or it's whatever you set as `POLYPTIC_BOOTSTRAP_TOKEN` at server boot.
+  In **open** mode (no token, dev/lab) machines auto-approve and skip steps 1-3's gate, and the server
+  logs a loud warning when open.
 
-## 1 · Provision the box (install the agent)
+## 1 · Boot the machine
 
-Recommended — air-gapped, from the control plane:
+**Network boot is the only supported way to put Polyptic on a machine** (D58). There is no OS to
+install and no agent to install: the machine boots the live image the control plane serves.
 
-```bash
-# agent only (enrols; no display yet — good for proving the swarm first):
-curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -
+1. Download the network bootloader from **Settings → Onboard Screens** (or the cold-start wizard) and
+   flash it to a USB stick (2 GB or larger). Balena Etcher or Rufus will do this.
+2. Insert the stick into the machine connected to the screen and boot from it. Leave Secure Boot **on**.
+3. It streams the current live image into RAM over HTTP, brings up the kiosk stack, and enrols. The
+   control-plane address and enrolment token come down with the boot menu.
 
-# full kiosk (greetd → sway → Chromium per output):
-curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -s -- --kiosk
-```
+Netbooted machines pick up image updates on their own (D51). To boot without a stick, use UEFI HTTP
+Boot or DHCP option 67; both are behind the *Boot without a USB stick* disclosure in the same card.
 
-The script bakes the control-plane URL in from the host you curled, writes `/etc/polyptic/agent.toml`
-(`server_url`, `bootstrap_token`), installs a `systemd` service, and starts the agent. It is the **only**
-supported way to install the agent (D41) — there is no standalone package to `apt install`.
-
-The agent identifies the machine by **`/etc/machine-id`**, so every box is distinct automatically. To
-advertise more than one output, set `POLYPTIC_OUTPUTS="HDMI-1,HDMI-2"` (or repeat `--output` in `setup`).
+The agent identifies the machine by a stable DMI/MAC-derived id (a diskless machine has no persistent
+`/etc/machine-id`), so every machine is distinct automatically. To advertise more than one output, set
+`POLYPTIC_OUTPUTS="HDMI-1,HDMI-2"`.
 
 ## 2 · The machine dials in → **pending**
 
@@ -87,9 +87,9 @@ A screen starts **unplaced** (in the left tray on the Wall view). To put it on t
 4. **Save a scene (optional)** — *Save scene* snapshots the whole mural (layout + grouping + content) so
    you can re-apply the entire arrangement in one click, or schedule it.
 
-If the box was provisioned `--kiosk`, that screen is now showing the content for real; reboot it to
-confirm the **zero-click cold boot** (power on → autologin → sway → agent reconnects on its credential →
-the wall renders its scene, no clicks, survives an end-of-day smart-plug cut).
+That screen is now showing the content for real. Reboot it to confirm the **zero-click cold boot**:
+power on → autologin → sway → agent reconnects on its credential → the wall renders its scene. No
+clicks, and it survives an end-of-day smart-plug cut.
 
 ---
 
@@ -98,8 +98,9 @@ the wall renders its scene, no clicks, survives an end-of-day smart-plug cut).
 The console's **Cold-start wizard** (launch it from **Machines → Connect a machine**, or the first-run
 empty state) bundles steps 2–5 into a flow:
 
-- **Step 1 · Connect** — shows the enrol command + token (and notes when the server is in open mode), then
-  **live-watches** for the new machine to appear pending and lets you **Approve** inline.
+- **Step 1 · Connect** — offers the **bootloader download** and how to boot from it (and notes when the
+  server is in open mode), then **live-watches** for the new machine to appear pending and lets you
+  **Approve** inline.
 - **Step 2 · Map screens** — for each new screen: **Ident** (flash the panel), **name** it, and **place**
   it on a mural. Finish → straight to the Wall.
 
@@ -108,16 +109,16 @@ Use it for the first few boxes; the manual Machines view is faster once you know
 ## Day-2: changing, re-onboarding, removing
 
 - **Re-IP / move a box** — the agent reconnects on its credential automatically; nothing to re-approve.
-- **Replace a box** — reject/revoke the old machine; provision the new one (it gets a fresh `machine-id`,
-  so it onboards clean). Re-ident its screens to the same names if you want scenes to keep working.
-- **Decommission** — Reject the machine in the console; on the box, `sudo polyptic-agent setup uninstall
-  [--purge]` tears down the kiosk and (with `--purge`) removes `/etc/polyptic` + the kiosk user.
+- **Replace a box** — reject/revoke the old machine, then boot the new one (it derives a fresh id, so it
+  onboards clean). Re-ident its screens to the same names if you want scenes to keep working.
+- **Decommission** — Reject the machine in the console and stop booting it from the Polyptic medium. A
+  netbooted machine keeps nothing on disk, so there is nothing to uninstall.
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
-| Machine never appears | The box can't reach the server (`curl http://CONTROL_PLANE:8080/healthz` from the box) or a wrong/expired token. Check `journalctl --user -u polyptic-agent` (kiosk) or the agent's stdout. |
+| Machine never appears | The machine can't reach the server (`curl http://CONTROL_PLANE:8080/healthz` from it) or a wrong/expired token. Check `journalctl --user -u polyptic-agent`. |
 | Appears pending, won't approve | You're in gated mode — that's expected; **Approve** it. A *rejected* machine must be **Re-approved**. |
 | Screen shows "Machine unreachable" | The agent/player isn't connected for that screen — the box is off, the kiosk session didn't start, or (dev) no player tab is open at `…:5173/?screen=<id>`. |
 | Content tile shows a framing/CSP error | The target site refuses to be embedded (`X-Frame-Options` / `frame-ancestors`). Use an embed-friendly URL/dashboard, or the kiosk Chromium's trusted-content flags. |

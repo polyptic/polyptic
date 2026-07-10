@@ -79,21 +79,21 @@ Per-output **JPEG thumbnails** (`grim`/`scrot`) flow up the agent channel and pa
 
 ## Provisioning the edge (air-gappable)
 
-The control plane *is* the depot — an edge box needs to reach **only your server**:
+The control plane *is* the depot, and a machine needs to reach **only your server**. It never touches
+the internet, and nothing is installed on it: it **network-boots a live Polyptic image into RAM** and
+runs from there, Secure Boot left on (D46/D47/D58).
 
-```bash
-# agent only — fully air-gapped (the box never touches the internet):
-curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -
+1. In the console, open **Settings → Onboard Screens** and download the network bootloader.
+2. Flash it to a USB stick (2 GB or larger) with Balena Etcher or Rufus.
+3. Boot the machine from the stick. It streams the current image, brings up the kiosk stack
+   (greetd autologin → sway → Chromium per output) and enrols itself.
 
-# full kiosk — substrate (sway/greetd/Chromium) from the server's bundle,
-# falling back to the distro's package manager only on an un-bundled distro with internet.
-# Auto-reboots into the kiosk when done (add --no-reboot to reboot yourself):
-curl -sfL http://CONTROL_PLANE:8080/install | POLYPTIC_TOKEN=<token> sh -s -- --kiosk
-```
+The control-plane address and the enrolment token are baked into the boot menu the server generates
+per request, so there is nothing to type on the machine. A netbooted machine re-pulls its whole OS at
+every boot, which is what makes image updates automatic (D51). To boot without a stick, point UEFI
+HTTP Boot or DHCP option 67 at the server. See `docs/NETBOOT.md` and `docs/DEPLOY.md`.
 
-The script bakes in the control-plane URL from the host you curled and downloads the agent binary from the server (`GET /dist/agent/<arch>`). The server bundles the substrate `.deb`s for a supported distro (Ubuntu latest); `--kiosk` prefers that bundle and only reaches the internet when the box is on a distro you haven't bundled. With `--kiosk` it **auto-reboots** at the end so the box cold-boots straight into content (`--no-reboot` opts out; the agent-only install never reboots). This depot one-liner is the **only** way to install an agent — there is no standalone `.deb`/`.rpm` to `apt install` (D41). See `docs/DEPLOY.md`.
-
-Once provisioned, a box **dials in and waits to be approved**. The operator journey from there —
+Once booted, a machine **dials in and waits to be approved**. The operator journey from there —
 **enrol → approve → ident the panels to name them → place on a mural → assign content** — is point-and-confirm (a guided **Cold-start wizard** in the console walks you through it). Full step-by-step:
 **[`docs/ONBOARDING.md`](docs/ONBOARDING.md)**.
 

@@ -14,8 +14,8 @@ media
 .env
 .env.*
 !.env.example
-# Keep deploy/ in the context: the build stage needs deploy/install.sh (served at GET /install)
-# and deploy/bundle-deps.sh, and compiles the agent + builds the depot under deploy/dist IN-IMAGE.
+# Keep deploy/ in the context: the build stage compiles the agent and builds the depot under
+# deploy/dist IN-IMAGE, and the runtime stage copies the image-rebuild scripts out of it.
 # Only the host's (stale, dev-OS) deploy/dist must not leak in — it's rebuilt inside the image.
 deploy/dist
 docs

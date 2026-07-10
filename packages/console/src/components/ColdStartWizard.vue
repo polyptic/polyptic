@@ -4,9 +4,9 @@
   Opened from the Machines view (a first-run empty state, or the "Connect a machine" button). It is a
   full-bleed overlay over the main column, mirroring docs/design/console.dc.html's COLD START WIZARD:
 
-    STEP 1 — connect: show how to enrol a new box (install the agent, present the bootstrap token —
-      or nothing, if the server runs in open mode), then LIVE-WATCH the store for the machine to
-      appear `pending` and Approve / Reject it inline.
+    STEP 1 — connect: show how to enrol a new machine (write the network bootloader to a USB stick and
+      boot from it; the machine streams the live image into RAM and dials in on its own), then
+      LIVE-WATCH the store for the machine to appear `pending` and Approve / Reject it inline.
     STEP 2 — map screens: for each screen the freshly approved machine reports, Ident the physical
       panel, give it a memorable name, and optionally place it on the active mural.
 
@@ -35,8 +35,8 @@ const focusedScreen = ref<string | null>(null);
 const identing = reactive<Record<string, boolean>>({});
 const identTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-// Reset all wizard state whenever it (re)opens, and (re)load the enrollment-token info so STEP 1
-// shows the REAL token (gated mode) or the open-mode note — closing the Phase-3e placeholder gap.
+// Reset all wizard state whenever it (re)opens, and (re)load the boot medium + enrollment-mode info
+// so STEP 1 offers the REAL bootloader download and knows whether the server is open or gated.
 watch(
   () => props.open,
   (open) => {
@@ -46,6 +46,7 @@ watch(
       for (const k of Object.keys(drafts)) delete drafts[k];
       for (const k of Object.keys(identing)) delete identing[k];
       void store.fetchEnrollment();
+      void store.fetchNetboot();
     }
   },
   { immediate: true },
@@ -53,14 +54,20 @@ watch(
 
 const pending = computed(() => store.pendingMachines);
 
-// Enrollment-token info (open vs gated) for STEP 1 — sourced from GET /settings/enrollment.
+// Open vs gated, for the note beside the download. A gated box needs no hand-typed token: it arrives
+// with the boot menu the control plane serves.
 const enrollmentLoaded = computed(() => store.enrollment !== null);
 const enrollmentOpen = computed(() => store.enrollmentOpen);
-const enrollmentToken = computed(() => store.enrollmentToken);
 
-// Where a fresh box installs the agent from — this control plane. Host = how the operator reached the
-// console; :8080 is the server (same-origin in the prod image; the dev console talks to it on 8080).
-const serverBase = `${window.location.protocol}//${window.location.hostname}:8080`;
+// The network bootloader (POL-33/D54), the only way a bare machine becomes a screen. Null until the
+// netboot info loads, and null-valued when no medium is built into this deployment's depot.
+const netbootLoaded = computed(() => store.netboot !== null);
+const bootMediumUrl = computed(() => store.netboot?.bootMediumUrl ?? null);
+
+function openOnboardSettings(): void {
+  emit("close");
+  void router.push({ name: "settings" });
+}
 
 const enrollingMachine = computed(() =>
   enrollingId.value ? store.machineById(enrollingId.value) : undefined,
@@ -166,42 +173,47 @@ function close(): void {
           <ol class="steps">
             <li>
               <span class="num">1</span>
-              <span>On a fresh Ubuntu box behind your screens, run the one-liner below — it installs the agent straight from this control plane (no internet on the box).</span>
+              <span>
+                Download the network bootloader below and flash it to a USB stick (2&nbsp;GB or
+                larger). You can use Balena Etcher or Rufus to do this.
+              </span>
             </li>
             <li>
               <span class="num">2</span>
               <span>
-                Point it at this control plane and give it the enrolment secret (its
-                <b>bootstrap token</b>) — it dials in automatically. If the server runs in
-                <b>open mode</b>, no token is needed.
+                Insert the USB stick into the machine connected to the screen and boot from the USB
+                stick. Leave Secure Boot <b>on</b>.
               </span>
             </li>
             <li>
               <span class="num">3</span>
-              <span>Approve it below, then name &amp; place the screens it drives.</span>
+              <span>
+                Once the machine boots up, you should see it appear below for approval. Approve it,
+                then name and place the screens it drives.
+              </span>
             </li>
           </ol>
 
-          <!-- the REAL enrolment token (gated) or the open-mode note (Phase 3f) -->
-          <div v-if="enrollmentLoaded && !enrollmentOpen" class="enrol-token-block">
-            <div class="enrol-token-label">Enrolment token</div>
-            <div class="enrol-token">{{ enrollmentToken }}</div>
+          <div class="dl-row">
+            <a v-if="bootMediumUrl" class="btn-download" :href="bootMediumUrl" download>
+              Download bootloader
+            </a>
+            <button v-else class="btn-download" type="button" disabled>Bootloader not built</button>
+            <span v-if="enrollmentLoaded && enrollmentOpen" class="enrol-open">
+              <span class="enrol-open-badge">Open mode</span>
+              <span>No token needed. Any agent that connects is auto-registered.</span>
+            </span>
+            <span v-else class="dl-note">
+              This control plane's address and enrolment token are sent with the boot menu, so there
+              is nothing to type on the machine.
+            </span>
           </div>
-          <div v-else-if="enrollmentLoaded && enrollmentOpen" class="enrol-open">
-            <span class="enrol-open-badge">Open mode</span>
-            <span>No token needed — any agent that connects is auto-registered.</span>
-          </div>
-
-          <div class="run">
-            <code v-if="enrollmentLoaded && !enrollmentOpen"
-              >curl -sfL {{ serverBase }}/install | POLYPTIC_TOKEN={{ enrollmentToken }} sh -</code
-            >
-            <code v-else>curl -sfL {{ serverBase }}/install | sh -</code>
-          </div>
-          <div class="run-hint">
-            Pulls the agent straight from this control plane — no internet on the box. Add
-            <code class="inline">sh -s -- --kiosk</code> to also set up the display (sway + Chromium).
-            If a screen can't reach <b>{{ serverBase }}</b>, use this server's LAN address instead.
+          <div v-if="netbootLoaded && !bootMediumUrl" class="run-hint gap">
+            No bootloader is built into this deployment.
+            <button type="button" class="link-btn" @click="openOnboardSettings">
+              Settings ▸ Onboard Screens
+            </button>
+            has the build instructions, plus other ways to boot a machine.
           </div>
 
           <!-- waiting for the machine to dial in -->
@@ -393,40 +405,64 @@ function close(): void {
   justify-content: center;
   flex: 0 0 auto;
 }
-.run {
-  background: var(--muted-bg);
-  border-radius: 10px;
-  padding: 12px 14px;
-  margin-bottom: 18px;
-  overflow-x: auto;
-}
-.run code {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+.run-hint {
   font-size: 11.5px;
-  color: var(--fg2);
-  white-space: pre;
+  color: var(--muted2);
   line-height: 1.6;
 }
-.enrol-token-block {
-  margin-bottom: 16px;
+.run-hint.gap {
+  margin-bottom: 12px;
 }
-.enrol-token-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-  margin-bottom: 8px;
+
+/* bootloader download */
+.dl-row {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
 }
-.enrol-token {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 17px;
+.btn-download {
+  padding: 10px 16px;
+  border-radius: 9px;
+  border: none;
+  background: var(--primary);
+  color: var(--primary-fg);
+  font-size: 12.5px;
   font-weight: 600;
-  letter-spacing: 0.05em;
+  font-family: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-download:hover:not(:disabled) {
+  opacity: 0.92;
+}
+.btn-download:disabled {
   background: var(--muted-bg);
-  padding: 12px 14px;
-  border-radius: 10px;
-  text-align: center;
-  overflow-x: auto;
+  color: var(--muted2);
+  cursor: not-allowed;
 }
+.dl-note {
+  flex: 1;
+  min-width: 200px;
+  font-size: 11.5px;
+  color: var(--muted2);
+  line-height: 1.5;
+}
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent-fg);
+  font-weight: 600;
+  cursor: pointer;
+}
+.link-btn:hover {
+  text-decoration: underline;
+}
+
 .enrol-open {
   display: flex;
   align-items: center;
@@ -434,7 +470,6 @@ function close(): void {
   font-size: 12.5px;
   color: var(--muted);
   line-height: 1.5;
-  margin-bottom: 16px;
 }
 .enrol-open-badge {
   flex: 0 0 auto;
@@ -452,6 +487,7 @@ function close(): void {
   flex-direction: column;
   align-items: center;
   gap: 10px;
+  margin-top: 16px;
   padding: 22px;
   border: 1.5px dashed var(--line2);
   border-radius: 11px;
@@ -483,6 +519,7 @@ function close(): void {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  margin-top: 16px;
 }
 .pend {
   border: 1px solid var(--warn-soft);
