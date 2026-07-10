@@ -209,8 +209,8 @@ RBAC (namespace-scoped, created by the chart): `jobs` create/get, `pods` list,
 `pods/log` get — no delete, no exec, no secrets.
 
 **Day-0 bootstrap:** the **boot medium** (signed loaders + `polyptic-boot.img`)
-is built automatically by a post-install/post-upgrade hook Job whenever the
-chart knows the address to bake (`imageUpdates.bakeBase`, defaulting to
+is built automatically by a per-revision Job whenever the chart knows the
+address to bake (`imageUpdates.bakeBase`, defaulting to
 `http://<ingressRoute.bootHost>`) and the depot is persistent — the Console's
 bootloader download is live from minute one, and a `bootHost` change re-bakes
 it on the next `helm upgrade` (opt out: `netboot.autoBuildMedium=false`). The
@@ -220,6 +220,19 @@ and publishes the netboot image plus the **downloadable live ISO** (enrolment
 token baked in) straight onto the depot volume. Without a bake address the
 Jobs publish only the netboot image. The nightly refresh keeps the live ISO in
 step with the payload.
+
+**The medium and Wi-Fi fleets (POL-63/POL-69):** the Job reads the local
+Wi-Fi payload (kernel + `initrd-wifi`) straight off the depot volume and
+lifts the **current enrolment token** from the server's own `/boot/grub.cfg`
+(via the in-cluster service), baking both into the image — so the downloaded
+stick boots Wi-Fi-only screens on a gated fleet, and a token rotated in the
+Console is picked up by the next re-bake with no chart value to keep in sync.
+Two consequences: on a gated fleet the downloadable `.img` is a **credential**
+(same trust model as the live ISO), and after rotating the token you re-run
+the Job (`helm upgrade` suffices) and re-flash Wi-Fi sticks — wired sticks
+don't carry it and don't care. Before the first full rebuild the depot has no
+payload, so the Job builds the LEAN wired-only medium and says so; the next
+`helm upgrade` after an image build re-bakes it in full.
 
 ## Dev workflow (local cluster)
 

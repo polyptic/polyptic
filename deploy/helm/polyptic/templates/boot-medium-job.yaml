@@ -34,6 +34,25 @@ The Job chowns its output to the server's runtime uid (1000, `bun` in the
 server image): it writes as root, and a root-owned depot is what stopped the
 server from creating builds/ for retention (EACCES, same incident).
 
+POL-69: the medium's LOCAL Wi-Fi payload (POL-63/D67) needs two more inputs.
+  - The ENROLMENT TOKEN, baked into the local menu — a Wi-Fi boot can never
+    fetch the server's tokenized menu, so gated fleets need it on the stick.
+    It is lifted at build time from the server's own ungated /boot/grub.cfg
+    (via the in-cluster service, not the ingress), the exact place wired boxes
+    get it: always the CURRENT token, even after a console rotation, with no
+    secret plumbed through chart values to go stale. Rotating the token means
+    re-baking (helm upgrade / re-run the Job) and re-downloading Wi-Fi sticks;
+    wired sticks never carried it and still don't. The downloadable .img is
+    therefore a CREDENTIAL on gated fleets — same trust model as the live ISO.
+  - The PAYLOAD (kernel + initrd-wifi), read straight off the depot PVC
+    (IMAGE_DIR_BASE=/depot/image) rather than fetched over the bake address,
+    which may not resolve from inside the cluster. On a FRESH install the
+    depot has no image yet and the v2 build refuses to assemble a payload-less
+    medium — so the Job detects that and falls back to LEAN=1 (the old tiny
+    wired-only dongle, loudly), keeping "Download bootloader works from
+    minute one" true; the next full rebuild + helm upgrade (or a manual
+    re-run) re-bakes it with the payload.
+
 Opt out with netboot.autoBuildMedium=false (the weekly full rebuild still
 builds the medium as before).
 */ -}}
@@ -91,7 +110,22 @@ spec:
               export DEBIAN_FRONTEND=noninteractive;
               apt-get update -qq;
               apt-get install -y -qq curl ca-certificates mtools binutils xz-utils zstd >/dev/null;
-              POLYPTIC_BASE={{ $bakeBase | quote }} bash /repo/deploy/build-boot-medium.sh;
+              svc="http://{{ include "polyptic.fullname" . }}:{{ .Values.service.port }}";
+              menu="";
+              for i in $(seq 1 30); do
+                menu="$(curl -fsS --max-time 5 "$svc/boot/grub.cfg" 2>/dev/null)" && break;
+                echo "waiting for the control plane at $svc ($i/30) ...";
+                sleep 2;
+              done;
+              token="$(printf '%s' "$menu" | sed -n 's/.*polyptic\.token=\([^ ]*\).*/\1/p' | head -n1)";
+              if [ -z "$menu" ]; then echo "WARNING: control plane unreachable - building without a token (gated fleets: re-run this Job once the server is up)"; fi;
+              lean="";
+              if ! ls /depot/image/*/initrd-wifi >/dev/null 2>&1; then
+                lean=1;
+                echo "no live image with a Wi-Fi payload in the depot yet - building the LEAN wired-only medium (run a Full rebuild, then helm upgrade or re-run this Job to re-bake with the Wi-Fi payload)";
+              fi;
+              POLYPTIC_BASE={{ $bakeBase | quote }} POLYPTIC_TOKEN="$token" LEAN="$lean"
+              IMAGE_DIR_BASE=/depot/image bash /repo/deploy/build-boot-medium.sh;
               mkdir -p /depot/boot;
               cp -f /repo/deploy/dist/boot/* /depot/boot/;
               chown -R 1000:1000 /depot/boot;

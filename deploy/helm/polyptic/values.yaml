@@ -244,11 +244,15 @@ netboot:
   # (<depotDir>/image and <depotDir>/boot).
   depotDir: /var/lib/polyptic/depot
   # Build the downloadable boot medium (polyptic-boot.img + signed loaders) onto
-  # the depot via a post-install/post-upgrade hook Job, so the console's
-  # bootloader download works from minute one. Needs an address to bake
-  # (imageUpdates.bakeBase or ingressRoute.bootHost) and a persistent depot;
-  # without either the hook is skipped. The weekly full rebuild also (re)builds
-  # the medium, exactly as before — this hook just removes the day-0 wait.
+  # the depot via a per-revision Job, so the console's bootloader download works
+  # from minute one. Needs an address to bake (imageUpdates.bakeBase or
+  # ingressRoute.bootHost) and a persistent depot; without either the Job is
+  # skipped. POL-69: the Job also bakes the CURRENT enrolment token (lifted from
+  # the server's /boot/grub.cfg at build time) and the local Wi-Fi payload from
+  # the depot, so the downloaded stick boots Wi-Fi-only screens on gated fleets
+  # — which makes the .img a credential there, and a token rotation wants a
+  # `helm upgrade` re-bake + re-flash of Wi-Fi sticks. Before the first image
+  # build it falls back to the LEAN wired-only medium, loudly.
   autoBuildMedium: true
   persistence:
     # Back the depot with a PVC. The live image is rebuilt nightly/weekly and
