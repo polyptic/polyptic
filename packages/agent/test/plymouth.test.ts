@@ -10,6 +10,8 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  PLYMOUTH_THEMES_DIR,
+  PLYMOUTH_THEME_DIR,
   PLYMOUTH_THEME_NAME,
   SPLASH_CMDLINE_TOKENS,
   mergeCmdlineTxt,
@@ -32,6 +34,16 @@ describe("plymouthdConf — the portable, dracut-honoured theme selector", () =>
     // Regression guard: Ubuntu ships plymouthd.conf with a COMMENTED '#[Daemon]', which is why the
     // theme was never applied. Our generated file must have a live section header.
     expect(conf).toMatch(/^\[Daemon\]$/m);
+  });
+
+  test("pairs Theme with ThemeDir, so the initramfs theme does not ride on an alternative (POL-53)", () => {
+    // `plymouth-populate-initrd`'s set_theme_dir() only believes plymouthd.conf when BOTH keys are
+    // set and the directory exists; with Theme= alone it falls back to the default.plymouth
+    // alternative, which install.ts registers with allowFail. If that registration ever misses, the
+    // theme resolves to 'none' and the script exits 1 BEFORE installing plymouth's systemd units —
+    // so plymouthd would never start in the initramfs at all.
+    expect(conf).toMatch(/^ThemeDir=\/usr\/share\/plymouth\/themes$/m);
+    expect(`${PLYMOUTH_THEMES_DIR}/${PLYMOUTH_THEME_NAME}`).toBe(PLYMOUTH_THEME_DIR);
   });
 });
 

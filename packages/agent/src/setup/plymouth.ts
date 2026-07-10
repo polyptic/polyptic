@@ -27,8 +27,10 @@
 
 /** Installed theme name (what `plymouth-set-default-theme` selects). */
 export const PLYMOUTH_THEME_NAME = "polyptic";
+/** The directory Plymouth searches for themes — `plymouthd.conf`'s `ThemeDir=`. */
+export const PLYMOUTH_THEMES_DIR = "/usr/share/plymouth/themes";
 /** Where the theme's files live once installed. */
-export const PLYMOUTH_THEME_DIR = `/usr/share/plymouth/themes/${PLYMOUTH_THEME_NAME}`;
+export const PLYMOUTH_THEME_DIR = `${PLYMOUTH_THEMES_DIR}/${PLYMOUTH_THEME_NAME}`;
 
 /** systemd drop-in that makes plymouth-quit retain the last splash frame (seamless handoff). */
 export const PLYMOUTH_QUIT_DROPIN =
@@ -44,12 +46,11 @@ export const PLYMOUTH_DRACUT_CONF_PATH = "/etc/dracut.conf.d/polyptic-splash.con
  * A dracut drop-in that force-bundles the given files into the initramfs, and puts the real KMS
  * drivers in there alongside them.
  *
- * WHY `install_items` (POL-7): dracut's `plymouth` module runs `plymouth-populate-initrd`, which only
- * bundles the *default* theme — and on Ubuntu 26.04 (no `plymouth-set-default-theme` helper, no
- * `default.plymouth` symlink) it silently resolves NO custom default and bundles only the text
- * fallbacks. So our theme + its `script` plugin never make it into the image and the splash falls back
- * to the stock/console. We bypass that entirely by naming the files in `install_items` so dracut copies
- * them verbatim; plymouthd (reading the bundled `plymouthd.conf` `Theme=`) then loads them at boot.
+ * WHY `install_items` (POL-7): dracut's `plymouth` module bundles the theme by running
+ * `plymouth-populate-initrd`, and on Ubuntu 26.04 that script needs `plymouthd.conf` to name a
+ * `ThemeDir=` as well as a `Theme=` before it will find ours (see `plymouthdConf`). Naming the files
+ * here as well means the theme + its `script` plugin land in the initramfs verbatim, whatever that
+ * script decides — a belt-and-braces path that does not depend on Plymouth's own theme resolution.
  *
  * WHY `add_dracutmodules+=" drm "` (POL-53): without it the splash renders at the firmware's
  * framebuffer resolution — commonly 1024×768 — and the panel upscales it, so a 1440p/4K wall shows a
@@ -76,9 +77,9 @@ export const PLYMOUTH_DRACUT_CONF_PATH = "/etc/dracut.conf.d/polyptic-splash.con
  */
 export function plymouthDracutConf(includePaths: readonly string[]): string {
   return `# ${MANAGED}
-# Force the Polyptic splash theme + its script plugin into the dracut initramfs (POL-7).
-# dracut's plymouth-populate-initrd does not reliably bundle a non-default theme on Ubuntu 26.04, so
-# we include the files explicitly; plymouthd loads them at boot via plymouthd.conf's Theme=.
+# Force the Polyptic splash theme + its script plugin into the dracut initramfs (POL-7). Belt and
+# braces: plymouth-populate-initrd should bundle them off plymouthd.conf's Theme=/ThemeDir=, but
+# naming them here means the theme lands whatever that script makes of our config.
 install_items+=" ${includePaths.join(" ")} "
 
 # Pull the real KMS drivers into the initramfs (POL-53). dracut's plymouth module depends on
@@ -226,9 +227,20 @@ ScriptFile=${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.script
  * Window.GetWidth()/GetHeight()). Colours are baked from the palette above.
  *
  * NOTE: the Plymouth scripting language is a small C/JS-like DSL (fun/if/while, `.` members, colour
- * args as 0..1 floats). Text from Image.Text renders at the plugin's default point size, so we
- * proportionally Scale() it for wall legibility rather than depend on the (version-varying) font
- * argument.
+ * args as 0..1 floats). Two traps live in it. Text from Image.Text renders at the plugin's default
+ * point size, so we proportionally Scale() it rather than depend on the (version-varying) font
+ * argument. And `x = 1` inside a `fun` creates a function-LOCAL unless `x` already exists in an
+ * enclosing scope — so every name layout() shares with the draw_* functions is initialised at the top
+ * level first, or the readers silently see nothing and draw nothing.
+ *
+ * The whole layout lives in `layout()` and is re-run whenever the window changes size (POL-53). Top-
+ * level script code runs ONCE, so a theme that reads `Window.GetWidth()` there and never looks again
+ * is frozen at whatever the first framebuffer was. That is a live race, not a hypothetical: plymouthd
+ * starts from `sysinit.target` while udev is still probing, so on a fast box it can paint before the
+ * KMS driver has taken over from `simpledrm` — and the mode then changes underneath it. Sprites keep
+ * their old sizes and positions, and the splash ends up small and off-centre in the corner of the
+ * panel. Watching the window size on every refresh costs two integer reads a frame and makes the
+ * theme correct whichever order that race resolves in.
  */
 export function plymouthScript(): string {
   return `# ${PLYMOUTH_THEME_NAME}.script — ${MANAGED}
@@ -239,10 +251,6 @@ export function plymouthScript(): string {
 # ── background (${COLORS.bg}) ──────────────────────────────────────────────────
 Window.SetBackgroundTopColor(${toPlymouthRgb(COLORS.bg)});
 Window.SetBackgroundBottomColor(${toPlymouthRgb(COLORS.bg)});
-
-sw = Window.GetWidth();
-sh = Window.GetHeight();
-cx = sw / 2;
 
 # The same theme covers BOTH cold boot AND machine shutdown/reboot (systemd runs plymouth on the way
 # down too), so no kernel/console text shows at either end. Pick the right status + only show the
@@ -262,48 +270,70 @@ if (boot_mode == "updates") {
   initial_status = "Applying updates";
 }
 
-# ── logo lockup (centred, ~30% of screen width) ──────────────────────────────
+# ── text sizing ──────────────────────────────────────────────────────────────
+# Image.Text renders at the label plugin's default point size, so we proportionally Scale() it for
+# wall legibility rather than depend on the (version-varying) font argument. That leaves the status
+# line a bitmap blown up ~2.3x on a 1440p panel — the softest thing on an otherwise crisp splash.
+# Naming a Pango size in Image.Text would fix it, and is a follow-up: a first attempt stopped the
+# line rendering at all, and this is a boot path where a mistake is a black screen on the wall.
+fun scale_text(img, factor) {
+  if (factor < 1) {
+    factor = 1;
+  }
+  return img.Scale(img.GetWidth() * factor, img.GetHeight() * factor);
+}
+
+# ── sprites: created ONCE, sized and placed by layout() ──────────────────────
+# Every sprite is born WITH an image. An image-less Sprite() is refreshed every frame by the script
+# plugin, and plymouth 5.x (Ubuntu 26.04) SEGFAULTS compositing one (script_lib_sprite_refresh) —
+# which crashed plymouthd and killed the splash on a normal boot (POL-7).
 logo.image = Image("logo.png");
 logo.have = 0;
 if (logo.image.GetWidth() > 0) {
   logo.have = 1;
-  logo.scale = (sw * 0.30) / logo.image.GetWidth();
-  logo.img = logo.image.Scale(logo.image.GetWidth() * logo.scale, logo.image.GetHeight() * logo.scale);
-  logo.sprite = Sprite(logo.img);
-  logo.x = cx - logo.img.GetWidth() / 2;
-  logo.y = sh * 0.30 - logo.img.GetHeight() / 2;
-  logo.sprite.SetX(logo.x);
-  logo.sprite.SetY(logo.y);
+  logo.sprite = Sprite(logo.image);
   logo.sprite.SetZ(10);
-  content_bottom = logo.y + logo.img.GetHeight();
-} else {
-  content_bottom = sh * 0.45;
 }
 
-# ── progress bar (determinate; driven by SetBootProgressFunction) ─────────────
 bar.track_img = Image("bar-track.png");
 bar.fill_img = Image("bar-fill.png");
-bar.w = sw * 0.135;
-bar.h = sh * 0.0037;
-if (bar.h < 3) {
-  bar.h = 3;
-}
-bar.x = cx - bar.w / 2;
-bar.y = content_bottom + sh * 0.10;
 bar.have = 0;
 if (show_bar == 1) {
   if (bar.track_img.GetWidth() > 0) {
     bar.have = 1;
-    bar.track = Sprite(bar.track_img.Scale(bar.w, bar.h));
-    bar.track.SetX(bar.x);
-    bar.track.SetY(bar.y);
+    bar.track = Sprite(bar.track_img);
     bar.track.SetZ(11);
-    bar.fill = Sprite();
-    bar.fill.SetX(bar.x);
-    bar.fill.SetY(bar.y);
+    bar.fill = Sprite(bar.fill_img);
     bar.fill.SetZ(12);
   }
 }
+
+stamp.image = Image("stamp.png");
+stamp.have = 0;
+if (stamp.image.GetHeight() > 0) {
+  stamp.have = 1;
+  stamp.sprite = Sprite(stamp.image);
+  stamp.sprite.SetZ(11);
+}
+
+status.sprite = Sprite(Image.Text(initial_status, ${toPlymouthRgb(COLORS.status)}));
+status.sprite.SetZ(11);
+status.text = initial_status;
+
+# operator/agent pushes: \`plymouth message --text="…"\` show just under the status line. The sprite is
+# created lazily on the first message — on a normal boot none ever arrives.
+message.have = 0;
+message.text = "";
+
+target_progress = 0;
+progress = 0;
+
+# Declared HERE, at the top level, on purpose. Plymouth's DSL creates a function-LOCAL on assignment
+# unless the name already exists in an enclosing scope: were these first assigned inside layout(),
+# draw_status() and draw_fill() would read an unset global and silently draw nothing (they did).
+sw = 0;
+sh = 0;
+cx = 0;
 
 fun draw_fill(p) {
   if (bar.have == 1) {
@@ -320,86 +350,130 @@ fun draw_fill(p) {
     bar.fill.SetImage(bar.fill_img.Scale(w, bar.h));
   }
 }
-draw_fill(0);
 
-# ── live boot-status line ─────────────────────────────────────────────────────
-status.y = bar.y + sh * 0.055;
-status.sprite = Sprite();
-status.text = "";
-fun set_status(text) {
-  if (text != status.text) {
-    status.text = text;
-    img = Image.Text(text, ${toPlymouthRgb(COLORS.status)});
-    k = sh / 620;
-    if (k < 1) {
-      k = 1;
+fun draw_status() {
+  if (status.text != "") {
+    img = scale_text(Image.Text(status.text, ${toPlymouthRgb(COLORS.status)}), sh / 620);
+    # Never hand a sprite a null/zero image: systemd pushes an empty status when a job settles, and an
+    # image-less sprite segfaults the script plugin on the next frame (POL-7). Keep the last good line.
+    if (img.GetHeight() > 0) {
+      # keep a long systemd status string from spilling past the panel edges
+      if (img.GetWidth() > sw * 0.8) {
+        img = img.Scale(sw * 0.8, img.GetHeight() * (sw * 0.8) / img.GetWidth());
+      }
+      status.sprite.SetImage(img);
+      status.sprite.SetX(cx - img.GetWidth() / 2);
+      status.sprite.SetY(status.y);
     }
-    img = img.Scale(img.GetWidth() * k, img.GetHeight() * k);
-    # keep a long systemd status string from spilling past the panel edges
-    if (img.GetWidth() > sw * 0.8) {
-      img = img.Scale(sw * 0.8, img.GetHeight() * (sw * 0.8) / img.GetWidth());
-    }
-    status.sprite.SetImage(img);
-    status.sprite.SetX(cx - img.GetWidth() / 2);
-    status.sprite.SetY(status.y);
-    status.sprite.SetZ(11);
   }
 }
-set_status(initial_status);
 
-# ── hostname / version stamp (bottom-centre) ─────────────────────────────────
-stamp.image = Image("stamp.png");
-if (stamp.image.GetHeight() > 0) {
-  # size by height (~2.6% of screen) so the text reads the same on any panel
-  stamp.scale = (sh * 0.026) / stamp.image.GetHeight();
-  stamp.img = stamp.image.Scale(stamp.image.GetWidth() * stamp.scale, stamp.image.GetHeight() * stamp.scale);
-  stamp.sprite = Sprite(stamp.img);
-  stamp.sprite.SetX(cx - stamp.img.GetWidth() / 2);
-  stamp.sprite.SetY(sh - sh * 0.06 - stamp.img.GetHeight() / 2);
-  stamp.sprite.SetZ(11);
+fun draw_message() {
+  if (message.text != "") {
+    img = scale_text(Image.Text(message.text, ${toPlymouthRgb(COLORS.status)}), sh / 700);
+    if (img.GetHeight() > 0) {
+      if (message.have == 0) {
+        message.sprite = Sprite(img);
+        message.have = 1;
+        message.sprite.SetZ(11);
+      } else {
+        message.sprite.SetImage(img);
+      }
+      message.sprite.SetX(cx - img.GetWidth() / 2);
+      message.sprite.SetY(message.y);
+    }
+  }
 }
 
-# ── live callbacks ────────────────────────────────────────────────────────────
-target_progress = 0;
-progress = 0;
+# ── layout: everything sized off the CURRENT window, re-run whenever it changes ──
+fun layout() {
+  sw = Window.GetWidth();
+  sh = Window.GetHeight();
+  cx = sw / 2;
 
+  # logo lockup (centred, ~30% of screen width)
+  content_bottom = sh * 0.45;
+  if (logo.have == 1) {
+    s = (sw * 0.30) / logo.image.GetWidth();
+    img = logo.image.Scale(logo.image.GetWidth() * s, logo.image.GetHeight() * s);
+    logo.sprite.SetImage(img);
+    logo.y = sh * 0.30 - img.GetHeight() / 2;
+    logo.sprite.SetX(cx - img.GetWidth() / 2);
+    logo.sprite.SetY(logo.y);
+    content_bottom = logo.y + img.GetHeight();
+  }
+
+  # progress bar (determinate; driven by SetBootProgressFunction)
+  bar.w = sw * 0.135;
+  bar.h = sh * 0.0037;
+  if (bar.h < 3) {
+    bar.h = 3;
+  }
+  bar.x = cx - bar.w / 2;
+  bar.y = content_bottom + sh * 0.10;
+  if (bar.have == 1) {
+    bar.track.SetImage(bar.track_img.Scale(bar.w, bar.h));
+    bar.track.SetX(bar.x);
+    bar.track.SetY(bar.y);
+    bar.fill.SetX(bar.x);
+    bar.fill.SetY(bar.y);
+    draw_fill(progress);
+  }
+
+  # live boot-status line, and any operator message just under it
+  status.y = bar.y + sh * 0.055;
+  draw_status();
+  message.y = status.y + sh * 0.05;
+  if (message.have == 1) {
+    draw_message();
+  }
+
+  # hostname / version stamp: sized by height (~2.6% of screen) so it reads the same on any panel
+  if (stamp.have == 1) {
+    s = (sh * 0.026) / stamp.image.GetHeight();
+    img = stamp.image.Scale(stamp.image.GetWidth() * s, stamp.image.GetHeight() * s);
+    stamp.sprite.SetImage(img);
+    stamp.sprite.SetX(cx - img.GetWidth() / 2);
+    stamp.sprite.SetY(sh - sh * 0.06 - img.GetHeight() / 2);
+  }
+}
+layout();
+
+# ── live callbacks ────────────────────────────────────────────────────────────
 Plymouth.SetBootProgressFunction(fun (duration, prog) {
   target_progress = prog;
 });
 
+# systemd pushes an EMPTY status when a job settles. Ignoring it keeps the last real line on screen
+# instead of blinking the splash's only live element in and out on every unit transition.
 Plymouth.SetUpdateStatusFunction(fun (text) {
-  set_status(text);
+  if (text != "") {
+    if (text != status.text) {
+      status.text = text;
+      draw_status();
+    }
+  }
 });
 
-# ease the bar towards the latest target on every refresh so it never jumps
+Plymouth.SetMessageFunction(fun (text) {
+  if (text != "") {
+    message.text = text;
+    draw_message();
+  }
+});
+
+# Re-lay-out the moment the window changes size — the KMS driver can take over from simpledrm (and
+# mode-set to the panel's native resolution) after plymouth has already painted. Then ease the bar
+# towards the latest target so it never jumps.
 Plymouth.SetRefreshFunction(fun () {
+  if (Window.GetWidth() != sw) {
+    layout();
+  }
+  if (Window.GetHeight() != sh) {
+    layout();
+  }
   progress = progress + (target_progress - progress) * 0.08;
   draw_fill(progress);
-});
-
-# operator/agent pushes: \`plymouth message --text="…"\` shows just under the status line.
-# The sprite is created LAZILY on the first message: an empty Sprite() (one with no image) is
-# refreshed every frame by the script plugin, and plymouth 5.x (Ubuntu 26.04) SEGFAULTS compositing
-# an image-less sprite (script_lib_sprite_refresh) — which crashed plymouthd and killed the splash on
-# a normal boot, where no message ever arrives. So we never hold an image-less sprite (POL-7).
-message.y = status.y + sh * 0.05;
-message.have = 0;
-Plymouth.SetMessageFunction(fun (text) {
-  img = Image.Text(text, ${toPlymouthRgb(COLORS.status)});
-  k = sh / 700;
-  if (k < 1) {
-    k = 1;
-  }
-  img = img.Scale(img.GetWidth() * k, img.GetHeight() * k);
-  if (message.have == 0) {
-    message.sprite = Sprite(img);
-    message.have = 1;
-  } else {
-    message.sprite.SetImage(img);
-  }
-  message.sprite.SetX(cx - img.GetWidth() / 2);
-  message.sprite.SetY(message.y);
-  message.sprite.SetZ(11);
 });
 `;
 }
@@ -413,12 +487,31 @@ Plymouth.SetMessageFunction(fun (text) {
  * select the theme there — the Debian `default.plymouth` alternative that the helper managed is an
  * initramfs-tools-only mechanism dracut ignores. (Depending on the helper is what left the splash
  * on the stock theme — POL-7.) Harmless on initramfs-tools boxes, which also honour this key.
+ *
+ * `ThemeDir=` is what makes this file live up to "authoritative" (POL-53). `plymouth-populate-initrd`
+ * — the script dracut's `plymouth` module shells out to — resolves the theme in `set_theme_dir()`,
+ * and it only believes `plymouthd.conf` when **both** `ThemeDir` and `Theme` are set and the directory
+ * exists. With `Theme=` alone it falls through to `update-alternatives --query default.plymouth`. That
+ * works today only because install.ts registers that alternative (step 2b) — and it does so with
+ * `allowFail`. Should the registration ever not take, the theme resolves to the literal name `none`,
+ * `ModuleName` comes back empty, and the script exits 1 with "The default plymouth plugin () doesn't
+ * exist" — an error dracut throws away (`2> /dev/null`). It dies BEFORE the block that installs
+ * plymouth's systemd units, so `plymouth-start.service` would never reach the initramfs: plymouthd
+ * would not run there at all, the screen would sit on console text until switch-root, and POL-35's
+ * `plymouth display-message` narration hooks would address a daemon that does not exist. Verified in
+ * a 26.04 container: with no alternative registered, `Theme=` alone exits 1 and installs zero units,
+ * while `Theme=` + `ThemeDir=` exits 0 and installs all ten. One extra key, one less thing to depend on.
  */
 export function plymouthdConf(): string {
   return `# ${MANAGED}
 # Selects the Polyptic boot splash. Read by plymouthd AND by dracut when it builds the initramfs.
+# ThemeDir accompanies Theme on purpose: plymouth-populate-initrd ignores a Theme= it cannot pair with
+# a ThemeDir=, and falls back to the default.plymouth alternative. With neither, it resolves the theme
+# to 'none' and aborts before installing plymouth's systemd units into the initramfs — which would
+# leave plymouthd unable to start there at all (POL-53).
 [Daemon]
 Theme=${PLYMOUTH_THEME_NAME}
+ThemeDir=${PLYMOUTH_THEMES_DIR}
 `;
 }
 

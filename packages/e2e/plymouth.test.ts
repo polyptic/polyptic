@@ -106,6 +106,57 @@ describe("plymouthScript — the live splash program", () => {
     // boot progress bar is gated so it doesn't show a stuck 0% bar on the way down
     expect(script).toContain("show_bar");
   });
+
+  test("re-lays-out when the window changes size (simpledrm → KMS mode-set, POL-53)", () => {
+    // Top-level script code runs ONCE. plymouthd starts from sysinit.target while udev is still
+    // probing, so the KMS driver can take over from simpledrm and mode-set AFTER the splash is
+    // painted. Read the window size only inside layout(), and re-run layout() from the refresh
+    // callback when it changes — otherwise the splash sits small and off-centre in the corner.
+    expect(script).toContain("fun layout() {");
+    expect(script).toMatch(/fun layout\(\) \{\n\s*sw = Window\.GetWidth\(\);\n\s*sh = Window\.GetHeight\(\);/);
+    expect(script).toMatch(/SetRefreshFunction\(fun \(\) \{\n\s*if \(Window\.GetWidth\(\) != sw\) \{\n\s*layout\(\);/);
+    expect(script).toMatch(/if \(Window\.GetHeight\(\) != sh\) \{\n\s*layout\(\);/);
+    // the sizes must not be captured at the top level, above layout()
+    expect(script.indexOf("Window.GetWidth()")).toBeGreaterThan(script.indexOf("fun layout() {"));
+  });
+
+  test("layout's shared state is declared at the top level, not created as function locals", () => {
+    // Plymouth's DSL makes `x = 1` inside a fun a LOCAL unless `x` already exists in an enclosing
+    // scope. layout() assigns sw/sh/cx and draw_status() reads them, so they must be initialised at
+    // the top level first — otherwise the readers silently see nothing and draw nothing. Observed:
+    // the whole status line disappeared from a real boot.
+    const layoutAt = script.indexOf("fun layout() {");
+    for (const decl of ["sw = 0;", "sh = 0;", "cx = 0;"]) {
+      const at = script.indexOf(decl);
+      expect(at).toBeGreaterThan(-1);
+      expect(at).toBeLessThan(layoutAt);
+    }
+  });
+
+  test("every sprite is born with an image (image-less Sprite() segfaults plymouth 5.x, POL-7)", () => {
+    const code = script
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(code).not.toMatch(/Sprite\(\)/);
+    expect(code).toMatch(/= Sprite\(\w/); // …they are all Sprite(<some image>)
+  });
+
+  test("text is scaled up for wall legibility and never shrunk", () => {
+    expect(script).toContain("scale_text(Image.Text(status.text");
+    expect(script).toContain("sh / 620");
+    expect(script).toContain("sh / 700");
+    expect(script).toMatch(/fun scale_text\(img, factor\) \{\n\s*if \(factor < 1\) \{/);
+  });
+
+  test("an empty status never blanks the line or hands a sprite a null image (POL-7 segfault)", () => {
+    // systemd pushes an empty status when a job settles. Image.Text("") has nothing to draw, and a
+    // sprite left image-less segfaults the script plugin on the next frame.
+    expect(script).toMatch(/fun draw_status\(\) \{\n\s*if \(status\.text != ""\) \{/);
+    expect(script).toMatch(/fun draw_message\(\) \{\n\s*if \(message\.text != ""\) \{/);
+    expect(script).toMatch(/if \(img\.GetHeight\(\) > 0\) \{/);
+    expect(script).toMatch(/SetUpdateStatusFunction\(fun \(text\) \{\n\s*if \(text != ""\) \{/);
+  });
 });
 
 describe("plymouthQuitDropin — seamless hand-off", () => {
