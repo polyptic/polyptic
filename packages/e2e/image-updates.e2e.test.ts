@@ -182,13 +182,17 @@ describe("image updates (POL-41)", () => {
   );
 
   test(
-    "POST /rebuild returns immediately as 'running', then the hook's outcome + new image id land",
+    "POST /rebuild returns without blocking on the hook, then the outcome + new image id land",
     async () => {
       const kicked = (await (
         await fetch(`${BASE}/api/v1/settings/image/rebuild`, { method: "POST" })
       ).json()) as Record<string, { status?: string } | unknown>;
       const lastBuild = kicked.lastBuild as { status: string };
-      expect(lastBuild.status).toBe("running");
+      // The endpoint is non-blocking by contract (D51): it persists "running", spawns the hook, and
+      // answers with a FRESH state read. With a near-instant stub hook the honest snapshot is
+      // therefore EITHER "running" or already "success" — a fast CI runner regularly wins that race
+      // (seen on the POL-35 follow-up PR). What must never appear here is a failure state.
+      expect(["running", "success"]).toContain(lastBuild.status);
 
       // The hook is near-instant; poll the settings until it settles.
       let settled: Record<string, unknown> | null = null;
@@ -222,7 +226,8 @@ describe("image updates (POL-41)", () => {
           body: JSON.stringify({ kind: "full" }),
         })
       ).json()) as Record<string, unknown>;
-      expect((kicked.lastBuild as { status: string }).status).toBe("running");
+      // Same non-blocking race as the refresh test above: "running" or an instant "success".
+      expect(["running", "success"]).toContain((kicked.lastBuild as { status: string }).status);
       expect((kicked.lastBuild as { kind: string }).kind).toBe("full");
 
       let settled: Record<string, unknown> | null = null;
