@@ -16,7 +16,7 @@ Reference renders of the Polyptic boot splash (see `docs/DECISIONS.md` **D36** a
   final designed `logo.svg` into `/usr/share/plymouth/themes/polyptic/` and re-run
   `polyptic-agent setup` to replace it.
 - `resolution-before-firmware-mode.png` / `resolution-after-native.png` — the POL-53
-  ([D56](../../DECISIONS.md)) comparison. Unlike the files above these ARE live Plymouth captures:
+  ([D64](../../DECISIONS.md)) comparison. Unlike the files above these ARE live Plymouth captures:
   QEMU `screendump`s of the real theme, booted under OVMF against a virtio GPU whose EDID advertises
   2560×1440. **Before**: the initramfs carried no KMS driver, so plymouth composed the splash on the
   firmware's 1280×800 framebuffer — the capture is that frame, bilinearly upscaled to 2560×1440, which
