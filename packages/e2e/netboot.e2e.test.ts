@@ -56,7 +56,9 @@ const ROOTFS_BYTES =
 // A decoy by the OLD casper artifact name: proves the /dist/image 404 is the whitelist, not mere absence.
 const SQUASHFS_DECOY_BYTES = "FAKE_POLYPTIC_SQUASHFS_DECOY_MUST_NOT_BE_SERVED\n";
 const BOOT_MEDIUM_NAME = "polyptic-boot.img";
-const BOOT_MEDIUM_BYTES = "FAKE_POLYPTIC_BOOT_IMG\x00FAT32-marker\n";
+// LARGE for the same reason as ROOTFS_BYTES: only an above-threshold body lets the "dongle is
+// streamed, never buffered" guard (POL-73) observe streaming — and the real file is ~490 MB.
+const BOOT_MEDIUM_BYTES = "FAKE_POLYPTIC_BOOT_IMG\x00FAT32-marker-" + "B".repeat(5_000_000) + "\n";
 // The four signed loaders (shim + network GRUB, both arches), each with its own sentinel payload.
 const EFI_FILES: Record<string, string> = {
   "shimx64.efi": "FAKE_POLYPTIC_SHIMX64\x00MZ-shim-x64\n",
@@ -764,6 +766,28 @@ describe("netboot: GET /dist/boot/:file", () => {
         expect(res.status).toBe(200);
         expect(res.headers.get("content-disposition") ?? "").toContain(name);
         expect(await res.text()).toBe(bytes);
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the dongle STREAMS while the loaders carry a Content-Length — the by-fetcher contract",
+    async () => {
+      // Streamed = chunked under Bun = no Content-Length: same REGRESSION GUARD as the root image
+      // above. Nothing in the boot chain ever fetches polyptic-boot.img (it IS the boot chain) —
+      // only browsers and the offload's curl do, both chunked-capable — and buffering it stopped
+      // being survivable when POL-63 grew it from 64 MiB to ~490 MB: the FIRST console "Download
+      // bootloader" click OOM-killed a 512Mi pod mid-download (fpd-ago, 2026-07-11, POL-73).
+      const img = await fetch(`${OPEN_BASE}/dist/boot/${BOOT_MEDIUM_NAME}`);
+      expect(img.status).toBe(200);
+      expect(img.headers.get("content-length")).toBeNull();
+      expect(await img.text()).toBe(BOOT_MEDIUM_BYTES);
+      // The four signed loaders stay BUFFERED: shim/the firmware fetch them over UEFI HTTP Boot
+      // and require a real Content-Length (they are 1–2 MB, safe forever).
+      for (const [name, bytes] of Object.entries(EFI_FILES)) {
+        const res = await fetch(`${OPEN_BASE}/dist/boot/${name}`);
+        expect(res.headers.get("content-length")).toBe(String(Buffer.byteLength(bytes as string)));
       }
     },
     TEST_TIMEOUT,

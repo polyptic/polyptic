@@ -76,7 +76,11 @@ ingress:
 resources:
   limits:
     cpu: 1000m
-    memory: 512Mi
+    # 1Gi, not 512Mi (POL-73): the wired netboot chain buffers `initrd` per GRUB fetch for its
+    # Content-Length, and that buffer grew to ~140 MB with POL-53's KMS drivers — two boxes cold
+    # booting at once against a 512Mi limit is a coin toss. (The ~490 MB dongle and the root image
+    # STREAM by contract and need no headroom here.)
+    memory: 1Gi
   requests:
     cpu: 100m
     memory: 256Mi

@@ -352,6 +352,13 @@ verified against the depot's `SHA256SUMS`, menu rewritten last so power loss mid
 old slot bootable) before rebooting. A box offline longer than the depot's retention boots the
 menu's recovery entry (newest image, possibly mismatched kernel) and heals itself on the next poll.
 
+The offline menu also **paints the branded boot splash** (POL-47), even with no server to fetch the
+theme from: `deploy/build-boot-medium.sh` bakes `theme.txt` + `logo.png` onto the medium (fetched
+from `GET /boot/theme.txt` at build time; the theme carries no baked URL, so a local copy renders
+identically), and the local menu points `set theme=` at that copy — guarded, so a `LEAN` or
+theme-less medium still boots to a plain menu on the correct dark background. An offloaded ESP
+carries the theme too. (POL-74.)
+
 ### The credentials file: `polyptic/wifi.conf`
 
 Plain `KEY=value`, one per line; values run from the first `=` to the end of the line, so SSIDs and
