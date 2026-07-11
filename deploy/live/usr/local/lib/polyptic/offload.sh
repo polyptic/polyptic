@@ -427,6 +427,12 @@ if [ "$wifi_payload" = 1 ]; then
     mkdir -p "$mnt/polyptic/certs"
     cp -R "$mnt_medium/polyptic/certs/." "$mnt/polyptic/certs/"
   fi
+  # The offline splash theme (POL-74): carry it to the ESP so an offloaded Wi-Fi box paints the
+  # branded menu too. render-local-grub's `set theme` guard means a medium without it still boots.
+  if [ -d "$mnt_medium/polyptic/boot/theme" ]; then
+    mkdir -p "$mnt/polyptic/boot/theme"
+    cp -R "$mnt_medium/polyptic/boot/theme/." "$mnt/polyptic/boot/theme/"
+  fi
   printf 'medium-esp-%s\n' "$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)" > "$mnt/polyptic/medium-id"
   umount "$mnt_medium" 2>/dev/null || true; rmdir "$mnt_medium" 2>/dev/null || true; mnt_medium=""
 fi

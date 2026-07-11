@@ -211,6 +211,22 @@ LOCALCFG
     eval "iid=\$PAYLOAD_IID_$arch"
     sh "$RENDER" "$arch" a "$HOSTPORT" "$iid" "${POLYPTIC_TOKEN:-}" > "$WORK/local-$arch.cfg"
   done
+
+  # Bake the POL-47 boot theme so the OFFLINE menu paints the branded splash with no network to fetch
+  # it from (POL-74). theme.txt is network-agnostic — it references logo.png relatively, with no base
+  # URL baked in (boot-theme.ts), so a local copy renders identically to the served one. Best-effort:
+  # if the server isn't serving it, the medium still boots, and render-local-grub's file-exists guard
+  # falls back to a plain menu on the correct dark background.
+  HAVE_THEME=0
+  mkdir -p "$WORK/theme"
+  if curl -fsS --max-time 15 -o "$WORK/theme/theme.txt" "$POLYPTIC_BASE/boot/theme.txt" 2>/dev/null \
+     && curl -fsS --max-time 15 -o "$WORK/theme/logo.png" "$POLYPTIC_BASE/boot/logo.png" 2>/dev/null; then
+    HAVE_THEME=1
+    echo "==> Boot theme: baked from $POLYPTIC_BASE/boot/ (offline menu shows the branded splash)"
+  else
+    rm -rf "$WORK/theme"
+    echo "==> Boot theme: $POLYPTIC_BASE not serving /boot/theme.txt — offline menu will be plain (still boots)"
+  fi
 fi
 
 IMG="$DIST/polyptic-boot.img"
@@ -263,6 +279,12 @@ if [ "$LEAN" != "1" ]; then
     mcopy -i "$IMG" "$vml" "::/polyptic/boot/$arch/a/vmlinuz"
     mcopy -i "$IMG" "$ird" "::/polyptic/boot/$arch/a/initrd"
   done
+  # The offline splash theme (POL-74), at the path render-local-grub.sh points `set theme=` at.
+  if [ "${HAVE_THEME:-0}" = 1 ]; then
+    mmd   -i "$IMG" ::/polyptic/boot/theme
+    mcopy -i "$IMG" "$WORK/theme/theme.txt" ::/polyptic/boot/theme/theme.txt
+    mcopy -i "$IMG" "$WORK/theme/logo.png"  ::/polyptic/boot/theme/logo.png
+  fi
 fi
 
 echo

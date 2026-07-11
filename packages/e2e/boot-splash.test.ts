@@ -11,6 +11,7 @@
  * (The HTTP routes that serve the theme live in netboot.e2e.test.ts, with the rest of the depot.)
  */
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,5 +128,38 @@ describe("the stage-1 config (boot medium + offloaded ESP)", () => {
     // …but a box that cannot reach its control plane still says so, by name.
     expect(DONGLE_TMPL).toContain("Could not reach the Polyptic control plane at $net");
     expect(DONGLE_TMPL).toContain("--id retry");
+  });
+});
+
+describe("the offline (Wi-Fi) local menu carries its own splash (POL-74)", () => {
+  // render-local-grub.sh is the menu a box paints when it can't reach the server — so it can't fetch
+  // the theme the wired path uses, and must set it from a copy baked onto the medium. This proves the
+  // shell renderer emits the themed gfx block, pointed at the on-medium path both build-boot-medium.sh
+  // and offload.sh write to. Rendered by running the actual script, so it can't drift from what ships.
+  const render = spawnSync(
+    "sh",
+    [resolve(repoRoot, "deploy/live/usr/local/lib/polyptic/render-local-grub.sh"),
+      "amd64", "a", "10.0.0.5:8080", "20260101T000000Z-abcd1234", "tok"],
+    { encoding: "utf8" },
+  );
+  const LOCAL_MENU = render.stdout ?? "";
+
+  test("emits the guarded gfx preamble (same discipline as bootGfxPreamble)", () => {
+    expect(render.status).toBe(0);
+    expect(LOCAL_MENU).toContain("if loadfont (memdisk)/fonts/unicode.pf2 ; then");
+    expect(LOCAL_MENU).toContain("terminal_output gfxterm");
+    expect(LOCAL_MENU).toContain('background_color "#0b0b0d"'); // the shared dark, no flash at hand-off
+    expect(LOCAL_MENU).toContain("insmod gfxmenu"); // needed to draw a theme, as the themed preamble does
+  });
+
+  test("sets the theme from the on-medium copy, guarded so a theme-less medium still boots", () => {
+    // Device-relative ($root), so it resolves on the USB stick AND an offloaded ESP; guarded by a
+    // file-exists check so a LEAN/theme-less medium degrades to a plain menu rather than erroring.
+    expect(LOCAL_MENU).toContain(
+      "if [ -f ($root)/polyptic/boot/theme/theme.txt ]; then set theme=($root)/polyptic/boot/theme/theme.txt ; fi",
+    );
+    // The theme is desktop-agnostic (no baked URL), which is exactly why a local copy is legitimate.
+    expect(buildBootThemeTxt()).toContain('file = "logo.png"');
+    expect(buildBootThemeTxt()).not.toContain("http");
   });
 });
