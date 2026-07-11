@@ -110,6 +110,16 @@ body {
    every frame; on a software-rendered box that alone pegs a core — POL-59/POL-65 heat, and the
    player measured ~2× the raw page's CPU on fpd-ago). So the pulse is a dark veil toggled by a
    discrete `visibility` steps() animation: two repaints per cycle, no layer promotion. */
+
+/* A page surface's content box (POL-42): the shared PageCanvas mounts inside (position:absolute,
+   inset:0), so this only has to BE the box — full region by default; a video-wall span's inline
+   style overrides to the explicit spanning size + translate, exactly like frames/media. */
+.surface-page {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
 .ident {
   position: absolute;
   inset: 0;

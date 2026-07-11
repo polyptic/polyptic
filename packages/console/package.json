@@ -10,6 +10,7 @@
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
+    "@polyptic/elements": "workspace:*",
     "@polyptic/protocol": "workspace:*",
     "@vue-flow/background": "^1.3.2",
     "@vue-flow/controls": "^1.1.2",

@@ -350,21 +350,28 @@ export async function renameVideoWall(wallId: string, name: string): Promise<Vid
 
 // ── Content library (Phase 3c) ───────────────────────────────────────────────
 
-/** POST /api/v1/content-sources { name, kind, url } — create a reusable library source. */
-export function createContentSource(body: CreateContentSourceBody): Promise<ContentSource> {
-  return send("POST", "/content-sources", CreateContentSourceBody.parse(body));
+/** POST /api/v1/content-sources { name, kind, url|definition } — create a reusable library source.
+ *  Returns the created source (the Studio needs the server-assigned id to keep saving to it). */
+export async function createContentSource(body: CreateContentSourceBody): Promise<ContentSource> {
+  const res = await send<{ source: ContentSource }>(
+    "POST",
+    "/content-sources",
+    CreateContentSourceBody.parse(body),
+  );
+  return res.source;
 }
 
-/** PATCH /api/v1/content-sources/:sourceId { name?, kind?, url? } — partial update of a source. */
-export function updateContentSource(
+/** PATCH /api/v1/content-sources/:sourceId — partial update of a source. Returns the updated source. */
+export async function updateContentSource(
   sourceId: string,
   body: UpdateContentSourceBody,
 ): Promise<ContentSource> {
-  return send(
+  const res = await send<{ source: ContentSource }>(
     "PATCH",
     `/content-sources/${encodeURIComponent(sourceId)}`,
     UpdateContentSourceBody.parse(body),
   );
+  return res.source;
 }
 
 /** DELETE /api/v1/content-sources/:sourceId — remove a source from the library. */

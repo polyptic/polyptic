@@ -28,6 +28,7 @@ import { MediaStore, registerMediaServeRoute } from "./media";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
+import { PageDataService } from "./page-data";
 import { registerRestRoutes } from "./rest";
 import { DevtoolsRelay } from "./devtools-relay";
 import { registerDevtoolsRoutes } from "./devtools-routes";
@@ -165,6 +166,32 @@ const tokens = new TokenService({
 });
 control.setTokenProvider(tokens);
 tokens.setProfiles(control.getCredentialProfilesInternal());
+
+// ── Page data (POL-42): server-side feed/weather poller for authored pages. Polls only the pages
+// assigned to ≥1 screen; when a poll actually changes something, re-push the slices showing those
+// pages so a fresh headline or temperature reaches the wall with no reload (D5). decorate stamps the
+// data (plus resolved, credential-stamped embeds) into the page surface at send time. ──
+const pageData = new PageDataService({
+  control,
+  log: fastify.log,
+  onChange: (sourceIds) => {
+    for (const slice of control.slicesShowingSources(sourceIds)) {
+      const message = ServerToPlayerRender.parse({
+        t: "server/render",
+        revision: control.state.revision,
+        friendlyName: control.getScreen(slice.screenId)?.friendlyName ?? slice.screenId,
+        slice: control.decorateSliceForSend(slice),
+      });
+      const delivered = hub.send(slice.screenId, message);
+      fastify.log.info(
+        { event: "render.push.page-data", screenId: slice.screenId, delivered },
+        "re-pushed render after page feed/weather data changed",
+      );
+    }
+  },
+});
+control.setPageDataProvider(pageData);
+pageData.start();
 
 // ── Live preview (Phase 5): bounded thumbnail store + capture coordinator. ──
 const thumbnails = new ThumbnailStore(
@@ -503,6 +530,7 @@ async function shutdown(signal: string): Promise<void> {
   fastify.log.info({ event: "server.shutdown", signal }, "shutting down");
   capture.stop();
   tokens.stop();
+  pageData.stop();
   agentMtlsChannel?.server.close();
   try {
     await fastify.close();

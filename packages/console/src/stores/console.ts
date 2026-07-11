@@ -121,6 +121,9 @@ export interface ConsoleState {
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
   connected: boolean;
+  /** True once the FIRST admin/state snapshot has been folded in — the difference between "the
+   *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
+  stateReceived: boolean;
   revision: number;
   machines: MachineView[];
   murals: Mural[];
@@ -168,6 +171,7 @@ export const useConsoleStore = defineStore("console", {
     imageUpdates: null,
     settings: null,
     connected: false,
+    stateReceived: false,
     revision: 0,
     machines: [],
     murals: [],
@@ -398,6 +402,7 @@ export const useConsoleStore = defineStore("console", {
         image: [],
         video: [],
         playlist: [],
+        page: [],
       };
       for (const s of state.contentSources) buckets[s.kind].push(s);
       return buckets;
@@ -689,6 +694,7 @@ export const useConsoleStore = defineStore("console", {
     /** @internal Fold a validated server→admin frame into reactive state. */
     applyMessage(msg: ServerToAdminMessage): void {
       if (msg.t === "admin/state") {
+        this.stateReceived = true;
         this.revision = msg.revision;
         this.machines = msg.machines;
         this.murals = msg.murals;
@@ -1205,14 +1211,14 @@ export const useConsoleStore = defineStore("console", {
 
     // ── Content library (Phase 3c) ──────────────────────────────────────────────
 
-    /** Create a library source. The authoritative admin/state broadcast adds it to contentSources. */
-    async createSource(body: CreateContentSourceBody): Promise<boolean> {
+    /** Create a library source. The authoritative admin/state broadcast adds it to contentSources.
+     *  Returns the created source (the Studio needs the server-assigned id), or null on failure. */
+    async createSource(body: CreateContentSourceBody): Promise<ContentSource | null> {
       try {
-        await api.createContentSource(body);
-        return true;
+        return await api.createContentSource(body);
       } catch (err) {
         console.error("[console] createSource failed", err);
-        return false;
+        return null;
       }
     },
 

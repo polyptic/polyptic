@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Per-screen renderer (Vue 3) — connects over WS, renders its screen's slice (incl. video-wall spans), applies changes via DOM diff (no reload).",
+  "description": "Per-screen renderer (Vue 3) \u2014 connects over WS, renders its screen's slice (incl. video-wall spans), applies changes via DOM diff (no reload).",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -12,6 +12,7 @@
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",
     "@fontsource-variable/geist-mono": "^5.2.8",
+    "@polyptic/elements": "workspace:*",
     "@polyptic/protocol": "workspace:*",
     "vue": "^3.5.13",
     "zod": "^3.23.0"

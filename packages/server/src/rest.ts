@@ -1212,6 +1212,11 @@ export function registerRestRoutes(
       if (result.error === "invalid-source") {
         return reply.code(400).send({ error: "the update leaves the source inconsistent" });
       }
+      if (result.error === "invalid-shape") {
+        return reply
+          .code(400)
+          .send({ error: "a page source needs a definition; every other kind needs a url" });
+      }
       // POL-34 — playlist authoring errors (bad item reference / missing duration).
       return reply.code(400).send({ error: playlistItemErrorDetail(result.error, result.itemSourceId) });
     }
