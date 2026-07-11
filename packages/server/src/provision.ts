@@ -382,11 +382,21 @@ export function parseRange(
  * OOM-killed the control plane in the field the day the root image shrank below the cap: a 486 MiB
  * `rootfs.squashfs` suddenly qualified for `readFile()` into a 512Mi-limited pod, every dracut
  * fetch crash-looped the server, and the netbooting box saw 502/503 (fpd-ago, 2026-07-10). What
- * GRUB fetches (vmlinuz, initrd, the signed `.efi` loaders, the dongle `.img`) is tens of MB and
- * safe to buffer; what userspace fetches (`rootfs.squashfs` via dracut's curl, `polyptic-live.iso`
- * via a browser) is chunked-capable and streams, whatever its size.
+ * GRUB and the firmware fetch (vmlinuz, initrd, the signed `.efi` loaders) is tens of MB and safe
+ * to buffer; what userspace fetches (`rootfs.squashfs` and `initrd-wifi` via curl,
+ * `polyptic-live.iso` and the dongle `.img` via a browser) is chunked-capable and streams,
+ * whatever its size.
  */
 const GRUB_FETCHED_IMAGE_FILES = new Set(["vmlinuz", "initrd"]);
+
+/** The boot-depot files the FIRMWARE fetches (UEFI HTTP Boot: shim by Boot URI, then GRUB by name
+ *  via shim) — 1–2 MB each, and that fetcher needs a real Content-Length, so they buffer. The
+ *  dongle `polyptic-boot.img` is deliberately NOT here: nothing in the boot chain ever fetches it
+ *  (it IS the boot chain) — only browsers (the console download) and the offload's curl do, both
+ *  chunked-capable — and POL-63's local payload grew it from 64 MiB to ~490 MB, so buffering it
+ *  OOM-killed a 512Mi pod the first time an operator clicked "Download bootloader" (fpd-ago,
+ *  2026-07-11, POL-73). */
+const FIRMWARE_FETCHED_BOOT_FILES = new Set(["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grubaa64.efi"]);
 
 /** Range slices up to this many bytes are buffered so the 206 carries an exact Content-Length
  *  (GRUB and the firmware only ever range small files); larger slices stream. Keeps a resuming
@@ -679,10 +689,10 @@ export function registerProvisionRoutes(
     }
     if (!st.isFile()) return reply.code(404).send({ error: "boot file not bundled" });
 
-    // The signed .efi loaders (offload + UEFI HTTP Boot fetch these via shim/firmware) and the dongle
-    // .img all need Content-Length; sendBootAsset buffers them (a few MB to ~64 MB). Range-aware.
+    // The signed .efi loaders (fetched by shim/the firmware) buffer for their Content-Length; the
+    // dongle .img streams — see FIRMWARE_FETCHED_BOOT_FILES for why that split is load-bearing.
     reply.header("Content-Disposition", `attachment; filename="${file}"`);
-    return sendBootAsset(reply, abs, st.size, request.headers.range, true);
+    return sendBootAsset(reply, abs, st.size, request.headers.range, FIRMWARE_FETCHED_BOOT_FILES.has(file));
   });
 
   // ── GET /api/v1/settings/netboot, GATED (auto: /api/v1 prefix → the global preHandler). Secret-free
