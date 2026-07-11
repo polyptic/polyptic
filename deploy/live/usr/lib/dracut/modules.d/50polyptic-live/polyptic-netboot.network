@@ -1,0 +1,45 @@
+# Polyptic live image (POL-76): a WIRED NIC WITH NO CARRIER MUST NOT HOLD UP network-online.target.
+#
+# dracut's systemd-networkd module turns `ip=dhcp` into a catch-all .network (its own
+# dracut-default.network / systemd-network-generator output) that matches EVERY physical NIC and
+# leaves RequiredForOnline at its default (routable). On a box with two onboard NICs where only one
+# has a cable, BOTH links are therefore "required for online" — and
+# `systemd-networkd-wait-online --any` still BLOCKS on a required link that never gains carrier
+# (systemd#5154): --any ends the wait when one required link comes up, but it will not give up on a
+# required link that is stuck below carrier, so the unplugged NIC held the initramfs on "Starting
+# Polyptic ..." for ~3 minutes before livenet fetched the root image (real hardware, Lenovo r8169 +
+# igc, one NIC unplugged, 2026-07-11: initrd fetched → rootfs.squashfs requested 179s later).
+#
+# The POL-35 --any drop-in alone could not fix this because it changed only the wait INVOCATION, not
+# the per-link policy. The rootfs already solved the identical stall the right way: netplan's
+# `optional: true` (01-polyptic-dhcp.yaml) renders to RequiredForOnline=no on every wired link. This
+# file gives the INITRAMFS the same policy the rootfs has had since POL-38.
+#
+# With RequiredForOnline=no on the wired links, network-online.target no longer waits for ANY of them
+# (an unplugged NIC never blocks; a genuinely-connecting one is not needed to satisfy the target
+# either). livenet's own initqueue `online` hook still fires the moment the plugged NIC is actually
+# routable — that udev-driven event, not this target, is what triggers the OS-image fetch — so the
+# first carrier-up + DHCP-bound NIC starts the download in seconds. `--any` + a bounded --timeout stay
+# as a backstop for the case where a link IS required (Wi-Fi, below).
+#
+# Scope is Type=ether ONLY, deliberately: WIRELESS links keep the default (required), so on a
+# Wi-Fi-only box wait-online still waits for wpa_supplicant to associate + DHCP (80-polyptic-wlan.network)
+# and never declares "online" before association. Kind=!* excludes virtual ethernet (bridge/bond/vlan),
+# which a diskless kiosk never has in the initramfs anyway.
+#
+# Sorts before dracut's generated `70-*.network` / `zzzz-dracut-default.network` (10 < 70 < zzzz), and
+# /etc wins over /run and /usr, so this is the .network networkd applies to each wired link. DHCP=yes
+# is kept (the link must still lease an address to fetch the image); ClientIdentifier=mac matches
+# dracut's own default so DHCP reservations behave identically.
+[Match]
+Type=ether
+Kind=!*
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+ClientIdentifier=mac
+
+[Link]
+RequiredForOnline=no
