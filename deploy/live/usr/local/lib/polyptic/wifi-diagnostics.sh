@@ -20,7 +20,10 @@
 
 CONF="${POLYPTIC_WIFI_CONF:-${1:-/run/polyptic/wifi.conf}}"
 RUN="${POLYPTIC_RUN_DIR:-/run/polyptic}"
-LIB="${POLYPTIC_LIB_DIR:-$(CDPATH= cd "$(dirname "$0")" && pwd)}"
+# Pure-shell own-directory resolution: the initramfs has no `dirname` (POL-78 — the very bug this
+# report exists to catch), so never depend on it here either.
+_lib="${0%/*}"; [ "$_lib" = "$0" ] && _lib="."
+LIB="${POLYPTIC_LIB_DIR:-$_lib}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 sec()  { printf '\n===== %s =====\n' "$1"; }

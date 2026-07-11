@@ -20,7 +20,11 @@
 #
 # Exit contract mirrors wifi-conf.sh: no config → nothing, exit 0; invalid → its stderr line, exit 1.
 
-LIB="${POLYPTIC_LIB_DIR:-$(CDPATH= cd "$(dirname "$0")" && pwd)}"
+# Resolve our own directory in PURE SHELL — the initramfs ships no `dirname` (POL-78), and the old
+# `$(dirname "$0")` left LIB EMPTY there, so the sibling wifi-conf.sh went unfound and EVERY Wi-Fi
+# config was "rejected" on real hardware. $0 always carries a slash from the callers (hook + tests).
+_lib="${0%/*}"; [ "$_lib" = "$0" ] && _lib="."
+LIB="${POLYPTIC_LIB_DIR:-$_lib}"
 CONF="${POLYPTIC_WIFI_CONF:-${1:-}}"
 CERT_DIR="${POLYPTIC_WIFI_CERT_DIR:-/run/polyptic}"
 

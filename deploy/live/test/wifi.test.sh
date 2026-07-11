@@ -187,6 +187,18 @@ out="$(render)"; rc=$?
 eq "render invalid rc" 1 "$rc"
 eq "render invalid emits nothing" "" "$out"
 
+# 23b) POL-78 regression: the supplicant resolves its sibling wifi-conf.sh with NO `dirname` on PATH.
+# The initramfs shipped no dirname, so the old `$(dirname "$0")` left LIB empty → sh looked for
+# `/wifi-conf.sh` → not found → EVERY Wi-Fi config "rejected" on real hardware. A broken dirname
+# (exit 127) stands in for its absence; the pure-`${0%/*}` resolver must not touch it.
+mkdir -p "$ROOT/nodirname"
+printf '#!/bin/sh\necho "dirname: command not found" >&2\nexit 127\n' > "$ROOT/nodirname/dirname"
+chmod +x "$ROOT/nodirname/dirname"
+conf 'WIFI_SSID=MyNet' 'WIFI_PSK=hunter2hunter2'
+out="$(PATH="$ROOT/nodirname:$PATH" sh "$LIB/wifi-supplicant-conf.sh" "$ROOT/wifi.conf" 2>"$ROOT/err")"; rc=$?
+eq "renders with dirname absent (rc)"   0 "$rc"
+has "renders with dirname absent (ssid)" "ssid=4d794e6574" "$out"
+
 # ─── find-boot-medium.sh: marker-proven identity ────────────────────────────────────────────────────
 # Stubs (offload.test.sh pattern): `mount` copies a fixture volume into the mountpoint, `umount`
 # empties it, `blkid` lists $STUB/vfat_devs. Volumes live at $STUB/vol-<basename-of-device>.

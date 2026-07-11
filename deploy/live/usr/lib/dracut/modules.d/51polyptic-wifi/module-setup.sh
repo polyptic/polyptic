@@ -40,7 +40,10 @@ installkernel() {
 }
 
 install() {
-    inst_multiple wpa_supplicant od sed grep tr wc cat cut sync mkdir cp chmod basename readlink mount umount blkid
+    # `dirname`/`head`/`tail` join the set for POL-78: the scripts no longer DEPEND on dirname (pure
+    # `${0%/*}` now), but dirname's absence here is exactly what rejected every Wi-Fi config on real
+    # hardware, and head (hook success path) + tail (diagnostics) were silently missing too.
+    inst_multiple wpa_supplicant od sed grep tr wc cat cut head tail sync mkdir cp chmod basename dirname readlink mount umount blkid
     # Optional diagnostics tools: when Wi-Fi bring-up fails, wifi-diagnostics.sh dumps the full
     # network/interface state to the medium (POL-77). `-o` means a box whose image lacks any of these
     # still builds — the report just notes the tool as absent rather than aborting the initrd build.
