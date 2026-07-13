@@ -185,3 +185,27 @@ describe("boot-theme.txt — the committed offline splash asset (POL-82)", () =>
     expect(sh).not.toMatch(/\bbun\s+["$]/); // no `bun <script>` invocation in the bake
   });
 });
+
+describe("the cluster Jobs carry the committed splash assets into /repo (POL-88)", () => {
+  // build-boot-medium.sh runs inside k8s Jobs whose /repo is assembled by an init container copying
+  // out of the server image. POL-82 made the offline theme a committed asset under
+  // packages/server/assets — but the init containers copied ONLY /app/deploy, so the bake's
+  // $REPO_ROOT/packages/server/assets lookup failed and every cluster-baked medium shipped a plain
+  // offline menu again (caught live in the v0.2.27 full-rebuild log). These pins hold the seam: any
+  // Job that runs the medium bake must copy the assets directory alongside deploy/.
+  const REBUILD_TMPL = read("deploy", "helm", "polyptic", "templates", "rebuild-jobs.yaml");
+  const MEDIUM_TMPL = read("deploy", "helm", "polyptic", "templates", "boot-medium-job.yaml");
+
+  test.each([
+    ["rebuild-jobs.yaml", REBUILD_TMPL],
+    ["boot-medium-job.yaml", MEDIUM_TMPL],
+  ])("%s's init container copies packages/server/assets into /repo", (_name, tmpl) => {
+    const command = tmpl
+      .split("\n")
+      .filter((l) => l.includes("cp -a /app/deploy/."))
+      .join("\n");
+    expect(command).not.toBe(""); // the deploy copy is still there…
+    expect(command).toContain("cp -a /app/packages/server/assets/. /repo/packages/server/assets/");
+    expect(command).toContain("mkdir -p /repo/deploy /repo/packages/server/assets");
+  });
+});

@@ -52,11 +52,13 @@ several GB) is an emptyDir at /var/tmp.
 {{- $arches := .Values.imageUpdates.arches }}
 {{- if not $arches }}{{- $arches = list .Values.imageUpdates.arch }}{{- end }}
 {{- $emulate := .Values.imageUpdates.emulation.enabled }}
+{{- /* build-boot-medium.sh resolves committed assets (the offline splash theme, POL-82/88) at
+      $REPO_ROOT/packages/server/assets — copy them alongside deploy/ or the bake goes plain. */}}
 {{- $payload := dict
       "name" "payload"
       "image" (include "polyptic.image" .)
       "imagePullPolicy" .Values.image.pullPolicy
-      "command" (list "sh" "-c" "mkdir -p /repo/deploy && cp -a /app/deploy/. /repo/deploy/ && ls /repo/deploy")
+      "command" (list "sh" "-c" "mkdir -p /repo/deploy /repo/packages/server/assets && cp -a /app/deploy/. /repo/deploy/ && cp -a /app/packages/server/assets/. /repo/packages/server/assets/ && ls /repo/deploy")
       "volumeMounts" (list (dict "name" "repo" "mountPath" "/repo"))
 }}
 {{- $volumes := list
