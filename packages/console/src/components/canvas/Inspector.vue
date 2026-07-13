@@ -1,11 +1,14 @@
 <!--
   Inspector — the right-hand context panel for the canvas selection.
 
-  Three states, mirroring docs/design/console.dc.html:
+  Four states, mirroring the POL-72 design handoff (v3):
     - empty   : nothing selected → prompt to pick a screen
-    - single  : rename, Ident (flash on wall), status + "Driven by {machine}",
-                assign content (type a URL), page zoom, layout read-out, remove from wall
-    - multi   : count + member list + Ident-all; combining lands in 3b
+    - single  : live preview (mirrors the tile's canvas state, status chip overlaid) · rename ·
+                "Driven by {machine}" + mono connector chip · Ident · content (LIBRARY only —
+                ad-hoc URL entry was removed as an anti-pattern; add URLs to the Content library
+                instead) · page zoom · layout read-out · remove from wall
+    - wall    : a combined surface — rename, Ident all / Split, spanning content, member panels
+    - multi   : count + member list + Ident-all + Combine
 
   The zoom control (POL-57) appears only when the selection frames a page — a web or dashboard
   surface. Media has nothing to zoom, and an empty screen has nothing at all, so in both cases the
@@ -86,10 +89,8 @@ function zoomWall(zoom: number) {
   if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
 }
 
-const wallUrlDraft = ref("");
 const wallSourcePick = ref("");
 watch(wall, () => {
-  wallUrlDraft.value = "";
   wallSourcePick.value = "";
 });
 
@@ -115,13 +116,6 @@ function commitWallName() {
 // A just-combined wall carries a temp id until the authoritative admin/state re-points it; spanning
 // content against the temp id would 404, so the Span control is disabled until the real wall arrives.
 const wallPending = computed(() => (wall.value ? wall.value.id.startsWith("wall-pending") : false));
-function submitWallUrl() {
-  if (!wall.value || wallPending.value) return;
-  const u = wallUrlDraft.value.trim();
-  if (!u) return;
-  store.setWallContent(wall.value.id, { url: u });
-  wallUrlDraft.value = "";
-}
 function assignWallSource() {
   if (!wall.value || wallPending.value) return;
   const id = wallSourcePick.value;
@@ -162,21 +156,11 @@ function commitName() {
   else nameDraft.value = s.friendlyName;
 }
 
-// ── content: library source + ad-hoc URL ────────────────────────────────────
-const urlDraft = ref("");
+// ── content: library sources only (the ad-hoc URL bypass was removed — POL-72) ──
 const sourcePick = ref("");
 watch(single, () => {
-  urlDraft.value = "";
   sourcePick.value = "";
 });
-function submitUrl() {
-  const s = single.value;
-  if (!s) return;
-  const u = urlDraft.value.trim();
-  if (!u) return;
-  store.setScreenContent(s.id, { url: u });
-  urlDraft.value = "";
-}
 function assignSource() {
   const s = single.value;
   if (!s) return;
@@ -199,11 +183,38 @@ const statusColor = computed(() => {
   if (!s) return "var(--ok)";
   return s.online ? "var(--ok)" : "var(--bad)";
 });
-const machineLine = computed(() => {
+const machineName = computed(() => {
   const s = single.value;
   if (!s) return "";
   const m = store.machineForScreen(s.id);
-  return `${m ? m.label : s.machineId} · ${s.connector}`;
+  return m ? m.label : s.machineId;
+});
+
+// ── live preview (mirrors the tile's canvas state: live / offline / empty) ──
+const previewState = computed<"live" | "offline" | "empty">(() => {
+  const s = single.value;
+  if (!s || !s.online) return "offline";
+  return hasContent.value ? "live" : "empty";
+});
+const previewMain = computed(() => {
+  switch (previewState.value) {
+    case "offline":
+      return "Screen dark";
+    case "empty":
+      return "No content";
+    default:
+      return singleContent.value?.name ?? "On air";
+  }
+});
+const previewSub = computed(() => {
+  switch (previewState.value) {
+    case "offline":
+      return "machine unreachable";
+    case "empty":
+      return "drop or assign content";
+    default:
+      return singleContentKind.value;
+  }
 });
 const placement = computed(() =>
   single.value ? store.placementForScreen(single.value.id) : undefined,
@@ -270,7 +281,7 @@ function selectOne(id: string) {
           <span class="content-kind">{{ wallContentKind }}</span>
         </span>
       </div>
-      <div v-else class="content-empty">No content yet — spans across</div>
+      <div v-else class="content-empty">Drag content to span across</div>
 
       <div v-if="librarySources.length" class="lib-pick">
         <select
@@ -290,20 +301,8 @@ function selectOne(id: string) {
         <router-link class="lib-link" :to="{ name: 'content' }">Manage library →</router-link>
       </div>
 
-      <div class="url-field">
-        <input
-          v-model="wallUrlDraft"
-          class="url-input"
-          placeholder="https://…"
-          :disabled="wallPending"
-          @keyup.enter="submitWallUrl"
-        />
-        <button class="url-btn" :disabled="!wallUrlDraft.trim() || wallPending" @click="submitWallUrl">
-          Span
-        </button>
-      </div>
       <div class="hint">
-        A library source (or ad-hoc URL) spans across every panel, with bezel seams shown.
+        A library source spans across every panel, with bezel seams shown.
       </div>
 
       <template v-if="wallZoom !== undefined">
@@ -333,6 +332,19 @@ function selectOne(id: string) {
     <!-- ── SINGLE ─────────────────────────────────────────────────────── -->
     <section v-else-if="single" class="pad">
       <div class="section-label">Screen</div>
+
+      <!-- Live preview — mirrors the screen's canvas state, status chip overlaid top-left. -->
+      <div class="preview" :class="previewState">
+        <div class="preview-chip">
+          <span class="dot" :style="{ background: statusColor }"></span>
+          <span class="preview-status">{{ statusLabel }}</span>
+        </div>
+        <div class="preview-center">
+          <span class="preview-main" :class="{ muted: previewState !== 'live' }">{{ previewMain }}</span>
+          <span class="preview-sub">{{ previewSub }}</span>
+        </div>
+      </div>
+
       <input
         v-model="nameDraft"
         class="name-input"
@@ -340,18 +352,18 @@ function selectOne(id: string) {
         @keyup.enter="commitName"
       />
 
+      <div class="id-row">
+        <span class="driven-by">Driven by {{ machineName }}</span>
+        <span class="spacer"></span>
+        <span class="conn-chip">{{ single.connector }}</span>
+      </div>
+
       <button class="ident-btn" :class="{ on: identingSingle }" @click="identSingle">
         <span class="dot accent"></span>
         {{ identingSingle ? "Flashing on wall…" : "Ident — flash on wall" }}
       </button>
 
-      <div class="status-row">
-        <span class="dot" :style="{ background: statusColor }"></span>
-        <span class="status-text">{{ statusLabel }}</span>
-      </div>
-      <div class="driven-by">Driven by {{ machineLine }}</div>
-
-      <div class="section-label gap-top">Content</div>
+      <div class="section-label">Content</div>
       <div v-if="hasContent" class="content-card">
         <span class="thumb"></span>
         <span class="content-meta">
@@ -359,7 +371,7 @@ function selectOne(id: string) {
           <span class="content-kind">{{ singleContentKind }}</span>
         </span>
       </div>
-      <div v-else class="content-empty">No content yet</div>
+      <div v-else class="content-empty">Drag content here</div>
 
       <div v-if="librarySources.length" class="lib-pick">
         <select v-model="sourcePick" class="lib-select" @change="assignSource">
@@ -373,17 +385,6 @@ function selectOne(id: string) {
         No saved sources.
         <router-link class="lib-link" :to="{ name: 'content' }">Manage library →</router-link>
       </div>
-
-      <div class="url-field">
-        <input
-          v-model="urlDraft"
-          class="url-input"
-          placeholder="https://…"
-          @keyup.enter="submitUrl"
-        />
-        <button class="url-btn" :disabled="!urlDraft.trim()" @click="submitUrl">Show</button>
-      </div>
-      <div class="hint">Pick a library source above, or paste an ad-hoc URL to show it here.</div>
 
       <template v-if="singleZoom !== undefined">
         <div class="section-label gap-top">Zoom</div>
@@ -440,7 +441,7 @@ function selectOne(id: string) {
         <span class="empty-glyph">◫</span>
         <span class="empty-title">Select a screen on the canvas</span>
         <span class="empty-sub">
-          Click to rename &amp; ident · shift-click<br />several to multi-select
+          Click to rename &amp; ident · shift-click<br />several, then combine into a surface
         </span>
       </div>
     </section>
@@ -480,6 +481,71 @@ function selectOne(id: string) {
   background: var(--accent);
 }
 
+/* live preview — a 16:9 miniature of the selected screen's canvas tile */
+.preview {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 10px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.preview.live {
+  background: var(--scr-live);
+  border: 1px solid var(--line);
+}
+.preview.offline {
+  background: var(--scr-off-bg);
+  border: 1px solid var(--line);
+}
+.preview.empty {
+  background: var(--scr-empty-bg);
+  border: 1.5px dashed var(--scr-empty-line);
+}
+.preview-chip {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--label-bg);
+  padding: 3px 8px;
+  border-radius: 6px;
+  z-index: 2;
+  backdrop-filter: blur(3px);
+}
+.preview-status {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.preview-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0 14px;
+  text-align: center;
+}
+.preview-main {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+}
+.preview-main.muted {
+  color: var(--muted);
+}
+.preview-sub {
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 500;
+}
+
 .name-input {
   width: 100%;
   background: var(--surface);
@@ -490,11 +556,29 @@ function selectOne(id: string) {
   font-weight: 600;
   color: var(--fg);
   outline: none;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
   font-family: inherit;
 }
 .name-input:focus {
   border-color: var(--accent);
+}
+
+.id-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 16px;
+}
+.id-row .spacer {
+  flex: 1;
+}
+.conn-chip {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+  background: var(--muted-bg);
+  border-radius: 5px;
+  padding: 2px 7px;
 }
 
 .ident-btn {
@@ -512,7 +596,7 @@ function selectOne(id: string) {
   font-weight: 500;
   cursor: pointer;
   box-shadow: var(--shadow-sm);
-  margin-bottom: 18px;
+  margin-bottom: 20px;
   font-family: inherit;
 }
 .ident-btn:hover {
@@ -526,19 +610,8 @@ function selectOne(id: string) {
   margin-bottom: 16px;
 }
 
-.status-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-.status-text {
-  font-size: 12.5px;
-  color: var(--fg2);
-  font-weight: 500;
-}
 .driven-by {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--muted);
 }
 
@@ -580,45 +653,6 @@ function selectOne(id: string) {
   border-radius: 9px;
   font-size: 12px;
   color: var(--muted);
-}
-
-.url-field {
-  display: flex;
-  gap: 7px;
-  margin-top: 10px;
-}
-.url-input {
-  flex: 1;
-  min-width: 0;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 9px 11px;
-  font-size: 12.5px;
-  color: var(--fg);
-  outline: none;
-  font-family: inherit;
-}
-.url-input:focus {
-  border-color: var(--accent);
-}
-.url-btn {
-  padding: 9px 14px;
-  border-radius: 8px;
-  border: none;
-  background: var(--primary);
-  color: var(--primary-fg);
-  font-size: 12.5px;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-}
-.url-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.url-btn:not(:disabled):hover {
-  opacity: 0.92;
 }
 
 /* library source picker */
@@ -681,21 +715,20 @@ function selectOne(id: string) {
 }
 
 .unplace-btn {
-  margin-top: 18px;
+  margin-top: 16px;
   width: 100%;
   padding: 9px;
   border-radius: 8px;
   border: 1px solid var(--line);
   background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
+  color: var(--bad);
+  font-size: 12.5px;
   font-weight: 500;
   cursor: pointer;
   font-family: inherit;
 }
 .unplace-btn:hover {
   background: var(--bad-soft);
-  color: var(--bad);
   border-color: var(--scr-bad-line);
 }
 

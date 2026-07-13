@@ -1,30 +1,27 @@
 <!--
-  Wall.vue — the Wall view shell (Phase 3a).
+  Wall.vue — the Wall view shell (Phase 3a; redesigned for POL-72, design handoff v3).
 
-  Layout mirrors docs/design/console.dc.html:
-    top bar : mural switcher · live indicator · "N screens · health"
-    body    : Unplaced-screens tray | Vue Flow canvas | Inspector
+  Layout:
+    top bar : scenes · mural switcher · live indicator · "N screens · health" · activity bell
+    body    : content-library sidebar | Vue Flow canvas (+ floating unplaced tray) | Inspector
 
-  The tray lists store.unplacedScreens; each row is draggable (HTML5 DnD,
-  screenId in dataTransfer) so it can be dropped onto the canvas, and carries
-  an Ident button plus a Place button (places at the next free grid slot). The
-  theme toggle lives in the app shell, not here.
+  The left sidebar is content-library ONLY — unplaced screens live in UnplacedTray, floating
+  bottom-center of the canvas (and absent entirely when there are none). The live-activity feed
+  is the ActivityBell in the top bar. The theme toggle lives in the app shell, not here.
 -->
 <script setup lang="ts">
 import { computed } from "vue";
 import { useConsoleStore } from "../stores/console";
-import { useIdent } from "../components/canvas/useIdent";
 import { kindGlyph, kindLabel, kindColorVar } from "../content";
 import MuralSwitcher from "../components/canvas/MuralSwitcher.vue";
 import SceneStrip from "../components/canvas/SceneStrip.vue";
 import WallCanvas from "../components/canvas/WallCanvas.vue";
 import Inspector from "../components/canvas/Inspector.vue";
-import ActivityFeed from "../components/canvas/ActivityFeed.vue";
+import UnplacedTray from "../components/canvas/UnplacedTray.vue";
+import ActivityBell from "../components/canvas/ActivityBell.vue";
 
 const store = useConsoleStore();
-const { ident } = useIdent();
 
-const unplaced = computed(() => store.unplacedScreens);
 const screenCount = computed(() => store.screens.length);
 
 // ── content library (left panel) ───────────────────────────────────────────
@@ -44,29 +41,12 @@ const alertText = computed(() =>
 );
 const alertColor = computed(() => (alerts.value > 0 ? "var(--warn)" : "var(--ok)"));
 
-function onDragStart(e: DragEvent, id: string) {
-  if (!e.dataTransfer) return;
-  e.dataTransfer.setData("application/x-polyptic-screen", id);
-  e.dataTransfer.setData("text/plain", id);
-  e.dataTransfer.effectAllowed = "move";
-}
-
 /** Drag a library source onto a screen/surface to assign it (distinct DnD type from screen placement). */
 function onSourceDragStart(e: DragEvent, id: string) {
   store.beginSourceDrag(id); // the drop reads this (store), not the unreliable dataTransfer.getData
   if (!e.dataTransfer) return;
   e.dataTransfer.setData("application/x-polyptic-source", id);
   e.dataTransfer.effectAllowed = "copy";
-}
-
-/** Place an unplaced screen at the next free grid slot (canvas px ≈ native res). */
-function place(id: string) {
-  const muralId = store.activeMuralId;
-  if (!muralId) return;
-  const n = store.placedScreens(muralId).length;
-  const col = n % 4;
-  const row = Math.floor(n / 4);
-  store.placeScreen(id, muralId, col * 2040, row * 1200);
 }
 </script>
 
@@ -86,15 +66,15 @@ function place(id: string) {
         {{ screenCount }} screens
         <span class="alert" :style="{ color: alertColor }">{{ alertText }}</span>
       </div>
+      <ActivityBell />
     </header>
 
     <!-- ── body ────────────────────────────────────────────────────────── -->
     <div class="body">
-      <!-- Unplaced tray + content library -->
-      <aside class="tray">
-        <!-- Content library -->
+      <!-- Content library (the sidebar's only job — unplaced screens live in the canvas tray) -->
+      <aside class="library">
         <div class="lib-head">
-          <span class="tray-head flush">Content library</span>
+          <span class="lib-title">Content library</span>
           <router-link class="manage-link" :to="{ name: 'content' }">Manage →</router-link>
         </div>
 
@@ -128,50 +108,19 @@ function place(id: string) {
           <button class="lib-cancel" @click="store.clearPickedSource()">Cancel</button>
         </div>
 
-        <div class="tray-head section-gap">Unplaced screens</div>
-
-        <div v-if="unplaced.length" class="tray-list">
-          <div
-            v-for="s in unplaced"
-            :key="s.id"
-            class="tray-item"
-            draggable="true"
-            @dragstart="onDragStart($event, s.id)"
-          >
-            <div class="tray-top">
-              <span class="dot" :style="{ background: s.online ? 'var(--ok)' : 'var(--bad)' }"></span>
-              <span class="tray-name">{{ s.friendlyName }}</span>
-            </div>
-            <div class="tray-actions">
-              <button class="mini-btn" @click="ident(s.id)">
-                <span class="mini-dot"></span>Ident
-              </button>
-              <span class="spacer"></span>
-              <button class="place-btn" title="Place on the canvas" @click="place(s.id)">
-                ⠿ Place
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div v-else class="tray-empty">
-          No unplaced screens. Approve a machine in <b>Machines</b> to add more.
-        </div>
-
-        <div class="tray-hint">
-          Drag a screen onto the canvas, or hit <b>Place</b>. Shift-click adjacent
-          screens, then <b>Combine</b> them into one surface.
+        <div class="lib-hint">
+          Shift-click adjacent screens, then <b>Combine</b> them into one surface.
         </div>
       </aside>
 
-      <!-- Canvas -->
-      <WallCanvas class="canvas-area" />
+      <!-- Canvas, with the unplaced tray floating over its bottom edge -->
+      <div class="canvas-wrap">
+        <WallCanvas class="canvas-area" />
+        <UnplacedTray />
+      </div>
 
-      <!-- Right rail: Inspector on top, Live activity feed below (design's right column). -->
-      <aside class="right-rail">
-        <Inspector class="inspector-area" />
-        <ActivityFeed />
-      </aside>
+      <!-- Inspector fills the full right column (the feed pane moved to the top-bar bell) -->
+      <Inspector class="inspector-area" />
     </div>
   </div>
 </template>
@@ -245,8 +194,8 @@ function place(id: string) {
   min-height: 0;
 }
 
-/* tray */
-.tray {
+/* content library sidebar */
+.library {
   width: 222px;
   flex: 0 0 222px;
   border-right: 1px solid var(--line);
@@ -254,25 +203,16 @@ function place(id: string) {
   padding: 18px 14px;
   overflow-y: auto;
 }
-.tray-head {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-  margin-bottom: 12px;
-}
-.tray-head.flush {
-  margin-bottom: 0;
-}
-.tray-head.section-gap {
-  margin-top: 20px;
-}
-
-/* content library */
 .lib-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 12px;
+}
+.lib-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
 }
 .manage-link {
   font-size: 11px;
@@ -368,129 +308,34 @@ function place(id: string) {
 .lib-cancel:hover {
   background: var(--surface);
 }
-.tray-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.tray-item {
-  border: 1px dashed var(--line2);
-  border-radius: 9px;
-  padding: 8px 8px 8px 9px;
-  background: var(--surface);
-  cursor: grab;
-  user-select: none;
-}
-.tray-item:active {
-  cursor: grabbing;
-}
-.tray-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 7px;
-}
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-}
-.tray-name {
-  flex: 1;
-  min-width: 0;
-  font-size: 12.5px;
-  color: var(--fg2);
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.tray-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.mini-btn {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  font-size: 11px;
-  color: var(--fg2);
-  font-weight: 500;
-  cursor: pointer;
-  font-family: inherit;
-}
-.mini-btn:hover {
-  background: var(--muted-bg);
-}
-.mini-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
-}
-.place-btn {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: none;
-  background: var(--muted-bg);
-  font-size: 11px;
-  color: var(--muted);
-  font-weight: 500;
-  cursor: grab;
-  font-family: inherit;
-}
-.place-btn:hover {
-  color: var(--fg2);
-}
-.tray-empty {
-  font-size: 11px;
-  color: var(--muted2);
-  line-height: 1.55;
-  padding: 4px 0;
-}
-.tray-empty b {
-  color: var(--accent-fg);
-  font-weight: 600;
-}
-.tray-hint {
-  margin-top: 14px;
+.lib-hint {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
   font-size: 11px;
   color: var(--muted2);
   line-height: 1.55;
 }
-.tray-hint b {
+.lib-hint b {
   color: var(--muted);
   font-weight: 600;
 }
 
 /* areas */
+.canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
 .canvas-area {
   flex: 1;
   min-width: 0;
 }
-/* Right rail — a vertical column hosting the Inspector (top, sizes to content, scrolls if tall)
-   and the Live activity feed (fills the remainder, scrolls). The children carry their own
-   border-left so the rail's left edge reads as one continuous rule down its full height. */
-.right-rail {
+.inspector-area {
   width: 272px;
   flex: 0 0 272px;
-  display: flex;
-  flex-direction: column;
   min-height: 0;
-}
-.inspector-area {
-  flex: 0 1 auto;
-  min-height: 0;
-  max-height: 62%;
 }
 
 @keyframes wall-pulse {
