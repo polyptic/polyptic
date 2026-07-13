@@ -223,8 +223,8 @@ function remove(): void {
       />
       <div class="sub">
         <span class="chip">{{ screen.connector }}</span>
-        <span class="driven">Driven by {{ machineLabel }}</span>
-        <span class="surfaces">
+        <span class="driven">
+          Driven by {{ machineLabel }} ·
           {{ screen.surfaceCount }} {{ screen.surfaceCount === 1 ? "surface" : "surfaces" }}
         </span>
       </div>
@@ -245,8 +245,8 @@ function remove(): void {
       <span class="inspect-glyph" aria-hidden="true">&lt;/&gt;</span>{{ inspectLabel }}
     </button>
 
-    <button class="remove-btn" title="Remove this screen from the console" @click="remove">
-      Remove
+    <button class="remove-btn" title="Remove screen" aria-label="Remove screen" @click="remove">
+      ✕
     </button>
   </div>
 </template>
@@ -418,21 +418,25 @@ function remove(): void {
 .inspect-btn.active .inspect-glyph {
   color: var(--accent);
 }
+/* Remove is a quiet ✕ icon (POL-68) — deletion shouldn't compete with Ident/Inspect for attention. */
 .remove-btn {
-  padding: 7px 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border-radius: 8px;
-  border: 1px solid var(--line2);
+  border: 1px solid var(--line);
   background: var(--surface);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--bad);
+  font-size: 11px;
+  color: var(--muted);
   cursor: pointer;
-  white-space: nowrap;
   font-family: inherit;
-  box-shadow: var(--shadow-sm);
 }
 .remove-btn:hover {
   background: var(--bad-soft);
-  border-color: var(--bad);
+  color: var(--bad);
 }
 </style>

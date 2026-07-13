@@ -68,6 +68,13 @@ export class Presence {
   private readonly inspecting = new Set<string>();
   /** screenId → why the box last refused to show it (POL-50). */
   private readonly inspectErrors = new Map<string, string>();
+  /** machineId → when the box ACCEPTED an operator reboot (POL-68). Live-only; cleared when the
+   *  machine reconnects, and expired after REBOOTING_TTL_MS so a box that dies mid-reboot doesn't
+   *  read "rebooting…" in the console forever. */
+  private readonly rebootingSince = new Map<string, number>();
+
+  /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
+  private static readonly REBOOTING_TTL_MS = 3 * 60_000;
 
   agentConnected(machineId: string): void {
     this.agentConns.set(machineId, (this.agentConns.get(machineId) ?? 0) + 1);
@@ -116,6 +123,30 @@ export class Presence {
 
   screenInspectError(screenId: string): string | undefined {
     return this.inspectErrors.get(screenId);
+  }
+
+  /** The box accepted `server/reboot` (POL-68) — it goes dark on purpose a moment later. */
+  setMachineRebooting(machineId: string): void {
+    this.rebootingSince.set(machineId, Date.now());
+  }
+
+  /** Whether an accepted reboot is still plausibly in flight (set, not reconnected, not expired). */
+  isMachineRebooting(machineId: string): boolean {
+    const since = this.rebootingSince.get(machineId);
+    if (since === undefined) return false;
+    if (Date.now() - since > Presence.REBOOTING_TTL_MS) {
+      this.rebootingSince.delete(machineId);
+      return false;
+    }
+    return true;
+  }
+
+  /** Clear (and report) an in-flight reboot — called when the machine dials back in, so the feed
+   *  can say "back online" for a round trip vs a plain "connected" for anything else. */
+  consumeMachineRebooting(machineId: string): boolean {
+    const wasRebooting = this.isMachineRebooting(machineId);
+    this.rebootingSince.delete(machineId);
+    return wasRebooting;
   }
 
   /**
@@ -175,6 +206,7 @@ export function buildAdminState(
       outputCount: machine.outputs.length,
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
+      rebooting: presence.isMachineRebooting(machine.id),
       screens: machineScreens,
     } satisfies MachineView;
   });

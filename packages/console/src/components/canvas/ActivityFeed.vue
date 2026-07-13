@@ -45,6 +45,8 @@ function severityColor(sev: ActivityEvent["severity"]): string {
       return "var(--bad)";
     case "warn":
       return "var(--warn)";
+    case "accent":
+      return "var(--accent)"; // operator-initiated lifecycle events (POL-68)
     default:
       return "var(--muted2)"; // info
   }

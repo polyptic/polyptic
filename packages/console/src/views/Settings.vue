@@ -142,17 +142,34 @@ const nowMs = ref(Date.now());
 const clock = window.setInterval(() => (nowMs.value = Date.now()), 30_000);
 onBeforeUnmount(() => window.clearInterval(clock));
 
-/** What the bootloader card says about the build pipeline right now. */
-const buildStatus = computed<{ text: string; tone: "busy" | "bad" | "idle" } | null>(() => {
+/**
+ * The status CHIP on the Network boot loader row — the only status element (POL-68 §4): while a
+ * build runs it becomes "Rebuilding"/"Updating" with a spinner, the detail lives in its hover
+ * tooltip; a failed build shows red; otherwise null and the idle "auto-updates" chip renders.
+ */
+const buildChip = computed<{ label: string; title: string; tone: "busy" | "bad" } | null>(() => {
   const b = store.imageUpdates?.lastBuild;
   if (!b) return null;
-  const when = new Date(b.startedAt).toLocaleString();
   if (b.status === "running") {
-    return { text: `${b.kind === "full" ? "Full rebuild" : "Build update"} running — started ${when}`, tone: "busy" };
+    const kind = b.kind === "full" ? "Full rebuild" : "Image update";
+    return {
+      label: b.kind === "full" ? "Rebuilding" : "Updating",
+      title: `${kind} running — started ${new Date(b.startedAt).toLocaleString()}`,
+      tone: "busy",
+    };
   }
-  if (b.status === "failure") return { text: `Last build failed — ${when}`, tone: "bad" };
-  return { text: `Built ${when}`, tone: "idle" };
+  if (b.status === "failure") {
+    return {
+      label: "Build failed",
+      title: `Last build failed — ${new Date(b.finishedAt ?? b.startedAt).toLocaleString()}`,
+      tone: "bad",
+    };
+  }
+  return null;
 });
+
+/** ISO downloads bake the enrolment token — said at the point of download, not in a footer (POL-68). */
+const ISO_CREDENTIAL_NOTE = "bakes the current enrolment token — treat the file as a credential";
 
 function onDownloadBootloader(): void {
   // The design opens the how-to modal; the download itself is the point, so do both. The anchor's
@@ -323,7 +340,7 @@ async function onSignOut(): Promise<void> {
                     <path d="M21 12a9 9 0 1 1-6.219-8.56" /><polyline points="21 3 21 8 16 8" />
                   </svg>
                   <span class="menu-text">
-                    <span class="menu-title">Build update</span>
+                    <span class="menu-title">Update image now</span>
                     <span class="menu-sub">In-place, userspace only.</span>
                   </span>
                 </button>
@@ -341,7 +358,7 @@ async function onSignOut(): Promise<void> {
                     <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" />
                   </svg>
                   <span class="menu-text">
-                    <span class="menu-title">Full rebuild</span>
+                    <span class="menu-title">Full rebuild now</span>
                     <span class="menu-sub">From the base ISO, kernel included.</span>
                   </span>
                 </button>
@@ -396,7 +413,18 @@ async function onSignOut(): Promise<void> {
               <div class="sub-title">Network boot loader</div>
               <div class="sub-sub">Write once to USB. Screens boot from it and pull the latest image automatically.</div>
             </div>
-            <span class="chip chip-accent">
+            <!-- The status chip is the ONLY status element on this row (POL-68 §4): it animates
+                 while a build runs and carries the detail in its tooltip. -->
+            <span
+              v-if="buildChip"
+              class="chip"
+              :class="buildChip.tone === 'busy' ? 'chip-accent' : 'chip-bad'"
+              :title="buildChip.title"
+            >
+              <span v-if="buildChip.tone === 'busy'" class="spinner" />
+              {{ buildChip.label }}
+            </span>
+            <span v-else class="chip chip-accent" title="The bootloader always pulls the newest published image">
               <svg
                 width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
                 stroke-linecap="round" stroke-linejoin="round"
@@ -419,6 +447,7 @@ async function onSignOut(): Promise<void> {
               class="btn btn-primary dl-btn"
               :href="store.netboot.bootMediumUrl"
               download
+              :title="`The bootloader ${ISO_CREDENTIAL_NOTE}`"
               @click="onDownloadBootloader"
             >
               <svg
@@ -433,10 +462,6 @@ async function onSignOut(): Promise<void> {
             <button v-else type="button" class="btn btn-primary dl-btn" disabled>Bootloader not built</button>
           </div>
 
-          <div v-if="buildStatus" class="build-status" :class="buildStatus.tone">
-            <span v-if="buildStatus.tone === 'busy'" class="spinner" />
-            {{ buildStatus.text }}
-          </div>
           <p v-if="!store.netboot?.bootMediumUrl && store.netboot" class="hint gap-sm">
             No prebuilt bootloader is bundled. Build one into <code class="code">BOOT_DIST_DIR</code> with
             <code class="code">deploy/build-boot-medium.sh</code>.
@@ -449,8 +474,11 @@ async function onSignOut(): Promise<void> {
           <div v-for="b in store.imageUpdates!.builds" :key="`${b.arch}-${b.imageId}`" class="build-row" :class="{ active: b.active }">
             <span class="arch">{{ b.arch }}</span>
             <span class="build-id">{{ formatImageId(b.imageId) }}</span>
-            <span class="build-when">{{ formatRelativeShort(b.builtAt, nowMs) }}</span>
-            <span class="tag" :class="b.active ? 'tag-ok' : 'tag-muted'">{{ b.active ? "Active" : "Superseded" }}</span>
+            <!-- The active row's accent tint IS its status — no age, no chip (POL-68 §4). -->
+            <template v-if="!b.active">
+              <span class="build-when">{{ formatRelativeShort(b.builtAt, nowMs) }}</span>
+              <span class="tag tag-muted">Superseded</span>
+            </template>
 
             <!-- The active build has nothing to activate, so its single action stays a plain icon.
                  Every other row folds Download + Activate into an overflow menu. -->
@@ -460,7 +488,7 @@ async function onSignOut(): Promise<void> {
                 class="row-btn"
                 :href="b.liveIsoUrl"
                 download
-                :title="`Download the bootable live ISO for ${b.imageId}`"
+                :title="`Download the bootable live ISO for ${b.imageId} — ${ISO_CREDENTIAL_NOTE}`"
               >
                 <svg
                   width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
@@ -495,6 +523,7 @@ async function onSignOut(): Promise<void> {
                     class="menu-item"
                     :href="b.liveIsoUrl"
                     download
+                    :title="`This ISO ${ISO_CREDENTIAL_NOTE}`"
                     @click="rowMenu = null"
                   >
                     <svg
@@ -515,7 +544,9 @@ async function onSignOut(): Promise<void> {
                       <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" />
                     </svg>
                     <span class="menu-text">
-                      <span class="menu-title">{{ activating === b.imageId ? "Activating…" : "Activate" }}</span>
+                      <span class="menu-title">
+                        {{ activating === b.imageId ? "Rolling back…" : "Roll fleet back to this build" }}
+                      </span>
                       <span class="menu-sub">Serve this build to the fleet.</span>
                     </span>
                   </button>
@@ -528,12 +559,6 @@ async function onSignOut(): Promise<void> {
           No builds retained yet — the depot fills as images are built. Run a build from the ⋯ menu, or with
           <code class="code">deploy/build-live-image.sh</code>.
         </p>
-        <p v-if="store.imageUpdates" class="hint gap-sm">
-          Keeping the newest {{ store.imageUpdates.retainBuilds }} build<span v-if="store.imageUpdates.retainBuilds > 1">s</span>
-          per architecture. Activating an older build rolls the fleet back to it. The download is that build's
-          standalone live ISO, which bakes the current enrolment token — treat the file as a credential.
-        </p>
-
         <!-- Boot without a USB stick (secondary) -------------------------------- -->
         <button type="button" class="disclosure" :class="{ open: advOpen }" @click="advOpen = !advOpen">
           <span class="caret">›</span>Boot without a USB stick
@@ -1157,20 +1182,6 @@ async function onSignOut(): Promise<void> {
   opacity: 0.5;
   cursor: default;
 }
-.build-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  font-size: 11.5px;
-  color: var(--muted2);
-}
-.build-status.busy {
-  color: var(--accent-fg);
-}
-.build-status.bad {
-  color: var(--bad);
-}
 .spinner {
   width: 11px;
   height: 11px;
@@ -1240,10 +1251,6 @@ async function onSignOut(): Promise<void> {
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 20px;
-}
-.tag-ok {
-  color: var(--ok);
-  background: var(--ok-soft);
 }
 .tag-muted {
   color: var(--muted);
@@ -1424,6 +1431,10 @@ async function onSignOut(): Promise<void> {
 .chip-accent {
   color: var(--accent-fg);
   background: var(--accent-soft);
+}
+.chip-bad {
+  color: var(--bad);
+  background: var(--bad-soft);
 }
 .badge-ok {
   flex: 0 0 auto;

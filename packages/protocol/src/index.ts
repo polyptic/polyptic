@@ -638,6 +638,10 @@ export const MachineView = z.object({
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
   shellEnabled: z.boolean().default(false),
+  /** POL-68 — an operator-requested reboot is in flight: the box accepted `server/reboot` and has
+   *  not reconnected yet. Live-only (never persisted) and bounded server-side, so a box that dies
+   *  mid-reboot doesn't read "rebooting…" forever. Optional = back-compat. */
+  rebooting: z.boolean().optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;
@@ -859,11 +863,13 @@ export const ServerToAdminShellMessage = z.discriminatedUnion("t", [
 ]);
 export type ServerToAdminShellMessage = z.infer<typeof ServerToAdminShellMessage>;
 
-/** A line in the Live Activity feed — a human-readable record of a notable event. */
+/** A line in the Live Activity feed — a human-readable record of a notable event.
+ *  `accent` (POL-68) marks operator-initiated lifecycle events (reboot requested, console session
+ *  opened) — notable but neither good nor bad, rendered in the console's accent blue. */
 export const ActivityEvent = z.object({
   id: z.string(),
   at: z.string(), // ISO timestamp
-  severity: z.enum(["info", "good", "warn", "bad"]),
+  severity: z.enum(["info", "good", "warn", "bad", "accent"]),
   text: z.string(),
 });
 export type ActivityEvent = z.infer<typeof ActivityEvent>;

@@ -72,7 +72,7 @@ describe("ShellRelay gating (POL-59)", () => {
     const admin = new FakeSocket();
     relay.openFromAdmin(admin as unknown as WebSocket, "box-1", 80, 24);
     expect(admin.last()).toMatchObject({ t: "server/shell-opened", ok: false });
-    expect(admin.last().reason).toContain("not armed");
+    expect(admin.last().reason).toContain("not enabled");
     // Nothing was asked of the agent.
     expect(agentSock.sent).toHaveLength(0);
   });

@@ -71,7 +71,7 @@ export class ShellRelay {
     if (!machine) return refuse("unknown machine");
     if (machine.status !== "approved") return refuse(`machine is ${machine.status}, not approved`);
     if (!this.control.isShellEnabled(machineId)) {
-      return refuse("remote shell is not armed for this machine — enable it first");
+      return refuse("the console is not enabled for this machine — enable it first");
     }
     const live = [...this.sessions.values()].filter((s) => s.machineId === machineId);
     if (live.length >= MAX_SESSIONS_PER_MACHINE) return refuse("too many shell sessions open on this machine");
@@ -82,7 +82,7 @@ export class ShellRelay {
     if (delivered === 0) return refuse("machine is offline");
 
     this.sessions.set(sessionId, { sessionId, machineId, admin });
-    this.activity.push("warn", `Remote shell opened on ${machine.label}`);
+    this.activity.push("accent", `Console session opened on ${machine.label}`);
     this.log.info({ event: "shell.open", machineId, sessionId }, "remote shell session opening");
   }
 
@@ -91,7 +91,7 @@ export class ShellRelay {
     const session = this.sessions.get(sessionId);
     if (!session || session.admin !== admin || session.machineId !== machineId) return;
     if (!this.control.isShellEnabled(machineId)) {
-      this.close(sessionId, "remote shell disarmed");
+      this.close(sessionId, "console disabled");
       return;
     }
     this.agentHub.send(machineId, ServerToAgentShellData.parse({ t: "server/shell-data", sessionId, dataBase64 }));

@@ -1,15 +1,22 @@
 <!--
-  Machines.vue — the operator MACHINES view (Phase 3e), ported from the retired SolidJS admin into
-  the Vue console. Mirrors docs/design/console.dc.html's MACHINES VIEW.
+  Machines.vue — the operator MACHINES view (Phase 3e, decluttered in POL-68). Mirrors the
+  "Polyptych Console v2" design's MACHINES VIEW.
 
   Machines are grouped by enrollment status:
     • Pending  — newly dialed-in boxes awaiting a decision: Approve (admits their screens) or Reject
                  (with an optional reason). Surfaced first, with a warning treatment.
-    • Approved — admitted machines, online first. Each shows its screens (connectivity dot, inline
-                 rename, connector, "Driven by {machine}", per-screen Ident) plus a per-machine
-                 "Ident all", a Reboot (online only — it rides the live agent socket), and a Revoke.
-                 (Revoke reuses the reject endpoint.)
+    • Approved — admitted machines, online first. Each card shows exactly three action clusters
+                 (POL-68): [Ident all] · [console button] · [⋯ overflow]. The ⋯ menu holds Reboot and
+                 the destructive actions (Revoke access / Remove machine); status chips (Online pill +
+                 an amber "Shell armed" security indicator) sit between the name and the actions.
+                 Screens are listed below each card (connectivity dot, inline rename, per-screen Ident).
     • Rejected — denied/revoked boxes, kept listed so access can be restored (Re-approve).
+
+  The console button is stateful (POL-68 §3): "Enable console" (bordered) → "Enabling…" while the
+  arm round-trips → a split button "Launch console ▾ / Disable console". Launch opens the full-screen
+  console view (MachineTerminal); sessions and enable/disable land in the activity feed. Enabling is
+  the per-machine shell arm from POL-59 — deliberately NOT fleet-wide, and immediate (no image
+  rebuild: the unprivileged shell is always in the image; arming is what gates it).
 
   A "Connect a machine" button (and a first-run empty state) opens the cold-start wizard. Screens are
   first-class and named; machines are plumbing — so the rich, per-screen affordances live here.
@@ -18,7 +25,7 @@
   ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints, no direct fetch.
 -->
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, reactive, onMounted, onUnmounted } from "vue";
 import type { MachineView } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
@@ -46,6 +53,13 @@ onUnmounted(() => {
   window.clearTimeout(toastTimer);
 });
 
+/** "just now" while online, "rebooting…" while an operator reboot is in flight, else relative. */
+function lastSeen(m: MachineView): string {
+  if (m.online) return "just now";
+  if (m.rebooting) return "rebooting…";
+  return formatLastSeen(m.lastSeen, now.value);
+}
+
 function approve(m: MachineView): void {
   void store.approveMachine(m.id);
 }
@@ -58,6 +72,7 @@ function reject(m: MachineView): void {
 }
 
 function revoke(m: MachineView): void {
+  menuFor.value = null;
   const yes = window.confirm(
     `Revoke "${m.label}"? Its screens go dark until it is approved again.`,
   );
@@ -73,6 +88,7 @@ function reapprove(m: MachineView): void {
  * Revoke (a remembered "rejected" state): a removed machine must be set up again to return.
  */
 function remove(m: MachineView): void {
+  menuFor.value = null;
   const n = m.screens.length;
   const what = n > 0 ? `its ${countLabel(n, "screen")} plus their layout and content` : "it";
   const yes = window.confirm(
@@ -88,9 +104,11 @@ function identAll(m: MachineView): void {
 
 /**
  * Power-cycle a wedged box (POL-55). Offered only while the machine is online, because the reboot
- * rides its live agent socket — an offline box has nothing to receive it.
+ * rides its live agent socket — an offline box has nothing to receive it. While it's down the card
+ * reads "rebooting…" (the server tracks the in-flight reboot) until the box dials back in.
  */
 async function reboot(m: MachineView): Promise<void> {
+  menuFor.value = null;
   const n = m.screens.length;
   const what = n > 0 ? `Its ${countLabel(n, "screen")} go dark` : "It goes dark";
   const yes = window.confirm(
@@ -101,25 +119,57 @@ async function reboot(m: MachineView): Promise<void> {
   showToast(error ?? `Rebooting ${m.label}…`);
 }
 
-// ── Remote shell (POL-59) ────────────────────────────────────────────────────
-// A box must be ARMED before an operator can open a terminal; arming is off by default so a console
-// compromise can't silently reach a shell on the fleet. The terminal itself is a modal panel.
+// ── Console lifecycle (POL-59 arm/disarm, POL-68 UI) ─────────────────────────
+// A box's console must be ENABLED before an operator can launch a terminal; it is off by default so
+// a console compromise can't silently reach a shell on the fleet. The terminal is a full-screen view.
 const terminalFor = ref<MachineView | null>(null);
+/** Machines whose enable round-trip is in flight — drives the "Enabling…" button state. */
+const enabling = reactive(new Set<string>());
 
-async function toggleShell(m: MachineView): Promise<void> {
-  const enabling = !m.shellEnabled;
-  if (enabling && !window.confirm(
-    `Arm the remote shell for "${m.label}"? While armed, an operator can open a root-less terminal on ` +
-      `this box. It cannot change what the screen displays. Disarm it when you're done.`,
-  )) {
-    return;
+async function enableConsole(m: MachineView): Promise<void> {
+  if (enabling.has(m.id)) return;
+  const yes = window.confirm(
+    `Enable the console on "${m.label}"? While enabled, an operator can open an unprivileged ` +
+      `terminal on this box. It cannot change what the screen displays. Sessions are logged to the ` +
+      `activity feed. Disable it when you're done.`,
+  );
+  if (!yes) return;
+  enabling.add(m.id);
+  try {
+    await store.setMachineShell(m.id, true);
+  } finally {
+    enabling.delete(m.id);
   }
-  await store.setMachineShell(m.id, enabling);
-  if (!enabling && terminalFor.value?.id === m.id) terminalFor.value = null;
+}
+
+async function disableConsole(m: MachineView): Promise<void> {
+  consoleMenuFor.value = null;
+  await store.setMachineShell(m.id, false);
+  if (terminalFor.value?.id === m.id) terminalFor.value = null;
 }
 
 function openTerminal(m: MachineView): void {
   terminalFor.value = m;
+}
+
+// ── Menus (⋯ overflow + the console split-button dropdown) ───────────────────
+// One of each may be open at a time; a fixed scrim closes them on any outside click.
+const menuFor = ref<string | null>(null);
+const consoleMenuFor = ref<string | null>(null);
+
+function toggleMenu(id: string): void {
+  menuFor.value = menuFor.value === id ? null : id;
+  consoleMenuFor.value = null;
+}
+
+function toggleConsoleMenu(id: string): void {
+  consoleMenuFor.value = consoleMenuFor.value === id ? null : id;
+  menuFor.value = null;
+}
+
+function closeMenus(): void {
+  menuFor.value = null;
+  consoleMenuFor.value = null;
 }
 
 const toast = ref("");
@@ -128,12 +178,6 @@ function showToast(message: string): void {
   window.clearTimeout(toastTimer);
   toast.value = message;
   toastTimer = window.setTimeout(() => (toast.value = ""), 2600);
-}
-
-/** A comma-joined list of a machine's screen names (or its output count if none registered yet). */
-function drives(m: MachineView): string {
-  if (m.screens.length === 0) return countLabel(m.outputCount, "screen");
-  return m.screens.map((s) => s.friendlyName).join(", ");
 }
 </script>
 
@@ -146,7 +190,7 @@ function drives(m: MachineView): string {
           <h1 class="title">Machines</h1>
           <p class="subtitle">
             The physical PCs driving your screens. New machines must be approved before they can show
-            anything — approved screens land in the Wall's unplaced tray.
+            anything.
           </p>
         </div>
         <button class="connect-btn" @click="wizardOpen = true">Connect a machine</button>
@@ -169,9 +213,8 @@ function drives(m: MachineView): string {
           <div class="enrol-text">
             <div class="enrol-title">Enrolling a machine</div>
             <div class="enrol-sub">
-              Boot a box from the Polyptic bootloader and it streams the live image into RAM — no OS
-              install, nothing to type — then dials in and appears below as Pending. Approve it to
-              admit its screens.
+              Boot a box from the Polyptic bootloader and it streams the live image into RAM then
+              dials in and appears below as Pending. Approve it to admit its screens.
             </div>
           </div>
           <button class="connect-btn ghost" @click="wizardOpen = true">Guided setup →</button>
@@ -194,8 +237,7 @@ function drives(m: MachineView): string {
                   </div>
                   <div class="machine-meta">
                     {{ m.online ? "Online" : "Offline" }} · reports
-                    {{ countLabel(m.outputCount, "screen") }} ·
-                    {{ m.online ? "just now" : formatLastSeen(m.lastSeen, now) }}
+                    {{ countLabel(m.outputCount, "screen") }} · {{ lastSeen(m) }}
                   </div>
                 </div>
                 <button class="btn-remove" @click="remove(m)">Remove</button>
@@ -224,48 +266,106 @@ function drives(m: MachineView): string {
                     <span class="machine-label">{{ m.label }}</span>
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
-                  <div class="machine-meta drives">Drives {{ drives(m) }}</div>
                 </div>
+
+                <!-- status chips: Shell armed is a passive security indicator, always visible while
+                     armed, independent of the console button state (POL-68 §2). -->
+                <span v-if="m.shellEnabled" class="chip-armed">Shell armed</span>
                 <span class="status-badge" :class="m.online ? 'online' : 'offline'">
                   {{ m.online ? "Online" : "Offline" }}
                 </span>
-                <span class="last-seen">
-                  {{ m.online ? "just now" : formatLastSeen(m.lastSeen, now) }}
-                </span>
-                <button
-                  v-if="m.screens.length"
-                  class="btn-ghost-sm"
-                  @click="identAll(m)"
-                >
+                <span class="last-seen">{{ lastSeen(m) }}</span>
+
+                <!-- cluster 1: Ident all -->
+                <button v-if="m.screens.length" class="btn-ghost-sm" @click="identAll(m)">
                   <span class="ident-dot"></span>Ident all
                 </button>
+
+                <!-- cluster 2: the stateful console button (POL-68 §3) -->
                 <button
-                  v-if="m.online"
+                  v-if="!m.shellEnabled"
                   class="btn-ghost-sm"
-                  title="Power-cycle this machine"
-                  @click="reboot(m)"
+                  :disabled="!m.online || enabling.has(m.id)"
+                  :title="
+                    m.online
+                      ? 'Enables an unprivileged debug shell on this box — sessions are logged to the activity feed'
+                      : `${m.label} is offline — the console rides its agent connection`
+                  "
+                  @click="enableConsole(m)"
                 >
-                  Reboot
+                  <template v-if="enabling.has(m.id)">
+                    <span class="spinner"></span>Enabling…
+                  </template>
+                  <template v-else>Enable console</template>
                 </button>
-                <button
-                  v-if="m.online"
-                  class="btn-ghost-sm"
-                  :class="{ 'shell-armed': m.shellEnabled }"
-                  :title="m.shellEnabled ? 'Disarm the remote shell' : 'Arm the remote shell for debugging'"
-                  @click="toggleShell(m)"
-                >
-                  {{ m.shellEnabled ? "Shell armed" : "Arm shell" }}
-                </button>
-                <button
-                  v-if="m.online && m.shellEnabled"
-                  class="btn-ghost-sm"
-                  title="Open a terminal on this machine"
-                  @click="openTerminal(m)"
-                >
-                  Console
-                </button>
-                <button class="btn-revoke" @click="revoke(m)">Revoke</button>
-                <button class="btn-remove" @click="remove(m)">Remove</button>
+                <div v-else class="split">
+                  <button
+                    class="split-main"
+                    :disabled="!m.online"
+                    :title="
+                      m.online
+                        ? 'Open a terminal on this machine'
+                        : `${m.label} is offline — the console rides its agent connection`
+                    "
+                    @click="openTerminal(m)"
+                  >
+                    Launch console
+                  </button>
+                  <div class="menu-wrap">
+                    <button
+                      class="split-chev"
+                      :class="{ open: consoleMenuFor === m.id }"
+                      aria-label="Console actions"
+                      :aria-expanded="consoleMenuFor === m.id"
+                      @click="toggleConsoleMenu(m.id)"
+                    >
+                      <svg
+                        width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"
+                      >
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                    </button>
+                    <template v-if="consoleMenuFor === m.id">
+                      <div class="menu-scrim" @click="closeMenus" />
+                      <div class="menu menu-console">
+                        <button class="menu-item danger" @click="disableConsole(m)">
+                          Disable console
+                        </button>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+
+                <!-- cluster 3: ⋯ overflow (Reboot · Revoke access · Remove machine) -->
+                <div class="menu-wrap">
+                  <button
+                    class="kebab"
+                    :class="{ open: menuFor === m.id }"
+                    title="More actions"
+                    aria-label="More actions"
+                    :aria-expanded="menuFor === m.id"
+                    @click="toggleMenu(m.id)"
+                  >
+                    ⋯
+                  </button>
+                  <template v-if="menuFor === m.id">
+                    <div class="menu-scrim" @click="closeMenus" />
+                    <div class="menu">
+                      <button
+                        class="menu-item"
+                        :disabled="!m.online"
+                        :title="m.online ? 'Power-cycle this machine' : `${m.label} is offline — nothing to reboot`"
+                        @click="reboot(m)"
+                      >
+                        Reboot
+                      </button>
+                      <div class="menu-sep"></div>
+                      <button class="menu-item danger" @click="revoke(m)">Revoke access</button>
+                      <button class="menu-item danger" @click="remove(m)">Remove machine</button>
+                    </div>
+                  </template>
+                </div>
               </div>
 
               <div v-if="m.screens.length" class="screens">
@@ -317,7 +417,7 @@ function drives(m: MachineView): string {
     <!-- cold-start wizard overlay -->
     <ColdStartWizard :open="wizardOpen" :now="now" @close="wizardOpen = false" />
 
-    <!-- remote-shell terminal (POL-59) -->
+    <!-- full-screen console (POL-59 shell, POL-68 view) -->
     <MachineTerminal
       v-if="terminalFor"
       :key="terminalFor.id"
@@ -496,7 +596,7 @@ function drives(m: MachineView): string {
 .machine-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 .machine-id {
   flex: 1;
@@ -510,10 +610,12 @@ function drives(m: MachineView): string {
 .machine-label {
   font-size: 14px;
   font-weight: 600;
+  white-space: nowrap;
 }
 .machine-uuid {
   font-size: 11px;
   color: var(--muted2);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -522,11 +624,6 @@ function drives(m: MachineView): string {
   font-size: 12px;
   color: var(--muted);
   margin-top: 2px;
-}
-.machine-meta.drives {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 .dot {
   width: 8px;
@@ -540,12 +637,25 @@ function drives(m: MachineView): string {
 .dot-off {
   background: var(--muted2);
 }
+
+/* status chips */
+.chip-armed {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
 .status-badge {
   font-size: 11px;
   font-weight: 600;
   padding: 3px 9px;
   border-radius: 20px;
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 .status-badge.online {
   background: var(--ok-soft);
@@ -606,29 +716,18 @@ function drives(m: MachineView): string {
   font-family: inherit;
   box-shadow: var(--shadow-sm);
 }
-.btn-ghost-sm:hover {
+.btn-ghost-sm:hover:not(:disabled) {
   background: var(--muted-bg);
+}
+.btn-ghost-sm:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 .ident-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--accent);
-}
-.btn-revoke {
-  padding: 7px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted);
-  cursor: pointer;
-  font-family: inherit;
-}
-.btn-revoke:hover {
-  background: var(--bad-soft);
-  color: var(--bad);
 }
 .btn-remove {
   padding: 7px 12px;
@@ -644,6 +743,158 @@ function drives(m: MachineView): string {
 .btn-remove:hover {
   background: var(--bad-soft);
   border-color: var(--bad);
+}
+
+/* the console split button (POL-68 §3) */
+.split {
+  display: flex;
+  flex: 0 0 auto;
+}
+.split-main {
+  padding: 7px 12px;
+  border-radius: 8px 0 0 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+.split-main:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.split-main:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.split-chev {
+  width: 26px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0 8px 8px 0;
+  border: 1px solid var(--line2);
+  border-left: none;
+  background: var(--surface);
+  font-size: 9px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+.split-chev:hover,
+.split-chev.open {
+  background: var(--muted-bg);
+  color: var(--fg);
+}
+
+/* the spinner inside "Enabling…" */
+.spinner {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid currentcolor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ⋯ overflow + dropdown menus */
+.menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+}
+.kebab {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 14px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+}
+.kebab:hover,
+.kebab.open {
+  background: var(--muted-bg);
+  color: var(--fg);
+}
+.menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+.menu {
+  position: absolute;
+  top: 36px;
+  right: 0;
+  z-index: 31;
+  width: 190px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+  padding: 5px;
+  animation: fadein 0.12s ease;
+}
+.menu.menu-console {
+  top: 34px;
+  width: 170px;
+}
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg2);
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.menu-item.danger {
+  color: var(--bad);
+}
+.menu-item.danger:hover:not(:disabled) {
+  background: var(--bad-soft);
+}
+.menu-sep {
+  height: 1px;
+  background: var(--line);
+  margin: 5px 4px;
+}
+@keyframes fadein {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .pending-note {
@@ -668,11 +919,6 @@ function drives(m: MachineView): string {
   margin-top: 12px;
   font-size: 12px;
   color: var(--muted2);
-}
-
-.btn-ghost-sm.shell-armed {
-  color: #b45309;
-  border-color: #f59e0b;
 }
 
 /* toast (reboot feedback) */

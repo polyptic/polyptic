@@ -1,11 +1,15 @@
 <!--
-  MachineTerminal.vue — the operator's remote shell on a running box (POL-59).
+  MachineTerminal.vue — the operator's full-screen console on a running box (POL-59, POL-68).
 
   A kiosk box dials OUT to the control plane (D12); there is nothing to SSH into. This component
   tunnels a real terminal over the SAME authenticated /admin socket the console already holds: it
   opens a session (`admin/shell-open`), streams keystrokes up and PTY bytes down (base64), and honours
   resize. The shell on the far side is UNPRIVILEGED (the kiosk user) and cannot change what the wall
   displays — it is for looking, not touching pixels.
+
+  POL-68 made this a full-screen view (not a modal): a header with "← Machines", the machine's
+  name + id, live Online / Console enabled chips, and a reminder that sessions land in the activity
+  feed; below it, the terminal fills the rest of the viewport.
 
   xterm.js does the terminal emulation (cursor addressing, colours, alt-screen) so `top`, `journalctl`
   and editors render correctly. Bytes are base64 so a PTY's raw output survives the JSON frames.
@@ -14,7 +18,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { useConsoleStore } from "../stores/console";
 
@@ -25,6 +29,12 @@ const store = useConsoleStore();
 const host = ref<HTMLDivElement | null>(null);
 const statusLine = ref("Connecting…");
 const connected = ref(false);
+
+// Live chips track the authoritative admin/state, not the props at open time — if the box drops or
+// an operator disables the console elsewhere, the header says so.
+const machine = computed(() => store.machineById(props.machineId));
+const online = computed(() => machine.value?.online ?? false);
+const shellEnabled = computed(() => machine.value?.shellEnabled ?? false);
 
 let term: Terminal | null = null;
 let fit: FitAddon | null = null;
@@ -47,7 +57,7 @@ onMounted(() => {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     fontSize: 13,
     cursorBlink: true,
-    theme: { background: "#0b0f14" },
+    theme: { background: "#0b0b0e" },
     scrollback: 5000,
   });
   fit = new FitAddon();
@@ -71,7 +81,7 @@ onMounted(() => {
         pushResize();
       } else {
         statusLine.value = `Refused: ${f.reason ?? "unknown reason"}`;
-        term?.writeln(`\r\n\x1b[31mRemote shell refused: ${f.reason ?? "unknown reason"}\x1b[0m`);
+        term?.writeln(`\r\n\x1b[31mConsole session refused: ${f.reason ?? "unknown reason"}\x1b[0m`);
       }
     } else if (f.t === "server/shell-data" && f.sessionId === sessionId && f.dataBase64) {
       term?.write(b64decodeToBytes(f.dataBase64));
@@ -114,98 +124,115 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="term-overlay" @click.self="emit('close')">
-    <div class="term-panel">
-      <div class="term-head">
-        <div class="term-title">
-          <span class="term-dot" :class="{ live: connected }"></span>
-          Remote shell — {{ machineLabel }}
-        </div>
-        <div class="term-status">{{ statusLine }}</div>
-        <button class="term-close" title="Close terminal" @click="emit('close')">✕</button>
+  <div class="console-view">
+    <div class="console-head">
+      <button class="back-btn" @click="emit('close')">← Machines</button>
+      <div class="who">
+        <span class="who-name">{{ machineLabel }}</span>
+        <span class="who-id">{{ machineId }}</span>
       </div>
-      <div ref="host" class="term-host"></div>
-      <div class="term-foot">
-        Unprivileged shell (kiosk user). It cannot change what the wall displays. Closing ends the session.
-      </div>
+      <span class="chip" :class="online ? 'chip-ok' : 'chip-bad'">{{ online ? "Online" : "Offline" }}</span>
+      <span v-if="shellEnabled" class="chip chip-warn">Shell armed</span>
+      <span v-if="!connected" class="session-status">{{ statusLine }}</span>
+      <span class="spacer"></span>
+      <span class="head-note">Session is logged to the activity feed</span>
     </div>
+    <div ref="host" class="term-host"></div>
   </div>
 </template>
 
 <style scoped>
-.term-overlay {
+.console-view {
   position: fixed;
   inset: 0;
   z-index: 50;
-  display: grid;
-  place-items: center;
-  background: rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(2px);
-}
-.term-panel {
-  width: min(920px, 92vw);
-  height: min(560px, 84vh);
   display: flex;
   flex-direction: column;
-  background: #0b0f14;
-  border: 1px solid var(--border, #23303c);
-  border-radius: 12px;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-  overflow: hidden;
+  background: #0b0b0e;
 }
-.term-head {
+.console-head {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 14px;
-  background: #10161d;
-  border-bottom: 1px solid var(--border, #23303c);
+  height: 56px;
+  flex: 0 0 56px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
 }
-.term-title {
+.back-btn {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  color: #e6edf3;
-}
-.term-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: #6b7683;
-}
-.term-dot.live {
-  background: #34d399;
-  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.2);
-}
-.term-status {
-  flex: 1;
-  color: #93a1b0;
-  font-size: 13px;
-}
-.term-close {
-  border: none;
+  gap: 6px;
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
   background: transparent;
-  color: #93a1b0;
-  font-size: 15px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg2);
   cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 6px;
+  font-family: inherit;
+  white-space: nowrap;
 }
-.term-close:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6edf3;
+.back-btn:hover {
+  background: var(--muted-bg);
+}
+.who {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+.who-name {
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.who-id {
+  font-size: 11px;
+  color: var(--muted2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.chip-ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+.chip-bad {
+  color: var(--bad);
+  background: var(--bad-soft);
+}
+.chip-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+.session-status {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.spacer {
+  flex: 1;
+}
+.head-note {
+  font-size: 11.5px;
+  color: var(--muted2);
+  white-space: nowrap;
 }
 .term-host {
   flex: 1;
   min-height: 0;
-  padding: 8px 10px;
-}
-.term-foot {
-  padding: 8px 14px;
-  font-size: 12px;
-  color: #7c8896;
-  background: #10161d;
-  border-top: 1px solid var(--border, #23303c);
+  padding: 12px 14px;
 }
 </style>

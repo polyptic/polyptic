@@ -421,7 +421,7 @@ export function registerRestRoutes(
     // The feed only reaches the console folded into an admin/state, and a reboot mutates no state that
     // would otherwise trigger one — so broadcast, or the operator's click leaves no trace until the
     // box drops off the network seconds later.
-    activity.push("warn", `Rebooting ${machine.label}`);
+    activity.push("accent", `Rebooting ${machine.label}`);
     broadcaster.broadcast();
     fastify.log.info(
       { event: "machine.reboot", machineId: machine.id, reason, delivered },
@@ -445,7 +445,7 @@ export function registerRestRoutes(
     if (!machine) return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
 
     // Disarming must not leave a terminal open on a box the operator just locked down.
-    if (!body.data.enabled) shellRelay.closeMachineSessions(machine.id, "remote shell disarmed");
+    if (!body.data.enabled) shellRelay.closeMachineSessions(machine.id, "console disabled");
 
     broadcaster.broadcast();
     fastify.log.info(

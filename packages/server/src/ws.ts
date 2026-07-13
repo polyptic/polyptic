@@ -392,7 +392,9 @@ function handleAgent(
       // A machine came online (and possibly new screens / a status change) — refresh the admin view.
       if (cameOnline) {
         const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
-        activity.push("good", `${label} connected`);
+        // POL-68 — closing the loop on an operator reboot reads "back online", not just "connected".
+        const rebootRoundTrip = presence.consumeMachineRebooting(msg.machineId);
+        activity.push("good", rebootRoundTrip ? `${label} back online` : `${label} connected`);
       }
       broadcaster.broadcast();
     } catch (err) {
@@ -428,6 +430,11 @@ function handleAgent(
       if (!msg.accepted) {
         activity.push("bad", `${label} refused to reboot: ${msg.reason ?? "no reason given"}`);
         // Nothing else will broadcast: the box stayed up, so no presence edge follows.
+        broadcaster.broadcast();
+      } else {
+        // POL-68 — the box goes dark ON PURPOSE a moment later: mark the reboot in flight so the
+        // console can show "rebooting…" instead of a bare Offline until it dials back in.
+        presence.setMachineRebooting(msg.machineId);
         broadcaster.broadcast();
       }
       log.info(
@@ -509,7 +516,11 @@ function handleAgent(
       const machine = control.getMachine(machineId);
       presence.agentDisconnected(machineId);
       if (machine && !presence.isMachineOnline(machineId)) {
-        activity.push("bad", `${machine.label} went unreachable`);
+        // An operator-requested reboot drops the socket ON PURPOSE — the feed already says
+        // "Rebooting X", so a scary "went unreachable" here would be noise (POL-68).
+        if (!presence.isMachineRebooting(machineId)) {
+          activity.push("bad", `${machine.label} went unreachable`);
+        }
         // POL-50 — the box is gone, so its panels are no longer showing an inspector. Drop the flag,
         // or a reboot-while-inspecting leaves the console badging a wall that came back sealed.
         presence.clearScreensInspecting(

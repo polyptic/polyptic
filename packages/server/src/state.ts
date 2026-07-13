@@ -819,7 +819,11 @@ export class ControlPlane {
     if (machine.shellEnabled !== enabled) {
       machine.shellEnabled = enabled;
       await this.store.setMachineShellEnabled(machineId, enabled);
-      this.emit(enabled ? "warn" : "info", `Remote shell ${enabled ? "armed" : "disarmed"} for ${machine.label}`);
+      // POL-68 — the console's vocabulary: enabling is security-relevant (red), disabling is calm.
+      this.emit(
+        enabled ? "bad" : "good",
+        `Console ${enabled ? "enabled" : "disabled"} on ${machine.label}`,
+      );
     }
     return machine;
   }
