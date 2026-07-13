@@ -10,23 +10,14 @@
          debug. These absolute paths are rewritten to the `/player/` base at build (vite.config.ts). -->
     <link rel="icon" href="/favicon.ico" sizes="32x32" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <!-- Idle-splash typography (POL-27). A PROGRESSIVE ENHANCEMENT, and it must never gate the
-         first paint: a wall box on an isolated VLAN cannot reach Google, and a plain
-         `rel="stylesheet"` is render-blocking — the screen stays WHITE until the request times out
-         (seen on real hardware: "white for ages", every boot). Loading it as `media="print"` makes
-         the browser fetch it without blocking rendering; the onload swap applies it if and when it
-         arrives. Offline boxes paint instantly on the system fallback (system-ui / ui-monospace),
-         which is exactly what the stack in styles.css already declares.
-         Self-hosting these two faces would remove the third-party dependency entirely — tracked
-         separately; this fix makes the wall correct offline either way. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
-      rel="stylesheet"
-      media="print"
-      onload="this.media='all'; this.onload=null;"
-    />
+    <!-- Idle-splash typography (POL-27) is now SELF-HOSTED and bundled by Vite — see src/main.ts.
+         It used to be fetched from fonts.googleapis.com, which was always wrong here: a wall box is
+         meant to reach the control plane and NOTHING else (docs/DEPLOY.md), so on an isolated VLAN
+         that request could only fail. The earlier fix made it non-blocking (`media="print"` + an
+         onload swap) so a white screen was no longer the cost — but the request was still made, and
+         on a boot where the network was still settling Chrome aborted it with ERR_NETWORK_CHANGED
+         along with the content itself (POL-86, real hardware). The font now ships with the player,
+         from the same origin as everything else, so there is no third-party request left to fail. -->
   </head>
   <body>
     <div id="root"></div>

@@ -28,11 +28,12 @@
  * scale is applied before the span's translate), so a video wall zooms as one continuous page. It is
  * a pure restyle of the SAME keyed element: the iframe rescales without navigating or reloading (D5).
  */
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protocol";
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
+import { FrameWatchdog } from "./frame-watchdog";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
 import IdleSplash from "./IdleSplash.vue";
 
@@ -108,21 +109,92 @@ function handleMessage(msg: ServerToPlayerMessage): void {
   }
 }
 
+// ── Frame watchdog (POL-86) — the wall heals a failed content load by itself ──────────────────
+//
+// A cross-origin iframe's failure is invisible to us (SOP), and Chrome fires `load` even for its own
+// ERR_NETWORK_CHANGED error page — so we cannot simply ask "did it load?". Instead we reload frames
+// on evidence that in-flight requests were killed. See ./frame-watchdog.ts for the full reasoning.
+
+/** surface id → its live <iframe>, so the watchdog can re-fetch it in place. */
+const frameEls = new Map<string, HTMLIFrameElement>();
+
+const watchdog = new FrameWatchdog({
+  // `el.src = el.src` re-fetches WITHOUT rewriting the URL — so the token the server stamped into a
+  // content URL at send time (POL-24) survives, and the keyed element that makes flips instant (D5)
+  // is never remounted.
+  reload: (id) => {
+    const el = frameEls.get(id);
+    if (el) el.src = el.src;
+  },
+  log: (msg) => console.info(`[player/watchdog] ${msg}`),
+});
+
+function bindFrame(id: string, el: unknown): void {
+  if (el instanceof HTMLIFrameElement) frameEls.set(id, el);
+  else frameEls.delete(id);
+}
+
+/** The iframe finished navigating. Not proof of health (an error page loads too) — see the module. */
+function onFrameLoad(id: string): void {
+  watchdog.onLoad(id);
+}
+
+/** Any framed surface (web/dashboard) currently on this screen — media has no iframe to watch. */
+const framedIds = computed(() => surfaces.value.filter(isFrame).map((s) => s.id));
+
+watch(
+  framedIds,
+  (ids) => {
+    // Wait for Vue to mount/patch the iframes before the watchdog starts timing them.
+    void nextTick(() => watchdog.sync(ids));
+  },
+  { immediate: true },
+);
+
+/** The browser saw the network come back. Anything loaded before this may hold an aborted page. */
+function onOnline(): void {
+  watchdog.heal("browser reported online");
+}
+
+/**
+ * A resource on OUR OWN page failed to load. This is the signal that would have caught the POL-86
+ * bug directly: the boot that broke the wall also failed the player's favicon with
+ * ERR_NETWORK_CHANGED. If our own subresources are being aborted, the content frame's almost
+ * certainly were too — and unlike the frame, these errors we CAN see. Capture phase: resource error
+ * events do not bubble.
+ */
+function onResourceError(event: Event): void {
+  if (event.target instanceof HTMLElement) watchdog.heal("a page resource failed to load");
+}
+
 onMounted(() => {
+  window.addEventListener("online", onOnline);
+  window.addEventListener("error", onResourceError, true);
+
   if (!screenId) {
     connState.value = "closed";
     return;
   }
+  let everOpen = false;
   socket = new PlayerSocket(SERVER_WS_URL, screenId, {
     onMessage: handleMessage,
     onState: (state) => {
+      // A RECONNECT (not the first connect) means the socket dropped — which is itself evidence the
+      // network moved under us, and therefore that a frame loaded before the drop may be broken.
+      if (state === "open" && everOpen) watchdog.heal("player socket reconnected");
+      if (state === "open") everOpen = true;
       connState.value = state;
     },
   });
   socket.start();
 });
 
-onUnmounted(() => socket?.stop());
+onUnmounted(() => {
+  window.removeEventListener("online", onOnline);
+  window.removeEventListener("error", onResourceError, true);
+  watchdog.stop();
+  socket?.stop();
+});
 
 // ── Rendering helpers ────────────────────────────────────────────────────────
 
@@ -272,11 +344,13 @@ function connLabel(state: ConnState): string {
     >
       <iframe
         v-if="isFrame(surface)"
+        :ref="(el) => bindFrame(surface.id, el)"
         class="surface-frame"
         :class="{ 'is-interactive': isInteractive(surface) }"
         :src="frameUrl(surface)"
         :style="frameStyle(surface)"
         allow="autoplay; encrypted-media; fullscreen; clipboard-read; clipboard-write"
+        @load="onFrameLoad(surface.id)"
       />
       <img
         v-else-if="surface.type === 'image'"

@@ -170,6 +170,63 @@ export class SwayBackend implements DisplayBackend {
     console.log(`[${ts()}] [sway] ${msg}`);
   }
 
+  /**
+   * Forward the browser's stdout/stderr into the agent's log, so a wall can explain itself in
+   * `journalctl --user -u polyptic-agent` (POL-86).
+   *
+   * Bounded on purpose. Chrome writes a great deal of noise nobody will ever read (font warnings,
+   * Vulkan probes, dbus chatter), and the journal on a RAM-only diskless box is not free — so we keep
+   * the lines that describe a FAILURE, drop the rest, and cap the rate so a browser stuck in a
+   * warning loop cannot fill it. `POLYPTIC_BROWSER_LOG=all` lifts the filter for a lab session.
+   *
+   * This was `stdio: "ignore"`, which is why a broken wall was mute: the browser's own account of the
+   * failure was thrown away, and the only way to read its mind was to open DevTools against it. It is
+   * also, pointedly, how surf's `DRI3 error` line — the entire POL-67 finding — stayed invisible.
+   */
+  private pipeBrowserOutput(child: ChildProcess, browser: KioskBrowser, connector: string): void {
+    const verbose = process.env.POLYPTIC_BROWSER_LOG?.trim() === "all";
+    // Worth reading on a wall that is misbehaving: renderer/GPU deaths, the EGL/DRI3 class that
+    // started POL-67, aborted loads, sandbox refusals, plain errors.
+    const interesting =
+      /error|fail|crash|denied|refus|fatal|EGL|GPU|DRI3|sandbox|ERR_|net::|cannot|unable/i;
+    const MAX_LINES_PER_MIN = 60;
+    let windowStart = Date.now();
+    let emitted = 0;
+    let suppressed = 0;
+
+    const sink =
+      (stream: "out" | "err") =>
+      (chunk: Buffer): void => {
+        for (const raw of chunk.toString("utf8").split("\n")) {
+          const line = raw.trim();
+          if (!line) continue;
+          if (!verbose && !interesting.test(line)) continue;
+
+          const now = Date.now();
+          if (now - windowStart >= 60_000) {
+            if (suppressed > 0) {
+              this.log(`[${browser}:${connector}] … ${suppressed} more line(s) suppressed`);
+            }
+            windowStart = now;
+            emitted = 0;
+            suppressed = 0;
+          }
+          if (emitted >= MAX_LINES_PER_MIN) {
+            suppressed += 1;
+            continue;
+          }
+          emitted += 1;
+          this.log(`[${browser}:${connector}:${stream}] ${line.slice(0, 500)}`);
+        }
+      };
+
+    child.stdout?.on("data", sink("out"));
+    child.stderr?.on("data", sink("err"));
+    // A pipe nobody drains would eventually block the browser; a stream error must never kill a wall.
+    child.stdout?.on("error", () => {});
+    child.stderr?.on("error", () => {});
+  }
+
   private async ensureBrowserKind(): Promise<KioskBrowser> {
     if (this.browser) return this.browser;
     this.browser = await selectKioskBrowser();
@@ -297,7 +354,14 @@ export class SwayBackend implements DisplayBackend {
               devtoolsPort: this.devtoolsPortFor(connector),
             })
           : buildSurfArgs({ url: target.url, inspector: target.inspector });
-      child = spawnChild(bin, args, { stdio: "ignore" });
+      // Pipe the browser's stdio instead of discarding it (POL-86). It used to be `stdio: "ignore"`,
+      // which meant the browser's own diagnosis of a failure never reached the journal — during the
+      // POL-67 hardware bring-up the box was mute about a broken wall and the only way to read the
+      // browser's mind was to open DevTools against it. It is also how surf's DRI3 warning (the whole
+      // POL-67 finding) would have surfaced years earlier. Browsers are chatty, so the sink filters
+      // and rate-limits rather than firehosing the journal (see pipeBrowserOutput).
+      child = spawnChild(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.pipeBrowserOutput(child, browser, connector);
       this.log(
         `spawned ${browser} pid=${child.pid ?? "?"} for ${connector} → ${target.url}` +
           (target.inspector ? " (Web Inspector enabled)" : ""),
