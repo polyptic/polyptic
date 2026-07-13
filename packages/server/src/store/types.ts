@@ -418,6 +418,14 @@ export interface Store {
   /** Persist the agent CA (single row, written once on first mTLS boot). */
   setMtlsCa(ca: PersistedMtlsCa): Promise<void>;
 
+  // ── Player-token secret (POL-54) ───────────────────────────────────────────
+  /** The persisted HMAC secret behind the per-screen player tokens (hex). Undefined until the first
+   *  boot generates it. Persisted so tokens survive a server restart — a reconnecting wall must
+   *  never be rejected just because the control plane bounced. */
+  getPlayerTokenSecret(): Promise<string | undefined>;
+  /** Persist the player-token secret (single row, written once on first boot). */
+  setPlayerTokenSecret(secret: string): Promise<void>;
+
   // ── Display settings (POL-6) ───────────────────────────────────────────────
   /** The persisted fleet-wide display settings (badge toggle). Undefined until first changed. */
   // ── Image updates (POL-41) ─────────────────────────────────────────────────

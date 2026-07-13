@@ -85,6 +85,15 @@ function readScreenId(): string {
   return (params.get("screen") ?? "").trim();
 }
 
+/** POL-54 — read `?token=<bearer>` from the URL: the screen's player token, minted by the server
+ *  into the playerUrl the agent launched us with. Echoed in every `player/hello`; a gated server
+ *  (auth enabled) rejects hellos without it. Empty on dev stacks with auth off — that's fine. */
+function readPlayerToken(): string | undefined {
+  const params = new URLSearchParams(window.location.search);
+  const token = (params.get("token") ?? "").trim();
+  return token.length > 0 ? token : undefined;
+}
+
 /** POL-46 — `?pending=<machineId>`: the board a machine shows on every output while it waits for an
  *  operator to approve it. It has no screen (and so no player WS) yet; this page is purely a sign. */
 function readPendingMachineId(): string {
@@ -94,6 +103,7 @@ function readPendingMachineId(): string {
 
 const pendingMachineId = readPendingMachineId();
 const screenId = readScreenId();
+const playerToken = readPlayerToken();
 
 // Diagnostics first (POL-86 priority A): from here on, every load-bearing step writes a line —
 // console + localStorage ring + (once the WS opens) the server's pod log. `initDiag` also replays
@@ -372,20 +382,25 @@ onMounted(() => {
   });
 
   let everOpen = false;
-  socket = new PlayerSocket(SERVER_WS_URL, screenId, {
-    onMessage: handleMessage,
-    onState: (state) => {
-      diag(`player socket ${state}`);
-      if (state === "open") {
-        // A RECONNECT (not the first connect) means the socket dropped — itself evidence the network
-        // moved under us, and therefore that content loaded before the drop may be broken.
-        if (everOpen) prober.recheck("player socket reconnected");
-        everOpen = true;
-        flushDiag();
-      }
-      connState.value = state;
+  socket = new PlayerSocket(
+    SERVER_WS_URL,
+    screenId,
+    {
+      onMessage: handleMessage,
+      onState: (state) => {
+        diag(`player socket ${state}`);
+        if (state === "open") {
+          // A RECONNECT (not the first connect) means the socket dropped — itself evidence the network
+          // moved under us, and therefore that content loaded before the drop may be broken.
+          if (everOpen) prober.recheck("player socket reconnected");
+          everOpen = true;
+          flushDiag();
+        }
+        connState.value = state;
+      },
     },
-  });
+    playerToken,
+  );
   bindDiagSender((line) => socket?.send({ t: "player/diag", screenId, ...line }) ?? false);
   socket.start();
 });

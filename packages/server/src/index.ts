@@ -19,6 +19,7 @@ import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettin
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import { AuthService, authConfigFromEnv } from "./auth-local";
+import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
 import { CaptureCoordinator, ThumbnailStore } from "./capture";
 import { Enrollment } from "./enroll";
@@ -230,6 +231,21 @@ const auth = new AuthService({ store, fastify, config: authConfig, log: fastify.
 await store.deleteExpiredSessions(new Date().toISOString());
 await auth.seedAdmin();
 
+// ── Player-channel auth (POL-54): a per-deployment secret (persisted, like the mTLS CA) derives a
+// bearer token per screen; the token is minted into every playerUrl handed to an agent and verified
+// on `player/hello`. Enforcement rides AUTH_ENABLED — the same switch as REST + the /admin WS — so a
+// dev stack stays open, while a secured deployment stops broadcasting slices (and their POL-24
+// credential-stamped URLs) to anyone who can reach the port. Minting is unconditional: URLs handed
+// out with auth off remain valid if auth is later switched on. ──
+const playerAuth = await PlayerAuth.init(store, auth.enabled, fastify.log);
+control.setPlayerTokenMinter((screenId) => playerAuth.tokenFor(screenId));
+fastify.log.info(
+  { event: "player.auth", required: playerAuth.required },
+  playerAuth.required
+    ? "player channel gated — player/hello requires the screen's token"
+    : "player channel OPEN (AUTH_ENABLED=false) — hellos are not token-checked",
+);
+
 // THE GATE: require a valid session on every /api/v1/** route except the public auth endpoints. The
 // device channels (/agent, /player), health/metrics and the WS upgrades are NOT /api/v1 and untouched.
 fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyReply) => {
@@ -306,6 +322,7 @@ const shellRelay = attachWebSockets({
   control,
   enrollment,
   auth,
+  playerAuth,
   hub,
   agentHub,
   adminHub,

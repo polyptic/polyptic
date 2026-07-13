@@ -33,6 +33,9 @@ export class PlayerSocket {
     private readonly url: string,
     private readonly screenId: string,
     private readonly handlers: PlayerSocketHandlers,
+    /** POL-54 — the screen's bearer token from the launch URL (`?token=`), echoed in every hello so
+     *  the gated server admits us. Absent on a dev stack with auth off; reconnects re-present it. */
+    private readonly token?: string,
   ) {}
 
   /** Begin connecting (and auto-reconnecting). */
@@ -85,11 +88,13 @@ export class PlayerSocket {
       if (this.ws !== ws) return;
       this.backoffMs = RECONNECT_MIN_MS;
       this.handlers.onState("open");
-      // Announce which screen this page is, so the server starts pushing our slice.
+      // Announce which screen this page is, so the server starts pushing our slice. The token
+      // (when the launch URL carried one) is what a POL-54-gated server admits the hello on.
       this.send({
         t: "player/hello",
         protocol: PROTOCOL_VERSION,
         screenId: this.screenId,
+        ...(this.token ? { token: this.token } : {}),
       });
     });
 

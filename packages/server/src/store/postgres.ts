@@ -376,6 +376,15 @@ export class PostgresStore implements Store {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `;
+    // Player-token secret (POL-54): a single row holding the deployment's HMAC secret behind the
+    // per-screen player tokens, generated once on first boot and reused forever — so the token a
+    // wall box carries in its player URL stays valid across server restarts.
+    await sql`
+      CREATE TABLE IF NOT EXISTS player_token_secret (
+        id     int PRIMARY KEY DEFAULT 1,
+        secret text NOT NULL
+      )
+    `;
     // Image updates (POL-41): a single row with the scheduled-rebuild settings, the urgent
     // roll-out switch, and the last rebuild-hook run's outcome.
     await sql`
@@ -1040,6 +1049,24 @@ export class PostgresStore implements Store {
       INSERT INTO mtls_ca (id, cert_pem, key_pem, created_at)
       VALUES (1, ${ca.certPem}, ${ca.keyPem}, ${ca.createdAt})
       ON CONFLICT (id) DO UPDATE SET cert_pem = EXCLUDED.cert_pem, key_pem = EXCLUDED.key_pem
+    `;
+  }
+
+  // ── Player-token secret (POL-54) ─────────────────────────────────────────────
+
+  async getPlayerTokenSecret(): Promise<string | undefined> {
+    const sql = this.sql;
+    const rows = await sql<{ secret: string }[]>`
+      SELECT secret FROM player_token_secret WHERE id = 1 LIMIT 1
+    `;
+    return rows[0]?.secret;
+  }
+
+  async setPlayerTokenSecret(secret: string): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO player_token_secret (id, secret) VALUES (1, ${secret})
+      ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret
     `;
   }
 

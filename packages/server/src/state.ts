@@ -118,9 +118,9 @@ function withZoomedFirstSurface(
   return { ...slice, surfaces: [{ ...surface, zoom }, ...slice.surfaces.slice(1)] };
 }
 
-function playerUrlFor(screenId: string): string {
-  return `${PLAYER_BASE_URL}/?screen=${encodeURIComponent(screenId)}`;
-}
+/** POL-54 — whoever can mint a screen's player token (the PlayerAuth service, wired after
+ *  construction like the token provider; absent in unit tests → tokenless URLs). */
+export type PlayerTokenMinter = (screenId: string) => string;
 
 /** POL-46 — the page a PENDING machine shows on every output until an operator approves it. Same
  *  player app, same base URL; no screen id, because a pending machine has no screens yet. */
@@ -297,6 +297,11 @@ export class ControlPlane {
 
   /** POL-42 — the poller's live feed/weather data, consumed at send time (buildPageData). */
   private pageDataProvider?: PageDataProvider;
+
+  /** POL-54 — mints the per-screen token stamped into every playerUrl the server hands an agent, so
+   *  the /player WS can authenticate the hello that comes back. Wired after construction (same
+   *  pattern as setTokenProvider); when absent (unit tests), playerUrls simply go out tokenless. */
+  private playerTokenMinter?: PlayerTokenMinter;
 
   /** POL-6 — fleet-wide display settings (on-screen badge visibility) pushed to every player. Starts
    *  at the env default; `init()` loads any persisted operator override on top. */
@@ -649,7 +654,7 @@ export class ControlPlane {
       assignments.push({
         connector: output.connector,
         screenId: screen.id,
-        playerUrl: playerUrlFor(screen.id),
+        playerUrl: this.playerUrlFor(screen.id),
       });
     }
 
@@ -2323,6 +2328,19 @@ export class ControlPlane {
   // and a routine token refresh never rewrites (= reloads) a live iframe.
 
   /** Wire the token cache after construction (the TokenService is seeded from these profiles). */
+  /** POL-54 — wire the player-token minter after construction (same pattern as setTokenProvider). */
+  setPlayerTokenMinter(minter: PlayerTokenMinter): void {
+    this.playerTokenMinter = minter;
+  }
+
+  /** The URL an agent points one output's browser at: base + `?screen=<id>` + the screen's bearer
+   *  token (POL-54) when a minter is wired. The token is what lets the /player WS trust the hello. */
+  private playerUrlFor(screenId: string): string {
+    const base = `${PLAYER_BASE_URL}/?screen=${encodeURIComponent(screenId)}`;
+    const token = this.playerTokenMinter?.(screenId);
+    return token ? `${base}&token=${encodeURIComponent(token)}` : base;
+  }
+
   setTokenProvider(provider: Pick<TokenService, "getToken" | "statusFor">): void {
     this.tokenProvider = provider;
   }

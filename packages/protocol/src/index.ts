@@ -808,6 +808,12 @@ export const PlayerHello = z.object({
   t: z.literal("player/hello"),
   protocol: z.literal(PROTOCOL_VERSION),
   screenId: z.string(),
+  /** POL-54 — the screen's player token. The server mints it into the `?token=` of every playerUrl it
+   *  hands an agent (`server/apply`), the player echoes it here, and the /player channel REJECTS a
+   *  hello without a valid one whenever auth is enabled — so "anyone who can reach the server" can no
+   *  longer subscribe to any screen's slice (which carries stamped credential URLs, POL-24). Optional
+   *  on the wire: a dev deployment with AUTH_ENABLED=false stays open, exactly like /admin and REST. */
+  token: z.string().min(1).max(200).optional(),
 });
 
 export const PlayerAck = z.object({

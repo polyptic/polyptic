@@ -13,9 +13,14 @@
  *            The socket's lifetime marks the machine ONLINE for the admin UI; it is also tracked by
  *            machineId in the `AgentHub` so an operator's approve/reject reaches it live.
  *
- *   /player  (screen ↔ server): the instant content path. On `player/hello` we register the socket
- *            under its screenId and reply `server/render` with the screen's current slice. The
- *            socket's lifetime marks the screen ONLINE; `player/ack` records its observed revision.
+ *   /player  (screen ↔ server): the instant content path. On `player/hello` the server first checks
+ *            the screen's bearer token (POL-54 — minted into the playerUrl the agent launched the
+ *            browser with; enforced whenever auth is enabled, since a slice carries POL-24
+ *            credential-stamped URLs). A bad/absent token is CLOSED (4401), never registered. An
+ *            admitted hello registers the socket under its screenId and replies `server/render`
+ *            with the screen's current slice; the socket is then BOUND to that screen — later
+ *            frames claiming another screenId are dropped. The socket's lifetime marks the screen
+ *            ONLINE; `player/ack` records its observed revision.
  *
  *   /admin   (admin UI ↔ server): on connect we push a full `admin/state` snapshot, then a fresh
  *            snapshot on `admin/hello`. Thereafter the server broadcasts `admin/state` on every
@@ -47,6 +52,7 @@ import type { RawData } from "ws";
 import { hashCredential } from "./enroll";
 import type { Enrollment } from "./enroll";
 import type { AuthService } from "./auth-local";
+import type { PlayerAuth } from "./player-auth";
 import type { CaptureCoordinator } from "./capture";
 import { pendingUrlFor } from "./state";
 import type { ControlPlane, RegisterMachineInput, ScreenAssignment } from "./state";
@@ -62,6 +68,8 @@ interface WsDeps {
   enrollment: Enrollment;
   /** Local-auth service — gates the /admin upgrade on a valid session cookie (Phase 3f). */
   auth: AuthService;
+  /** POL-54 — gates `player/hello` on the screen's bearer token (minted into playerUrl). */
+  playerAuth: PlayerAuth;
   hub: PlayerHub;
   agentHub: AgentHub;
   adminHub: AdminHub;
@@ -123,7 +131,7 @@ export function parseDevtoolsUpgradePath(pathname: string): { screenId: string; 
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, log, allowedOrigins, agentMtls } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, log, allowedOrigins, agentMtls } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -148,7 +156,9 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
       // Device channel — authenticated via enrollment credentials on agent/hello, NOT a user session.
       agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, "plain"));
     } else if (pathname === "/player") {
-      // Device channel — players carry no user session; not gated.
+      // Device channel — players carry no user session, but they are NOT anonymous: the agent
+      // launched them at a server-minted URL carrying a per-screen bearer token, echoed back in
+      // `player/hello` and verified there (POL-54). The upgrade itself passes; the hello is the gate.
       playerWss.handleUpgrade(req, socket, head, (ws) => playerWss.emit("connection", ws, req));
     } else if (pathname === "/admin") {
       // Anti-CSWSH: a browser WS handshake sends the page's Origin and the cookie is auto-attached, so
@@ -253,7 +263,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
     });
   }
   playerWss.on("connection", (ws: WebSocket) =>
-    handlePlayer(ws, control, hub, presence, broadcaster, activity, log),
+    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, log),
   );
   adminWss.on("connection", (ws: WebSocket) =>
     handleAdmin(ws, adminHub, broadcaster, control, shellRelay, log),
@@ -650,8 +660,15 @@ function handleAgent(
   );
 }
 
+/** POL-54 — app-level close codes on the /player channel (4000–4999 are free for applications).
+ *  The player's reconnect loop treats any close the same way (backoff + retry), so a wall whose
+ *  token becomes valid (agent relaunch after a secret rotation) self-heals with no special casing. */
+export const PLAYER_CLOSE_UNAUTHORIZED = 4401;
+export const PLAYER_CLOSE_PROTOCOL = 4400;
+
 function handlePlayer(
   ws: WebSocket,
+  playerAuth: PlayerAuth,
   control: ControlPlane,
   hub: PlayerHub,
   presence: Presence,
@@ -660,6 +677,8 @@ function handlePlayer(
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "player.connected" }, "player socket opened");
+  /** Set ONLY by an admitted hello — the screen this socket is bound to. Frames claiming any other
+   *  screenId (spoofed acks/diag, a second hello for a different screen) never reach the registry. */
   let screenId: string | null = null;
 
   ws.on("message", (data: RawData) => {
@@ -672,6 +691,28 @@ function handlePlayer(
     }
 
     if (msg.t === "player/hello") {
+      // A socket is bound to ONE screen for its lifetime — a re-hello for another screen is a
+      // protocol violation (and would let one authorized token register extra screens).
+      if (screenId !== null && screenId !== msg.screenId) {
+        log.warn(
+          { event: "player.hello.rebind", boundScreenId: screenId, claimedScreenId: msg.screenId },
+          "player tried to re-hello as a different screen — closing",
+        );
+        ws.close(PLAYER_CLOSE_PROTOCOL, "socket already bound to a screen");
+        return;
+      }
+      // POL-54 — THE GATE. Enforced whenever auth is enabled (the same switch as REST + /admin):
+      // the hello must carry the exact token the server minted into this screen's playerUrl. A miss
+      // is closed and NEVER registered — no render, no presence, no activity line, no enumeration
+      // signal beyond the close itself. The token itself is never logged.
+      if (playerAuth.required && !playerAuth.verify(msg.screenId, msg.token)) {
+        log.warn(
+          { event: "player.hello.unauthorized", screenId: msg.screenId, hadToken: Boolean(msg.token) },
+          "rejected player hello — missing or invalid player token",
+        );
+        ws.close(PLAYER_CLOSE_UNAUTHORIZED, "invalid or missing player token");
+        return;
+      }
       screenId = msg.screenId;
       // True online edge: this socket takes the screen from 0→online (no player was connected before).
       const cameOnline = hub.count(screenId) === 0;
@@ -711,19 +752,27 @@ function handlePlayer(
       );
       // Screen just came online — refresh the admin view.
       broadcaster.broadcast();
+    } else if (screenId === null || msg.screenId !== screenId) {
+      // POL-54 — everything after hello is scoped to the BOUND screen. A frame before any admitted
+      // hello, or one claiming a different screenId, is dropped: an authorized player for screen A
+      // must not be able to write screen B's observed revision or speak in B's name in the log.
+      log.warn(
+        { event: "player.frame.unbound", boundScreenId: screenId, claimedScreenId: msg.screenId, t: msg.t },
+        "dropped player frame — no admitted hello for that screen on this socket",
+      );
     } else if (msg.t === "player/diag") {
       // POL-86: the player's own account of what happened on the glass — probe failures, aborted
       // loads, heals — with the box's timestamps. This line in the pod log is how a broken boot is
       // diagnosed without SSH or DevTools. The player rate-caps itself; we just record it.
       log.info(
-        { event: "player.diag", screenId: msg.screenId, playerAt: msg.at },
+        { event: "player.diag", screenId, playerAt: msg.at },
         `player diag: ${msg.msg}`,
       );
     } else {
       // player/ack — record the revision this screen has observed.
-      presence.setScreenObservedRevision(msg.screenId, msg.revision);
+      presence.setScreenObservedRevision(screenId, msg.revision);
       log.debug(
-        { event: "player.ack", screenId: msg.screenId, revision: msg.revision },
+        { event: "player.ack", screenId, revision: msg.revision },
         "player ack",
       );
       broadcaster.broadcast();
