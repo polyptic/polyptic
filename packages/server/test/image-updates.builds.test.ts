@@ -13,7 +13,7 @@
  *      would rewrite a retained build's checksums through the link.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -192,5 +192,101 @@ describe("image build retention (POL-45)", () => {
     const iu = makeUpdates(root);
     await iu.adopt("arm64");
     expect((await iu.builds("arm64")).map((b) => b.imageId)).toEqual(["20260702T000000Z-bbbbbbbb"]);
+  });
+});
+
+// ── POL-79: the active build must ALWAYS have a builds/<id>/ mirror ──────────────────────────────
+//
+// The local boot medium PINS `root=live:…/dist/image/<arch>/builds/<active-id>/rootfs.squashfs`
+// (POL-63/D67), so a box 404s and retries forever if the active build reached the arch root by a
+// path that never ran a reconcile — an externally-run rebuild Job, or a partially-failed multi-arch
+// hook run whose non-zero exit skipped the post-rebuild retain. These tests reproduce that gap (the
+// homelab's exact state: builds/ held the OLDER builds but not the ACTIVE one) and prove the heal.
+
+describe("active build is always mirrored into builds/ (POL-79)", () => {
+  /** Overwrite the arch root with a brand-new active build, as an EXTERNAL rebuild (a Job run
+   *  directly, bypassing the server's execute→retain) would leave it: new artifacts + image-id.txt
+   *  at the root, and NO builds/<new-id>/ mirror.
+   *
+   *  Faithful to `build-live-image.sh` (`rm -f "$OUT_DIR/rootfs.squashfs"` then `mksquashfs`, line
+   *  321): a real rebuild ALLOCATES A NEW INODE for the payload, so an already-adopted OLDER build
+   *  keeps its own inode + mtime. Writing in place (writeFileSync without the rm) would instead
+   *  TRUNCATE the inode the old mirror is hardlinked to, corrupting its content and collapsing its
+   *  mtime onto the new build's — a nondeterministic tie that made this suite pass on macOS but flip
+   *  on Linux's readdir order. The explicit newest-mtime stamp then makes the freshly-published build
+   *  sort ahead of any retained older one, deterministically. */
+  function externalRebuildAtRoot(root: string, imageId: string, epochSeconds = 1_800_000_000): void {
+    const arch = join(root, "arm64");
+    for (const name of ["image-id.txt", "rootfs.squashfs", "vmlinuz", "initrd", "initrd-wifi", "SHA256SUMS"]) {
+      rmSync(join(arch, name), { force: true }); // fresh inode, exactly like the build script's `rm -f`
+    }
+    writeFileSync(join(arch, "image-id.txt"), `${imageId}\n`);
+    writeFileSync(join(arch, "rootfs.squashfs"), `rootfs-${imageId}`);
+    writeFileSync(join(arch, "vmlinuz"), `vmlinuz-${imageId}`);
+    writeFileSync(join(arch, "initrd"), `initrd-${imageId}`);
+    writeFileSync(join(arch, "initrd-wifi"), `initrd-wifi-${imageId}`);
+    writeFileSync(join(arch, "SHA256SUMS"), `sha-${imageId}  rootfs.squashfs\n`);
+    const t = new Date(epochSeconds * 1000);
+    utimesSync(join(arch, "rootfs.squashfs"), t, t); // adopt() hardlinks this, so the mirror inherits it
+  }
+
+  test("ensureActiveBuild() heals a depot whose active build reached the arch root with no mirror", async () => {
+    // Start with an adopted history, then simulate an external rebuild bumping the arch root.
+    const root = depotWithPublished("20260709T000000Z-oldbuild");
+    const iu = makeUpdates(root);
+    await iu.adopt("arm64"); // builds/<old>/ exists; old is active
+    stampMtime(root, "20260709T000000Z-oldbuild", 1_700_000_000);
+
+    externalRebuildAtRoot(root, "20260711T191928Z-981386cb"); // the homelab's active id shape
+
+    // The gap: the active build is only at the arch root — its pinned builds/<id>/ path is a 404.
+    expect(statSync(join(root, "arm64", "rootfs.squashfs"), { throwIfNoEntry: false })).toBeDefined();
+    expect(statSync(join(root, "arm64", "builds", "20260711T191928Z-981386cb"), { throwIfNoEntry: false })).toBeUndefined();
+
+    await iu.ensureActiveBuild("arm64");
+
+    // The mirror now exists and carries every artifact the netboot chain streams.
+    const dir = join(root, "arm64", "builds", "20260711T191928Z-981386cb");
+    expect(readFileSync(join(dir, "rootfs.squashfs"), "utf8")).toBe("rootfs-20260711T191928Z-981386cb");
+    expect(readFileSync(join(dir, "vmlinuz"), "utf8")).toBe("vmlinuz-20260711T191928Z-981386cb");
+    expect(readFileSync(join(dir, "initrd"), "utf8")).toBe("initrd-20260711T191928Z-981386cb");
+    expect(readFileSync(join(dir, "initrd-wifi"), "utf8")).toBe("initrd-wifi-20260711T191928Z-981386cb");
+    expect(readFileSync(join(dir, "SHA256SUMS"), "utf8")).toBe("sha-20260711T191928Z-981386cb  rootfs.squashfs\n");
+
+    // rootfs.squashfs is shared by hardlink — the mirror costs no extra bytes.
+    expect(statSync(join(root, "arm64", "rootfs.squashfs")).ino).toBe(statSync(join(dir, "rootfs.squashfs")).ino);
+
+    // builds() now flags the new build active, and the old one survives as (inactive) history.
+    const builds = await iu.builds("arm64");
+    expect(builds.find((b) => b.imageId === "20260711T191928Z-981386cb")!.active).toBe(true);
+    expect(builds.find((b) => b.imageId === "20260709T000000Z-oldbuild")!.active).toBe(false);
+  });
+
+  test("ensureActiveBuild() is idempotent — a second call is a no-op that keeps the same inode", async () => {
+    const root = depotWithPublished("20260711T191928Z-981386cb");
+    const iu = makeUpdates(root);
+
+    await iu.ensureActiveBuild("arm64");
+    const dir = join(root, "arm64", "builds", "20260711T191928Z-981386cb");
+    const inoAfterFirst = statSync(join(dir, "rootfs.squashfs")).ino;
+
+    await iu.ensureActiveBuild("arm64");
+    expect((await iu.builds("arm64"))).toHaveLength(1);
+    expect(statSync(join(dir, "rootfs.squashfs")).ino).toBe(inoAfterFirst); // untouched, not re-linked
+  });
+
+  test("retain() heals every arch and never prunes the freshly-mirrored active build", async () => {
+    const root = depotWithPublished("20260709T000000Z-oldbuild");
+    const iu = makeUpdates(root, 1); // retain just ONE — the active build must still survive
+    await iu.adopt("arm64");
+    stampMtime(root, "20260709T000000Z-oldbuild", 1_700_000_000);
+    externalRebuildAtRoot(root, "20260711T191928Z-981386cb");
+
+    await iu.retain(); // the post-rebuild / startup reconcile
+
+    const builds = await iu.builds("arm64");
+    // The active build was mirrored AND kept despite retain=1; the older one is pruned out.
+    expect(builds.map((b) => b.imageId)).toEqual(["20260711T191928Z-981386cb"]);
+    expect(builds[0]!.active).toBe(true);
   });
 });

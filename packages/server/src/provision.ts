@@ -33,6 +33,7 @@
  * traversal or a 500.
  */
 import { createReadStream } from "node:fs";
+import type { Stats } from "node:fs";
 import { open, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,6 +120,17 @@ function safeResolve(root: string, ...segments: string[]): string | null {
   const abs = resolve(base, ...segments);
   if (abs !== base && !abs.startsWith(base + sep)) return null;
   return abs;
+}
+
+/** `stat` a path, returning the Stats only when it is a regular file, else null (missing / not a
+ *  file / any error). Lets a serve route branch on presence without a try/catch at each call site. */
+async function statFileOrNull(abs: string): Promise<Stats | null> {
+  try {
+    const st = await stat(abs);
+    return st.isFile() ? st : null;
+  } catch {
+    return null;
+  }
 }
 
 /** First value of a (possibly comma-joined / array) header, trimmed; "" if absent. */
@@ -486,6 +498,13 @@ export async function resolveBootMedium(bootDistDir: string): Promise<string | n
 export interface ImageManifestSource {
   manifest(arch: string): Promise<{ arch: string; imageId: string; builtAt: string; sha256: string | null } | null>;
   state(): Promise<{ urgent: boolean }>;
+  /**
+   * Heal the ACTIVE build's `builds/<imageId>/` mirror if the depot lacks it (POL-79). The netboot
+   * medium pins `root=live:…/builds/<active-id>/rootfs.squashfs`, so the serve path calls this on a
+   * miss to hardlink the mirror from the arch root — no server restart needed. Best-effort and
+   * idempotent; a non-active (e.g. pruned) id stays a clean 404.
+   */
+  ensureActiveBuild(arch: string): Promise<void>;
 }
 
 export function registerProvisionRoutes(
@@ -640,13 +659,19 @@ export function registerProvisionRoutes(
     const abs = safeResolve(imageDistDir, arch, "builds", imageId, file);
     if (!abs) return reply.code(404).send({ error: "not found" });
 
-    let st;
-    try {
-      st = await stat(abs);
-    } catch {
-      return reply.code(404).send({ error: "build artifact not retained" });
+    let st = await statFileOrNull(abs);
+    if (!st && imageUpdates) {
+      // Self-heal (POL-79). The local boot medium PINS `builds/<active-id>/…` (POL-63/D67), but a
+      // rebuild that reached the arch root outside the server's reconcile — an externally-run Job,
+      // or a partially-failed multi-arch hook run — left no mirror, so this pinned fetch 404s and
+      // the box retries forever (observed on the homelab depot). If `imageId` is the ACTIVE build,
+      // hardlink its mirror from the arch root now (no restart needed) and serve it; a non-active or
+      // pruned id heals nothing and stays a clean 404. Best-effort: a heal that throws (e.g. a race
+      // with a concurrent heal) must never turn into a 500 — we just re-stat and answer honestly.
+      await imageUpdates.ensureActiveBuild(arch).catch(() => {});
+      st = await statFileOrNull(abs);
     }
-    if (!st.isFile()) return reply.code(404).send({ error: "build artifact not retained" });
+    if (!st) return reply.code(404).send({ error: "build artifact not retained" });
     return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 

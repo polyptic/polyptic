@@ -308,6 +308,21 @@ export class ImageUpdates {
   }
 
   /**
+   * Ensure the ACTIVE build's `builds/<imageId>/` mirror exists (POL-79). This is {@link adopt}
+   * exposed under a name the depot serve path can call: a box PINS `root=live:…/builds/<active-id>/`
+   * (POL-63/D67), so if that build reached the arch root by a path that never ran a reconcile — an
+   * externally-run rebuild Job (`bun deploy/k8s-run-job.ts full amd64` invoked directly), or a
+   * partially-failed multi-arch hook run whose non-zero exit skipped the post-rebuild retain — the
+   * pinned path 404s until the next server RESTART runs {@link start}'s reconcile. Healing it lazily
+   * on the fetch (and on the box's manifest poll) removes that restart dependency: the exact homelab
+   * gap POL-79 fixes. Idempotent (an already-mirrored build is one stat and a return) and best-effort
+   * at the call site.
+   */
+  async ensureActiveBuild(arch: string): Promise<void> {
+    await this.adopt(arch);
+  }
+
+  /**
    * Serve a retained build: relink the arch root at it and publish its id. Every netbooted box on a
    * different image reboots into it on its next 5-minute poll (urgent → minutes, else the nightly
    * window), so activating an OLDER build rolls the fleet back. Throws when the build is unknown.
@@ -444,9 +459,15 @@ export class ImageUpdates {
     };
     await this.store.setImageRollout(finished);
     // The hook writes the new artifacts to the arch root and stamps image-id.txt; take a retained
-    // copy of what it just published, then drop anything past the retention window (POL-45).
+    // copy of what it just published (`builds/<active-id>/`, hardlinked), then drop anything past
+    // the retention window (POL-45). Reconcile on FAILURE too (POL-79): a multi-arch hook run
+    // (`k8s-run-job.ts full` fans out over every arch) exits non-zero if ANY arch fails, yet the
+    // arches that DID succeed already published their new arch root — gating retain on overall
+    // success left those builds with no `builds/<id>/` mirror, so a box pinning that arch's build
+    // 404'd. `retain()` reads the live manifest and mirrors only what is actually at each arch root,
+    // so running it unconditionally heals the good arches and is a no-op for the failed one.
     // Never fatal: a depot we cannot file is still a depot we can serve.
-    if (status === "success") await this.retain();
+    await this.retain();
     this.running = false;
     this.log.info(
       { event: "image.rebuild.done", trigger, kind, status, imageIds: (await this.manifests()).map((m) => `${m.arch}:${m.imageId}`) },
