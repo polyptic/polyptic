@@ -22,6 +22,7 @@ const routes: RouteRecordRaw[] = [
       { path: "wall", name: "wall", component: () => import("./views/Wall.vue") },
       { path: "machines", name: "machines", component: () => import("./views/Machines.vue") },
       { path: "content", name: "content", component: () => import("./views/Content.vue") },
+      { path: "playlists", name: "playlists", component: () => import("./views/Playlists.vue") },
       { path: "scenes", name: "scenes", component: () => import("./views/Scenes.vue") },
       { path: "settings", name: "settings", component: () => import("./views/Settings.vue") },
     ],

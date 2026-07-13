@@ -90,6 +90,19 @@ body {
   animation: badge-blink 1.6s steps(1, end) infinite;
 }
 
+/* Playlist (POL-34): the NEXT entry pre-warming invisibly behind the current one, so a rotation
+   swaps without flashing a blank region. Same box as the content, just never seen or clicked. */
+.playlist-preload {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  opacity: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+
 /* Ident pulse — flash the screen's friendly name on its colour so panels can be mapped.
    WALL-CHROME MOTION RULES (D66, re-measured for POL-67): never animate opacity/transform/filter
    (WebKit's no-GL compositor silently drops promoted layers — the overlay would VANISH on exactly

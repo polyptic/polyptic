@@ -390,13 +390,14 @@ export const useConsoleStore = defineStore("console", {
       return state.contentSources;
     },
 
-    /** Library sources bucketed by kind (web/dashboard/image/video) — every kind key present. */
+    /** Library sources bucketed by kind — every kind key present. */
     sourcesByKind(state): Record<ContentKind, ContentSource[]> {
       const buckets: Record<ContentKind, ContentSource[]> = {
         web: [],
         dashboard: [],
         image: [],
         video: [],
+        playlist: [],
       };
       for (const s of state.contentSources) buckets[s.kind].push(s);
       return buckets;

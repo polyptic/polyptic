@@ -55,6 +55,16 @@ function isActive(name: string): boolean {
       <span class="label">Content</span>
     </button>
 
+    <button class="nav" :class="{ active: isActive('playlists') }" title="Playlists" @click="go('playlists')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 5h13" />
+        <path d="M3 10h13" />
+        <path d="M3 15h7" />
+        <path d="M14 14.5v6l5-3z" fill="currentColor" stroke="none" />
+      </svg>
+      <span class="label">Playlists</span>
+    </button>
+
     <button class="nav" :class="{ active: isActive('scenes') }" title="Scenes" @click="go('scenes')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <rect x="2" y="4" width="20" height="14" rx="2" />

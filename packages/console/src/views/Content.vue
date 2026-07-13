@@ -25,7 +25,9 @@ import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
 
 const store = useConsoleStore();
 
-const sources = computed(() => store.sources);
+// Playlists are library sources too, but they have their own sidebar view (POL-34) — the Content
+// list stays a flat catalogue of addresses and files.
+const sources = computed(() => store.sources.filter((s) => s.kind !== "playlist"));
 const profiles = computed(() => store.profiles);
 
 // ── modal state ──────────────────────────────────────────────────────────────
@@ -58,7 +60,7 @@ function openEdit(s: ContentSource) {
   editingId.value = s.id;
   draftName.value = s.name;
   draftKind.value = s.kind;
-  draftUrl.value = s.url;
+  draftUrl.value = s.url ?? "";
   draftProfileId.value = s.credentialProfileId ?? "";
   errorMsg.value = null;
   modalOpen.value = true;
@@ -106,6 +108,11 @@ async function remove(s: ContentSource) {
 /** A compact, scheme-stripped address for the list row (matches the design's "address" read-out). */
 function pretty(url: string): string {
   return url.replace(/^https?:\/\//, "");
+}
+
+/** The library row's sub-line: the kind plus the compact address. */
+function rowSub(s: ContentSource): string {
+  return `${kindLabel(s.kind)} · ${pretty(s.url ?? "")}`;
 }
 
 /** The profile a source references, for the library row's auth read-out. */
@@ -338,7 +345,12 @@ async function doUpload() {
 
 /** Whether a source's `url` resolves to a directly-renderable picture (for a list thumbnail). */
 function isImage(s: ContentSource): boolean {
-  return s.kind === "image";
+  return s.kind === "image" && !!s.url;
+}
+
+/** The thumbnail address for an image row (guarded by `isImage`; typed for the template). */
+function thumbSrc(s: ContentSource): string {
+  return s.url ?? "";
 }
 </script>
 
@@ -363,14 +375,14 @@ function isImage(s: ContentSource): boolean {
       <!-- list -->
       <div v-if="sources.length" class="list">
         <div v-for="c in sources" :key="c.id" class="row">
-          <img v-if="isImage(c)" class="thumb" :src="c.url" :alt="c.name" loading="lazy" />
+          <img v-if="isImage(c)" class="thumb" :src="thumbSrc(c)" :alt="c.name" loading="lazy" />
           <span v-else class="glyph" :style="{ color: `var(${kindColorVar(c.kind)})` }">
             {{ kindGlyph(c.kind) }}
           </span>
           <div class="row-meta">
             <div class="row-name">{{ c.name }}</div>
             <div class="row-sub">
-              {{ kindLabel(c.kind) }} · {{ pretty(c.url) }}
+              {{ rowSub(c) }}
               <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
             </div>
           </div>

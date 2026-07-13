@@ -25,6 +25,7 @@ import {
   ContentSource,
   DashboardSurface,
   ImageSurface,
+  PlaylistSurface,
   Scene,
   VideoSurface,
   VideoWall,
@@ -34,6 +35,8 @@ import {
 import type {
   ContentKind,
   CreateContentSourceBody,
+  PlaylistEntry,
+  PlaylistItem,
   CreateCredentialProfileBody,
   CredentialProfileView,
   DesiredState,
@@ -192,11 +195,19 @@ export interface ContentAssignment {
   url?: string;
 }
 
-/** A resolved content spec: the kind to build and the URL to point it at. */
+/** A resolved content spec: the kind to build and the URL to point it at. A playlist (POL-34) has no
+ *  URL of its own — it carries the resolved rotation (`entries`) plus the shared rotation anchor
+ *  (`startedAt`, resolved ONCE per assignment so every wall member anchors to the same instant). */
 interface ResolvedSpec {
   kind: ContentKind;
   url: string;
+  entries?: PlaylistEntry[];
+  startedAt?: string;
 }
+
+/** POL-34 — the fallback hold time for a playlist entry that should be timed but carries no duration
+ *  (its source's kind drifted after authoring). Authoring-time validation makes this rare. */
+const DEFAULT_PLAYLIST_ITEM_SECONDS = 15;
 
 /** Phase 3b spanning descriptor (a sub-rectangle of contentW×contentH at an offset). */
 interface Span {
@@ -453,8 +464,16 @@ export class ControlPlane {
 
     // ── Content library (Phase 3c) ────────────────────────────────────────────
     for (const cs of persisted.contentSources) {
-      // Re-validate at the edge; drop a malformed/legacy row rather than crash the boot.
-      const parsed = ContentSource.safeParse(cs);
+      // Re-validate at the edge; drop a malformed/legacy row rather than crash the boot. Storage
+      // NULLs (a playlist's url, a non-playlist's items) become the absences the contract expects.
+      const parsed = ContentSource.safeParse({
+        id: cs.id,
+        name: cs.name,
+        kind: cs.kind,
+        url: cs.url ?? undefined,
+        credentialProfileId: cs.credentialProfileId ?? null,
+        items: cs.items ?? undefined,
+      });
       if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
     }
     // Resume the source counter past the highest persisted "source-N" so new ids stay unique.
@@ -1334,7 +1353,15 @@ export class ControlPlane {
     } catch {
       /* not a URL */
     }
-    return kind === "web" ? "Web page" : kind === "dashboard" ? "Dashboard" : kind === "image" ? "Image" : "Video";
+    return kind === "web"
+      ? "Web page"
+      : kind === "dashboard"
+        ? "Dashboard"
+        : kind === "image"
+          ? "Image"
+          : kind === "video"
+            ? "Video"
+            : "Playlist";
   }
 
   /** A human content name for an activity line: the library source's name, else the ad-hoc URL's host. */
@@ -1402,6 +1429,16 @@ export class ControlPlane {
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
       case "video":
         return VideoSurface.parse({ ...base, type: "video", src: spec.url, loop: true, muted: true });
+      case "playlist":
+        // POL-34 — the whole resolved rotation ships in one surface; the player advances it locally.
+        // `startedAt` came off the spec (resolved once per assignment), so every wall member anchors
+        // its rotation to the same instant. Zoom does not apply — a playlist is not one page.
+        return PlaylistSurface.parse({
+          ...base,
+          type: "playlist",
+          items: spec.entries ?? [],
+          startedAt: spec.startedAt ?? new Date().toISOString(),
+        });
     }
   }
 
@@ -1518,9 +1555,35 @@ export class ControlPlane {
   }
 
   /**
+   * Resolve a library source to its renderable spec. A playlist (POL-34) resolves each authored item
+   * to a concrete entry AT THIS MOMENT — an item whose source was deleted (or somehow became another
+   * playlist) is skipped, and a timed kind that lost its duration to authoring-time drift falls back
+   * to the default hold — and stamps the rotation anchor once, shared by every surface built from it.
+   */
+  private specFor(source: ContentSource): ResolvedSpec {
+    if (source.kind !== "playlist") return { kind: source.kind, url: source.url ?? "" };
+    const entries: PlaylistEntry[] = [];
+    for (const item of source.items ?? []) {
+      const step = this.contentSources.get(item.sourceId);
+      if (!step || step.kind === "playlist" || !step.url) continue;
+      entries.push({
+        kind: step.kind,
+        url: step.url,
+        ...(item.durationSeconds !== undefined
+          ? { durationSeconds: item.durationSeconds }
+          : step.kind !== "video"
+            ? { durationSeconds: DEFAULT_PLAYLIST_ITEM_SECONDS }
+            : {}),
+        sourceId: step.id,
+      });
+    }
+    return { kind: "playlist", url: "", entries, startedAt: new Date().toISOString() };
+  }
+
+  /**
    * Resolve a content assignment to a concrete spec + the sourceId to record (null for ad-hoc). An
    * ad-hoc `url` becomes a web spec (exactly the Phase 3b behaviour); a `sourceId` is looked up in the
-   * library and resolved to its kind+url (error if unknown).
+   * library and resolved to its kind+url — or, for a playlist, its entries (error if unknown).
    */
   private resolveSpec(
     a: ContentAssignment,
@@ -1530,7 +1593,7 @@ export class ControlPlane {
     }
     const source = a.sourceId !== undefined ? this.contentSources.get(a.sourceId) : undefined;
     if (!source) return { error: "unknown-source" };
-    return { spec: { kind: source.kind, url: source.url }, sourceId: source.id };
+    return { spec: this.specFor(source), sourceId: source.id };
   }
 
   /** Record (or clear) the library source a screen currently shows. */
@@ -1852,14 +1915,63 @@ export class ControlPlane {
     return `source-${this.sourceCounter}`;
   }
 
+  /** Project a library source onto its storage DTO (contract absences → storage NULLs). */
+  private toPersistedSource(source: ContentSource) {
+    return {
+      id: source.id,
+      name: source.name,
+      kind: source.kind,
+      url: source.url ?? null,
+      credentialProfileId: source.credentialProfileId ?? null,
+      items: source.items ?? null,
+    };
+  }
+
+  /**
+   * Authoring-time validation of a playlist's items (POL-34): every step must reference an EXISTING,
+   * NON-PLAYLIST source (playlists cannot nest — the player would otherwise need a rotation stack and
+   * the console a cycle detector, for no operator value), and any step whose content never ends by
+   * itself (everything but video) must say how long it holds the screen.
+   */
+  private validatePlaylistItems(
+    items: PlaylistItem[],
+  ):
+    | { ok: true }
+    | {
+        ok: false;
+        error: "unknown-item-source" | "nested-playlist" | "item-needs-duration";
+        itemSourceId: string;
+      } {
+    for (const item of items) {
+      const step = this.contentSources.get(item.sourceId);
+      if (!step) return { ok: false, error: "unknown-item-source", itemSourceId: item.sourceId };
+      if (step.kind === "playlist")
+        return { ok: false, error: "nested-playlist", itemSourceId: item.sourceId };
+      if (step.kind !== "video" && item.durationSeconds === undefined)
+        return { ok: false, error: "item-needs-duration", itemSourceId: item.sourceId };
+    }
+    return { ok: true };
+  }
+
   /** Create a new library source with a server-assigned id. Write-through. Rejects a reference to a
-   *  credential profile that doesn't exist (POL-24). */
+   *  credential profile that doesn't exist (POL-24) and invalid playlist items (POL-34). */
   async createContentSource(
     body: CreateContentSourceBody,
-  ): Promise<{ ok: true; source: ContentSource } | { ok: false; error: "unknown-profile" }> {
+  ): Promise<
+    | { ok: true; source: ContentSource }
+    | {
+        ok: false;
+        error: "unknown-profile" | "unknown-item-source" | "nested-playlist" | "item-needs-duration";
+        itemSourceId?: string;
+      }
+  > {
     const credentialProfileId = body.credentialProfileId ?? null;
     if (credentialProfileId && !this.credentialProfiles.has(credentialProfileId)) {
       return { ok: false, error: "unknown-profile" };
+    }
+    if (body.kind === "playlist") {
+      const valid = this.validatePlaylistItems(body.items ?? []);
+      if (!valid.ok) return { ok: false, error: valid.error, itemSourceId: valid.itemSourceId };
     }
     const id = this.nextSourceId();
     const source = ContentSource.parse({
@@ -1868,66 +1980,27 @@ export class ControlPlane {
       kind: body.kind,
       url: body.url,
       credentialProfileId,
+      items: body.items,
     });
     this.contentSources.set(id, source);
-    await this.store.upsertContentSource({
-      id: source.id,
-      name: source.name,
-      kind: source.kind,
-      url: source.url,
-      credentialProfileId,
-    });
+    await this.store.upsertContentSource(this.toPersistedSource(source));
     return { ok: true, source };
   }
 
   /**
-   * Update a library source (any subset of name/kind/url/credentialProfileId — null DETACHES the
-   * profile). If the source is currently assigned to any screen(s) or wall(s), each is RE-RESOLVED
-   * against the new kind/url and the touched slices are returned (one revision bump, write-through)
-   * for the caller to push live.
+   * Re-resolve every screen + wall currently ASSIGNED a source and apply the fresh surfaces in memory,
+   * returning the touched slices (the caller bumps + persists). The zoom is remembered against the
+   * SOURCE ID, not its URL, so re-pointing a source at a new URL keeps each target's dialled-in zoom.
    */
-  async updateContentSource(
-    id: string,
-    patch: UpdateContentSourceBody,
-  ): Promise<
-    | { ok: true; source: ContentSource; slices: ScreenSlice[] }
-    | { ok: false; error: "unknown-source" | "unknown-profile" }
-  > {
-    const existing = this.contentSources.get(id);
-    if (existing === undefined) return { ok: false, error: "unknown-source" };
-
-    const credentialProfileId =
-      patch.credentialProfileId !== undefined
-        ? patch.credentialProfileId
-        : (existing.credentialProfileId ?? null);
-    if (credentialProfileId && !this.credentialProfiles.has(credentialProfileId)) {
-      return { ok: false, error: "unknown-profile" };
-    }
-
-    const source = ContentSource.parse({
-      id: existing.id,
-      name: patch.name ?? existing.name,
-      kind: patch.kind ?? existing.kind,
-      url: patch.url ?? existing.url,
-      credentialProfileId,
-    });
-    this.contentSources.set(id, source);
-    await this.store.upsertContentSource({
-      id: source.id,
-      name: source.name,
-      kind: source.kind,
-      url: source.url,
-      credentialProfileId,
-    });
-
-    // Re-resolve every screen + wall currently showing this source. The zoom is remembered against the
-    // SOURCE ID, not its URL, so re-pointing a source at a new URL keeps each target's dialled-in zoom.
-    const spec: ResolvedSpec = { kind: source.kind, url: source.url };
-    const sourceKey = this.sourceKeyFor(id, source.url);
+  private reresolveAssignments(sourceId: string): ScreenSlice[] {
+    const source = this.contentSources.get(sourceId);
+    if (!source) return [];
+    const spec = this.specFor(source);
+    const sourceKey = this.sourceKeyFor(sourceId, spec.url);
     const byScreen = new Map<string, ScreenSlice>();
 
     for (const [screenId, sid] of this.screenSourceIds) {
-      if (sid !== id) continue;
+      if (sid !== sourceId) continue;
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
       const surface = this.buildSurface(
@@ -1943,23 +2016,97 @@ export class ControlPlane {
     }
 
     for (const [wallId, sid] of this.wallSourceIds) {
-      if (sid !== id) continue;
+      if (sid !== sourceId) continue;
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
       const zoom = this.zoomFor(wallId, sourceKey);
       for (const next of this.computeWallSlices(wall, spec, zoom)) byScreen.set(next.screenId, next);
     }
 
-    const slices = [...byScreen.values()];
+    return [...byScreen.values()];
+  }
+
+  /**
+   * Update a library source (any subset of name/kind/url/credentialProfileId/items — null DETACHES
+   * the profile; `items` replaces a playlist's whole carousel). Kind/url/items consistency is
+   * validated against the MERGED source. If the source is currently assigned to any screen(s) or
+   * wall(s) — or referenced by a PLAYLIST that is (POL-34) — each is RE-RESOLVED and the touched
+   * slices are returned (one revision bump, write-through) for the caller to push live.
+   */
+  async updateContentSource(
+    id: string,
+    patch: UpdateContentSourceBody,
+  ): Promise<
+    | { ok: true; source: ContentSource; slices: ScreenSlice[] }
+    | {
+        ok: false;
+        error:
+          | "unknown-source"
+          | "unknown-profile"
+          | "invalid-source"
+          | "unknown-item-source"
+          | "nested-playlist"
+          | "item-needs-duration";
+        itemSourceId?: string;
+      }
+  > {
+    const existing = this.contentSources.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown-source" };
+
+    const credentialProfileId =
+      patch.credentialProfileId !== undefined
+        ? patch.credentialProfileId
+        : (existing.credentialProfileId ?? null);
+    if (credentialProfileId && !this.credentialProfiles.has(credentialProfileId)) {
+      return { ok: false, error: "unknown-profile" };
+    }
+
+    const kind = patch.kind ?? existing.kind;
+    const items = kind === "playlist" ? (patch.items ?? existing.items ?? []) : undefined;
+    if (kind === "playlist") {
+      const valid = this.validatePlaylistItems(items ?? []);
+      if (!valid.ok) return { ok: false, error: valid.error, itemSourceId: valid.itemSourceId };
+    }
+
+    const merged = ContentSource.safeParse({
+      id: existing.id,
+      name: patch.name ?? existing.name,
+      kind,
+      // A kind change across the playlist boundary sheds the field the new kind cannot carry.
+      url: kind === "playlist" ? undefined : (patch.url ?? existing.url ?? undefined),
+      credentialProfileId,
+      items,
+    });
+    if (!merged.success) return { ok: false, error: "invalid-source" };
+    const source = merged.data;
+    this.contentSources.set(id, source);
+    await this.store.upsertContentSource(this.toPersistedSource(source));
+
+    // Re-resolve the source's own assignments, then (POL-34) every playlist that references it — a
+    // playlist shows this source's CONTENT, so its targets are just as stale as direct ones.
+    const groups: { sourceId: string; slices: ScreenSlice[] }[] = [
+      { sourceId: id, slices: this.reresolveAssignments(id) },
+    ];
+    for (const pl of this.contentSources.values()) {
+      if (pl.kind !== "playlist" || pl.id === id) continue;
+      if (!(pl.items ?? []).some((i) => i.sourceId === id)) continue;
+      groups.push({ sourceId: pl.id, slices: this.reresolveAssignments(pl.id) });
+    }
+
+    // Assignments are exclusive (a screen shows one source; wall members carry no direct assignment),
+    // so the groups never overlap and a flat concat cannot double-push a screen.
+    const slices = groups.flatMap((g) => g.slices);
     if (slices.length > 0) {
       this.bumpRevision();
-      for (const slice of slices) {
-        await this.store.upsertContent({
-          screenId: slice.screenId,
-          canvas: slice.canvas,
-          surfaces: slice.surfaces,
-          sourceId: id,
-        });
+      for (const g of groups) {
+        for (const slice of g.slices) {
+          await this.store.upsertContent({
+            screenId: slice.screenId,
+            canvas: slice.canvas,
+            surfaces: slice.surfaces,
+            sourceId: g.sourceId,
+          });
+        }
       }
       await this.store.setRevision(this.state.revision);
     }
@@ -1971,7 +2118,10 @@ export class ControlPlane {
    * Delete a library source. Any screen(s)/wall(s) currently showing it have their content CLEARED
    * (empty slices — the assignment is gone), and those cleared slices are returned (one revision bump,
    * write-through) for the caller to push. A cleared wall keeps its combined structure but spans no
-   * content until reassigned. Returns null if the source is unknown.
+   * content until reassigned. POL-34: the source is also STRIPPED out of every playlist that
+   * references it, and targets showing those playlists re-resolve to the shortened rotation (a
+   * playlist emptied this way keeps its library slot but renders nothing until refilled). Returns
+   * null if the source is unknown.
    */
   async deleteContentSource(id: string): Promise<{ slices: ScreenSlice[] } | null> {
     if (!this.contentSources.has(id)) return null;
@@ -2001,16 +2151,40 @@ export class ControlPlane {
     this.contentSources.delete(id);
     await this.store.deleteContentSource(id);
 
-    const slices = [...byScreen.values()];
+    // POL-34 — strip the deleted source out of every playlist referencing it (persisting the
+    // shortened carousel), then re-resolve any screen/wall showing that playlist so no rotation keeps
+    // cycling through dead content. These slices carry the PLAYLIST as their assignment.
+    const retargeted: { sourceId: string; slices: ScreenSlice[] }[] = [];
+    for (const pl of this.contentSources.values()) {
+      if (pl.kind !== "playlist") continue;
+      const items = pl.items ?? [];
+      const kept = items.filter((i) => i.sourceId !== id);
+      if (kept.length === items.length) continue;
+      pl.items = kept;
+      await this.store.upsertContentSource(this.toPersistedSource(pl));
+      retargeted.push({ sourceId: pl.id, slices: this.reresolveAssignments(pl.id) });
+    }
+
+    const slices = [...byScreen.values(), ...retargeted.flatMap((g) => g.slices)];
     if (slices.length > 0) {
       this.bumpRevision();
-      for (const slice of slices) {
+      for (const slice of byScreen.values()) {
         await this.store.upsertContent({
           screenId: slice.screenId,
           canvas: slice.canvas,
           surfaces: slice.surfaces,
           sourceId: null,
         });
+      }
+      for (const g of retargeted) {
+        for (const slice of g.slices) {
+          await this.store.upsertContent({
+            screenId: slice.screenId,
+            canvas: slice.canvas,
+            surfaces: slice.surfaces,
+            sourceId: g.sourceId,
+          });
+        }
       }
       await this.store.setRevision(this.state.revision);
     }
@@ -2138,15 +2312,27 @@ export class ControlPlane {
     return { ok: true };
   }
 
-  /** Every screen currently showing content authenticated by this profile (directly or via a wall) —
-   *  the set to re-push when the profile's token becomes usable again. */
+  /** Does a source load content authenticated by this profile — itself, or (POL-34) via any step of
+   *  its playlist? What a screen SHOWS is what needs the token, not just what it's assigned. */
+  private sourceUsesProfile(sourceId: string, profileId: string): boolean {
+    const source = this.contentSources.get(sourceId);
+    if (!source) return false;
+    if (source.credentialProfileId === profileId) return true;
+    if (source.kind !== "playlist") return false;
+    return (source.items ?? []).some(
+      (i) => this.contentSources.get(i.sourceId)?.credentialProfileId === profileId,
+    );
+  }
+
+  /** Every screen currently showing content authenticated by this profile (directly, via a wall, or
+   *  via a playlist step) — the set to re-push when the profile's token becomes usable again. */
   screenIdsUsingProfile(profileId: string): string[] {
     const ids = new Set<string>();
     for (const [screenId, sid] of this.screenSourceIds) {
-      if (this.contentSources.get(sid)?.credentialProfileId === profileId) ids.add(screenId);
+      if (this.sourceUsesProfile(sid, profileId)) ids.add(screenId);
     }
     for (const [wallId, sid] of this.wallSourceIds) {
-      if (this.contentSources.get(sid)?.credentialProfileId !== profileId) continue;
+      if (!this.sourceUsesProfile(sid, profileId)) continue;
       const wall = this.videoWalls.get(wallId);
       for (const screenId of wall?.memberScreenIds ?? []) ids.add(screenId);
     }
@@ -2165,31 +2351,50 @@ export class ControlPlane {
     }
   }
 
+  /** The usable send-time token for a source's credential profile, if it has all three. */
+  private tokenForSource(sourceId: string): { param: string; token: string } | undefined {
+    const profileId = this.contentSources.get(sourceId)?.credentialProfileId;
+    if (!profileId) return undefined;
+    const profile = this.credentialProfiles.get(profileId);
+    if (!profile) return undefined;
+    const token = this.tokenProvider?.getToken(profileId);
+    if (!token) return undefined;
+    return { param: profile.tokenParam, token };
+  }
+
   /**
    * The send-time auth stamp: if this slice's screen is showing a library source that references a
    * credential profile with a usable token, return a COPY with the token appended to the web/dashboard
-   * surface URLs. Otherwise return the slice untouched (no token yet → the target app's login page
-   * shows until the token-usable edge re-pushes). Never mutates stored state.
+   * surface URLs. A PLAYLIST surface (POL-34) stamps per ENTRY — each step resolved from its own
+   * source, so each carries its own source's profile token. Otherwise return the slice untouched (no
+   * token yet → the target app's login page shows until the token-usable edge re-pushes). Never
+   * mutates stored state.
    */
   decorateSliceForSend(slice: ScreenSlice): ScreenSlice {
     if (!this.tokenProvider || slice.surfaces.length === 0) return slice;
     const wall = this.getWallForScreen(slice.screenId);
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(slice.screenId);
-    if (!sourceId) return slice;
-    const source = this.contentSources.get(sourceId);
-    const profileId = source?.credentialProfileId;
-    if (!profileId) return slice;
-    const profile = this.credentialProfiles.get(profileId);
-    if (!profile) return slice;
-    const token = this.tokenProvider.getToken(profileId);
-    if (!token) return slice;
-    return {
-      ...slice,
-      surfaces: slice.surfaces.map((surface) => {
-        if (surface.type !== "web" && surface.type !== "dashboard") return surface;
-        return { ...surface, url: ControlPlane.stampToken(surface.url, profile.tokenParam, token) };
-      }),
-    };
+    const direct = sourceId ? this.tokenForSource(sourceId) : undefined;
+    let changed = false;
+    const surfaces = slice.surfaces.map((surface): Surface => {
+      if (surface.type === "playlist") {
+        let entriesChanged = false;
+        const items = surface.items.map((entry) => {
+          if (entry.kind !== "web" && entry.kind !== "dashboard") return entry;
+          const t = entry.sourceId ? this.tokenForSource(entry.sourceId) : undefined;
+          if (!t) return entry;
+          entriesChanged = true;
+          return { ...entry, url: ControlPlane.stampToken(entry.url, t.param, t.token) };
+        });
+        if (!entriesChanged) return surface;
+        changed = true;
+        return { ...surface, items };
+      }
+      if ((surface.type !== "web" && surface.type !== "dashboard") || !direct) return surface;
+      changed = true;
+      return { ...surface, url: ControlPlane.stampToken(surface.url, direct.param, direct.token) };
+    });
+    return changed ? { ...slice, surfaces } : slice;
   }
 
   /**
@@ -2230,7 +2435,8 @@ export class ControlPlane {
     return `scene-${this.sceneCounter}`;
   }
 
-  /** The renderable URL a surface points at (web/dashboard → `url`, image/video → `src`), if any. */
+  /** The renderable URL a surface points at (web/dashboard → `url`, image/video → `src`), if any.
+   *  A playlist has none — it is a rotation over other sources, only ever assigned from the library. */
   private surfaceUrl(surface: Surface): string | undefined {
     switch (surface.type) {
       case "web":
@@ -2239,6 +2445,8 @@ export class ControlPlane {
       case "image":
       case "video":
         return surface.src;
+      case "playlist":
+        return undefined;
     }
   }
 

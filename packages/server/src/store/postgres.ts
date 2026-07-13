@@ -16,12 +16,15 @@
  */
 import postgres from "postgres";
 
+import { z } from "zod";
+
 import {
   ContentKind,
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
   Output,
+  PlaylistItem,
   Surface,
 } from "@polyptic/protocol";
 
@@ -106,8 +109,28 @@ interface ContentSourceRow {
   id: string;
   name: string;
   kind: string;
-  url: string;
+  url: string | null;
   credential_profile_id: string | null;
+  items: unknown;
+}
+
+/** Row → DTO for a content source, re-validating at the edge (shared by load + list). Returns []
+ *  for a row with an unrecognised kind rather than crashing the boot; a malformed `items` jsonb
+ *  degrades to an empty carousel rather than dropping the playlist. */
+function contentSourceFromRow(row: ContentSourceRow): PersistedContentSource[] {
+  const kind = ContentKind.safeParse(row.kind);
+  if (!kind.success) return [];
+  const items = z.array(PlaylistItem).safeParse(row.items);
+  return [
+    {
+      id: row.id,
+      name: row.name,
+      kind: kind.data,
+      url: row.url ?? null,
+      credentialProfileId: row.credential_profile_id ?? null,
+      items: kind.data === "playlist" ? (items.success ? items.data : []) : null,
+    },
+  ];
 }
 
 interface CredentialProfileRow {
@@ -267,6 +290,10 @@ export class PostgresStore implements Store {
     // Idempotent migration for databases created before POL-24: which credential profile (if any)
     // authenticates this source. NULL = unauthenticated.
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS credential_profile_id text`;
+    // Playlists (POL-34): a playlist source keeps its carousel steps here and has NO url, so the url
+    // column loses its NOT NULL. Both idempotent for databases created before playlists existed.
+    await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS items jsonb`;
+    await sql`ALTER TABLE content_sources ALTER COLUMN url DROP NOT NULL`;
     // Page zoom preferences (POL-57). One row per (screen-or-wall, content) pair, so re-assigning a
     // page to a screen restores the zoom that screen last used FOR THAT PAGE.
     await sql`
@@ -397,7 +424,7 @@ export class PostgresStore implements Store {
       sql<MuralRow[]>`SELECT id, name FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
-      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id FROM content_sources`,
+      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
@@ -466,20 +493,8 @@ export class PostgresStore implements Store {
       contentSourceId: row.content_source_id ?? null,
     }));
 
-    const contentSources: PersistedContentSource[] = contentSourceRows.flatMap((row) => {
-      const kind = ContentKind.safeParse(row.kind);
-      // Drop a row with an unrecognised kind rather than crash the boot.
-      if (!kind.success) return [];
-      return [
-        {
-          id: row.id,
-          name: row.name,
-          kind: kind.data,
-          url: row.url,
-          credentialProfileId: row.credential_profile_id ?? null,
-        },
-      ];
-    });
+    const contentSources: PersistedContentSource[] =
+      contentSourceRows.flatMap(contentSourceFromRow);
 
     const credentialProfiles: PersistedCredentialProfile[] = credentialProfileRows.map((row) => ({
       id: row.id,
@@ -739,13 +754,14 @@ export class PostgresStore implements Store {
   async upsertContentSource(source: PersistedContentSource): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO content_sources (id, name, kind, url, credential_profile_id)
-      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url}, ${source.credentialProfileId ?? null})
+      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items)
+      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url ?? null}, ${source.credentialProfileId ?? null}, ${source.items ? sql.json(source.items) : null})
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         kind = EXCLUDED.kind,
         url  = EXCLUDED.url,
-        credential_profile_id = EXCLUDED.credential_profile_id
+        credential_profile_id = EXCLUDED.credential_profile_id,
+        items = EXCLUDED.items
     `;
   }
 
@@ -760,20 +776,8 @@ export class PostgresStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     const sql = this.sql;
-    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id FROM content_sources`;
-    return rows.flatMap((row) => {
-      const kind = ContentKind.safeParse(row.kind);
-      if (!kind.success) return [];
-      return [
-        {
-          id: row.id,
-          name: row.name,
-          kind: kind.data,
-          url: row.url,
-          credentialProfileId: row.credential_profile_id ?? null,
-        },
-      ];
-    });
+    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items FROM content_sources`;
+    return rows.flatMap(contentSourceFromRow);
   }
 
   // ── Page zoom preferences (POL-57) ───────────────────────────────────────────

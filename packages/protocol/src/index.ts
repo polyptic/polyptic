@@ -141,11 +141,47 @@ export const VideoSurface = SurfaceBase.extend({
   muted: z.boolean().default(true),
 });
 
+// ── Playlists (POL-34) ────────────────────────────────────────────────────────
+// A playlist is a library-authored CAROUSEL of content. The server resolves each step's source to a
+// concrete PlaylistEntry at assignment time and ships the whole rotation to the player in ONE surface;
+// the PLAYER advances it locally — a timer for content that never ends by itself, the `ended` event
+// for a video left untimed. Content rotation must survive a control-plane outage like everything else
+// the player shows, so the server never drives ticks over the wire.
+
+/** What one resolved playlist entry renders as — every renderable kind except another playlist. */
+export const PlaylistEntryKind = z.enum(["web", "dashboard", "image", "video"]);
+export type PlaylistEntryKind = z.infer<typeof PlaylistEntryKind>;
+
+/** One resolved step of a playlist, as the player receives it. */
+export const PlaylistEntry = z.object({
+  kind: PlaylistEntryKind,
+  url: z.string().url(),
+  /** Seconds this entry holds the screen. Absent ONLY for video, meaning "advance when it ends". */
+  durationSeconds: z.number().int().min(1).max(86400).optional(),
+  /** The library source this entry resolved from — how send-time auth stamping (POL-24) finds the
+   *  entry's credential profile. Absent on an entry with nothing to stamp. */
+  sourceId: z.string().optional(),
+});
+export type PlaylistEntry = z.infer<typeof PlaylistEntry>;
+
+export const PlaylistSurface = SurfaceBase.extend({
+  type: z.literal("playlist"),
+  /** The resolved rotation, in order. May be empty if every referenced source was since deleted —
+   *  the player treats an empty playlist as nothing to show. */
+  items: z.array(PlaylistEntry),
+  /** ISO instant the playlist was (re-)assigned — the rotation anchor. A fully-TIMED playlist derives
+   *  its current entry from (now − startedAt) mod cycle, so wall members stay in phase with each other
+   *  and a rebooting box rejoins the rotation mid-cycle instead of restarting it. A playlist with any
+   *  untimed video can't be derived from a clock and plays sequentially from the top. */
+  startedAt: z.string(),
+});
+
 export const Surface = z.discriminatedUnion("type", [
   WebSurface,
   DashboardSurface,
   ImageSurface,
   VideoSurface,
+  PlaylistSurface,
 ]);
 export type Surface = z.infer<typeof Surface>;
 
@@ -642,7 +678,8 @@ export const ScreenView = Screen.extend({
   content: z
     .object({
       name: z.string(),
-      kind: z.enum(["web", "dashboard", "image", "video"]),
+      // Mirrors ContentKind (declared below); inlined because this schema evaluates first.
+      kind: z.enum(["web", "dashboard", "image", "video", "playlist"]),
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
@@ -723,9 +760,20 @@ export const VideoWall = z.object({
 });
 export type VideoWall = z.infer<typeof VideoWall>;
 
-/** The kind of a content source — mirrors the renderable Surface types. */
-export const ContentKind = z.enum(["web", "dashboard", "image", "video"]);
+/** The kind of a content source — mirrors the renderable Surface types. `playlist` (POL-34) is the
+ *  composite kind: a carousel over the other four. */
+export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist"]);
 export type ContentKind = z.infer<typeof ContentKind>;
+
+/** One AUTHORED step of a playlist source (POL-34): a reference to another library source plus how
+ *  long it holds the screen. `durationSeconds` is REQUIRED for content that never ends by itself
+ *  (web/dashboard/image — the server rejects an untimed static) and OPTIONAL for video, where absence
+ *  means "advance when the video ends". Playlists cannot nest. */
+export const PlaylistItem = z.object({
+  sourceId: z.string(),
+  durationSeconds: z.number().int().min(1).max(86400).optional(),
+});
+export type PlaylistItem = z.infer<typeof PlaylistItem>;
 
 // ── Credential profiles (POL-24) ─────────────────────────────────────────────
 // Bucket-A content auth (D11/D17), first real strategy through the seam: a CREDENTIAL PROFILE is a
@@ -773,16 +821,32 @@ export type CredentialProfileView = z.infer<typeof CredentialProfileView>;
 
 /** A reusable, named entry in the content LIBRARY. A screen or video wall is assigned a source by id;
  *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
- *  media served from a disk volume (an upload becomes a source whose url points at the media route). */
-export const ContentSource = z.object({
-  id: z.string(),
-  name: z.string().min(1).max(120),
-  kind: ContentKind,
-  url: z.string().url(),
-  /** POL-24 — the credential profile whose token is stamped into this source's URL at send time.
-   *  null/undefined = unauthenticated. Meaningful for web/dashboard kinds. */
-  credentialProfileId: z.string().nullable().optional(),
-});
+ *  media served from a disk volume (an upload becomes a source whose url points at the media route).
+ *  POL-34 adds the `playlist` kind: it has NO url — its content is `items`, an ordered carousel over
+ *  other (non-playlist) sources. `items` may be EMPTY on a stored playlist (deleting a referenced
+ *  source strips it out); creating one requires ≥1 via CreateContentSourceBody. */
+export const ContentSource = z
+  .object({
+    id: z.string(),
+    name: z.string().min(1).max(120),
+    kind: ContentKind,
+    url: z.string().url().optional(),
+    /** POL-24 — the credential profile whose token is stamped into this source's URL at send time.
+     *  null/undefined = unauthenticated. Meaningful for web/dashboard kinds. */
+    credentialProfileId: z.string().nullable().optional(),
+    /** POL-34 — playlist kind only: the authored carousel steps, in order. */
+    items: z.array(PlaylistItem).optional(),
+  })
+  .superRefine((s, ctx) => {
+    if (s.kind === "playlist") {
+      if (s.url !== undefined) ctx.addIssue({ code: "custom", message: "a playlist has no url" });
+      if (s.items === undefined) ctx.addIssue({ code: "custom", message: "a playlist needs items" });
+    } else {
+      if (s.url === undefined) ctx.addIssue({ code: "custom", message: "url is required" });
+      if (s.items !== undefined)
+        ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
+    }
+  });
 export type ContentSource = z.infer<typeof ContentSource>;
 
 // ── Scenes (Phase 3d) ────────────────────────────────────────────────────────
@@ -1037,22 +1101,39 @@ export type SetContentBody = z.infer<typeof SetContentBody>;
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
 
-// REST bodies — content library (Phase 3c)
-export const CreateContentSourceBody = z.object({
-  name: z.string().min(1).max(120),
-  kind: ContentKind,
-  url: z.string().url(),
-  /** POL-24 — attach a credential profile (null/omitted = unauthenticated). */
-  credentialProfileId: z.string().nullable().optional(),
-});
+// REST bodies — content library (Phase 3c; playlists POL-34)
+export const CreateContentSourceBody = z
+  .object({
+    name: z.string().min(1).max(120),
+    kind: ContentKind,
+    url: z.string().url().optional(),
+    /** POL-24 — attach a credential profile (null/omitted = unauthenticated). */
+    credentialProfileId: z.string().nullable().optional(),
+    /** POL-34 — playlist kind only: the carousel steps. A new playlist needs at least one. */
+    items: z.array(PlaylistItem).min(1).max(100).optional(),
+  })
+  .superRefine((b, ctx) => {
+    if (b.kind === "playlist") {
+      if (b.url !== undefined) ctx.addIssue({ code: "custom", message: "a playlist has no url" });
+      if (b.items === undefined)
+        ctx.addIssue({ code: "custom", message: "a playlist needs at least one item" });
+    } else {
+      if (b.url === undefined) ctx.addIssue({ code: "custom", message: "url is required" });
+      if (b.items !== undefined)
+        ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
+    }
+  });
 export type CreateContentSourceBody = z.infer<typeof CreateContentSourceBody>;
 
-/** Partial update of a library source (any subset of fields; credentialProfileId null DETACHES). */
+/** Partial update of a library source (any subset of fields; credentialProfileId null DETACHES;
+ *  `items` replaces a playlist's whole carousel). Kind/url/items consistency is validated against the
+ *  MERGED source server-side — a partial body can't judge it alone. */
 export const UpdateContentSourceBody = z.object({
   name: z.string().min(1).max(120).optional(),
   kind: ContentKind.optional(),
   url: z.string().url().optional(),
   credentialProfileId: z.string().nullable().optional(),
+  items: z.array(PlaylistItem).min(1).max(100).optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 

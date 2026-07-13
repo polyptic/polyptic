@@ -7,7 +7,8 @@
  */
 import type { ContentKind } from "@polyptic/protocol";
 
-/** Every content kind, in the order they're offered in the type picker. */
+/** The URL-backed kinds, in the order they're offered in the Add-source type picker. A playlist
+ *  (POL-34) is deliberately NOT here — it is authored in its own modal, not typed as an address. */
 export const CONTENT_KINDS: ContentKind[] = ["web", "dashboard", "image", "video"];
 
 const LABELS: Record<ContentKind, string> = {
@@ -15,6 +16,7 @@ const LABELS: Record<ContentKind, string> = {
   dashboard: "Dashboard",
   image: "Image",
   video: "Video",
+  playlist: "Playlist",
 };
 
 const SHORT_LABELS: Record<ContentKind, string> = {
@@ -22,6 +24,7 @@ const SHORT_LABELS: Record<ContentKind, string> = {
   dashboard: "Dashboard",
   image: "Image",
   video: "Video",
+  playlist: "Playlist",
 };
 
 const GLYPHS: Record<ContentKind, string> = {
@@ -29,6 +32,7 @@ const GLYPHS: Record<ContentKind, string> = {
   dashboard: "D",
   image: "▦",
   video: "▷",
+  playlist: "≣",
 };
 
 /** A CSS custom-property name carrying the accent colour for a kind's glyph badge. */
@@ -37,6 +41,7 @@ const COLOR_VARS: Record<ContentKind, string> = {
   dashboard: "--ok",
   image: "--accent-fg",
   video: "--warn",
+  playlist: "--accent",
 };
 
 export function kindLabel(kind: ContentKind): string {

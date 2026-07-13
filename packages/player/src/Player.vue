@@ -57,6 +57,8 @@ import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
+import { contentStyle as spanContentStyle } from "./surface-style";
+import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
 import { openIdbMediaStore } from "./media-cache-idb";
@@ -118,6 +120,13 @@ const showBadges = ref<boolean>(import.meta.env.DEV);
 
 // Pre-first-render the revision is -1; show an em-dash until the first slice lands.
 const revLabel = computed(() => (revision.value < 0 ? "—" : String(revision.value)));
+
+// POL-34 — a playlist whose every referenced source was deleted still occupies a surface slot but has
+// nothing to paint; treat a slice of only such husks as "no content" so the idle splash (POL-27)
+// shows instead of a silent black panel.
+const hasRenderable = computed(() =>
+  surfaces.value.some((s) => s.type !== "playlist" || s.items.length > 0),
+);
 
 let socket: PlayerSocket | undefined;
 
@@ -261,9 +270,13 @@ const prober = new SurfaceProber({
   log: (msg) => diag(msg),
 });
 
-/** What each on-screen surface will actually fetch — the exact URLs the prober must prove. */
+/** What each on-screen surface will actually fetch — the exact URLs the prober must prove.
+ *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
+ *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. */
 const probeTargets = computed(() =>
-  surfaces.value.map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
+  surfaces.value
+    .filter((s) => s.type !== "playlist")
+    .map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
 );
 
 watch(probeTargets, (targets) => prober.sync(targets), { immediate: true });
@@ -397,7 +410,9 @@ function regionStyle(region: Geometry, c: Geometry): CSSProperties {
 }
 
 /**
- * The size/transform of the CONTENT element (iframe/img/video) inside a surface.
+ * The size/transform of the CONTENT element (iframe/img/video) inside a surface. The span/zoom math
+ * itself lives in surface-style.ts (shared with the playlist rotator, POL-34) — see there for the
+ * full account of how span and zoom compose. In short:
  *
  * No span, no zoom → empty (CSS makes the element fill 100%×100% of the region, as before).
  *
@@ -414,25 +429,7 @@ function regionStyle(region: Geometry, c: Geometry): CSSProperties {
  * region pixels, exactly as the server's span math assumes.
  */
 function contentStyle(surface: Surface, zoom = 1): CSSProperties {
-  const span = surface.span;
-  if (!span) {
-    if (zoom === 1) return {};
-    return {
-      width: `${100 / zoom}%`,
-      height: `${100 / zoom}%`,
-      transform: `scale(${zoom})`,
-      transformOrigin: "top left",
-    };
-  }
-  const shift = `translate(${-span.offsetX}px, ${-span.offsetY}px)`;
-  return {
-    width: `${span.contentW / zoom}px`,
-    height: `${span.contentH / zoom}px`,
-    maxWidth: "none",
-    maxHeight: "none",
-    transform: zoom === 1 ? shift : `${shift} scale(${zoom})`,
-    transformOrigin: "top left",
-  };
+  return spanContentStyle(surface.span, zoom);
 }
 
 /** Style for an image/video element: span sizing (if any) plus the image's object-fit. Media has no
@@ -514,7 +511,7 @@ function connLabel(state: ConnState): string {
       (POL-27). It sits below the ident overlay and dev badge (higher z-index), so both still work.
     -->
     <IdleSplash
-      v-if="surfaces.length === 0"
+      v-if="!hasRenderable"
       :name="screenName"
       :conn-state="connState"
       :version="APP_VERSION"
@@ -534,7 +531,14 @@ function connLabel(state: ConnState): string {
       class="surface"
       :style="regionStyle(surface.region, canvas)"
     >
-      <template v-if="painted[surface.id]">
+      <!-- POL-34: the rotator owns its own elements and timers, and renders ungated (a rotation
+           has no single URL for the prober to prove; each entry swap is local). -->
+      <PlaylistRotator
+        v-if="surface.type === 'playlist'"
+        :surface="surface"
+        :server-http-base="SERVER_HTTP_BASE"
+      />
+      <template v-else-if="painted[surface.id]">
         <iframe
           v-if="isFrame(surface)"
           :ref="(el) => bindEl(surface.id, el)"

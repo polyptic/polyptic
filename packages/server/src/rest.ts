@@ -87,6 +87,21 @@ const MuralParams = z.object({ id: z.string().min(1) });
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
 const ContentSourceParams = z.object({ id: z.string().min(1) });
+
+/** A plain sentence for each playlist authoring error (POL-34), shown to the operator verbatim. */
+function playlistItemErrorDetail(
+  error: "unknown-item-source" | "nested-playlist" | "item-needs-duration",
+  itemSourceId?: string,
+): string {
+  switch (error) {
+    case "unknown-item-source":
+      return `playlist item references an unknown source: ${itemSourceId}`;
+    case "nested-playlist":
+      return `a playlist cannot contain another playlist (${itemSourceId})`;
+    case "item-needs-duration":
+      return `playlist items that are not videos need a duration (${itemSourceId})`;
+  }
+}
 const CredentialProfileParams = z.object({ id: z.string().min(1) });
 const SceneParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
@@ -1158,7 +1173,11 @@ export function registerRestRoutes(
 
     const result = await control.createContentSource(body.data);
     if (!result.ok) {
-      return reply.code(404).send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
+      if (result.error === "unknown-profile") {
+        return reply.code(404).send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
+      }
+      // POL-34 — playlist authoring errors are the operator's to fix: 400 with a plain sentence.
+      return reply.code(400).send({ error: playlistItemErrorDetail(result.error, result.itemSourceId) });
     }
     const source = result.source;
     fastify.log.info(
@@ -1182,11 +1201,19 @@ export function registerRestRoutes(
 
     const result = await control.updateContentSource(params.data.id, body.data);
     if (!result.ok) {
-      const detail =
-        result.error === "unknown-source"
-          ? `unknown content source: ${params.data.id}`
-          : `unknown credential profile: ${body.data.credentialProfileId}`;
-      return reply.code(404).send({ error: detail });
+      if (result.error === "unknown-source") {
+        return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+      }
+      if (result.error === "unknown-profile") {
+        return reply
+          .code(404)
+          .send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
+      }
+      if (result.error === "invalid-source") {
+        return reply.code(400).send({ error: "the update leaves the source inconsistent" });
+      }
+      // POL-34 — playlist authoring errors (bad item reference / missing duration).
+      return reply.code(400).send({ error: playlistItemErrorDetail(result.error, result.itemSourceId) });
     }
 
     // Re-resolved every screen/wall showing this source — push the new render to each affected player.

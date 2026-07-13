@@ -19,6 +19,7 @@ import type {
   EnrollmentStatus,
   Geometry,
   Output,
+  PlaylistItem,
   Scene,
   Surface,
 } from "@polyptic/protocol";
@@ -74,12 +75,18 @@ export interface PersistedContentSource {
   id: string;
   name: string;
   kind: ContentKind;
-  url: string;
+  /** The address non-playlist kinds resolve to. `null`/undefined on a playlist (POL-34). */
+  url?: string | null;
   /**
    * POL-24 — the credential profile whose token is stamped into this source's URL at send time.
    * `null`/undefined = unauthenticated (also the value on legacy rows persisted before the column).
    */
   credentialProfileId?: string | null;
+  /**
+   * POL-34 — playlist kind only: the authored carousel steps (jsonb). `null`/undefined on every other
+   * kind and on legacy rows persisted before the column.
+   */
+  items?: PlaylistItem[] | null;
 }
 
 /**
