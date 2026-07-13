@@ -333,6 +333,11 @@ export function registerMediaServeRoute(fastify: FastifyInstance, media: MediaSt
     reply.header("Accept-Ranges", "bytes");
     // Content is immutable (a stored upload never changes) and the id is unguessable → cache hard.
     reply.header("Cache-Control", "public, max-age=31536000, immutable");
+    // POL-32 — the player's offline blob cache downloads media with fetch(), which (unlike an
+    // <img>/<video> tag) is CORS-gated when the dev player (:5173) fetches the server (:8080).
+    // This route is public by design (ids are unguessable, no session — see above), so allowing
+    // any origin changes nothing about its security posture.
+    reply.header("Access-Control-Allow-Origin", "*");
     reply.header("X-Content-Type-Options", "nosniff");
     reply.type(rec.mime);
 

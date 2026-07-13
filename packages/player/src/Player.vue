@@ -37,6 +37,17 @@
  * naive `transform: scale()` on a full-size frame would not achieve. Zoom composes with span (the
  * scale is applied before the span's translate), so a video wall zooms as one continuous page. It is
  * a pure restyle of the SAME keyed element: the iframe rescales without navigating or reloading (D5).
+ *
+ * POL-32 — cached media: images and videos are downloaded once into an IndexedDB blob cache and the
+ * elements are pointed at `blob:` object URLs, so a network outage cannot stall a looping video or
+ * break an image; the last-good slice is persisted to localStorage and restored on startup, so a
+ * player that boots or reloads while the control plane is unreachable shows the wall's last-known
+ * content (from the blob cache) instead of an idle splash. The blob swap rides the POL-86 prober:
+ * `mediaSrc()` prefers the blob, so the probe target changes network→blob, the (local, offline-safe)
+ * blob probe passes, and the element repaints from the cache — the same proven-before-painted path
+ * as everything else. Sites (iframes) are already as safe as a client can make them — a WS drop
+ * never blanks or reloads a frame — but what a live page does when ITS network calls fail is the
+ * page's own business. See media-cache.ts for the full story.
  */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
@@ -44,8 +55,12 @@ import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protoco
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
-import { bindDiagSender, diag, flushDiag, initDiag } from "./diag";
+import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
+import { MediaCache } from "./media-cache";
+import type { WantedMedia } from "./media-cache";
+import { openIdbMediaStore } from "./media-cache-idb";
+import { loadLastSlice, saveLastSlice } from "./last-slice";
 import IdleSplash from "./IdleSplash.vue";
 
 // Injected by Vite (see vite.config.ts) from package.json — the build version shown on the idle splash.
@@ -106,6 +121,73 @@ const revLabel = computed(() => (revision.value < 0 ? "—" : String(revision.va
 
 let socket: PlayerSocket | undefined;
 
+// ── POL-32: media blob cache ─────────────────────────────────────────────────
+// Resolved network URL → live `blob:` object URL. `mediaSrc` prefers the blob, so once a media file
+// is cached the element renders entirely from the box and a network outage cannot touch it. The map
+// is REPLACED (not mutated) on change so Vue tracks it as one reactive value.
+const blobSrcs = ref<ReadonlyMap<string, string>>(new Map());
+let mediaCache: MediaCache | undefined;
+
+/** The media URLs the current surfaces want, resolved to what the box actually fetches. Uploaded
+ *  control-plane media (`/media/<id>`) is immutable by construction (a re-upload mints a new id),
+ *  so it caches forever; anything else revalidates in the background. */
+function wantedMedia(): WantedMedia[] {
+  const wanted: WantedMedia[] = [];
+  for (const surface of surfaces.value) {
+    if (surface.type !== "image" && surface.type !== "video") continue;
+    const url = resolveMediaSrc(surface.src, SERVER_HTTP_BASE);
+    wanted.push({ url, immutable: url.startsWith(`${SERVER_HTTP_BASE}/media/`) });
+  }
+  return wanted;
+}
+
+/**
+ * A blob for `url` is ready (or was refreshed): repoint the rendered element at it. The swap rides
+ * the prober (probe target changes network→blob; the old frame stays up until the blob proves), and
+ * the keyed DOM node survives — only its src patches. A VIDEO reloads on a src change, so its
+ * playback position is carried across the swap: captured now, restored on the element's next
+ * `loadedmetadata` (attached up front — the repaint lands a prober round-trip later, not nextTick).
+ */
+function publishBlobSrc(url: string, objectUrl: string): void {
+  const previous = blobSrcs.value.get(url);
+  for (const el of surfaceEls.values()) {
+    if (!(el instanceof HTMLVideoElement)) continue;
+    const src = el.getAttribute("src");
+    const onThisMedia =
+      el.currentSrc === url ||
+      src === url ||
+      (previous !== undefined && (el.currentSrc === previous || src === previous));
+    if (!onThisMedia) continue;
+    const time = el.currentTime;
+    el.addEventListener(
+      "loadedmetadata",
+      () => {
+        try {
+          el.currentTime = time;
+        } catch {
+          // A refreshed (shorter) file may reject the old position — playing from 0 is fine.
+        }
+        el.play().catch(() => {});
+      },
+      { once: true },
+    );
+  }
+  blobSrcs.value = new Map(blobSrcs.value).set(url, objectUrl);
+  diag(`media cached: ${redactUrl(url)} now serves from the box`);
+}
+
+/** Persist the current slice so a boot/reload during an outage can restore it (POL-32). */
+function persistSlice(): void {
+  saveLastSlice(localStorage, screenId, {
+    canvas: canvas.value,
+    surfaces: surfaces.value,
+    revision: Math.max(revision.value, 0),
+    friendlyName: screenName.value,
+    showBadges: showBadges.value,
+    savedAt: Date.now(),
+  });
+}
+
 function handleMessage(msg: ServerToPlayerMessage): void {
   if (msg.t === "server/render") {
     // Replace canvas + surfaces; Vue's keyed reconcile reuses DOM nodes for surfaces that kept
@@ -122,11 +204,15 @@ function handleMessage(msg: ServerToPlayerMessage): void {
           : msg.slice.surfaces.map((s) => `${s.id}=${s.type}`).join(" ")
       }`,
     );
+    // POL-32 — start caching what this render shows, and remember it for an outage boot.
+    mediaCache?.sync(wantedMedia());
+    persistSlice();
     // Close the reconcile loop so the control plane knows this screen is at this revision.
     socket?.send({ t: "player/ack", screenId, revision: msg.revision });
   } else if (msg.t === "server/settings") {
     // POL-6 — fleet-wide display settings: show/hide the corner status badge on this screen live.
     showBadges.value = msg.settings.showBadges;
+    persistSlice();
   } else {
     // server/ident-pulse → flash the friendly name so an operator can map physical panels.
     ident.value = msg.on ? { friendlyName: msg.friendlyName, color: msg.color } : null;
@@ -194,6 +280,21 @@ function onContentLoad(id: string, kind: string): void {
  *  deterministic signal the first watchdog never listened for — the broken-image boot, seen. */
 function onContentError(id: string, kind: string): void {
   diag(`${id}: ${kind} FAILED to load (element error event)`);
+  // POL-32 — if what failed is a CACHED blob (torn write, corrupt download), re-proving it would
+  // succeed forever (a local fetch can't fail) and re-paint the corpse. Drop the cache entry so the
+  // prober's re-prove falls back to the network URL and a fresh download.
+  const shown = painted[id];
+  if (shown?.startsWith("blob:")) {
+    for (const [url, objectUrl] of blobSrcs.value) {
+      if (objectUrl !== shown) continue;
+      const next = new Map(blobSrcs.value);
+      next.delete(url);
+      blobSrcs.value = next;
+      void mediaCache?.discard(url);
+      diag(`${id}: cached copy failed to decode — dropped ${redactUrl(url)} from the cache`);
+      break;
+    }
+  }
   prober.elementError(id);
 }
 
@@ -225,6 +326,35 @@ onMounted(() => {
     connState.value = "closed";
     return;
   }
+
+  // POL-32 — restore the last-good slice BEFORE dialing: a normal boot paints last-known content
+  // instantly, and a boot during an outage shows the wall instead of a splash. Display-only: the
+  // restored revision is never ACKed; the first live render reconciles it (same keyed DOM diff).
+  // Restoring `surfaces` fires the probeTargets watcher, so the prober starts proving immediately.
+  const restored = loadLastSlice(localStorage, screenId);
+  if (restored) {
+    canvas.value = restored.canvas;
+    surfaces.value = restored.surfaces;
+    revision.value = restored.revision;
+    screenName.value = restored.friendlyName;
+    if (restored.showBadges !== undefined) showBadges.value = restored.showBadges;
+    diag(`restored last-good slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`);
+  }
+
+  // POL-32 — bring up the blob cache. If IndexedDB is unavailable the player runs uncached (media
+  // straight off the network) — exactly the pre-POL-32 behaviour, never an error on the glass.
+  void openIdbMediaStore().then((store) => {
+    if (!store) {
+      diag("media cache: IndexedDB unavailable — running uncached");
+      return;
+    }
+    mediaCache = new MediaCache(store, {
+      onReady: (url, objectUrl) => publishBlobSrc(url, objectUrl),
+    });
+    mediaCache.sync(wantedMedia());
+    void mediaCache.prune();
+  });
+
   let everOpen = false;
   socket = new PlayerSocket(SERVER_WS_URL, screenId, {
     onMessage: handleMessage,
@@ -328,7 +458,11 @@ function mediaSrc(surface: Surface): string {
   const raw = surface.type === "image" || surface.type === "video" ? surface.src : "";
   // Re-home a loopback-baked media URL onto the origin this box reaches the server at (POL-5): a
   // remote wall can't fetch `http://localhost:8080/media/<id>`. External URLs pass through untouched.
-  return resolveMediaSrc(raw, SERVER_HTTP_BASE);
+  const resolved = resolveMediaSrc(raw, SERVER_HTTP_BASE);
+  // POL-32 — prefer the cached blob. `probeTargets` computes through here, so when a blob lands the
+  // surface's probe target flips network→blob and the prober repaints from the cache (offline-safe:
+  // a local blob fetch proves even with the control plane dead).
+  return blobSrcs.value.get(resolved) ?? resolved;
 }
 function isInteractive(surface: Surface): boolean {
   return surface.type === "web" ? surface.interactive : false;

@@ -488,6 +488,20 @@ describe("phase 7 media serving", () => {
   );
 
   test(
+    "GET /media/<id> → immutable Cache-Control + CORS (the POL-32 offline blob cache fetches cross-origin in dev)",
+    async () => {
+      const res = await fetch(`${BASE}/media/${imageId}`);
+      expect(res.status).toBe(200);
+      // A stored upload never changes under its id (a re-upload mints a NEW id) → cache hard.
+      expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      // The player's blob cache uses fetch(), which is CORS-gated when the dev player (:5173)
+      // fetches the server (:8080); the route is public by design, so any origin may read it.
+      expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "GET /media/<id> with Range: bytes=0-9 → 206 + Content-Range + exactly 10 bytes",
     async () => {
       const res = await fetch(`${BASE}/media/${imageId}`, {
