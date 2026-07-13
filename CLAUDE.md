@@ -11,7 +11,7 @@ Polyptic is a **generic, self-hostable** system to centrally orchestrate **walls
 3. **Instant.** Changes propagate over **WebSocket** and apply in **< ~150ms with no page reload**. Snappy enough to impress stakeholders — a hard requirement, the antithesis of the old clunky setup.
 4. **Zero-click cold boot to content.** Power on → autologin → compositor → agent reconnects → renders. No clicks, no sleeps, no typed passwords.
 5. **Generic everywhere.** Display backend (Wayland/sway **and** X11/i3), identity (OIDC, any IdP), and content (pluggable adapters) are all swappable. Never hard-wire a vendor.
-6. **Buy the substrate, build the brain.** Device stack (Ubuntu, sway/greetd/systemd, surf) is borrowed. Only `server` + `agent` + `player` are ours.
+6. **Buy the substrate, build the brain.** Device stack (Ubuntu, sway/greetd/systemd, Chrome — surf fallback) is borrowed. Only `server` + `agent` + `player` are ours.
 
 ## Two web apps (don't conflate)
 - **Console** (`packages/console`, **Vue 3 + Vite + Vue Router + Pinia + Vue Flow**) — the operator app: the murals canvas (Vue Flow), machines / content / scenes / settings, sign-in. (D28; the old SolidJS `packages/admin` is being retired by 3e.)

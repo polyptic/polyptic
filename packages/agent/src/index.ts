@@ -55,12 +55,14 @@ import {
   parseMessage,
   PROTOCOL_VERSION,
 } from "@polyptic/protocol";
-import type { Output } from "@polyptic/protocol";
+import type { KioskBrowser, Output } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
+import { selectKioskBrowser } from "./backends/chrome";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import { DevtoolsManager } from "./devtools";
 import { rebootHost } from "./host";
 import { ShellManager } from "./shell";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
@@ -133,6 +135,7 @@ type ShellOpenMsg = Extract<ServerToAgentMessage, { t: "server/shell-open" }>;
 type ShellDataMsg = Extract<ServerToAgentMessage, { t: "server/shell-data" }>;
 type ShellResizeMsg = Extract<ServerToAgentMessage, { t: "server/shell-resize" }>;
 type ShellCloseMsg = Extract<ServerToAgentMessage, { t: "server/shell-close" }>;
+type DevtoolsRequestMsg = Extract<ServerToAgentMessage, { t: "server/devtools-request" }>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent
@@ -154,6 +157,10 @@ class Agent {
    *  reports it can't provide a real terminal, and every open on such a box is refused. */
   private shell: ShellManager | null = null;
 
+  /** Remote-DevTools bridge (POL-67), created on first `server/devtools-*` frame. The backend's
+   *  `devtoolsEndpoint` gate means a non-Chrome box simply refuses every request. */
+  private devtools: DevtoolsManager | null = null;
+
   private lastAppliedRevision = 0;
   /** connector → player URL currently placed (dedupes repeat opens on reconnect/re-apply). */
   private readonly placed = new Map<string, string>();
@@ -168,6 +175,8 @@ class Agent {
     private readonly outputs: Output[],
     private readonly bootstrapToken: string | undefined,
     credential: string | null,
+    /** Which kiosk browser this box drives (POL-67); undefined on dev-open (no kiosk browser). */
+    private readonly browser: KioskBrowser | undefined,
   ) {
     this.credential = credential;
   }
@@ -219,9 +228,10 @@ class Agent {
     ws.on("close", (code: number) => {
       log(`agent channel closed (code ${code})`);
       this.stopHeartbeat();
-      // A remote shell is authorised by the live connection; kill every PTY when it drops so a
-      // session can never outlive the socket that carried it (POL-59).
+      // A remote shell / DevTools session is authorised by the live connection; kill them all when
+      // it drops so a session can never outlive the socket that carried it (POL-59, POL-67).
       this.shell?.closeAll();
+      this.devtools?.closeAll();
       if (!this.closing) this.scheduleReconnect();
     });
   }
@@ -293,6 +303,18 @@ class Agent {
         break;
       case "server/shell-close":
         this.shellMgr().close(msg.sessionId, msg.reason);
+        break;
+      case "server/devtools-request":
+        await this.onDevtoolsRequest(msg);
+        break;
+      case "server/devtools-open":
+        this.devtoolsMgr().open(msg.sessionId, msg.connector, msg.path);
+        break;
+      case "server/devtools-data":
+        this.devtoolsMgr().data(msg.sessionId, msg.dataBase64);
+        break;
+      case "server/devtools-close":
+        this.devtoolsMgr().close(msg.sessionId, msg.reason);
         break;
     }
   }
@@ -422,6 +444,40 @@ class Agent {
     return this.shell;
   }
 
+  /** Lazily build the DevTools bridge (POL-67). All policy lives in `backend.devtoolsEndpoint`:
+   *  a non-Chrome or disarmed connector refuses with the reason, never a dead proxy. */
+  private devtoolsMgr(): DevtoolsManager {
+    if (!this.devtools) {
+      this.devtools = new DevtoolsManager(
+        this.backend,
+        {
+          onResponse: (reqId, res) =>
+            this.send({
+              t: "agent/devtools-response",
+              machineId: this.machineId,
+              reqId,
+              ...(res.ok
+                ? { ok: true, status: res.status, contentType: res.contentType, bodyBase64: res.bodyBase64 }
+                : { ok: false, error: res.error }),
+            }),
+          onOpened: (sessionId, ok, reason) =>
+            this.send({ t: "agent/devtools-opened", machineId: this.machineId, sessionId, ok, reason }),
+          onData: (sessionId, dataBase64) =>
+            this.send({ t: "agent/devtools-data", machineId: this.machineId, sessionId, dataBase64 }),
+          onClosed: (sessionId, reason) =>
+            this.send({ t: "agent/devtools-closed", machineId: this.machineId, sessionId, reason }),
+        },
+        log,
+      );
+    }
+    return this.devtools;
+  }
+
+  /** `server/devtools-request` — proxy one HTTP GET to the armed connector's DevTools port. */
+  private async onDevtoolsRequest(msg: DevtoolsRequestMsg): Promise<void> {
+    await this.devtoolsMgr().request(msg.reqId, msg.connector, msg.path);
+  }
+
   /**
    * `server/shell-open` — an operator opened a terminal on this box (POL-59). The server only sends
    * this to an ARMED box, so policy is already enforced upstream; here we just try to allocate the
@@ -543,6 +599,7 @@ class Agent {
       machineId: this.machineId,
       agentVersion: this.agentVersion,
       backend: this.backend.id,
+      browser: this.browser,
       outputs: this.outputs,
       hostname: osHostname(),
       bootstrapToken: this.bootstrapToken,
@@ -624,11 +681,16 @@ async function main(): Promise<void> {
   const outputs = await resolveAdvertisedOutputs(backend, connector, { log });
   const bootstrapToken = readBootstrapToken();
   const credential = loadCredential(machineId);
+  // POL-67 — which kiosk browser this box drives, reported on hello so the console knows whether
+  // Inspect means remote DevTools (chrome) or the on-panel inspector (surf). The SAME selection the
+  // sway backend makes at launch; x11-i3 only ever drives surf, and dev-open owns no browser.
+  const browser: KioskBrowser | undefined =
+    backend.id === "wayland-sway" ? await selectKioskBrowser() : backend.id === "x11-i3" ? "surf" : undefined;
 
   log(
     `polyptic-agent v${agentVersion} · machineId=${machineId} · outputs=${outputs
       .map((o) => o.connector)
-      .join(",")} · backend=${backend.id}`,
+      .join(",")} · backend=${backend.id}${browser ? ` · browser=${browser}` : ""}`,
   );
   log(
     `enrollment: ${credential ? "stored credential found" : "no stored credential"}${
@@ -644,6 +706,7 @@ async function main(): Promise<void> {
     outputs,
     bootstrapToken,
     credential,
+    browser,
   );
   agent.start();
 

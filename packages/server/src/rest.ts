@@ -29,6 +29,7 @@
 import { z } from "zod";
 
 import type { ShellRelay } from "./shell-relay";
+import type { DevtoolsRelay } from "./devtools-relay";
 
 import {
   CombineScreensBody,
@@ -105,6 +106,7 @@ export function registerRestRoutes(
   activity: ActivityLog,
   presence: Presence,
   shellRelay: ShellRelay,
+  devtoolsRelay: DevtoolsRelay,
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -497,6 +499,10 @@ export function registerRestRoutes(
         .code(409)
         .send({ error: `${machine.label} is offline — nothing to show an inspector on` });
     }
+
+    // POL-67 — disarming must not leave a DevTools session bridged to a screen the operator just
+    // sealed. (For a chrome box `inspect off` IS the DevTools disarm; harmless no-op for surf.)
+    if (!body.data.on) devtoolsRelay.closeScreenSessions(screen.id, "DevTools disarmed");
 
     // Drop any previous refusal now that a fresh request is in flight, so the console shows this
     // attempt's outcome rather than re-reporting the last one.

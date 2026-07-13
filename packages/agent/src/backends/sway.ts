@@ -1,25 +1,40 @@
 /**
  * wayland-sway — the real Wayland/sway placement backend (D9 default).
  *
- * Phase 4. For each output the control plane assigns, it ensures a kiosk surf is running and pinned
- * to that physical connector, supervises/respawns it, and can grab a `grim` thumbnail.
+ * Phase 4. For each output the control plane assigns, it ensures a kiosk browser is running and
+ * pinned to that physical connector, supervises/respawns it, and can grab a `grim` thumbnail.
+ *
+ * The browser is Chrome (native Wayland) where installed, surf as the fallback — selected once via
+ * `selectKioskBrowser` (POL-67/D77; the same call the agent's hello reports). The launch mechanics
+ * differ but the supervision model doesn't:
+ *   - chrome: `--app=<url> --ozone-platform=wayland`, one process per output via a per-connector
+ *     `--user-data-dir`, a loopback `--remote-debugging-port` each. `inspect` ARMS the remote
+ *     DevTools tunnel for that output — no relaunch, nothing on the glass.
+ *   - surf: X11 via Xwayland (D48 plumbing stays for the fallback), URL positional, inspector only
+ *     at launch (`-N`) — so `inspect` relaunches that output and pops it on the panel (POL-50/D63).
  *
  * Placement gotcha (docs/ARCHITECTURE.md): Wayland forbids client self-positioning, so we subscribe
  * to sway's `window` events BEFORE spawning, then move the matching new window onto the target output
  * via `swaymsg` IPC — keyed on the child's pid, with `app_id` / launch order as the fallback (the
- * agent applies screens sequentially, so a fresh `new` window is unambiguous). surf is an X11 client,
- * so under sway it arrives through XWayland (D48: the `xwayland` package must exist, and the sway
- * config imports DISPLAY into the systemd user environment).
+ * agent applies screens sequentially, so a fresh `new` window is unambiguous).
  *
- * Content never changes surf's URL here — that is fixed per screen; content flips happen inside the
- * player over its own WS channel. So `showScreen` only (re)launches when the URL actually changes
- * (handled by SupervisedBrowser). The one other reason to relaunch is the Web Inspector (POL-50),
- * which surf can only be given at launch.
+ * Content never changes the browser's URL here — that is fixed per screen; content flips happen
+ * inside the player over its own WS channel. So `showScreen` only (re)launches when the URL actually
+ * changes (handled by SupervisedBrowser).
  */
 import type { ChildProcess } from "node:child_process";
+import type { KioskBrowser } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
 import { buildSurfArgs, matchesSurfWindow, prelaunchSurf, resolveSurf } from "./surf";
+import {
+  DEVTOOLS_PORT_BASE,
+  buildChromeArgs,
+  matchesChromeWindow,
+  prelaunchChrome,
+  resolveChrome,
+  selectKioskBrowser,
+} from "./chrome";
 import { SupervisedBrowser } from "./supervise";
 import type { LaunchTarget } from "./supervise";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
@@ -137,20 +152,46 @@ export class SwayBackend implements DisplayBackend {
 
   /** Latched once `grim` is found missing, so we log the remediation hint once and then skip. */
   private captureUnavailable = false;
+  /** Which browser this box drives (chrome | surf), resolved once via selectKioskBrowser. */
+  private browser: KioskBrowser | null = null;
   /** Resolved once; reused for every (re)launch. */
   private browserBin: string | null = null;
-  /** connector → why the last inspector-opening attempt failed (null = it worked). Read by `inspect`
-   *  so the operator's ack carries the real reason, since the opening happens inside the launch. */
+  /** connector → why the last inspector-opening attempt failed (null = it worked). surf only: read
+   *  by `inspect` so the operator's ack carries the real reason, since the opening happens inside
+   *  the launch. */
   private readonly inspectErrors = new Map<string, string | null>();
+  /** connector → its Chrome instance's loopback DevTools port, assigned on first launch and stable
+   *  across respawns (POL-67). */
+  private readonly devtoolsPorts = new Map<string, number>();
+  /** Connectors an operator has ARMED for the DevTools tunnel (`inspect on`, chrome only). */
+  private readonly devtoolsArmed = new Set<string>();
 
   private log(msg: string): void {
     console.log(`[${ts()}] [sway] ${msg}`);
   }
 
+  private async ensureBrowserKind(): Promise<KioskBrowser> {
+    if (this.browser) return this.browser;
+    this.browser = await selectKioskBrowser();
+    this.log(`kiosk browser: ${this.browser}`);
+    return this.browser;
+  }
+
   private async ensureBin(): Promise<string> {
     if (this.browserBin) return this.browserBin;
-    this.browserBin = await resolveSurf();
+    const browser = await this.ensureBrowserKind();
+    this.browserBin = browser === "chrome" ? await resolveChrome() : await resolveSurf();
     return this.browserBin;
+  }
+
+  /** This connector's DevTools port — assigned once, in arrival order from the base (POL-67). */
+  private devtoolsPortFor(connector: string): number {
+    let port = this.devtoolsPorts.get(connector);
+    if (port === undefined) {
+      port = DEVTOOLS_PORT_BASE + this.devtoolsPorts.size;
+      this.devtoolsPorts.set(connector, port);
+    }
+    return port;
   }
 
   /**
@@ -229,9 +270,9 @@ export class SwayBackend implements DisplayBackend {
   }
 
   /**
-   * Launch + place surf for one (connector, target). `output` is the real sway output the window is
-   * moved onto (it may differ from the requested `connector` under the single-output fallback).
-   * Returns the live child for supervision.
+   * Launch + place the kiosk browser for one (connector, target). `output` is the real sway output
+   * the window is moved onto (it may differ from the requested `connector` under the single-output
+   * fallback). Returns the live child for supervision.
    */
   private async launchAndPlace(
     connector: string,
@@ -239,16 +280,26 @@ export class SwayBackend implements DisplayBackend {
     bin: string,
     target: LaunchTarget,
   ): Promise<ChildProcess> {
-    await prelaunchSurf(target.url, (m) => this.log(m));
+    const browser = await this.ensureBrowserKind();
+    if (browser === "chrome") await prelaunchChrome(connector, (m) => this.log(m));
+    else await prelaunchSurf(target.url, (m) => this.log(m));
 
     // Subscribe BEFORE spawning so we never miss the window's `new` event.
-    const sub = startSwayWindowSubscription(matchesSurfWindow, (m) => this.log(m));
+    const matches = browser === "chrome" ? matchesChromeWindow : matchesSurfWindow;
+    const sub = startSwayWindowSubscription(matches, (m) => this.log(m));
     let child: ChildProcess;
     try {
-      const args = buildSurfArgs({ url: target.url, inspector: target.inspector });
+      const args =
+        browser === "chrome"
+          ? buildChromeArgs({
+              url: target.url,
+              connector,
+              devtoolsPort: this.devtoolsPortFor(connector),
+            })
+          : buildSurfArgs({ url: target.url, inspector: target.inspector });
       child = spawnChild(bin, args, { stdio: "ignore" });
       this.log(
-        `spawned surf pid=${child.pid ?? "?"} for ${connector} → ${target.url}` +
+        `spawned ${browser} pid=${child.pid ?? "?"} for ${connector} → ${target.url}` +
           (target.inspector ? " (Web Inspector enabled)" : ""),
       );
     } catch (err) {
@@ -261,16 +312,17 @@ export class SwayBackend implements DisplayBackend {
     try {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
       await this.moveToOutput(conId, output);
-      this.log(`placed surf (con_id=${conId}) on ${output}`);
+      this.log(`placed ${browser} (con_id=${conId}) on ${output}`);
     } catch (err) {
       this.log(`placement on ${output} failed: ${(err as Error).message} (left on default output)`);
     } finally {
       sub.close();
     }
 
-    // Opening the inspector belongs to the LAUNCH, not to the operator's click: a supervised browser
-    // that crashes and respawns while being inspected must come back inspected, or the console would
-    // badge an inspector that is no longer on the panel. `inspect()` reads the outcome below.
+    // surf only: opening the on-panel inspector belongs to the LAUNCH, not to the operator's click —
+    // a supervised browser that crashes and respawns while being inspected must come back inspected,
+    // or the console would badge an inspector that is no longer on the panel. `inspect()` reads the
+    // outcome below. (Chrome never takes this path: its target.inspector is always false.)
     if (target.inspector) await this.openInspector(connector, child.pid ?? -1);
     return child;
   }
@@ -321,6 +373,7 @@ export class SwayBackend implements DisplayBackend {
 
   async hideScreen(connector: string): Promise<void> {
     const supervised = this.browsers.get(connector);
+    this.devtoolsArmed.delete(connector); // an unplaced output has nothing left to inspect
     if (!supervised) {
       this.log(`hideScreen(${connector}): nothing placed`);
       return;
@@ -339,16 +392,30 @@ export class SwayBackend implements DisplayBackend {
   }
 
   /**
-   * Pop surf's Web Inspector on the panel driven by `connector` (POL-50). Relaunches that output's
-   * surf with `-N` — the only way surf takes the inspector — which places it again and opens the
-   * inspector as part of the launch. Turning it off relaunches without `-N`, which both closes the
-   * inspector and re-seals the kiosk.
+   * Enable/disable inspection of `connector`'s page — browser-dependent (POL-50 / POL-67):
+   *
+   *   - chrome: ARM/DISARM the remote DevTools tunnel for this output. No relaunch, nothing on the
+   *     glass; from here the agent honours `server/devtools-*` frames for this connector (see
+   *     `devtoolsEndpoint`) and the operator drives DevTools from their own browser.
+   *   - surf: relaunch with/without `-N` and pop the Web Inspector ON the panel — the only
+   *     inspector WebKitGTK has (D63); the page reloads.
    */
   async inspect(connector: string, on: boolean): Promise<void> {
     const supervised = this.browsers.get(connector);
     if (!supervised) {
       throw new Error(`nothing is placed on ${connector} — no page to inspect`);
     }
+
+    if ((await this.ensureBrowserKind()) === "chrome") {
+      if (!supervised.running) {
+        throw new Error(`the browser on ${connector} is not running — nothing to inspect`);
+      }
+      if (on) this.devtoolsArmed.add(connector);
+      else this.devtoolsArmed.delete(connector);
+      this.log(`inspect(${connector}): remote DevTools ${on ? "armed" : "disarmed"}`);
+      return;
+    }
+
     if (supervised.inspector === on && supervised.running) {
       this.log(`inspect(${connector}): already ${on ? "on" : "off"} — no-op`);
       return;
@@ -365,6 +432,20 @@ export class SwayBackend implements DisplayBackend {
     const failure = this.inspectErrors.get(connector);
     if (failure) throw new Error(failure);
     this.log(`inspect(${connector}): Web Inspector open on the wall`);
+  }
+
+  /**
+   * The loopback DevTools endpoint the agent may proxy to for `connector` (POL-67): non-null only
+   * for a RUNNING Chrome on an output an operator ARMED. The port itself always listens (Chrome
+   * takes it only at launch); this gate is what keeps it reachable strictly through the armed,
+   * operator-authenticated tunnel.
+   */
+  devtoolsEndpoint(connector: string): { port: number } | null {
+    if (this.browser !== "chrome") return null;
+    if (!this.devtoolsArmed.has(connector)) return null;
+    if (!this.browsers.get(connector)?.running) return null;
+    const port = this.devtoolsPorts.get(connector);
+    return port === undefined ? null : { port };
   }
 
   /** Grab a thumbnail of `connector` via `grim`. Returns JPEG bytes (or PNG), `null` on failure. */

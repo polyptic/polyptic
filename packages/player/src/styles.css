@@ -69,7 +69,13 @@ body {
   background: #0b0f14;
 }
 
-/* Ident pulse — flash the screen's friendly name on its colour so panels can be mapped. */
+/* Ident pulse — flash the screen's friendly name on its colour so panels can be mapped.
+   WALL-CHROME MOTION RULES (D66, re-measured for POL-67): never animate opacity/transform/filter
+   (WebKit's no-GL compositor silently drops promoted layers — the overlay would VANISH on exactly
+   the boxes that need it), and never animate continuously (a smooth ease repaints the full screen
+   every frame; on a software-rendered box that alone pegs a core — POL-59/POL-65 heat, and the
+   player measured ~2× the raw page's CPU on fpd-ago). So the pulse is a dark veil toggled by a
+   discrete `visibility` steps() animation: two repaints per cycle, no layer promotion. */
 .ident {
   position: absolute;
   inset: 0;
@@ -77,10 +83,20 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  animation: ident-pulse 1.1s ease-in-out infinite;
+}
+
+.ident::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: rgba(10, 10, 10, 0.24);
+  animation: ident-blink 1.1s steps(1, end) infinite;
 }
 
 .ident-name {
+  position: relative;
+  z-index: 1;
   padding: 0 4vw;
   font-size: 13vw;
   font-weight: 800;
@@ -91,17 +107,21 @@ body {
   text-shadow: 0 2px 40px rgba(255, 255, 255, 0.35);
 }
 
-@keyframes ident-pulse {
+@keyframes ident-blink {
   0%,
-  100% {
-    opacity: 1;
+  49.9% {
+    visibility: hidden;
   }
-  50% {
-    opacity: 0.76;
+  50%,
+  100% {
+    visibility: visible;
   }
 }
 
-/* Dev-only corner badge — proves "instant" by showing live state + the current revision. */
+/* Dev-only corner badge — proves "instant" by showing live state + the current revision.
+   No backdrop-filter, deliberately (POL-67): a blur sampling the surface BELOW must re-blur on
+   every underlying iframe repaint — measured on fpd-ago as part of the player roughly DOUBLING a
+   continuously-repainting page's CPU under software rendering. An opaque pill costs nothing. */
 .badge {
   position: absolute;
   right: 12px;
@@ -112,9 +132,8 @@ body {
   gap: 8px;
   padding: 6px 12px;
   border-radius: 999px;
-  background: rgba(8, 12, 18, 0.82);
+  background: rgba(8, 12, 18, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(8px);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   color: #cdd7e2;
@@ -136,7 +155,9 @@ body {
 
 .badge-dot--connecting {
   background: #f2c14e;
-  animation: badge-blink 1s steps(2, jump-none) infinite;
+  /* visibility, not opacity: discrete (two tiny repaints/s, not per-frame) and immune to WebKit's
+     no-GL layer-drop (D66). */
+  animation: badge-blink 1s steps(1, end) infinite;
 }
 
 .badge-dot--closed {
@@ -148,8 +169,13 @@ body {
 }
 
 @keyframes badge-blink {
-  50% {
-    opacity: 0.3;
+  0%,
+  49.9% {
+    visibility: visible;
+  }
+  50%,
+  100% {
+    visibility: hidden;
   }
 }
 

@@ -15,7 +15,7 @@ It replaces the all-too-common pattern of "a fragile per-machine boot script tha
 - **Screens, not machines.** You drive *named screens* ("Nessie", "Bertha"). A client machine is just plumbing — "this box owns these outputs." An **ident mode** flashes each screen's name on its physical panel so onboarding is point-and-confirm, never remote-desktop-and-guess.
 - **One global layout, reconciled.** The control plane holds a single spatial layout ("murals") + named **scenes**; each agent renders only *its* slice. Same desired-state reconcile loop as a Kubernetes controller — the fleet is **one consistent system, not N isolated kiosks**, by construction.
 - **Instant.** Content changes propagate over WebSocket and patch the player's DOM **in place — no reload** (the iframe/img/video source swaps, no white flash). Snappy enough to demo to stakeholders.
-- **Buy the substrate, build the brain.** The device stack (Ubuntu + `sway`/`greetd`/`systemd` + the `surf` kiosk browser) is standard and borrowed wholesale. Only the global-layout + scenes + content library + API + console are ours.
+- **Buy the substrate, build the brain.** The device stack (Ubuntu + `sway`/`greetd`/`systemd` + Google Chrome as the kiosk browser, `surf` fallback) is standard and borrowed wholesale. Only the global-layout + scenes + content library + API + console are ours.
 - **Outbound-only agents, air-gappable edge.** Clients dial out to the control plane; no inbound ports. The control plane is also the **provisioning depot** — an edge box can install everything from the server with `curl … | sh`, no internet required (see *Provisioning*).
 
 ## Quickstart (local dev)
@@ -46,7 +46,7 @@ Open **http://localhost:5175**, sign in (dev default `operator@polyptic.local` /
      │  Display client A  │   (machine = plumbing)        │  Display client C  │
      │  Ubuntu + sway     │            ...                │  Ubuntu + x11/i3   │
      │  polyptic-agent    │  reconciles its slice via     │  polyptic-agent    │
-     │    surf per out    │  swaymsg / xrandr + player    │    surf per out    │
+     │  chrome per out    │  swaymsg / xrandr + player    │  chrome per out    │
      │ ┌────────┬────────┐│                              │ ┌────────┬────────┐ │
      │ │ Screen │ Screen ││                              │ │  ...   │  ...   │ │
      │ └────────┴────────┘│                              │ └────────┴────────┘ │
@@ -61,11 +61,11 @@ Open **http://localhost:5175**, sign in (dev default `operator@polyptic.local` /
 | `@polyptic/server` | Bun · Fastify · `ws` · Postgres (porsager) · `zod` | source of truth: registry, murals/placement, combined surfaces, content library, scenes, media; REST + WS (`/agent`, `/player`, `/admin`); local auth; `/healthz` + Prometheus `/metrics`; serves both SPAs |
 | `@polyptic/console` | **Vue 3 · Vite · Vue Router · Pinia · Vue Flow** | the operator UI: spatial **Wall** canvas, content library, scenes, machines + cold-start wizard, settings, live activity feed |
 | `@polyptic/player` | **Vue 3 · Vite** | per-screen renderer; draws its slice of typed surfaces, including a video-wall **span** of one piece of content across panels; in-place updates |
-| `@polyptic/agent` | **Bun single binary** (served by the control-plane depot) | outbound WS, reconciles its slice, drives `sway` (`swaymsg`) or `x11/i3`, launches surf-per-output, pops the on-screen Web Inspector on request, captures `grim`/`scrot` preview thumbnails |
+| `@polyptic/agent` | **Bun single binary** (served by the control-plane depot) | outbound WS, reconciles its slice, drives `sway` (`swaymsg`) or `x11/i3`, launches a kiosk browser per output (Chrome native-Wayland, surf fallback), arms remote DevTools / pops surf's on-screen inspector on request, captures `grim`/`scrot` preview thumbnails |
 | `@polyptic/protocol` | `zod` | the shared contract — every cross-process message is defined and validated here |
 
 ### Device stack (each display client)
-Ubuntu Server-minimal → `greetd` passwordless autologin (`kiosk`) → **`sway`** (Wayland; `x11`/`i3` fallback for NVIDIA) with outputs pinned by connector → `systemd`-supervised agent + one **`surf`** per output (chromeless by nature, placed by the compositor, respawned by the agent). No idle/blank; `output * dpms on`. **Zero clicks, zero sleeps, zero typed passwords.**
+Ubuntu Server-minimal → `greetd` passwordless autologin (`kiosk`) → **`sway`** (Wayland; `x11`/`i3` fallback for NVIDIA) with outputs pinned by connector → `systemd`-supervised agent + one **Chrome** kiosk window per output (native Wayland; `surf` fallback; placed by the compositor, respawned by the agent). No idle/blank; `output * dpms on`. **Zero clicks, zero sleeps, zero typed passwords.**
 
 ### Content model
 Reusable **`ContentSource`** library entries — `web` · `dashboard` · `image` · `video` — that are **linkable (a URL) or uploaded** (stored on a disk volume, served with HTTP Range so video seeks). Assign a source to a screen or a combined surface by **drag-and-drop** or the inspector; a source assigned to a video wall **spans** across its member panels. Editing a library source re-pushes live to every screen showing it. (Office docs → pre-convert to image/video; framing-hostile sites are a known web limitation — use embed-friendly URLs or the kiosk's trusted-content flags.)
@@ -86,7 +86,7 @@ runs from there, Secure Boot left on (D46/D47/D58).
 1. In the console, open **Settings → Onboard Screens** and download the network bootloader.
 2. Flash it to a USB stick (2 GB or larger) with Balena Etcher or Rufus.
 3. Boot the machine from the stick. It streams the current image, brings up the kiosk stack
-   (greetd autologin → sway → surf per output) and enrols itself.
+   (greetd autologin → sway → browser per output) and enrols itself.
 
 The control-plane address and the enrolment token are baked into the boot menu the server generates
 per request, so there is nothing to type on the machine. A netbooted machine re-pulls its whole OS at
@@ -109,7 +109,7 @@ See **[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md)** for the full packaging st
 **Feature-complete through Phase 8** and verified headlessly + in a real browser; the remaining work is environmental (real hardware), not features.
 
 - **Built & tested:** Phases 1–3 (instant slice → registry → enrollment → the full Vue console: murals, combined surfaces, content library, scenes, machines + cold-start wizard, local auth + settings), Phase 5 (live preview, metrics, Helm), Phase 7 (media upload to disk), Phase 8 (single-image packaging + CI/release/Pages). **101 end-to-end tests** (real server, REST + WS) + full TypeScript typecheck are green; the console's interactions (content names, drag-to-assign, combine/rename, the activity feed) are **verified in-browser** via the `tools/ui-check` Playwright harness. *(Phase 6 / OIDC is deliberately deferred — the seam is in place.)*
-- **Code-complete, not yet proven on hardware:** the **device stack** (Phase 4 — real `sway`/`x11` backends, zero-touch depot install, greetd cold-boot, boot splash, surf-per-output) and the **production image build** / actual multi-machine deploy. These can only be validated on real boxes/VMs — that's the active next step.
+- **Code-complete, not yet proven on hardware:** the **device stack** (Phase 4 — real `sway`/`x11` backends, zero-touch depot install, greetd cold-boot, boot splash, browser-per-output) and the **production image build** / actual multi-machine deploy. These can only be validated on real boxes/VMs — that's the active next step.
 
 See **`docs/ONBOARDING.md`** to add a display, `docs/DEPLOY.md` for the device side, `docs/DISTRIBUTION.md` for packaging, `docs/ROADMAP.md` for the detailed state, `docs/DECISIONS.md` for the decision log (D1–D34+), `docs/DESIGN.md` for the narrative, `docs/ARCHITECTURE.md` for the build reference, and `CLAUDE.md` for working conventions.
 

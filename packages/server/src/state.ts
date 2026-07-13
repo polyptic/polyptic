@@ -40,6 +40,7 @@ import type {
   DisplayBackend,
   DisplaySettings,
   Geometry,
+  KioskBrowser,
   Machine,
   Mural,
   Output,
@@ -128,6 +129,9 @@ export interface RegisterMachineInput {
   machineId: string;
   agentVersion: string;
   backend: DisplayBackend;
+  /** POL-67 — the kiosk browser the agent reported (chrome = remote DevTools). Held in memory only:
+   *  it is re-reported on every hello, and only matters while the box is online. */
+  browser?: KioskBrowser;
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
@@ -695,6 +699,7 @@ export class ControlPlane {
       label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
       agentVersion: input.agentVersion,
       backend: input.backend,
+      browser: input.browser,
       outputs: input.outputs,
       status: "approved",
       lastSeen: new Date().toISOString(),
@@ -727,6 +732,7 @@ export class ControlPlane {
       label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
       agentVersion: input.agentVersion,
       backend: input.backend,
+      browser: input.browser,
       outputs: input.outputs,
       status: "pending",
       lastSeen: new Date().toISOString(),

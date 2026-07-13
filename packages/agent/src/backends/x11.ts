@@ -325,6 +325,11 @@ export class X11Backend implements DisplayBackend {
     this.log(`inspect(${connector}): Web Inspector open on the wall`);
   }
 
+  /** x11-i3 drives surf, which has no tunnel-able remote inspector (D63) — never a DevTools port. */
+  devtoolsEndpoint(): { port: number } | null {
+    return null;
+  }
+
   /** Crop the output's region out of the root window via ImageMagick `import`, else `scrot`. */
   async capture(connector: string): Promise<Buffer | null> {
     if (this.captureUnavailable) return null;

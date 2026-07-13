@@ -52,6 +52,7 @@ import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import { ShellRelay } from "./shell-relay";
+import type { DevtoolsRelay } from "./devtools-relay";
 
 interface WsDeps {
   server: Server;
@@ -68,13 +69,29 @@ interface WsDeps {
   activity: ActivityLog;
   /** Live-preview capture (Phase 5) — ingests inbound `agent/thumbnail` frames. */
   capture: CaptureCoordinator;
+  /** Remote-DevTools relay (POL-67) — bridges an operator's DevTools frontend to a wall's Chrome. */
+  devtoolsRelay: DevtoolsRelay;
   log: FastifyBaseLogger;
   /** Allowed browser origins for the /admin WS upgrade (anti-CSWSH); from CORS_ORIGIN. */
   allowedOrigins: string[];
 }
 
+/** The CDP WebSocket path the proxied DevTools frontend connects back on (see devtools-routes.ts):
+ *  /api/v1/screens/<screenId>/devtools/<box path>. Returns null for any other path. */
+export function parseDevtoolsUpgradePath(pathname: string): { screenId: string; path: string } | null {
+  const m = /^\/api\/v1\/screens\/([^/]+)\/devtools(\/.+)$/.exec(pathname);
+  if (!m || !m[1] || !m[2]) return null;
+  let screenId: string;
+  try {
+    screenId = decodeURIComponent(m[1]);
+  } catch {
+    return null;
+  }
+  return { screenId, path: m[2] };
+}
+
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, log, allowedOrigins } =
+  const { server, control, enrollment, auth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, log, allowedOrigins } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -84,6 +101,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   const agentWss = new WebSocketServer({ noServer: true });
   const playerWss = new WebSocketServer({ noServer: true });
   const adminWss = new WebSocketServer({ noServer: true });
+  const devtoolsWss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (req, socket, head) => {
     let pathname: string;
@@ -132,13 +150,55 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
           log.warn({ event: "admin.ws.error", err: String(err) }, "error gating /admin upgrade");
           socket.destroy();
         });
+    } else if (parseDevtoolsUpgradePath(pathname)) {
+      // POL-67 — the proxied DevTools frontend's CDP socket. Gated EXACTLY like /admin (origin
+      // check + session cookie), with one addition: the frontend page is served from THIS server's
+      // own origin (via the /api/v1 proxy), which need not be in CORS_ORIGIN — same-host origins
+      // are same-site by definition, so they pass.
+      const target = parseDevtoolsUpgradePath(pathname);
+      if (!target) {
+        socket.destroy();
+        return;
+      }
+      const origin = req.headers.origin;
+      const sameHost = origin ? origin.endsWith(`//${req.headers.host ?? ""}`) : false;
+      if (origin && !sameHost && !allowedOrigins.includes(origin)) {
+        log.warn({ event: "devtools.ws.badorigin", origin }, "rejected devtools upgrade — origin not allowed");
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      const admit = (): void => {
+        devtoolsWss.handleUpgrade(req, socket, head, (ws) =>
+          devtoolsRelay.openFromClient(ws, target.screenId, target.path),
+        );
+      };
+      if (!auth.enabled) {
+        admit();
+        return;
+      }
+      void auth
+        .verifyCookieHeader(req.headers.cookie)
+        .then((user) => {
+          if (!user) {
+            log.warn({ event: "devtools.ws.rejected" }, "rejected devtools upgrade — no valid session");
+            socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+            socket.destroy();
+            return;
+          }
+          admit();
+        })
+        .catch((err) => {
+          log.warn({ event: "devtools.ws.error", err: String(err) }, "error gating devtools upgrade");
+          socket.destroy();
+        });
     } else {
       socket.destroy();
     }
   });
 
   agentWss.on("connection", (ws: WebSocket) =>
-    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, shellRelay, log),
+    handleAgent(ws, control, enrollment, agentHub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, log),
   );
   playerWss.on("connection", (ws: WebSocket) =>
     handlePlayer(ws, control, hub, presence, broadcaster, activity, log),
@@ -160,6 +220,7 @@ function handleAgent(
   activity: ActivityLog,
   capture: CaptureCoordinator,
   shellRelay: ShellRelay,
+  devtoolsRelay: DevtoolsRelay,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected" }, "agent socket opened");
@@ -247,6 +308,7 @@ function handleAgent(
       machineId: msg.machineId,
       agentVersion: msg.agentVersion,
       backend: msg.backend,
+      browser: msg.browser,
       outputs: msg.outputs,
       hostname: msg.hostname,
     };
@@ -378,6 +440,14 @@ function handleAgent(
       shellRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
     } else if (msg.t === "agent/shell-closed") {
       shellRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
+    } else if (msg.t === "agent/devtools-response") {
+      devtoolsRelay.responseFromAgent(msg.machineId, msg.reqId, msg.ok, msg.status, msg.contentType, msg.bodyBase64, msg.error);
+    } else if (msg.t === "agent/devtools-opened") {
+      devtoolsRelay.openedFromAgent(msg.machineId, msg.sessionId, msg.ok, msg.reason);
+    } else if (msg.t === "agent/devtools-data") {
+      devtoolsRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
+    } else if (msg.t === "agent/devtools-closed") {
+      devtoolsRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
     } else if (msg.t === "agent/inspect-ack") {
       // POL-50 — the box's answer to `server/inspect`, and the ONLY writer of the `inspecting` flag:
       // the operator's click is a request, but only the wall knows whether surf relaunched and took
@@ -430,6 +500,7 @@ function handleAgent(
 
   ws.on("close", (code) => {
     if (machineId) shellRelay.agentDisconnected(machineId);
+    if (machineId) devtoolsRelay.agentDisconnected(machineId);
     if (machineId && hubRegistered) agentHub.remove(machineId, ws);
     if (machineId && presenceMarked) {
       // Resolve the machine BEFORE dropping presence; emit only on the true online→offline edge — and

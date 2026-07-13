@@ -15,6 +15,9 @@
 # kernel, modules and initrd now come from one apt transaction), but because a kernel bump means
 # republishing vmlinuz + rebuilding the initrd, which is exactly what the weekly full rebuild
 # (deploy/build-live-image.sh) does. Everything else (openssl, glibc, browsers, sway, …) refreshes here.
+# That includes google-chrome-stable (POL-67): the image carries Google's apt repo + key under
+# /etc/apt (written by `polyptic-agent setup` at build time), so the `apt-get update && upgrade`
+# below pulls the then-latest stable Chrome on every nightly cycle with no extra plumbing.
 #
 # LINUX ROOT ONLY (chroot), container-friendly: the same privileged Docker recipe as
 # build-live-image.sh works (apt-get install squashfs-tools rsync curl).

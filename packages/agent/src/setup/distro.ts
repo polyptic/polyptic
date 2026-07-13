@@ -116,8 +116,8 @@ export function isInstalled(sys: Sys, pm: PkgManager, pkg: string): boolean {
 
 // ── package name maps ──────────────────────────────────────────────────────────
 //
-// Generic capability → concrete package name per manager. The browser (surf) and the two tools it
-// needs — xwayland, xdotool — are handled separately in browser.ts (D63).
+// Generic capability → concrete package name per manager. The browsers (chrome + the surf fallback)
+// and surf's two companions — xwayland, xdotool — are handled separately in browser.ts (D63/D77).
 
 interface PkgSet {
   base: string[];
@@ -137,7 +137,9 @@ interface PkgSet {
 // boot, killing the splash. So the label plugin is REQUIRED, not optional. On Ubuntu it's a separate
 // package (`plymouth-label`, which also pulls pango/fontconfig + a font); dracut's plymouth module
 // then bundles the whole text-render closure into the initramfs for early boot.
-// VIDEO (Phase 7 media). WebKitGTK (`surf`) decodes <video> through GStreamer. `surf` pulls
+// VIDEO (Phase 7 media). Chrome bundles its own decoders, so this block exists for the SURF
+// FALLBACK (arm64 / POLYPTIC_BROWSER=surf boxes). WebKitGTK (`surf`) decodes <video> through
+// GStreamer. `surf` pulls
 // plugins-base + plugins-good as hard deps, which cover WebM/VP8/VP9 and
 // Opus/Vorbis — but NOT H.264/AAC, i.e. the .mp4 almost everyone uploads. Those live in
 // `gstreamer1.0-libav` (the ffmpeg-backed decoder), which is only a *recommends* — and setup installs

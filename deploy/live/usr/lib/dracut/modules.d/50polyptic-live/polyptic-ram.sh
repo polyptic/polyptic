@@ -28,15 +28,24 @@ case " $(cat /proc/cmdline 2>/dev/null) " in
         mount -o remount,size=90% / 2>/dev/null || :
 
         polyptic_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-        # 2 GiB. Below this, 90% of RAM cannot hold a ~700 MiB squashfs plus a running sway+browser
-        # (the floor rose with POL-63: the image carries every major vendor's Wi-Fi firmware).
-        if [ "${polyptic_mem_kb:-0}" -gt 0 ] && [ "$polyptic_mem_kb" -lt 2097152 ]; then
+        # 3 GiB (3145728 KiB). The floor tracks the image, and the image has grown twice:
+        #   POL-63 added every major vendor's Wi-Fi firmware  (squashfs → ~700 MiB)
+        #   POL-67 added Chrome, ~300-400 MB                  (squashfs → ~1.0-1.1 GiB)
+        # 90% of RAM has to hold the squashfs for the WHOLE session (it is loop-mounted out of this
+        # tmpfs, not freed after boot), plus the overlay's writes, plus a running sway + Chrome —
+        # and Chrome is multi-process, so it is hungrier than the surf it replaced. On a 2 GB box
+        # that is now hopeless: 90% ≈ 1.8 GB, and the image alone eats ~1.05 GB of it.
+        #
+        # THESE ARE ESTIMATES, not measurements: the first post-Chrome build is what calibrates them.
+        # When it lands, re-check the real `rootfs.squashfs` size and correct BOTH numbers here and
+        # the copy below (docs/NETBOOT.md "RAM" section quotes the same figures).
+        if [ "${polyptic_mem_kb:-0}" -gt 0 ] && [ "$polyptic_mem_kb" -lt 3145728 ]; then
             polyptic_mem_gb=$((polyptic_mem_kb / 1048576))
             {
                 echo ""
                 echo "  ##############################################################"
                 echo "  ## Polyptic: this machine has ~${polyptic_mem_gb} GB RAM."
-                echo "  ## Netbooting streams the whole OS image into RAM and needs ~2.5 GB."
+                echo "  ## Netbooting streams the whole OS image into RAM and needs ~3.5 GB."
                 echo "  ##"
                 echo "  ## Use the LIVE ISO instead (Console > Settings > Onboard Screens):"
                 echo "  ## it runs the OS straight off the USB stick and needs ~1 GB."

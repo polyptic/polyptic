@@ -28,6 +28,8 @@ import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
 import { registerRestRoutes } from "./rest";
+import { DevtoolsRelay } from "./devtools-relay";
+import { registerDevtoolsRoutes } from "./devtools-routes";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
 import { createStore } from "./store";
@@ -194,6 +196,10 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
 });
 
 registerAuthRoutes(fastify, auth, enrollment);
+// The remote-DevTools relay (POL-67) bridges an operator's DevTools frontend to a wall's Chrome over
+// the agent WS — the POL-59 shell pattern. Built before the WS channels (agent frames route into it)
+// and handed to REST so disarming a screen closes its live sessions instantly.
+const devtoolsRelay = new DevtoolsRelay(agentHub, control, presence, activity, fastify.log);
 // The WS channels attach first so the remote-shell relay (POL-59) exists before REST — the
 // arm/disarm endpoint closes a box's live sessions the instant it is disarmed.
 const shellRelay = attachWebSockets({
@@ -208,6 +214,7 @@ const shellRelay = attachWebSockets({
   broadcaster,
   activity,
   capture,
+  devtoolsRelay,
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
 });
@@ -227,7 +234,10 @@ registerRestRoutes(
   activity,
   presence,
   shellRelay,
+  devtoolsRelay,
 );
+// The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
+registerDevtoolsRoutes(fastify, devtoolsRelay);
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).
 registerMediaServeRoute(fastify, media);

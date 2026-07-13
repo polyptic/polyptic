@@ -6,17 +6,25 @@
   pulse, and an Inspect toggle. The rename draft re-syncs from the authoritative admin/state on every
   snapshot UNLESS the operator is mid-edit, so a live repaint never clobbers typed text or steals focus.
 
-  Inspect (POL-50) pops the kiosk browser's Web Inspector ON the panel itself — the kiosk browser has
-  no remote inspector to tunnel (D63), so the console asks and someone at the screen reads. The button
-  reflects `screen.inspecting`, which only ever comes from the agent's ack; while the box relaunches
-  its browser the button shows a pending label rather than lying about the wall.
+  The Inspect affordance is browser-dependent (POL-50 / POL-67, driven by the machine's reported
+  kiosk browser):
+    - chrome: "DevTools" ARMS the remote tunnel and opens Chrome DevTools in a NEW TAB on the
+      operator's own machine — nothing on the glass changes and nothing reloads. Clicking again
+      disarms (which also severs any live DevTools tab).
+    - surf (or an older agent that reports no browser): "Inspect" pops the Web Inspector ON the
+      panel itself — WebKitGTK has no remote inspector to tunnel (D63), so the console asks and
+      someone at the screen reads. Relaunches the browser, so the page reloads.
+  Either way the button reflects `screen.inspecting`, which only ever comes from the agent's ack;
+  until the box answers the button shows a pending label rather than lying about the wall.
 
   All mutations go through the Pinia store (renameScreen / identScreen / inspectScreen) — no direct
-  fetch here. Failures are surfaced to the parent via `notify`, which toasts them.
+  fetch here (the DevTools tab is a navigation, not a fetch). Failures are surfaced to the parent
+  via `notify`, which toasts them.
 -->
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted } from "vue";
-import type { ScreenView } from "@polyptic/protocol";
+import type { KioskBrowser, ScreenView } from "@polyptic/protocol";
+import { devtoolsUrl } from "../api";
 import { useConsoleStore } from "../stores/console";
 import { useScreenThumbnail } from "./canvas/useThumbnails";
 
@@ -25,6 +33,8 @@ const props = defineProps<{
   machineLabel: string;
   /** Is the screen's machine reachable? The inspector rides the agent socket, not the player's. */
   machineOnline: boolean;
+  /** The machine's kiosk browser (POL-67): chrome = remote DevTools, else the on-panel inspector. */
+  browser?: KioskBrowser;
 }>();
 
 const emit = defineEmits<{ notify: [message: string] }>();
@@ -75,24 +85,35 @@ function ident(): void {
   }, 3000);
 }
 
-// ── On-screen inspector (POL-50) ────────────────────────────────────────────────
+// ── Inspect / DevTools (POL-50 / POL-67) ───────────────────────────────────────
 // `inspecting` is written only by the agent's ack, so the click leaves the button in a pending state
 // until the wall confirms. A stuck box therefore reads as "Opening…", never as a live inspector.
 const inspectPending = ref(false);
 let inspectTimer: ReturnType<typeof setTimeout> | null = null;
 
+const isChrome = computed(() => props.browser === "chrome");
 const inspecting = computed(() => props.screen.inspecting === true);
 const inspectLabel = computed(() => {
+  if (isChrome.value) {
+    if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
+    return inspecting.value ? "DevTools live" : "DevTools";
+  }
   if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
   return inspecting.value ? "Inspecting" : "Inspect";
 });
-const inspectTitle = computed(() =>
-  props.machineOnline
-    ? inspecting.value
-      ? "Close the Web Inspector on this panel (reloads the page)"
-      : "Open the browser's Web Inspector ON this panel — read it at the screen (reloads the page)"
-    : `${props.machineLabel} is offline — the inspector rides its agent connection`,
-);
+const inspectTitle = computed(() => {
+  if (!props.machineOnline) {
+    return `${props.machineLabel} is offline — the inspector rides its agent connection`;
+  }
+  if (isChrome.value) {
+    return inspecting.value
+      ? "Disarm remote DevTools for this screen (closes any open DevTools tab)"
+      : "Open Chrome DevTools for this screen in a new tab — remote, nothing shows on the wall";
+  }
+  return inspecting.value
+    ? "Close the Web Inspector on this panel (reloads the page)"
+    : "Open the browser's Web Inspector ON this panel — read it at the screen (reloads the page)";
+});
 
 /**
  * Clear the pending state as soon as the wall's ack lands — on EITHER signal.
@@ -124,7 +145,13 @@ onUnmounted(() => {
 async function toggleInspect(): Promise<void> {
   if (inspectPending.value || !props.machineOnline) return;
   const on = !inspecting.value;
-  if (on) {
+
+  if (isChrome.value && on) {
+    // POL-67 — remote DevTools: open the tab NOW, inside the user gesture (popup blockers), then
+    // arm in parallel. The server's entry route waits briefly for the arm ack before proxying, so
+    // the tab and the handshake race safely.
+    window.open(devtoolsUrl(props.screen.id), "_blank", "noopener");
+  } else if (!isChrome.value && on) {
     const yes = window.confirm(
       `Open the Web Inspector on "${props.screen.friendlyName}"?\n\n` +
         `It appears ON that panel, so anyone looking at the screen will see it, and the page reloads ` +
@@ -133,8 +160,9 @@ async function toggleInspect(): Promise<void> {
     if (!yes) return;
   }
   inspectPending.value = true;
-  // The agent relaunches the browser, so the ack takes a few seconds. Give up waiting well after
-  // that, rather than leaving the button pending forever if the box never answers.
+  // surf relaunches the browser, so its ack takes a few seconds (chrome acks near-instantly).
+  // Give up waiting well after that, rather than leaving the button pending forever if the box
+  // never answers.
   if (inspectTimer) clearTimeout(inspectTimer);
   inspectTimer = setTimeout(() => {
     if (!inspectPending.value) return;

@@ -43,6 +43,13 @@ export type Output = z.infer<typeof Output>;
 export const DisplayBackend = z.enum(["wayland-sway", "x11-i3", "dev-open"]);
 export type DisplayBackend = z.infer<typeof DisplayBackend>;
 
+/** POL-67 — which kiosk browser the box drives. `chrome` (Google Chrome, native Wayland) is the
+ *  default where installable and is what makes REMOTE DevTools possible; `surf` (WebKitGTK under
+ *  Xwayland, D63) is the fallback whose only inspector is on-panel. The console branches its
+ *  per-screen Inspect/DevTools affordance on this. */
+export const KioskBrowser = z.enum(["chrome", "surf"]);
+export type KioskBrowser = z.infer<typeof KioskBrowser>;
+
 /** Enrollment lifecycle of a machine (Phase 2b). New machines arrive `pending`; an operator
  * approves them. Existing/auto-registered machines default to `approved`. */
 export const EnrollmentStatus = z.enum(["pending", "approved", "rejected"]);
@@ -54,6 +61,8 @@ export const Machine = z.object({
   label: z.string(),
   agentVersion: z.string().optional(),
   backend: DisplayBackend.optional(),
+  /** POL-67 — the kiosk browser the agent reported on hello (absent for dev-open / older agents). */
+  browser: KioskBrowser.optional(),
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
   lastSeen: z.string().datetime().optional(),
@@ -166,6 +175,9 @@ export const AgentHello = z.object({
   machineId: z.string(),
   agentVersion: z.string(),
   backend: DisplayBackend,
+  /** POL-67 — which kiosk browser this box drives (chrome = remote DevTools available). Omitted by
+   *  dev-open (no kiosk browser) and by pre-POL-67 agents. */
+  browser: KioskBrowser.optional(),
   outputs: z.array(Output),
   /** The box's os.hostname(), used as the human machine label (additive-safe; optional). */
   hostname: z.string().optional(),
@@ -261,6 +273,58 @@ export const AgentInspectAck = z.object({
   reason: z.string().optional(),
 });
 
+// ── Remote DevTools tunnel (POL-67) ──────────────────────────────────────────
+//
+// Chrome on the box listens on a LOOPBACK-ONLY `--remote-debugging-port`; these frames tunnel its
+// DevTools protocol (plain HTTP for the frontend files + target list, a WebSocket for CDP) over the
+// agent's existing outbound WS — the POL-59 shell-relay pattern, because the trust model is the
+// same: the port is code-exec-adjacent, so it is never exposed on the network, and the server only
+// relays for a screen an operator has ARMED (`server/inspect on` → the agent's ack). Bodies and CDP
+// frames ride base64 so bytes survive JSON.
+
+export const DevtoolsSessionId = z.string().min(1).max(64);
+/** A path on the box's DevTools HTTP server, e.g. "/json/list" or "/devtools/inspector.html?…". */
+export const DevtoolsPath = z.string().min(1).max(4096).startsWith("/");
+
+/** Agent → server: the answer to one `server/devtools-request` (one proxied HTTP GET). */
+export const AgentDevtoolsResponse = z.object({
+  t: z.literal("agent/devtools-response"),
+  machineId: z.string(),
+  reqId: z.string().min(1).max(64),
+  ok: z.boolean(),
+  /** HTTP status from Chrome (ok only). */
+  status: z.number().int().optional(),
+  contentType: z.string().optional(),
+  bodyBase64: z.string().optional(),
+  /** Why the box refused / failed: DevTools not armed, wrong browser, Chrome unreachable. */
+  error: z.string().optional(),
+});
+
+/** Agent → server: the CDP WebSocket to Chrome connected (or refused). */
+export const AgentDevtoolsOpened = z.object({
+  t: z.literal("agent/devtools-opened"),
+  machineId: z.string(),
+  sessionId: DevtoolsSessionId,
+  ok: z.boolean(),
+  reason: z.string().optional(),
+});
+
+/** Agent → server: one CDP frame from Chrome (base64 of the text frame). */
+export const AgentDevtoolsData = z.object({
+  t: z.literal("agent/devtools-data"),
+  machineId: z.string(),
+  sessionId: DevtoolsSessionId,
+  dataBase64: z.string(),
+});
+
+/** Agent → server: the CDP socket to Chrome closed; the session is over. */
+export const AgentDevtoolsClosed = z.object({
+  t: z.literal("agent/devtools-closed"),
+  machineId: z.string(),
+  sessionId: DevtoolsSessionId,
+  reason: z.string().optional(),
+});
+
 export const AgentMessage = z.discriminatedUnion("t", [
   AgentHello,
   AgentStatus,
@@ -270,6 +334,10 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentShellData,
   AgentShellClosed,
   AgentInspectAck,
+  AgentDevtoolsResponse,
+  AgentDevtoolsOpened,
+  AgentDevtoolsData,
+  AgentDevtoolsClosed,
 ]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
 
@@ -309,17 +377,18 @@ export const ServerToAgentReboot = z.object({
 });
 
 /**
- * POL-50 — show/hide the kiosk browser's Web Inspector ON the panel driven by `connector`.
+ * POL-50 / POL-67 — enable/disable inspection of the page on the panel driven by `connector`. What
+ * that MEANS depends on the box's kiosk browser (see `Machine.browser`):
  *
- * A wall you can only debug by photographing it is a wall you can't debug. surf (WebKitGTK, D63)
- * exposes NO browser-openable remote inspector — its `WEBKIT_INSPECTOR_SERVER` port speaks WebKit's
- * own protocol, not HTTP or WebSocket — so there is nothing to tunnel to an operator's browser and
- * the inspector is shown where the page is. The operator clicks in the console; someone at the
- * screen reads the console/network.
+ *   - chrome (POL-67): ARM/DISARM the remote DevTools tunnel for this connector. Nothing changes on
+ *     the glass and nothing reloads; the agent simply starts honouring `server/devtools-*` frames
+ *     for this output, and the operator drives Chrome DevTools from their own browser.
+ *   - surf (D63): show/hide the Web Inspector ON the panel. WebKitGTK exposes no tunnel-able remote
+ *     inspector, and surf takes `-N` only at launch, so honouring this RELAUNCHES that output's
+ *     browser (the page reloads) and someone at the screen reads the console/network.
  *
- * surf only takes its inspector at launch (`-N`), so honouring this RELAUNCHES that output's browser
- * and the page reloads. Turning it off relaunches without `-N`, re-sealing the kiosk. The agent
- * answers `agent/inspect-ack`.
+ * Either way the agent answers `agent/inspect-ack`, and that ack — never the operator's click — is
+ * what drives `ScreenView.inspecting`.
  */
 export const ServerToAgentInspect = z.object({
   t: z.literal("server/inspect"),
@@ -389,6 +458,38 @@ export const ServerToAgentShellClose = z.object({
   reason: z.string().optional(),
 });
 
+/** Server → agent: proxy ONE HTTP GET to the armed connector's DevTools port (POL-67). The agent
+ *  answers `agent/devtools-response` with the same `reqId`, and REFUSES unless that connector's
+ *  DevTools are armed (`server/inspect on`) — defense in depth under the server's own gate. */
+export const ServerToAgentDevtoolsRequest = z.object({
+  t: z.literal("server/devtools-request"),
+  reqId: z.string().min(1).max(64),
+  connector: z.string(),
+  path: DevtoolsPath,
+});
+
+/** Server → agent: open a CDP WebSocket to the armed connector's DevTools port. */
+export const ServerToAgentDevtoolsOpen = z.object({
+  t: z.literal("server/devtools-open"),
+  sessionId: DevtoolsSessionId,
+  connector: z.string(),
+  path: DevtoolsPath,
+});
+
+/** Server → agent: one CDP frame from the operator's DevTools frontend (base64 of the text frame). */
+export const ServerToAgentDevtoolsData = z.object({
+  t: z.literal("server/devtools-data"),
+  sessionId: DevtoolsSessionId,
+  dataBase64: z.string(),
+});
+
+/** Server → agent: tear the CDP socket down (tab closed, screen disarmed, operator dropped). */
+export const ServerToAgentDevtoolsClose = z.object({
+  t: z.literal("server/devtools-close"),
+  sessionId: DevtoolsSessionId,
+  reason: z.string().optional(),
+});
+
 export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentApply,
   ServerToAgentIdent,
@@ -402,6 +503,10 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentShellData,
   ServerToAgentShellResize,
   ServerToAgentShellClose,
+  ServerToAgentDevtoolsRequest,
+  ServerToAgentDevtoolsOpen,
+  ServerToAgentDevtoolsData,
+  ServerToAgentDevtoolsClose,
 ]);
 export type ServerToAgentMessage = z.infer<typeof ServerToAgentMessage>;
 
@@ -509,6 +614,9 @@ export const MachineView = z.object({
   label: z.string(),
   agentVersion: z.string().optional(),
   backend: DisplayBackend.optional(),
+  /** POL-67 — the box's kiosk browser: `chrome` = the console's Inspect action opens REMOTE
+   *  DevTools; `surf` (or absent, e.g. an older agent) = the on-panel inspector (POL-50). */
+  browser: KioskBrowser.optional(),
   online: z.boolean(), // is the agent's WS currently connected?
   status: EnrollmentStatus, // pending machines await operator approval
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)

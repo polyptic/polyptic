@@ -195,12 +195,13 @@ USAGE
   polyptic-agent setup uninstall [--purge]    tear down / restore the prior display manager
 
 WHAT IT DOES (each step idempotent + logged; --dry-run previews without changes)
-  distro-detect (apt/dnf/pacman) -> install deps (greetd, sway, surf, xwayland, xdotool, grim, fonts,
-  plymouth) -> create the kiosk user -> write /etc/greetd/config.toml (autologin -> compositor)
+  distro-detect (apt/dnf/pacman) -> install deps (greetd, sway, google-chrome-stable [apt+amd64,
+  from Google's repo] + surf/xwayland/xdotool fallback, grim, fonts, plymouth) -> create the kiosk
+  user -> write /etc/greetd/config.toml (autologin -> compositor)
   -> write the sway/i3 config (pin outputs, no idle/blank, dpms on, hand off to systemd)
   -> write the systemd user unit(s) (polyptic-agent, Restart=always) -> write /etc/polyptic/agent.toml
   -> install the Polyptic boot splash (branded Plymouth theme + quiet/splash kernel cmdline, POL-7)
-  -> make greetd the display manager. Cold boot: splash -> greetd -> sway -> agent -> surf.
+  -> make greetd the display manager. Cold boot: splash -> greetd -> sway -> agent -> browser.
 
 OPTIONS
   --server-url <wss://host/agent>   control-plane URL (-> agent.toml). Omit to write agent.toml.example.

@@ -157,7 +157,7 @@ The image is built **up from `ubuntu-base`**, not trimmed down from Ubuntu's liv
 - **The root image is a bare `rootfs.squashfs`.** dracut's netboot mechanism is `root=live:<url>`: `livenet` curls the squashfs into the initramfs tmpfs and `dmsquash-live` loop-mounts it under an overlayfs. No ISO wrapper, no `xorriso`, no casper metadata.
 - **Firmware is curated, not complete.** 26.04 splits `linux-firmware` into per-vendor packages; the image ships `linux-firmware-minimal` plus the two GPU vendors and Realtek NICs. Note that `linux-image-generic` **Depends** on the full `linux-firmware` (~600 MB) — which `--no-install-recommends` cannot decline — so the build installs the *concrete* `linux-image-<abi>-generic` instead. A box with unanticipated hardware gets a black screen or a dead NIC: rebuild with `FULL_FIRMWARE=1`, or extend `FIRMWARE_PACKAGES`.
 - **RAM sizing:** the squashfs lands in a tmpfs, so a box needs roughly **the image size plus the running system's working set**. The initrd's `polyptic-live` dracut module raises the tmpfs cap from the kernel's default 50% of RAM to 90%, and prints a plain-English message below the floor. Never pass `rd.live.ram=1` — it `dd`s a *second* full copy of the image into RAM.
-- The kiosk browser is **surf**, the only one Polyptic ships (D63). It is installed with `xwayland` (surf is an X11 client) and `xdotool` (the on-screen Web Inspector, POL-50).
+- The kiosk browser is **Google Chrome (native Wayland)** where Google ships it — apt + amd64, installed from **Google's own repo**, whose key/list persist into the squashfs so the nightly refresh's plain `apt-get upgrade` tracks the latest stable Chrome (POL-67/[D77](DECISIONS.md); adds ~300–400 MB to the image, so the D55 ~492 MiB amd64 image lands back around ~800 MiB — re-measure the RAM floor). **surf** installs alongside as the fallback — and is all arm64 gets (Google's apt repo serves no arm64 index yet; `setup` probes for it, so arm64 adopts Chrome automatically once Google publishes) — together with `xwayland` (surf is an X11 client) and `xdotool` (surf's on-screen Web Inspector, POL-50). The agent picks at runtime; `POLYPTIC_BROWSER` overrides.
 
 ### The live ISO (macOS or Linux)
 
@@ -597,18 +597,29 @@ whole root image into a RAM tmpfs.)
 
 ---
 
-## RAM: netboot needs ~2.5 GB, the live ISO needs ~1 GB
+## RAM: netboot needs ~3.5 GB, the live ISO needs ~1 GB
 
 The two media differ in *where the operating system lives*, and that decides the memory floor:
 
 | Medium | Where the OS runs from | RAM needed |
 | --- | --- | --- |
-| Boot medium / netboot (`polyptic-boot.img`) | the whole `rootfs.squashfs` (~700 MiB) is streamed into a **RAM tmpfs** and stays there, alongside the unpacked initrd | **~2.5 GB** |
+| Boot medium / netboot (`polyptic-boot.img`) | the whole `rootfs.squashfs` (~1.0–1.1 GiB) is streamed into a **RAM tmpfs** and stays there, alongside the unpacked initrd | **~3.5 GB** |
 | Live ISO (`polyptic-live.iso`) | the squashfs is read **straight off the USB stick** | **~1 GB** |
+
+> **The netboot figures above are ESTIMATES pending the first post-Chrome build.** POL-67/[D77](DECISIONS.md)
+> added Google Chrome (~300–400 MB) to the root image, which is what took the squashfs from ~700 MiB
+> to ~1.0–1.1 GiB and the floor from ~2.5 GB to ~3.5 GB. Re-measure `rootfs.squashfs` on the first
+> full rebuild and correct **both** this section and the floor in
+> `deploy/live/usr/lib/dracut/modules.d/50polyptic-live/polyptic-ram.sh`, which quotes the same numbers.
+> The **boot medium itself is unaffected** — it carries only `vmlinuz` + `initrd-wifi`; the squashfs
+> is streamed, never written to the stick or the offloaded ESP. The **live ISO** does carry the
+> squashfs, so that file grows by the same ~300–400 MB (still comfortably on a 2 GB stick), but its
+> RAM floor does not, because it mounts the image from the medium instead of RAM.
 
 Both floors dropped by roughly a factor of two in POL-35/[D55](DECISIONS.md), when the root image
 stopped being a 1.4 GiB casper ISO and became a bare squashfs; POL-63 then raised the netboot floor
-~half a GB by shipping every major vendor's Wi-Fi firmware in the root image. Measured on the 26.04
+~half a GB by shipping every major vendor's Wi-Fi firmware in the root image, and POL-67 raised it
+again with Chrome. Measured on the 26.04
 arm64 build (POL-63 + the POL-53 KMS drivers below): `rootfs.squashfs` **689 MiB**, lean `initrd`
 **137 MiB** (wired GRUB fetch, wlan-firmware-free by construction), `initrd-wifi` **210 MiB** (local
 media only), `vmlinuz` **23 MiB**; the universal medium with one arch's payload is a **~490 MiB**
@@ -622,7 +633,7 @@ floors above are unchanged: an initrd of that size is noise next to the ~500 MiB
 The image still lands in the initramfs tmpfs, which the kernel caps at **50 % of RAM** by default —
 so the naive ceiling would be twice the image. The initrd's `polyptic-live` dracut module
 (`deploy/live/usr/lib/dracut/modules.d/50polyptic-live/`) raises that cap to 90 % before livenet
-fetches anything, and below ~2 GB of RAM it prints a plain-English message naming the live ISO as
+fetches anything, and below ~3 GB of RAM it prints a plain-English message naming the live ISO as
 the fix, rather than failing minutes later with a bare `No space left on device`.
 
 If you see that message, the box is out of RAM — nothing is wrong with the network or the image. Use

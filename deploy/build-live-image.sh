@@ -196,8 +196,14 @@ echo '==> [4/8] chroot: the substrate, via the compiled agent setup'
 install -m0755 "$AGENT_BIN" "$ROOTFS/usr/local/bin/polyptic-agent"
 # No --server-url/--bootstrap-token/--start: those arrive on the kernel cmdline at boot; greetd starts
 # the agent. `setup` writes greetd autologin, the compositor launcher, sway/i3 config + the user unit,
-# installs the browser (surf, D63), and (POL-7/D45) writes /etc/dracut.conf.d/polyptic-splash.conf so the Plymouth
-# theme lands in the initramfs step 6 builds. That drop-in is why this runs BEFORE dracut.
+# installs the browser(s) (POL-67/D77: google-chrome-stable from GOOGLE'S apt repo on amd64 — the
+# repo file + key land under /etc/apt and PERSIST into the squashfs, so the nightly refresh's plain
+# `apt-get upgrade` tracks the latest stable Chrome; surf/xwayland/xdotool ship alongside as the
+# fallback and are all arm64 gets, since Google publishes no Linux arm64 Chrome), and (POL-7/D45)
+# writes /etc/dracut.conf.d/polyptic-splash.conf so the Plymouth theme lands in the initramfs step 6
+# builds. That drop-in is why this runs BEFORE dracut. Chrome costs ~300-400 MB in the squashfs —
+# the POL-35 ~492 MiB amd64 image lands back around ~800 MiB (re-measure the RAM floor accordingly);
+# correctness on real GPUs beats the size win (D77).
 chroot "$ROOTFS" /usr/local/bin/polyptic-agent setup \
   --backend wayland-sway --user kiosk --render auto
 chroot "$ROOTFS" /bin/sh -c 'apt-get clean'

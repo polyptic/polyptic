@@ -34,12 +34,21 @@ export interface DisplayBackend {
   ident(on: boolean): Promise<void>;
 
   /**
-   * Show/hide the browser's Web Inspector ON the panel driven by `connector` (POL-50) — the only
-   * way to see a wall's console/network, since WebKitGTK exposes no browser-openable remote
-   * inspector (D63). Relaunches that output's browser, so the page reloads. Throws when the
-   * connector has nothing placed on it, or when this backend has no inspector to show.
+   * Enable/disable inspection of the page on the panel driven by `connector`. Browser-dependent
+   * (POL-50 / POL-67): with Chrome this ARMS the remote DevTools tunnel for that output (nothing on
+   * the glass changes); with surf it pops the Web Inspector ON the panel, which relaunches that
+   * output's browser and reloads the page (WebKitGTK exposes no tunnel-able remote inspector, D63).
+   * Throws when the connector has nothing placed on it, or when this backend has no inspector.
    */
   inspect(connector: string, on: boolean): Promise<void>;
+
+  /**
+   * The loopback DevTools endpoint for `connector`, or `null` unless ALL of: this backend drives
+   * Chrome, that output's browser is running, and an operator has ARMED it via `inspect(…, true)`
+   * (POL-67). The agent refuses to proxy `server/devtools-*` frames whenever this is null — defense
+   * in depth under the server's own gate.
+   */
+  devtoolsEndpoint(connector: string): { port: number } | null;
 
   /** Grab a thumbnail of `connector`, or `null` if this backend can't capture. */
   capture(connector: string): Promise<Buffer | null>;

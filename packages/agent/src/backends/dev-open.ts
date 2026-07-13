@@ -77,6 +77,11 @@ export class DevOpenBackend implements DisplayBackend {
     );
   }
 
+  /** dev-open does not own its browser — never a DevTools port to tunnel to. */
+  devtoolsEndpoint(): { port: number } | null {
+    return null;
+  }
+
   async capture(): Promise<Buffer | null> {
     // No screenshot facility without a compositor (grim/grim-equivalent lands in Phase 5).
     return null;

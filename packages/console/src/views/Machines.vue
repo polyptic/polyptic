@@ -275,6 +275,7 @@ function drives(m: MachineView): string {
                   :screen="s"
                   :machine-label="m.label"
                   :machine-online="m.online"
+                  :browser="m.browser"
                   @notify="showToast"
                 />
               </div>

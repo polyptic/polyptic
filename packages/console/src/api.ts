@@ -46,6 +46,14 @@ export async function serverHealth(): Promise<{ version?: string; revision?: str
   return (await res.json()) as { version?: string; revision?: string };
 }
 
+/** Absolute URL of a screen's remote-DevTools entry (POL-67). Opened in a NEW TAB (not fetched),
+ *  so it must be absolute against the API origin — in dev the console runs on Vite while the API
+ *  (and the DevTools proxy) live on the server. The route redirects into Chrome's own DevTools
+ *  frontend, proxied over the agent WS. */
+export function devtoolsUrl(screenId: string): string {
+  return `${BASE}/screens/${encodeURIComponent(screenId)}/devtools`;
+}
+
 /** A non-2xx REST response, with the parsed error payload (if any) for diagnostics. */
 export class ApiError extends Error {
   constructor(

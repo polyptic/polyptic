@@ -168,6 +168,7 @@ export function buildAdminState(
       label: machine.label,
       agentVersion: machine.agentVersion,
       backend: machine.backend,
+      browser: machine.browser,
       online: presence.isMachineOnline(machine.id),
       status: machine.status,
       // Outputs the agent reported — shown for pending machines that have no screens yet.
