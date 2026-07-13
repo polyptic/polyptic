@@ -214,34 +214,32 @@ LOCALCFG
   done
 
   # Bake the POL-47 boot theme so the OFFLINE menu paints the branded splash with no network to fetch
-  # it from (POL-74). DETERMINISTIC, from the repo/server-image assets — NOT a build-time curl (POL-80):
-  # POL-74 fetched theme.txt+logo.png from POLYPTIC_BASE at build time, so a medium built before the
-  # server was reachable silently shipped a plain (theme-less) medium (seen on the homelab). Instead we
-  # GENERATE theme.txt with bun from the SAME buildBootThemeTxt() the server serves at /boot/theme.txt
-  # (deploy/render-boot-theme.ts) — byte-identical to the wired path's, since the theme references
-  # logo.png relatively with no base URL baked in (boot-theme.ts) — and copy the committed boot-logo.png
-  # the server also serves. Needs no network and no @polyptic/protocol build (boot-theme.ts imports
-  # nothing), so it runs the same in-cluster (rebuild Job = server image + /repo + bun) and on macOS.
-  # Guarded like the rest: a genuinely missing asset (no bun, no logo, render fails) degrades to a
-  # plain-but-booting menu with a LOUD line — never a silent plain medium, never a hard build failure;
-  # render-local-grub's file-exists guard then falls back to a plain menu on the correct dark background.
+  # it from (POL-74). DETERMINISTIC, by COPYING two COMMITTED assets — no curl, no `bun`, no runtime
+  # (POL-82). History: POL-74 fetched theme.txt+logo.png from POLYPTIC_BASE at build time, so a medium
+  # built before the server was reachable silently shipped a plain (theme-less) medium (homelab). POL-80
+  # replaced that with a build-time `bun` GENERATION of theme.txt — but the cluster's medium-baking Jobs
+  # are ubuntu:24.04 containers with the repo files under /repo but NO `bun` on PATH, so generation
+  # failed and the medium shipped PLAIN again. So the theme is now a committed file exactly like
+  # boot-logo.png (regenerate with `bun deploy/render-boot-theme.ts`; a test pins it == the served
+  # theme). Both are byte-identical to the wired path (the theme references logo.png relatively, no base
+  # URL). Guarded: a missing asset degrades to a plain-but-booting menu with a LOUD line — never a silent
+  # plain medium, never a hard build failure; render-local-grub's file-exists guard then falls back to a
+  # plain menu on the correct dark background.
   HAVE_THEME=0
-  THEME_TS="$HERE/render-boot-theme.ts"
+  THEME_SRC="$REPO_ROOT/packages/server/assets/boot-theme.txt"
   LOGO_SRC="$REPO_ROOT/packages/server/assets/boot-logo.png"
   mkdir -p "$WORK/theme"
-  if ! command -v bun >/dev/null 2>&1; then
+  if [ ! -f "$THEME_SRC" ]; then
     rm -rf "$WORK/theme"
-    echo "==> Boot theme: 'bun' not found, cannot generate theme.txt — offline menu will be plain (still boots)" >&2
+    echo "==> Boot theme: missing $THEME_SRC (run 'bun deploy/render-boot-theme.ts') — offline menu will be plain (still boots)" >&2
   elif [ ! -f "$LOGO_SRC" ]; then
     rm -rf "$WORK/theme"
     echo "==> Boot theme: missing $LOGO_SRC (run 'bun deploy/render-boot-logo.ts') — offline menu will be plain (still boots)" >&2
-  elif bun "$THEME_TS" > "$WORK/theme/theme.txt" 2>/dev/null && [ -s "$WORK/theme/theme.txt" ]; then
-    cp "$LOGO_SRC" "$WORK/theme/logo.png"
-    HAVE_THEME=1
-    echo "==> Boot theme: baked deterministically from repo assets (offline menu shows the branded splash)"
   else
-    rm -rf "$WORK/theme"
-    echo "==> Boot theme: failed to render theme.txt from $THEME_TS — offline menu will be plain (still boots)" >&2
+    cp "$THEME_SRC" "$WORK/theme/theme.txt"
+    cp "$LOGO_SRC"  "$WORK/theme/logo.png"
+    HAVE_THEME=1
+    echo "==> Boot theme: baked from committed repo assets (offline menu shows the branded splash)"
   fi
 fi
 

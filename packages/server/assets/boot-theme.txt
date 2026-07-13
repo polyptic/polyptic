@@ -1,0 +1,39 @@
+# Polyptic boot theme (POL-47), served by the control plane at /boot/theme.txt.
+# GRUB draws this while it fetches the kernel; the Plymouth splash takes over from the same dark.
+desktop-color: "#0b0b0d"
+title-text: ""
+terminal-font: "GNU Unifont Regular 16"
+
++ image {
+    left = 50%-240
+    top = 24%
+    width = 480
+    height = 210
+    file = "logo.png"
+}
+
++ label {
+    id = "__timeout__"
+    text = "Starting in %d s"
+    left = 0
+    top = 24%+250
+    width = 100%
+    align = "center"
+    color = "#71717a"
+    font = "GNU Unifont Regular 16"
+}
+
++ boot_menu {
+    left = 50%-224
+    top = 24%+300
+    width = 448
+    height = 120
+    item_font = "GNU Unifont Regular 16"
+    item_color = "#71717a"
+    selected_item_color = "#fafafa"
+    item_height = 24
+    item_spacing = 6
+    item_padding = 0
+    item_icon_space = 0
+    scrollbar = false
+}

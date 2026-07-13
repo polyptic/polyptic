@@ -164,24 +164,21 @@ describe("the offline (Wi-Fi) local menu carries its own splash (POL-74)", () =>
   });
 });
 
-describe("render-boot-theme.ts — the deterministic offline bake (POL-80)", () => {
-  // build-boot-medium.sh bakes the offline splash by RUNNING this script, not by curling the server at
-  // build time (POL-74's fragile path). This proves the bake is byte-identical to what the server
-  // serves — so the wired and offline splashes can never drift — and needs no network.
-  test("prints EXACTLY the theme body the server serves at /boot/theme.txt", () => {
-    const r = spawnSync("bun", [resolve(repoRoot, "deploy/render-boot-theme.ts")], { encoding: "utf8" });
-    expect(r.status).toBe(0);
-    expect(r.stdout).toBe(buildBootThemeTxt()); // byte-for-byte, including the trailing newline
+describe("boot-theme.txt — the committed offline splash asset (POL-82)", () => {
+  // build-boot-medium.sh bakes the offline splash by COPYING this committed file (POL-82) — not by
+  // curling the server (POL-74's fragile path) and not by `bun`-generating it at build time (POL-80,
+  // which failed in the cluster's bun-less ubuntu Jobs → a plain medium). It is committed exactly like
+  // boot-logo.png, so the bake needs no `bun` and no network anywhere.
+  test("is byte-identical to the theme the server serves at /boot/theme.txt", () => {
+    // The drift guard: fails if boot-theme.ts changes without re-running `bun deploy/render-boot-theme.ts`.
+    const committed = read("packages", "server", "assets", "boot-theme.txt");
+    expect(committed).toBe(buildBootThemeTxt()); // byte-for-byte, including the trailing newline
   });
 
-  test("needs no network — the generator opens no socket and spawns nothing", () => {
-    // Strip comments so the word "curl" in the docstring (which explains the OLD path) doesn't count;
-    // what must be absent is an actual network primitive or a subprocess that could reach one.
-    const code = read("deploy", "render-boot-theme.ts")
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/.*$/gm, "");
-    expect(code).not.toContain("fetch(");
-    expect(code).not.toContain("Bun.spawn");
-    expect(code).not.toContain("://"); // no http/ws URL anywhere in the executable source
+  test("build-boot-medium.sh bakes it by plain copy — no bun, no network at build time", () => {
+    const sh = read("deploy", "build-boot-medium.sh");
+    expect(sh).toContain("assets/boot-theme.txt"); // sources the committed asset
+    expect(sh).toContain('cp "$THEME_SRC"'); // by copy
+    expect(sh).not.toMatch(/\bbun\s+["$]/); // no `bun <script>` invocation in the bake
   });
 });
