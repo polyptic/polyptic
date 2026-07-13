@@ -26,6 +26,7 @@ import {
   DashboardSurface,
   ImageSurface,
   PlaylistSurface,
+  PageSurface,
   Scene,
   VideoSurface,
   VideoWall,
@@ -47,6 +48,12 @@ import type {
   Machine,
   Mural,
   Output,
+  PageData,
+  PageDefinition,
+  PageEmbedResolution,
+  PageFeedData,
+  PageImageResolution,
+  PageWeatherData,
   Placement,
   SceneContent,
   Screen,
@@ -195,14 +202,26 @@ export interface ContentAssignment {
   url?: string;
 }
 
-/** A resolved content spec: the kind to build and the URL to point it at. A playlist (POL-34) has no
- *  URL of its own — it carries the resolved rotation (`entries`) plus the shared rotation anchor
- *  (`startedAt`, resolved ONCE per assignment so every wall member anchors to the same instant). */
-interface ResolvedSpec {
-  kind: ContentKind;
-  url: string;
-  entries?: PlaylistEntry[];
-  startedAt?: string;
+/** A resolved content spec: the kind to build and the URL to point it at. A playlist (POL-34) has
+ *  no URL of its own — it carries the resolved rotation (`entries`) plus the shared rotation anchor
+ *  (`startedAt`, resolved ONCE per assignment so every wall member anchors to the same instant). A
+ *  page (POL-42) has no url either — it carries the authored definition (embeds inside it resolve
+ *  at send time). */
+type ResolvedSpec =
+  | { kind: Exclude<ContentKind, "page">; url: string; entries?: PlaylistEntry[]; startedAt?: string }
+  | { kind: "page"; definition: PageDefinition };
+
+/** The url half of a zoom/name key. Pages carry no url (and take no zoom), so they contribute an
+ *  empty url — their sourceId always identifies them. */
+function specUrl(spec: ResolvedSpec): string {
+  return spec.kind === "page" ? "" : spec.url;
+}
+
+/** POL-42 — the live data the poller holds for pages: last-good feed items + cached weather. The
+ *  ControlPlane consumes it at send time (decorateSliceForSend); the PageDataService implements it. */
+export interface PageDataProvider {
+  feedFor(url: string): PageFeedData | undefined;
+  weatherFor(location: string): PageWeatherData | undefined;
 }
 
 /** POL-34 — the fallback hold time for a playlist entry that should be timed but carries no duration
@@ -275,6 +294,9 @@ export class ControlPlane {
   /** POL-24 — wired after construction (the TokenService needs the control plane's profiles first).
    *  When absent (unit tests), URLs simply go out unstamped. */
   private tokenProvider?: Pick<TokenService, "getToken" | "statusFor">;
+
+  /** POL-42 — the poller's live feed/weather data, consumed at send time (buildPageData). */
+  private pageDataProvider?: PageDataProvider;
 
   /** POL-6 — fleet-wide display settings (on-screen badge visibility) pushed to every player. Starts
    *  at the env default; `init()` loads any persisted operator override on top. */
@@ -465,7 +487,8 @@ export class ControlPlane {
     // ── Content library (Phase 3c) ────────────────────────────────────────────
     for (const cs of persisted.contentSources) {
       // Re-validate at the edge; drop a malformed/legacy row rather than crash the boot. Storage
-      // NULLs (a playlist's url, a non-playlist's items) become the absences the contract expects.
+      // NULLs (a playlist's url, a non-playlist's items, a page's definition) become the absences
+      // the contract expects.
       const parsed = ContentSource.safeParse({
         id: cs.id,
         name: cs.name,
@@ -473,6 +496,7 @@ export class ControlPlane {
         url: cs.url ?? undefined,
         credentialProfileId: cs.credentialProfileId ?? null,
         items: cs.items ?? undefined,
+        definition: cs.definition ?? undefined,
       });
       if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
     }
@@ -1361,7 +1385,9 @@ export class ControlPlane {
           ? "Image"
           : kind === "video"
             ? "Video"
-            : "Playlist";
+            : kind === "playlist"
+              ? "Playlist"
+              : "Page";
   }
 
   /** A human content name for an activity line: the library source's name, else the ad-hoc URL's host. */
@@ -1370,7 +1396,7 @@ export class ControlPlane {
       const src = this.contentSources.get(sourceId);
       if (src) return src.name;
     }
-    return this.contentNameFromUrl(spec.url, spec.kind);
+    return this.contentNameFromUrl(specUrl(spec), spec.kind);
   }
 
   private nextWallId(): string {
@@ -1414,6 +1440,11 @@ export class ControlPlane {
   ): Surface {
     const base = span ? { id, region, span } : { id, region };
     switch (spec.kind) {
+      case "page":
+        // POL-42 — the STORED surface carries only the clean definition; embeds/feeds/weather are
+        // resolved + stamped into `data` at send time (decorateSliceForSend). No zoom: pages scale
+        // by design (% regions + container units), so zoom is ignored for page surfaces (No-Gos).
+        return PageSurface.parse({ ...base, type: "page", definition: spec.definition });
       case "web":
         return WebSurface.parse({
           ...base,
@@ -1561,11 +1592,18 @@ export class ControlPlane {
    * to the default hold — and stamps the rotation anchor once, shared by every surface built from it.
    */
   private specFor(source: ContentSource): ResolvedSpec {
+    if (source.kind === "page") {
+      // A malformed row that lost its definition resolves to an EMPTY page rather than crashing.
+      return {
+        kind: "page",
+        definition: source.definition ?? { aspect: "16:9", bg: "#0b0b0e", elements: [] },
+      };
+    }
     if (source.kind !== "playlist") return { kind: source.kind, url: source.url ?? "" };
     const entries: PlaylistEntry[] = [];
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
-      if (!step || step.kind === "playlist" || !step.url) continue;
+      if (!step || step.kind === "playlist" || step.kind === "page" || !step.url) continue;
       entries.push({
         kind: step.kind,
         url: step.url,
@@ -1816,7 +1854,7 @@ export class ControlPlane {
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
     // POL-57 — restore the zoom this wall last used FOR THIS PAGE (100% if it never has).
-    const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, resolved.spec.url));
+    const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
 
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
     const slices = this.computeWallSlices(wall, resolved.spec, zoom);
@@ -1864,7 +1902,7 @@ export class ControlPlane {
 
     // POL-57 — restore the zoom this screen last used FOR THIS PAGE (100% if it never has), so the
     // operator dials a dashboard in once per screen and it comes back that way every time.
-    const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, resolved.spec.url));
+    const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
 
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
     const surface = this.buildSurface(
@@ -1924,6 +1962,7 @@ export class ControlPlane {
       url: source.url ?? null,
       credentialProfileId: source.credentialProfileId ?? null,
       items: source.items ?? null,
+      definition: source.definition ?? null,
     };
   }
 
@@ -1981,6 +2020,7 @@ export class ControlPlane {
       url: body.url,
       credentialProfileId,
       items: body.items,
+      definition: body.definition,
     });
     this.contentSources.set(id, source);
     await this.store.upsertContentSource(this.toPersistedSource(source));
@@ -1996,7 +2036,7 @@ export class ControlPlane {
     const source = this.contentSources.get(sourceId);
     if (!source) return [];
     const spec = this.specFor(source);
-    const sourceKey = this.sourceKeyFor(sourceId, spec.url);
+    const sourceKey = this.sourceKeyFor(sourceId, specUrl(spec));
     const byScreen = new Map<string, ScreenSlice>();
 
     for (const [screenId, sid] of this.screenSourceIds) {
@@ -2044,6 +2084,7 @@ export class ControlPlane {
           | "unknown-source"
           | "unknown-profile"
           | "invalid-source"
+          | "invalid-shape"
           | "unknown-item-source"
           | "nested-playlist"
           | "item-needs-duration";
@@ -2067,15 +2108,24 @@ export class ControlPlane {
       const valid = this.validatePlaylistItems(items ?? []);
       if (!valid.ok) return { ok: false, error: valid.error, itemSourceId: valid.itemSourceId };
     }
+    // POL-42 — a partial patch must not produce a source the resolver can't render: a page needs
+    // its definition, everything else (bar a playlist) needs a url.
+    const definition = kind === "page" ? (patch.definition ?? existing.definition) : undefined;
+    const nextUrl =
+      kind === "playlist" || kind === "page" ? undefined : (patch.url ?? existing.url ?? undefined);
+    if (kind === "page" ? definition === undefined : kind !== "playlist" && nextUrl === undefined) {
+      return { ok: false, error: "invalid-shape" };
+    }
 
     const merged = ContentSource.safeParse({
       id: existing.id,
       name: patch.name ?? existing.name,
       kind,
-      // A kind change across the playlist boundary sheds the field the new kind cannot carry.
-      url: kind === "playlist" ? undefined : (patch.url ?? existing.url ?? undefined),
+      // A kind change across the playlist/page boundary sheds the field the new kind cannot carry.
+      url: nextUrl,
       credentialProfileId,
       items,
+      definition,
     });
     if (!merged.success) return { ok: false, error: "invalid-source" };
     const source = merged.data;
@@ -2111,7 +2161,73 @@ export class ControlPlane {
       await this.store.setRevision(this.state.revision);
     }
 
-    return { ok: true, source, slices };
+    // POL-42 — pages EMBEDDING this source resolve it at send time, so their stored slices are
+    // already correct; they just need a re-push so live walls pick the edit up. Never upserted here
+    // (their screens' source assignment is the PAGE's id, not the edited source's).
+    const seen = new Set(slices.map((s) => s.screenId));
+    const pageSlices = this.slicesShowingPagesEmbedding(id).filter((s) => !seen.has(s.screenId));
+
+    return { ok: true, source, slices: [...slices, ...pageSlices] };
+  }
+
+  /** POL-42 — the slices of every screen currently showing a PAGE whose definition embeds (or draws
+   *  an image from) source `id`. These re-push on that source's edit/delete: the page's stored slice
+   *  is untouched (resolution is send-time), but the wall must repaint with the new resolution. */
+  private slicesShowingPagesEmbedding(id: string): ScreenSlice[] {
+    const pageIds = new Set<string>();
+    for (const source of this.contentSources.values()) {
+      if (source.kind !== "page" || !source.definition) continue;
+      const embeds = source.definition.elements.some(
+        (el) => (el.kind === "embed" || el.kind === "image") && el.props.sourceId === id,
+      );
+      if (embeds) pageIds.add(source.id);
+    }
+    if (pageIds.size === 0) return [];
+    return this.slicesShowingSources(pageIds);
+  }
+
+  /** The slices of every screen showing any of these library sources, directly or via a video wall. */
+  slicesShowingSources(sourceIds: ReadonlySet<string>): ScreenSlice[] {
+    const byScreen = new Map<string, ScreenSlice>();
+    for (const [screenId, sid] of this.screenSourceIds) {
+      if (!sourceIds.has(sid)) continue;
+      const slice = this.state.slices[screenId];
+      if (slice) byScreen.set(screenId, slice);
+    }
+    for (const [wallId, sid] of this.wallSourceIds) {
+      if (!sourceIds.has(sid)) continue;
+      const wall = this.videoWalls.get(wallId);
+      for (const screenId of wall?.memberScreenIds ?? []) {
+        const slice = this.state.slices[screenId];
+        if (slice) byScreen.set(screenId, slice);
+      }
+    }
+    return [...byScreen.values()];
+  }
+
+  /** POL-42 — what the poller needs to keep fresh: the feed URLs and weather locations used by pages
+   *  currently assigned to ≥1 screen (directly or via a wall). Unassigned pages cost no polling. */
+  pageDataRequirements(): { feeds: Set<string>; locations: Set<string>; sourcesByFeed: Map<string, Set<string>>; sourcesByLocation: Map<string, Set<string>> } {
+    const assigned = new Set<string>([...this.screenSourceIds.values(), ...this.wallSourceIds.values()]);
+    const feeds = new Set<string>();
+    const locations = new Set<string>();
+    const sourcesByFeed = new Map<string, Set<string>>();
+    const sourcesByLocation = new Map<string, Set<string>>();
+    for (const source of this.contentSources.values()) {
+      if (source.kind !== "page" || !source.definition || !assigned.has(source.id)) continue;
+      for (const el of source.definition.elements) {
+        if (el.kind === "feed" && el.props.url.trim()) {
+          const url = el.props.url.trim();
+          feeds.add(url);
+          (sourcesByFeed.get(url) ?? sourcesByFeed.set(url, new Set()).get(url)!).add(source.id);
+        } else if (el.kind === "weather" && el.props.location.trim()) {
+          const location = el.props.location.trim();
+          locations.add(location);
+          (sourcesByLocation.get(location) ?? sourcesByLocation.set(location, new Set()).get(location)!).add(source.id);
+        }
+      }
+    }
+    return { feeds, locations, sourcesByFeed, sourcesByLocation };
   }
 
   /**
@@ -2189,7 +2305,12 @@ export class ControlPlane {
       await this.store.setRevision(this.state.revision);
     }
 
-    return { slices };
+    // POL-42 — pages embedding the deleted source re-push so their embed regions fall back to the
+    // placeholder (send-time resolution now finds nothing). Their stored slices are untouched.
+    const seen = new Set(slices.map((sl) => sl.screenId));
+    const pageSlices = this.slicesShowingPagesEmbedding(id).filter((sl) => !seen.has(sl.screenId));
+
+    return { slices: [...slices, ...pageSlices] };
   }
 
   // ── Credential profiles (POL-24) ─────────────────────────────────────────────
@@ -2371,12 +2492,26 @@ export class ControlPlane {
    * mutates stored state.
    */
   decorateSliceForSend(slice: ScreenSlice): ScreenSlice {
-    if (!this.tokenProvider || slice.surfaces.length === 0) return slice;
+    if (slice.surfaces.length === 0) return slice;
+
+    // POL-42 — page surfaces get their live half stamped in: resolved (credential-stamped) embeds,
+    // resolved image sources, and the poller's last-good feed/weather data. Independent of the
+    // framed-content token stamp below, which needs the slice's own source to carry a profile.
+    let decorated: ScreenSlice = slice.surfaces.some((s) => s.type === "page")
+      ? {
+          ...slice,
+          surfaces: slice.surfaces.map((surface) =>
+            surface.type === "page" ? { ...surface, data: this.buildPageData(surface.definition) } : surface,
+          ),
+        }
+      : slice;
+
+    if (!this.tokenProvider) return decorated;
     const wall = this.getWallForScreen(slice.screenId);
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(slice.screenId);
     const direct = sourceId ? this.tokenForSource(sourceId) : undefined;
     let changed = false;
-    const surfaces = slice.surfaces.map((surface): Surface => {
+    const surfaces = decorated.surfaces.map((surface): Surface => {
       if (surface.type === "playlist") {
         let entriesChanged = false;
         const items = surface.items.map((entry) => {
@@ -2394,7 +2529,71 @@ export class ControlPlane {
       changed = true;
       return { ...surface, url: ControlPlane.stampToken(surface.url, direct.param, direct.token) };
     });
-    return changed ? { ...slice, surfaces } : slice;
+    return changed ? { ...decorated, surfaces } : decorated;
+  }
+
+  /** POL-42 — wire the poller after construction (same pattern as setTokenProvider). */
+  setPageDataProvider(provider: PageDataProvider): void {
+    this.pageDataProvider = provider;
+  }
+
+  /**
+   * The live half of a page surface, built at SEND time: embed elements resolve their source to its
+   * CURRENT url with the CURRENT credential token stamped (per-source profile — each embed may carry
+   * its own); image elements resolve to their source's url; feed/weather elements take the poller's
+   * last-good data. A dangling sourceId (deleted, or pointing at another page) resolves to nothing
+   * and the element renders its placeholder. Stored slices never carry any of this.
+   */
+  private buildPageData(definition: PageDefinition): PageData {
+    const embeds: Record<string, PageEmbedResolution> = {};
+    const images: Record<string, PageImageResolution> = {};
+    const feeds: Record<string, PageFeedData> = {};
+    const weather: Record<string, PageWeatherData> = {};
+
+    for (const el of definition.elements) {
+      if (el.kind === "embed") {
+        const resolution = this.resolveEmbed(el.props.sourceId, el.props.url);
+        if (resolution) embeds[el.id] = resolution;
+      } else if (el.kind === "image") {
+        const source = el.props.sourceId ? this.contentSources.get(el.props.sourceId) : undefined;
+        if (source?.kind === "image" && source.url) images[el.id] = { src: source.url };
+      } else if (el.kind === "feed" && el.props.url.trim()) {
+        const data = this.pageDataProvider?.feedFor(el.props.url.trim());
+        if (data) feeds[el.id] = data;
+      } else if (el.kind === "weather" && el.props.location.trim()) {
+        const data = this.pageDataProvider?.weatherFor(el.props.location.trim());
+        if (data) weather[el.id] = data;
+      }
+    }
+
+    const bundle: PageData = {};
+    if (Object.keys(embeds).length > 0) bundle.embeds = embeds;
+    if (Object.keys(images).length > 0) bundle.images = images;
+    if (Object.keys(feeds).length > 0) bundle.feeds = feeds;
+    if (Object.keys(weather).length > 0) bundle.weather = weather;
+    return bundle;
+  }
+
+  /** Resolve one embed element: a library source by id (its url, credential-stamped when it carries a
+   *  profile with a usable token) or a raw ad-hoc url (never any credentials, by design). A page can
+   *  never embed another page. */
+  private resolveEmbed(
+    sourceId: string | undefined,
+    rawUrl: string | undefined,
+  ): PageEmbedResolution | undefined {
+    if (sourceId) {
+      const source = this.contentSources.get(sourceId);
+      if (!source || source.kind === "page" || source.kind === "playlist" || !source.url) return undefined;
+      let url = source.url;
+      if (source.credentialProfileId && this.tokenProvider) {
+        const profile = this.credentialProfiles.get(source.credentialProfileId);
+        const token = profile ? this.tokenProvider.getToken(profile.id) : undefined;
+        if (profile && token) url = ControlPlane.stampToken(url, profile.tokenParam, token);
+      }
+      return { url, kind: source.kind };
+    }
+    if (rawUrl) return { url: rawUrl, kind: "web" };
+    return undefined;
   }
 
   /**

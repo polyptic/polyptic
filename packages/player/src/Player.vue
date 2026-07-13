@@ -58,6 +58,7 @@ import { SurfaceProber } from "./surface-prober";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle } from "./surface-style";
+import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
@@ -272,10 +273,12 @@ const prober = new SurfaceProber({
 
 /** What each on-screen surface will actually fetch — the exact URLs the prober must prove.
  *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
- *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. */
+ *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
+ *  (POL-42) are excluded for the same reason: a page renders locally (text/clock/shapes need no
+ *  network) and its embeds carry send-time-resolved data with their own calm placeholders. */
 const probeTargets = computed(() =>
   surfaces.value
-    .filter((s) => s.type !== "playlist")
+    .filter((s) => s.type !== "playlist" && s.type !== "page")
     .map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
 );
 
@@ -461,6 +464,12 @@ function mediaSrc(surface: Surface): string {
   // a local blob fetch proves even with the control plane dead).
   return blobSrcs.value.get(resolved) ?? resolved;
 }
+/** POL-42 — re-home URLs INSIDE a page's data bundle (resolved image sources etc.) the same way
+ *  top-level media is re-homed (POL-5): a remote wall can't fetch `http://localhost:8080/...`. */
+function rehomeMediaSrc(src: string): string {
+  return resolveMediaSrc(src, SERVER_HTTP_BASE);
+}
+
 function isInteractive(surface: Surface): boolean {
   return surface.type === "web" ? surface.interactive : false;
 }
@@ -538,6 +547,21 @@ function connLabel(state: ConnState): string {
         :surface="surface"
         :server-http-base="SERVER_HTTP_BASE"
       />
+      <!-- POL-42: a page renders locally through the shared elements package (the Studio previews
+           with the SAME renderer). Ungated like the rotator — its embeds arrive with send-time
+           resolved data and paint their own calm placeholders when it's absent. -->
+      <div
+        v-else-if="surface.type === 'page'"
+        class="surface-page"
+        :style="contentStyle(surface)"
+      >
+        <PageCanvas
+          :definition="surface.definition"
+          :data="surface.data"
+          :resolve-src="rehomeMediaSrc"
+          live
+        />
+      </div>
       <template v-else-if="painted[surface.id]">
         <iframe
           v-if="isFrame(surface)"

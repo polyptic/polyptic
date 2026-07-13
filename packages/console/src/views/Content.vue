@@ -13,6 +13,7 @@
 -->
 <script setup lang="ts">
 import { ref, computed } from "vue";
+import { useRouter } from "vue-router";
 import { CreateContentSourceBody, CreateCredentialProfileBody } from "@polyptic/protocol";
 import type {
   ContentKind,
@@ -24,6 +25,25 @@ import { useConsoleStore } from "../stores/console";
 import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
 
 const store = useConsoleStore();
+const router = useRouter();
+
+// ── pages (POL-42) ────────────────────────────────────────────────────────────
+// A page is composed in the Studio, not added by URL: "New page" opens a blank Studio; a page row's
+// edit affordance reopens it. Deletion goes through the same source delete as everything else.
+function newPage() {
+  void router.push({ name: "studio" });
+}
+
+function openStudio(s: ContentSource) {
+  void router.push({ name: "studio", params: { id: s.id } });
+}
+
+/** The list row's second line for a page: what it is, not an address it doesn't have. */
+function pageSubtitle(s: ContentSource): string {
+  const count = s.definition?.elements.length ?? 0;
+  const aspect = s.definition?.aspect ?? "16:9";
+  return `${count} element${count === 1 ? "" : "s"} · ${aspect} · composed in the Studio`;
+}
 
 // Playlists are library sources too, but they have their own sidebar view (POL-34) — the Content
 // list stays a flat catalogue of addresses and files.
@@ -106,8 +126,8 @@ async function remove(s: ContentSource) {
 }
 
 /** A compact, scheme-stripped address for the list row (matches the design's "address" read-out). */
-function pretty(url: string): string {
-  return url.replace(/^https?:\/\//, "");
+function pretty(url: string | undefined): string {
+  return (url ?? "").replace(/^https?:\/\//, "");
 }
 
 /** The library row's sub-line: the kind plus the compact address. */
@@ -368,6 +388,13 @@ function thumbSrc(s: ContentSource): string {
         </div>
         <div class="head-actions">
           <button class="add-btn ghost compact" @click="openUpload">⤓ Upload</button>
+          <button
+            class="add-btn ghost compact"
+            title="Compose elements into a page in the Studio"
+            @click="newPage"
+          >
+            ▦ New page
+          </button>
           <button class="add-btn" @click="openAdd">+ Add source</button>
         </div>
       </header>
@@ -380,14 +407,21 @@ function thumbSrc(s: ContentSource): string {
             {{ kindGlyph(c.kind) }}
           </span>
           <div class="row-meta">
-            <div class="row-name">{{ c.name }}</div>
+            <div class="row-name">
+              {{ c.name }}
+              <span v-if="c.kind === 'page'" class="page-badge">PAGE</span>
+            </div>
             <div class="row-sub">
-              {{ rowSub(c) }}
-              <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
+              <template v-if="c.kind === 'page'">{{ pageSubtitle(c) }}</template>
+              <template v-else>
+                {{ rowSub(c) }}
+                <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
+              </template>
             </div>
           </div>
           <span class="kind-badge">{{ kindLabel(c.kind) }}</span>
-          <button class="edit-btn" @click="openEdit(c)">Edit</button>
+          <button v-if="c.kind === 'page'" class="edit-btn" @click="openStudio(c)">Edit in Studio</button>
+          <button v-else class="edit-btn" @click="openEdit(c)">Edit</button>
           <button class="del-btn" title="Delete source" @click="remove(c)">✕</button>
         </div>
       </div>
@@ -734,6 +768,20 @@ function thumbSrc(s: ContentSource): string {
   font-size: 13.5px;
   font-weight: 600;
   color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* POL-42 — the page chip beside a composed source's name. */
+.page-badge {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 20px;
+  color: var(--accent-fg);
+  background: var(--accent-soft);
 }
 .row-sub {
   font-size: 11.5px;

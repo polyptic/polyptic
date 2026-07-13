@@ -4,13 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Generic, self-hostable orchestration for walls of screens and fleets of display kiosks.",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "engines": {
     "bun": ">=1.1"
   },
   "scripts": {
     "build": "(cd packages/protocol && bun run build) && (cd packages/server && bun run build) && (cd packages/player && bun run build) && (cd packages/agent && bun run build)",
-    "typecheck": "(cd packages/protocol && bun run build) && (cd packages/server && bun run typecheck) && (cd packages/player && bun run typecheck) && (cd packages/console && bun run typecheck) && (cd packages/agent && bun run typecheck) && (cd packages/e2e && bun run typecheck)",
+    "typecheck": "(cd packages/protocol && bun run build) && (cd packages/server && bun run typecheck) && (cd packages/player && bun run typecheck) && (cd packages/elements && bun run typecheck) && (cd packages/console && bun run typecheck) && (cd packages/agent && bun run typecheck) && (cd packages/e2e && bun run typecheck)",
     "dev": "(cd packages/protocol && bun run build) && concurrently -n server,player,console,agent -c green,cyan,blue,yellow \"cd packages/server && bun run dev\" \"cd packages/player && bun run dev\" \"cd packages/console && bun run dev\" \"cd packages/agent && bun run dev\"",
     "db:up": "docker compose -f deploy/docker-compose.yml up -d db",
     "db:down": "docker compose -f deploy/docker-compose.yml down",

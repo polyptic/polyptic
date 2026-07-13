@@ -112,6 +112,7 @@ interface ContentSourceRow {
   url: string | null;
   credential_profile_id: string | null;
   items: unknown;
+  definition: unknown | null;
 }
 
 /** Row → DTO for a content source, re-validating at the edge (shared by load + list). Returns []
@@ -128,6 +129,7 @@ function contentSourceFromRow(row: ContentSourceRow): PersistedContentSource[] {
       kind: kind.data,
       url: row.url ?? null,
       credentialProfileId: row.credential_profile_id ?? null,
+      definition: row.definition ?? null,
       items: kind.data === "playlist" ? (items.success ? items.data : []) : null,
     },
   ];
@@ -291,9 +293,11 @@ export class PostgresStore implements Store {
     // authenticates this source. NULL = unauthenticated.
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS credential_profile_id text`;
     // Playlists (POL-34): a playlist source keeps its carousel steps here and has NO url, so the url
-    // column loses its NOT NULL. Both idempotent for databases created before playlists existed.
+    // column loses its NOT NULL. Pages (POL-42) store an authored composition (`definition` jsonb)
+    // instead of an address. All idempotent for databases created before either kind existed.
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS items jsonb`;
     await sql`ALTER TABLE content_sources ALTER COLUMN url DROP NOT NULL`;
+    await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS definition jsonb`;
     // Page zoom preferences (POL-57). One row per (screen-or-wall, content) pair, so re-assigning a
     // page to a screen restores the zoom that screen last used FOR THAT PAGE.
     await sql`
@@ -424,7 +428,7 @@ export class PostgresStore implements Store {
       sql<MuralRow[]>`SELECT id, name FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
-      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items FROM content_sources`,
+      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
@@ -754,14 +758,16 @@ export class PostgresStore implements Store {
   async upsertContentSource(source: PersistedContentSource): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items)
-      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url ?? null}, ${source.credentialProfileId ?? null}, ${source.items ? sql.json(source.items) : null})
+      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items, definition)
+      VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url ?? null}, ${source.credentialProfileId ?? null}, ${source.items ? sql.json(source.items) : null},
+        ${source.definition != null ? sql.json(source.definition as Parameters<typeof sql.json>[0]) : null})
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         kind = EXCLUDED.kind,
         url  = EXCLUDED.url,
         credential_profile_id = EXCLUDED.credential_profile_id,
-        items = EXCLUDED.items
+        items = EXCLUDED.items,
+        definition = EXCLUDED.definition
     `;
   }
 
@@ -776,7 +782,7 @@ export class PostgresStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     const sql = this.sql;
-    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items FROM content_sources`;
+    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition FROM content_sources`;
     return rows.flatMap(contentSourceFromRow);
   }
 

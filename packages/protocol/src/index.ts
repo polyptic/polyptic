@@ -175,6 +175,221 @@ export const PlaylistSurface = SurfaceBase.extend({
    *  untimed video can't be derived from a clock and plays sequentially from the top. */
   startedAt: z.string(),
 });
+export type PlaylistSurface = z.infer<typeof PlaylistSurface>;
+
+// ── Pages (POL-42) — authored compositions of framing elements ───────────────
+//
+// A PAGE is a content source composed in the console's Studio: an ordered list of elements, each
+// positioned in PERCENT of the page (so one definition renders at any resolution), drawn over a
+// solid background. The definition travels INSIDE the ScreenSlice as one `page` surface, so
+// video-wall spanning and the <150ms DOM-diff path work unchanged — saving in the Studio re-pushes
+// the slice and the wall updates in place, no reload.
+//
+// The STORED definition never carries a resolved URL, a credential, or live feed items: an embed or
+// image element references a library source BY ID, and the server resolves + credential-stamps at
+// SEND time into `PageSurface.data` (same clean-at-rest pattern as POL-24 token stamping). Feed and
+// weather data are polled server-side and delivered through the same `data` bundle.
+
+export const PageAspect = z.enum(["16:9", "9:16"]);
+export type PageAspect = z.infer<typeof PageAspect>;
+
+/** A percent coordinate within the page (elements are placed in % so pages are resolution-free). */
+const PagePercent = z.number().min(0).max(100);
+
+const PageElementBase = z.object({
+  id: z.string().min(1).max(64),
+  x: PagePercent,
+  y: PagePercent,
+  w: z.number().min(0.5).max(100),
+  h: z.number().min(0.5).max(100),
+});
+
+/** Embed: a content source (by id — credentials are stamped server-side) or a raw URL (no
+ *  credentials, by design) framed in a region. This is what composites a dashboard onto a page.
+ *  Sources that require `placement:"window"` cannot go on a page (No-Gos). */
+export const PageEmbedElement = PageElementBase.extend({
+  kind: z.literal("embed"),
+  props: z.object({
+    sourceId: z.string().optional(),
+    url: z.string().url().optional(),
+  }),
+});
+
+/** Scrolling text strip. Plain CSS transform animation — fine on the Chrome/amd64 GPU boxes that
+ *  are the primary wall target; on the surf/arm64 fallback it is an operator choice (see D66/D74). */
+export const PageTickerElement = PageElementBase.extend({
+  kind: z.literal("ticker"),
+  props: z.object({
+    text: z.string().max(2000).default(""),
+    /** Scroll speed in px/s (at 1080p-equivalent scale). */
+    speed: z.number().min(20).max(120).default(60),
+    fg: z.string().max(32).default("#fafafa"),
+    bg: z.string().max(32).default("#101014"),
+  }),
+});
+
+/** RSS/Atom headlines, polled SERVER-side (~5 min, last-good on failure) — the player never fights
+ *  CORS. Items arrive in `PageSurface.data.feeds[elementId]`. */
+export const PageFeedElement = PageElementBase.extend({
+  kind: z.literal("feed"),
+  props: z.object({
+    url: z.string().max(500).default(""),
+    items: z.number().int().min(2).max(8).default(4),
+  }),
+});
+
+/** An uploaded/linked image from the library (kind image), by source id. */
+export const PageImageElement = PageElementBase.extend({
+  kind: z.literal("image"),
+  props: z.object({
+    sourceId: z.string().optional(),
+    fit: z.enum(["contain", "cover"]).default("contain"),
+  }),
+});
+
+export const PageTextElement = PageElementBase.extend({
+  kind: z.literal("text"),
+  props: z.object({
+    text: z.string().max(500).default("Text"),
+    /** Point size at 1080p-equivalent scale (rendered proportionally via container units). */
+    size: z.number().min(14).max(120).default(40),
+    color: z.string().max(32).default("#fafafa"),
+    align: z.enum(["left", "center", "right"]).default("left"),
+  }),
+});
+
+/** Live clock. Updates a text node once a minute (once a second with seconds on) — no animation,
+ *  safe on every box (D66). */
+export const PageClockElement = PageElementBase.extend({
+  kind: z.literal("clock"),
+  props: z.object({
+    format: z.enum(["24h", "12h"]).default("24h"),
+    seconds: z.boolean().default(false),
+    color: z.string().max(32).default("#fafafa"),
+  }),
+});
+
+export const PageShapeElement = PageElementBase.extend({
+  kind: z.literal("shape"),
+  props: z.object({
+    fill: z.string().max(32).default("#18181b"),
+    radius: z.number().min(0).max(48).default(12),
+    opacity: z.number().min(10).max(100).default(100),
+  }),
+});
+
+/** Local conditions, fetched SERVER-side from Open-Meteo (keyless, cached ~15 min) so the provider
+ *  stays swappable behind the poller. Data arrives in `PageSurface.data.weather[elementId]`. */
+export const PageWeatherElement = PageElementBase.extend({
+  kind: z.literal("weather"),
+  props: z.object({
+    location: z.string().max(120).default(""),
+    units: z.enum(["C", "F"]).default("C"),
+  }),
+});
+
+/** Static QR code, encoded to SVG client-side in the shared elements package — no network. */
+export const PageQrElement = PageElementBase.extend({
+  kind: z.literal("qr"),
+  props: z.object({
+    url: z.string().max(500).default(""),
+  }),
+});
+
+/** Time to a target time-of-day. Updates a text node per minute — no animation (D66). */
+export const PageCountdownElement = PageElementBase.extend({
+  kind: z.literal("countdown"),
+  props: z.object({
+    label: z.string().max(120).default(""),
+    /** Target time-of-day, "HH:MM" server-local to the viewer. */
+    target: z
+      .string()
+      .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+      .default("17:00"),
+    color: z.string().max(32).default("#fafafa"),
+  }),
+});
+
+export const PageElement = z.discriminatedUnion("kind", [
+  PageEmbedElement,
+  PageTickerElement,
+  PageFeedElement,
+  PageImageElement,
+  PageTextElement,
+  PageClockElement,
+  PageShapeElement,
+  PageWeatherElement,
+  PageQrElement,
+  PageCountdownElement,
+]);
+export type PageElement = z.infer<typeof PageElement>;
+export type PageElementKind = PageElement["kind"];
+
+/** The authored page: elements in draw order (last = frontmost) over a solid background. */
+export const PageDefinition = z.object({
+  aspect: PageAspect.default("16:9"),
+  bg: z.string().max(32).default("#0b0b0e"),
+  elements: z.array(PageElement).max(100).default([]),
+});
+export type PageDefinition = z.infer<typeof PageDefinition>;
+
+// ── Send-time page data (never stored) ───────────────────────────────────────
+
+/** What an embed element's source resolved to. `web`/`dashboard` frame the url; `image`/`video`
+ *  render it as media. The url is already credential-stamped when the source has a profile. */
+export const PageEmbedResolution = z.object({
+  url: z.string(),
+  kind: z.enum(["web", "dashboard", "image", "video"]),
+});
+export type PageEmbedResolution = z.infer<typeof PageEmbedResolution>;
+
+export const PageImageResolution = z.object({ src: z.string() });
+export type PageImageResolution = z.infer<typeof PageImageResolution>;
+
+export const PageFeedItem = z.object({
+  title: z.string(),
+  link: z.string().optional(),
+  publishedAt: z.string().optional(),
+});
+export type PageFeedItem = z.infer<typeof PageFeedItem>;
+
+export const PageFeedData = z.object({
+  items: z.array(PageFeedItem),
+  fetchedAt: z.string(),
+  /** The feed's own channel title, when it declared one. */
+  title: z.string().optional(),
+});
+export type PageFeedData = z.infer<typeof PageFeedData>;
+
+export const PageWeatherData = z.object({
+  tempC: z.number(),
+  /** WMO weather interpretation code, as Open-Meteo reports it. */
+  code: z.number().int(),
+  description: z.string(),
+  location: z.string(),
+  fetchedAt: z.string(),
+});
+export type PageWeatherData = z.infer<typeof PageWeatherData>;
+
+/** The live half of a page surface, stamped by the server at SEND time (decorateSliceForSend):
+ *  resolved embed/image sources (credential-stamped) + last-polled feed/weather data, all keyed by
+ *  element id. Stored slices never carry it, so the DB never holds a token or a stale headline. */
+export const PageData = z.object({
+  embeds: z.record(z.string(), PageEmbedResolution).optional(),
+  images: z.record(z.string(), PageImageResolution).optional(),
+  feeds: z.record(z.string(), PageFeedData).optional(),
+  weather: z.record(z.string(), PageWeatherData).optional(),
+});
+export type PageData = z.infer<typeof PageData>;
+
+/** A rendered page: ONE surface, so span math (video walls) and the keyed DOM-diff path work
+ *  unchanged. Zoom does not apply to pages (they scale by design — % regions + container units). */
+export const PageSurface = SurfaceBase.extend({
+  type: z.literal("page"),
+  definition: PageDefinition,
+  data: PageData.optional(),
+});
+export type PageSurface = z.infer<typeof PageSurface>;
 
 export const Surface = z.discriminatedUnion("type", [
   WebSurface,
@@ -182,6 +397,7 @@ export const Surface = z.discriminatedUnion("type", [
   ImageSurface,
   VideoSurface,
   PlaylistSurface,
+  PageSurface,
 ]);
 export type Surface = z.infer<typeof Surface>;
 
@@ -679,7 +895,7 @@ export const ScreenView = Screen.extend({
     .object({
       name: z.string(),
       // Mirrors ContentKind (declared below); inlined because this schema evaluates first.
-      kind: z.enum(["web", "dashboard", "image", "video", "playlist"]),
+      kind: z.enum(["web", "dashboard", "image", "video", "playlist", "page"]),
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
@@ -761,8 +977,9 @@ export const VideoWall = z.object({
 export type VideoWall = z.infer<typeof VideoWall>;
 
 /** The kind of a content source — mirrors the renderable Surface types. `playlist` (POL-34) is the
- *  composite kind: a carousel over the other four. */
-export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist"]);
+ *  composite kind: a carousel over the other renderables. `page` (POL-42) is an authored composition
+ *  created in the console's Studio; it has a `definition`, not a `url`. */
+export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist", "page"]);
 export type ContentKind = z.infer<typeof ContentKind>;
 
 /** One AUTHORED step of a playlist source (POL-34): a reference to another library source plus how
@@ -823,8 +1040,9 @@ export type CredentialProfileView = z.infer<typeof CredentialProfileView>;
  *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
  *  media served from a disk volume (an upload becomes a source whose url points at the media route).
  *  POL-34 adds the `playlist` kind: it has NO url — its content is `items`, an ordered carousel over
- *  other (non-playlist) sources. `items` may be EMPTY on a stored playlist (deleting a referenced
- *  source strips it out); creating one requires ≥1 via CreateContentSourceBody. */
+ *  other (non-playlist) sources; `items` may be EMPTY on a stored playlist (deleting a referenced
+ *  source strips it out). POL-42 adds the `page` kind: also url-less — its content is `definition`,
+ *  the Studio's saved composition. */
 export const ContentSource = z
   .object({
     id: z.string(),
@@ -836,16 +1054,24 @@ export const ContentSource = z
     credentialProfileId: z.string().nullable().optional(),
     /** POL-34 — playlist kind only: the authored carousel steps, in order. */
     items: z.array(PlaylistItem).optional(),
+    /** POL-42 — page kind only: the Studio's saved composition. */
+    definition: PageDefinition.optional(),
   })
   .superRefine((s, ctx) => {
     if (s.kind === "playlist") {
       if (s.url !== undefined) ctx.addIssue({ code: "custom", message: "a playlist has no url" });
       if (s.items === undefined) ctx.addIssue({ code: "custom", message: "a playlist needs items" });
+    } else if (s.kind === "page") {
+      if (s.url !== undefined) ctx.addIssue({ code: "custom", message: "a page has no url" });
+      if (s.definition === undefined)
+        ctx.addIssue({ code: "custom", message: "a page needs a definition" });
     } else {
       if (s.url === undefined) ctx.addIssue({ code: "custom", message: "url is required" });
-      if (s.items !== undefined)
-        ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
     }
+    if (s.kind !== "playlist" && s.items !== undefined)
+      ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
+    if (s.kind !== "page" && s.definition !== undefined)
+      ctx.addIssue({ code: "custom", message: "a definition is only valid on a page" });
   });
 export type ContentSource = z.infer<typeof ContentSource>;
 
@@ -1101,7 +1327,7 @@ export type SetContentBody = z.infer<typeof SetContentBody>;
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
 
-// REST bodies — content library (Phase 3c; playlists POL-34)
+// REST bodies — content library (Phase 3c; playlists POL-34; pages POL-42)
 export const CreateContentSourceBody = z
   .object({
     name: z.string().min(1).max(120),
@@ -1111,17 +1337,25 @@ export const CreateContentSourceBody = z
     credentialProfileId: z.string().nullable().optional(),
     /** POL-34 — playlist kind only: the carousel steps. A new playlist needs at least one. */
     items: z.array(PlaylistItem).min(1).max(100).optional(),
+    /** POL-42 — required when kind is `page`; the Studio's saved composition. */
+    definition: PageDefinition.optional(),
   })
   .superRefine((b, ctx) => {
     if (b.kind === "playlist") {
       if (b.url !== undefined) ctx.addIssue({ code: "custom", message: "a playlist has no url" });
       if (b.items === undefined)
         ctx.addIssue({ code: "custom", message: "a playlist needs at least one item" });
+    } else if (b.kind === "page") {
+      if (b.url !== undefined) ctx.addIssue({ code: "custom", message: "a page has no url" });
+      if (b.definition === undefined)
+        ctx.addIssue({ code: "custom", message: "a page needs a definition" });
     } else {
       if (b.url === undefined) ctx.addIssue({ code: "custom", message: "url is required" });
-      if (b.items !== undefined)
-        ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
     }
+    if (b.kind !== "playlist" && b.items !== undefined)
+      ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
+    if (b.kind !== "page" && b.definition !== undefined)
+      ctx.addIssue({ code: "custom", message: "a definition is only valid on a page" });
   });
 export type CreateContentSourceBody = z.infer<typeof CreateContentSourceBody>;
 
@@ -1134,6 +1368,8 @@ export const UpdateContentSourceBody = z.object({
   url: z.string().url().optional(),
   credentialProfileId: z.string().nullable().optional(),
   items: z.array(PlaylistItem).min(1).max(100).optional(),
+  /** POL-42 — replace a page source's composition (the Studio's Save). */
+  definition: PageDefinition.optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 

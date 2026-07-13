@@ -75,7 +75,8 @@ export interface PersistedContentSource {
   id: string;
   name: string;
   kind: ContentKind;
-  /** The address non-playlist kinds resolve to. `null`/undefined on a playlist (POL-34). */
+  /** The address non-playlist/non-page kinds resolve to. `null`/undefined on a playlist (POL-34)
+   *  or a page (POL-42 — a page has a definition, not an address). */
   url?: string | null;
   /**
    * POL-24 — the credential profile whose token is stamped into this source's URL at send time.
@@ -87,6 +88,9 @@ export interface PersistedContentSource {
    * kind and on legacy rows persisted before the column.
    */
   items?: PlaylistItem[] | null;
+  /** POL-42 — the authored composition (a `PageDefinition` as JSON), present only for `page`
+   *  sources. The control plane re-validates it against the contract on load. */
+  definition?: unknown | null;
 }
 
 /**
