@@ -236,8 +236,10 @@ LOCALCFG
     rm -rf "$WORK/theme"
     echo "==> Boot theme: missing $LOGO_SRC (run 'bun deploy/render-boot-logo.ts') — offline menu will be plain (still boots)" >&2
   else
-    cp "$THEME_SRC" "$WORK/theme/theme.txt"
+    # Logo first, theme.txt last (POL-87 discipline shared by every theme writer): theme.txt is the
+    # file the GRUB guard keys on, so its bitmap must exist before it at every instant.
     cp "$LOGO_SRC"  "$WORK/theme/logo.png"
+    cp "$THEME_SRC" "$WORK/theme/theme.txt"
     HAVE_THEME=1
     echo "==> Boot theme: baked from committed repo assets (offline menu shows the branded splash)"
   fi

@@ -493,6 +493,59 @@ out="$(up "$d")"
 hasnt "theme heal: silent when server serves no theme" "healed the offline boot splash" "$out"
 eq "theme heal: no theme.txt written on 404" "" "$(cat "$d/vol-POLYPTIC-BT/polyptic/boot/theme/theme.txt" 2>/dev/null || true)"
 
+# ─── POL-87: a theme without its logo makes GRUB error on a keyboard-less screen ────────────────────
+# theme.txt references logo.png; a medium carrying one without the other paints
+# "error: null src bitmap ... Press any key to continue" on every offline boot. Pinned here:
+# an already-broken stick repairs itself even when the server serves no theme, a zero-byte logo
+# counts as missing, and a torn heal can never CREATE the broken state (logo first, theme.txt last —
+# theme.txt is the commit, because it is what the GRUB guard keys on).
+
+# 38e) orphan repair: theme.txt with NO logo.png (the pre-fix heal's torn-write legacy) is removed
+#      on the next poll — even with the server serving no theme — so the box falls back to the
+#      plain menu, which boots silently.
+d="$(new_poll_case poll-orphan cur-9 cur-9 cur-9)"   # no served-theme/served-logo → curl exits 22
+tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"; mkdir -p "$tdir"
+printf 'ORPHANED-THEME\n' > "$tdir/theme.txt"
+out="$(up "$d")"
+eq  "orphan repair: theme.txt removed"  "" "$(cat "$tdir/theme.txt" 2>/dev/null || true)"
+has "orphan repair: logs the removal"   "removed an orphan theme.txt" "$out"
+out2="$(up "$d")"
+hasnt "orphan repair: second run is silent" "removed an orphan theme.txt" "$out2"
+
+# 38f) a ZERO-BYTE logo (a torn FAT write) counts as missing — GRUB would hand it to the scaler and
+#      hit the same null bitmap, so the orphan repair fires on it too.
+d="$(new_poll_case poll-orphan0 cur-9 cur-9 cur-9)"
+tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"; mkdir -p "$tdir"
+printf 'ORPHANED-THEME\n' > "$tdir/theme.txt"; : > "$tdir/logo.png"
+out="$(up "$d")"
+eq  "orphan repair: fires on a zero-byte logo" "" "$(cat "$tdir/theme.txt" 2>/dev/null || true)"
+
+# 38g) torn-write ordering: if the FINAL mv dies (yanked stick, FAT error), the medium must be left
+#      WITHOUT a theme.txt — plain menu — never with a theme that references a bitmap it doesn't
+#      have. The next healthy poll completes the pair.
+cat > "$BIN/mv" <<'EOF'
+#!/bin/sh
+if [ -f "$STUB/mv_fail_theme" ]; then
+  for a in "$@"; do case "$a" in */theme.txt) exit 1 ;; esac; done
+fi
+exec /bin/mv "$@"
+EOF
+chmod +x "$BIN/mv"
+d="$(new_poll_case poll-torn cur-9 cur-9 cur-9)"
+printf 'THEME-BODY-v1\n' > "$d/served-theme"
+printf 'LOGO-BYTES-v1\n' > "$d/served-logo"
+: > "$d/mv_fail_theme"
+tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"
+out="$(up "$d")"
+eq    "torn heal: no theme.txt committed"  "" "$(cat "$tdir/theme.txt" 2>/dev/null || true)"
+hasnt "torn heal: does not claim success"  "healed the offline boot splash" "$out"
+eq    "torn heal: no stray temp files"     "" "$(ls "$tdir" 2>/dev/null | grep '\.new$' || true)"
+rm -f "$d/mv_fail_theme"
+out2="$(up "$d")"
+eq  "torn heal: next poll completes the pair (theme)" "THEME-BODY-v1" "$(cat "$tdir/theme.txt" 2>/dev/null)"
+eq  "torn heal: next poll completes the pair (logo)"  "LOGO-BYTES-v1" "$(cat "$tdir/logo.png" 2>/dev/null)"
+rm -f "$BIN/mv"   # later cases must see the real mv
+
 # ─── wifi-diagnostics.sh: the keyboard-less failure report (POL-77) ──────────────────────────────────
 # When association can't start the hook writes this report to the medium so a screen with no keyboard
 # can be debugged by pulling the stick. What is pinned: it surfaces the staged reject reason, traces

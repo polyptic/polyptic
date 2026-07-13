@@ -69,20 +69,33 @@ heal_boot_theme() {
   # Only a medium with the local (offline) menu needs a baked theme: a plain server-menu netboot stick
   # fetches the theme from the server, and a LEAN medium has no /polyptic tree.
   if [ -n "$hdev" ] && [ -f "$hm/grub/local-$arch.cfg" ]; then
+    td="$hm/polyptic/boot/theme"
+    # POL-87 orphan repair FIRST, independent of the server: theme.txt without its logo.png makes
+    # GRUB paint "error: null src bitmap ... Press any key" on every offline boot (the theme
+    # references logo.png; old media were rendered with a guard that only checked theme.txt). An
+    # already-broken stick repairs itself here even when the server serves no theme — plain menu,
+    # which boots silently, until a later poll re-heals the full pair.
+    if [ -f "$td/theme.txt" ] && [ ! -s "$td/logo.png" ]; then
+      rm -f "$td/theme.txt" 2>/dev/null \
+        && echo "update-poll: removed an orphan theme.txt (no logo.png) from $hdev — plain menu until the splash re-heals"
+    fi
     stg="$(mktemp -d 2>/dev/null || true)"
     if [ -n "$stg" ] \
        && curl -fsS --max-time 60 -o "$stg/theme.txt" "$base/boot/theme.txt" 2>/dev/null \
        && curl -fsS --max-time 60 -o "$stg/logo.png"  "$base/boot/logo.png"  2>/dev/null \
        && [ -s "$stg/theme.txt" ] && [ -s "$stg/logo.png" ]; then
-      td="$hm/polyptic/boot/theme"
       if cmp -s "$stg/theme.txt" "$td/theme.txt" 2>/dev/null \
          && cmp -s "$stg/logo.png" "$td/logo.png" 2>/dev/null; then
         : # already current — leave the FAT untouched (the every-5-minutes steady state)
+      # logo FIRST, theme.txt LAST (POL-87): theme.txt is what the GRUB guard keys on, so it is the
+      # COMMIT record — its dependency must exist before it. A write torn anywhere in this chain
+      # leaves either the old state or logo-without-theme, both of which boot silently; the old
+      # order could leave theme-without-logo, which errors on the glass forever.
       elif mkdir -p "$td" 2>/dev/null \
-           && cp "$stg/theme.txt" "$td/theme.txt.new" 2>/dev/null \
            && cp "$stg/logo.png"  "$td/logo.png.new"  2>/dev/null \
-           && mv -f "$td/theme.txt.new" "$td/theme.txt" 2>/dev/null \
-           && mv -f "$td/logo.png.new"  "$td/logo.png"  2>/dev/null; then
+           && cp "$stg/theme.txt" "$td/theme.txt.new" 2>/dev/null \
+           && mv -f "$td/logo.png.new"  "$td/logo.png"  2>/dev/null \
+           && mv -f "$td/theme.txt.new" "$td/theme.txt" 2>/dev/null; then
         echo "update-poll: healed the offline boot splash on $hdev from $base/boot/ (theme.txt + logo.png)"
       fi
       rm -f "$td/theme.txt.new" "$td/logo.png.new" 2>/dev/null || true

@@ -429,9 +429,14 @@ if [ "$wifi_payload" = 1 ]; then
   fi
   # The offline splash theme (POL-74): carry it to the ESP so an offloaded Wi-Fi box paints the
   # branded menu too. render-local-grub's `set theme` guard means a medium without it still boots.
-  if [ -d "$mnt_medium/polyptic/boot/theme" ]; then
+  # Only a COMPLETE pair is copied, logo first and theme.txt last (POL-87): theme.txt is what the
+  # GRUB guard keys on, and a theme without its bitmap paints "error: null src bitmap ... Press any
+  # key" on a keyboard-less screen — an interrupted copy must degrade to a plain menu, and an
+  # orphaned theme on the source medium must not propagate to the ESP.
+  if [ -f "$mnt_medium/polyptic/boot/theme/theme.txt" ] && [ -s "$mnt_medium/polyptic/boot/theme/logo.png" ]; then
     mkdir -p "$mnt/polyptic/boot/theme"
-    cp -R "$mnt_medium/polyptic/boot/theme/." "$mnt/polyptic/boot/theme/"
+    cp "$mnt_medium/polyptic/boot/theme/logo.png"  "$mnt/polyptic/boot/theme/logo.png" \
+      && cp "$mnt_medium/polyptic/boot/theme/theme.txt" "$mnt/polyptic/boot/theme/theme.txt"
   fi
   printf 'medium-esp-%s\n' "$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)" > "$mnt/polyptic/medium-id"
   umount "$mnt_medium" 2>/dev/null || true; rmdir "$mnt_medium" 2>/dev/null || true; mnt_medium=""

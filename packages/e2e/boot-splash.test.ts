@@ -153,10 +153,13 @@ describe("the offline (Wi-Fi) local menu carries its own splash (POL-74)", () =>
   });
 
   test("sets the theme from the on-medium copy, guarded so a theme-less medium still boots", () => {
-    // Device-relative ($root), so it resolves on the USB stick AND an offloaded ESP; guarded by a
-    // file-exists check so a LEAN/theme-less medium degrades to a plain menu rather than erroring.
+    // Device-relative ($root), so it resolves on the USB stick AND an offloaded ESP; guarded on
+    // BOTH files (POL-87): the theme references logo.png, and a theme whose bitmap is missing makes
+    // GRUB paint "error: null src bitmap ... Press any key to continue" on a keyboard-less screen.
+    // A LEAN/theme-less/half-healed medium must degrade to a plain menu instead. Nested ifs, not
+    // `-a` — plain `[ -f ]` is the only test form every GRUB build is guaranteed to have.
     expect(LOCAL_MENU).toContain(
-      "if [ -f ($root)/polyptic/boot/theme/theme.txt ]; then set theme=($root)/polyptic/boot/theme/theme.txt ; fi",
+      "if [ -f ($root)/polyptic/boot/theme/theme.txt ]; then if [ -f ($root)/polyptic/boot/theme/logo.png ]; then set theme=($root)/polyptic/boot/theme/theme.txt ; fi ; fi",
     );
     // The theme is desktop-agnostic (no baked URL), which is exactly why a local copy is legitimate.
     expect(buildBootThemeTxt()).toContain('file = "logo.png"');
