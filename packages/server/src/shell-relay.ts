@@ -27,6 +27,7 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 
 import type { ActivityLog } from "./activity";
+import type { AdminBroadcaster } from "./admin";
 import type { AgentHub } from "./hub";
 import type { ControlPlane } from "./state";
 
@@ -42,12 +43,48 @@ interface Session {
 export class ShellRelay {
   private readonly sessions = new Map<string, Session>();
 
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     private readonly agentHub: AgentHub,
     private readonly control: ControlPlane,
     private readonly activity: ActivityLog,
+    private readonly broadcaster: AdminBroadcaster,
     private readonly log: FastifyBaseLogger,
   ) {}
+
+  /** True when a machine has at least one live shell session (spares it from the auto-disarm sweep). */
+  private hasSession(machineId: string): boolean {
+    for (const s of this.sessions.values()) if (s.machineId === machineId) return true;
+    return false;
+  }
+
+  /**
+   * Start the auto-disarm sweep (POL-59 hardening): every minute, disarm any box armed-and-idle past
+   * `ttlMs` so a forgotten armed box is not a standing shell-openable target. A box with a live
+   * session is spared (its arm time is also refreshed on open). `ttlMs <= 0` disables the sweep.
+   */
+  startArmingSweep(ttlMs: number): void {
+    if (this.sweepTimer || ttlMs <= 0) return;
+    this.sweepTimer = setInterval(() => void this.sweepArming(ttlMs), 60_000);
+    if (typeof this.sweepTimer.unref === "function") this.sweepTimer.unref();
+  }
+
+  stopArmingSweep(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
+  }
+
+  private async sweepArming(ttlMs: number): Promise<void> {
+    try {
+      const disarmed = await this.control.disarmExpiredShells(ttlMs, Date.now(), (id) => this.hasSession(id));
+      if (disarmed.length === 0) return;
+      for (const m of disarmed) this.closeMachineSessions(m.id, "remote shell auto-disarmed (idle)");
+      this.broadcaster.broadcast();
+    } catch (err) {
+      this.log.error({ event: "shell.sweep_error", err: String(err) }, "arming sweep failed");
+    }
+  }
 
   /** Send a server→admin shell frame if the socket is still open. */
   private toAdmin(admin: WebSocket, msg: Record<string, unknown>): void {
@@ -82,6 +119,8 @@ export class ShellRelay {
     if (delivered === 0) return refuse("machine is offline");
 
     this.sessions.set(sessionId, { sessionId, machineId, admin });
+    // Opening a terminal counts as activity — refresh the arm window so an in-use box is not swept.
+    void this.control.refreshShellArmed(machineId);
     this.activity.push("accent", `Console session opened on ${machine.label}`);
     this.log.info({ event: "shell.open", machineId, sessionId }, "remote shell session opening");
   }

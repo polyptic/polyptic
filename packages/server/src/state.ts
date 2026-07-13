@@ -319,6 +319,7 @@ export class ControlPlane {
       credentialHash: this.credentialHashes.get(machine.id),
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
+      shellArmedAt: machine.shellArmedAt,
     };
   }
 
@@ -342,6 +343,7 @@ export class ControlPlane {
         status: m.status ?? "approved",
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
+        shellArmedAt: m.shellArmedAt,
       });
       if (m.credentialHash) this.credentialHashes.set(m.id, m.credentialHash);
     }
@@ -704,6 +706,7 @@ export class ControlPlane {
       status: "approved",
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
+      shellArmedAt: existing?.shellArmedAt,
     };
     this.machines.set(input.machineId, machine);
 
@@ -737,6 +740,7 @@ export class ControlPlane {
       status: "pending",
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
+      shellArmedAt: existing?.shellArmedAt,
     };
     this.machines.set(input.machineId, machine);
     await this.store.upsertMachine(this.toPersistedMachine(machine));
@@ -818,7 +822,8 @@ export class ControlPlane {
     if (!machine) return null;
     if (machine.shellEnabled !== enabled) {
       machine.shellEnabled = enabled;
-      await this.store.setMachineShellEnabled(machineId, enabled);
+      machine.shellArmedAt = enabled ? new Date().toISOString() : undefined;
+      await this.store.setMachineShellEnabled(machineId, enabled, machine.shellArmedAt ?? null);
       // POL-68 — the console's vocabulary: enabling is security-relevant (red), disabling is calm.
       this.emit(
         enabled ? "bad" : "good",
@@ -826,6 +831,38 @@ export class ControlPlane {
       );
     }
     return machine;
+  }
+
+  /** Refresh the arm timestamp (POL-59) — called when a terminal opens, so an actively-used box
+   *  keeps extending its TTL window and only a FORGOTTEN armed box auto-disarms. No-op if disarmed. */
+  async refreshShellArmed(machineId: string): Promise<void> {
+    const machine = this.machines.get(machineId);
+    if (!machine || !machine.shellEnabled) return;
+    machine.shellArmedAt = new Date().toISOString();
+    await this.store.setMachineShellEnabled(machineId, true, machine.shellArmedAt);
+  }
+
+  /**
+   * Auto-disarm boxes armed-and-idle past `ttlMs` (POL-59 hardening): a forgotten armed box must not
+   * stay a standing shell-openable target. `keepArmed(id)` lets the caller spare a box with a LIVE
+   * session (the relay knows liveness). `ttlMs <= 0` disables the sweep. Returns the disarmed
+   * machines so the caller can close their sessions + broadcast. Testable: `nowMs` is injected.
+   */
+  async disarmExpiredShells(ttlMs: number, nowMs: number, keepArmed: (id: string) => boolean): Promise<Machine[]> {
+    if (ttlMs <= 0) return [];
+    const disarmed: Machine[] = [];
+    for (const machine of this.machines.values()) {
+      if (!machine.shellEnabled) continue;
+      if (keepArmed(machine.id)) continue;
+      const armedAt = machine.shellArmedAt ? Date.parse(machine.shellArmedAt) : 0;
+      if (!armedAt || nowMs - armedAt < ttlMs) continue;
+      machine.shellEnabled = false;
+      machine.shellArmedAt = undefined;
+      await this.store.setMachineShellEnabled(machine.id, false, null);
+      this.emit("good", `Console auto-disabled on ${machine.label} (idle past the TTL)`);
+      disarmed.push(machine);
+    }
+    return disarmed;
   }
 
   /** Whether a machine is currently armed for the remote shell (the WS relay's gate). */

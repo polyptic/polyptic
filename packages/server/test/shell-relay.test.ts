@@ -30,6 +30,7 @@ class FakeSocket {
   }
 }
 
+const fakeBroadcaster = { broadcast() {} } as any;
 const noopLog = {
   info() {},
   warn() {},
@@ -57,7 +58,7 @@ beforeEach(async () => {
   control = new ControlPlane(store);
   await control.init();
   agentHub = new AgentHub();
-  relay = new ShellRelay(agentHub, control, new ActivityLog(), noopLog);
+  relay = new ShellRelay(agentHub, control, new ActivityLog(), fakeBroadcaster, noopLog);
   // A registered, approved, online box.
   await control.registerMachine(hello("box-1"), undefined);
   agentSock = new FakeSocket();

@@ -93,9 +93,12 @@ export class MemoryStore implements Store {
     if (machine) machine.status = status;
   }
 
-  async setMachineShellEnabled(id: string, enabled: boolean): Promise<void> {
+  async setMachineShellEnabled(id: string, enabled: boolean, armedAt: string | null): Promise<void> {
     const machine = this.machines.get(id);
-    if (machine) machine.shellEnabled = enabled;
+    if (machine) {
+      machine.shellEnabled = enabled;
+      machine.shellArmedAt = armedAt ?? undefined;
+    }
   }
 
   async deleteMachine(id: string): Promise<void> {

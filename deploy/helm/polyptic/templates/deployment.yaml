@@ -88,6 +88,11 @@ spec:
                   key: DATABASE_URL
                   # Optional so STORE=memory (no DB) does not block startup.
                   optional: true
+            {{- if .Values.remoteShell.armTtlSeconds }}
+            # POL-59 — auto-disarm a remote shell left armed-and-idle this long. 0 disables (sticky).
+            - name: SHELL_ARM_TTL_MS
+              value: {{ mul (int .Values.remoteShell.armTtlSeconds) 1000 | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
