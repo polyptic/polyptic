@@ -6,7 +6,11 @@
     - single  : live preview (mirrors the tile's canvas state, status chip overlaid) · rename ·
                 "Driven by {machine}" + mono connector chip · Ident · content (LIBRARY only —
                 ad-hoc URL entry was removed as an anti-pattern; add URLs to the Content library
-                instead) · page zoom · layout read-out · remove from wall
+                instead) · page zoom · layout read-out · remove from wall. The header carries a ⋯
+                overflow menu with the dev-tools quick-launch (POL-85): the same arm-then-open flow
+                as the Machines view (chrome = remote DevTools in a new tab, surf = the on-panel
+                inspector), via the shared useScreenInspect composable — an operator debugging a
+                wall never has to leave this page.
     - wall    : a combined surface — rename, Ident all / Split, spanning content, member panels
     - multi   : count + member list + Ident-all + Combine
 
@@ -18,10 +22,12 @@
   All reads/writes go through the Pinia store; ident uses the shared composable.
 -->
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onUnmounted } from "vue";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
+import { devtoolsUrl } from "../../api";
+import { useScreenInspect, type InspectTarget } from "../useInspect";
 import ZoomControl from "./ZoomControl.vue";
 
 const store = useConsoleStore();
@@ -190,6 +196,66 @@ const machineName = computed(() => {
   return m ? m.label : s.machineId;
 });
 
+// ── dev-tools quick-launch (POL-85 — the ⋯ overflow in the single-screen header) ──
+// Identical flow + semantics to the Machines view's per-screen button, via the shared composable:
+// chrome = arm the POL-67 remote-DevTools tunnel and open it in a new tab; surf/unknown = the
+// on-panel Web Inspector (confirmed first — it shows ON the glass and reloads the page). Offline
+// machines leave the item disabled with the explanatory tooltip.
+const menuOpen = ref(false);
+// Refusals/timeouts surface as a transient inline notice — the Wall view has no toast rail.
+const notice = ref("");
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+function showNotice(message: string): void {
+  notice.value = message;
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => (notice.value = ""), 5000);
+}
+onUnmounted(() => {
+  if (noticeTimer) clearTimeout(noticeTimer);
+});
+
+const inspectTarget = computed<InspectTarget | undefined>(() => {
+  const s = single.value;
+  if (!s) return undefined;
+  const m = store.machineForScreen(s.id);
+  return {
+    screen: s,
+    machineLabel: m?.label ?? s.machineId,
+    machineOnline: m?.online === true,
+    browser: m?.browser,
+  };
+});
+const {
+  isChrome,
+  inspecting,
+  pending: inspectPending,
+  disabled: inspectDisabled,
+  title: inspectTitle,
+  toggle: toggleInspect,
+} = useScreenInspect(inspectTarget, {
+  inspect: (id, on) => store.inspectScreen(id, on),
+  devtoolsUrl,
+  notify: showNotice,
+});
+const inspectItemLabel = computed(() => {
+  if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
+  if (isChrome.value) return inspecting.value ? "Disarm DevTools" : "Open DevTools";
+  return inspecting.value ? "Close on-panel inspector" : "Inspect on panel";
+});
+function launchInspect(): void {
+  menuOpen.value = false;
+  void toggleInspect();
+}
+// Close the menu (and drop any stale notice) when the selection moves to a different screen —
+// keyed on the id, NOT the object, which is fresh on every broadcast.
+watch(
+  () => single.value?.id,
+  () => {
+    menuOpen.value = false;
+    notice.value = "";
+  },
+);
+
 // ── live preview (mirrors the tile's canvas state: live / offline / empty) ──
 const previewState = computed<"live" | "offline" | "empty">(() => {
   const s = single.value;
@@ -331,7 +397,38 @@ function selectOne(id: string) {
 
     <!-- ── SINGLE ─────────────────────────────────────────────────────── -->
     <section v-else-if="single" class="pad">
-      <div class="section-label">Screen</div>
+      <!-- header: section label + the ⋯ overflow (dev-tools quick-launch, POL-85) -->
+      <div class="head-row">
+        <span class="section-label flush">Screen</span>
+        <div class="menu-wrap">
+          <button
+            class="kebab"
+            :class="{ open: menuOpen }"
+            title="Screen tools"
+            aria-label="Screen tools"
+            :aria-expanded="menuOpen"
+            @click="menuOpen = !menuOpen"
+          >
+            ⋯
+          </button>
+          <template v-if="menuOpen">
+            <div class="menu-scrim" @click="menuOpen = false" />
+            <div class="menu">
+              <button
+                class="menu-item"
+                :disabled="inspectDisabled"
+                :title="inspectTitle"
+                @click="launchInspect"
+              >
+                <span class="mi-glyph" aria-hidden="true">&lt;/&gt;</span>{{ inspectItemLabel }}
+              </button>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- transient notice (inspector refusals/timeouts — nobody is standing at that screen) -->
+      <div v-if="notice" class="notice">{{ notice }}</div>
 
       <!-- Live preview — mirrors the screen's canvas state, status chip overlaid top-left. -->
       <div class="preview" :class="previewState">
@@ -469,6 +566,108 @@ function selectOne(id: string) {
 }
 .gap-top {
   margin-top: 18px;
+}
+
+/* single-screen header row: section label + the ⋯ overflow (POL-85) */
+.head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 9px;
+}
+.menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+}
+/* Mirrors the Machines view's kebab/menu language, sized down for the narrow panel. */
+.kebab {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+}
+.kebab:hover,
+.kebab.open {
+  background: var(--muted-bg);
+  color: var(--fg);
+}
+.menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+.menu {
+  position: absolute;
+  top: 31px;
+  right: 0;
+  z-index: 31;
+  width: 200px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+  padding: 5px;
+  animation: menu-fadein 0.12s ease;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg2);
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.mi-glyph {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  color: var(--muted2);
+}
+@keyframes menu-fadein {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* transient inline notice (inspector refusals/timeouts) */
+.notice {
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
 }
 
 .dot {

@@ -27,6 +27,7 @@ import type { KioskBrowser, ScreenView } from "@polyptic/protocol";
 import { devtoolsUrl } from "../api";
 import { useConsoleStore } from "../stores/console";
 import { useScreenThumbnail } from "./canvas/useThumbnails";
+import { useScreenInspect, type InspectTarget } from "./useInspect";
 
 const props = defineProps<{
   screen: ScreenView;
@@ -86,97 +87,34 @@ function ident(): void {
 }
 
 // ── Inspect / DevTools (POL-50 / POL-67) ───────────────────────────────────────
-// `inspecting` is written only by the agent's ack, so the click leaves the button in a pending state
-// until the wall confirms. A stuck box therefore reads as "Opening…", never as a live inspector.
-const inspectPending = ref(false);
-let inspectTimer: ReturnType<typeof setTimeout> | null = null;
-
-const isChrome = computed(() => props.browser === "chrome");
-const inspecting = computed(() => props.screen.inspecting === true);
+// The whole toggle — the ack-driven pending state, the new-tab arm on chrome, the on-panel confirm
+// on surf — lives in the shared composable (also behind the Wall Inspector's ⋯ menu, POL-85).
+const inspectTarget = computed<InspectTarget>(() => ({
+  screen: props.screen,
+  machineLabel: props.machineLabel,
+  machineOnline: props.machineOnline,
+  browser: props.browser,
+}));
+const {
+  isChrome,
+  inspecting,
+  pending: inspectPending,
+  title: inspectTitle,
+  toggle: toggleInspect,
+} = useScreenInspect(inspectTarget, {
+  inspect: (id, on) => store.inspectScreen(id, on),
+  devtoolsUrl,
+  notify: (message) => emit("notify", message),
+});
 const inspectLabel = computed(() => {
-  if (isChrome.value) {
-    if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
-    return inspecting.value ? "DevTools live" : "DevTools";
-  }
   if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
+  if (isChrome.value) return inspecting.value ? "DevTools live" : "DevTools";
   return inspecting.value ? "Inspecting" : "Inspect";
 });
-const inspectTitle = computed(() => {
-  if (!props.machineOnline) {
-    return `${props.machineLabel} is offline — the inspector rides its agent connection`;
-  }
-  if (isChrome.value) {
-    return inspecting.value
-      ? "Disarm remote DevTools for this screen (closes any open DevTools tab)"
-      : "Open Chrome DevTools for this screen in a new tab — remote, nothing shows on the wall";
-  }
-  return inspecting.value
-    ? "Close the Web Inspector on this panel (reloads the page)"
-    : "Open the browser's Web Inspector ON this panel — read it at the screen (reloads the page)";
-});
 
-/**
- * Clear the pending state as soon as the wall's ack lands — on EITHER signal.
- *
- * A refusal leaves `inspecting` false, i.e. unchanged, so watching that alone would leave the button
- * spinning on "Opening…" until its timeout for exactly the case the operator most needs to hear about.
- * `inspectError` is the refusal edge; report it, because nobody is standing at that screen.
- *
- * `props.screen` is a fresh object on every admin/state broadcast, so this fires for unrelated
- * changes too. Only the two transitions that actually mean "the box answered" may settle the button:
- * the inspector flipping, or a NEW refusal. Notably, the server CLEARING a stale error at the start
- * of a fresh request must not cancel the pending state that request just set.
- */
-watch(
-  () => [props.screen.inspecting === true, props.screen.inspectError ?? ""] as const,
-  ([nowOn, error], [wasOn, prevError]) => {
-    const newRefusal = error !== "" && error !== prevError;
-    if (!newRefusal && nowOn === wasOn) return; // an unrelated broadcast, or a stale error cleared
-    inspectPending.value = false;
-    if (inspectTimer) clearTimeout(inspectTimer);
-    if (newRefusal) emit("notify", `Inspector: ${error}`);
-  },
-);
 onUnmounted(() => {
-  if (inspectTimer) clearTimeout(inspectTimer);
   if (identTimer) clearTimeout(identTimer);
 });
-
-async function toggleInspect(): Promise<void> {
-  if (inspectPending.value || !props.machineOnline) return;
-  const on = !inspecting.value;
-
-  if (isChrome.value && on) {
-    // POL-67 — remote DevTools: open the tab NOW, inside the user gesture (popup blockers), then
-    // arm in parallel. The server's entry route waits briefly for the arm ack before proxying, so
-    // the tab and the handshake race safely.
-    window.open(devtoolsUrl(props.screen.id), "_blank", "noopener");
-  } else if (!isChrome.value && on) {
-    const yes = window.confirm(
-      `Open the Web Inspector on "${props.screen.friendlyName}"?\n\n` +
-        `It appears ON that panel, so anyone looking at the screen will see it, and the page reloads ` +
-        `so the inspector captures the whole load.`,
-    );
-    if (!yes) return;
-  }
-  inspectPending.value = true;
-  // surf relaunches the browser, so its ack takes a few seconds (chrome acks near-instantly).
-  // Give up waiting well after that, rather than leaving the button pending forever if the box
-  // never answers.
-  if (inspectTimer) clearTimeout(inspectTimer);
-  inspectTimer = setTimeout(() => {
-    if (!inspectPending.value) return;
-    inspectPending.value = false;
-    emit("notify", `${props.screen.friendlyName} did not confirm the inspector — check the screen.`);
-  }, 20_000);
-
-  const error = await store.inspectScreen(props.screen.id, on);
-  if (error) {
-    inspectPending.value = false;
-    if (inspectTimer) clearTimeout(inspectTimer);
-    emit("notify", error);
-  }
-}
 
 // Permanently forget this screen (POL-14) — deletes it, its placement + content. Aimed at stale
 // screens (an output the machine no longer drives); a still-reported output reappears on reconnect.
