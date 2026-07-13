@@ -214,6 +214,21 @@ output * dpms on
 ### No idle / no blank / no lock. A wall runs unattended for days.
 # (intentionally NO \`exec swayidle\` and NO lock — never blank the content)
 
+### Ignore physical input devices (POL-60). A deployed wall is glass, not a terminal: a walk-up
+# keyboard must not Tab focus around the dashboard, or reach a VT console. Wholesale, so a device
+# hot-plugged later is disabled the moment sway sees it. Unaffected: the agent (swaymsg IPC), the
+# inspector's keystrokes (XTEST inside Xwayland, not a libinput device), and the operator's remote
+# shell (rides the agent WS). Caveat: this also matches VIRTUAL seat devices, so a hand-started
+# wayvnc gets view-only input — re-enable over the remote shell if remote control is needed.
+input * events disabled
+# Debug boots (the GRUB "Debug console" entry = systemd.debug-shell=1 on the kernel cmdline) get
+# their input back, or the tty9 root shell would be unreachable from the box itself. One exec per
+# device type, each quote- comma- and glob-free, so the line survives sway's exec arg handling and
+# sh word-splitting verbatim.
+exec grep -q systemd.debug-shell=1 /proc/cmdline && swaymsg input type:keyboard events enabled
+exec grep -q systemd.debug-shell=1 /proc/cmdline && swaymsg input type:pointer events enabled
+exec grep -q systemd.debug-shell=1 /proc/cmdline && swaymsg input type:touch events enabled
+
 ### Browser windows fill each output: no decorations, borders, or gaps.
 default_border none
 default_floating_border none
@@ -277,6 +292,14 @@ ${i3OutputLines(p.outputs)}
 ### Always-on: disable the X screensaver + DPMS blanking; hide the cursor.
 exec_always --no-startup-id xset s off -dpms s noblank
 exec_always --no-startup-id unclutter -idle 3
+
+### Ignore physical input devices (POL-60) — kiosk glass, not a terminal — except in a debug boot
+# (systemd.debug-shell=1 on the kernel cmdline), which keeps its keyboard for the tty9 root shell.
+# The XTEST virtual devices STAY enabled: they carry no physical input, and disabling them would
+# break the on-screen inspector's synthesised keystrokes (see docs/ARCHITECTURE.md gotchas). X11
+# has no wholesale switch, so a device hot-plugged after startup stays live until the next i3
+# reload — best effort; the primary (sway) path disables input for good.
+exec_always --no-startup-id sh -c 'grep -q systemd.debug-shell=1 /proc/cmdline || xinput list | grep -iv xtest | grep -E "slave +(keyboard|pointer)" | grep -oE "id=[0-9]+" | cut -d= -f2 | xargs -r -n1 xinput disable'
 
 ### Hand off to the systemd user session (supervises polyptic-agent, Restart=always).
 exec_always --no-startup-id systemctl --user import-environment DISPLAY XAUTHORITY LIBGL_ALWAYS_SOFTWARE

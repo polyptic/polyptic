@@ -150,7 +150,8 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
   apt: {
     base: ["greetd", "dbus-user-session", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
-    x11: ["xserver-xorg", "xinit", "i3", "x11vnc", "scrot", "imagemagick", "unclutter"],
+    // `xinput` disables physical input devices at session start (POL-60 kiosk lockdown).
+    x11: ["xserver-xorg", "xinit", "i3", "x11vnc", "scrot", "imagemagick", "unclutter", "xinput"],
     fonts: ["fonts-dejavu-core", "fonts-liberation"],
     // Debian/Ubuntu: `script` plugin ships inside `plymouth`; `plymouth-label` = the text renderer
     // (REQUIRED, see above); `librsvg2-bin` = rsvg-convert.
@@ -160,7 +161,7 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
-    x11: ["xorg-x11-server-Xorg", "xorg-x11-xinit", "i3", "x11vnc", "scrot", "ImageMagick", "unclutter"],
+    x11: ["xorg-x11-server-Xorg", "xorg-x11-xinit", "i3", "x11vnc", "scrot", "ImageMagick", "unclutter", "xinput"],
     fonts: ["dejavu-sans-fonts", "liberation-fonts"],
     // Fedora splits the script plugin, `plymouth-set-default-theme`, and the label renderer into
     // separate packages; `plymouth-plugin-label` is the text renderer (REQUIRED, see above).
@@ -171,7 +172,7 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
     wayland: ["sway", "grim", "wayvnc"],
-    x11: ["xorg-server", "xorg-xinit", "i3-wm", "x11vnc", "scrot", "imagemagick", "unclutter"],
+    x11: ["xorg-server", "xorg-xinit", "i3-wm", "x11vnc", "scrot", "imagemagick", "unclutter", "xorg-xinput"],
     fonts: ["ttf-dejavu", "ttf-liberation"],
     // Arch's `plymouth` bundles ALL plugins (script, label, set-default-theme); `librsvg` = rsvg-convert.
     splash: ["plymouth", "librsvg"],
