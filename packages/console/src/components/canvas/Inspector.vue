@@ -138,11 +138,43 @@ function splitWall() {
   if (wall.value) store.split(wall.value.id);
 }
 
-// ── multi-select pre-combine ───────────────────────────────────────────────
+// ── clearing content (POL-96) ──────────────────────────────────────────────
+// The explicit unset. Until now content could only be REPLACED — "show nothing" had no affordance
+// anywhere in the console. A cleared screen falls back to the player's idle splash (D39).
+function clearSingle() {
+  if (single.value) store.clearScreenContent(single.value.id);
+}
+function clearWall() {
+  if (wall.value && !wallPending.value) store.clearWallContent(wall.value.id);
+}
+
+// ── multi-select: pre-combine + bulk content (POL-96) ──────────────────────
 function combine() {
   const muralId = store.activeMuralId;
   if (!muralId || count.value < 2) return;
   store.combine(muralId, [...selectedIds.value]);
+}
+
+const multiSourcePick = ref("");
+watch(count, () => {
+  multiSourcePick.value = "";
+});
+const multiHasContent = computed(() =>
+  selectedIds.value.some((id) => (store.screenById(id)?.surfaceCount ?? 0) > 0),
+);
+function assignMulti() {
+  const id = multiSourcePick.value;
+  if (!id || count.value < 2) return;
+  store.bulkSetContent({ screenIds: [...selectedIds.value] }, { sourceId: id });
+  multiSourcePick.value = "";
+}
+function clearMulti() {
+  if (count.value < 2) return;
+  store.bulkSetContent({ screenIds: [...selectedIds.value] }, null);
+}
+function unplaceMulti() {
+  if (count.value < 2) return;
+  store.unplaceScreens([...selectedIds.value]);
 }
 
 // ── rename ─────────────────────────────────────────────────────────────────
@@ -346,6 +378,9 @@ function selectOne(id: string) {
           <span class="content-name">{{ wallContent?.name ?? "On air" }}</span>
           <span class="content-kind">{{ wallContentKind }}</span>
         </span>
+        <button class="clear-btn" title="Show nothing on this surface" @click="clearWall">
+          Clear
+        </button>
       </div>
       <div v-else class="content-empty">Drag content to span across</div>
 
@@ -467,6 +502,9 @@ function selectOne(id: string) {
           <span class="content-name">{{ singleContent?.name ?? "On air" }}</span>
           <span class="content-kind">{{ singleContentKind }}</span>
         </span>
+        <button class="clear-btn" title="Show nothing on this screen" @click="clearSingle">
+          Clear
+        </button>
       </div>
       <div v-else class="content-empty">Drag content here</div>
 
@@ -511,6 +549,22 @@ function selectOne(id: string) {
         <button class="ident-btn shrink" @click="identAll">
           <span class="dot accent"></span>Ident
         </button>
+      </div>
+
+      <!-- Bulk (POL-96): one source across the lot, or clear them all. One call, one broadcast. -->
+      <div v-if="librarySources.length" class="lib-pick gap-top">
+        <select v-model="multiSourcePick" class="lib-select" @change="assignMulti">
+          <option value="" disabled>Assign to all {{ count }}…</option>
+          <option v-for="s in librarySources" :key="s.id" :value="s.id">
+            {{ kindLabel(s.kind) }} · {{ s.name }}
+          </option>
+        </select>
+      </div>
+      <div class="group-actions">
+        <button class="unplace-btn flush" :disabled="!multiHasContent" @click="clearMulti">
+          Clear content
+        </button>
+        <button class="unplace-btn flush" @click="unplaceMulti">Unplace all</button>
       </div>
 
       <div class="member-list">
@@ -833,6 +887,8 @@ function selectOne(id: string) {
   display: flex;
   flex-direction: column;
   line-height: 1.35;
+  flex: 1;
+  min-width: 0;
 }
 .content-name {
   font-size: 12.5px;
@@ -926,9 +982,36 @@ function selectOne(id: string) {
   cursor: pointer;
   font-family: inherit;
 }
-.unplace-btn:hover {
+.unplace-btn:hover:not(:disabled) {
   background: var(--bad-soft);
   border-color: var(--scr-bad-line);
+}
+/* Side-by-side bulk buttons (multi-selection): no top margin, share the row. */
+.unplace-btn.flush {
+  margin-top: 8px;
+  flex: 1;
+}
+.unplace-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* "Clear" — the explicit unset, sitting quietly on the content card (POL-96). */
+.clear-btn {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+}
+.clear-btn:hover {
+  background: var(--bad-soft);
+  color: var(--bad);
 }
 
 .multi-count {

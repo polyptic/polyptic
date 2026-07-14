@@ -32,7 +32,10 @@ import {
   VideoWall,
   WebSurface,
   Zoom,
+  packRects,
+  rectsAreAdjacent,
 } from "@polyptic/protocol";
+import type { Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
   CreateContentSourceBody,
@@ -168,10 +171,44 @@ export type CombineScreensResult =
         | "unknown-screen"
         | "not-placed"
         | "wrong-mural"
-        | "already-combined";
+        | "already-combined"
+        // POL-100 — the members don't form one contiguous region (a gap, or a corner-only join). The
+        // caller may retry with `pack: true`, which closes the gaps first.
+        | "not-adjacent";
       screenId?: string;
       wallId?: string;
     };
+
+/** Result of the atomic canvas move (POL-100): the placements that shifted, or why nothing did.
+ *  `breaks-wall` = the move would tear a combined surface apart; NOTHING is written in that case. */
+export type MoveTargetsResult =
+  | { ok: true; placements: Placement[] }
+  | {
+      ok: false;
+      error: "unknown-mural" | "unknown-screen" | "unknown-wall" | "wrong-mural" | "not-placed" | "breaks-wall";
+      screenId?: string;
+      wallId?: string;
+    };
+
+/** Result of an explicit CLEAR (POL-96): the emptied slices to push, or why nothing was cleared. */
+export type ClearContentResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | { ok: false; error: "unknown-screen" | "unknown-wall" | "wall-member"; wallId?: string };
+
+/**
+ * Result of a bulk content apply/clear (POL-96). `slices` is the whole fan-out (one per affected
+ * screen, deduped); `applied` counts the targets that took the change and `skipped` names the ones
+ * that could not (an unknown id, or a screen that is really a wall member) — a partial selection
+ * still does the useful work rather than refusing the lot.
+ */
+export type BulkContentResult =
+  | {
+      ok: true;
+      slices: ScreenSlice[];
+      applied: { screens: number; walls: number };
+      skipped: Array<{ id: string; reason: string }>;
+    }
+  | { ok: false; error: "unknown-source" };
 
 /** Result of `setWallContent`: the per-member slices to render, or why it could not be computed. */
 export type SetWallContentResult =
@@ -1725,6 +1762,7 @@ export class ControlPlane {
     muralId: string,
     memberScreenIds: string[],
     name?: string,
+    pack = false,
   ): Promise<CombineScreensResult> {
     if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
 
@@ -1742,6 +1780,21 @@ export class ControlPlane {
       const existing = this.getWallForScreen(screenId);
       if (existing) {
         return { ok: false, error: "already-combined", screenId, wallId: existing.id };
+      }
+    }
+
+    // POL-100 — a wall must be ONE contiguous region (see the adjacency rule in protocol/geometry).
+    // A gappy selection is either packed bezel-tight first (the operator asked) or refused outright:
+    // combining it would span content across canvas that no screen is showing.
+    const rects = ids.map((sid) => this.placements.get(sid)!);
+    if (!rectsAreAdjacent(rects)) {
+      if (!pack) return { ok: false, error: "not-adjacent" };
+      const packed = packRects(rects);
+      if (!rectsAreAdjacent(packed)) return { ok: false, error: "not-adjacent" };
+      for (let i = 0; i < ids.length; i++) {
+        const next: Placement = { ...rects[i]!, x: packed[i]!.x, y: packed[i]!.y };
+        this.placements.set(next.screenId, next);
+        await this.store.upsertPlacement(next);
       }
     }
 
@@ -1935,6 +1988,262 @@ export class ControlPlane {
       `${screen.friendlyName} → ${this.resolvedContentName(resolved.spec, resolved.sourceId)}`,
     );
     return { ok: true, slice: next };
+  }
+
+  // ── Clearing content + bulk canvas operations (POL-96) ──────────────────────
+  //
+  // Until now content could only be REPLACED, never removed: "show nothing" had no API path at all.
+  // Clearing is the same mutation combine/split already make internally (empty the slice, drop the
+  // library-source assignment, push) — it just becomes something the operator can ask for. A cleared
+  // screen falls back to the player's idle splash (D39). Bulk is the same primitives run under one
+  // emit, so a 20-screen selection is one REST call, one broadcast and one activity line.
+
+  /** Clear a single screen's content (it falls back to the idle splash). A wall member is refused —
+   *  its content belongs to the combined surface, so the WALL is what gets cleared. */
+  async clearScreenContent(screenId: string): Promise<ClearContentResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slices = this.clearSlices([screenId]);
+    if (slices.length === 0) return { ok: false, error: "unknown-screen" };
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("info", `${screen.friendlyName} cleared`);
+    return { ok: true, slices };
+  }
+
+  /** Clear a combined surface's spanning content — every member goes blank (idle splash), and the
+   *  wall keeps existing (it is a grouping, not a piece of content). */
+  async clearWallContent(wallId: string): Promise<ClearContentResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices = this.clearSlices(wall.memberScreenIds);
+    await this.setWallSourceAssignment(wall, null);
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("info", `${wall.name ?? wall.id} cleared`);
+    return { ok: true, slices };
+  }
+
+  /**
+   * Assign content to — or clear it from — many screens and walls in ONE mutation (POL-96). Runs the
+   * per-target primitives with their activity lines suppressed and emits a single summary instead;
+   * the caller pushes the returned slices (deduped) and broadcasts once. Targets that cannot take the
+   * change (an unknown id; a screen that is a member of a wall) are SKIPPED and named back, so a
+   * selection that includes one awkward screen still does the operator's work.
+   */
+  async applyBulkContent(
+    targets: { screenIds: readonly string[]; wallIds: readonly string[] },
+    content: ContentAssignment | null,
+  ): Promise<BulkContentResult> {
+    // Fail fast on a bad source: a bulk assign that can't resolve should change nothing at all.
+    if (content) {
+      const resolved = this.resolveSpec(content);
+      if ("error" in resolved) return { ok: false, error: "unknown-source" };
+    }
+
+    const touched = new Map<string, ScreenSlice>();
+    const skipped: Array<{ id: string; reason: string }> = [];
+    let screens = 0;
+    let walls = 0;
+    let name = "";
+
+    this.suppressEmit = true;
+    try {
+      for (const wallId of targets.wallIds) {
+        const result = content
+          ? await this.setWallContent(wallId, content)
+          : await this.clearWallContent(wallId);
+        if (!result.ok) {
+          skipped.push({ id: wallId, reason: result.error });
+          continue;
+        }
+        for (const slice of result.slices) touched.set(slice.screenId, slice);
+        walls += 1;
+        name ||= this.videoWalls.get(wallId)?.name ?? wallId;
+      }
+
+      for (const screenId of targets.screenIds) {
+        if (content) {
+          const result = await this.setScreenContent(screenId, content);
+          if (!result.ok) {
+            skipped.push({ id: screenId, reason: result.error });
+            continue;
+          }
+          touched.set(result.slice.screenId, result.slice);
+        } else {
+          const result = await this.clearScreenContent(screenId);
+          if (!result.ok) {
+            skipped.push({ id: screenId, reason: result.error });
+            continue;
+          }
+          for (const slice of result.slices) touched.set(slice.screenId, slice);
+        }
+        screens += 1;
+        name ||= this.getScreen(screenId)?.friendlyName ?? screenId;
+      }
+    } finally {
+      this.suppressEmit = false;
+    }
+
+    const applied = screens + walls;
+    if (applied > 0) {
+      const what = applied === 1 ? name : `${applied} targets`;
+      if (content) {
+        const resolved = this.resolveSpec(content);
+        const contentName =
+          "error" in resolved ? "content" : this.resolvedContentName(resolved.spec, resolved.sourceId);
+        this.emit("good", `${what} → ${contentName}`);
+      } else {
+        this.emit("info", `${what} cleared`);
+      }
+    }
+
+    return { ok: true, slices: [...touched.values()], applied: { screens, walls }, skipped };
+  }
+
+  /**
+   * Return several screens to the unplaced tray in one mutation (POL-96). Unplacing a wall member
+   * dissolves that wall exactly as the single-screen path does — the returned slices are every screen
+   * that must be re-rendered. One activity line for the lot.
+   */
+  async unplaceScreens(screenIds: readonly string[]): Promise<{ slices: ScreenSlice[]; unplaced: string[] }> {
+    const touched = new Map<string, ScreenSlice>();
+    const unplaced: string[] = [];
+    let name = "";
+
+    this.suppressEmit = true;
+    try {
+      for (const screenId of screenIds) {
+        const result = await this.unplaceScreen(screenId);
+        if (result === false) continue;
+        for (const slice of result.slices) touched.set(slice.screenId, slice);
+        unplaced.push(screenId);
+        name ||= this.getScreen(screenId)?.friendlyName ?? screenId;
+      }
+    } finally {
+      this.suppressEmit = false;
+    }
+
+    if (unplaced.length === 1) this.emit("info", `${name} unplaced`);
+    else if (unplaced.length > 1) this.emit("info", `${unplaced.length} screens unplaced`);
+
+    return { slices: [...touched.values()], unplaced };
+  }
+
+  // ── The atomic canvas move (POL-100) ────────────────────────────────────────
+  //
+  // Dragging a WALL moves every member together; a keyboard nudge moves a whole selection. Both are
+  // ONE intent, so both are one mutation: every named screen and every member of every named wall is
+  // translated by the same (dx, dy), and the result is written through only if EVERY wall the move
+  // touches is still adjacent afterwards. A rigid translation preserves adjacency by construction —
+  // the re-check is what makes that a guarantee rather than an assumption, and it also catches the
+  // case where a loose screen in the same move happens to be a member of another wall.
+
+  /**
+   * Translate placements by (dx, dy), atomically. All targets must live on `muralId`. Returns the new
+   * placements, or an error result — and on ANY error nothing at all is written (the check runs on a
+   * projection of the move before a single row is touched), so a move can never leave a broken wall.
+   */
+  async moveTargets(
+    muralId: string,
+    targets: { screenIds: readonly string[]; wallIds: readonly string[] },
+    dx: number,
+    dy: number,
+  ): Promise<MoveTargetsResult> {
+    if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
+
+    // Collect the screens to move: the named ones plus every member of every named wall.
+    const moving = new Set<string>();
+    for (const wallId of targets.wallIds) {
+      const wall = this.videoWalls.get(wallId);
+      if (!wall) return { ok: false, error: "unknown-wall", wallId };
+      if (wall.muralId !== muralId) return { ok: false, error: "wrong-mural", wallId };
+      for (const sid of wall.memberScreenIds) moving.add(sid);
+    }
+    for (const screenId of targets.screenIds) {
+      if (!this.getScreen(screenId)) return { ok: false, error: "unknown-screen", screenId };
+      moving.add(screenId);
+    }
+
+    for (const screenId of moving) {
+      const placement = this.placements.get(screenId);
+      if (!placement) return { ok: false, error: "not-placed", screenId };
+      if (placement.muralId !== muralId) return { ok: false, error: "wrong-mural", screenId };
+    }
+
+    // Project the move, then re-check every wall it touches BEFORE writing anything.
+    const next = new Map<string, Placement>();
+    for (const screenId of moving) {
+      const p = this.placements.get(screenId)!;
+      next.set(screenId, { ...p, x: p.x + dx, y: p.y + dy });
+    }
+    const projected = (screenId: string): Placement | undefined =>
+      next.get(screenId) ?? this.placements.get(screenId);
+
+    for (const wall of this.videoWalls.values()) {
+      if (!wall.memberScreenIds.some((sid) => moving.has(sid))) continue;
+      const rects: Rect[] = [];
+      for (const sid of wall.memberScreenIds) {
+        const p = projected(sid);
+        if (p) rects.push(p);
+      }
+      if (!rectsAreAdjacent(rects)) return { ok: false, error: "breaks-wall", wallId: wall.id };
+    }
+
+    for (const [screenId, placement] of next) {
+      this.placements.set(screenId, placement);
+      await this.store.upsertPlacement(placement);
+    }
+
+    // Placements are not part of any render slice (the span offsets are union-RELATIVE, so a rigid
+    // translation leaves every member's slice byte-identical) — no revision bump, no push. The
+    // console repaints from the admin/state broadcast the REST layer sends.
+    return { ok: true, placements: [...next.values()] };
+  }
+
+  /**
+   * Would placing `screenId` at `rect` tear apart the wall it belongs to? Returns that wall, or null
+   * when the screen is wall-free or the wall survives the move. The REST placement edge calls this so
+   * a single-screen drag can never leave a wall with a hole in it (POL-100).
+   */
+  wallBrokenByPlacement(screenId: string, rect: Rect): VideoWall | null {
+    const wall = this.getWallForScreen(screenId);
+    if (!wall) return null;
+    const rects: Rect[] = [];
+    for (const sid of wall.memberScreenIds) {
+      if (sid === screenId) {
+        rects.push(rect);
+        continue;
+      }
+      const p = this.placements.get(sid);
+      if (p) rects.push(p);
+    }
+    return rectsAreAdjacent(rects) ? null : wall;
   }
 
   // ── Content library (Phase 3c) ──────────────────────────────────────────────

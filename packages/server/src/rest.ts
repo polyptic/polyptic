@@ -32,6 +32,7 @@ import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
 
 import {
+  BulkContentBody,
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
@@ -39,7 +40,9 @@ import {
   CreateSceneBody,
   IdentBody,
   InspectBody,
+  MoveTargetsBody,
   PlaceScreenBody,
+  UnplaceScreensBody,
   RebootBody,
   ShellArmBody,
   RenameMuralBody,
@@ -795,6 +798,23 @@ export function registerRestRoutes(
       return reply.code(404).send({ error: `unknown mural: ${body.data.muralId}` });
     }
 
+    // POL-100 — a member of a combined surface may be nudged around, but never OUT of its wall: a
+    // wall whose members stop forming one contiguous region would span content across canvas nobody
+    // is showing. Refuse the move (nothing is written); the operator splits the wall first.
+    const existing = control.getPlacement(params.data.screenId);
+    const broken = control.wallBrokenByPlacement(params.data.screenId, {
+      x: body.data.x,
+      y: body.data.y,
+      w: body.data.w ?? existing?.w ?? 0,
+      h: body.data.h ?? existing?.h ?? 0,
+    });
+    if (broken) {
+      return reply.code(409).send({
+        error: `moving ${params.data.screenId} there would break up ${broken.name ?? broken.id} — split the surface first, or drag the whole surface`,
+        wallId: broken.id,
+      });
+    }
+
     const placement = await control.placeScreen(
       params.data.screenId,
       body.data.muralId,
@@ -877,6 +897,7 @@ export function registerRestRoutes(
       params.data.muralId,
       body.data.memberScreenIds,
       body.data.name,
+      body.data.pack === true,
     );
     if (!result.ok) {
       const status =
@@ -885,7 +906,14 @@ export function registerRestRoutes(
           : result.error === "already-combined"
             ? 409
             : 400;
-      return reply.code(status).send({ error: result.error, screenId: result.screenId, wallId: result.wallId });
+      // POL-100 — a gappy selection is refused with a reason the console can act on (offer to pack).
+      const message =
+        result.error === "not-adjacent"
+          ? "those screens don't sit next to each other — close the gaps (pack) or move them together"
+          : result.error;
+      return reply
+        .code(status)
+        .send({ error: result.error, message, screenId: result.screenId, wallId: result.wallId });
     }
 
     // Combining clears the members' previous content — push the (now empty) slice to each player.
@@ -1034,6 +1062,167 @@ export function registerRestRoutes(
     pushRender(params.data.screenId, result.slice);
     broadcaster.broadcast(); // surfaceCount changed
     return { ok: true, revision: control.state.revision, slice: result.slice };
+  });
+
+  // ── Clearing content + bulk canvas operations (POL-96) ───────────────────────
+  //
+  // "Show nothing" is an intent in its own right: DELETE the content and the screen falls back to the
+  // idle splash (D39) instead of being handed some other page to display. The bulk route is the same
+  // thing across a whole selection — one call, one fan-out, one broadcast, one activity line, so a
+  // 20-screen assign costs the operator one interaction and the control plane one push per player.
+
+  // DELETE /api/v1/screens/:screenId/content  -> clear one screen (409 if it's a wall member)
+  fastify.delete("/api/v1/screens/:screenId/content", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.clearScreenContent(params.data.screenId);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; clear the wall`,
+          wallId: result.wallId,
+        });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "screen.content.clear", screenId: params.data.screenId, revision: control.state.revision },
+      "screen content cleared",
+    );
+    broadcaster.broadcast(); // surfaceCount changed
+    return { ok: true, revision: control.state.revision };
+  });
+
+  // DELETE /api/v1/walls/:wallId/content  -> clear a combined surface (the wall itself survives)
+  fastify.delete("/api/v1/walls/:wallId/content", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.clearWallContent(params.data.wallId);
+    if (!result.ok) {
+      return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "wall.content.clear", wallId: params.data.wallId, revision: control.state.revision },
+      "video wall content cleared",
+    );
+    broadcaster.broadcast();
+    return { ok: true, revision: control.state.revision };
+  });
+
+  // POST /api/v1/content/assign  { screenIds, wallIds, content|null }  -> bulk assign OR bulk clear
+  fastify.post("/api/v1/content/assign", async (request, reply) => {
+    const body = BulkContentBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.applyBulkContent(
+      { screenIds: body.data.screenIds, wallIds: body.data.wallIds },
+      body.data.content,
+    );
+    if (!result.ok) {
+      return reply.code(404).send({ error: `unknown content source: ${body.data.content?.sourceId}` });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      {
+        event: body.data.content ? "content.bulk-assign" : "content.bulk-clear",
+        screens: result.applied.screens,
+        walls: result.applied.walls,
+        skipped: result.skipped.length,
+        revision: control.state.revision,
+      },
+      body.data.content ? "content assigned in bulk" : "content cleared in bulk",
+    );
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      revision: control.state.revision,
+      applied: result.applied,
+      skipped: result.skipped,
+    };
+  });
+
+  // POST /api/v1/screens/unplace  { screenIds }  -> return several screens to the tray in one call
+  fastify.post("/api/v1/screens/unplace", async (request, reply) => {
+    const body = UnplaceScreensBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.unplaceScreens(body.data.screenIds);
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "screen.bulk-unplace", screenIds: result.unplaced },
+      "screens unplaced in bulk",
+    );
+    broadcaster.broadcast();
+    return { ok: true, unplaced: result.unplaced };
+  });
+
+  // POST /api/v1/murals/:muralId/move  { screenIds, wallIds, dx, dy }  -> atomic translate (POL-100)
+  //
+  // A whole combined surface drags as ONE unit (all members shift together) and a keyboard nudge
+  // moves a whole selection — both land here, so the wall's adjacency is re-checked once, against the
+  // finished geometry, and refused before a single row is written if it would break.
+  fastify.post("/api/v1/murals/:muralId/move", async (request, reply) => {
+    const params = MuralIdParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = MoveTargetsBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.moveTargets(
+      params.data.muralId,
+      { screenIds: body.data.screenIds, wallIds: body.data.wallIds },
+      body.data.dx,
+      body.data.dy,
+    );
+    if (!result.ok) {
+      const status =
+        result.error === "unknown-mural" ||
+        result.error === "unknown-screen" ||
+        result.error === "unknown-wall"
+          ? 404
+          : 409;
+      return reply.code(status).send({
+        error:
+          result.error === "breaks-wall"
+            ? `that move would break up the combined surface ${result.wallId} — split it first`
+            : result.error,
+        screenId: result.screenId,
+        wallId: result.wallId,
+      });
+    }
+
+    fastify.log.info(
+      {
+        event: "canvas.move",
+        muralId: params.data.muralId,
+        screens: body.data.screenIds,
+        walls: body.data.wallIds,
+        dx: body.data.dx,
+        dy: body.data.dy,
+      },
+      "canvas selection moved",
+    );
+    // A rigid translation changes no slice (span offsets are union-relative) — no render push needed.
+    broadcaster.broadcast();
+    return { ok: true, placements: result.placements };
   });
 
   // ── Page zoom (POL-57) ───────────────────────────────────────────────────────

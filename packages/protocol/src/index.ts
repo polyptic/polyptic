@@ -10,6 +10,10 @@
  */
 import { z } from "zod";
 
+/** Canvas geometry both the server and the console reason about: contact/adjacency + auto-pack
+ *  (POL-96/POL-100). Pure functions — the wall-validity rules live in exactly one place. */
+export * from "./geometry.js";
+
 export const PROTOCOL_VERSION = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1303,11 +1307,34 @@ export const PlaceScreenBody = z.object({
 });
 export type PlaceScreenBody = z.infer<typeof PlaceScreenBody>;
 
+/** Translate a canvas selection — screens and/or whole combined surfaces — by a delta, atomically
+ *  (POL-100). One call, one broadcast: this is how a wall is dragged (its members move together), how
+ *  the keyboard nudges a selection, and how a multi-screen drag lands. Every wall the move touches is
+ *  re-checked for adjacency, so a move can never leave an invalid wall behind. */
+export const MoveTargetsBody = z
+  .object({
+    screenIds: z.array(z.string()).default([]),
+    wallIds: z.array(z.string()).default([]),
+    dx: z.number(),
+    dy: z.number(),
+  })
+  .refine((b) => b.screenIds.length + b.wallIds.length > 0, {
+    message: "name at least one screen or wall to move",
+  });
+export type MoveTargetsBody = z.infer<typeof MoveTargetsBody>;
+
+/** Return several screens to the unplaced tray in one call (POL-96). */
+export const UnplaceScreensBody = z.object({ screenIds: z.array(z.string()).min(1) });
+export type UnplaceScreensBody = z.infer<typeof UnplaceScreensBody>;
+
 // REST bodies — combined surfaces (Phase 3b)
 export const CombineScreensBody = z.object({
   muralId: z.string(),
   memberScreenIds: z.array(z.string()).min(2),
   name: z.string().min(1).max(80).optional(), // optional name at creation; else a default is derived
+  /** POL-100 — close the gaps first: pack the members into a bezel-tight grid, then combine. Without
+   *  it a non-adjacent selection is REFUSED (a wall with a hole in it renders content nobody shows). */
+  pack: z.boolean().optional(),
 });
 export type CombineScreensBody = z.infer<typeof CombineScreensBody>;
 
@@ -1326,6 +1353,22 @@ export const SetContentBody = z
     message: "provide exactly one of sourceId or url",
   });
 export type SetContentBody = z.infer<typeof SetContentBody>;
+
+/**
+ * Assign content to — or CLEAR it from — many screens and walls at once (POL-96). `content: null` is
+ * the explicit unset: the named targets stop showing anything and fall back to the idle splash (D39).
+ * One call, one fan-out, one activity line, whatever the size of the selection.
+ */
+export const BulkContentBody = z
+  .object({
+    screenIds: z.array(z.string()).default([]),
+    wallIds: z.array(z.string()).default([]),
+    content: SetContentBody.nullable(),
+  })
+  .refine((b) => b.screenIds.length + b.wallIds.length > 0, {
+    message: "name at least one screen or wall",
+  });
+export type BulkContentBody = z.infer<typeof BulkContentBody>;
 
 /** Set the page zoom on a single screen's OR a video wall's framed content (POL-57). The server
  *  remembers the value against the (target, content) pair, so re-assigning the same page to the same

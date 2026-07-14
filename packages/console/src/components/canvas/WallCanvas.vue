@@ -7,23 +7,39 @@
   apply a fixed display scale to keep tiles tile-sized and labels legible at
   zoom 1 (Vue Flow's own pan/zoom still works on top).
 
-  Interactions:
-    - drag a node  → store.moveScreen (converted back to canvas px)
+  Interactions (POL-96 / POL-100 — the canvas now behaves like the Studio):
+    - drag a screen     → snaps to its neighbours' edges/centres (dashed guides), then store.moveScreen
+    - drag a WALL       → the whole combined surface moves as one unit, in one atomic server call;
+                          the server re-checks adjacency and refuses a move that would break it up
+    - drag several      → every selected tile moves together (one atomic call)
+    - shift-drag pane   → rubber-band select
+    - click             → select; shift-click toggles multi-select
+    - arrows            → nudge the selection (Shift = a big step), snapping as it goes
+    - Delete/Backspace  → unplace the selection · Escape → clear it
     - drop a tray item (HTML5 DnD, screenId in dataTransfer) → store.placeScreen
-    - click        → store.select([id]); shift-click toggles multi-select
-    - click pane   → clear selection
+    - click pane        → clear selection
 -->
 <script setup lang="ts">
-import { ref, watch, computed } from "vue";
+import { ref, watch, computed, onMounted, onUnmounted } from "vue";
 import type { Ref } from "vue";
 import { VueFlow, useVueFlow } from "@vue-flow/core";
 import type { Node } from "@vue-flow/core";
 import { Background } from "@vue-flow/background";
 import { Controls } from "@vue-flow/controls";
-import type { ScreenView } from "@polyptic/protocol";
+import type { Rect, ScreenView } from "@polyptic/protocol";
 
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
+import {
+  GRID_PX,
+  NUDGE_BIG_PX,
+  NUDGE_PX,
+  SNAP_PX,
+  nudgeRect,
+  snapCandidates,
+  snapRect,
+  unionBounds,
+} from "./snap";
 import ScreenNode from "./ScreenNode.vue";
 import WallNode from "./WallNode.vue";
 import SelectionToolbar from "./SelectionToolbar.vue";
@@ -38,12 +54,44 @@ const store = useConsoleStore();
 const { identingIds } = useIdent();
 
 const vf = useVueFlow();
-const { onNodeClick, onPaneClick, onNodeDragStart, onNodeDragStop, onPaneReady, fitView } = vf;
+const {
+  onNodeClick,
+  onPaneClick,
+  onNodeDragStart,
+  onNodeDrag,
+  onNodeDragStop,
+  onSelectionDragStart,
+  onSelectionDrag,
+  onSelectionDragStop,
+  onPaneReady,
+  onSelectionEnd,
+  getSelectedNodes,
+  fitView,
+  viewport,
+} = vf;
 
 // Cast past UnwrapRef: wrapping Vue Flow's deeply-generic Node in a ref otherwise trips TS2589.
 const nodes = ref([]) as Ref<Node[]>;
 const draggingIds = new Set<string>();
+/** Where each node sat (display px) when this drag began — the delta is what the server is told. */
+const dragOrigin = new Map<string, { x: number; y: number }>();
+/** The node ids Vue Flow was last handed — see the note at the end of `reconcile`. */
+let lastSignature = "";
 let didInitialFit = false;
+
+// Alignment guides (canvas px) shown while a single tile is dragged — the Studio's ergonomics.
+const guideX = ref<number | null>(null);
+const guideY = ref<number | null>(null);
+
+// A refusal from the control plane (e.g. a move that would break a combined surface). The Wall view
+// has no toast rail, so it shows as a transient line over the canvas.
+const notice = ref("");
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+function showNotice(message: string): void {
+  notice.value = message;
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => (notice.value = ""), 5000);
+}
 
 const hasPlaced = computed(() =>
   store.activeMuralId ? store.placedScreens(store.activeMuralId).length > 0 : false,
@@ -75,6 +123,11 @@ function buildData(screen: ScreenView) {
 /** Vue Flow node id for a combined surface (prefixed so it can never collide with a screen id). */
 function wallNodeId(wallId: string): string {
   return `w:${wallId}`;
+}
+
+/** The wall id behind a "w:…" node id, or null for a screen node. */
+function wallIdOfNode(nodeId: string): string | null {
+  return nodeId.startsWith("w:") ? nodeId.slice(2) : null;
 }
 
 function buildWallData(wall: { id: string; memberScreenIds: string[] }, bounds: { x: number; y: number; w: number; h: number }) {
@@ -141,6 +194,10 @@ function reconcile() {
     if (existing) {
       existing.data = data;
       existing.style = style;
+      // Vue Flow drags every SELECTED node together, so the store's selection is mirrored onto the
+      // node — that's what makes a multi-selection move as one (and the marquee's result draggable).
+      // `selected` lives on the runtime GraphNode, not the input Node type — hence the cast.
+      (existing as unknown as { selected: boolean }).selected = data.selected;
       // Don't yank a node out from under an in-progress drag.
       if (!draggingIds.has(screen.id)) {
         const cx = existing.position?.x ?? 0;
@@ -156,6 +213,7 @@ function reconcile() {
         style,
         draggable: true,
         selectable: true,
+        selected: data.selected,
       } as Node);
     }
   }
@@ -177,7 +235,7 @@ function reconcile() {
     if (existing) {
       existing.data = data;
       existing.style = style;
-      existing.position = pos;
+      if (!draggingIds.has(nid)) existing.position = pos;
     } else {
       nodes.value.push({
         id: nid,
@@ -185,10 +243,27 @@ function reconcile() {
         position: pos,
         data,
         style,
-        draggable: false,
+        // POL-100 — a combined surface drags as ONE unit (its members translate together).
+        draggable: true,
         selectable: true,
+        // NOTE: deliberately NOT mirroring the store's selection onto the wall node. Vue Flow will
+        // not sync a reconcile pass that REMOVES a selected node and ADDS another (found live: the
+        // optimistic `wall-pending` box was never replaced by the real wall, so it could not be
+        // dragged, renamed or given content until a reload). A wall drags as a single node either
+        // way; the selection ring is drawn by WallNode itself from the store.
       } as Node);
     }
+  }
+
+  // Vue Flow only picks up a model change when the ARRAY ITSELF changes — an in-place edit that keeps
+  // the same node COUNT is silently ignored (found live: combining swapped `w:wall-pending` for the
+  // real `w:wall-1` without changing the length, and the canvas kept rendering the optimistic box,
+  // which could then never be dragged, renamed or given content). Whenever the id set moves, hand
+  // Vue Flow a fresh array so the swap actually lands.
+  const signature = nodes.value.map((n) => n.id).join("|");
+  if (signature !== lastSignature) {
+    lastSignature = signature;
+    nodes.value = [...nodes.value];
   }
 }
 
@@ -234,20 +309,152 @@ onPaneReady(() => {
   }
 });
 
-onNodeDragStart((p: any) => {
-  const list = p?.nodes ?? (p?.node ? [p.node] : []);
-  for (const n of list) draggingIds.add(n.id);
-});
+// ── geometry helpers (canvas px) ────────────────────────────────────────────
 
-onNodeDragStop((p: any) => {
-  const list = p?.nodes ?? (p?.node ? [p.node] : []);
+/** The canvas rectangle a node covers: a screen's placement, or a wall's union bounding box. */
+function nodeRect(nodeId: string): Rect | undefined {
+  const wallId = wallIdOfNode(nodeId);
+  if (wallId) return store.wallBounds(wallId);
+  return store.placementForScreen(nodeId);
+}
+
+/** The screen ids a node stands for (a wall stands for all its members). */
+function nodeScreenIds(nodeId: string): string[] {
+  const wallId = wallIdOfNode(nodeId);
+  if (wallId) return [...(store.wallById(wallId)?.memberScreenIds ?? [])];
+  return [nodeId];
+}
+
+/** Every OTHER tile's rectangle — what the moving tile snaps against (solo screens + whole walls). */
+function siblingRects(movingNodeIds: readonly string[]): Rect[] {
+  const muralId = store.activeMuralId;
+  if (!muralId) return [];
+  const moving = new Set(movingNodeIds.flatMap((id) => nodeScreenIds(id)));
+  const walls = store.wallsForMural(muralId);
+  const walled = new Set(walls.flatMap((w) => w.memberScreenIds));
+
+  const rects: Rect[] = [];
+  for (const wall of walls) {
+    if (wall.memberScreenIds.some((sid) => moving.has(sid))) continue;
+    const bounds = store.wallBounds(wall.id);
+    if (bounds) rects.push(bounds);
+  }
+  for (const { screen, placement } of store.placedScreens(muralId)) {
+    if (moving.has(screen.id) || walled.has(screen.id)) continue;
+    rects.push(placement);
+  }
+  return rects;
+}
+
+/** Candidates = every sibling's edges/centres, plus the wall's own outer edges and centre. */
+function candidatesFor(movingNodeIds: readonly string[]) {
+  const siblings = siblingRects(movingNodeIds);
+  return snapCandidates(siblings, unionBounds(siblings));
+}
+
+// ── drag ────────────────────────────────────────────────────────────────────
+//
+// Vue Flow routes a drag of a SELECTED node through its selection machinery (selectionDrag*) and an
+// unselected one through nodeDrag* — the same gesture, two event families (found live: a selected
+// wall moved on screen and no server call ever went out). Both are wired to the same handlers.
+//
+// The snap lands on DROP, not mid-drag: Vue Flow recomputes each node's position from the pointer on
+// every tick, so a position we wrote during the drag would simply be overwritten. The guides show
+// live (that's the preview), and the drop is what clicks into place.
+
+/** The nodes a drag event carries (Vue Flow hands us `nodes` for a group, `node` for a lone tile). */
+function draggedNodes(p: any): any[] {
+  return p?.nodes?.length ? p.nodes : p?.node ? [p.node] : [];
+}
+
+/** The snapped canvas position of a single dragged tile, plus the guides to draw. */
+function snapDragged(node: any) {
+  const rect = nodeRect(node.id);
+  if (!rect) return undefined;
+  const moving: Rect = {
+    x: node.position.x / SCALE,
+    y: node.position.y / SCALE,
+    w: rect.w,
+    h: rect.h,
+  };
+  return { rect, ...snapRect(moving, candidatesFor([node.id]), { threshold: SNAP_PX, grid: GRID_PX }) };
+}
+
+function handleDragStart(p: any): void {
+  for (const n of draggedNodes(p)) {
+    draggingIds.add(n.id);
+    dragOrigin.set(n.id, { x: n.position.x, y: n.position.y });
+  }
+}
+
+function handleDrag(p: any): void {
+  const list = draggedNodes(p);
+  // A multi-tile drag keeps its members' relative geometry — snapping one of them would shear the
+  // group, so alignment guides are a single-tile affair (a group still drags + nudges freely).
+  if (list.length !== 1) {
+    guideX.value = null;
+    guideY.value = null;
+    return;
+  }
+  const snapped = snapDragged(list[0]);
+  guideX.value = snapped?.guideX ?? null;
+  guideY.value = snapped?.guideY ?? null;
+}
+
+async function handleDragStop(p: any): Promise<void> {
+  const list = draggedNodes(p);
+  guideX.value = null;
+  guideY.value = null;
+  if (list.length === 0) return;
+
+  // A lone tile lands on its SNAPPED position; a group moves by the raw delta it was dragged.
+  const single = list.length === 1 ? snapDragged(list[0]) : undefined;
+  const first = list[0];
+  const origin = dragOrigin.get(first.id);
+
+  let dx = origin ? Math.round((first.position.x - origin.x) / SCALE) : 0;
+  let dy = origin ? Math.round((first.position.y - origin.y) / SCALE) : 0;
+  if (single) {
+    dx = Math.round(single.x - single.rect.x);
+    dy = Math.round(single.y - single.rect.y);
+  }
+
   for (const n of list) {
     draggingIds.delete(n.id);
-    // Only screen tiles are draggable; combined surfaces (type "wall") are not moved here.
-    if (n.type === "wall") continue;
-    store.moveScreen(n.id, Math.round(n.position.x / SCALE), Math.round(n.position.y / SCALE));
+    dragOrigin.delete(n.id);
   }
-});
+  if (dx === 0 && dy === 0) {
+    reconcile(); // put the tile back where the store says it is (a nudge too small to keep)
+    return;
+  }
+
+  const wallIds = list
+    .map((n: any) => wallIdOfNode(n.id))
+    .filter((id: string | null): id is string => !!id);
+  const screenIds = list
+    .filter((n: any) => !wallIdOfNode(n.id))
+    .map((n: any) => n.id as string);
+
+  // One screen on its own keeps the absolute placement path (it carries the snapped x/y exactly).
+  // Anything else — a whole combined surface, or a group — is ONE atomic translate on the server.
+  if (single && wallIds.length === 0 && screenIds.length === 1) {
+    await store.moveScreen(screenIds[0]!, Math.round(single.x), Math.round(single.y));
+    return;
+  }
+
+  const refusal = await store.moveTargets({ screenIds, wallIds }, dx, dy);
+  if (refusal) showNotice(refusal);
+  reconcile(); // the authoritative geometry (snapped, or rolled back) repaints the tiles
+}
+
+onNodeDragStart(handleDragStart);
+onSelectionDragStart(handleDragStart);
+onNodeDrag(handleDrag);
+onSelectionDrag(handleDrag);
+onNodeDragStop(handleDragStop);
+onSelectionDragStop(handleDragStop);
+
+// ── selection ───────────────────────────────────────────────────────────────
 
 onNodeClick((p: any) => {
   const node = p.node;
@@ -283,7 +490,115 @@ onNodeClick((p: any) => {
   }
 });
 
+// Rubber-band (shift-drag on the pane) — Vue Flow draws the box; the store owns what it caught.
+// Only loose screens are collected: a combined surface is addressed as a whole (selectWall), and
+// mixing the two selections has no meaningful bulk action.
+onSelectionEnd(() => {
+  const caught = getSelectedNodes.value
+    .filter((n) => !wallIdOfNode(n.id))
+    .map((n) => n.id);
+  if (caught.length === 0) return;
+  store.select(caught);
+});
+
 onPaneClick(() => store.select([]));
+
+// ── keyboard: nudge / unplace / clear (POL-100) ─────────────────────────────
+
+/** True when the operator is typing — the canvas must not eat those keys. */
+function typingInField(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || !el.tagName) return false;
+  const tag = el.tagName.toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable === true;
+}
+
+/** The current selection as canvas targets: a wall, or some loose screens. */
+function selectionTargets(): { screenIds: string[]; wallIds: string[] } {
+  const wallId = store.selectedWallId;
+  if (wallId) return { screenIds: [], wallIds: [wallId] };
+  return { screenIds: [...store.selectedScreenIds], wallIds: [] };
+}
+
+async function nudge(dx: number, dy: number): Promise<void> {
+  const targets = selectionTargets();
+  const nodeIds = [
+    ...targets.wallIds.map((id) => wallNodeId(id)),
+    ...targets.screenIds,
+  ];
+  if (nodeIds.length === 0) return;
+
+  let ddx = dx;
+  let ddy = dy;
+  // A single tile snaps as it nudges (arrow it at its neighbour and it lands bezel-tight); a group
+  // moves by the raw step, so its internal geometry is preserved exactly.
+  if (nodeIds.length === 1) {
+    const rect = nodeRect(nodeIds[0]!);
+    if (rect) {
+      const snapped = nudgeRect(rect, dx, dy, candidatesFor(nodeIds), SNAP_PX);
+      ddx = Math.round(snapped.x - rect.x);
+      ddy = Math.round(snapped.y - rect.y);
+    }
+  }
+  const refusal = await store.moveTargets(targets, ddx, ddy);
+  if (refusal) showNotice(refusal);
+}
+
+async function unplaceSelection(): Promise<void> {
+  const targets = selectionTargets();
+  // Unplacing a wall's members dissolves the wall and returns the panels to the tray.
+  const screenIds = targets.wallIds.length
+    ? targets.wallIds.flatMap((id) => store.wallById(id)?.memberScreenIds ?? [])
+    : targets.screenIds;
+  if (screenIds.length === 0) return;
+  await store.unplaceScreens(screenIds);
+  store.select([]);
+}
+
+function onKeyDown(e: KeyboardEvent): void {
+  if (typingInField(e.target)) return;
+  const hasSelection = store.selectedWallId !== null || store.selectedScreenIds.length > 0;
+
+  if (e.key === "Escape") {
+    store.select([]);
+    return;
+  }
+  if (!hasSelection) return;
+
+  if (e.key === "Delete" || e.key === "Backspace") {
+    e.preventDefault();
+    void unplaceSelection();
+    return;
+  }
+
+  const step = e.shiftKey ? NUDGE_BIG_PX : NUDGE_PX;
+  switch (e.key) {
+    case "ArrowLeft":
+      e.preventDefault();
+      void nudge(-step, 0);
+      break;
+    case "ArrowRight":
+      e.preventDefault();
+      void nudge(step, 0);
+      break;
+    case "ArrowUp":
+      e.preventDefault();
+      void nudge(0, -step);
+      break;
+    case "ArrowDown":
+      e.preventDefault();
+      void nudge(0, step);
+      break;
+    default:
+      break;
+  }
+}
+
+onMounted(() => window.addEventListener("keydown", onKeyDown));
+onUnmounted(() => {
+  window.removeEventListener("keydown", onKeyDown);
+  if (noticeTimer) clearTimeout(noticeTimer);
+});
 
 // ── Drop a screen from the Unplaced tray onto the canvas ───────────────────
 function toFlow(clientX: number, clientY: number): { x: number; y: number } {
@@ -330,6 +645,14 @@ function onDragOver(e: DragEvent) {
   // the browser reject the drop, so honour the in-progress source drag.
   if (e.dataTransfer) e.dataTransfer.dropEffect = store.draggingSourceId ? "copy" : "move";
 }
+
+// The guides live in canvas space, so they ride the viewport transform (pan + zoom) with the tiles.
+const guideTransform = computed(() => {
+  const vp = viewport.value;
+  return `translate(${vp.x}px, ${vp.y}px) scale(${vp.zoom})`;
+});
+const guideLeft = computed(() => (guideX.value === null ? 0 : guideX.value * SCALE));
+const guideTop = computed(() => (guideY.value === null ? 0 : guideY.value * SCALE));
 </script>
 
 <template>
@@ -339,12 +662,12 @@ function onDragOver(e: DragEvent) {
       class="wall-flow"
       :min-zoom="0.2"
       :max-zoom="2"
-      :snap-to-grid="true"
-      :snap-grid="[12, 12]"
+      :snap-to-grid="false"
       :default-viewport="{ x: 40, y: 40, zoom: 1 }"
       :select-nodes-on-drag="false"
       :nodes-connectable="false"
       :elements-selectable="true"
+      selection-key-code="Shift"
     >
       <Background :gap="24" :size="1.2" pattern-color="var(--dot)" />
       <Controls :show-interactive="false" />
@@ -358,7 +681,15 @@ function onDragOver(e: DragEvent) {
       </template>
     </VueFlow>
 
+    <!-- Alignment guides (the Studio's dashed accent lines), drawn in canvas space. -->
+    <div class="guides" :style="{ transform: guideTransform }">
+      <div v-if="guideX !== null" class="guide-v" :style="{ left: `${guideLeft}px` }"></div>
+      <div v-if="guideY !== null" class="guide-h" :style="{ top: `${guideTop}px` }"></div>
+    </div>
+
     <SelectionToolbar />
+
+    <div v-if="notice" class="canvas-notice">{{ notice }}</div>
 
     <div v-if="!hasPlaced" class="empty-canvas">
       <div class="empty-card">
@@ -384,6 +715,46 @@ function onDragOver(e: DragEvent) {
 .wall-flow {
   width: 100%;
   height: 100%;
+}
+
+/* guides */
+.guides {
+  position: absolute;
+  inset: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
+  z-index: 70;
+}
+.guide-v {
+  position: absolute;
+  top: -100000px;
+  height: 200000px;
+  width: 0;
+  border-left: 1px dashed var(--accent);
+}
+.guide-h {
+  position: absolute;
+  left: -100000px;
+  width: 200000px;
+  height: 0;
+  border-top: 1px dashed var(--accent);
+}
+
+.canvas-notice {
+  position: absolute;
+  left: 50%;
+  bottom: 78px;
+  transform: translateX(-50%);
+  max-width: 460px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+  color: var(--fg2);
+  line-height: 1.45;
+  z-index: 95;
 }
 
 .empty-canvas {
@@ -433,6 +804,12 @@ function onDragOver(e: DragEvent) {
 }
 .wall-flow :deep(.vue-flow__node-screen.selected) {
   box-shadow: none;
+}
+/* The rubber band (shift-drag on the pane). */
+.wall-flow :deep(.vue-flow__selection) {
+  background: var(--accent-soft);
+  border: 1px dashed var(--accent);
+  border-radius: 4px;
 }
 .wall-flow :deep(.vue-flow__controls) {
   box-shadow: var(--shadow);
