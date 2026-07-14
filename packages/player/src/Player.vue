@@ -64,6 +64,7 @@ import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
 import { openIdbMediaStore } from "./media-cache-idb";
 import { loadLastSlice, saveLastSlice } from "./last-slice";
+import { applyAudio, ensurePlaying, surfaceAudio } from "./audio";
 import IdleSplash from "./IdleSplash.vue";
 
 // Injected by Vite (see vite.config.ts) from package.json — the build version shown on the idle splash.
@@ -498,8 +499,47 @@ function isInteractive(surface: Surface): boolean {
 function videoLoop(surface: Surface): boolean {
   return surface.type === "video" ? surface.loop : true;
 }
-function videoMuted(surface: Surface): boolean {
-  return surface.type === "video" ? surface.muted : true;
+/**
+ * POL-112 — the surface's audio intent, straight off the wire. The player no longer decides: the flag
+ * the control plane sent is the flag the element gets (a surface that carries none is silent).
+ */
+function videoAudio(surface: Surface) {
+  return surfaceAudio(surface);
+}
+
+/** Re-apply audio to the elements already on the wall whenever the intent changes. The elements are
+ *  keyed by surface id and SURVIVE the push (D5), so unmuting a wall does not restart the clip — the
+ *  volume simply comes up on the video that is already playing. */
+watch(
+  () => surfaces.value.map((s) => `${s.id}:${JSON.stringify(surfaceAudio(s))}`).join("|"),
+  () => {
+    for (const surface of surfaces.value) {
+      const el = surfaceEls.get(surface.id);
+      if (el instanceof HTMLVideoElement) void applyVideoAudio(surface, el);
+    }
+  },
+);
+
+/** Apply the intent, then make sure the element is actually PLAYING: an unmuted autoplay that the
+ *  browser's policy refuses (surf/Xwayland, a dev browser, no `--autoplay-policy` flag) falls back to
+ *  muted playback rather than freezing the wall on a dead frame. The fallback is logged, never fatal. */
+async function applyVideoAudio(surface: Surface, el: HTMLVideoElement): Promise<void> {
+  const intent = surfaceAudio(surface);
+  applyAudio(el, intent);
+  if (intent.muted) return; // a muted element autoplays everywhere; nothing to rescue
+  const outcome = await ensurePlaying(el);
+  if (outcome === "muted-fallback") {
+    diag(`${surface.id}: unmuted autoplay was BLOCKED by the browser — playing muted instead`);
+  } else if (outcome === "blocked") {
+    diag(`${surface.id}: playback was blocked by the browser even muted`);
+  }
+}
+
+/** The video element has data: it is safe to apply audio and (if unmuted) to force playback. */
+function onVideoReady(surface: Surface, event: Event): void {
+  onContentLoad(surface.id, "video");
+  const el = event.target;
+  if (el instanceof HTMLVideoElement) void applyVideoAudio(surface, el);
 }
 
 function connLabel(state: ConnState): string {
@@ -614,8 +654,9 @@ function connLabel(state: ConnState): string {
           autoplay
           playsinline
           :loop="videoLoop(surface)"
-          :muted="videoMuted(surface)"
-          @loadeddata="onContentLoad(surface.id, 'video')"
+          :muted="videoAudio(surface).muted"
+          :volume="videoAudio(surface).volume"
+          @loadeddata="onVideoReady(surface, $event)"
           @error="onContentError(surface.id, 'video')"
         />
       </template>

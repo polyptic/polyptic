@@ -6,7 +6,7 @@
     - single  : live preview (mirrors the tile's canvas state, status chip overlaid) · rename ·
                 "Driven by {machine}" + mono connector chip · Ident · content (LIBRARY only —
                 ad-hoc URL entry was removed as an anti-pattern; add URLs to the Content library
-                instead) · page zoom · layout read-out · remove from wall. The header carries a ⋯
+                instead) · page zoom · SOUND (POL-112) · layout read-out · remove from wall. The header carries a ⋯
                 overflow menu with the dev-tools quick-launch (POL-85): the same arm-then-open flow
                 as the Machines view (chrome = remote DevTools in a new tab, surf = the on-panel
                 inspector), via the shared useScreenInspect composable — an operator debugging a
@@ -30,6 +30,8 @@ import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
 import Toggle from "../Toggle.vue";
 import ZoomControl from "./ZoomControl.vue";
+import AudioControl from "./AudioControl.vue";
+import type { AudioIntent } from "@polyptic/protocol";
 
 const store = useConsoleStore();
 const { ident, identMany, flash, isIdenting } = useIdent();
@@ -94,6 +96,23 @@ function zoomScreen(zoom: number) {
 function zoomWall(zoom: number) {
   const w = wall.value;
   if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
+}
+
+// ── sound (POL-112) ─────────────────────────────────────────────────────────
+// The live audio rides on the content read-out and is present only for AUDIBLE (video/playlist)
+// content — so `audio !== undefined` is exactly the question "can this selection make sound?", and
+// the control is absent, not disabled, for a dashboard or an empty screen. A wall's read-out carries
+// the operator's INTENT for the surface; the server gives the sound to one panel (see the caption).
+const singleAudio = computed(() => singleContent.value?.audio);
+const wallAudio = computed(() => wallContent.value?.audio);
+
+function soundScreen(audio: AudioIntent) {
+  const s = single.value;
+  if (s) void store.setScreenAudio(s.id, audio);
+}
+function soundWall(audio: AudioIntent) {
+  const w = wall.value;
+  if (w && !wallPending.value) void store.setWallAudio(w.id, audio);
 }
 
 const wallSourcePick = ref("");
@@ -402,6 +421,17 @@ function selectOne(id: string) {
         />
       </template>
 
+      <template v-if="wallAudio !== undefined">
+        <div class="section-label gap-top">Sound</div>
+        <AudioControl
+          :audio="wallAudio"
+          title="Wall sound"
+          :disabled="wallPending"
+          caption="One panel carries the sound for the whole surface — every panel playing it would echo the room. Muted until you turn it on."
+          @update="soundWall"
+        />
+      </template>
+
       <div class="panels-head">
         <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
         <span class="panels-res">{{ wallRes }}</span>
@@ -528,6 +558,16 @@ function selectOne(id: string) {
           :zoom="singleZoom"
           caption="Remembered for this screen and this page."
           @update="zoomScreen"
+        />
+      </template>
+
+      <template v-if="singleAudio !== undefined">
+        <div class="section-label gap-top">Sound</div>
+        <AudioControl
+          :audio="singleAudio"
+          title="Screen sound"
+          caption="Muted until you turn it on. Remembered for this screen and this content — new content always arrives silent."
+          @update="soundScreen"
         />
       </template>
 

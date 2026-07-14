@@ -47,6 +47,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedAudioPreference,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -147,6 +148,13 @@ interface CredentialProfileRow {
   scope: string | null;
   audience: string | null;
   token_param: string;
+}
+
+interface AudioPreferenceRow {
+  target_id: string;
+  source_key: string;
+  muted: boolean;
+  volume: number;
 }
 
 interface ZoomPreferenceRow {
@@ -313,6 +321,18 @@ export class PostgresStore implements Store {
         PRIMARY KEY (target_id, source_key)
       )
     `;
+    // Audio preferences (POL-112). Same shape and lifetime as a zoom preference: one row per
+    // (screen-or-wall, content) pair, so an operator dials the sound in once and the same clip on the
+    // same screen comes back that way. No row = the muted default, which is what NEW content gets.
+    await sql`
+      CREATE TABLE IF NOT EXISTS audio_preferences (
+        target_id  text NOT NULL,
+        source_key text NOT NULL,
+        muted      boolean NOT NULL,
+        volume     double precision NOT NULL,
+        PRIMARY KEY (target_id, source_key)
+      )
+    `;
     // Credential profiles (POL-24): centrally-held OAuth clients for Bucket-A content auth. The
     // client secret's ONLY durable home — never broadcast, never returned by REST, never logged.
     await sql`
@@ -452,6 +472,7 @@ export class PostgresStore implements Store {
       sceneRows,
       credentialProfileRows,
       zoomPreferenceRows,
+      audioPreferenceRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
@@ -464,6 +485,7 @@ export class PostgresStore implements Store {
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
+      sql<AudioPreferenceRow[]>`SELECT target_id, source_key, muted, volume FROM audio_preferences`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -551,6 +573,13 @@ export class PostgresStore implements Store {
       zoom: Number(row.zoom),
     }));
 
+    const audioPreferences: PersistedAudioPreference[] = audioPreferenceRows.map((row) => ({
+      targetId: row.target_id,
+      sourceKey: row.source_key,
+      muted: row.muted === true,
+      volume: Number(row.volume),
+    }));
+
     const scenes: PersistedScene[] = sceneRows.map((row) => {
       // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
       const raw =
@@ -582,6 +611,7 @@ export class PostgresStore implements Store {
       scenes,
       credentialProfiles,
       zoomPreferences,
+      audioPreferences,
     };
   }
 
@@ -631,6 +661,7 @@ export class PostgresStore implements Store {
     await sql`DELETE FROM screen_content WHERE screen_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM placements WHERE screen_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM zoom_preferences WHERE target_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
+    await sql`DELETE FROM audio_preferences WHERE target_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM screens WHERE machine_id = ${id}`;
     await sql`DELETE FROM machines WHERE id = ${id}`;
   }
@@ -843,6 +874,34 @@ export class PostgresStore implements Store {
       targetId: row.target_id,
       sourceKey: row.source_key,
       zoom: Number(row.zoom),
+    }));
+  }
+
+  // ── Audio preferences (POL-112) ──────────────────────────────────────────────
+
+  async upsertAudioPreference(pref: PersistedAudioPreference): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO audio_preferences (target_id, source_key, muted, volume)
+      VALUES (${pref.targetId}, ${pref.sourceKey}, ${pref.muted}, ${pref.volume})
+      ON CONFLICT (target_id, source_key)
+      DO UPDATE SET muted = EXCLUDED.muted, volume = EXCLUDED.volume
+    `;
+  }
+
+  async deleteAudioPreferencesForTarget(targetId: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM audio_preferences WHERE target_id = ${targetId}`;
+  }
+
+  async listAudioPreferences(): Promise<PersistedAudioPreference[]> {
+    const sql = this.sql;
+    const rows = await sql<AudioPreferenceRow[]>`SELECT target_id, source_key, muted, volume FROM audio_preferences`;
+    return rows.map((row) => ({
+      targetId: row.target_id,
+      sourceKey: row.source_key,
+      muted: row.muted === true,
+      volume: Number(row.volume),
     }));
   }
 

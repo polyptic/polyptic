@@ -160,9 +160,15 @@ describe("playlist resolution (POL-34)", () => {
     // The rotation anchor is a real instant (wall members + reboots derive their phase from it).
     expect(Number.isFinite(Date.parse(surface.startedAt))).toBe(true);
 
-    // The console reads this as the library source it is — and offers no zoom (not one page).
+    // The console reads this as the library source it is — and offers no zoom (not one page). It DOES
+    // offer sound (POL-112): a rotation can hold a video, so the audio read-out is present — muted.
     const summary = cp.screenContentSummary(screen.id);
-    expect(summary).toEqual({ name: "Rotation", kind: "playlist", zoom: undefined });
+    expect(summary).toEqual({
+      name: "Rotation",
+      kind: "playlist",
+      zoom: undefined,
+      audio: { muted: true, volume: 1 },
+    });
   });
 
   test("a playlist SPANS a video wall: every member carries the same rotation and anchor", async () => {

@@ -20,12 +20,14 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  SetAudioBody,
   SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type {
+  AudioIntent,
   ContentSource,
   CredentialProfileTestResult,
   CredentialProfileView,
@@ -308,6 +310,12 @@ export function setScreenZoom(screenId: string, zoom: number): Promise<unknown> 
   return send("PUT", `/screens/${encodeURIComponent(screenId)}/zoom`, SetZoomBody.parse({ zoom }));
 }
 
+/** PUT /api/v1/screens/:screenId/audio { muted, volume } — sound for this screen's video/playlist
+ *  (POL-112). Remembered for this (screen, content) pair; new content always arrives muted. */
+export function setScreenAudio(screenId: string, audio: AudioIntent): Promise<unknown> {
+  return send("PUT", `/screens/${encodeURIComponent(screenId)}/audio`, SetAudioBody.parse(audio));
+}
+
 // ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
 
 /** POST /api/v1/murals/:muralId/walls { muralId, memberScreenIds } — combine ≥2 adjacent screens. */
@@ -341,6 +349,12 @@ export function setWallContent(wallId: string, body: SetContentBody): Promise<un
  *  Every member takes the same zoom, so the wall stays one continuous page. */
 export function setWallZoom(wallId: string, zoom: number): Promise<unknown> {
   return send("PUT", `/walls/${encodeURIComponent(wallId)}/zoom`, SetZoomBody.parse({ zoom }));
+}
+
+/** PUT /api/v1/walls/:wallId/audio { muted, volume } — sound for a combined surface (POL-112). The
+ *  server gives it to ONE panel (the anchor) and keeps the rest muted, so the wall cannot echo. */
+export function setWallAudio(wallId: string, audio: AudioIntent): Promise<unknown> {
+  return send("PUT", `/walls/${encodeURIComponent(wallId)}/audio`, SetAudioBody.parse(audio));
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */
