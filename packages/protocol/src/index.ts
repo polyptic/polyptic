@@ -1226,6 +1226,81 @@ export const Scene = z.object({
 });
 export type Scene = z.infer<typeof Scene>;
 
+// ── Scene apply-preview (POL-95) ─────────────────────────────────────────────
+// Applying a scene is a leap: on a 12-screen mural the wall visibly jumps and nothing said what was
+// about to happen. The server — the only thing that knows BOTH the saved snapshot and the live wall —
+// computes the changeset (`GET /api/v1/scenes/:id/diff`) and the console renders it as a glanceable
+// card on Apply. Terraform-plan / kubectl-diff mental model: show the plan, then reconcile. The
+// preview is READ-ONLY and never a gate — apply stays one click.
+
+/** What applying the scene does to ONE target (a screen or a video wall). A target can carry several:
+ *  a screen may move AND change content; a wall may be combined AND given content. */
+export const SceneDiffChange = z.enum([
+  "content", // the content on it changes (from → to)
+  "cleared", // it is showing something and the scene has it empty
+  "move", // it stays on the mural but its placement geometry changes
+  "place", // it is not on the mural now; the scene places it
+  "unplace", // it is on the mural now; the scene does not include it (its content is cleared)
+  "combine", // these screens are combined into a video wall (they are not one now)
+  "split", // this video wall is broken back into individual screens
+]);
+export type SceneDiffChange = z.infer<typeof SceneDiffChange>;
+
+/** One side of a content change, pre-resolved for display: the assignment plus a human label (a
+ *  library source's name, or the ad-hoc url). `null` = nothing on air. */
+export const SceneDiffContent = z
+  .object({
+    sourceId: z.string().optional(),
+    url: z.string().optional(),
+    label: z.string(),
+  })
+  .nullable();
+export type SceneDiffContent = z.infer<typeof SceneDiffContent>;
+
+/** One changed target. Unchanged targets are NOT listed (they are counted in `summary.unchanged`) —
+ *  the card is a read-out of what MOVES, not an inventory of the wall. */
+export const SceneDiffEntry = z.object({
+  target: z.enum(["screen", "wall"]),
+  /** The screen id, or — for a wall — a stable key derived from its sorted member ids. */
+  id: z.string(),
+  /** Friendly name: the screen's, or "Video wall (N screens)". */
+  name: z.string(),
+  /** The screens this entry covers (1 for a screen, N for a wall). */
+  screenIds: z.array(z.string()).min(1),
+  changes: z.array(SceneDiffChange).min(1),
+  from: SceneDiffContent, // what is on it NOW
+  to: SceneDiffContent, // what the scene puts on it
+});
+export type SceneDiffEntry = z.infer<typeof SceneDiffEntry>;
+
+/** The counts behind the one-line read-out ("3 screens change content, 1 screen moves, 1 wall splits"). */
+export const SceneDiffSummary = z.object({
+  contentChanges: z.number().int().nonnegative(),
+  cleared: z.number().int().nonnegative(),
+  moves: z.number().int().nonnegative(),
+  placed: z.number().int().nonnegative(),
+  unplaced: z.number().int().nonnegative(),
+  combines: z.number().int().nonnegative(),
+  splits: z.number().int().nonnegative(),
+  /** Targets the apply leaves exactly as they are. */
+  unchanged: z.number().int().nonnegative(),
+});
+export type SceneDiffSummary = z.infer<typeof SceneDiffSummary>;
+
+export const SceneDiff = z.object({
+  sceneId: z.string(),
+  sceneName: z.string(),
+  muralId: z.string(),
+  /** True when applying would change nothing on the wall (the scene IS the live wall). */
+  identical: z.boolean(),
+  entries: z.array(SceneDiffEntry),
+  summary: SceneDiffSummary,
+  /** Plain-English caveats the apply cannot fix: a captured screen that no longer exists, a captured
+   *  library source that has been deleted (that target will land EMPTY). */
+  warnings: z.array(z.string()),
+});
+export type SceneDiff = z.infer<typeof SceneDiff>;
+
 export const AdminHello = z.object({
   t: z.literal("admin/hello"),
   protocol: z.literal(PROTOCOL_VERSION),
@@ -1366,6 +1441,11 @@ export const ServerToAdminState = z.object({
   videoWalls: z.array(VideoWall), // Phase 3b — combined surfaces
   contentSources: z.array(ContentSource), // Phase 3c — the content library
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
+  /** POL-95 — the scene the wall is CURRENTLY on, straight from the server's desired state (null once
+   *  a manual change diverges the wall from it). Authoritative: every console — a reload, a second
+   *  operator — agrees on the Active badge because it is told, never because it guessed. Optional on
+   *  the wire = back-compat with an older server (the console then simply shows no badge). */
+  activeSceneId: z.string().nullable().optional(),
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat

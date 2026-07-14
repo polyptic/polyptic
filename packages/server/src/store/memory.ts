@@ -69,6 +69,8 @@ export class MemoryStore implements Store {
   /** Fleet-wide display settings (POL-6), undefined until first changed. */
   private displaySettings: PersistedDisplaySettings | undefined;
   private revision = 0;
+  /** POL-95 — the scene the wall is on (null = none / diverged). */
+  private activeSceneId: string | null = null;
 
   async migrate(): Promise<void> {
     // Nothing to set up for the in-memory store.
@@ -77,6 +79,7 @@ export class MemoryStore implements Store {
   async load(): Promise<PersistedState> {
     return {
       revision: this.revision,
+      activeSceneId: this.activeSceneId,
       machines: [...this.machines.values()].map(clone),
       screens: [...this.screens.values()].map(clone),
       content: [...this.content.values()].map(clone),
@@ -138,6 +141,10 @@ export class MemoryStore implements Store {
 
   async setRevision(revision: number): Promise<void> {
     this.revision = revision;
+  }
+
+  async setActiveSceneId(sceneId: string | null): Promise<void> {
+    this.activeSceneId = sceneId;
   }
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────

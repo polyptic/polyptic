@@ -1552,6 +1552,22 @@ export function registerRestRoutes(
     return reply.code(201).send({ ok: true, scene });
   });
 
+  // GET /api/v1/scenes/:id/diff  -> the APPLY PREVIEW (POL-95): what applying this scene would change
+  // on its mural (content / placement / combine / split / cleared), computed server-side against the
+  // LIVE wall. Read-only — it changes nothing, and it never gates the apply (which stays one click).
+  fastify.get("/api/v1/scenes/:id/diff", async (request, reply) => {
+    const params = SceneParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const diff = control.diffScene(params.data.id);
+    if (!diff) {
+      return reply.code(404).send({ error: `unknown scene: ${params.data.id}` });
+    }
+    return reply.send({ ok: true, diff });
+  });
+
   // POST /api/v1/scenes/:id/apply  -> re-apply the scene to its mural; push render to every member
   fastify.post("/api/v1/scenes/:id/apply", async (request, reply) => {
     const params = SceneParams.safeParse(request.params);

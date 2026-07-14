@@ -296,6 +296,9 @@ export function buildAdminState(
     videoWalls: control.getVideoWalls(),
     contentSources: control.getContentSources(),
     scenes: control.getScenes(),
+    // POL-95 — the ACTIVE scene, straight from desired state. The console used to invent this
+    // client-side (optimistic on apply), so a reload or a second operator saw a wrong/absent badge.
+    activeSceneId: control.state.activeSceneId,
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)

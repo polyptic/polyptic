@@ -30,6 +30,7 @@ import type {
   CredentialProfileTestResult,
   CredentialProfileView,
   Scene,
+  SceneDiff,
   VideoWall,
 } from "@polyptic/protocol";
 
@@ -534,6 +535,16 @@ export function applyScene(sceneId: string): Promise<unknown> {
 export async function updateScene(sceneId: string, body: UpdateSceneBody): Promise<Scene> {
   const res = await send<{ scene: Scene }>("PATCH", `/scenes/${encodeURIComponent(sceneId)}`, UpdateSceneBody.parse(body));
   return res.scene;
+}
+
+/**
+ * GET /api/v1/scenes/:sceneId/diff — the APPLY PREVIEW (POL-95): what applying this scene would
+ * change on its mural, computed by the server against the live wall (the only thing that knows both).
+ * Read-only; it is a read-out, never a gate — apply stays one click.
+ */
+export async function sceneDiff(sceneId: string): Promise<SceneDiff> {
+  const res = await send<{ diff: SceneDiff }>("GET", `/scenes/${encodeURIComponent(sceneId)}/diff`);
+  return res.diff;
 }
 
 /** DELETE /api/v1/scenes/:sceneId — delete a saved scene. */

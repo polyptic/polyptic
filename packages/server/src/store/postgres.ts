@@ -83,6 +83,7 @@ interface ContentRow {
 
 interface MetaRow {
   revision: string; // bigint comes back as a string to avoid precision loss
+  active_scene_id: string | null; // POL-95 — the scene the wall is on (null = none / diverged)
 }
 
 interface MuralRow {
@@ -253,6 +254,10 @@ export class PostgresStore implements Store {
       INSERT INTO meta (id, revision) VALUES (1, 0)
       ON CONFLICT (id) DO NOTHING
     `;
+    // POL-95 — the ACTIVE scene rides in the same single row as the revision: it is desired state
+    // (which scene the wall is on), not a console hint, so it must survive a restart. Idempotent
+    // migration for databases created before POL-95; NULL = none / the wall has diverged.
+    await sql`ALTER TABLE meta ADD COLUMN IF NOT EXISTS active_scene_id text`;
     // Murals & placement (Phase 3). A screen is placed on at most one mural, so screen_id is the PK.
     await sql`
       CREATE TABLE IF NOT EXISTS murals (
@@ -456,7 +461,7 @@ export class PostgresStore implements Store {
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
-      sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
+      sql<MetaRow[]>`SELECT revision, active_scene_id FROM meta WHERE id = 1`,
       sql<MuralRow[]>`SELECT id, name FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
@@ -569,9 +574,11 @@ export class PostgresStore implements Store {
     });
 
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
+    const activeSceneId = metaRows[0]?.active_scene_id ?? null;
 
     return {
       revision,
+      activeSceneId,
       machines,
       screens,
       content,
@@ -680,6 +687,14 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO meta (id, revision) VALUES (1, ${revision})
       ON CONFLICT (id) DO UPDATE SET revision = EXCLUDED.revision
+    `;
+  }
+
+  async setActiveSceneId(sceneId: string | null): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO meta (id, revision, active_scene_id) VALUES (1, 0, ${sceneId})
+      ON CONFLICT (id) DO UPDATE SET active_scene_id = EXCLUDED.active_scene_id
     `;
   }
 

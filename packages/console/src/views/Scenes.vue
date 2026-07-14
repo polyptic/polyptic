@@ -18,6 +18,7 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useConsoleStore } from "../stores/console";
+import SceneDiffCard from "../components/canvas/SceneDiffCard.vue";
 
 const store = useConsoleStore();
 
@@ -58,6 +59,23 @@ function onSchedule(id: string, e: Event) {
 }
 function apply(id: string) {
   store.applyScene(id);
+}
+
+// ── apply preview (POL-95) ─────────────────────────────────────────────────────
+// Hover or keyboard-focus Apply and the server says what would change on the wall before the wall
+// visibly jumps. A read-out, never a gate — Apply is still one click.
+const previewId = ref<string | null>(null);
+let previewTimer: ReturnType<typeof setTimeout> | null = null;
+
+function previewSoon(id: string) {
+  if (previewTimer) clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => {
+    previewId.value = id;
+  }, 220);
+}
+function previewOff() {
+  if (previewTimer) clearTimeout(previewTimer);
+  previewId.value = null;
 }
 async function remove(id: string) {
   const scene = store.sceneById(id);
@@ -105,7 +123,23 @@ async function remove(id: string) {
               @change="onSchedule(s.id, $event)"
             />
           </label>
-          <button class="apply-btn" @click="apply(s.id)">Apply</button>
+          <div
+            class="apply-wrap"
+            @mouseenter="previewSoon(s.id)"
+            @mouseleave="previewOff"
+          >
+            <button
+              class="apply-btn"
+              @click="apply(s.id)"
+              @focus="previewSoon(s.id)"
+              @blur="previewOff"
+            >
+              Apply
+            </button>
+            <div v-if="previewId === s.id" class="preview">
+              <SceneDiffCard :scene-id="s.id" />
+            </div>
+          </div>
           <button class="del-btn" title="Delete scene" @click="remove(s.id)">✕</button>
         </div>
       </div>
@@ -299,6 +333,16 @@ async function remove(id: string) {
 }
 .sched-input:focus {
   border-color: var(--accent);
+}
+.apply-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.preview {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 250;
 }
 .apply-btn {
   padding: 7px 13px;

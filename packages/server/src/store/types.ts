@@ -308,6 +308,10 @@ export interface PersistedDisplaySettings {
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
+  /** POL-95 — the scene the wall is currently on (null = none / diverged). Persisted with the
+   *  revision in the single-row `meta` table: the active scene is desired state, not a UI hint, so a
+   *  server restart must not lose it. */
+  activeSceneId: string | null;
   machines: PersistedMachine[];
   screens: PersistedScreen[];
   content: PersistedContent[];
@@ -361,6 +365,9 @@ export interface Store {
   deleteContent(screenId: string): Promise<void>;
   /** Persist the global revision counter. */
   setRevision(revision: number): Promise<void>;
+  /** POL-95 — persist the ACTIVE scene (null = none / the wall has diverged). Single-row, alongside
+   *  the revision: which scene the wall is on is desired state, and must survive a restart. */
+  setActiveSceneId(sceneId: string | null): Promise<void>;
 
   // ── Murals & placement (Phase 3) ──────────────────────────────────────────
   /** Insert-or-update a mural row (id + name). */
