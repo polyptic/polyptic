@@ -1337,6 +1337,17 @@ export const BootReportCode = z.enum([
   "boot-order-not-first", // the entry exists but the firmware still boots something else first
   "esp-too-small", // POL-63: the Wi-Fi local payload (kernel + initrd-wifi + spare slot) won't fit
   "no-local-payload", // POL-63: a Wi-Fi box's offload found no payload for its arch on the medium
+  // ── POL-115: boot-order DRIFT, reported by a box that is already up and netbooted ────────────────
+  // Firmware re-prepends its own OS entry to BootOrder after firmware updates, reflashes, and a disk
+  // OS running `grub-install` — so a box that offloaded cleanly months ago silently boots a stale disk
+  // OS on its next power-cycle, and the wall goes dark. The running box watches its own boot path and
+  // says so. `boot-order-drift` is the REPORT-ONLY verdict (the default posture: nothing was written);
+  // `boot-order-reasserted` is a drift the box corrected and then PROVED by re-reading NVRAM;
+  // `boot-order-reassert-failed` is a firmware that would not keep our entry first (a persistent fight
+  // an operator must settle in firmware setup — the box says so once and goes on rendering).
+  "boot-order-drift",
+  "boot-order-reasserted",
+  "boot-order-reassert-failed",
   // POL-116: not a bootloader outcome at all — an initramfs one. The box's boot medium pinned a build
   // (D67's offline menu) that retention (D54) has since pruned from the depot, so it healed itself in
   // the initramfs and streamed the ACTIVE image instead. It IS up, on a rootfs its on-stick kernel did
@@ -1355,6 +1366,26 @@ export const BootReportBody = z.object({
   machineId: z.string().max(128).default(""),
 });
 export type BootReportBody = z.infer<typeof BootReportBody>;
+
+/**
+ * The fleet's UEFI boot-order policy (POL-115), served to booted boxes at `GET /boot/policy` and
+ * flipped by the operator in Console ▸ Settings.
+ *
+ * `reassert: false` is the DEFAULT and the safe posture: a box that finds its UEFI entry displaced
+ * writes NOTHING and only reports the drift, so an operator learns about a firmware fight from the
+ * activity feed instead of from a dark screen. Turning it on lets the box put its own entry back at
+ * the head of BootOrder — a write to firmware NVRAM, hence opt-in, and never an implicit default.
+ */
+export const BootOrderPolicy = z.object({
+  reassert: z.boolean(),
+});
+export type BootOrderPolicy = z.infer<typeof BootOrderPolicy>;
+
+/** Flip the fleet's UEFI boot-order policy from the console (POL-115). */
+export const UpdateBootOrderPolicyBody = z.object({
+  reassert: z.boolean(),
+});
+export type UpdateBootOrderPolicyBody = z.infer<typeof UpdateBootOrderPolicyBody>;
 
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({

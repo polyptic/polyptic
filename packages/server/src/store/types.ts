@@ -305,6 +305,15 @@ export interface PersistedDisplaySettings {
   showBadges: boolean;
 }
 
+/**
+ * The fleet's UEFI boot-order policy (POL-115): may a running box put its own UEFI entry back at the
+ * head of BootOrder when the firmware displaces it? Absent until an operator first flips it, and the
+ * control plane's fallback is `false` — report the drift, write nothing.
+ */
+export interface PersistedBootOrderPolicy {
+  reassert: boolean;
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -475,6 +484,12 @@ export interface Store {
   getDisplaySettings(): Promise<PersistedDisplaySettings | undefined>;
   /** Persist the fleet-wide display settings (single row). */
   setDisplaySettings(settings: PersistedDisplaySettings): Promise<void>;
+
+  // ── UEFI boot-order policy (POL-115) ───────────────────────────────────────
+  /** The persisted boot-order policy. Undefined until an operator first flips it (default: report-only). */
+  getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined>;
+  /** Persist the fleet-wide boot-order policy (single row). */
+  setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

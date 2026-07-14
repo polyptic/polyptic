@@ -19,6 +19,7 @@ onMounted(() => {
   void store.fetchEnrollment();
   void store.fetchNetboot();
   void store.fetchDisplaySettings();
+  void store.fetchBootOrderPolicy();
   void store.fetchImageUpdates();
   void loadHttps();
   document.addEventListener("keydown", onKeydown);
@@ -68,6 +69,28 @@ async function setBadges(show: boolean): Promise<void> {
     /* the store already reverted the optimistic value; the switch reflects the true state */
   } finally {
     badgesSaving.value = false;
+  }
+}
+
+// ── UEFI boot order (POL-115) ──────────────────────────────────────────────────
+// Opt-in, and deliberately worded as one: the box writes a firmware boot variable. Off means a box
+// that finds its entry displaced REPORTS the drift and writes nothing.
+const bootOrderSaving = ref(false);
+
+async function setBootOrderReassert(reassert: boolean): Promise<void> {
+  if (bootOrderSaving.value || store.bootOrder?.reassert === reassert) return;
+  bootOrderSaving.value = true;
+  try {
+    await store.setBootOrderReassert(reassert);
+    showToast(
+      reassert
+        ? "Boxes may now re-assert their own boot order"
+        : "Boxes will only report boot-order drift",
+    );
+  } catch {
+    /* the store already reverted the optimistic value; the switch reflects the true state */
+  } finally {
+    bootOrderSaving.value = false;
   }
 }
 
@@ -729,6 +752,33 @@ async function onSignOut(): Promise<void> {
             {{ store.showBadges ? "Shown on every connected screen." : "Hidden on every connected screen." }}
           </span>
         </div>
+      </section>
+
+      <!-- UEFI boot order (POL-115) --------------------------------------------- -->
+      <section class="card">
+        <div class="card-head">
+          <div class="min-w-0">
+            <h2 class="card-title">Boot order</h2>
+            <p class="card-sub wrap">
+              Firmware re-prepends its own OS after updates and reflashes, and the box quietly boots the
+              wrong thing on its next power-on. Every box watches its own UEFI boot order and reports
+              drift here. It only puts itself back at the front if you let it.
+            </p>
+          </div>
+          <Toggle
+            label="Re-assert boot order"
+            :model-value="store.bootOrder?.reassert ?? false"
+            :disabled="bootOrderSaving || store.bootOrder === null"
+            @update:model-value="setBootOrderReassert"
+          />
+        </div>
+        <p class="hint">
+          {{
+            store.bootOrder?.reassert
+              ? "Boxes put their own UEFI entry back at the head of the boot order, keep every other entry, and report what the firmware accepted."
+              : "Report only — no box writes a firmware boot variable. Drift shows up in Live Activity."
+          }}
+        </p>
       </section>
 
       <!-- Enrolment token ------------------------------------------------------ -->

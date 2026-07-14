@@ -12,6 +12,7 @@
 import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
+  BootOrderPolicy,
   ActivityEvent,
   AuthUser,
   ChangePasswordBody,
@@ -120,6 +121,9 @@ export interface ConsoleState {
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
+  /** The fleet's UEFI boot-order policy (POL-115) — may a box put its own entry back at the head of
+   *  BootOrder when firmware displaces it? Null until Settings fetches it; the safe read is `false`. */
+  bootOrder: BootOrderPolicy | null;
   connected: boolean;
   /** True once the FIRST admin/state snapshot has been folded in — the difference between "the
    *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
@@ -170,6 +174,7 @@ export const useConsoleStore = defineStore("console", {
     netboot: null,
     imageUpdates: null,
     settings: null,
+    bootOrder: null,
     connected: false,
     stateReceived: false,
     revision: 0,
@@ -583,6 +588,29 @@ export const useConsoleStore = defineStore("console", {
         this.settings = await auth.getDisplaySettings();
       } catch (err) {
         console.error("[console] fetchDisplaySettings failed", err);
+      }
+    },
+
+    /** The fleet's UEFI boot-order policy (POL-115). Report-only until the operator opts in. */
+    async fetchBootOrderPolicy(): Promise<void> {
+      try {
+        this.bootOrder = await auth.getBootOrderPolicy();
+      } catch (err) {
+        console.error("[console] fetchBootOrderPolicy failed", err);
+      }
+    },
+
+    /** Opt the fleet in (or out) of self-healing its UEFI boot order. Optimistic; reverts + rethrows
+     *  on failure, because "the boxes may now write firmware NVRAM" must never be shown unless true. */
+    async setBootOrderReassert(reassert: boolean): Promise<void> {
+      const previous = this.bootOrder;
+      this.bootOrder = { reassert };
+      try {
+        this.bootOrder = await auth.updateBootOrderPolicy(reassert);
+      } catch (err) {
+        this.bootOrder = previous;
+        console.error("[console] setBootOrderReassert failed", err);
+        throw err;
       }
     },
 

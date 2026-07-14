@@ -457,6 +457,9 @@ registerProvisionRoutes(
       "Netboot depot artifacts served (kernel, initrd, root image, …).",
       { arch, file },
     ),
+  // POL-115 — what a box may do about its own UEFI boot order when the firmware displaces our entry.
+  // Report-only unless an operator opted in, so the fleet's default is "never write firmware NVRAM".
+  () => control.getBootOrderPolicy(),
 );
 
 // TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.

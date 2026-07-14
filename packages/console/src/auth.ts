@@ -12,6 +12,7 @@
  */
 import {
   AuthUser,
+  BootOrderPolicy,
   ChangePasswordBody,
   DisplaySettings,
   EnrollmentInfo,
@@ -22,6 +23,7 @@ import {
   UpdateImageSettingsBody,
 } from "@polyptic/protocol";
 import type {
+  BootOrderPolicy as BootOrderPolicyT,
   ChangePasswordBody as ChangePasswordBodyT,
   DisplaySettings as DisplaySettingsT,
   LoginBody as LoginBodyT,
@@ -164,4 +166,16 @@ export async function getDisplaySettings(): Promise<DisplaySettingsT> {
 export async function updateDisplaySettings(showBadges: boolean): Promise<DisplaySettingsT> {
   const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/display`, { showBadges });
   return DisplaySettings.parse(raw);
+}
+
+/** GET /api/v1/settings/boot-order → the fleet's UEFI boot-order policy (POL-115). */
+export async function getBootOrderPolicy(): Promise<BootOrderPolicyT> {
+  const raw = await send<unknown>("GET", `${BASE_SETTINGS}/boot-order`);
+  return BootOrderPolicy.parse(raw);
+}
+
+/** PUT /api/v1/settings/boot-order { reassert } → the applied policy (POL-115). */
+export async function updateBootOrderPolicy(reassert: boolean): Promise<BootOrderPolicyT> {
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/boot-order`, { reassert });
+  return BootOrderPolicy.parse(raw);
 }

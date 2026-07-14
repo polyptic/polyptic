@@ -44,6 +44,14 @@ base="$(printf '%s' "$CMDLINE" | sed -n 's/.*polyptic\.base=\([^ ]*\).*/\1/p')"
 token="$(printf '%s' "$CMDLINE" | sed -n 's/.*polyptic\.token=\([^ ]*\).*/\1/p')"
 hostport="${base#http://}"; hostport="${hostport%%/*}"
 
+# ── Watch our own UEFI boot path (POL-115) ──────────────────────────────────────────────────────────
+# Firmware re-prepends its own OS entry to BootOrder after updates and reflashes, so a box that
+# offloaded cleanly boots a stale disk OS on its next power-cycle and the wall goes dark. This runs
+# BEFORE every early exit below (a box already on the current image still needs its boot path
+# watched), reports drift to the activity feed, and only re-orders NVRAM when the operator has opted
+# in. Best-effort and non-fatal by construction: nothing it can do may stop the update poll.
+sh "$LIB/boot-order.sh" || true
+
 case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) exit 0 ;; esac
 
 MANIFEST="$(curl -fsS --max-time 10 "$base/dist/image/$arch/manifest.json" 2>/dev/null || true)"

@@ -12,6 +12,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedBootOrderPolicy,
   PersistedDisplaySettings,
   PersistedImageRollout,
   PersistedMachine,
@@ -68,6 +69,7 @@ export class MemoryStore implements Store {
   private playerTokenSecret: string | undefined;
   /** Fleet-wide display settings (POL-6), undefined until first changed. */
   private displaySettings: PersistedDisplaySettings | undefined;
+  private bootOrderPolicy: PersistedBootOrderPolicy | undefined;
   private revision = 0;
 
   async migrate(): Promise<void> {
@@ -378,6 +380,14 @@ export class MemoryStore implements Store {
 
   async setDisplaySettings(settings: PersistedDisplaySettings): Promise<void> {
     this.displaySettings = clone(settings);
+  }
+
+  async getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined> {
+    return this.bootOrderPolicy ? clone(this.bootOrderPolicy) : undefined;
+  }
+
+  async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
+    this.bootOrderPolicy = clone(policy);
   }
 
   async close(): Promise<void> {
