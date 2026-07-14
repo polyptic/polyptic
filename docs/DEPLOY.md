@@ -165,7 +165,7 @@ If a screen's machine is offline the button is disabled — the request rides th
 | `output * dpms on` | sway config | outputs forced on at session start |
 | autologin via greetd `initial_session` | greetd config | no login prompt, no typed password on cold boot |
 
-### Fleet health — the stats strip and `/metrics` (POL-92 / D91)
+### Fleet health — the stats strip and `/metrics` (POL-92 / D112)
 
 Every heartbeat (10s) carries the box's own **vitals**, sampled straight from `/proc` and `/sys`: CPU, memory, root-filesystem usage (on a netbooted box that **is** the RAM image), the hottest thermal zone, load, uptime, the **running image id**, and per-output browser health — resident memory, respawn count, and whether the browser holds an open fd on **`/dev/dri`**.
 
