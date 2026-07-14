@@ -262,6 +262,11 @@ export function buildAdminState(
           inspectError: presence.screenInspectError(s.id),
           castEnabled: s.castEnabled, // POL-119 — the persistent operator toggle
           castActive: presence.isScreenCasting(s.id), // POL-119 — a session is live NOW
+          variables: s.variables, // POL-111 — this screen's local flavour, edited in the Inspector
+          // POL-111 — placeholders this screen's content uses that resolve to nothing: they render as
+          // EMPTY on the glass (never literal braces), so the console warning badge is the only way an
+          // operator ever finds a typo'd `{{lien}}`.
+          unresolvedVariables: control.unresolvedVariablesFor(s.id),
         } satisfies ScreenView;
       });
 

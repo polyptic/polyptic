@@ -163,6 +163,69 @@ function commitName() {
   else nameDraft.value = s.friendlyName;
 }
 
+// ── variables (POL-111) — this screen's local flavour ───────────────────────
+// A small key/value table, edited as a DRAFT and committed whole (the server takes the whole map).
+// The values never touch the content: the server substitutes `{{placeholders}}` into the screen's
+// URLs / page text on the way OUT, so one source stays one source across the fleet.
+type VarRow = { key: string; value: string };
+const varRows = ref<VarRow[]>([]);
+const varError = ref("");
+const varSaving = ref(false);
+
+watch(
+  single,
+  (s) => {
+    varRows.value = Object.entries(s?.variables ?? {}).map(([key, value]) => ({ key, value }));
+    varError.value = "";
+  },
+  { immediate: true },
+);
+
+/** Placeholders the assigned content uses that resolve to nothing — server-computed, per screen. */
+const unresolvedVars = computed(() => single.value?.unresolvedVariables ?? []);
+
+// Every string that SHOWS a placeholder is built here, never in the template: Vue's tokenizer closes
+// an interpolation on the first close-brace pair, so a literal token inside one is a compile error.
+const OPEN = "{".repeat(2);
+const CLOSE = "}".repeat(2);
+const token = (name: string): string => `${OPEN}${name}${CLOSE}`;
+const unresolvedList = computed(() => unresolvedVars.value.map(token).join(" · "));
+const exampleToken = token("line");
+const builtInTokens = ["screen.name", "screen.id", "machine.hostname"].map(token);
+
+function addVar(): void {
+  varRows.value.push({ key: "", value: "" });
+}
+function removeVar(index: number): void {
+  varRows.value.splice(index, 1);
+  void commitVars();
+}
+async function commitVars(): Promise<void> {
+  const s = single.value;
+  if (!s || varSaving.value) return;
+  const map: Record<string, string> = {};
+  for (const row of varRows.value) {
+    const key = row.key.trim();
+    if (key) map[key] = row.value;
+  }
+  // Nothing changed (the common blur) → don't spend a round-trip or a re-push on it.
+  if (JSON.stringify(map) === JSON.stringify(s.variables ?? {})) {
+    varError.value = "";
+    return;
+  }
+  varSaving.value = true;
+  try {
+    await store.setScreenVariables(s.id, map);
+    varError.value = "";
+  } catch {
+    // The protocol refused a key or a value (no dots, no braces, no control characters). Say so, and
+    // leave the operator's draft on screen so they can fix it rather than retype it.
+    varError.value = "Rejected — keys are letters/digits/_/- (no dots); values can't contain {{ }}.";
+  } finally {
+    varSaving.value = false;
+  }
+}
+
 // ── content: library sources only (the ad-hoc URL bypass was removed — POL-72) ──
 const sourcePick = ref("");
 watch(single, () => {
@@ -520,6 +583,45 @@ function selectOne(id: string) {
       <div v-else class="lib-empty">
         No saved sources.
         <router-link class="lib-link" :to="{ name: 'content' }">Manage library →</router-link>
+      </div>
+
+      <!-- Variables (POL-111): local flavour, substituted into this screen's content at send time. -->
+      <div class="section-label gap-top">Variables</div>
+      <div v-if="unresolvedVars.length" class="var-warn">
+        <span class="var-warn-glyph" aria-hidden="true">!</span>
+        <span>
+          {{ unresolvedVars.length }}
+          {{ unresolvedVars.length === 1 ? "placeholder renders" : "placeholders render" }} empty on
+          this screen:
+          <span class="var-warn-names">{{ unresolvedList }}</span>
+        </span>
+      </div>
+      <div class="var-table">
+        <div v-for="(row, i) in varRows" :key="i" class="var-row">
+          <input
+            v-model="row.key"
+            class="var-input key"
+            placeholder="line"
+            spellcheck="false"
+            @blur="commitVars"
+            @keyup.enter="commitVars"
+          />
+          <input
+            v-model="row.value"
+            class="var-input value"
+            placeholder="Line 3"
+            @blur="commitVars"
+            @keyup.enter="commitVars"
+          />
+          <button class="var-del" title="Remove variable" @click="removeVar(i)">×</button>
+        </div>
+        <button class="var-add" @click="addVar">+ Add variable</button>
+      </div>
+      <div v-if="varError" class="var-error">{{ varError }}</div>
+      <div class="hint">
+        Use <code>{{ exampleToken }}</code> in a content URL, page or ticker — it resolves per screen.
+        Always available:
+        <code v-for="t in builtInTokens" :key="t">{{ t }}</code>
       </div>
 
       <template v-if="singleZoom !== undefined">
@@ -978,6 +1080,116 @@ function selectOne(id: string) {
   font-size: 11px;
   color: var(--muted2);
   line-height: 1.55;
+}
+.hint code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 3px;
+}
+
+/* ── Variables (POL-111) ─────────────────────────────────────────────────── */
+.var-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-bottom: 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.var-warn-glyph {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: var(--warn);
+  color: var(--surface);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+.var-warn-names {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-weight: 600;
+}
+.var-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.var-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.var-input {
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 7px 9px;
+  font-size: 12px;
+  color: var(--fg);
+  outline: none;
+  font-family: inherit;
+}
+.var-input.key {
+  flex: 0 1 38%;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-weight: 600;
+}
+.var-input.value {
+  flex: 1 1 auto;
+}
+.var-input:focus {
+  border-color: var(--accent);
+}
+.var-del {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted2);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.var-del:hover {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+.var-add {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 5px 9px;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted2);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.var-add:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.var-error {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--bad);
+  line-height: 1.5;
 }
 
 .layout-grid {

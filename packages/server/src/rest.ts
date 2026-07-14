@@ -46,6 +46,7 @@ import {
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
+  ScreenVariablesBody,
   ServerToAgentApply,
   ServerToAgentInspect,
   ServerToAgentReboot,
@@ -606,6 +607,43 @@ export function registerRestRoutes(
       body.data.enabled ? "casting enabled" : "casting disabled",
     );
     return { ok: true, screen, delivered };
+  });
+
+  // POST /api/v1/screens/:screenId/variables  { variables }  -> per-screen template variables (POL-111)
+  //
+  // The whole map, replaced. Registry metadata (like a rename), so no revision bump — but the screen's
+  // render IS re-pushed at the SAME revision, because what the player should now show HAS changed:
+  // `decorateSliceForSend` re-substitutes the clean, stored templates against the new scope and the
+  // player DOM-diffs the new URL/text in place. No reload, no duplicated source, nothing substituted
+  // written to the DB.
+  fastify.post("/api/v1/screens/:screenId/variables", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = ScreenVariablesBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = await control.setScreenVariables(params.data.screenId, body.data.variables);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    pushRender(screen.id, control.sliceForPlayer(screen.id));
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.variables",
+        screenId: screen.id,
+        // Keys only — a value is operator content and has no business in the logs.
+        keys: Object.keys(screen.variables),
+      },
+      "screen variables set",
+    );
+    return { ok: true, screen };
   });
 
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────

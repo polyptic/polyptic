@@ -19,6 +19,7 @@ import {
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
+  ScreenVariablesBody,
   SetContentBody,
   SetZoomBody,
   UpdateContentSourceBody,
@@ -27,6 +28,7 @@ import {
 } from "@polyptic/protocol";
 import type {
   ContentSource,
+  ScreenVariables,
   CredentialProfileTestResult,
   CredentialProfileView,
   Scene,
@@ -278,6 +280,17 @@ export function inspectScreen(screenId: string, body: InspectBody): Promise<unkn
  *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
 export function setScreenCast(screenId: string, enabled: boolean): Promise<unknown> {
   return send("POST", `/screens/${encodeURIComponent(screenId)}/cast`, CastArmBody.parse({ enabled }));
+}
+
+/** POST /api/v1/screens/:screenId/variables { variables } — replace this screen's template variables
+ *  (POL-111). Whole-map semantics. The server re-substitutes and re-pushes the screen's render at the
+ *  same revision, so the wall updates in place — no reload, and nothing substituted is ever stored. */
+export function setScreenVariables(screenId: string, variables: ScreenVariables): Promise<unknown> {
+  return send(
+    "POST",
+    `/screens/${encodeURIComponent(screenId)}/variables`,
+    ScreenVariablesBody.parse({ variables }),
+  );
 }
 
 /**

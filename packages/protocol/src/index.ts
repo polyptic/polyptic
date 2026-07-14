@@ -75,6 +75,52 @@ export const Machine = z.object({
 });
 export type Machine = z.infer<typeof Machine>;
 
+// ── Per-screen template variables (POL-111) ──────────────────────────────────
+//
+// One source, fifty screens: a single dashboard URL / page / ticker carries `{{placeholder}}` tokens
+// and the SERVER substitutes them per screen on the way out (decorateSliceForSend — the same send-time
+// seam as POL-24 credential stamping). The DB and the stored slices always keep the CLEAN, tokenised
+// value; nothing substituted is ever persisted, so one edit of the source still reaches every screen.
+//
+// Scope for a screen = its own `variables` map, plus the always-available built-ins
+// `{{screen.name}}`, `{{screen.id}}` and `{{machine.hostname}}`. Custom keys may NOT contain a dot,
+// which is what makes shadowing a built-in impossible.
+
+/** A custom variable key: identifier-ish, dot-free (dots are reserved for the built-in namespaces). */
+export const ScreenVariableKey = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,31}$/, {
+  message: "keys start with a letter and use letters/digits/_/- (max 32, no dots)",
+});
+export type ScreenVariableKey = z.infer<typeof ScreenVariableKey>;
+
+/**
+ * A variable value. Deliberately narrow — this string is inserted into URLs and on-glass text, so the
+ * edge refuses the two things that would make substitution an injection primitive:
+ *   - control characters (header/line-break smuggling, invisible payloads),
+ *   - `{{` / `}}` (a value that could be re-expanded on a second pass — there IS no second pass, and
+ *     forbidding braces here means there never can be one, even if a future caller loops).
+ * Everything else (quotes, `<`, `&`, `javascript:`) is allowed as DATA and neutralised per context by
+ * the substituter: percent-encoded in a URL, rendered as a text node in page text.
+ */
+export const ScreenVariableValue = z
+  .string()
+  .max(200)
+  .refine((v) => ![...v].some((c) => (c.codePointAt(0) ?? 0) < 0x20 || c.codePointAt(0) === 0x7f), {
+    message: "value cannot contain control characters",
+  })
+  .refine((v) => !v.includes("{{") && !v.includes("}}"), {
+    message: "value cannot contain template braces",
+  });
+export type ScreenVariableValue = z.infer<typeof ScreenVariableValue>;
+
+/** A screen's custom variables. Capped — this is local flavour ("Line 3"), not a config store. */
+export const ScreenVariables = z
+  .record(ScreenVariableKey, ScreenVariableValue)
+  .refine((v) => Object.keys(v).length <= 32, { message: "at most 32 variables per screen" });
+export type ScreenVariables = z.infer<typeof ScreenVariables>;
+
+/** The built-in variable names, always in scope, never overridable (custom keys cannot contain a dot). */
+export const BUILT_IN_VARIABLES = ["screen.name", "screen.id", "machine.hostname"] as const;
+
 /** A screen: the first-class, named entity users actually configure. */
 export const Screen = z.object({
   id: z.string(), // control-plane assigned, stable
@@ -87,6 +133,9 @@ export const Screen = z.object({
    *  advertised under the screen's friendlyName, and a sender's PIN entry (always on, displayed on the
    *  glass) is the per-session gate, so leaving this enabled is not an open door. */
   castEnabled: z.boolean().default(false),
+  /** POL-111 — this screen's local flavour ("line" → "Line 3"), substituted into the content it is
+   *  sent at SEND time. Part of the screen registry, not of any content: one source stays one source. */
+  variables: ScreenVariables.default({}),
 });
 export type Screen = z.infer<typeof Screen>;
 
@@ -1018,6 +1067,12 @@ export const ScreenView = Screen.extend({
    *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
    *  toggle — is inherited from `Screen`.) */
   castActive: z.boolean().optional(),
+  /** POL-111 — placeholders the content on this screen uses that resolve to NOTHING in its scope
+   *  (neither a built-in nor one of its own `variables`). They render as EMPTY on the glass — never as
+   *  literal braces — so the only way an operator learns about a typo'd `{{lien}}` is this list, which
+   *  the console shows as a warning badge on the screen's Variables card. Server-computed from the
+   *  screen's STORED (clean) slice at broadcast time. */
+  unresolvedVariables: z.array(z.string()).optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -1400,6 +1455,13 @@ export type InspectBody = z.infer<typeof InspectBody>;
  *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
 export const CastArmBody = z.object({ enabled: z.boolean() });
 export type CastArmBody = z.infer<typeof CastArmBody>;
+
+/** POST /api/v1/screens/:id/variables — replace this screen's variable map wholesale (POL-111).
+ *  Whole-map PUT semantics: the console edits a small table, and a partial patch protocol would only
+ *  invent a delete-vs-blank ambiguity. Registry metadata, so no revision bump — but the screen's
+ *  render IS re-pushed (same revision) because the substituted content changed. */
+export const ScreenVariablesBody = z.object({ variables: ScreenVariables });
+export type ScreenVariablesBody = z.infer<typeof ScreenVariablesBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

@@ -1022,6 +1022,25 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Replace one screen's template variables (POL-111). Whole-map semantics — the Inspector edits a
+     * small table and sends it entire. Optimistic like the cast toggle; the authoritative admin/state
+     * broadcast reconciles (and brings the recomputed `unresolvedVariables` warning list with it).
+     * Throws on rejection so the Inspector can show WHY (an invalid key/value is a 400, not a shrug).
+     */
+    async setScreenVariables(screenId: string, variables: Record<string, string>): Promise<void> {
+      const screen = this.screenById(screenId);
+      const previous = screen ? { ...screen.variables } : undefined;
+      if (screen) screen.variables = { ...variables }; // optimistic
+      try {
+        await api.setScreenVariables(screenId, variables);
+      } catch (err) {
+        if (screen && previous) screen.variables = previous; // revert
+        console.error("[console] setScreenVariables failed", err);
+        throw err;
+      }
+    },
+
     /** Flash a screen's friendly name on the physical panel (fire-and-forget pulse). */
     async identScreen(screenId: string): Promise<void> {
       try {
