@@ -11,6 +11,8 @@
  */
 import type { DisplayBackend as BackendId } from "@polyptic/protocol";
 
+import type { BrowserProbe } from "../vitals";
+
 export interface DisplayBackend {
   /** Which `DisplayBackend` enum value this implementation reports in `agent/hello`. */
   readonly id: BackendId;
@@ -68,4 +70,12 @@ export interface DisplayBackend {
    * box — never the operator's toggle — is what the console shows as "casting now".
    */
   onCastSession(listener: (connector: string, active: boolean) => void): void;
+
+  /**
+   * POL-92 — the kiosk browsers this backend currently supervises (one per placed output): their
+   * pids and respawn counts, which the heartbeat's vitals sampler turns into RSS + the `/dev/dri`
+   * GPU tell. Optional: a backend that owns no browser process (dev-open hands the URL to the host's
+   * browser and forgets it) implements nothing and the heartbeat reports no per-browser vitals.
+   */
+  browserProbes?(): BrowserProbe[];
 }

@@ -457,6 +457,67 @@ export const AgentHello = z.object({
   csrPem: z.string().optional(),
 });
 
+// ── Host vitals (POL-92) ─────────────────────────────────────────────────────
+//
+// What a box knows about ITSELF, sampled from /proc + /sys on every heartbeat and carried on
+// `agent/status`. The fleet's known failure modes are physical — a browser software-rendering on a
+// broken GPU path pegs the CPU (D77), a wedged page eats the RAM, a respawn loop churns — and until
+// now none of them were visible to an operator without a shell session on the box.
+//
+// EVERY field is optional. A pre-POL-92 agent sends no `vitals` at all; a NON-Linux agent (dev-open
+// on a laptop) sends none either; a box whose kernel exposes no thermal zone simply omits `tempC`.
+// The console and the metrics exporter therefore render what they have and say nothing about what
+// they don't — an absent number is never rendered as a zero.
+
+/** One supervised kiosk browser (one per output), as the agent sees it right now. */
+export const BrowserVitals = z.object({
+  connector: z.string(),
+  /** Is a browser child alive on this output at all? */
+  running: z.boolean(),
+  pid: z.number().int().positive().optional(),
+  /** Resident set of the browser process TREE (the parent + its renderer/GPU children). */
+  rssBytes: z.number().nonnegative().optional(),
+  /** How many times the agent has respawned this output's browser since it started supervising it.
+   *  A climbing number is a crash loop — the wall may look fine between respawns. */
+  respawns: z.number().int().nonnegative().optional(),
+  /**
+   * THE D77 TELL. True when some process in this browser's tree holds an open fd on `/dev/dri/*` —
+   * i.e. it is talking to the GPU. False means the browser is rendering the wall IN SOFTWARE, which
+   * on a real panel pegs the CPU (the surf/Xwayland DRI3 bug, POL-67) and cooks the box. Absent when
+   * the agent could not tell (no /proc, no browser running, fds unreadable).
+   */
+  gpuAccel: z.boolean().optional(),
+});
+export type BrowserVitals = z.infer<typeof BrowserVitals>;
+
+/** A single cheap sample of the host's health, taken by the agent at heartbeat time. */
+export const MachineVitals = z.object({
+  /** When the box took this sample (ISO, the box's own clock). */
+  at: z.string().optional(),
+  /** Whole-host CPU busy %, 0–100, averaged over the interval since the previous sample. */
+  cpuPercent: z.number().min(0).max(100).optional(),
+  cores: z.number().int().positive().optional(),
+  /** 1/5/15-minute load averages. */
+  loadavg: z.array(z.number().nonnegative()).length(3).optional(),
+  memUsedBytes: z.number().nonnegative().optional(),
+  memTotalBytes: z.number().nonnegative().optional(),
+  memPercent: z.number().min(0).max(100).optional(),
+  /** The root filesystem — on a netbooted box that is the RAM-backed image (tmpfs/overlay), so a
+   *  full "disk" means a full box. */
+  diskUsedBytes: z.number().nonnegative().optional(),
+  diskTotalBytes: z.number().nonnegative().optional(),
+  diskPercent: z.number().min(0).max(100).optional(),
+  /** Hottest thermal zone, °C. Absent on hosts that expose none (VMs, most laptops-as-servers). */
+  tempC: z.number().optional(),
+  uptimeSec: z.number().nonnegative().optional(),
+  /** The live image this box is RUNNING (`/etc/polyptic/image-id`), which is how an operator learns
+   *  a box never took the last roll-out. */
+  imageId: z.string().optional(),
+  /** Per-output browser health (RSS, respawns, and the GPU tell). */
+  browsers: z.array(BrowserVitals).optional(),
+});
+export type MachineVitals = z.infer<typeof MachineVitals>;
+
 export const AgentStatus = z.object({
   t: z.literal("agent/status"),
   machineId: z.string(),
@@ -474,6 +535,9 @@ export const AgentStatus = z.object({
       casting: z.boolean().optional(),
     }),
   ),
+  /** POL-92 — host vitals, sampled each heartbeat. Optional: an older agent (or a backend with no
+   *  /proc to read) sends a status frame without it, and it still parses. */
+  vitals: MachineVitals.optional(),
 });
 
 export const AgentThumbnail = z.object({
@@ -978,6 +1042,10 @@ export const MachineView = z.object({
   rebooting: z.boolean().optional(),
   /** POL-59 — when the arming was set / last refreshed (for the "auto-disarms in N min" hint). */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-92 — the machine's LATEST host vitals sample (the head of the server's per-machine ring).
+   *  Absent while the box is offline, before its first heartbeat, or when it runs an agent/backend
+   *  that samples nothing — the console then says so rather than drawing empty meters. */
+  vitals: MachineVitals.optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;

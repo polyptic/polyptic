@@ -17,7 +17,7 @@
  */
 import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
+import type { MachineVitals, MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
@@ -76,8 +76,21 @@ export class Presence {
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
 
+  /** POL-92 — machineId → a small ring of host-vitals samples, newest LAST. Live-only, exactly like
+   *  the rest of Presence: vitals describe a running box, and a box that isn't running has none. The
+   *  ring (not just the latest sample) is what lets an operator surface, and a future feature graph,
+   *  a few minutes of history without touching the store or the <150ms path. */
+  private readonly vitals = new Map<string, MachineVitals[]>();
+  /** machineId → ms epoch of the last heartbeat we accepted (with or WITHOUT vitals — a pre-POL-92
+   *  agent still proves liveness). Drives `polyptic_machine_last_seen_seconds`. */
+  private readonly lastHeartbeat = new Map<string, number>();
+
   /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
   private static readonly REBOOTING_TTL_MS = 3 * 60_000;
+
+  /** Samples retained per machine — ~5 minutes at the agent's 10s heartbeat. Bounded on purpose:
+   *  this is a fleet-sized in-memory structure, not a time-series database. */
+  private static readonly VITALS_RING = 30;
 
   agentConnected(machineId: string): void {
     this.agentConns.set(machineId, (this.agentConns.get(machineId) ?? 0) + 1);
@@ -179,6 +192,43 @@ export class Presence {
       this.casting.delete(id);
     }
   }
+
+  // ── Host vitals (POL-92) ───────────────────────────────────────────────────
+
+  /** Record one heartbeat's arrival, with or without vitals (an old agent proves liveness too). */
+  noteHeartbeat(machineId: string, vitals?: MachineVitals): void {
+    this.lastHeartbeat.set(machineId, Date.now());
+    if (!vitals) return;
+    const ring = this.vitals.get(machineId) ?? [];
+    ring.push(vitals);
+    if (ring.length > Presence.VITALS_RING) ring.splice(0, ring.length - Presence.VITALS_RING);
+    this.vitals.set(machineId, ring);
+  }
+
+  /** The newest sample, or undefined when this box has never reported any. */
+  machineVitals(machineId: string): MachineVitals | undefined {
+    const ring = this.vitals.get(machineId);
+    return ring && ring.length > 0 ? ring[ring.length - 1] : undefined;
+  }
+
+  /** The whole ring, oldest first (a few minutes of history). */
+  machineVitalsSeries(machineId: string): readonly MachineVitals[] {
+    return this.vitals.get(machineId) ?? [];
+  }
+
+  /** Ms epoch of the last heartbeat from this machine, or undefined if we've had none this boot. */
+  machineLastHeartbeat(machineId: string): number | undefined {
+    return this.lastHeartbeat.get(machineId);
+  }
+
+  /** A machine was REMOVED (POL-14) — drop everything we hold about it, so an id that is reused
+   *  never inherits a dead box's vitals. */
+  forgetMachine(machineId: string): void {
+    this.vitals.delete(machineId);
+    this.lastHeartbeat.delete(machineId);
+    this.rebootingSince.delete(machineId);
+    this.agentConns.delete(machineId);
+  }
 }
 
 /**
@@ -229,6 +279,10 @@ export function buildAdminState(
       shellEnabled: machine.shellEnabled ?? false,
       rebooting: presence.isMachineRebooting(machine.id),
       shellArmedAt: machine.shellArmedAt,
+      // POL-92 — the latest host-vitals sample, but ONLY while the box is online. A CPU reading from
+      // a machine that has since gone dark is not health data, it is an epitaph; the console says
+      // "System stats unavailable while offline" instead of drawing a stale meter.
+      vitals: presence.isMachineOnline(machine.id) ? presence.machineVitals(machine.id) : undefined,
       screens: machineScreens,
     } satisfies MachineView;
   });

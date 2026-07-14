@@ -17,8 +17,9 @@ import { join } from "node:path";
 import type { DisplayBackend } from "./types";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
 import { buildSurfArgs, prelaunchSurf, resolveSurf } from "./surf";
-import { sanitizeConnector, SupervisedBrowser } from "./supervise";
+import { browserProbesFrom, sanitizeConnector, SupervisedBrowser } from "./supervise";
 import type { LaunchTarget } from "./supervise";
+import type { BrowserProbe } from "../vitals";
 import { captureStdout, delay, run, spawnChild, which } from "./proc";
 
 /** How long to wait for the freshly-launched browser window to be mapped + named. */
@@ -340,6 +341,12 @@ export class X11Backend implements DisplayBackend {
 
   onCastSession(): void {
     // Never fires: no receiver can run here.
+  }
+
+  /** POL-92 — the browsers this backend supervises, for the heartbeat's vitals sampler. On X11 that
+   *  is surf under Xwayland, the very stack whose lost DRI3 path (D77) the GPU tell exists to catch. */
+  browserProbes(): BrowserProbe[] {
+    return browserProbesFrom(this.browsers);
   }
 
   /** Crop the output's region out of the root window via ImageMagick `import`, else `scrot`. */

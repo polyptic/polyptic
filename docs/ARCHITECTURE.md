@@ -68,7 +68,9 @@ POST   /api/v1/fleet:activate-scene {sceneId}
 GET    /api/v1/screens/:id/preview            # latest grim thumbnail
 POST   /api/v1/screens/:id/inspect {on}       # chrome: arm the remote-DevTools tunnel · surf: pop the on-panel inspector
 GET    /api/v1/screens/:id/devtools[/**]      # remote DevTools entry + proxied frontend/CDP (POL-67; armed screens only)
-GET    /metrics                               # Prometheus
+GET    /metrics                               # Prometheus — process gauges + PER-MACHINE fleet gauges
+                                              #   (polyptic_machine_up / _cpu_percent / _gpu_accelerated / …,
+                                              #    POL-92; sample rules: deploy/prometheus-alerts.example.yaml)
 WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack, reboot
 WS     /ui         (browser → server)          live layout, thumbnails, health
 WS     /player?screen=<id>  (browser → server)  desired surfaces for this screen

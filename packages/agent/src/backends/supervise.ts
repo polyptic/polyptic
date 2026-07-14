@@ -12,6 +12,7 @@
  */
 import type { ChildProcess } from "node:child_process";
 import { escapeRegex, run, which } from "./proc";
+import type { BrowserProbe } from "../vitals";
 
 // Supervision / respawn tuning.
 const RESTART_BASE_MS = 750;
@@ -69,6 +70,17 @@ export async function killStaleByToken(
 /** A backend-provided launcher: (re)launch+place the browser for one target, returning the child. */
 export type LaunchFn = (target: LaunchTarget) => Promise<ChildProcess>;
 
+/** POL-92 — snapshot every supervised browser for the heartbeat's vitals sampler. Shared by the two
+ *  real backends, which both key their SupervisedBrowsers by connector. */
+export function browserProbesFrom(browsers: ReadonlyMap<string, SupervisedBrowser>): BrowserProbe[] {
+  return [...browsers.values()].map((b) => ({
+    connector: b.connector,
+    running: b.running,
+    pid: b.pid,
+    respawns: b.respawns,
+  }));
+}
+
 /**
  * One supervised long-lived child process for one output. Owns the child's lifecycle:
  *   - `setTarget(t)` — no-op if already running that exact target, else (re)launch,
@@ -89,6 +101,10 @@ export class SupervisedProcess<T> {
   private currentGen = 0;
   private restartAttempt = 0;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  /** POL-92 — how many times this output's browser has been respawned after an unwanted exit, for
+   *  the lifetime of the agent. A climbing number is a crash loop; an operator-driven relaunch
+   *  (a new target, an inspector toggle) is NOT a respawn and never counts. */
+  private respawnCount = 0;
 
   constructor(
     readonly connector: string,
@@ -109,6 +125,11 @@ export class SupervisedProcess<T> {
   /** The live child's pid, or `null` when nothing is running (used to focus its window). */
   get pid(): number | null {
     return this.running ? (this.child?.pid ?? null) : null;
+  }
+
+  /** POL-92 — respawns since the agent started supervising this output (heartbeat vitals). */
+  get respawns(): number {
+    return this.respawnCount;
   }
 
   /** Launch (or relaunch) this output at `target`. Idempotent: a no-op when already running it. */
@@ -171,6 +192,7 @@ export class SupervisedProcess<T> {
     const backoff = Math.min(RESTART_CAP_MS, RESTART_BASE_MS * 2 ** this.restartAttempt);
     const wait = backoff + Math.floor(Math.random() * 250);
     this.restartAttempt += 1;
+    this.respawnCount += 1;
     this.log(`respawning ${this.kind} for ${this.connector} in ${wait}ms (attempt ${this.restartAttempt})`);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;

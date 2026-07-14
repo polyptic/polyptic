@@ -18,6 +18,10 @@
   the per-machine shell arm from POL-59 — deliberately NOT fleet-wide, and immediate (no image
   rebuild: the unprivileged shell is always in the image; arming is what gates it).
 
+  Each approved card also carries the POL-92 stats strip (MachineStats.vue): live CPU/memory/disk
+  meters from the agent's heartbeat, an overload banner, and the software-rendering tell — the health
+  data that previously required a remote shell and `top`.
+
   A "Connect a machine" button (and a first-run empty state) opens the cold-start wizard. Screens are
   first-class and named; machines are plumbing — so the rich, per-screen affordances live here.
 
@@ -31,6 +35,7 @@ import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
 import ScreenRow from "../components/ScreenRow.vue";
 import ColdStartWizard from "../components/ColdStartWizard.vue";
+import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
 
 const store = useConsoleStore();
@@ -375,6 +380,10 @@ function showToast(message: string): void {
                   </template>
                 </div>
               </div>
+
+              <!-- POL-92 — host vitals, live from the heartbeat (CPU/memory/disk, overload, and the
+                   software-render tell). Offline machines get the "unavailable" line instead. -->
+              <MachineStats :machine="m" />
 
               <div v-if="m.screens.length" class="screens">
                 <ScreenRow

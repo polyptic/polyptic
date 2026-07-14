@@ -36,7 +36,7 @@ import {
   resolveChrome,
   selectKioskBrowser,
 } from "./chrome";
-import { SupervisedBrowser, SupervisedProcess, killStaleByToken } from "./supervise";
+import { browserProbesFrom, SupervisedBrowser, SupervisedProcess, killStaleByToken } from "./supervise";
 import type { LaunchTarget } from "./supervise";
 import {
   CAST_PORT_BASE,
@@ -51,6 +51,7 @@ import {
 } from "./cast";
 import type { CastTarget } from "./cast";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
+import type { BrowserProbe } from "../vitals";
 
 /** How long to wait for the freshly-launched browser window to appear on the sway tree. */
 const PLACE_TIMEOUT_MS = 8_000;
@@ -740,6 +741,11 @@ export class SwayBackend implements DisplayBackend {
     if (!inst) return;
     inst.windows.delete(conId);
     if (inst.windows.size === 0) this.castSession?.(connector, false);
+  }
+
+  /** POL-92 — the browsers this backend supervises, for the heartbeat's vitals sampler. */
+  browserProbes(): BrowserProbe[] {
+    return browserProbesFrom(this.browsers);
   }
 
   /** Grab a thumbnail of `connector` via `grim`. Returns JPEG bytes (or PNG), `null` on failure. */
