@@ -420,6 +420,9 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS full_schedule_day int NOT NULL DEFAULT 0`;
     await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS full_schedule_time text NOT NULL DEFAULT '02:00'`;
     await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS last_build_kind text`;
+    // POL-121: the first-image latch. The server that finds an EMPTY depot on a fresh install stamps
+    // this before it spawns the one-shot full build, so pod churn cannot re-trigger it.
+    await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS first_build_at timestamptz`;
     // Display settings (POL-6): a single row holding the fleet-wide on-screen badge toggle. Absent
     // until an operator first changes it — the control plane falls back to its env default (prod off,
     // dev on) until then, so the row is written on the first mutation, not on migrate.
@@ -1135,13 +1138,14 @@ export class PostgresStore implements Store {
         full_schedule_day: number;
         full_schedule_time: string;
         urgent: boolean;
+        first_build_at: Date | null;
         last_build_started_at: Date | null;
         last_build_finished_at: Date | null;
         last_build_status: string | null;
         last_build_log: string | null;
         last_build_kind: string | null;
       }[]
-    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
+    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
     const row = rows[0];
     if (!row) return undefined;
     const status = row.last_build_status;
@@ -1153,6 +1157,7 @@ export class PostgresStore implements Store {
       fullScheduleDay: row.full_schedule_day,
       fullScheduleTime: row.full_schedule_time,
       urgent: row.urgent,
+      firstBuildAt: row.first_build_at?.toISOString() ?? null,
       lastBuildStartedAt: row.last_build_started_at?.toISOString() ?? null,
       lastBuildFinishedAt: row.last_build_finished_at?.toISOString() ?? null,
       lastBuildStatus: status === "running" || status === "success" || status === "failure" ? status : null,
@@ -1164,8 +1169,8 @@ export class PostgresStore implements Store {
   async setImageRollout(rollout: PersistedImageRollout): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
-      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
+      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
+      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
       ON CONFLICT (id) DO UPDATE SET
         schedule_enabled = EXCLUDED.schedule_enabled,
         schedule_time = EXCLUDED.schedule_time,
@@ -1173,6 +1178,9 @@ export class PostgresStore implements Store {
         full_schedule_day = EXCLUDED.full_schedule_day,
         full_schedule_time = EXCLUDED.full_schedule_time,
         urgent = EXCLUDED.urgent,
+        -- The first-image latch (POL-121) is claimed ONCE and never cleared: COALESCE keeps the
+        -- original stamp even if a later write carries a null, so no code path can un-latch it.
+        first_build_at = COALESCE(image_rollout.first_build_at, EXCLUDED.first_build_at),
         last_build_started_at = EXCLUDED.last_build_started_at,
         last_build_finished_at = EXCLUDED.last_build_finished_at,
         last_build_status = EXCLUDED.last_build_status,
