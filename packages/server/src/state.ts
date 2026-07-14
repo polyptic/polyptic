@@ -149,6 +149,9 @@ export interface RegisterMachineInput {
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
+  /** POL-105 — the OS image the box BOOTED (`/etc/polyptic/image-id`). Absent on a dev box (no live
+   *  image) and on any pre-POL-105 agent; an absent value never ERASES the id we already knew. */
+  imageId?: string;
 }
 
 export interface RegisterMachineResult {
@@ -363,6 +366,8 @@ export class ControlPlane {
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
       tags: machine.tags ?? [],
+      imageId: machine.imageId,
+      imageIdAt: machine.imageIdAt,
     };
   }
 
@@ -389,6 +394,9 @@ export class ControlPlane {
         shellArmedAt: m.shellArmedAt,
         // POL-103 — legacy rows have no tags column value; they load untagged.
         tags: m.tags ?? [],
+        // POL-105 — the last build this box reported booting (absent until it reports one).
+        imageId: m.imageId,
+        imageIdAt: m.imageIdAt,
       });
       if (m.credentialHash) this.credentialHashes.set(m.id, m.credentialHash);
     }
@@ -770,6 +778,10 @@ export class ControlPlane {
       // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
       // anything the box reports about itself.
       tags: existing?.tags ?? [],
+      // POL-105 — the box's own report of the image it BOOTED. A hello that carries none (dev box,
+      // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
+      imageId: input.imageId ?? existing?.imageId,
+      imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
     };
     this.machines.set(input.machineId, machine);
 
@@ -807,6 +819,10 @@ export class ControlPlane {
       // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
       // anything the box reports about itself.
       tags: existing?.tags ?? [],
+      // POL-105 — the box's own report of the image it BOOTED. A hello that carries none (dev box,
+      // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
+      imageId: input.imageId ?? existing?.imageId,
+      imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
     };
     this.machines.set(input.machineId, machine);
     await this.store.upsertMachine(this.toPersistedMachine(machine));
@@ -903,6 +919,43 @@ export class ControlPlane {
         : `${machine.label} untagged`,
     );
     return machine;
+  }
+
+  /** POL-105 — the tags a machine carries, for the depot's per-machine manifest (an unknown machine
+   *  carries none, so it can match no ring and simply follows the fleet's active build). */
+  machineTags(machineId: string): string[] {
+    return this.machines.get(machineId)?.tags ?? [];
+  }
+
+  /**
+   * POL-105 — record the OS image a box reports BOOTING (`agent/hello`, and every heartbeat's vitals
+   * so a long-lived session still tells the truth). Persisted, because the box a roll-out stranded is
+   * the box that has gone dark, and "which machines are still on 20260711T…?" has to be answerable
+   * about exactly that box.
+   *
+   * A CHANGE is announced: the id a box comes back on is the only evidence that a roll-out — or a
+   * canary, or a rollback — actually reached it. An unchanged id is silent (it arrives every 5s).
+   * Returns true when the value changed.
+   */
+  async noteMachineImage(machineId: string, imageId: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine || imageId.trim() === "") return false;
+    const next = imageId.trim();
+    if (machine.imageId === next) return false;
+
+    const previous = machine.imageId;
+    const at = new Date().toISOString();
+    machine.imageId = next;
+    machine.imageIdAt = at;
+    await this.store.setMachineImage(machineId, next, at);
+
+    this.emit(
+      "good",
+      previous
+        ? `${machine.label} booted image ${next} (was ${previous})`
+        : `${machine.label} is running image ${next}`,
+    );
+    return true;
   }
 
   /**

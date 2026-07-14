@@ -274,6 +274,11 @@ export function buildAdminState(
       online: presence.isMachineOnline(machine.id),
       status: machine.status,
       tags: machine.tags ?? [], // POL-103 — the chips + what a selector matches
+      // POL-105 — the build this box last reported BOOTING. Unlike vitals this is NOT gated on the
+      // box being online: the machine a roll-out stranded is exactly the machine that is now dark,
+      // and the version-distribution view exists to find it.
+      imageId: machine.imageId,
+      imageIdAt: machine.imageIdAt,
 
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,

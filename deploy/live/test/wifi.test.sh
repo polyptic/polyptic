@@ -358,8 +358,11 @@ while [ $# -gt 0 ]; do
   case "$1" in -o) shift; out="$1" ;; --max-time) shift ;; -*) ;; *) url="$1" ;; esac
   shift
 done
+printf '%s\n' "$url" >> "$STUB/curl.log"
 case "$url" in
-  */manifest.json) cat "$STUB/manifest" 2>/dev/null || exit 22 ;;
+  # POL-105: the poll now asks for the manifest AS A MACHINE (`?machineId=…`), so the depot can
+  # answer it with a roll-out ring's build instead of the fleet's. Both shapes are matched.
+  */manifest.json|*/manifest.json\?*) cat "$STUB/manifest" 2>/dev/null || exit 22 ;;
   */builds/*/vmlinuz)     [ -f "$STUB/curl_fail_kernel" ] && exit 22; cp "$STUB/new-vmlinuz" "$out" ;;
   */builds/*/initrd-wifi) [ -f "$STUB/curl_fail_initrd" ] && exit 22; cp "$STUB/new-initrd" "$out" ;;
   */builds/*/SHA256SUMS)  cp "$STUB/new-sums" "$out" ;;
@@ -435,6 +438,22 @@ eq "poll corrupt: no reboot"         "" "$(cat "$d/systemctl.log" 2>/dev/null ||
 d="$(new_poll_case poll-no-medium old-1 new-2)"
 out="$(up "$d")"
 has "poll no-medium: reboots"        "reboot" "$(cat "$d/systemctl.log" 2>/dev/null)"
+
+# 35a) POL-105: the poll asks for the manifest AS THIS MACHINE, so the depot can answer it with a
+#      canary ring's build rather than the fleet's. The box itself is unchanged — it still just
+#      compares two ids — but if this query parameter goes missing, every box silently rejoins the
+#      fleet build and staged roll-outs quietly stop working. Hence a test.
+d="$(new_poll_case poll-machineid old-1 new-2)"
+out="$(up "$d")"
+has "poll: manifest is fetched per machine" "manifest.json?machineId=dmi-test" "$(cat "$d/curl.log")"
+
+# 35b) …and a box with no machine id yet (pre-enrolment) asks for the plain fleet manifest rather
+#      than an empty, meaningless `?machineId=`.
+d="$(new_poll_case poll-no-machineid old-1 new-2)"
+: > "$d/agent.env"
+out="$(up "$d")"
+has "poll: no machine id → the plain fleet manifest" "manifest.json" "$(cat "$d/curl.log")"
+eq  "poll: no empty machineId param" "" "$(grep -c 'machineId=$' "$d/curl.log" | grep -v '^0$')"
 
 # 36) recovery-boot heal: ids MATCH but the kernel has no modules dir → refresh check + reboot.
 d="$(new_poll_case poll-heal new-2 new-2 new-2)"

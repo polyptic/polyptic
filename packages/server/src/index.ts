@@ -14,7 +14,14 @@ import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
-import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettingsBody } from "@polyptic/protocol";
+import {
+  ActivateImageBody,
+  ImageUpdateInfo,
+  PromoteImageRingBody,
+  RebuildImageBody,
+  SetImageRingsBody,
+  UpdateImageSettingsBody,
+} from "@polyptic/protocol";
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
@@ -457,6 +464,9 @@ registerProvisionRoutes(
       "Netboot depot artifacts served (kernel, initrd, root image, …).",
       { arch, file },
     ),
+  // POL-105 — the depot's manifest route resolves PER MACHINE: a box appends `?machineId=…`, and its
+  // tags decide which roll-out ring (if any) it matches. The registry is the only place tags live.
+  (machineId) => control.machineTags(machineId),
 );
 
 // TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.
@@ -509,6 +519,7 @@ const imageUpdateInfo = async (request: FastifyRequest) => {
       liveIsoUrl: b.hasLiveIso ? `${base}/dist/image/${b.arch}/builds/${b.imageId}/polyptic-live.iso` : null,
     })),
     retainBuilds: imageUpdates.retainBuilds,
+    rings: st.rings ?? [],
   });
 };
 fastify.get("/api/v1/settings/image", async (request) => imageUpdateInfo(request));
@@ -531,6 +542,34 @@ fastify.post("/api/v1/settings/image/activate", async (request, reply) => {
   } catch (err) {
     return reply.code(404).send({ error: (err as Error).message });
   }
+  return imageUpdateInfo(request);
+});
+
+// ── Staged roll-outs (POL-105) ──
+// The rings are the WHOLE list, replaced in one call (like a machine's tag set): add, remove and
+// reorder are the same mutation, so the console never reconciles two half-applied writes. A ring
+// whose selector does not parse, or whose build the depot no longer retains, is a 400 — you cannot
+// point a box at a boot it cannot make.
+fastify.put("/api/v1/settings/image/rings", async (request, reply) => {
+  const { rings } = SetImageRingsBody.parse(request.body ?? {});
+  try {
+    await imageUpdates.setRings(rings);
+  } catch (err) {
+    return reply.code(400).send({ error: (err as Error).message });
+  }
+  return imageUpdateInfo(request);
+});
+
+// Promote a ring's build to the whole fleet: activate it for that arch AND drop the ring, so the
+// canary boxes and everyone else converge on one id. One action, one activity line (the DoD).
+fastify.post("/api/v1/settings/image/promote", async (request, reply) => {
+  const { arch, selector, urgent } = PromoteImageRingBody.parse(request.body ?? {});
+  try {
+    await imageUpdates.promote(arch, selector, urgent);
+  } catch (err) {
+    return reply.code(404).send({ error: (err as Error).message });
+  }
+  broadcaster.broadcast();
   return imageUpdateInfo(request);
 });
 

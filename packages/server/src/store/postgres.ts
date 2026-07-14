@@ -23,6 +23,7 @@ import {
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
+  ImageRings,
   MachineTags,
   Output,
   PlaylistItem,
@@ -66,6 +67,8 @@ interface MachineRow {
   shell_enabled: boolean | null;
   shell_armed_at: Date | null;
   tags: unknown;
+  image_id: string | null;
+  image_id_at: Date | null;
 }
 
 interface ScreenRow {
@@ -226,6 +229,11 @@ export class PostgresStore implements Store {
     // POL-103 — operator tags. jsonb, not a join table: a tag set is small, always read whole, and
     // only ever replaced whole; a `machine_tags` table would buy nothing but a second write path.
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS tags jsonb NOT NULL DEFAULT '[]'::jsonb`;
+    // POL-105 — the OS image the box last reported BOOTING. Persisted, not live-only: "which boxes
+    // are still on 20260711T…?" must be answerable about a box that is currently offline — which is
+    // precisely the box a roll-out has stranded.
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS image_id text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS image_id_at timestamptz`;
     await sql`
       CREATE TABLE IF NOT EXISTS screens (
         id            text PRIMARY KEY,
@@ -432,6 +440,9 @@ export class PostgresStore implements Store {
     // POL-121: the first-image latch. The server that finds an EMPTY depot on a fresh install stamps
     // this before it spawns the one-shot full build, so pod churn cannot re-trigger it.
     await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS first_build_at timestamptz`;
+    // POL-105: the staged roll-out rings (selector → build). jsonb for the same reason as machine
+    // tags: a small ordered list, always read whole, only ever replaced whole.
+    await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS rings jsonb NOT NULL DEFAULT '[]'::jsonb`;
     // Display settings (POL-6): a single row holding the fleet-wide on-screen badge toggle. Absent
     // until an operator first changes it — the control plane falls back to its env default (prod off,
     // dev on) until then, so the row is written on the first mutation, not on migrate.
@@ -458,7 +469,7 @@ export class PostgresStore implements Store {
       credentialProfileRows,
       zoomPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
@@ -489,6 +500,9 @@ export class PostgresStore implements Store {
         shellArmedAt: row.shell_armed_at ? row.shell_armed_at.toISOString() : undefined,
         // POL-103 — legacy rows (NULL) and anything unrecognised load as untagged.
         tags: MachineTags.safeParse(row.tags).data ?? [],
+        // POL-105 — the last image id the box reported booting (NULL until it reports one).
+        imageId: row.image_id ?? undefined,
+        imageIdAt: row.image_id_at ? row.image_id_at.toISOString() : undefined,
       };
     });
 
@@ -595,7 +609,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -607,7 +621,9 @@ export class PostgresStore implements Store {
         ${machine.lastSeen ? new Date(machine.lastSeen) : null},
         ${machine.shellEnabled ?? false},
         ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null},
-        ${sql.json(machine.tags ?? [])}
+        ${sql.json(machine.tags ?? [])},
+        ${machine.imageId ?? null},
+        ${machine.imageIdAt ? new Date(machine.imageIdAt) : null}
       )
       ON CONFLICT (id) DO UPDATE SET
         label           = EXCLUDED.label,
@@ -619,8 +635,17 @@ export class PostgresStore implements Store {
         last_seen       = EXCLUDED.last_seen,
         shell_enabled   = EXCLUDED.shell_enabled,
         shell_armed_at  = EXCLUDED.shell_armed_at,
-        tags            = EXCLUDED.tags
+        tags            = EXCLUDED.tags,
+        -- POL-105 — never let a re-hello that carries no image id ERASE the one we already know: an
+        -- older agent (or a dev box with no live image) must not blank a real box's reported build.
+        image_id        = COALESCE(EXCLUDED.image_id, machines.image_id),
+        image_id_at     = COALESCE(EXCLUDED.image_id_at, machines.image_id_at)
     `;
+  }
+
+  async setMachineImage(id: string, imageId: string, at: string): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET image_id = ${imageId}, image_id_at = ${new Date(at)} WHERE id = ${id}`;
   }
 
   async setMachineTags(id: string, tags: string[]): Promise<void> {
@@ -1159,13 +1184,14 @@ export class PostgresStore implements Store {
         full_schedule_time: string;
         urgent: boolean;
         first_build_at: Date | null;
+        rings: unknown;
         last_build_started_at: Date | null;
         last_build_finished_at: Date | null;
         last_build_status: string | null;
         last_build_log: string | null;
         last_build_kind: string | null;
       }[]
-    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
+    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
     const row = rows[0];
     if (!row) return undefined;
     const status = row.last_build_status;
@@ -1177,6 +1203,9 @@ export class PostgresStore implements Store {
       fullScheduleDay: row.full_schedule_day,
       fullScheduleTime: row.full_schedule_time,
       urgent: row.urgent,
+      // POL-105 — a corrupt/legacy rings value degrades to NO rings, i.e. one image for the whole
+      // fleet. Parse at the edge: an unreadable ring must never point a box at a build we invented.
+      rings: ImageRings.safeParse(row.rings).data ?? [],
       firstBuildAt: row.first_build_at?.toISOString() ?? null,
       lastBuildStartedAt: row.last_build_started_at?.toISOString() ?? null,
       lastBuildFinishedAt: row.last_build_finished_at?.toISOString() ?? null,
@@ -1189,8 +1218,8 @@ export class PostgresStore implements Store {
   async setImageRollout(rollout: PersistedImageRollout): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
-      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
+      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
+      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${sql.json(rollout.rings ?? [])}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
       ON CONFLICT (id) DO UPDATE SET
         schedule_enabled = EXCLUDED.schedule_enabled,
         schedule_time = EXCLUDED.schedule_time,
@@ -1201,6 +1230,7 @@ export class PostgresStore implements Store {
         -- The first-image latch (POL-121) is claimed ONCE and never cleared: COALESCE keeps the
         -- original stamp even if a later write carries a null, so no code path can un-latch it.
         first_build_at = COALESCE(image_rollout.first_build_at, EXCLUDED.first_build_at),
+        rings = EXCLUDED.rings,
         last_build_started_at = EXCLUDED.last_build_started_at,
         last_build_finished_at = EXCLUDED.last_build_finished_at,
         last_build_status = EXCLUDED.last_build_status,

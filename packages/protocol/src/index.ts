@@ -10,7 +10,25 @@
  */
 import { z } from "zod";
 
+import { ImageRings } from "./image-rollout";
 import { MachineTags } from "./selector";
+
+/** POL-105 — staged (canary) image roll-outs targeted by a POL-103 selector, and the fleet's
+ *  version distribution (who is actually running which build). */
+export {
+  ImageArch,
+  ImageDistributionBucket,
+  ImageDistributionMachine,
+  ImageRing,
+  ImageRings,
+  imageDistribution,
+  resolveRolloutImage,
+} from "./image-rollout";
+export type {
+  DistributableBuild,
+  DistributableMachine,
+  RolloutResolution,
+} from "./image-rollout";
 
 /** POL-103 — machine tags + the selector grammar that targets bulk operations. */
 export {
@@ -83,6 +101,13 @@ export const Machine = z.object({
   /** POL-103 — free-form operator tags ("atrium", "floor:2", "canary"). Flat and opaque: a selector
    *  matches them by set membership, never by parsing them. They are what bulk operations target. */
   tags: MachineTags.default([]),
+  /** POL-105 — the OS image this box last told us it BOOTED (`/etc/polyptic/image-id`, carried on
+   *  `agent/hello` and in every heartbeat's vitals). PERSISTED, unlike the live vitals ring, because
+   *  the box a roll-out has stranded is precisely the box that is offline: "which machines are still
+   *  on 20260711T…?" has to be answerable about a box that is not currently talking to us. */
+  imageId: z.string().optional(),
+  /** When that image id was last reported (ISO). */
+  imageIdAt: z.string().datetime().optional(),
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
    *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
@@ -460,6 +485,11 @@ export const AgentHello = z.object({
   outputs: z.array(Output),
   /** The box's os.hostname(), used as the human machine label (additive-safe; optional). */
   hostname: z.string().optional(),
+  /** POL-105 — the OS image this box BOOTED (`/etc/polyptic/image-id`). Sent on the very first frame
+   *  of a session, so the control plane learns a box's build the moment it comes back rather than one
+   *  heartbeat later — a reboot into a canary build is exactly the moment an operator is watching.
+   *  Optional: a dev box (no live image) and any pre-POL-105 agent simply omit it. */
+  imageId: z.string().optional(),
   /** First contact only: the operator-configured enrollment secret. The server validates it,
    * creates the machine as `pending`, and replies `server/enrolled` with a durable credential. */
   bootstrapToken: z.string().optional(),
@@ -1052,6 +1082,10 @@ export const MachineView = z.object({
   status: EnrollmentStatus, // pending machines await operator approval
   /** POL-103 — the machine's operator tags; the console renders them as chips and filters on them. */
   tags: MachineTags.default([]),
+  /** POL-105 — the build this box last reported BOOTING. Persisted, so it survives the box going
+   *  dark: the version-distribution view in Settings is built from this. */
+  imageId: z.string().optional(),
+  imageIdAt: z.string().datetime().optional(),
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
@@ -1844,6 +1878,10 @@ export const ImageUpdateInfo = z.object({
   builds: z.array(ImageBuild).default([]),
   /** How many builds per arch the depot keeps before pruning (IMAGE_RETAIN_BUILDS, default 3). */
   retainBuilds: z.number().int().min(1).default(3),
+  /** POL-105 — the roll-out RINGS: ordered, first match wins, each pinning one build for the
+   *  machines a POL-103 selector matches (`tag=canary` → build X). Everything else follows the
+   *  arch's active build. Empty = today's behaviour, one image for the whole fleet. */
+  rings: ImageRings.default([]),
 });
 export type ImageUpdateInfo = z.infer<typeof ImageUpdateInfo>;
 
@@ -1871,6 +1909,31 @@ export const ActivateImageBody = z.object({
   imageId: z.string().min(1),
 });
 export type ActivateImageBody = z.infer<typeof ActivateImageBody>;
+
+/**
+ * POL-105 — replace the whole ordered ring list (`PUT /api/v1/settings/image/rings`). Whole-list, like
+ * a machine's tag set: add/remove/reorder are one call, so the console never has to reconcile two
+ * half-applied mutations. The server REJECTS a ring whose selector does not parse (POL-103's grammar)
+ * or whose build the depot does not retain — a ring you cannot serve is a boot the box cannot make.
+ */
+export const SetImageRingsBody = z.object({ rings: ImageRings });
+export type SetImageRingsBody = z.infer<typeof SetImageRingsBody>;
+
+/**
+ * POL-105 — PROMOTE a ring's build to the whole fleet in one action (`POST .../image/promote`):
+ * activate that build for its arch (the D54 relink) and DROP the ring, so the canary machines and
+ * everyone else converge on the same id. One activity line names what happened. This is the "one
+ * action with evidence" the ticket's DoD asks for; a promotion that left the ring in place would
+ * leave a canary pinned to what is now merely the fleet build.
+ */
+export const PromoteImageRingBody = z.object({
+  arch: z.enum(["arm64", "amd64"]),
+  /** The ring to promote, named by its selector — the same string the operator typed. */
+  selector: z.string().min(1).max(200),
+  /** Roll it out to the rest of the fleet immediately rather than in the nightly window. */
+  urgent: z.boolean().default(false),
+});
+export type PromoteImageRingBody = z.infer<typeof PromoteImageRingBody>;
 
 /** Update the fleet-wide display settings from the console (POL-6). Currently just the badge toggle. */
 export const UpdateDisplaySettingsBody = z.object({

@@ -612,6 +612,15 @@ export interface ImageManifestSource {
   manifest(arch: string): Promise<{ arch: string; imageId: string; builtAt: string; sha256: string | null } | null>;
   state(): Promise<{ urgent: boolean }>;
   /**
+   * POL-105 — the manifest for ONE machine, given its tags: the first roll-out ring whose selector
+   * matches wins, everyone else gets the arch's active build. This is what makes `tag=canary` boot a
+   * different build than the rest of the fleet *from the same depot*.
+   */
+  resolveFor(
+    arch: string,
+    tags: readonly string[],
+  ): Promise<{ arch: string; imageId: string; builtAt: string; sha256: string | null; urgent: boolean } | null>;
+  /**
    * Heal the ACTIVE build's `builds/<imageId>/` mirror if the depot lacks it (POL-79). The netboot
    * medium pins `root=live:…/builds/<active-id>/rootfs.squashfs`, so the serve path calls this on a
    * miss to hardlink the mirror from the arch root — no server restart needed. Best-effort and
@@ -628,6 +637,9 @@ export function registerProvisionRoutes(
   onBootReport?: ActivitySink,
   /** POL-92 — called for every depot artifact actually served, for the `/metrics` fetch counter. */
   onDepotFetch?: (arch: string, file: string) => void,
+  /** POL-105 — the tags a machine carries, for the per-machine manifest. Absent (or an unknown
+   *  machineId) → no tags → no ring can match → the box follows the fleet's active build. */
+  machineTags?: (machineId: string) => readonly string[],
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
 
@@ -751,15 +763,25 @@ export function registerProvisionRoutes(
   //    boxes reboot into the image this same depot serves. Netbooted boxes poll this every 5
   //    minutes and reboot when their /etc/polyptic/image-id no longer matches (urgent → now,
   //    else the nightly window). 404 until a POL-41 build publishes an image-id.txt.
+  //
+  //    POL-105 — the box appends `?machineId=<its stable id>` and the answer is resolved FOR THAT
+  //    MACHINE: the first roll-out ring whose POL-103 selector matches its tags wins (`tag=canary` →
+  //    build X), and every other box — including one whose id we do not know, and every pre-POL-105
+  //    box that sends no machineId at all — gets the arch's ACTIVE build, i.e. exactly the previous
+  //    behaviour. Still ungated and still secret-free: a machine id is not a secret (it is derived
+  //    from the box's own DMI/MAC and already rides the boot cmdline), and the worst an attacker can
+  //    learn by guessing one is which build the operator pointed that box at — from a depot that will
+  //    serve them that build anyway. Nothing here mutates the registry.
   fastify.get("/dist/image/:arch/manifest.json", async (request, reply) => {
     if (!imageUpdates) return reply.code(404).send({ error: "image updates not wired" });
     const { arch } = request.params as { arch?: string };
     if (!arch || !ARCH_RE.test(arch)) return reply.code(404).send({ error: "unknown architecture" });
-    const m = await imageUpdates.manifest(arch);
+    const { machineId } = request.query as { machineId?: string };
+    const tags = machineId ? (machineTags?.(machineId) ?? []) : [];
+    const m = await imageUpdates.resolveFor(arch, tags);
     if (!m) return reply.code(404).send({ error: "no published image for this arch" });
-    const { urgent } = await imageUpdates.state();
     reply.header("Cache-Control", "no-store");
-    return { ...m, urgent };
+    return m;
   });
 
   // ── GET /dist/image/:arch/builds/:imageId/:file — one RETAINED build's artifacts (POL-45).

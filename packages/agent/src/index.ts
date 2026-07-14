@@ -783,6 +783,9 @@ class Agent {
       browser: this.browser,
       outputs: this.outputs,
       hostname: osHostname(),
+      // POL-105 — the OS image this box actually BOOTED (`/etc/polyptic/image-id`). Undefined on a
+      // dev box with no live image, and dropped by JSON.stringify, so an old server ignores it.
+      imageId: await this.vitals.bootedImageId().catch(() => undefined),
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,

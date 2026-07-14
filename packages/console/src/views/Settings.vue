@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import { imageDistribution } from "@polyptic/protocol";
+import type { HttpsInfo, ImageBuild, ImageRing } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
@@ -293,6 +294,102 @@ async function activate(build: ImageBuild): Promise<void> {
     showToast("Could not activate that build");
   } finally {
     activating.value = null;
+  }
+}
+
+// ── Staged roll-outs + the version distribution (POL-105) ──────────────────────
+//
+// The distribution is computed from the LIVE admin state (`store.machines`, pushed over the WS on
+// every change) joined against the depot's retained builds — so "which boxes are on which build"
+// updates itself as boxes come back on a new image, with no polling and no second source of truth.
+// `imageDistribution` is the shared protocol function; the server's tests pin the same one.
+
+const distribution = computed(() =>
+  imageDistribution(store.machines, store.imageUpdates?.builds ?? []),
+);
+
+/** The roll-out rings, indexed by the build they pin — the build rows render their own canary state. */
+const ringsByBuild = computed(() => {
+  const map = new Map<string, ImageRing[]>();
+  for (const ring of store.imageUpdates?.rings ?? []) {
+    const key = `${ring.arch}-${ring.imageId}`;
+    map.set(key, [...(map.get(key) ?? []), ring]);
+  }
+  return map;
+});
+
+const ringBusy = ref(false);
+
+async function saveRings(rings: ImageRing[], message: string): Promise<void> {
+  if (ringBusy.value) return;
+  ringBusy.value = true;
+  try {
+    store.imageUpdates = await auth.setImageRings(rings);
+    showToast(message);
+  } catch (err) {
+    console.error("[console] rings update failed", err);
+    showToast(err instanceof Error ? err.message : "Could not save the roll-out rings");
+  } finally {
+    ringBusy.value = false;
+  }
+}
+
+/** Pin a build to a tag: every machine carrying that tag boots THIS build, the rest of the fleet
+ *  stays on the active one. The tag is POL-103's — the same chips the Machines view edits. */
+async function canary(build: ImageBuild): Promise<void> {
+  rowMenu.value = null;
+  const raw = window.prompt(
+    `Which tag should boot ${formatImageId(build.imageId)} (${build.arch})?\n\nMachines carrying this tag boot this build; every other machine stays on the fleet build. Tag machines in the Machines view.`,
+    "canary",
+  );
+  if (raw === null) return;
+  const tag = raw.trim().toLowerCase();
+  if (!tag) return;
+
+  const selector = `tag=${tag}`;
+  const urgent = window.confirm(
+    `Reboot the ${selector} machines into this build within minutes?\n\nOK = now (splayed). Cancel = they take it in the nightly window.`,
+  );
+  const rings = (store.imageUpdates?.rings ?? []).filter(
+    (r) => !(r.arch === build.arch && r.selector === selector),
+  );
+  await saveRings(
+    [...rings, { selector, arch: build.arch, imageId: build.imageId, urgent }],
+    `${selector} → ${build.arch} · ${build.imageId.split("-").pop()}`,
+  );
+}
+
+/** Drop a ring: its machines rejoin the fleet build on their next poll. */
+async function dropRing(ring: ImageRing): Promise<void> {
+  rowMenu.value = null;
+  if (!window.confirm(`Stop pinning ${ring.selector} to this build? Those machines rejoin the fleet build.`)) return;
+  await saveRings(
+    (store.imageUpdates?.rings ?? []).filter((r) => r !== ring),
+    `${ring.selector} rejoins the fleet build`,
+  );
+}
+
+/** Promote a canary to the whole fleet: activate its build AND drop the ring, in one action. */
+async function promote(ring: ImageRing): Promise<void> {
+  rowMenu.value = null;
+  if (ringBusy.value) return;
+  if (
+    !window.confirm(
+      `Promote ${formatImageId(ring.imageId)} (${ring.arch}) from ${ring.selector} to the WHOLE fleet?\n\nEvery box on another image reboots into it, and ${ring.selector} stops being a canary.`,
+    )
+  ) {
+    return;
+  }
+  const urgent = window.confirm("Roll it out within minutes?\n\nOK = now (splayed). Cancel = the nightly window.");
+  ringBusy.value = true;
+  try {
+    store.imageUpdates = await auth.promoteImageRing(ring.arch, ring.selector, urgent);
+    showToast(`Promoted ${ring.arch} · ${ring.imageId.split("-").pop()} to the fleet`);
+  } catch (err) {
+    console.error("[console] promote failed", err);
+    showToast("Could not promote that build");
+  } finally {
+    ringBusy.value = false;
   }
 }
 
@@ -596,6 +693,17 @@ async function onSignOut(): Promise<void> {
               <span class="tag tag-muted">Superseded</span>
             </template>
 
+            <!-- POL-105 — the roll-out rings pinned to this build: `tag=canary` boots THIS build
+                 while the fleet stays on the active one. -->
+            <span
+              v-for="ring in ringsByBuild.get(rowKey(b)) ?? []"
+              :key="ring.selector"
+              class="tag tag-ring"
+              :title="`Machines matching ${ring.selector} boot this build${ring.urgent ? ' — within minutes' : ' — in the nightly window'}`"
+            >
+              {{ ring.selector }}{{ ring.urgent ? " · now" : "" }}
+            </span>
+
             <!-- The active build has nothing to activate, so its single action stays a plain icon.
                  Every other row folds Download + Activate into an overflow menu. -->
             <template v-if="b.active">
@@ -666,6 +774,43 @@ async function onSignOut(): Promise<void> {
                       <span class="menu-sub">Serve this build to the fleet.</span>
                     </span>
                   </button>
+
+                  <!-- POL-105 — the staged roll-out. A ring pins this build to the machines a tag
+                       matches; promoting it makes it the fleet's build and retires the ring. -->
+                  <div class="menu-sep"></div>
+                  <button type="button" class="menu-item" :disabled="ringBusy" @click="canary(b)">
+                    <svg
+                      width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                      stroke-linecap="round" stroke-linejoin="round" class="menu-icon"
+                    >
+                      <path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82Z" />
+                      <circle cx="7" cy="7" r="1.2" fill="currentColor" />
+                    </svg>
+                    <span class="menu-text">
+                      <span class="menu-title">Canary this build to a tag…</span>
+                      <span class="menu-sub">Only tagged machines boot it. The fleet stays put.</span>
+                    </span>
+                  </button>
+                  <template v-for="ring in ringsByBuild.get(rowKey(b)) ?? []" :key="ring.selector">
+                    <button type="button" class="menu-item" :disabled="ringBusy" @click="promote(ring)">
+                      <svg
+                        width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                        stroke-linecap="round" stroke-linejoin="round" class="menu-icon"
+                      >
+                        <path d="M12 19V5" /><path d="m5 12 7-7 7 7" />
+                      </svg>
+                      <span class="menu-text">
+                        <span class="menu-title">Promote {{ ring.selector }} to the whole fleet</span>
+                        <span class="menu-sub">Serve it to everyone and retire the canary.</span>
+                      </span>
+                    </button>
+                    <button type="button" class="menu-item danger" :disabled="ringBusy" @click="dropRing(ring)">
+                      <span class="menu-text">
+                        <span class="menu-title">Stop the {{ ring.selector }} canary</span>
+                        <span class="menu-sub">Those machines rejoin the fleet build.</span>
+                      </span>
+                    </button>
+                  </template>
                 </div>
               </template>
             </div>
@@ -674,6 +819,57 @@ async function onSignOut(): Promise<void> {
         <p v-else class="hint">
           No builds retained yet — the depot fills as images are built. Run a build from the ⋯ menu, or with
           <code class="code">deploy/build-live-image.sh</code>.
+        </p>
+
+        <!-- What the fleet is ACTUALLY running (POL-105) ------------------------ -->
+        <!-- Live: every box reports the image id it booted on hello + every heartbeat, and the
+             control plane persists it — so an OFFLINE box still shows the build it is stuck on,
+             which is exactly the box a roll-out has stranded. -->
+        <div class="field-label field-label-spaced">Fleet versions</div>
+        <div v-if="distribution.length > 0" class="versions">
+          <div
+            v-for="bucket in distribution"
+            :key="bucket.imageId ?? 'unknown'"
+            class="version-row"
+            :class="{ active: bucket.active, stale: bucket.imageId !== null && !bucket.active, unknown: bucket.imageId === null }"
+          >
+            <div class="version-head">
+              <span class="build-id">
+                {{ bucket.imageId ? formatImageId(bucket.imageId) : "Not reported" }}
+              </span>
+              <span v-if="bucket.arch" class="arch">{{ bucket.arch }}</span>
+              <span v-if="bucket.active" class="tag tag-accent">Fleet build</span>
+              <span
+                v-else-if="bucket.imageId && !bucket.retained"
+                class="tag tag-muted"
+                title="The depot no longer has this build — these boxes are running something it cannot re-serve."
+              >
+                Pruned
+              </span>
+              <span v-else-if="bucket.imageId" class="tag tag-muted">Superseded</span>
+              <span class="version-count">
+                {{ bucket.machines.length }} {{ bucket.machines.length === 1 ? "machine" : "machines" }}
+              </span>
+            </div>
+            <div class="version-machines">
+              <span
+                v-for="m in bucket.machines"
+                :key="m.id"
+                class="chip-machine"
+                :class="{ offline: !m.online }"
+                :title="
+                  m.online
+                    ? `${m.label} — online${m.tags.length ? `, tagged ${m.tags.join(', ')}` : ''}`
+                    : `${m.label} — offline; this is the last build it reported`
+                "
+              >
+                {{ m.label }}<span v-if="m.tags.length" class="chip-machine-tags">{{ m.tags.join(" · ") }}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+        <p v-else class="hint">
+          No machines have reported an image yet — a box reports the build it booted when its agent connects.
         </p>
         <!-- Boot without a USB stick (secondary) -------------------------------- -->
         <button type="button" class="disclosure" :class="{ open: advOpen }" @click="advOpen = !advOpen">
@@ -1481,6 +1677,71 @@ async function onSignOut(): Promise<void> {
   color: var(--muted);
   background: var(--muted-bg);
 }
+.tag-accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ── POL-105: roll-out rings + the fleet's version distribution ───────────────── */
+.tag-ring {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--line);
+}
+.versions {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  overflow: hidden;
+}
+.version-row {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 14px;
+}
+.version-row + .version-row {
+  border-top: 1px solid var(--line);
+}
+.version-row.active {
+  background: var(--accent-soft);
+}
+.version-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.version-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted2);
+}
+.version-machines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip-machine {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: var(--muted-bg);
+  color: var(--fg2);
+}
+/* An offline box is the point of this view, not a footnote: it is the box a roll-out stranded. */
+.chip-machine.offline {
+  color: var(--muted2);
+  border-style: dashed;
+}
+.chip-machine-tags {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--muted);
+}
 .row-btn {
   display: flex;
   align-items: center;
@@ -1584,6 +1845,11 @@ async function onSignOut(): Promise<void> {
   font-weight: 600;
   color: var(--muted);
   margin-bottom: 10px;
+}
+/* A label that follows a bordered list (POL-105's Fleet versions, under Recent builds) needs the
+   breathing room the card's own stack does not give it. */
+.field-label-spaced {
+  margin-top: 20px;
 }
 .mono-field {
   flex: 1;

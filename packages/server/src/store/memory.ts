@@ -112,6 +112,14 @@ export class MemoryStore implements Store {
     if (machine) machine.tags = [...tags];
   }
 
+  async setMachineImage(id: string, imageId: string, at: string): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) {
+      machine.imageId = imageId;
+      machine.imageIdAt = at;
+    }
+  }
+
   async deleteMachine(id: string): Promise<void> {
     this.machines.delete(id);
     // Cascade the machine's screens + their content + placements (defensive — the control plane also
