@@ -392,6 +392,14 @@ registerRestRoutes(
   presence,
   shellRelay,
   devtoolsRelay,
+  // POL-113 — the backup document carries the image-update SCHEDULE (fleet configuration), not the
+  // depot (rebuildable by design). The scheduler is constructed below, so the port defers to it
+  // lazily; by the time an operator can call /export or /import, it exists.
+  {
+    state: () => imageUpdates.state(),
+    updateSettings: (patch) => imageUpdates.updateSettings(patch),
+  },
+  { version: BUILD_VERSION, revision: BUILD_REVISION },
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);

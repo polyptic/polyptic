@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import { BackupDocument } from "@polyptic/protocol";
+import type { HttpsInfo, ImageBuild, ImportMode, ImportResult } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
@@ -310,6 +311,127 @@ async function onChangePassword(): Promise<void> {
   } finally {
     pwSaving.value = false;
   }
+}
+
+// ── Backup & restore (POL-113) ─────────────────────────────────────────────────
+//
+// Two things an operator can do here, and one of them can delete their wall — so the flow is: pick a
+// file, SEE what it would do (the dry run, computed by the server), then decide. Nothing is applied
+// until "Apply restore", and the destructive option is named for what it does, not for what it is
+// called internally ("replace").
+const backingUp = ref(false);
+const restoreFile = ref<HTMLInputElement | null>(null);
+const restoreDoc = ref<BackupDocument | null>(null);
+const restoreName = ref("");
+const restorePlan = ref<ImportResult | null>(null);
+const restoreError = ref("");
+const restoreDelete = ref(false);
+const restoreBusy = ref(false);
+
+const restoreMode = computed<ImportMode>(() => (restoreDelete.value ? "replace" : "merge"));
+
+/** The changes worth showing: an unchanged entity is noise in a diff. */
+const restoreChanges = computed(() =>
+  (restorePlan.value?.changes ?? []).filter((c) => c.action !== "unchanged"),
+);
+
+async function downloadBackup(): Promise<void> {
+  if (backingUp.value) return;
+  backingUp.value = true;
+  try {
+    const doc = await auth.exportBackup();
+    const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `polyptic-backup-${doc.exportedAt.replace(/[:.]/g, "-")}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("Backup downloaded");
+  } catch (err) {
+    console.error("[console] backup download failed", err);
+    showToast("Backup failed");
+  } finally {
+    backingUp.value = false;
+  }
+}
+
+function pickRestoreFile(): void {
+  restoreFile.value?.click();
+}
+
+async function onRestoreFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = ""; // so picking the same file twice re-runs the dry run
+  if (!file) return;
+
+  clearRestore();
+  restoreName.value = file.name;
+  try {
+    restoreDoc.value = BackupDocument.parse(JSON.parse(await file.text()));
+  } catch {
+    restoreDoc.value = null;
+    restoreError.value = "That file isn't a Polyptic backup.";
+    return;
+  }
+  await runDryRun();
+}
+
+/** Ask the server what the restore WOULD do. Never writes; re-run whenever the mode changes. */
+async function runDryRun(): Promise<void> {
+  if (!restoreDoc.value || restoreBusy.value) return;
+  restoreBusy.value = true;
+  restoreError.value = "";
+  try {
+    restorePlan.value = await auth.importBackup(restoreDoc.value, {
+      mode: restoreMode.value,
+      dryRun: true,
+    });
+  } catch (err) {
+    console.error("[console] restore dry run failed", err);
+    restoreError.value = "Could not read that backup on the server.";
+    restorePlan.value = null;
+  } finally {
+    restoreBusy.value = false;
+  }
+}
+
+async function applyRestore(): Promise<void> {
+  const doc = restoreDoc.value;
+  const plan = restorePlan.value;
+  if (!doc || !plan || restoreBusy.value) return;
+
+  const deletes = plan.summary.delete;
+  const warning =
+    deletes > 0
+      ? `Restore this backup? ${plan.summary.create} added, ${plan.summary.update} updated, and ${deletes} DELETED — screens, murals, scenes or content that aren't in this file will be removed.`
+      : `Restore this backup? ${plan.summary.create} added, ${plan.summary.update} updated. Nothing will be deleted.`;
+  if (!window.confirm(warning)) return;
+
+  restoreBusy.value = true;
+  try {
+    const result = await auth.importBackup(doc, { mode: restoreMode.value, dryRun: false });
+    showToast(
+      `Restored — ${result.summary.create} added, ${result.summary.update} updated, ${result.summary.delete} removed`,
+    );
+    clearRestore();
+    void store.fetchDisplaySettings();
+    void store.fetchImageUpdates();
+  } catch (err) {
+    console.error("[console] restore failed", err);
+    restoreError.value = "The restore did not complete. Nothing else was changed.";
+  } finally {
+    restoreBusy.value = false;
+  }
+}
+
+function clearRestore(): void {
+  restoreDoc.value = null;
+  restorePlan.value = null;
+  restoreName.value = "";
+  restoreError.value = "";
+  restoreDelete.value = false;
 }
 
 // ── Logout ─────────────────────────────────────────────────────────────────────
@@ -680,6 +802,102 @@ async function onSignOut(): Promise<void> {
           </div>
           <p class="hint gap-sm">Regenerating revokes access for machines that haven't dialled in yet.</p>
         </template>
+      </section>
+
+      <!-- Backup & restore (POL-113) -------------------------------------------- -->
+      <section id="sec-backup" class="card">
+        <h2 class="card-title">Backup</h2>
+        <p class="card-sub wrap gap">
+          One file with everything you configured: murals, screens, walls, scenes, the content library (pages and
+          playlists included), and your settings. Keep it somewhere else — it is what turns a dead database into an
+          afternoon rather than a rebuild.
+        </p>
+
+        <div class="field-row">
+          <button type="button" class="btn-ghost-sm" :disabled="backingUp" @click="downloadBackup">
+            {{ backingUp ? "Preparing…" : "Download backup" }}
+          </button>
+          <button type="button" class="btn-ghost-sm" :disabled="restoreBusy" @click="pickRestoreFile">
+            Restore from a backup…
+          </button>
+          <input
+            ref="restoreFile"
+            type="file"
+            accept="application/json,.json"
+            class="file-input"
+            @change="onRestoreFile"
+          />
+        </div>
+
+        <p class="hint gap-sm">
+          Not in the file: <strong>secrets</strong> (credential-profile client secrets are never exported — re-enter
+          them after a restore), <strong>machines and their enrolment</strong> (each box re-enrols and then adopts its
+          screen back from the backup), and <strong>uploaded media files</strong> (they are listed, so a restore can
+          tell you which uploads are missing here).
+        </p>
+
+        <p v-if="restoreError" class="restore-error gap-sm">{{ restoreError }}</p>
+
+        <!-- The dry run: what this restore WILL do, before it does any of it. -->
+        <div v-if="restorePlan" class="restore">
+          <div class="restore-head">
+            <div class="min-w-0">
+              <strong class="restore-file">{{ restoreName }}</strong>
+              <span class="hint">exported {{ formatRelativeShort(restorePlan.exportedAt, Date.now()) }}</span>
+            </div>
+            <button type="button" class="btn-ghost-sm" @click="clearRestore">Cancel</button>
+          </div>
+
+          <div class="tally">
+            <span class="tag add">{{ restorePlan.summary.create }} added</span>
+            <span class="tag upd">{{ restorePlan.summary.update }} updated</span>
+            <span class="tag del" :class="{ hot: restorePlan.summary.delete > 0 }">
+              {{ restorePlan.summary.delete }} deleted
+            </span>
+            <span class="hint">{{ restorePlan.summary.unchanged }} unchanged</span>
+          </div>
+
+          <ul v-if="restoreChanges.length" class="diff">
+            <li v-for="change in restoreChanges" :key="`${change.entity}:${change.id}:${change.action}`">
+              <span class="tag" :class="change.action">{{ change.action }}</span>
+              <span class="diff-entity">{{ change.entity }}</span>
+              <span class="diff-label">{{ change.label }}</span>
+            </li>
+          </ul>
+          <p v-else class="hint gap-sm">This deployment already matches the backup — nothing to change.</p>
+
+          <ul class="notes">
+            <li v-if="restorePlan.credentialProfilesNeedingSecret.length">
+              Re-enter the client secret for
+              <strong>{{ restorePlan.credentialProfilesNeedingSecret.join(", ") }}</strong> — secrets are never
+              exported, so authenticated content stays unauthenticated until you do.
+            </li>
+            <li v-if="restorePlan.screensWithoutMachine.length">
+              {{ restorePlan.screensWithoutMachine.length }} screen(s) belong to machines that have not enrolled here.
+              They are restored anyway and light up as soon as each box dials in.
+            </li>
+            <li v-if="restorePlan.missingMedia.length">
+              {{ restorePlan.missingMedia.length }} uploaded file(s) are not on this deployment
+              ({{ restorePlan.missingMedia.map((m) => m.originalName).join(", ") }}) — re-upload them.
+            </li>
+            <li v-for="warning in restorePlan.warnings" :key="warning">{{ warning }}</li>
+          </ul>
+
+          <label class="danger-toggle">
+            <input type="checkbox" :checked="restoreDelete" :disabled="restoreBusy" @change="
+              restoreDelete = ($event.target as HTMLInputElement).checked;
+              runDryRun();
+            " />
+            <span>
+              Also <strong>delete</strong> murals, screens, scenes and content that aren't in this backup (make this
+              deployment match the file exactly).
+            </span>
+          </label>
+
+          <button type="button" class="btn-apply" :class="{ danger: restorePlan.summary.delete > 0 }" :disabled="restoreBusy" @click="applyRestore">
+            {{ restoreBusy ? "Working…" : "Apply restore" }}
+          </button>
+        </div>
       </section>
 
       <!-- HTTPS (POL-70/D89) ----------------------------------------------------- -->
@@ -1087,6 +1305,135 @@ async function onSignOut(): Promise<void> {
   color: var(--muted2);
   line-height: 1.55;
   margin: 0;
+}
+
+/* ── Backup & restore (POL-113) ────────────────────────────────────────────── */
+.file-input {
+  display: none;
+}
+.restore-error {
+  font-size: 12px;
+  color: var(--bad, #e5484d);
+  margin: 0;
+}
+.restore {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--muted-bg);
+}
+.restore-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.restore-file {
+  font-size: 13px;
+  display: block;
+}
+.tally {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+.tag {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  text-transform: lowercase;
+}
+.tag.add,
+.tag.create {
+  color: #2e9e5b;
+  border-color: #2e9e5b55;
+}
+.tag.upd,
+.tag.update {
+  color: #b08000;
+  border-color: #b0800055;
+}
+.tag.del,
+.tag.delete {
+  color: var(--muted2);
+}
+.tag.del.hot,
+.tag.delete {
+  color: #e5484d;
+  border-color: #e5484d55;
+}
+.diff {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.diff li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.diff-entity {
+  color: var(--muted2);
+  font-size: 11px;
+  min-width: 108px;
+}
+.diff-label {
+  color: var(--fg2);
+  overflow-wrap: anywhere;
+}
+.notes {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted2);
+  line-height: 1.55;
+}
+.danger-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+.btn-apply {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 9px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg2);
+  cursor: pointer;
+}
+.btn-apply:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.btn-apply.danger {
+  color: #e5484d;
+  border-color: #e5484d66;
+}
+.btn-apply:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 /* HTTPS card (POL-70/D89): the per-OS trust steps. Hint-toned so the card stays calm. */
