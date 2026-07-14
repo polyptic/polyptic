@@ -2,7 +2,7 @@
 # Polyptic's dracut module (POL-35). Pulled in by `dracut --add polyptic-live` when
 # deploy/build-live-image.sh builds the initramfs inside the image chroot.
 #
-# Three jobs, each earned by a real boot failure:
+# Four jobs, each earned by a real boot failure:
 #
 #   1. polyptic-ram.sh — livenet downloads the WHOLE rootfs.squashfs into the initramfs root, a
 #      tmpfs the kernel caps at 50% of RAM. Raise the cap, and speak English on a box that truly
@@ -20,6 +20,13 @@
 #      from which host / what is failing), so a stuck boot says WHY without alt-tab console
 #      archaeology. plymouth's display-message feeds the theme's live status line (D45), which our
 #      narration owns while it is up; `-done` hands it back to systemd before switch-root (POL-53).
+#   4. polyptic-pinned-fallback.sh — the offline/Wi-Fi menu PINS `builds/<imageId>/rootfs.squashfs`
+#      (D67), and retention (D54) prunes that build once the box has been off across three rebuilds:
+#      a 404 the box could never boot past, because the refresh that re-pins the medium only happens
+#      after a successful boot (real hardware, 2026-07-14, POL-116). The netroot hook probes the pin
+#      and, when the depot no longer has it, re-points livenet at the ACTIVE build (or the unpinned
+#      arch root) — loudly. It is a `netroot` hook because that is the one place dracut sources our
+#      code into the shell that owns $netroot, right before it hands that URL to livenetroot.
 #
 # `check()` returns 0 unconditionally: the module is never auto-detected, only `--add`ed.
 
@@ -42,6 +49,10 @@ install() {
     inst_hook initqueue/settled 05 "$moddir/polyptic-progress-wait.sh"
     inst_hook initqueue/online 94 "$moddir/polyptic-progress-online.sh"
     inst_hook initqueue/timeout 10 "$moddir/polyptic-progress-timeout.sh"
+    # `netroot` hooks are SOURCED by /sbin/netroot (45net-lib) in the shell that holds $netroot, and
+    # immediately before it runs `livenetroot "$netif" "$netroot"` — the only place a hook can change
+    # WHICH image livenet fetches without patching livenet itself (POL-116).
+    inst_hook netroot 50 "$moddir/polyptic-pinned-fallback.sh"
     # `pre-pivot` is the last hook that runs with plymouthd still owning the initramfs' screen.
     inst_hook pre-pivot 50 "$moddir/polyptic-progress-done.sh"
     # Sorts AFTER dracut's own 99-dracut.conf (d < p), so these settings win.
@@ -52,5 +63,10 @@ install() {
     # netplan `optional: true`. Sorts before dracut's generated 70-*/zzzz-*.network, so it wins.
     inst_simple "$moddir/polyptic-netboot.network" \
         "/etc/systemd/network/10-polyptic-netboot.network"
-    inst_multiple awk mount sleep sed
+    # Everything polyptic-pinned-fallback.sh shells out to must be HERE: an initramfs missing one
+    # external is how POL-78 spent a week rejecting every Wi-Fi config (no `dirname` in the initrd).
+    # curl comes in with url-lib and sed/awk/sleep with the hooks above; naming them is the contract.
+    # `tr` is the only soft one — the script guards it with `command -v` and just reports no machine
+    # id without it.
+    inst_multiple awk mount sleep sed curl tr
 }

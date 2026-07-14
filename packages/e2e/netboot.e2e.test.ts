@@ -498,6 +498,37 @@ describe("netboot: POST /boot/report", () => {
   );
 
   test(
+    "POL-116: a box that healed a pruned pin reports `warn` — it is UP, on an image its kernel did not ship with",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ok: false,
+          code: "pinned-build-missing",
+          detail:
+            "the OS image this screen was pinned to (20260713T140345Z-fe8ca57b) is gone from the depot; booting the current image (20260714T045032Z-5724b929) instead",
+          machineId: "dmi-4c4c4544-0037",
+        }),
+      });
+      expect(res.status).toBe(204);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      const line = activity.find((e) => e.text.includes("was pinned to"));
+      expect(line).toBeDefined();
+      // `warn`, not `bad`: the wall is showing content. A red line for a healthy wall trains the
+      // operator to ignore the feed — but a silent swap is exactly what POL-116 forbids.
+      expect(line?.severity).toBe("warn");
+      expect(line?.text).toContain("dmi-4c4c4544-0037");
+      expect(line?.text).toContain("started the current one instead");
+      expect(line?.text).toContain("20260714T045032Z-5724b929");
+      // It must NOT be laundered into the bootloader-install vocabulary: nothing was installed.
+      expect(line?.text).not.toContain("bootloader");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "an unknown code or an oversized detail is a 400, never an activity line",
     async () => {
       const bad = await fetch(`${OPEN_BASE}/boot/report`, {

@@ -349,8 +349,19 @@ Everything netboot buys survives on Wi-Fi: the OS still streams from the control
 every boot, the box stays diskless and generic, and updates stay automatic — the 5-minute poll
 **refreshes the medium itself** (new build's kernel + initrd-wifi into the inactive A/B slot,
 verified against the depot's `SHA256SUMS`, menu rewritten last so power loss mid-update leaves the
-old slot bootable) before rebooting. A box offline longer than the depot's retention boots the
-menu's recovery entry (newest image, possibly mismatched kernel) and heals itself on the next poll.
+old slot bootable) before rebooting.
+
+A box offline **longer than the depot's retention** comes back to a pin that has been pruned — a 404
+it cannot boot past, and it can never boot to earn the refresh that would re-pin it. So it heals
+itself **in the initramfs**, where it still has the network it just joined (POL-116): when the pinned
+image cannot be fetched, it asks `manifest.json` which build is active, boots THAT one (or the
+unpinned arch root), and says so — on the splash, and off-box as a `pinned-build-missing` boot report,
+because the wall is now running a rootfs its on-stick kernel did not ship with. The update poll then
+re-pins the medium as it always has, so the fallback fires exactly once. If the kernel and the image
+genuinely disagree, the existing recovery path owns it: the running kernel has no `/lib/modules` in
+that rootfs, the poll sees the tell, refreshes the medium and reboots into a matched pair. (The
+menu's manual **"newest image"** entry survives for an operator standing at a box with a keyboard —
+but a wall screen has neither, which is why the fallback is automatic.)
 
 The offline menu also **paints the branded boot splash** (POL-47), even with no server to fetch the
 theme from: `deploy/build-boot-medium.sh` bakes `theme.txt` + `logo.png` onto the medium (fetched

@@ -327,14 +327,26 @@ function reporterName(machineId: string): string {
  * composed about its own firmware and disks; the server never parses it, only quotes it — the codes
  * are the machine-readable half of the contract, and they are what tests pin.
  *
- * `installed` is `good`. Everything else is `bad` except the two "the operator has to decide" cases —
- * an ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human.
+ * `installed` is `good`. Everything else is `bad` except the "the operator has to decide" cases — an
+ * ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human — and
+ * POL-116's `pinned-build-missing`, which is not a bootloader outcome at all.
  */
 export function bootReportLine(report: BootReport): { severity: "good" | "warn" | "bad"; text: string } {
   const who = reporterName(report.machineId);
   const detail = report.detail.trim();
   if (report.ok && report.code === "installed") {
     return { severity: "good", text: `${who} installed the Polyptic bootloader${detail ? `: ${detail}` : ""}` };
+  }
+  // POL-116: the box IS up — it just healed a pin retention had pruned and streamed the ACTIVE image
+  // instead of the one its medium named. `warn`, not `bad`: nothing is broken, but the operator must
+  // know the wall is running a rootfs its on-stick kernel did not ship with until the medium re-pins.
+  if (report.code === "pinned-build-missing") {
+    return {
+      severity: "warn",
+      text: `${who} could not find the OS image its boot medium was pinned to and started the current one instead${
+        detail ? `: ${detail}` : ""
+      }`,
+    };
   }
   const severity = report.code === "ambiguous-esp" || report.code === "not-uefi" ? "warn" : "bad";
   return {

@@ -17,4 +17,6 @@ if type plymouth > /dev/null 2>&1 && plymouth --ping 2> /dev/null; then
     plymouth hide-message --text="Waiting for the network (DHCP) ..." 2> /dev/null || :
     plymouth hide-message --text="Downloading the OS image ..." 2> /dev/null || :
     plymouth hide-message --text="Cannot fetch the OS image" 2> /dev/null || :
+    # POL-116: the pinned-build fallback's line (polyptic-pinned-fallback.sh raises this exact text).
+    plymouth hide-message --text="The OS image this screen was set up with is gone; starting the newest one ..." 2> /dev/null || :
 fi

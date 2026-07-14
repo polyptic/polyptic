@@ -1232,6 +1232,11 @@ export const BootReportCode = z.enum([
   "boot-order-not-first", // the entry exists but the firmware still boots something else first
   "esp-too-small", // POL-63: the Wi-Fi local payload (kernel + initrd-wifi + spare slot) won't fit
   "no-local-payload", // POL-63: a Wi-Fi box's offload found no payload for its arch on the medium
+  // POL-116: not a bootloader outcome at all — an initramfs one. The box's boot medium pinned a build
+  // (D67's offline menu) that retention (D54) has since pruned from the depot, so it healed itself in
+  // the initramfs and streamed the ACTIVE image instead. It IS up, on a rootfs its on-stick kernel did
+  // not ship with, until update-poll re-pins the medium — hence a report rather than a silent swap.
+  "pinned-build-missing",
 ]);
 export type BootReportCode = z.infer<typeof BootReportCode>;
 
