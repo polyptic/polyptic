@@ -51,13 +51,14 @@
  */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
-import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protocol";
+import type { Geometry, ServerToPlayerMessage, SliceOverlay, Surface } from "@polyptic/protocol";
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle } from "./surface-style";
+import { overlayStyle, probeableSurfaces } from "./overlay-layer";
 import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
@@ -122,6 +123,13 @@ const surfaces = ref<Surface[]>([]);
 const connState = ref<ConnState>("connecting");
 const revision = ref(-1);
 const ident = ref<{ friendlyName: string; color: string } | null>(null);
+
+// POL-97 — the overlay layer: a page (transparent background) composited ABOVE the content surfaces
+// and below the wall's chrome. It arrives in its own slice field, never in `surfaces`, so nothing
+// that reasons about content — the keyed diff, the span math, the idle-splash test, the POL-86
+// prober — has to know it exists. Replaced wholesale on each render; `undefined` = no overlay, which
+// is how removing one reaches the glass: the content beneath was never touched, so it just stays.
+const overlay = ref<SliceOverlay | undefined>(undefined);
 
 // POL-6 — corner status-badge visibility is a fleet-wide setting the server pushes over the player WS
 // (`server/settings`), no longer the build-time `import.meta.env.DEV` flag. We seed it from DEV so a dev
@@ -201,6 +209,7 @@ function persistSlice(): void {
   saveLastSlice(localStorage, screenId, {
     canvas: canvas.value,
     surfaces: surfaces.value,
+    overlay: overlay.value,
     revision: Math.max(revision.value, 0),
     friendlyName: screenName.value,
     showBadges: showBadges.value,
@@ -214,6 +223,7 @@ function handleMessage(msg: ServerToPlayerMessage): void {
     // their id, patching only changed attributes (e.g. a web surface's url) — no reload.
     canvas.value = msg.slice.canvas;
     surfaces.value = msg.slice.surfaces;
+    overlay.value = msg.slice.overlay;
     revision.value = msg.revision;
     // The name rides on every render, so a console rename relabels the idle splash / badge instantly.
     screenName.value = msg.friendlyName;
@@ -222,6 +232,10 @@ function handleMessage(msg: ServerToPlayerMessage): void {
         msg.slice.surfaces.length === 0
           ? "no surfaces (idle splash)"
           : msg.slice.surfaces.map((s) => `${s.id}=${s.type}`).join(" ")
+      }${
+        msg.slice.overlay
+          ? ` + overlay ${msg.slice.overlay.sourceId} (${msg.slice.overlay.scope} scope)`
+          : ""
       }`,
     );
     // POL-32 — start caching what this render shows, and remember it for an outage boot.
@@ -281,15 +295,12 @@ const prober = new SurfaceProber({
   log: (msg) => diag(msg),
 });
 
-/** What each on-screen surface will actually fetch — the exact URLs the prober must prove.
- *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
- *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
- *  (POL-42) are excluded for the same reason: a page renders locally (text/clock/shapes need no
- *  network) and its embeds carry send-time-resolved data with their own calm placeholders. */
+/** What each on-screen surface will actually fetch — the exact URLs the prober must prove. The probe
+ *  set itself is defined in ./overlay-layer.ts: playlists and pages are excluded (a rotation has no
+ *  single URL; a page renders locally with send-time data and its own calm placeholders), and the
+ *  POL-97 overlay — not a surface at all — can never enter it. */
 const probeTargets = computed(() =>
-  surfaces.value
-    .filter((s) => s.type !== "playlist" && s.type !== "page")
-    .map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
+  probeableSurfaces(surfaces.value).map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
 );
 
 watch(probeTargets, (targets) => prober.sync(targets), { immediate: true });
@@ -361,6 +372,7 @@ onMounted(() => {
   if (restored) {
     canvas.value = restored.canvas;
     surfaces.value = restored.surfaces;
+    overlay.value = restored.overlay;
     revision.value = restored.revision;
     screenName.value = restored.friendlyName;
     if (restored.showBadges !== undefined) showBadges.value = restored.showBadges;
@@ -615,6 +627,27 @@ function connLabel(state: ConnState): string {
       <!-- URL not yet proven reachable: a calm placeholder, never a sad face / broken-image icon. -->
       <div v-else class="surface-loading" aria-hidden="true">
         <span class="surface-loading-dot" />
+      </div>
+    </div>
+
+    <!--
+      POL-97 — the overlay layer. ABOVE the content surfaces, BELOW the ident flash and the badge, and
+      `pointer-events: none` so it can never swallow a click meant for an interactive surface. It is
+      rendered by the SAME PageCanvas the Studio previews with and a page surface uses — `transparent`
+      only tells it to drop the authored background, so the content beneath shows through. Keyed by
+      the source it resolved from: swapping the overlay swaps the layer, and clearing it unmounts the
+      layer alone — the content surfaces are never re-keyed, so nothing beneath reloads (D5).
+    -->
+    <div v-if="overlay" class="overlay" aria-hidden="true">
+      <div class="overlay-page" :style="overlayStyle(overlay)">
+        <PageCanvas
+          :key="overlay.sourceId"
+          :definition="overlay.definition"
+          :data="overlay.data"
+          :resolve-src="rehomeMediaSrc"
+          transparent
+          live
+        />
       </div>
     </div>
 

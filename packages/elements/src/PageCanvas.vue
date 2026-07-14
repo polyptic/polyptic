@@ -10,22 +10,29 @@
   1080p panel, and a spanned video wall (where this box is the full spanning content's size).
 -->
 <script setup lang="ts">
+import { computed } from "vue";
 import type { PageData, PageDefinition } from "@polyptic/protocol";
 import PageElementView from "./PageElementView.vue";
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
     definition: PageDefinition;
     data?: PageData;
     live?: boolean;
     resolveSrc?: (src: string) => string;
+    /** POL-97 — draw the page as an OVERLAY: its authored background is ignored and the canvas is
+     *  transparent, so the content underneath shows through everywhere an element isn't. The same
+     *  renderer, one flag — an overlay IS a page, and a second renderer could only drift from this one. */
+    transparent?: boolean;
   }>(),
-  { data: undefined, live: true, resolveSrc: undefined },
+  { data: undefined, live: true, resolveSrc: undefined, transparent: false },
 );
+
+const background = computed(() => (props.transparent ? "transparent" : props.definition.bg));
 </script>
 
 <template>
-  <div class="page-canvas" :style="{ background: definition.bg }">
+  <div class="page-canvas" :style="{ background }">
     <div
       v-for="(element, i) in definition.elements"
       :key="element.id"

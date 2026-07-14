@@ -19,6 +19,7 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  SetOverlayBody,
   SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -26,6 +27,8 @@ import {
 } from "@polyptic/protocol";
 import type {
   ContentSource,
+  OverlayAssignment,
+  OverlayScope,
   CredentialProfileTestResult,
   CredentialProfileView,
   Scene,
@@ -532,4 +535,28 @@ export async function updateScene(sceneId: string, body: UpdateSceneBody): Promi
 /** DELETE /api/v1/scenes/:sceneId — delete a saved scene. */
 export function deleteScene(sceneId: string): Promise<unknown> {
   return send("DELETE", `/scenes/${encodeURIComponent(sceneId)}`);
+}
+
+// ── Overlays (POL-97) ─────────────────────────────────────────────────────────
+//
+// An overlay is a library PAGE composited ABOVE whatever content a screen is showing. It is applied
+// to a SCOPE — fleet | mural | wall | screen — and the narrowest scope covering a screen wins. The
+// server pushes the affected players immediately; nothing about their content changes.
+
+/** PUT /api/v1/overlays — apply (or replace) the overlay on one scope. */
+export async function setOverlay(body: SetOverlayBody): Promise<OverlayAssignment> {
+  const res = await send<{ overlay: OverlayAssignment }>(
+    "PUT",
+    "/overlays",
+    SetOverlayBody.parse(body),
+  );
+  return res.overlay;
+}
+
+/** DELETE /api/v1/overlays/:scope[/:targetId] — take the overlay off a scope. */
+export async function clearOverlay(scope: OverlayScope, targetId?: string): Promise<void> {
+  const path = targetId
+    ? `/overlays/${scope}/${encodeURIComponent(targetId)}`
+    : `/overlays/${scope}`;
+  await send("DELETE", path);
 }

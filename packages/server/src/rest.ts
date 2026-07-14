@@ -39,6 +39,7 @@ import {
   CreateSceneBody,
   IdentBody,
   InspectBody,
+  OverlayScope,
   PlaceScreenBody,
   RebootBody,
   ShellArmBody,
@@ -53,6 +54,7 @@ import {
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetOverlayBody,
   SetZoomBody,
   Surface,
   UpdateContentSourceBody,
@@ -103,6 +105,11 @@ function playlistItemErrorDetail(
   }
 }
 const CredentialProfileParams = z.object({ id: z.string().min(1) });
+/** POL-97 — DELETE /api/v1/overlays/:scope[/:targetId]; the fleet scope carries no target. */
+const OverlayParams = z.object({
+  scope: OverlayScope,
+  targetId: z.string().min(1).optional(),
+});
 const SceneParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
 const DemoWebBody = z.object({ screenId: z.string().min(1), url: z.string().url() });
@@ -1269,6 +1276,88 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return { ok: true, sourceId: params.data.id, screens: result.slices.map((s) => s.screenId) };
+  });
+
+  // ── POL-97 routes (overlays — a page composited above whatever is playing) ────
+  //
+  // PUT /api/v1/overlays                    { scope, targetId?, sourceId } -> apply/replace
+  // DELETE /api/v1/overlays/:scope[/:targetId]                             -> remove
+  // GET /api/v1/overlays                                                   -> assignments + coverage
+  //
+  // Neither mutation bumps the revision or touches a stored slice: the overlay is resolved per screen
+  // at SEND time, so applying or removing one is a re-push of the SAME content with (or without) one
+  // extra layer. The pushes go only to the screens whose RESOLVED overlay actually changed — a screen
+  // a narrower scope already covers keeps what it has (screen > wall > mural > fleet).
+
+  // GET /api/v1/overlays -> { overlays: OverlayAssignment[], coverage: {screenId, scope, sourceId}[] }
+  fastify.get("/api/v1/overlays", async () => ({
+    overlays: control.getOverlays(),
+    coverage: control.overlayCoverage(),
+  }));
+
+  // PUT /api/v1/overlays  { scope, targetId?, sourceId }
+  fastify.put("/api/v1/overlays", async (request, reply) => {
+    const body = SetOverlayBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setOverlay(body.data.scope, body.data.targetId, body.data.sourceId);
+    if (!result.ok) {
+      if (result.error === "unknown-target") {
+        return reply
+          .code(404)
+          .send({ error: `unknown ${body.data.scope}: ${body.data.targetId}` });
+      }
+      if (result.error === "unknown-source") {
+        return reply.code(404).send({ error: `unknown content source: ${body.data.sourceId}` });
+      }
+      // Only a page composes over content — every other kind would occlude what it sits above.
+      return reply.code(400).send({ error: "an overlay must be a page source (author one in the Studio)" });
+    }
+
+    for (const screenId of result.screenIds) pushRender(screenId, control.sliceForPlayer(screenId));
+
+    fastify.log.info(
+      {
+        event: "overlay.set",
+        scope: body.data.scope,
+        targetId: body.data.targetId,
+        sourceId: body.data.sourceId,
+        screens: result.screenIds,
+      },
+      "overlay applied",
+    );
+    broadcaster.broadcast();
+    return { ok: true, overlay: result.assignment, screens: result.screenIds };
+  });
+
+  // DELETE /api/v1/overlays/:scope  |  /api/v1/overlays/:scope/:targetId
+  fastify.delete("/api/v1/overlays/:scope/:targetId?", async (request, reply) => {
+    const params = OverlayParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const { scope, targetId } = params.data;
+    if ((scope === "fleet") !== (targetId === undefined)) {
+      return reply.code(400).send({
+        error: scope === "fleet" ? "the fleet scope takes no targetId" : `the ${scope} scope needs a targetId`,
+      });
+    }
+
+    const result = await control.clearOverlay(scope, targetId);
+    if (!result) {
+      return reply.code(404).send({ error: `no overlay on ${scope}${targetId ? ` ${targetId}` : ""}` });
+    }
+
+    for (const screenId of result.screenIds) pushRender(screenId, control.sliceForPlayer(screenId));
+
+    fastify.log.info(
+      { event: "overlay.clear", scope, targetId, screens: result.screenIds },
+      "overlay removed",
+    );
+    broadcaster.broadcast();
+    return { ok: true, screens: result.screenIds };
   });
 
   // ── POL-24 routes (credential profiles — content auth) ────────────────────────

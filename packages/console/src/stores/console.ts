@@ -27,6 +27,8 @@ import type {
   MachineView,
   Mural,
   NetbootInfo,
+  OverlayAssignment,
+  OverlayScope,
   Placement,
   Scene,
   ScreenView,
@@ -135,6 +137,10 @@ export interface ConsoleState {
    *  admin/state.credentialProfiles (optional on the wire → [] against an older server). Never
    *  carries a client secret. */
   credentialProfiles: CredentialProfileView[];
+  /** POL-97 — overlay assignments by scope (fleet | mural | wall | screen), mirrored from
+   *  admin/state.overlays (optional on the wire → [] against an older server). An overlay is a page
+   *  composited ABOVE whatever content is playing; the narrowest scope covering a screen wins. */
+  overlays: OverlayAssignment[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
   /** The Live Activity feed (D25) — bounded, newest-first human event log, mirrored from
@@ -179,6 +185,7 @@ export const useConsoleStore = defineStore("console", {
     videoWalls: [],
     contentSources: [],
     credentialProfiles: [],
+    overlays: [],
     scenes: [],
     activity: [],
     activeSceneId: null,
@@ -263,6 +270,39 @@ export const useConsoleStore = defineStore("console", {
 
     screenById(): (id: string) => ScreenView | undefined {
       return (id: string) => this.screens.find((s) => s.id === id);
+    },
+
+    // ── Overlays (POL-97) ───────────────────────────────────────────────────────
+
+    /** The overlay assignment on one scope, if any. */
+    overlayFor(): (scope: OverlayScope, targetId?: string) => OverlayAssignment | undefined {
+      return (scope: OverlayScope, targetId?: string) =>
+        this.overlays.find((o) => o.scope === scope && (o.targetId ?? undefined) === targetId);
+    },
+
+    /**
+     * Which overlay each screen actually WEARS — resolved client-side by the same precedence the
+     * server applies (screen > wall > mural > fleet), so the console can show at a glance which
+     * panels carry one, and from which scope, without a second round-trip.
+     */
+    overlayCoverage(): (screenId: string) => OverlayAssignment | undefined {
+      return (screenId: string) => {
+        const wallId = this.videoWalls.find((w) => w.memberScreenIds.includes(screenId))?.id;
+        const muralId = this.placements.find((p) => p.screenId === screenId)?.muralId;
+        const candidates: [OverlayScope, string | undefined][] = [
+          ["screen", screenId],
+          ["wall", wallId],
+          ["mural", muralId],
+          ["fleet", undefined],
+        ];
+        for (const [scope, targetId] of candidates) {
+          if (scope !== "fleet" && targetId === undefined) continue;
+          const overlay = this.overlayFor(scope, targetId);
+          // An assignment whose page has since been deleted covers nothing (the server agrees).
+          if (overlay && this.contentSources.some((s) => s.id === overlay.sourceId)) return overlay;
+        }
+        return undefined;
+      };
     },
 
     placementForScreen(): (screenId: string) => Placement | undefined {
@@ -703,6 +743,8 @@ export const useConsoleStore = defineStore("console", {
         this.contentSources = msg.contentSources;
         // POL-24 — credential profiles are optional on the wire (older servers omit them).
         this.credentialProfiles = msg.credentialProfiles ?? [];
+        // POL-97 — overlays are optional on the wire (older servers omit them).
+        this.overlays = msg.overlays ?? [];
         this.scenes = msg.scenes;
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
@@ -1213,6 +1255,31 @@ export const useConsoleStore = defineStore("console", {
 
     /** Create a library source. The authoritative admin/state broadcast adds it to contentSources.
      *  Returns the created source (the Studio needs the server-assigned id), or null on failure. */
+    // ── Overlays (POL-97) ───────────────────────────────────────────────────────
+
+    /** Apply a page as the overlay on one scope. The server pushes the affected players immediately;
+     *  the admin/state broadcast that follows is what refreshes `overlays` here. */
+    async applyOverlay(scope: OverlayScope, targetId: string | undefined, sourceId: string): Promise<boolean> {
+      try {
+        await api.setOverlay({ scope, targetId, sourceId });
+        return true;
+      } catch (err) {
+        console.error("[console] applyOverlay failed", err);
+        return false;
+      }
+    },
+
+    /** Take the overlay off a scope. Content underneath is untouched — it was never replaced. */
+    async removeOverlay(scope: OverlayScope, targetId?: string): Promise<boolean> {
+      try {
+        await api.clearOverlay(scope, targetId);
+        return true;
+      } catch (err) {
+        console.error("[console] removeOverlay failed", err);
+        return false;
+      }
+    },
+
     async createSource(body: CreateContentSourceBody): Promise<ContentSource | null> {
       try {
         return await api.createContentSource(body);

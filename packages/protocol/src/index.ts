@@ -88,21 +88,23 @@ export type Screen = z.infer<typeof Screen>;
 // Typed surfaces — what renders inside a region of a screen
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Video-wall spanning (Phase 3b): this content is the sub-rectangle at (offsetX,offsetY) of a
+ *  contentW×contentH whole. The player sizes the content to contentW×contentH and translates it by
+ *  -(offsetX,offsetY) so this screen renders only its slice of the spanning whole. Named because the
+ *  overlay layer (POL-97) spans a video wall by exactly the same math a surface does. */
+export const SurfaceSpan = z.object({
+  contentW: z.number().positive(),
+  contentH: z.number().positive(),
+  offsetX: z.number(),
+  offsetY: z.number(),
+});
+export type SurfaceSpan = z.infer<typeof SurfaceSpan>;
+
 const SurfaceBase = z.object({
   id: z.string(),
   region: Geometry, // position within the screen
-  /** Video-wall spanning (Phase 3b): when set, this surface shows the sub-rectangle at
-   *  (offsetX,offsetY) of a contentW×contentH content. The player sizes the content to
-   *  contentW×contentH and translates it by -(offsetX,offsetY) so this screen renders only its
-   *  slice of the spanning content. Unset = an ordinary single-screen tile. */
-  span: z
-    .object({
-      contentW: z.number().positive(),
-      contentH: z.number().positive(),
-      offsetX: z.number(),
-      offsetY: z.number(),
-    })
-    .optional(),
+  /** Spanning descriptor; unset = an ordinary single-screen tile. See {@link SurfaceSpan}. */
+  span: SurfaceSpan.optional(),
 });
 
 /** Page zoom for a FRAMED surface (web/dashboard), as a scale factor — 1 = 100%, like a browser's
@@ -401,11 +403,59 @@ export const Surface = z.discriminatedUnion("type", [
 ]);
 export type Surface = z.infer<typeof Surface>;
 
-/** The renderable unit a single player receives: its screen's canvas + the surfaces on it. */
+// ── Overlays (POL-97) — a page composited ABOVE whatever content is playing ───
+//
+// An OVERLAY is a page (POL-42) with a transparent background, drawn in a layer above the content
+// surfaces and below the wall's own chrome (ident, badge): a corner logo, an emergency ticker, a
+// "MEETING IN PROGRESS" banner. It never replaces content — it composites over it, whatever that
+// content is (including a takeover). An operator applies ONE overlay per scope; the most specific
+// scope covering a screen wins: screen > wall > mural > fleet.
+//
+// It rides BESIDE `surfaces`, not inside them (D102). A seventh Surface kind would have dragged the
+// overlay through everything that reasons about surfaces — span math, the region layout, the idle
+// splash's "no surfaces" test, the POL-86 prober's probe targets, the last-slice cache — and every
+// one of those would have needed a "…except the overlay" branch. As its own optional field it is
+// invisible to all of them: `surfaces` still means CONTENT, the keyed DOM-diff over `surfaces` is
+// untouched, and the player simply paints one extra layer.
+
+/** Where an overlay applies. Most specific wins: screen > wall > mural > fleet. */
+export const OverlayScope = z.enum(["fleet", "mural", "wall", "screen"]);
+export type OverlayScope = z.infer<typeof OverlayScope>;
+
+/** An operator's overlay assignment: this page source, composited over everything in this scope.
+ *  `targetId` is the mural/wall/screen id — absent for `fleet` (there is only one fleet). */
+export const OverlayAssignment = z.object({
+  scope: OverlayScope,
+  targetId: z.string().optional(),
+  /** The library source (kind `page`) drawn as the overlay. */
+  sourceId: z.string(),
+});
+export type OverlayAssignment = z.infer<typeof OverlayAssignment>;
+
+/** The overlay as one player receives it, stamped into the slice at SEND time (never stored): the
+ *  resolved definition + its live data bundle, exactly like a page surface, plus the same Phase-3b
+ *  span descriptor when the overlay covers a video wall (so a corner logo lands once, in the WALL's
+ *  corner, not once per panel). Stored slices never carry it — the overlay is resolved per send, so
+ *  removing it is a re-push, not a content edit. */
+export const SliceOverlay = z.object({
+  /** The page source this overlay resolved from (diagnostics + the console's "which screens carry it"). */
+  sourceId: z.string(),
+  /** Which scope won the precedence contest for this screen — shown in the console, logged by the player. */
+  scope: OverlayScope,
+  definition: PageDefinition,
+  data: PageData.optional(),
+  span: SurfaceSpan.optional(),
+});
+export type SliceOverlay = z.infer<typeof SliceOverlay>;
+
+/** The renderable unit a single player receives: its screen's canvas + the surfaces on it (+ the
+ *  overlay composited above them, POL-97). */
 export const ScreenSlice = z.object({
   screenId: z.string(),
   canvas: Geometry, // the screen's own pixel space (x/y usually 0,0)
   surfaces: z.array(Surface),
+  /** POL-97 — the overlay layer, stamped at send time. Absent = no overlay covers this screen. */
+  overlay: SliceOverlay.optional(),
 });
 export type ScreenSlice = z.infer<typeof ScreenSlice>;
 
@@ -1259,6 +1309,7 @@ export const ServerToAdminState = z.object({
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  overlays: z.array(OverlayAssignment).optional(), // POL-97 — overlay assignments by scope; optional = back-compat
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -1285,6 +1336,23 @@ export type ShellArmBody = z.infer<typeof ShellArmBody>;
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });
 export type InspectBody = z.infer<typeof InspectBody>;
+
+/** PUT /api/v1/overlays — apply a page as the overlay for one scope (POL-97). Re-PUTting the same
+ *  scope replaces its overlay; DELETE /api/v1/overlays/:scope[/:targetId] removes it. `targetId` is
+ *  required for every scope but `fleet`. */
+export const SetOverlayBody = z
+  .object({
+    scope: OverlayScope,
+    targetId: z.string().min(1).optional(),
+    sourceId: z.string().min(1),
+  })
+  .superRefine((b, ctx) => {
+    if (b.scope === "fleet" && b.targetId !== undefined)
+      ctx.addIssue({ code: "custom", message: "the fleet scope takes no targetId" });
+    if (b.scope !== "fleet" && b.targetId === undefined)
+      ctx.addIssue({ code: "custom", message: `the ${b.scope} scope needs a targetId` });
+  });
+export type SetOverlayBody = z.infer<typeof SetOverlayBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

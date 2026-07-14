@@ -47,6 +47,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedOverlay,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -146,6 +147,14 @@ interface CredentialProfileRow {
   scope: string | null;
   audience: string | null;
   token_param: string;
+}
+
+/** POL-97 — one overlay per scope. `target_id` is '' on the single fleet row (a NULL would sit
+ *  outside the primary key). */
+interface OverlayRow {
+  scope: string;
+  target_id: string;
+  source_id: string;
 }
 
 interface ZoomPreferenceRow {
@@ -309,6 +318,17 @@ export class PostgresStore implements Store {
         PRIMARY KEY (target_id, source_key)
       )
     `;
+    // Overlays (POL-97): the page composited ABOVE whatever content is playing, one row per scope
+    // (fleet | mural | wall | screen). The fleet row's target_id is '' (empty), so (scope, target_id)
+    // is a real primary key and re-applying an overlay to a scope simply replaces it.
+    await sql`
+      CREATE TABLE IF NOT EXISTS overlays (
+        scope     text NOT NULL,
+        target_id text NOT NULL DEFAULT '',
+        source_id text NOT NULL,
+        PRIMARY KEY (scope, target_id)
+      )
+    `;
     // Credential profiles (POL-24): centrally-held OAuth clients for Bucket-A content auth. The
     // client secret's ONLY durable home — never broadcast, never returned by REST, never logged.
     await sql`
@@ -445,6 +465,7 @@ export class PostgresStore implements Store {
       sceneRows,
       credentialProfileRows,
       zoomPreferenceRows,
+      overlayRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
@@ -457,6 +478,7 @@ export class PostgresStore implements Store {
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
+      sql<OverlayRow[]>`SELECT scope, target_id, source_id FROM overlays`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -543,6 +565,14 @@ export class PostgresStore implements Store {
       zoom: Number(row.zoom),
     }));
 
+    // POL-97 — an unknown scope value (a downgrade, a hand-edited row) is dropped rather than crashing
+    // the boot: a screen simply carries no overlay until an operator re-applies one.
+    const overlays: PersistedOverlay[] = overlayRows.flatMap((row) =>
+      row.scope === "fleet" || row.scope === "mural" || row.scope === "wall" || row.scope === "screen"
+        ? [{ scope: row.scope, targetId: row.target_id === "" ? null : row.target_id, sourceId: row.source_id }]
+        : [],
+    );
+
     const scenes: PersistedScene[] = sceneRows.map((row) => {
       // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
       const raw =
@@ -574,6 +604,7 @@ export class PostgresStore implements Store {
       scenes,
       credentialProfiles,
       zoomPreferences,
+      overlays,
     };
   }
 
@@ -835,6 +866,32 @@ export class PostgresStore implements Store {
       sourceKey: row.source_key,
       zoom: Number(row.zoom),
     }));
+  }
+
+  // ── Overlays (POL-97) ────────────────────────────────────────────────────────
+
+  async upsertOverlay(overlay: PersistedOverlay): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO overlays (scope, target_id, source_id)
+      VALUES (${overlay.scope}, ${overlay.targetId ?? ""}, ${overlay.sourceId})
+      ON CONFLICT (scope, target_id) DO UPDATE SET source_id = EXCLUDED.source_id
+    `;
+  }
+
+  async deleteOverlay(scope: PersistedOverlay["scope"], targetId: string | null): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM overlays WHERE scope = ${scope} AND target_id = ${targetId ?? ""}`;
+  }
+
+  async listOverlays(): Promise<PersistedOverlay[]> {
+    const sql = this.sql;
+    const rows = await sql<OverlayRow[]>`SELECT scope, target_id, source_id FROM overlays`;
+    return rows.flatMap((row) =>
+      row.scope === "fleet" || row.scope === "mural" || row.scope === "wall" || row.scope === "screen"
+        ? [{ scope: row.scope, targetId: row.target_id === "" ? null : row.target_id, sourceId: row.source_id }]
+        : [],
+    );
   }
 
   // ── Credential profiles (POL-24) ─────────────────────────────────────────────

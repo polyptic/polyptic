@@ -19,7 +19,7 @@
  * waits for the live render as before. All storage errors (quota, private mode) are swallowed:
  * persistence is an enhancement, its absence is only ever the pre-POL-32 behaviour.
  */
-import { Geometry, Surface } from "@polyptic/protocol";
+import { Geometry, SliceOverlay, Surface } from "@polyptic/protocol";
 import { z } from "zod";
 
 /** localStorage-shaped seam so tests can inject a plain object store. */
@@ -35,6 +35,10 @@ export const SliceSnapshot = z.object({
   v: z.literal(SNAPSHOT_VERSION),
   canvas: Geometry,
   surfaces: z.array(Surface),
+  /** POL-97 — the overlay layer, snapshotted with the content so an outage boot restores the WHOLE
+   *  wall (logo bug and all), not the content with its branding stripped. Optional: a snapshot written
+   *  before overlays existed still parses, and simply restores without one. */
+  overlay: SliceOverlay.optional(),
   revision: z.number().int().nonnegative(),
   friendlyName: z.string(),
   showBadges: z.boolean().optional(),

@@ -125,6 +125,21 @@ export interface PersistedZoomPreference {
   zoom: number;
 }
 
+/**
+ * POL-97 — an OVERLAY assignment: the page source composited above whatever content is showing in
+ * one scope. `scope` is fleet | mural | wall | screen and `targetId` is that scope's id (NULL for
+ * `fleet`, which has exactly one row). Primary key is (scope, targetId) — one overlay per scope, so
+ * re-applying replaces. The overlay itself is resolved at SEND time from the referenced page source,
+ * so nothing about a screen's stored CONTENT changes when an overlay is applied or removed.
+ */
+export interface PersistedOverlay {
+  scope: "fleet" | "mural" | "wall" | "screen";
+  /** The mural/wall/screen id; `null` on the single `fleet` row. */
+  targetId: string | null;
+  /** The library source (kind `page`) drawn as the overlay. */
+  sourceId: string;
+}
+
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
 export interface PersistedMural {
   id: string;
@@ -315,6 +330,8 @@ export interface PersistedState {
   credentialProfiles: PersistedCredentialProfile[];
   /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
   zoomPreferences: PersistedZoomPreference[];
+  /** POL-97 — overlay assignments (one per scope). Empty on a deployment with no overlays. */
+  overlays: PersistedOverlay[];
 }
 
 /**
@@ -390,6 +407,14 @@ export interface Store {
   deleteZoomPreferencesForTarget(targetId: string): Promise<void>;
   /** All persisted zoom preferences. */
   listZoomPreferences(): Promise<PersistedZoomPreference[]>;
+
+  // ── Overlays (POL-97) ──────────────────────────────────────────────────────
+  /** Insert-or-update the overlay for one scope (keyed by scope + targetId). */
+  upsertOverlay(overlay: PersistedOverlay): Promise<void>;
+  /** Remove a scope's overlay (`targetId` null = the fleet row). No-op if absent. */
+  deleteOverlay(scope: PersistedOverlay["scope"], targetId: string | null): Promise<void>;
+  /** All persisted overlay assignments. */
+  listOverlays(): Promise<PersistedOverlay[]>;
 
   // ── Credential profiles (POL-24) ───────────────────────────────────────────
   /** Insert-or-update a credential-profile row (the only home of the client secret). */

@@ -26,6 +26,8 @@ const routes: RouteRecordRaw[] = [
       // POL-42 — the page Studio: compose framing elements into a `page` content source. No :id =
       // a new, unsaved page; with :id it edits that library source.
       { path: "studio/:id?", name: "studio", component: () => import("./views/Studio.vue") },
+      // POL-97 — overlays: a page composited ABOVE whatever content is playing, by scope.
+      { path: "overlays", name: "overlays", component: () => import("./views/Overlays.vue") },
       { path: "scenes", name: "scenes", component: () => import("./views/Scenes.vue") },
       { path: "settings", name: "settings", component: () => import("./views/Settings.vue") },
     ],

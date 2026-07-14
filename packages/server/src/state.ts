@@ -24,6 +24,7 @@
 import {
   ContentSource,
   DashboardSurface,
+  OverlayAssignment,
   ImageSurface,
   PlaylistSurface,
   PageSurface,
@@ -55,9 +56,11 @@ import type {
   PageImageResolution,
   PageWeatherData,
   Placement,
+  OverlayScope,
   SceneContent,
   Screen,
   ScreenSlice,
+  SliceOverlay,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -67,6 +70,7 @@ import type {
 import type {
   PersistedCredentialProfile,
   PersistedMachine,
+  PersistedOverlay,
   PersistedScene,
   Store,
 } from "./store/types";
@@ -101,6 +105,20 @@ function isFramed(surface: Surface): surface is FramedSurface {
  *  neither half, so no screen/URL combination can collide with another. */
 function zoomKey(targetId: string, sourceKey: string): string {
   return `${targetId}\u0000${sourceKey}`;
+}
+
+/** POL-97 — the key one overlay assignment is held under. One overlay per scope; `fleet` has no target. */
+function overlayKey(scope: OverlayScope, targetId?: string): string {
+  return `${scope}\u0000${targetId ?? "*"}`;
+}
+
+/** Overlay scopes, MOST SPECIFIC FIRST — the precedence order resolution walks (POL-97). Mirrors the
+ *  takeover precedence: the narrowest scope that covers a screen is the one that wins. */
+const OVERLAY_PRECEDENCE = ["screen", "wall", "mural", "fleet"] as const;
+
+/** "on every screen" / "on wall-2" — how an overlay scope reads in the activity feed. */
+function scopeLabel(scope: OverlayScope, targetId?: string): string {
+  return scope === "fleet" ? "to every screen" : `to ${scope} ${targetId}`;
 }
 
 /** "125%" — how a zoom factor reads in the activity feed. */
@@ -281,6 +299,12 @@ export class ControlPlane {
   /** POL-57 — remembered page zoom, keyed by `zoomKey(targetId, sourceKey)`. A target is a screen or
    *  a wall; a sourceKey identifies the page. Assigning that page there again restores this zoom. */
   private readonly zoomPrefs = new Map<string, number>();
+
+  /** POL-97 — overlay assignments keyed by `overlayKey(scope, targetId)`: the page composited ABOVE
+   *  whatever content a screen in that scope is showing. One overlay per scope; the most specific
+   *  scope covering a screen wins (screen > wall > mural > fleet). Never part of a stored slice —
+   *  it is resolved and stamped at send time, so applying/removing one touches no content. */
+  private readonly overlays = new Map<string, OverlayAssignment>();
 
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
@@ -487,6 +511,16 @@ export class ControlPlane {
       // back to 100%) rather than pushed to a player as an unrenderable scale.
       const zoom = Zoom.safeParse(p.zoom);
       if (zoom.success) this.zoomPrefs.set(zoomKey(p.targetId, p.sourceKey), zoom.data);
+    }
+
+    // ── Overlays (POL-97) ─────────────────────────────────────────────────────
+    for (const o of persisted.overlays ?? []) {
+      const parsed = OverlayAssignment.safeParse({
+        scope: o.scope,
+        targetId: o.targetId ?? undefined,
+        sourceId: o.sourceId,
+      });
+      if (parsed.success) this.overlays.set(overlayKey(parsed.data.scope, parsed.data.targetId), parsed.data);
     }
 
     // ── Content library (Phase 3c) ────────────────────────────────────────────
@@ -1660,21 +1694,27 @@ export class ControlPlane {
   }
 
   /**
-   * Recompute every member's span slice for a wall showing `spec` and apply it in memory. Reuses the
-   * Phase 3b union-bbox span math (works for ANY surface kind). Returns the touched member slices (empty
-   * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
-   *
-   * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
+   * The Phase-3b span geometry of a video wall: its still-placed members plus the union bounding box
+   * of their placements (canvas pixels). The ONE place that bbox is computed — wall content spans by
+   * it (computeWallSlices) and, since POL-97, so does the overlay layer, so a logo bug lands once in
+   * the WALL's corner rather than once per panel. Undefined if no member is placed on its mural.
    */
-  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
+  private wallBounds(wall: VideoWall):
+    | {
+        members: { screenId: string; placement: Placement }[];
+        unionMinX: number;
+        unionMinY: number;
+        contentW: number;
+        contentH: number;
+      }
+    | undefined {
     const members: { screenId: string; placement: Placement }[] = [];
     for (const screenId of wall.memberScreenIds) {
       const placement = this.placements.get(screenId);
       if (placement && placement.muralId === wall.muralId) members.push({ screenId, placement });
     }
-    if (members.length === 0) return [];
+    if (members.length === 0) return undefined;
 
-    // Union bounding box of the member placements (canvas pixels).
     let unionMinX = Infinity;
     let unionMinY = Infinity;
     let unionMaxX = -Infinity;
@@ -1685,8 +1725,26 @@ export class ControlPlane {
       unionMaxX = Math.max(unionMaxX, placement.x + placement.w);
       unionMaxY = Math.max(unionMaxY, placement.y + placement.h);
     }
-    const contentW = unionMaxX - unionMinX;
-    const contentH = unionMaxY - unionMinY;
+    return {
+      members,
+      unionMinX,
+      unionMinY,
+      contentW: unionMaxX - unionMinX,
+      contentH: unionMaxY - unionMinY,
+    };
+  }
+
+  /**
+   * Recompute every member's span slice for a wall showing `spec` and apply it in memory. Reuses the
+   * Phase 3b union-bbox span math (works for ANY surface kind). Returns the touched member slices (empty
+   * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
+   *
+   * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
+   */
+  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
+    const bounds = this.wallBounds(wall);
+    if (!bounds) return [];
+    const { members, unionMinX, unionMinY, contentW, contentH } = bounds;
 
     const slices: ScreenSlice[] = [];
     for (const { screenId, placement } of members) {
@@ -2169,8 +2227,13 @@ export class ControlPlane {
     // POL-42 — pages EMBEDDING this source resolve it at send time, so their stored slices are
     // already correct; they just need a re-push so live walls pick the edit up. Never upserted here
     // (their screens' source assignment is the PAGE's id, not the edited source's).
+    // POL-97 — likewise the screens wearing this page as an OVERLAY: an overlay is resolved at send
+    // time, so a Studio save reaches the glass by re-push alone, with the content beneath untouched.
     const seen = new Set(slices.map((s) => s.screenId));
-    const pageSlices = this.slicesShowingPagesEmbedding(id).filter((s) => !seen.has(s.screenId));
+    const sendOnly = new Map<string, ScreenSlice>();
+    for (const sl of this.slicesShowingPagesEmbedding(id)) sendOnly.set(sl.screenId, sl);
+    for (const sl of this.overlaySlicesForSources(new Set([id]))) sendOnly.set(sl.screenId, sl);
+    const pageSlices = [...sendOnly.values()].filter((sl) => !seen.has(sl.screenId));
 
     return { ok: true, source, slices: [...slices, ...pageSlices] };
   }
@@ -2191,9 +2254,12 @@ export class ControlPlane {
     return this.slicesShowingSources(pageIds);
   }
 
-  /** The slices of every screen showing any of these library sources, directly or via a video wall. */
+  /** The slices of every screen showing any of these library sources — as content (directly or via a
+   *  video wall) or, since POL-97, as its OVERLAY. Both are on the glass, so both re-push when the
+   *  source changes (a feed poll, an edit, a deleted embed target). */
   slicesShowingSources(sourceIds: ReadonlySet<string>): ScreenSlice[] {
     const byScreen = new Map<string, ScreenSlice>();
+    for (const slice of this.overlaySlicesForSources(sourceIds)) byScreen.set(slice.screenId, slice);
     for (const [screenId, sid] of this.screenSourceIds) {
       if (!sourceIds.has(sid)) continue;
       const slice = this.state.slices[screenId];
@@ -2214,6 +2280,9 @@ export class ControlPlane {
    *  currently assigned to ≥1 screen (directly or via a wall). Unassigned pages cost no polling. */
   pageDataRequirements(): { feeds: Set<string>; locations: Set<string>; sourcesByFeed: Map<string, Set<string>>; sourcesByLocation: Map<string, Set<string>> } {
     const assigned = new Set<string>([...this.screenSourceIds.values(), ...this.wallSourceIds.values()]);
+    // POL-97 — a page shown as an OVERLAY is on the glass just as much as one assigned as content, so
+    // its feeds/weather are polled too: a ticker in an overlay stays as live as a ticker in a page.
+    for (const { sourceId } of this.overlayCoverage()) assigned.add(sourceId);
     const feeds = new Set<string>();
     const locations = new Set<string>();
     const sourcesByFeed = new Map<string, Set<string>>();
@@ -2269,6 +2338,18 @@ export class ControlPlane {
       await this.setWallSourceAssignment(wall, null);
     }
 
+    // POL-97 — an overlay drawing the deleted page comes OFF the glass: drop every assignment that
+    // referenced it (any scope) and re-push those screens, which repaint their untouched content
+    // minus the layer. Collected BEFORE the source is deleted, while resolution can still see it.
+    const overlayScreenIds = new Set(
+      this.overlaySlicesForSources(new Set([id])).map((sl) => sl.screenId),
+    );
+    for (const [key, assignment] of [...this.overlays]) {
+      if (assignment.sourceId !== id) continue;
+      this.overlays.delete(key);
+      await this.store.deleteOverlay(assignment.scope, assignment.targetId ?? null);
+    }
+
     this.contentSources.delete(id);
     await this.store.deleteContentSource(id);
 
@@ -2312,10 +2393,209 @@ export class ControlPlane {
 
     // POL-42 — pages embedding the deleted source re-push so their embed regions fall back to the
     // placeholder (send-time resolution now finds nothing). Their stored slices are untouched.
+    // POL-97 — plus the screens that wore the deleted page as an overlay (assignments dropped above).
     const seen = new Set(slices.map((sl) => sl.screenId));
-    const pageSlices = this.slicesShowingPagesEmbedding(id).filter((sl) => !seen.has(sl.screenId));
+    const sendOnly = new Map<string, ScreenSlice>();
+    for (const sl of this.slicesShowingPagesEmbedding(id)) sendOnly.set(sl.screenId, sl);
+    for (const screenId of overlayScreenIds) sendOnly.set(screenId, this.sliceForPlayer(screenId));
+    const pageSlices = [...sendOnly.values()].filter((sl) => !seen.has(sl.screenId));
 
     return { slices: [...slices, ...pageSlices] };
+  }
+
+  // ── Overlays (POL-97) ────────────────────────────────────────────────────────
+  //
+  // An overlay is a library PAGE composited ABOVE whatever a screen is showing — a logo bug, an
+  // emergency ticker, a "MEETING IN PROGRESS" banner. It is applied to a SCOPE (fleet | mural | wall
+  // | screen) and never touches content: the assignment lives in its own map, is resolved per screen
+  // at SEND time (`decorateSliceForSend`), and rides the slice in its own `overlay` field. So the
+  // stored slices, the span math and the player's keyed diff over `surfaces` are all untouched —
+  // applying or clearing an overlay is a re-push of the SAME content, plus (or minus) one layer.
+  //
+  // Precedence is most-specific-wins: screen > wall > mural > fleet (the same ordering a takeover
+  // resolves by). A takeover REPLACES content; an overlay sits above whatever content is showing,
+  // takeover included — the two compose rather than compete.
+
+  /** Every overlay assignment, most-specific scope first (the console lists them in this order). */
+  getOverlays(): OverlayAssignment[] {
+    const order = new Map(OVERLAY_PRECEDENCE.map((scope, i) => [scope, i] as const));
+    return [...this.overlays.values()].sort(
+      (a, b) => (order.get(a.scope) ?? 9) - (order.get(b.scope) ?? 9),
+    );
+  }
+
+  /**
+   * The overlay covering a screen, if any: the assignment on the NARROWEST scope that contains it —
+   * its own id, then its video wall, then the mural it is placed on, then the fleet. An assignment
+   * whose page source has since vanished resolves to nothing (the screen simply carries no overlay).
+   */
+  resolveOverlay(screenId: string): OverlayAssignment | undefined {
+    const wall = this.getWallForScreen(screenId);
+    const muralId = this.placements.get(screenId)?.muralId;
+    for (const scope of OVERLAY_PRECEDENCE) {
+      const targetId =
+        scope === "screen" ? screenId : scope === "wall" ? wall?.id : scope === "mural" ? muralId : undefined;
+      if (scope !== "fleet" && targetId === undefined) continue;
+      const assignment = this.overlays.get(overlayKey(scope, targetId));
+      if (!assignment) continue;
+      const source = this.contentSources.get(assignment.sourceId);
+      if (source?.kind !== "page" || !source.definition) continue;
+      return assignment;
+    }
+    return undefined;
+  }
+
+  /**
+   * The overlay layer as one screen receives it — the resolved page definition, its live data bundle
+   * (feeds/weather/embeds, exactly as a page surface gets), and the wall span when the overlay comes
+   * from a scope WIDER than the screen itself and that screen is part of a video wall: the fleet's
+   * logo then spans the combined surface once, instead of repeating in every panel's corner. A
+   * SCREEN-scoped overlay is deliberately never spanned — the operator addressed that one panel.
+   */
+  private overlayForSend(screenId: string): SliceOverlay | undefined {
+    const assignment = this.resolveOverlay(screenId);
+    if (!assignment) return undefined;
+    const source = this.contentSources.get(assignment.sourceId);
+    const definition = source?.definition;
+    if (!definition) return undefined;
+
+    let span: SliceOverlay["span"];
+    if (assignment.scope !== "screen") {
+      const wall = this.getWallForScreen(screenId);
+      const bounds = wall ? this.wallBounds(wall) : undefined;
+      const placement = bounds?.members.find((m) => m.screenId === screenId)?.placement;
+      if (bounds && placement) {
+        span = {
+          contentW: bounds.contentW,
+          contentH: bounds.contentH,
+          offsetX: placement.x - bounds.unionMinX,
+          offsetY: placement.y - bounds.unionMinY,
+        };
+      }
+    }
+
+    return {
+      sourceId: assignment.sourceId,
+      scope: assignment.scope,
+      definition,
+      data: this.buildPageData(definition),
+      ...(span ? { span } : {}),
+    };
+  }
+
+  /** Which screens the overlay layer would CHANGE for, given a mutation applied by `mutate`. Computed
+   *  by diffing the resolved overlay of every screen before and after — precedence means an edit to a
+   *  wide scope can be invisible on a screen a narrower scope already covers, and those screens must
+   *  NOT be re-pushed. Returns the screen ids whose overlay actually differs. */
+  private async withOverlayDiff(mutate: () => Promise<void>): Promise<string[]> {
+    const before = new Map<string, string | undefined>();
+    for (const screen of this.state.screens) {
+      before.set(screen.id, this.overlaySignature(screen.id));
+    }
+    await mutate();
+    const changed: string[] = [];
+    for (const screen of this.state.screens) {
+      if (this.overlaySignature(screen.id) !== before.get(screen.id)) changed.push(screen.id);
+    }
+    return changed;
+  }
+
+  /** What a screen's overlay resolves to, as a comparable string (absent → undefined). */
+  private overlaySignature(screenId: string): string | undefined {
+    const assignment = this.resolveOverlay(screenId);
+    return assignment ? `${assignment.scope}:${assignment.targetId ?? "*"}:${assignment.sourceId}` : undefined;
+  }
+
+  private toPersistedOverlay(assignment: OverlayAssignment): PersistedOverlay {
+    return {
+      scope: assignment.scope,
+      targetId: assignment.targetId ?? null,
+      sourceId: assignment.sourceId,
+    };
+  }
+
+  /** Does this scope's target exist? (`fleet` always does.) */
+  private overlayTargetExists(scope: OverlayScope, targetId?: string): boolean {
+    switch (scope) {
+      case "fleet":
+        return true;
+      case "mural":
+        return targetId !== undefined && this.murals.has(targetId);
+      case "wall":
+        return targetId !== undefined && this.videoWalls.has(targetId);
+      case "screen":
+        return targetId !== undefined && this.state.screens.some((s) => s.id === targetId);
+    }
+  }
+
+  /**
+   * Apply a page as the overlay for one scope (replacing any overlay already on that scope). Write-
+   * through; does NOT bump the revision — no screen's CONTENT changed, and the revision is the
+   * content reconcile counter players ack. Returns the screens whose overlay actually changed, for
+   * the caller to re-push (a screen a narrower scope already covers is deliberately not in the list).
+   */
+  async setOverlay(
+    scope: OverlayScope,
+    targetId: string | undefined,
+    sourceId: string,
+  ): Promise<
+    | { ok: true; assignment: OverlayAssignment; screenIds: string[] }
+    | { ok: false; error: "unknown-target" | "unknown-source" | "not-a-page" }
+  > {
+    if (!this.overlayTargetExists(scope, targetId)) return { ok: false, error: "unknown-target" };
+    const source = this.contentSources.get(sourceId);
+    if (!source) return { ok: false, error: "unknown-source" };
+    // Only a page can be an overlay: it is the one kind that composes (transparent background, %
+    // regions, elements). A video or a dashboard would occlude the content it is meant to sit above.
+    if (source.kind !== "page" || !source.definition) return { ok: false, error: "not-a-page" };
+
+    const assignment = OverlayAssignment.parse({ scope, targetId, sourceId });
+    const screenIds = await this.withOverlayDiff(async () => {
+      this.overlays.set(overlayKey(scope, targetId), assignment);
+      await this.store.upsertOverlay(this.toPersistedOverlay(assignment));
+    });
+    this.emit("info", `Overlay ${source.name} applied ${scopeLabel(scope, targetId)}`);
+    return { ok: true, assignment, screenIds };
+  }
+
+  /** Remove a scope's overlay. Returns the screens whose overlay changed (they re-push WITHOUT it —
+   *  and, because the overlay was never part of their stored content, the content beneath is exactly
+   *  what it was). Null if that scope carried no overlay. */
+  async clearOverlay(
+    scope: OverlayScope,
+    targetId?: string,
+  ): Promise<{ screenIds: string[] } | null> {
+    if (!this.overlays.has(overlayKey(scope, targetId))) return null;
+    const screenIds = await this.withOverlayDiff(async () => {
+      this.overlays.delete(overlayKey(scope, targetId));
+      await this.store.deleteOverlay(scope, targetId ?? null);
+    });
+    this.emit("info", `Overlay removed ${scopeLabel(scope, targetId)}`);
+    return { screenIds };
+  }
+
+  /** Every screen currently carrying an overlay, mapped to the assignment that won — what the console
+   *  shows so an operator can see at a glance which panels are wearing one, and from which scope. */
+  overlayCoverage(): { screenId: string; scope: OverlayScope; sourceId: string }[] {
+    const coverage: { screenId: string; scope: OverlayScope; sourceId: string }[] = [];
+    for (const screen of this.state.screens) {
+      const assignment = this.resolveOverlay(screen.id);
+      if (assignment) {
+        coverage.push({ screenId: screen.id, scope: assignment.scope, sourceId: assignment.sourceId });
+      }
+    }
+    return coverage;
+  }
+
+  /** The (send-shaped) slices of every screen whose RESOLVED overlay draws one of these page sources.
+   *  Synthesized for a screen with no content: an overlay on an idle screen still repaints. */
+  private overlaySlicesForSources(sourceIds: ReadonlySet<string>): ScreenSlice[] {
+    const slices: ScreenSlice[] = [];
+    for (const screen of this.state.screens) {
+      const assignment = this.resolveOverlay(screen.id);
+      if (assignment && sourceIds.has(assignment.sourceId)) slices.push(this.sliceForPlayer(screen.id));
+    }
+    return slices;
   }
 
   // ── Credential profiles (POL-24) ─────────────────────────────────────────────
@@ -2510,19 +2790,26 @@ export class ControlPlane {
    * mutates stored state.
    */
   decorateSliceForSend(slice: ScreenSlice): ScreenSlice {
-    if (slice.surfaces.length === 0) return slice;
+    // POL-97 — the overlay layer, resolved for THIS screen (screen > wall > mural > fleet) and stamped
+    // ALONGSIDE the surfaces, never into them. Content is untouched: a screen with no surfaces still
+    // gets its overlay (an idle panel can wear a logo), and every path below still sees the same
+    // `surfaces` array it always did.
+    const overlay = this.overlayForSend(slice.screenId);
+    const base: ScreenSlice = overlay ? { ...slice, overlay } : slice;
+
+    if (base.surfaces.length === 0) return base;
 
     // POL-42 — page surfaces get their live half stamped in: resolved (credential-stamped) embeds,
     // resolved image sources, and the poller's last-good feed/weather data. Independent of the
     // framed-content token stamp below, which needs the slice's own source to carry a profile.
-    let decorated: ScreenSlice = slice.surfaces.some((s) => s.type === "page")
+    let decorated: ScreenSlice = base.surfaces.some((s) => s.type === "page")
       ? {
-          ...slice,
-          surfaces: slice.surfaces.map((surface) =>
+          ...base,
+          surfaces: base.surfaces.map((surface) =>
             surface.type === "page" ? { ...surface, data: this.buildPageData(surface.definition) } : surface,
           ),
         }
-      : slice;
+      : base;
 
     if (!this.tokenProvider) return decorated;
     const wall = this.getWallForScreen(slice.screenId);

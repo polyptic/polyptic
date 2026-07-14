@@ -25,6 +25,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedOverlay,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -37,6 +38,11 @@ function clone<T>(value: T): T {
  *  separator can't appear in an id, so no pair can collide with another. */
 function zoomKey(targetId: string, sourceKey: string): string {
   return `${targetId}\u0000${sourceKey}`;
+}
+
+/** Composite key for an overlay (POL-97) — one per scope; the fleet row has no target. */
+function overlayKey(scope: string, targetId: string | null): string {
+  return `${scope}\u0000${targetId ?? "*"}`;
 }
 
 export class MemoryStore implements Store {
@@ -56,6 +62,8 @@ export class MemoryStore implements Store {
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
   private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
+  /** Keyed by `<scope>\0<targetId|*>` — one overlay per scope (POL-97). */
+  private readonly overlays = new Map<string, PersistedOverlay>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
@@ -87,6 +95,7 @@ export class MemoryStore implements Store {
       scenes: [...this.scenes.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
       zoomPreferences: [...this.zoomPreferences.values()].map(clone),
+      overlays: [...this.overlays.values()].map(clone),
     };
   }
 
@@ -222,6 +231,20 @@ export class MemoryStore implements Store {
 
   async listZoomPreferences(): Promise<PersistedZoomPreference[]> {
     return [...this.zoomPreferences.values()].map(clone);
+  }
+
+  // ── Overlays (POL-97) ───────────────────────────────────────────────────────
+
+  async upsertOverlay(overlay: PersistedOverlay): Promise<void> {
+    this.overlays.set(overlayKey(overlay.scope, overlay.targetId), clone(overlay));
+  }
+
+  async deleteOverlay(scope: PersistedOverlay["scope"], targetId: string | null): Promise<void> {
+    this.overlays.delete(overlayKey(scope, targetId));
+  }
+
+  async listOverlays(): Promise<PersistedOverlay[]> {
+    return [...this.overlays.values()].map(clone);
   }
 
   private dropZoomPreferences(targetId: string): void {
