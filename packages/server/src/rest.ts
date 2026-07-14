@@ -53,6 +53,7 @@ import {
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetGroomBody,
   SetZoomBody,
   Surface,
   UpdateContentSourceBody,
@@ -1118,6 +1119,92 @@ export function registerRestRoutes(
       wallId: params.data.wallId,
       revision: control.state.revision,
       zoom: body.data.zoom,
+      screens: result.slices.map((s) => s.screenId),
+    };
+  });
+
+  // ── Grooming (POL-98) ────────────────────────────────────────────────────────
+  //
+  // Crop, scroll and (dashboards) the refresh cadence for the framed page on a screen or a combined
+  // surface. Remembered against the (target, page) pair like the zoom, and pushed as a re-styled
+  // surface with the SAME id — the player restyles the iframe it already has and re-arms its refresh
+  // timer; it does not navigate. The body is the WHOLE groom: an omitted field clears that knob.
+
+  // PUT /api/v1/screens/:screenId/groom  { refreshSeconds?, crop?, scroll? }
+  fastify.put("/api/v1/screens/:screenId/groom", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetGroomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenGroom(params.data.screenId, body.data);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; groom the wall`,
+          wallId: result.wallId,
+        });
+      }
+      if (result.error === "no-content" || result.error === "not-groomable") {
+        return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.groom",
+        screenId: params.data.screenId,
+        groom: body.data,
+        revision: control.state.revision,
+      },
+      "screen groom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's content read-out carries the live groom
+    return { ok: true, revision: control.state.revision, groom: body.data };
+  });
+
+  // PUT /api/v1/walls/:wallId/groom  { refreshSeconds?, crop?, scroll? }  -> every member
+  fastify.put("/api/v1/walls/:wallId/groom", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetGroomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallGroom(params.data.wallId, body.data);
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.groom",
+        wallId: params.data.wallId,
+        groom: body.data,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall groom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      revision: control.state.revision,
+      groom: body.data,
       screens: result.slices.map((s) => s.screenId),
     };
   });

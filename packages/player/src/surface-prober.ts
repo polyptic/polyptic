@@ -252,6 +252,36 @@ export class SurfaceProber {
     }, this.recheckDebounceMs);
   }
 
+  /**
+   * POL-98 — the operator's refresh cadence came due for this surface (the RefreshScheduler calls
+   * this; nothing else does). A refresh is deliberately NOT a bare `element.src = element.src`: it
+   * is a RE-PROVE of a URL this surface already has painted, which means the existing machinery
+   * decides what happens next and there is only ever ONE healing path:
+   *
+   *   reachable    → reload in place, rate-limited and queued like any other heal (a mistyped 30s
+   *                  cadence cannot hammer the wall), then re-verified.
+   *   unreachable  → back to proving, with backoff, forever — and the OLD page stays on the glass
+   *                  the whole time. A refresh that lands on a dead dashboard cannot blank the wall.
+   *
+   * Refusals: nothing painted yet (the first paint is already being hunted) and a surface that is
+   * mid-prove (the prober is healing it — a refresh would only pile on). In both cases the prober
+   * already owns the surface, and the next tick will find it settled.
+   */
+  refresh(id: string): void {
+    if (this.stopped) return;
+    const state = this.surfaces.get(id);
+    if (!state) return;
+    if (state.paintedUrl === null || state.phase === "proving") {
+      this.log(`${id}: refresh skipped — the prober is already hunting this surface`);
+      return;
+    }
+    this.invalidate(state);
+    state.phase = "proving";
+    state.attempts = 0;
+    this.log(`${id}: refresh due — re-proving ${redactUrl(state.url)} before reloading it`);
+    void this.prove(id, "refresh cadence");
+  }
+
   stop(): void {
     this.stopped = true;
     if (this.recheckTimer) clearTimeout(this.recheckTimer);

@@ -19,6 +19,9 @@
   control is absent rather than disabled. The server remembers each value against the (screen-or-wall,
   page) pair, which is what the "Remembered for this screen" caption is promising the operator.
 
+  The groom panel (POL-98 — crop / scroll / dashboard refresh) sits under it on exactly the same test,
+  and is remembered against exactly the same pair; only its refresh row is kind-specific (dashboards).
+
   All reads/writes go through the Pinia store; ident uses the shared composable.
 -->
 <script setup lang="ts">
@@ -29,6 +32,8 @@ import { kindLabel } from "../../content";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
 import ZoomControl from "./ZoomControl.vue";
+import GroomControl from "./GroomControl.vue";
+import type { SurfaceGroom } from "@polyptic/protocol";
 
 const store = useConsoleStore();
 const { ident, identMany, flash, isIdenting } = useIdent();
@@ -93,6 +98,24 @@ function zoomScreen(zoom: number) {
 function zoomWall(zoom: number) {
   const w = wall.value;
   if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
+}
+
+// ── grooming (POL-98) ───────────────────────────────────────────────────────
+// Crop / scroll / refresh ride on the same content read-out as the zoom and are present on exactly
+// the same test (framed content), so the groom panel appears wherever the zoom control does. The
+// refresh cadence is offered only for a DASHBOARD — that cadence is what the kind means.
+const singleGroom = computed(() => singleContent.value?.groom);
+const wallGroom = computed(() => wallContent.value?.groom);
+const singleCanRefresh = computed(() => singleContent.value?.kind === "dashboard");
+const wallCanRefresh = computed(() => wallContent.value?.kind === "dashboard");
+
+function groomScreen(groom: SurfaceGroom) {
+  const s = single.value;
+  if (s) store.setScreenGroom(s.id, groom);
+}
+function groomWall(groom: SurfaceGroom) {
+  const w = wall.value;
+  if (w && !wallPending.value) store.setWallGroom(w.id, groom);
 }
 
 const wallSourcePick = ref("");
@@ -381,6 +404,17 @@ function selectOne(id: string) {
         />
       </template>
 
+      <template v-if="wallGroom !== undefined">
+        <div class="section-label gap-top">Grooming</div>
+        <GroomControl
+          :groom="wallGroom"
+          :can-refresh="wallCanRefresh"
+          :disabled="wallPending"
+          caption="Cropped and parked across the whole surface — the panels stay one continuous page."
+          @update="groomWall"
+        />
+      </template>
+
       <div class="panels-head">
         <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
         <span class="panels-res">{{ wallRes }}</span>
@@ -489,6 +523,16 @@ function selectOne(id: string) {
           :zoom="singleZoom"
           caption="Remembered for this screen and this page."
           @update="zoomScreen"
+        />
+      </template>
+
+      <template v-if="singleGroom !== undefined">
+        <div class="section-label gap-top">Grooming</div>
+        <GroomControl
+          :groom="singleGroom"
+          :can-refresh="singleCanRefresh"
+          caption="Crop the chrome off, park the page where it matters — remembered for this screen and this page."
+          @update="groomScreen"
         />
       </template>
 

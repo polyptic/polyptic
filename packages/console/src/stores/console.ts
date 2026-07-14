@@ -30,6 +30,7 @@ import type {
   Placement,
   Scene,
   ScreenView,
+  SurfaceGroom,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
@@ -1168,6 +1169,32 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Groom the page on a single screen (POL-98): crop, scroll offset, dashboard refresh cadence.
+     * Optimistic like the zoom — the authoritative groom rides back on the next `admin/state`, but
+     * the panel's controls must step from what the operator can see, not from a value in flight.
+     */
+    async setScreenGroom(screenId: string, groom: SurfaceGroom): Promise<void> {
+      this.patchScreenGroom([screenId], groom);
+      try {
+        await api.setScreenGroom(screenId, groom);
+      } catch (err) {
+        console.error("[console] setScreenGroom failed", err);
+      }
+    },
+
+    /** Write a groom onto the given screens' content read-outs in place (optimistic). Screens with
+     *  no framed content carry no groom, and are left alone. */
+    patchScreenGroom(screenIds: readonly string[], groom: SurfaceGroom): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content) continue;
+          if (screen.content.groom === undefined) continue;
+          screen.content = { ...screen.content, groom };
+        }
+      }
+    },
+
     /** Zoom the page spanning a combined surface (POL-57) — every member takes the same zoom. */
     async setWallZoom(wallId: string, zoom: number): Promise<void> {
       if (wallId.startsWith("wall-pending")) return;
@@ -1177,6 +1204,18 @@ export const useConsoleStore = defineStore("console", {
         await api.setWallZoom(wallId, zoom);
       } catch (err) {
         console.error("[console] setWallZoom failed", err);
+      }
+    },
+
+    /** Groom the page spanning a combined surface (POL-98) — every member takes the same groom. */
+    async setWallGroom(wallId: string, groom: SurfaceGroom): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchScreenGroom(wall.memberScreenIds, groom);
+      try {
+        await api.setWallGroom(wallId, groom);
+      } catch (err) {
+        console.error("[console] setWallGroom failed", err);
       }
     },
 

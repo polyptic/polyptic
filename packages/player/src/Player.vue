@@ -38,6 +38,13 @@
  * scale is applied before the span's translate), so a video wall zooms as one continuous page. It is
  * a pure restyle of the SAME keyed element: the iframe rescales without navigating or reloading (D5).
  *
+ * POL-98 — grooming: a framed surface may also carry `crop` (an inset chopped off each edge of the
+ * page) and `scroll` (where the page is parked), and a dashboard a `refreshSeconds` cadence. Crop and
+ * scroll are pure geometry on the same keyed element — they compose with span and zoom in
+ * surface-style.ts and apply as a restyle, no reload. The refresh cadence is driven by the
+ * RefreshScheduler through the PROBER (never straight at the DOM), so a refresh onto a dead URL is
+ * just another failed probe: the old page stays up and the healing path brings it back.
+ *
  * POL-32 — cached media: images and videos are downloaded once into an IndexedDB blob cache and the
  * elements are pointed at `blob:` object URLs, so a network outage cannot stall a looping video or
  * break an image; the last-good slice is persisted to localStorage and restored on startup, so a
@@ -55,9 +62,11 @@ import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protoco
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
+import { RefreshScheduler } from "./refresh-timer";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle } from "./surface-style";
+import type { Groom } from "./surface-style";
 import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
@@ -294,6 +303,25 @@ const probeTargets = computed(() =>
 
 watch(probeTargets, (targets) => prober.sync(targets), { immediate: true });
 
+// POL-98 — a dashboard's refresh cadence. The scheduler never touches the DOM: it asks the prober to
+// re-prove and reload IN PLACE, so a refresh that lands on a dead URL is just another failed probe
+// and the healing path (which keeps the old page up) owns it. A refresh cannot blank the wall.
+const refresher = new RefreshScheduler({
+  refresh: (id) => prober.refresh(id),
+  seed: screenId, // the fleet's cadence fans out instead of arriving as one thundering herd
+  log: (msg) => diag(msg),
+});
+
+const refreshTargets = computed(() =>
+  surfaces.value.flatMap((s) =>
+    s.type === "dashboard" && s.refreshSeconds !== undefined
+      ? [{ id: s.id, seconds: s.refreshSeconds }]
+      : [],
+  ),
+);
+
+watch(refreshTargets, (targets) => refresher.sync(targets), { immediate: true, deep: true });
+
 /** The element finished a real load. For media that is genuine health (no SOP wall); for an iframe
  *  it is merely "a page committed" — Chrome fires `load` for its own error page too. Logged either
  *  way: the load/abort timeline is exactly the evidence a broken boot used to destroy. */
@@ -410,6 +438,7 @@ onUnmounted(() => {
   window.removeEventListener("offline", onOffline);
   window.removeEventListener("error", onResourceError, true);
   prober.stop();
+  refresher.stop();
   socket?.stop();
 });
 
@@ -446,8 +475,8 @@ function regionStyle(region: Geometry, c: Geometry): CSSProperties {
  * then shifts the already-full-size result by the span offset — the translate stays in un-scaled
  * region pixels, exactly as the server's span math assumes.
  */
-function contentStyle(surface: Surface, zoom = 1): CSSProperties {
-  return spanContentStyle(surface.span, zoom);
+function contentStyle(surface: Surface, zoom = 1, groom?: Groom): CSSProperties {
+  return spanContentStyle(surface.span, zoom, groom);
 }
 
 /** Style for an image/video element: span sizing (if any) plus the image's object-fit. Media has no
@@ -458,9 +487,12 @@ function mediaStyle(surface: Surface): CSSProperties {
   return style;
 }
 
-/** Style for a web/dashboard iframe: span sizing plus the operator's page zoom (POL-57). */
+/** Style for a web/dashboard iframe: span sizing, the operator's page zoom (POL-57), and their
+ *  grooming — crop + scroll (POL-98). All four compose in surface-style.ts; a groom change is a
+ *  restyle of the SAME keyed element, so it applies with no reload (D5), exactly like zoom. */
 function frameStyle(surface: Surface): CSSProperties {
-  return contentStyle(surface, isFrame(surface) ? surface.zoom : 1);
+  if (!isFrame(surface)) return contentStyle(surface);
+  return contentStyle(surface, surface.zoom, { crop: surface.crop, scroll: surface.scroll });
 }
 
 /** The two surface kinds rendered in an iframe — the only ones that carry a url and a zoom. */

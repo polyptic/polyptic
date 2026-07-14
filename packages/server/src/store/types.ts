@@ -125,6 +125,19 @@ export interface PersistedZoomPreference {
   zoom: number;
 }
 
+/**
+ * POL-98 — the remembered GROOMING for one (target, content) pair: crop, scroll, and (dashboards) the
+ * refresh cadence. Keyed exactly like the zoom preference above, and for the same reason — the same
+ * dashboard wants a different crop on a portrait pillar than on a 4K panel, so grooming belongs to
+ * the pair, not to the screen and not to the library source. `groom` is stored as opaque JSON (a
+ * `SurfaceGroom`); the control plane re-validates it against the contract on load.
+ */
+export interface PersistedGroomPreference {
+  targetId: string;
+  sourceKey: string;
+  groom: unknown;
+}
+
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
 export interface PersistedMural {
   id: string;
@@ -315,6 +328,8 @@ export interface PersistedState {
   credentialProfiles: PersistedCredentialProfile[];
   /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
   zoomPreferences: PersistedZoomPreference[];
+  /** POL-98 — remembered grooming (crop/scroll/refresh) per (screen-or-wall, content) pair. */
+  groomPreferences: PersistedGroomPreference[];
 }
 
 /**
@@ -390,6 +405,14 @@ export interface Store {
   deleteZoomPreferencesForTarget(targetId: string): Promise<void>;
   /** All persisted zoom preferences. */
   listZoomPreferences(): Promise<PersistedZoomPreference[]>;
+
+  // ── Grooming preferences (POL-98) ──────────────────────────────────────────
+  /** Insert-or-update the remembered grooming for one (target, content) pair. */
+  upsertGroomPreference(pref: PersistedGroomPreference): Promise<void>;
+  /** Forget every remembered groom for a screen or wall that no longer exists. No-op if none. */
+  deleteGroomPreferencesForTarget(targetId: string): Promise<void>;
+  /** All persisted grooming preferences. */
+  listGroomPreferences(): Promise<PersistedGroomPreference[]>;
 
   // ── Credential profiles (POL-24) ───────────────────────────────────────────
   /** Insert-or-update a credential-profile row (the only home of the client secret). */

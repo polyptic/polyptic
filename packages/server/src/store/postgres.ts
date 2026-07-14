@@ -47,6 +47,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedGroomPreference,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -152,6 +153,12 @@ interface ZoomPreferenceRow {
   target_id: string;
   source_key: string;
   zoom: number;
+}
+
+interface GroomPreferenceRow {
+  target_id: string;
+  source_key: string;
+  groom: unknown;
 }
 
 interface SceneRow {
@@ -309,6 +316,17 @@ export class PostgresStore implements Store {
         PRIMARY KEY (target_id, source_key)
       )
     `;
+    // Grooming preferences (POL-98). One row per (screen-or-wall, content) pair: the crop, the scroll
+    // offset and the dashboard's refresh cadence an operator dialled in for that page on that target.
+    // Opaque JSON — the shape is the contract's `SurfaceGroom`, re-validated on load.
+    await sql`
+      CREATE TABLE IF NOT EXISTS groom_preferences (
+        target_id  text NOT NULL,
+        source_key text NOT NULL,
+        groom      jsonb NOT NULL,
+        PRIMARY KEY (target_id, source_key)
+      )
+    `;
     // Credential profiles (POL-24): centrally-held OAuth clients for Bucket-A content auth. The
     // client secret's ONLY durable home — never broadcast, never returned by REST, never logged.
     await sql`
@@ -445,6 +463,7 @@ export class PostgresStore implements Store {
       sceneRows,
       credentialProfileRows,
       zoomPreferenceRows,
+      groomPreferenceRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector FROM screens`,
@@ -457,6 +476,7 @@ export class PostgresStore implements Store {
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
+      sql<GroomPreferenceRow[]>`SELECT target_id, source_key, groom FROM groom_preferences`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -543,6 +563,13 @@ export class PostgresStore implements Store {
       zoom: Number(row.zoom),
     }));
 
+    // POL-98 — jsonb comes back parsed; the ControlPlane re-validates each groom against the contract.
+    const groomPreferences: PersistedGroomPreference[] = groomPreferenceRows.map((row) => ({
+      targetId: row.target_id,
+      sourceKey: row.source_key,
+      groom: row.groom,
+    }));
+
     const scenes: PersistedScene[] = sceneRows.map((row) => {
       // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
       const raw =
@@ -574,6 +601,7 @@ export class PostgresStore implements Store {
       scenes,
       credentialProfiles,
       zoomPreferences,
+      groomPreferences,
     };
   }
 
@@ -623,6 +651,7 @@ export class PostgresStore implements Store {
     await sql`DELETE FROM screen_content WHERE screen_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM placements WHERE screen_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM zoom_preferences WHERE target_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
+    await sql`DELETE FROM groom_preferences WHERE target_id IN (SELECT id FROM screens WHERE machine_id = ${id})`;
     await sql`DELETE FROM screens WHERE machine_id = ${id}`;
     await sql`DELETE FROM machines WHERE id = ${id}`;
   }
@@ -834,6 +863,32 @@ export class PostgresStore implements Store {
       targetId: row.target_id,
       sourceKey: row.source_key,
       zoom: Number(row.zoom),
+    }));
+  }
+
+  // ── Grooming preferences (POL-98) ────────────────────────────────────────────
+
+  async upsertGroomPreference(pref: PersistedGroomPreference): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO groom_preferences (target_id, source_key, groom)
+      VALUES (${pref.targetId}, ${pref.sourceKey}, ${JSON.stringify(pref.groom)}::jsonb)
+      ON CONFLICT (target_id, source_key) DO UPDATE SET groom = EXCLUDED.groom
+    `;
+  }
+
+  async deleteGroomPreferencesForTarget(targetId: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM groom_preferences WHERE target_id = ${targetId}`;
+  }
+
+  async listGroomPreferences(): Promise<PersistedGroomPreference[]> {
+    const sql = this.sql;
+    const rows = await sql<GroomPreferenceRow[]>`SELECT target_id, source_key, groom FROM groom_preferences`;
+    return rows.map((row) => ({
+      targetId: row.target_id,
+      sourceKey: row.source_key,
+      groom: row.groom,
     }));
   }
 

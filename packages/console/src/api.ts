@@ -19,6 +19,7 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  SetGroomBody,
   SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -26,6 +27,7 @@ import {
 } from "@polyptic/protocol";
 import type {
   ContentSource,
+  SurfaceGroom,
   CredentialProfileTestResult,
   CredentialProfileView,
   Scene,
@@ -301,6 +303,12 @@ export function setScreenZoom(screenId: string, zoom: number): Promise<unknown> 
   return send("PUT", `/screens/${encodeURIComponent(screenId)}/zoom`, SetZoomBody.parse({ zoom }));
 }
 
+/** PUT /api/v1/screens/:screenId/groom — crop / scroll / refresh the page this screen frames
+ *  (POL-98). The body is the WHOLE groom; the server remembers it for this (screen, page) pair. */
+export function setScreenGroom(screenId: string, groom: SurfaceGroom): Promise<unknown> {
+  return send("PUT", `/screens/${encodeURIComponent(screenId)}/groom`, SetGroomBody.parse(groom));
+}
+
 // ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
 
 /** POST /api/v1/murals/:muralId/walls { muralId, memberScreenIds } — combine ≥2 adjacent screens. */
@@ -334,6 +342,12 @@ export function setWallContent(wallId: string, body: SetContentBody): Promise<un
  *  Every member takes the same zoom, so the wall stays one continuous page. */
 export function setWallZoom(wallId: string, zoom: number): Promise<unknown> {
   return send("PUT", `/walls/${encodeURIComponent(wallId)}/zoom`, SetZoomBody.parse({ zoom }));
+}
+
+/** PUT /api/v1/walls/:wallId/groom — crop / scroll / refresh the page spanning a combined surface
+ *  (POL-98). Every member takes the same groom, so the wall stays one continuous page. */
+export function setWallGroom(wallId: string, groom: SurfaceGroom): Promise<unknown> {
+  return send("PUT", `/walls/${encodeURIComponent(wallId)}/groom`, SetGroomBody.parse(groom));
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */

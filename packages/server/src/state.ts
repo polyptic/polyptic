@@ -28,6 +28,7 @@ import {
   PlaylistSurface,
   PageSurface,
   Scene,
+  SurfaceGroom,
   VideoSurface,
   VideoWall,
   WebSurface,
@@ -118,6 +119,52 @@ function withZoomedFirstSurface(
   return { ...slice, surfaces: [{ ...surface, zoom }, ...slice.surfaces.slice(1)] };
 }
 
+/** POL-98 — an ungroomed page: the whole page, unparked, never refreshed. Absence, not zeroes. */
+const NO_GROOM: SurfaceGroom = {};
+
+/** The groom fields a surface of this kind can actually carry. Crop and scroll are geometry and apply
+ *  to any framed page; `refreshSeconds` is the DASHBOARD kind's distinguishing knob, so a web surface
+ *  simply drops it (an operator who wants a refreshing page makes it a dashboard — which is what the
+ *  kind is FOR). */
+function groomFields(kind: "web" | "dashboard", groom: SurfaceGroom): Partial<FramedSurface> {
+  const geometry = { crop: groom.crop, scroll: groom.scroll };
+  return kind === "dashboard" ? { ...geometry, refreshSeconds: groom.refreshSeconds } : geometry;
+}
+
+/** The groom currently ON a surface — what the console's read-out shows, and what a partial edit
+ *  builds from. Media has no groom (it has no page). */
+function groomOf(surface: Surface): SurfaceGroom | undefined {
+  if (!isFramed(surface)) return undefined;
+  return {
+    refreshSeconds: surface.type === "dashboard" ? surface.refreshSeconds : undefined,
+    crop: surface.crop,
+    scroll: surface.scroll,
+  };
+}
+
+/** "every 5m · cropped · scrolled" — how a groom reads in the activity feed. */
+function groomLabel(groom: SurfaceGroom): string {
+  const parts: string[] = [];
+  if (groom.refreshSeconds !== undefined) {
+    const s = groom.refreshSeconds;
+    parts.push(s % 3600 === 0 ? `every ${s / 3600}h` : s % 60 === 0 ? `every ${s / 60}m` : `every ${s}s`);
+  }
+  if (groom.crop) parts.push("cropped");
+  if (groom.scroll && (groom.scroll.x > 0 || groom.scroll.y > 0)) parts.push("scrolled");
+  return parts.length > 0 ? parts.join(" · ") : "ungroomed";
+}
+
+/** A copy of `slice` whose FIRST surface carries `groom` — same id, same url, so the player restyles
+ *  the iframe it already has (crop/scroll) and re-arms its timer (refresh). No reload (D5). */
+function withGroomedFirstSurface(
+  slice: ScreenSlice,
+  surface: FramedSurface,
+  groom: SurfaceGroom,
+): ScreenSlice {
+  const next = { ...surface, ...groomFields(surface.type, groom) } as FramedSurface;
+  return { ...slice, surfaces: [next, ...slice.surfaces.slice(1)] };
+}
+
 /** POL-54 — whoever can mint a screen's player token (the PlayerAuth service, wired after
  *  construction like the token provider; absent in unit tests → tokenless URLs). */
 export type PlayerTokenMinter = (screenId: string) => string;
@@ -190,6 +237,16 @@ export type SetZoomResult =
   | {
       ok: false;
       error: "unknown-screen" | "unknown-wall" | "wall-member" | "no-content" | "not-zoomable";
+      wallId?: string;
+    };
+
+/** Result of `setScreenGroom` / `setWallGroom` (POL-98). The refusals are the zoom's, for the same
+ *  reasons — `not-groomable` = the target shows media, which has no page to crop, park or refresh. */
+export type SetGroomResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error: "unknown-screen" | "unknown-wall" | "wall-member" | "no-content" | "not-groomable";
       wallId?: string;
     };
 
@@ -281,6 +338,10 @@ export class ControlPlane {
   /** POL-57 — remembered page zoom, keyed by `zoomKey(targetId, sourceKey)`. A target is a screen or
    *  a wall; a sourceKey identifies the page. Assigning that page there again restores this zoom. */
   private readonly zoomPrefs = new Map<string, number>();
+
+  /** POL-98 — remembered grooming (crop/scroll/refresh), keyed by the SAME (target, page) pair as the
+   *  zoom: a dashboard cropped for a portrait pillar must not arrive cropped that way on a 4K panel. */
+  private readonly groomPrefs = new Map<string, SurfaceGroom>();
 
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
@@ -487,6 +548,14 @@ export class ControlPlane {
       // back to 100%) rather than pushed to a player as an unrenderable scale.
       const zoom = Zoom.safeParse(p.zoom);
       if (zoom.success) this.zoomPrefs.set(zoomKey(p.targetId, p.sourceKey), zoom.data);
+    }
+
+    // ── Grooming preferences (POL-98) ─────────────────────────────────────────
+    for (const p of persisted.groomPreferences) {
+      // Same rule as the zoom: re-validate at the edge and DROP a row the contract no longer accepts
+      // (an out-of-range crop from an older build), rather than push ungeometry to a wall.
+      const groom = SurfaceGroom.safeParse(p.groom);
+      if (groom.success) this.groomPrefs.set(zoomKey(p.targetId, p.sourceKey), groom.data);
     }
 
     // ── Content library (Phase 3c) ────────────────────────────────────────────
@@ -1356,22 +1425,27 @@ export class ControlPlane {
 
   /** What's on a screen now, for the console's tiles/inspector: the library source's name+kind (a
    *  wall member shows the wall's source), an ad-hoc URL's derived name, or null when nothing's on air. */
-  screenContentSummary(screenId: string): { name: string; kind: ContentKind; zoom?: number } | null {
+  screenContentSummary(
+    screenId: string,
+  ): { name: string; kind: ContentKind; zoom?: number; groom?: SurfaceGroom } | null {
     const surface = this.state.slices[screenId]?.surfaces[0];
     // POL-57 — the live zoom, present only for framed content. Its absence is how the console knows
     // this screen has nothing to zoom (media, or no content at all) and hides the control.
     const zoom = surface && isFramed(surface) ? surface.zoom : undefined;
+    // POL-98 — the live grooming, on the same test (framed ⇒ groomable), so the console offers the
+    // groom panel exactly where it offers the zoom control. An ungroomed page reports `{}`.
+    const groom = surface ? groomOf(surface) : undefined;
 
     const wall = this.getWallForScreen(screenId);
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind, zoom };
+      if (src) return { name: src.name, kind: src.kind, zoom, groom };
     }
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind, zoom };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, groom };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -1442,6 +1516,7 @@ export class ControlPlane {
     region: Geometry,
     span?: Span,
     zoom: number = DEFAULT_ZOOM,
+    groom: SurfaceGroom = NO_GROOM,
   ): Surface {
     const base = span ? { id, region, span } : { id, region };
     switch (spec.kind) {
@@ -1458,9 +1533,16 @@ export class ControlPlane {
           placement: "iframe",
           interactive: false,
           zoom,
+          ...groomFields("web", groom),
         });
       case "dashboard":
-        return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url, zoom });
+        return DashboardSurface.parse({
+          ...base,
+          type: "dashboard",
+          url: spec.url,
+          zoom,
+          ...groomFields("dashboard", groom),
+        });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
       case "video":
@@ -1498,18 +1580,112 @@ export class ControlPlane {
     await this.store.upsertZoomPreference({ targetId, sourceKey, zoom });
   }
 
-  /** Forget every remembered zoom for a screen/wall that is being removed. Ids are never reused, so a
-   *  pref that outlived its target could only ever be dead weight. */
+  /** Forget every remembered zoom AND groom (POL-98) for a screen/wall that is being removed. Ids are
+   *  never reused, so a pref that outlived its target could only ever be dead weight. */
   private async forgetZooms(targetId: string): Promise<void> {
     for (const key of [...this.zoomPrefs.keys()]) {
       if (key.startsWith(`${targetId}\u0000`)) this.zoomPrefs.delete(key);
     }
+    for (const key of [...this.groomPrefs.keys()]) {
+      if (key.startsWith(`${targetId}\u0000`)) this.groomPrefs.delete(key);
+    }
     await this.store.deleteZoomPreferencesForTarget(targetId);
+    await this.store.deleteGroomPreferencesForTarget(targetId);
   }
 
-  /** The page identity a zoom is remembered against: a library source by id, else the ad-hoc URL. */
+  /** The page identity a zoom/groom is remembered against: a library source by id, else the URL. */
   private sourceKeyFor(sourceId: string | null, url: string): string {
     return sourceId ? `source:${sourceId}` : `url:${url}`;
+  }
+
+  // ── Grooming (POL-98) ───────────────────────────────────────────────────────
+  //
+  // Crop, scroll and (dashboards) the refresh cadence, remembered against the (target, page) pair for
+  // exactly the reasons zoom is: a crop that hides a nav bar on a 1080p panel is the wrong crop on a
+  // portrait pillar, and a page cycles between targets. Everything below mirrors the zoom path — one
+  // pattern, two knobs — because the operator's mental model is one thing: "how this page sits HERE".
+
+  /** The remembered grooming for a (target, page) pair — an empty groom when never set. */
+  private groomFor(targetId: string, sourceKey: string): SurfaceGroom {
+    return this.groomPrefs.get(zoomKey(targetId, sourceKey)) ?? NO_GROOM;
+  }
+
+  /** Remember the grooming for a pair, write-through. An explicit reset (`{}`) is STORED, not
+   *  dropped: "back to the whole page" is a choice, and must survive a restart. */
+  private async rememberGroom(targetId: string, sourceKey: string, groom: SurfaceGroom): Promise<void> {
+    this.groomPrefs.set(zoomKey(targetId, sourceKey), groom);
+    await this.store.upsertGroomPreference({ targetId, sourceKey, groom });
+  }
+
+  /**
+   * Set the grooming on a single screen's framed content. Like zoom, this PATCHES the existing surface
+   * rather than re-resolving it: the keyed id and the url are untouched, so the player restyles the
+   * iframe it already has (crop/scroll) and re-arms its refresh timer — no navigation, no reload (D5).
+   */
+  async setScreenGroom(screenId: string, groom: SurfaceGroom): Promise<SetGroomResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slice = this.state.slices[screenId];
+    const surface = slice?.surfaces[0];
+    if (slice === undefined || surface === undefined) return { ok: false, error: "no-content" };
+    if (!isFramed(surface)) return { ok: false, error: "not-groomable" };
+
+    const next: ScreenSlice = withGroomedFirstSurface(slice, surface, groom);
+    this.state.slices[screenId] = next;
+    this.bumpRevision();
+
+    const sourceId = this.screenSourceIds.get(screenId) ?? null;
+    await this.rememberGroom(screenId, this.sourceKeyFor(sourceId, surface.url), groom);
+    await this.store.upsertContent({
+      screenId,
+      canvas: next.canvas,
+      surfaces: next.surfaces,
+      sourceId,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${screen.friendlyName} groom: ${groomLabel(groom)}`);
+    return { ok: true, slices: [next] };
+  }
+
+  /** Set the grooming on a combined surface: every member frames the same page, so they take the same
+   *  groom — the crop is applied to the SPANNING page once, and the wall still reads as one page. */
+  async setWallGroom(wallId: string, groom: SurfaceGroom): Promise<SetGroomResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices: ScreenSlice[] = [];
+    let sourceKey: string | undefined;
+    for (const screenId of wall.memberScreenIds) {
+      const slice = this.state.slices[screenId];
+      const surface = slice?.surfaces[0];
+      if (slice === undefined || surface === undefined) continue;
+      if (!isFramed(surface)) return { ok: false, error: "not-groomable" };
+      sourceKey ??= this.sourceKeyFor(this.wallSourceIds.get(wallId) ?? null, surface.url);
+      const next: ScreenSlice = withGroomedFirstSurface(slice, surface, groom);
+      this.state.slices[screenId] = next;
+      slices.push(next);
+    }
+    if (slices.length === 0 || sourceKey === undefined) return { ok: false, error: "no-content" };
+
+    this.bumpRevision();
+    await this.rememberGroom(wallId, sourceKey, groom);
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: this.wallSourceIds.get(wallId) ?? null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${wall.name ?? wall.id} groom: ${groomLabel(groom)}`);
+    return { ok: true, slices };
   }
 
   /**
@@ -1665,8 +1841,15 @@ export class ControlPlane {
    * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
    *
    * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
+   * POL-98: so is `groom` — the crop/scroll is dialled against the SPANNING page, so every member
+   * takes the identical values and the wall stays one continuous, cropped, parked page.
    */
-  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
+  private computeWallSlices(
+    wall: VideoWall,
+    spec: ResolvedSpec,
+    zoom = DEFAULT_ZOOM,
+    groom: SurfaceGroom = NO_GROOM,
+  ): ScreenSlice[] {
     const members: { screenId: string; placement: Placement }[] = [];
     for (const screenId of wall.memberScreenIds) {
       const placement = this.placements.get(screenId);
@@ -1705,6 +1888,7 @@ export class ControlPlane {
           offsetY: placement.y - unionMinY,
         },
         zoom,
+        groom,
       );
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
@@ -1858,11 +2042,13 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
-    // POL-57 — restore the zoom this wall last used FOR THIS PAGE (100% if it never has).
-    const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
+    // POL-57/POL-98 — restore the zoom AND the grooming this wall last used FOR THIS PAGE.
+    const wallKey = this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec));
+    const zoom = this.zoomFor(wallId, wallKey);
+    const groom = this.groomFor(wallId, wallKey);
 
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
-    const slices = this.computeWallSlices(wall, resolved.spec, zoom);
+    const slices = this.computeWallSlices(wall, resolved.spec, zoom, groom);
     if (slices.length === 0) return { ok: false, error: "no-placements" };
 
     // Record which library source (if any) this wall now spans, persisting the wall row.
@@ -1905,9 +2091,12 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
-    // POL-57 — restore the zoom this screen last used FOR THIS PAGE (100% if it never has), so the
-    // operator dials a dashboard in once per screen and it comes back that way every time.
-    const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
+    // POL-57/POL-98 — restore the zoom AND the grooming this screen last used FOR THIS PAGE, so the
+    // operator dials a dashboard in once per screen and it comes back that way every time: same
+    // scale, same crop, same scroll offset, same refresh cadence.
+    const screenKey = this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec));
+    const zoom = this.zoomFor(screenId, screenKey);
+    const groom = this.groomFor(screenId, screenKey);
 
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
     const surface = this.buildSurface(
@@ -1916,6 +2105,7 @@ export class ControlPlane {
       { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
       undefined,
       zoom,
+      groom,
     );
     const next: ScreenSlice = { ...slice, surfaces: [surface] };
     this.state.slices[screenId] = next;
@@ -2054,6 +2244,7 @@ export class ControlPlane {
         { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
         undefined,
         this.zoomFor(screenId, sourceKey),
+        this.groomFor(screenId, sourceKey),
       );
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
@@ -2065,7 +2256,10 @@ export class ControlPlane {
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
       const zoom = this.zoomFor(wallId, sourceKey);
-      for (const next of this.computeWallSlices(wall, spec, zoom)) byScreen.set(next.screenId, next);
+      const groom = this.groomFor(wallId, sourceKey);
+      for (const next of this.computeWallSlices(wall, spec, zoom, groom)) {
+        byScreen.set(next.screenId, next);
+      }
     }
 
     return [...byScreen.values()];

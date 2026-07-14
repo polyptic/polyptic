@@ -112,6 +112,69 @@ const SurfaceBase = z.object({
 export const Zoom = z.number().min(0.25).max(4);
 export type Zoom = z.infer<typeof Zoom>;
 
+// ── Grooming a framed page (POL-98) ──────────────────────────────────────────
+//
+// A wallboard is never TV-shaped: the page an operator wants on the glass is a REGION of a page that
+// was designed for a desk. Three knobs make an embedded page wall-ready, and they are pure geometry
+// plus one timer — nothing vendor-shaped, nothing that reaches inside the framed document (the SOP
+// forbids it anyway):
+//
+//   crop    — chop an inset off each edge of the framed page (the nav bar, the footer, a sidebar).
+//   scroll  — park the page at an offset, so a long report starts at the table that matters.
+//   refresh — re-fetch a DASHBOARD on a cadence: a wallboard that silently goes stale is worse than
+//             a blank one. (Dashboards only: the refresh cadence is what the `dashboard` kind MEANS.)
+//
+// Crop + scroll are a restyle of the same keyed element — instant, no reload (D5). Refresh rides the
+// POL-86 prober: a refresh is a RE-PROVE of an already-proven URL, so a refresh onto a dead URL is
+// simply a failed probe and the prober's healing path owns it. The wall never blanks either way.
+
+/** How a crop inset is measured. `percent` is a fraction of the framed page's own viewport (it
+ *  survives a panel swap or a resolution change); `px` is the page's own CSS pixels (what you get
+ *  when you measure a 64px header in DevTools). */
+export const CropUnit = z.enum(["percent", "px"]);
+export type CropUnit = z.infer<typeof CropUnit>;
+
+/** POL-98 — an inset chopped off each edge of the framed page. Zero on every edge = no crop. The
+ *  percent bounds keep the opposing pair under 95% (a 100% crop is an infinitely wide frame). */
+export const SurfaceCrop = z
+  .object({
+    top: z.number().min(0).max(20000).default(0),
+    right: z.number().min(0).max(20000).default(0),
+    bottom: z.number().min(0).max(20000).default(0),
+    left: z.number().min(0).max(20000).default(0),
+    unit: CropUnit.default("percent"),
+  })
+  .refine(
+    (c) => c.unit !== "percent" || (c.left + c.right <= 95 && c.top + c.bottom <= 95),
+    { message: "a percent crop must leave at least 5% of each axis visible" },
+  );
+export type SurfaceCrop = z.infer<typeof SurfaceCrop>;
+
+/** POL-98 — where the framed page is parked, in the page's own CSS pixels (the units a page scrolls
+ *  in). The player grows the frame and shifts it: a cross-origin document cannot be scripted, so the
+ *  offset is geometry, not `scrollTo`. */
+export const SurfaceScroll = z.object({
+  x: z.number().min(0).max(100000).default(0),
+  y: z.number().min(0).max(100000).default(0),
+});
+export type SurfaceScroll = z.infer<typeof SurfaceScroll>;
+
+/** POL-98 — how often a dashboard re-fetches itself, in seconds. Floored at 30s: a wall of boxes
+ *  hammering someone's dashboard server is an outage, not a feature. */
+export const RefreshSeconds = z.number().int().min(30).max(86400);
+export type RefreshSeconds = z.infer<typeof RefreshSeconds>;
+
+/** POL-98 — the grooming an operator has dialled in for one (screen-or-wall, page) pair. Every field
+ *  is optional; an all-absent groom is "ungroomed", which is what a page lands as. `refreshSeconds`
+ *  applies to dashboard surfaces only (a web surface has no refresh cadence — that is the kind's
+ *  distinguishing knob), and is ignored elsewhere. */
+export const SurfaceGroom = z.object({
+  refreshSeconds: RefreshSeconds.optional(),
+  crop: SurfaceCrop.optional(),
+  scroll: SurfaceScroll.optional(),
+});
+export type SurfaceGroom = z.infer<typeof SurfaceGroom>;
+
 export const WebSurface = SurfaceBase.extend({
   type: z.literal("web"),
   url: z.string().url(),
@@ -119,13 +182,20 @@ export const WebSurface = SurfaceBase.extend({
   placement: z.enum(["iframe", "window"]).default("iframe"),
   interactive: z.boolean().default(false),
   zoom: Zoom.default(1),
+  /** POL-98 — grooming geometry; absent = the whole page, unparked. */
+  crop: SurfaceCrop.optional(),
+  scroll: SurfaceScroll.optional(),
 });
 
 export const DashboardSurface = SurfaceBase.extend({
   type: z.literal("dashboard"),
   url: z.string().url(), // adapter-built (e.g. a single-panel dashboard embed URL)
-  refreshSeconds: z.number().int().positive().optional(),
+  /** POL-98 — the player reloads this frame IN PLACE on this cadence (previously dead contract). */
+  refreshSeconds: RefreshSeconds.optional(),
   zoom: Zoom.default(1),
+  /** POL-98 — grooming geometry; absent = the whole page, unparked. */
+  crop: SurfaceCrop.optional(),
+  scroll: SurfaceScroll.optional(),
 });
 
 export const ImageSurface = SurfaceBase.extend({
@@ -905,6 +975,10 @@ export const ScreenView = Screen.extend({
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
+      /** POL-98 — the grooming currently applied to the framed page (crop/scroll, and a dashboard's
+       *  refresh cadence). Present — possibly empty — exactly when the content is framed, so the
+       *  console offers the groom panel on the same test as the zoom control. */
+      groom: SurfaceGroom.optional(),
     })
     .nullable()
     .optional(),
@@ -1332,6 +1406,12 @@ export type SetContentBody = z.infer<typeof SetContentBody>;
  *  screen later restores the zoom the operator last dialled in. */
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
+
+/** Groom the framed page on a single screen OR a video wall (POL-98). The body is the WHOLE groom,
+ *  not a patch: what you send is what the (target, page) pair has, so an omitted field clears that
+ *  knob and `{}` is a full reset. Remembered like the zoom, and applied live to the same surface. */
+export const SetGroomBody = SurfaceGroom;
+export type SetGroomBody = z.infer<typeof SetGroomBody>;
 
 // REST bodies — content library (Phase 3c; playlists POL-34; pages POL-42)
 export const CreateContentSourceBody = z

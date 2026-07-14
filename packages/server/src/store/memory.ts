@@ -25,6 +25,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedGroomPreference,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -33,8 +34,8 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-/** Composite key for a zoom preference — the pair (target, content) it is remembered against. The
- *  separator can't appear in an id, so no pair can collide with another. */
+/** Composite key for a zoom/groom preference — the pair (target, content) it is remembered against.
+ *  The separator can't appear in an id, so no pair can collide with another. */
 function zoomKey(targetId: string, sourceKey: string): string {
   return `${targetId}\u0000${sourceKey}`;
 }
@@ -56,6 +57,8 @@ export class MemoryStore implements Store {
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
   private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
+  /** Keyed the same way — remembered grooming per pair (POL-98). */
+  private readonly groomPreferences = new Map<string, PersistedGroomPreference>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
@@ -87,6 +90,7 @@ export class MemoryStore implements Store {
       scenes: [...this.scenes.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
       zoomPreferences: [...this.zoomPreferences.values()].map(clone),
+      groomPreferences: [...this.groomPreferences.values()].map(clone),
     };
   }
 
@@ -117,6 +121,7 @@ export class MemoryStore implements Store {
       this.content.delete(screenId);
       this.placements.delete(screenId);
       this.dropZoomPreferences(screenId);
+      this.dropGroomPreferences(screenId);
     }
   }
 
@@ -227,6 +232,26 @@ export class MemoryStore implements Store {
   private dropZoomPreferences(targetId: string): void {
     for (const [key, pref] of this.zoomPreferences) {
       if (pref.targetId === targetId) this.zoomPreferences.delete(key);
+    }
+  }
+
+  // ── Grooming preferences (POL-98) ────────────────────────────────────────────
+
+  async upsertGroomPreference(pref: PersistedGroomPreference): Promise<void> {
+    this.groomPreferences.set(zoomKey(pref.targetId, pref.sourceKey), clone(pref));
+  }
+
+  async deleteGroomPreferencesForTarget(targetId: string): Promise<void> {
+    this.dropGroomPreferences(targetId);
+  }
+
+  async listGroomPreferences(): Promise<PersistedGroomPreference[]> {
+    return [...this.groomPreferences.values()].map(clone);
+  }
+
+  private dropGroomPreferences(targetId: string): void {
+    for (const [key, pref] of this.groomPreferences) {
+      if (pref.targetId === targetId) this.groomPreferences.delete(key);
     }
   }
 
