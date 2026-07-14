@@ -23,6 +23,7 @@ import { WebSocket } from "ws";
 import type { ControlPlane } from "./state";
 import type { PlayerHub } from "./hub";
 import type { ActivityLog } from "./activity";
+import type { SourceHealthTracker } from "./source-health";
 
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
 export class AdminHub {
@@ -172,6 +173,9 @@ export function buildAdminState(
   playerHub: PlayerHub,
   presence: Presence,
   activity: ActivityLog,
+  /** POL-94 — live per-source health from the players' probes. Optional so the older call sites (and
+   *  tests) that only care about machines keep working; absent = every source reads "unknown". */
+  health?: SourceHealthTracker,
 ): ServerToAdminMessage {
   const screens = control.getScreens();
 
@@ -224,6 +228,16 @@ export function buildAdminState(
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
+    // POL-94 — the library's inventory half: where each source is used (a fold over desired state)
+    // and whether the screens showing it can actually fetch it (a fold over the players' probes).
+    sourceStatus: health
+      ? health.statusList(control.getContentSourceUsage())
+      : control.getContentSourceUsage().map((usage) => ({
+          sourceId: usage.sourceId,
+          usage,
+          health: "unknown" as const,
+          unreachableScreenIds: [],
+        })),
   });
 }
 
@@ -233,6 +247,8 @@ interface BroadcasterDeps {
   presence: Presence;
   adminHub: AdminHub;
   activity: ActivityLog;
+  /** POL-94 — per-source content health, as reported by the players' probes. */
+  health?: SourceHealthTracker;
   log: FastifyBaseLogger;
 }
 
@@ -253,6 +269,7 @@ export class AdminBroadcaster {
       this.deps.playerHub,
       this.deps.presence,
       this.deps.activity,
+      this.deps.health,
     );
   }
 

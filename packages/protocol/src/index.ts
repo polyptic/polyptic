@@ -91,6 +91,13 @@ export type Screen = z.infer<typeof Screen>;
 const SurfaceBase = z.object({
   id: z.string(),
   region: Geometry, // position within the screen
+  /** POL-94 — the library source this surface is rendering, stamped at SEND time (never stored, same
+   *  pattern as the POL-24 token stamp and the POL-29 friendly name). It is what lets a player's
+   *  reachability report (`player/surface-health`) be attributed back to a library entry, so the
+   *  console can show per-source health. Absent for ad-hoc URLs (nothing in the library to attribute
+   *  to) and against an older server — the player simply reports without it, and the server ignores
+   *  the report. */
+  sourceId: z.string().optional(),
   /** Video-wall spanning (Phase 3b): when set, this surface shows the sub-rectangle at
    *  (offsetX,offsetY) of a contentW×contentH content. The player sizes the content to
    *  contentW×contentH and translates it by -(offsetX,offsetY) so this screen renders only its
@@ -837,7 +844,41 @@ export const PlayerDiag = z.object({
 });
 export type PlayerDiag = z.infer<typeof PlayerDiag>;
 
-export const PlayerMessage = z.discriminatedUnion("t", [PlayerHello, PlayerAck, PlayerDiag]);
+/** What a player's own reachability probe (POL-86's SurfaceProber) last concluded about a surface's
+ *  URL. `reachable` = the probe resolved, so the box CAN fetch it; `unreachable` = the probe rejected
+ *  (DNS, route, refused, timed out) or the element itself reported a failed load. Nothing more is
+ *  claimed — see SourceHealthState for what this deliberately cannot know. */
+export const SurfaceHealthState = z.enum(["reachable", "unreachable"]);
+export type SurfaceHealthState = z.infer<typeof SurfaceHealthState>;
+
+/** POL-94 — a player telling the control plane what the glass knows: this surface's URL just became
+ *  reachable, or just stopped being reachable. Sent ONLY on a state CHANGE (and re-sent once per
+ *  socket open, because the server forgets a screen's reports when it drops), so a fleet of walls
+ *  costs the control plane a handful of frames a day, not a poll per surface. The `url` is REDACTED
+ *  by the player (origin + path; a send-time credential token never leaves the box in a report). */
+export const PlayerSurfaceHealth = z.object({
+  t: z.literal("player/surface-health"),
+  screenId: z.string(),
+  /** The surface within this screen's slice (its id, stable across a re-render). */
+  surfaceId: z.string().max(120),
+  /** The library source the surface was rendering (send-time stamp). Absent for an ad-hoc URL — the
+   *  server then has nothing to attribute the report to and drops it. */
+  sourceId: z.string().max(120).optional(),
+  url: z.string().max(2000),
+  state: SurfaceHealthState,
+  /** Player-side ISO-8601 timestamp — the box's own clock, like `player/diag`. */
+  at: z.string().max(40),
+  /** Why, in the player's words ("failed to fetch", "element failed to load"). Never a URL. */
+  detail: z.string().max(200).optional(),
+});
+export type PlayerSurfaceHealth = z.infer<typeof PlayerSurfaceHealth>;
+
+export const PlayerMessage = z.discriminatedUnion("t", [
+  PlayerHello,
+  PlayerAck,
+  PlayerDiag,
+  PlayerSurfaceHealth,
+]);
 export type PlayerMessage = z.infer<typeof PlayerMessage>;
 
 /** Pushed whenever this screen's slice changes. The player applies it via DOM diff — no reload. */
@@ -1081,6 +1122,61 @@ export const ContentSource = z
   });
 export type ContentSource = z.infer<typeof ContentSource>;
 
+// ── Library status: usage + health (POL-94) ──────────────────────────────────
+//
+// The library was a flat list: no way to see WHERE a source is used, and no signal about whether it
+// is actually loading on the glass. Two folds fix that, both computed server-side and shipped with
+// the admin snapshot — one over DESIRED STATE (usage), one over what the PLAYERS report (health).
+
+/** Everything in the registry that references one library source. Ids (not just counts) so the
+ *  console can say exactly what a delete will break and link through to it. */
+export const SourceUsage = z.object({
+  sourceId: z.string(),
+  /** Screens directly assigned this source. */
+  screenIds: z.array(z.string()),
+  /** Video walls spanning it (each has ≥2 member screens — counted as ONE wall, not N screens). */
+  wallIds: z.array(z.string()),
+  /** Playlists with a step referencing it. */
+  playlistIds: z.array(z.string()),
+  /** Pages whose definition embeds it (an `embed` or `image` element). */
+  pageIds: z.array(z.string()),
+});
+export type SourceUsage = z.infer<typeof SourceUsage>;
+
+/**
+ * The console's health badge for a library source, folded from its players' `player/surface-health`
+ * reports. HONEST LIMITS, because a badge that overclaims is worse than none:
+ *
+ *   reachable    at least one screen showing it last PROVED it fetchable, and none has since failed.
+ *                It does NOT mean the content rendered correctly: an HTTP 500, an expired session's
+ *                login page and a blank dashboard are all "reachable" — they are the content owner's
+ *                page, fetched fine. Cross-origin framed content is behind the SOP wall; the browser
+ *                will not tell us what it rendered, and Polyptic will not pretend otherwise.
+ *   unreachable  a screen showing it could not fetch the URL at all (DNS, route, refused, timeout) or
+ *                the media element reported a failed load. This is the one that matters: it is the
+ *                broken-image icon / sad face the wall must never show.
+ *   unknown      nobody is showing it (an unassigned source is never probed — a library of 200 URLs
+ *                must not become 200 outbound requests), or the screens showing it are offline, or the
+ *                players are older than this protocol.
+ */
+export const SourceHealthState = z.enum(["reachable", "unreachable", "unknown"]);
+export type SourceHealthState = z.infer<typeof SourceHealthState>;
+
+/** A library source's usage fold + its live health fold, denormalized for the console. */
+export const ContentSourceStatus = z.object({
+  sourceId: z.string(),
+  usage: SourceUsage,
+  health: SourceHealthState,
+  /** When the newest report backing `health` was written, on the reporting box's clock. Absent when
+   *  health is `unknown` (nothing has ever reported). */
+  lastSeenAt: z.string().max(40).optional(),
+  /** The screens currently reporting this source as unreachable (drives "broken on Lobby 2"). */
+  unreachableScreenIds: z.array(z.string()).default([]),
+  /** The newest failure's reason, in the player's words. Absent when nothing is failing. */
+  detail: z.string().max(200).optional(),
+});
+export type ContentSourceStatus = z.infer<typeof ContentSourceStatus>;
+
 // ── Scenes (Phase 3d) ────────────────────────────────────────────────────────
 // A Scene is a named SNAPSHOT of a mural's whole wall — its layout (placements), grouping (video
 // walls) and content (per screen + per wall) — re-appliable in one click. Content is captured as the
@@ -1259,6 +1355,9 @@ export const ServerToAdminState = z.object({
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  /** POL-94 — per-source usage + live health, one entry per library source. Optional = back-compat
+   *  (an older console ignores it; a newer console against an older server shows "unknown"). */
+  sourceStatus: z.array(ContentSourceStatus).optional(),
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;

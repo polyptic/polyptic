@@ -263,6 +263,35 @@ function bindEl(id: string, el: unknown): void {
   }
 }
 
+/** POL-94 — surface id → the library source it is rendering (stamped by the server at send time).
+ *  A report about an ad-hoc URL carries no sourceId; the server has nothing to attribute it to. */
+const surfaceSourceIds = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {};
+  for (const s of surfaces.value) if (s.sourceId) map[s.id] = s.sourceId;
+  return map;
+});
+
+/**
+ * POL-94 — tell the control plane what this box knows about its content. The prober fires only on a
+ * CHANGE of verdict, so a healthy wall sends nothing and a dead dashboard sends one frame — the
+ * console's library badge is live without anybody polling anything. The URL is redacted (origin +
+ * path): the query is where the server stamps credentials at send time (POL-24), and a health report
+ * must never carry one back off the box.
+ */
+function reportHealth(change: { id: string; url: string; state: "reachable" | "unreachable"; detail?: string }): void {
+  if (!screenId) return;
+  socket?.send({
+    t: "player/surface-health",
+    screenId,
+    surfaceId: change.id,
+    ...(surfaceSourceIds.value[change.id] ? { sourceId: surfaceSourceIds.value[change.id] } : {}),
+    url: redactUrl(change.url),
+    state: change.state,
+    at: new Date().toISOString(),
+    ...(change.detail ? { detail: change.detail } : {}),
+  });
+}
+
 const prober = new SurfaceProber({
   paint: (id, url) => {
     painted[id] = url;
@@ -278,6 +307,7 @@ const prober = new SurfaceProber({
     if (el instanceof HTMLVideoElement) el.load();
     else el.src = el.src;
   },
+  onHealth: reportHealth,
   log: (msg) => diag(msg),
 });
 
@@ -395,6 +425,10 @@ onMounted(() => {
           if (everOpen) prober.recheck("player socket reconnected");
           everOpen = true;
           flushDiag();
+          // POL-94 — the server forgets a screen's content health when it drops, so re-state what we
+          // already know. Without this, a wall that reconnected while its dashboard was dead would
+          // read "unknown" in the console until the URL changed state again — i.e. never.
+          for (const change of prober.snapshot()) reportHealth(change);
         }
         connState.value = state;
       },

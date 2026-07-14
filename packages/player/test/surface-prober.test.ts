@@ -35,10 +35,12 @@ function harness(overrides: Partial<SurfaceProberOptions> = {}) {
   const painted: Array<[string, string]> = [];
   const cleared: string[] = [];
   const reloaded: string[] = [];
+  const health: Array<[string, string, string | undefined]> = [];
   const prober = new SurfaceProber({
     paint: (id, url) => painted.push([id, url]),
     clear: (id) => cleared.push(id),
     reload: (id) => reloaded.push(id),
+    onHealth: (c) => health.push([c.id, c.state, c.detail]),
     probe: () => Promise.resolve(),
     probeBackoffMinMs: 10,
     probeBackoffMaxMs: 40,
@@ -48,7 +50,7 @@ function harness(overrides: Partial<SurfaceProberOptions> = {}) {
     errorRetryMinMs: 5,
     ...overrides,
   });
-  return { prober, painted, cleared, reloaded };
+  return { prober, painted, cleared, reloaded, health };
 }
 
 describe("SurfaceProber", () => {
@@ -242,5 +244,105 @@ describe("SurfaceProber", () => {
     await sleep(60);
     expect(h.painted).toEqual([]);
     expect(h.reloaded).toEqual([]);
+  });
+});
+
+/**
+ * POL-94 — the prober's verdicts leave the box: the console's library badge is exactly this knowledge,
+ * addressed per content source. The load-bearing property is CHEAPNESS: a report on every state
+ * CHANGE, never on every probe — a dead URL retried forever must cost one frame, not one per retry.
+ */
+describe("SurfaceProber health reporting (POL-94)", () => {
+  test("a proven URL reports reachable exactly once, however many probes it takes", async () => {
+    let call = 0;
+    const h = harness({
+      probe: () => (++call < 3 ? Promise.reject(new Error("Failed to fetch")) : Promise.resolve()),
+    });
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(80);
+
+    // Two failures → ONE "unreachable"; then success → ONE "reachable". Not five reports.
+    expect(h.health).toEqual([
+      ["s1", "unreachable", "Failed to fetch"],
+      ["s1", "reachable", undefined],
+    ]);
+    h.prober.stop();
+  });
+
+  test("a URL that stays dead is reported once, not once per retry", async () => {
+    const h = harness({ probe: () => Promise.reject(new Error("Failed to fetch")) });
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(120); // several retries have run by now (backoff 10ms → 40ms)
+
+    expect(h.health).toEqual([["s1", "unreachable", "Failed to fetch"]]);
+    h.prober.stop();
+  });
+
+  test("a verify failure after a good paint reports the break", async () => {
+    let call = 0;
+    const h = harness({
+      // 1: prove (ok) → paint. 2: verify (fails) → the network moved after the paint.
+      probe: () => (++call === 2 ? Promise.reject(new Error("Failed to fetch")) : Promise.resolve()),
+      verifyDelaysMs: [10],
+    });
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(60);
+
+    expect(h.health[0]).toEqual(["s1", "reachable", undefined]);
+    expect(h.health[1]).toEqual(["s1", "unreachable", "Failed to fetch"]);
+    h.prober.stop();
+  });
+
+  test("a media element that fails to load is unreachable even though the URL probes fine", async () => {
+    const h = harness({ probe: () => Promise.resolve() });
+    h.prober.sync([{ id: "s1", url: "http://c/x.png" }]);
+    await sleep(10);
+    expect(h.health).toEqual([["s1", "reachable", undefined]]);
+
+    // A 404 image is perfectly "reachable" — and a broken-image icon on the wall. The element wins.
+    h.prober.elementError("s1");
+    await sleep(40);
+    expect(h.health[1]).toEqual(["s1", "unreachable", "element failed to load"]);
+    // The re-prove SUCCEEDS (the URL was never the problem) — and must NOT report a false green.
+    expect(h.health.filter(([, state]) => state === "reachable")).toHaveLength(1);
+
+    // Only a real load clears it.
+    h.prober.elementLoaded("s1");
+    expect(h.health[h.health.length - 1]).toEqual(["s1", "reachable", undefined]);
+    h.prober.stop();
+  });
+
+  test("a retargeted surface forgets its old verdict (the answer was about another URL)", async () => {
+    const h = harness({
+      probe: (url: string) =>
+        url.endsWith("/dead") ? Promise.reject(new Error("Failed to fetch")) : Promise.resolve(),
+    });
+    h.prober.sync([{ id: "s1", url: "http://c/dead" }]);
+    await sleep(40);
+    expect(h.health).toEqual([["s1", "unreachable", "Failed to fetch"]]);
+
+    h.prober.sync([{ id: "s1", url: "http://c/live" }]); // operator repointed the source
+    await sleep(40);
+    expect(h.health[1]).toEqual(["s1", "reachable", undefined]);
+    expect(h.prober.snapshot()).toEqual([{ id: "s1", url: "http://c/live", state: "reachable" }]);
+    h.prober.stop();
+  });
+
+  test("snapshot() is what a reconnecting player re-states (the server forgot it when it dropped)", async () => {
+    const h = harness({
+      probe: (url: string) =>
+        url.endsWith("/dead") ? Promise.reject(new Error("Failed to fetch")) : Promise.resolve(),
+    });
+    h.prober.sync([
+      { id: "s1", url: "http://c/live" },
+      { id: "s2", url: "http://c/dead" },
+    ]);
+    await sleep(60);
+
+    expect(h.prober.snapshot()).toEqual([
+      { id: "s1", url: "http://c/live", state: "reachable" },
+      { id: "s2", url: "http://c/dead", state: "unreachable" },
+    ]);
+    h.prober.stop();
   });
 });

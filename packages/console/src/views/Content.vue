@@ -50,6 +50,113 @@ function pageSubtitle(s: ContentSource): string {
 const sources = computed(() => store.sources.filter((s) => s.kind !== "playlist"));
 const profiles = computed(() => store.profiles);
 
+// ── search / filter / sort (POL-94) ───────────────────────────────────────────
+// The library grew into a pile: a flat, unsorted list with no way to find anything. All three are
+// CLIENT-side — a library is tens of rows, not thousands, and a round trip to filter a list you are
+// already holding is a worse experience than typing into it.
+
+const query = ref("");
+const kindFilter = ref<ContentKind | "all">("all");
+const sortBy = ref<"name" | "kind" | "usage">("name");
+
+/** The kinds actually present in the library — never offer a filter that can only return nothing. */
+const availableKinds = computed<ContentKind[]>(() =>
+  CONTENT_KINDS.filter((k) => sources.value.some((s) => s.kind === k)),
+);
+
+/** Total references (screens + walls + playlists + pages) — the "recently/most used" sort key. */
+function usageCount(s: ContentSource): number {
+  const u = store.statusForSource(s.id)?.usage;
+  if (!u) return 0;
+  return u.screenIds.length + u.wallIds.length + u.playlistIds.length + u.pageIds.length;
+}
+
+/** Name + address + kind, matched case-insensitively on every whitespace-separated term. */
+function matches(s: ContentSource, terms: string[]): boolean {
+  const hay = `${s.name} ${s.url ?? ""} ${kindLabel(s.kind)}`.toLowerCase();
+  return terms.every((t) => hay.includes(t));
+}
+
+const visibleSources = computed(() => {
+  const terms = query.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const filtered = sources.value.filter(
+    (s) => (kindFilter.value === "all" || s.kind === kindFilter.value) && matches(s, terms),
+  );
+  const sorted = [...filtered];
+  if (sortBy.value === "name") {
+    sorted.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sortBy.value === "kind") {
+    sorted.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+  } else {
+    // Most-used first — the sources an operator actually lives with float to the top.
+    sorted.sort((a, b) => usageCount(b) - usageCount(a) || a.name.localeCompare(b.name));
+  }
+  return sorted;
+});
+
+// ── usage + health (POL-94) ───────────────────────────────────────────────────
+
+/** "Used on 2 screens · 1 video wall" — or "Not used yet", which is itself the useful answer. */
+function usageLine(s: ContentSource): string {
+  return store.usageSummary(s.id) || "Not used yet";
+}
+
+/** The screens (by friendly name) currently reporting this source as unreachable. */
+function brokenOn(s: ContentSource): string[] {
+  const ids = store.statusForSource(s.id)?.unreachableScreenIds ?? [];
+  return ids.map((id) => store.screenById(id)?.friendlyName ?? id);
+}
+
+function healthLabel(s: ContentSource): string {
+  const health = store.healthForSource(s.id);
+  if (health === "reachable") return "loading";
+  if (health === "unreachable") return "not loading";
+  return "not checked";
+}
+
+/**
+ * What the badge means, spelled out — because a health badge that overclaims is worse than none.
+ * The player PROVES a URL fetchable before it paints it (POL-86); that is all this knows. It cannot
+ * see inside a cross-origin frame (same-origin policy), so a 500, an expired session's login page
+ * and an empty dashboard all read as "loading". Say so, in the tooltip, every time.
+ */
+function healthTitle(s: ContentSource): string {
+  const status = store.statusForSource(s.id);
+  const health = status?.health ?? "unknown";
+  const seen = status?.lastSeenAt ? ` Last reported ${timeAgo(status.lastSeenAt)}.` : "";
+  if (health === "reachable") {
+    return (
+      `The screens showing this fetched it successfully — it is loading on the glass.${seen} ` +
+      `This does not mean the page rendered what you want: a browser cannot see inside someone ` +
+      `else's page, so an error page or a signed-out dashboard also counts as "loading".`
+    );
+  }
+  if (health === "unreachable") {
+    const where = brokenOn(s);
+    const detail = status?.detail ? ` (${status.detail})` : "";
+    return (
+      `A screen showing this could not fetch it at all${detail} — ` +
+      `${where.length ? where.join(", ") : "the screen"} is showing a placeholder and retrying.${seen}`
+    );
+  }
+  return (
+    "Nobody is showing this right now, so nothing has checked it. Polyptic never probes a source " +
+    "no screen is displaying — a library of 200 links would become 200 requests an hour."
+  );
+}
+
+/** "2 min ago" / "3 h ago" — the badge's "when was this last seen" half, in the operator's terms. */
+function timeAgo(at: string): string {
+  const ms = Date.now() - Date.parse(at);
+  if (!Number.isFinite(ms) || ms < 0) return "just now";
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
 // ── modal state ──────────────────────────────────────────────────────────────
 const modalOpen = ref(false);
 const editingId = ref<string | null>(null); // null = creating
@@ -118,11 +225,48 @@ async function save() {
   }
 }
 
+/**
+ * POL-94 — what deleting this source will actually break, named. The old copy said "any screen or
+ * video wall currently showing it will be cleared", which is true and useless: it never told you
+ * WHICH, and it never mentioned the playlist step or the page embed that would silently vanish.
+ * Plain text on purpose, so a dialog component can adopt it verbatim.
+ */
+function deleteConsequences(s: ContentSource): string {
+  const usage = store.statusForSource(s.id)?.usage;
+  if (!usage) return `Delete "${s.name}"?`;
+  const clauses: string[] = [];
+  const named = (ids: string[], resolve: (id: string) => string): string =>
+    ids.map(resolve).join(", ");
+  if (usage.screenIds.length) {
+    clauses.push(
+      `clear ${usage.screenIds.length === 1 ? "1 screen" : `${usage.screenIds.length} screens`} ` +
+        `(${named(usage.screenIds, (id) => store.screenById(id)?.friendlyName ?? id)})`,
+    );
+  }
+  if (usage.wallIds.length) {
+    clauses.push(
+      `clear ${usage.wallIds.length === 1 ? "1 video wall" : `${usage.wallIds.length} video walls`} ` +
+        `(${named(usage.wallIds, (id) => store.wallName(id))})`,
+    );
+  }
+  if (usage.playlistIds.length) {
+    clauses.push(
+      `remove a step from ${usage.playlistIds.length === 1 ? "1 playlist" : `${usage.playlistIds.length} playlists`} ` +
+        `(${named(usage.playlistIds, (id) => store.sourceById(id)?.name ?? id)})`,
+    );
+  }
+  if (usage.pageIds.length) {
+    clauses.push(
+      `blank an element on ${usage.pageIds.length === 1 ? "1 page" : `${usage.pageIds.length} pages`} ` +
+        `(${named(usage.pageIds, (id) => store.sourceById(id)?.name ?? id)})`,
+    );
+  }
+  if (clauses.length === 0) return `Delete "${s.name}"? It isn't used anywhere.`;
+  return `Delete "${s.name}"? This will ${clauses.join(", and ")}.`;
+}
+
 async function remove(s: ContentSource) {
-  const yes = window.confirm(
-    `Delete "${s.name}"? Any screen or video wall currently showing it will be cleared.`,
-  );
-  if (yes) await store.deleteSource(s.id);
+  if (window.confirm(deleteConsequences(s))) await store.deleteSource(s.id);
 }
 
 /** A compact, scheme-stripped address for the list row (matches the design's "address" read-out). */
@@ -399,9 +543,47 @@ function thumbSrc(s: ContentSource): string {
         </div>
       </header>
 
+      <!-- ── search · filter · sort (POL-94) ────────────────────────────────── -->
+      <div v-if="sources.length" class="toolbar">
+        <div class="search-wrap">
+          <span class="search-glyph">⌕</span>
+          <input
+            v-model="query"
+            class="search"
+            type="search"
+            placeholder="Search by name or address…"
+            aria-label="Search content sources"
+          />
+        </div>
+        <div class="filter-row">
+          <button
+            class="filter-btn"
+            :class="{ active: kindFilter === 'all' }"
+            @click="kindFilter = 'all'"
+          >
+            All
+          </button>
+          <button
+            v-for="k in availableKinds"
+            :key="k"
+            class="filter-btn"
+            :class="{ active: kindFilter === k }"
+            @click="kindFilter = k"
+          >
+            <span :style="{ color: `var(${kindColorVar(k)})` }">{{ kindGlyph(k) }}</span>
+            {{ kindLabel(k) }}
+          </button>
+        </div>
+        <select v-model="sortBy" class="sort" aria-label="Sort content sources">
+          <option value="name">Sort: name</option>
+          <option value="kind">Sort: type</option>
+          <option value="usage">Sort: most used</option>
+        </select>
+      </div>
+
       <!-- list -->
-      <div v-if="sources.length" class="list">
-        <div v-for="c in sources" :key="c.id" class="row">
+      <div v-if="visibleSources.length" class="list">
+        <div v-for="c in visibleSources" :key="c.id" class="row">
           <img v-if="isImage(c)" class="thumb" :src="thumbSrc(c)" :alt="c.name" loading="lazy" />
           <span v-else class="glyph" :style="{ color: `var(${kindColorVar(c.kind)})` }">
             {{ kindGlyph(c.kind) }}
@@ -418,11 +600,41 @@ function thumbSrc(s: ContentSource): string {
                 <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
               </template>
             </div>
+            <!-- POL-94 — where this source is used: an inventory, not a pile. -->
+            <div class="row-usage">{{ usageLine(c) }}</div>
           </div>
+          <!-- POL-94 — the live health badge. What it can and cannot know is in its tooltip. -->
+          <span
+            class="health-pill"
+            :class="store.healthForSource(c.id)"
+            :title="healthTitle(c)"
+          >
+            {{
+              store.healthForSource(c.id) === "reachable"
+                ? "●"
+                : store.healthForSource(c.id) === "unreachable"
+                  ? "⚠"
+                  : "○"
+            }}
+            {{ healthLabel(c) }}
+          </span>
           <span class="kind-badge">{{ kindLabel(c.kind) }}</span>
           <button v-if="c.kind === 'page'" class="edit-btn" @click="openStudio(c)">Edit in Studio</button>
           <button v-else class="edit-btn" @click="openEdit(c)">Edit</button>
           <button class="del-btn" title="Delete source" @click="remove(c)">✕</button>
+        </div>
+      </div>
+
+      <!-- nothing matched the search / filter (the library itself is not empty) -->
+      <div v-else-if="sources.length" class="empty">
+        <span class="empty-glyph">⌕</span>
+        <span class="empty-title">No sources match</span>
+        <span class="empty-sub">
+          Nothing in the library matches that search or filter. Clear them to see all
+          {{ sources.length }}.
+        </span>
+        <div class="empty-actions">
+          <button class="add-btn ghost" @click="query = ''; kindFilter = 'all'">Clear filters</button>
         </div>
       </div>
 
@@ -1121,6 +1333,107 @@ function thumbSrc(s: ContentSource): string {
   background: var(--muted-bg);
   padding: 1px 4px;
   border-radius: 4px;
+}
+
+/* ── search · filter · sort (POL-94) ─────────────────────────────────────────── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.search-wrap {
+  position: relative;
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+.search-glyph {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 13px;
+  color: var(--muted2);
+  pointer-events: none;
+}
+.search {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 12px 8px 30px;
+  font-size: 13px;
+  color: var(--fg);
+  outline: none;
+  font-family: inherit;
+}
+.search:focus {
+  border-color: var(--accent);
+}
+.filter-row {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.filter-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.filter-btn:hover {
+  background: var(--muted-bg);
+}
+.filter-btn.active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.sort {
+  appearance: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 12px;
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* ── usage + health (POL-94) ─────────────────────────────────────────────────── */
+.row-usage {
+  font-size: 11px;
+  color: var(--muted2);
+  margin-top: 2px;
+}
+.health-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+  cursor: help;
+  color: var(--muted);
+  background: var(--muted-bg);
+}
+.health-pill.reachable {
+  color: var(--ok, #1d8a4e);
+  background: var(--ok-soft, var(--muted-bg));
+}
+.health-pill.unreachable {
+  color: var(--bad);
+  background: var(--bad-soft);
 }
 
 /* upload progress */
