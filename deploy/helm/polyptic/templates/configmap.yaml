@@ -52,6 +52,32 @@ data:
   AGENT_MTLS_SANS: {{ join "," .Values.agentMtls.sans | quote }}
   {{- end }}
   {{- end }}
+  {{- if .Values.oidc.enabled }}
+  # ── Generic OIDC operator sign-in (POL-106/D101) ────────────────────────────
+  # Discovery-driven: the issuer's own /.well-known/openid-configuration supplies
+  # every endpoint, so no provider is named here or in the code. The client SECRET
+  # is not in this ConfigMap — it rides the Secret (see deployment.yaml).
+  {{- if not (and .Values.oidc.issuer .Values.oidc.clientId) }}
+  {{- fail "oidc.enabled requires oidc.issuer and oidc.clientId (and a client secret via oidc.clientSecret or secrets.existingSecret). The server refuses to boot half-configured." }}
+  {{- end }}
+  OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}
+  OIDC_CLIENT_ID: {{ .Values.oidc.clientId | quote }}
+  OIDC_PROVIDER_NAME: {{ .Values.oidc.providerName | quote }}
+  OIDC_SCOPES: {{ .Values.oidc.scopes | quote }}
+  {{- if .Values.oidc.redirectUri }}
+  # Exact-match against the IdP registration. Unset → derived from PUBLIC_BASE_URL.
+  OIDC_REDIRECT_URI: {{ .Values.oidc.redirectUri | quote }}
+  {{- end }}
+  {{- if .Values.oidc.postLoginUrl }}
+  OIDC_POST_LOGIN_URL: {{ .Values.oidc.postLoginUrl | quote }}
+  {{- end }}
+  {{- if .Values.oidc.allowedDomains }}
+  OIDC_ALLOWED_DOMAINS: {{ .Values.oidc.allowedDomains | quote }}
+  {{- end }}
+  {{- if .Values.oidc.rpLogout }}
+  OIDC_RP_LOGOUT: "1"
+  {{- end }}
+  {{- end }}
   # ── Phase 7 — MEDIA ─────────────────────────────────────────────────────────
   # Uploads (POST /api/v1/media) are streamed to MEDIA_DIR (a mounted volume, see
   # the PVC/volumeMount in deployment.yaml) and served back, ungated, from the

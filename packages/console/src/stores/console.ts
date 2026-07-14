@@ -510,12 +510,17 @@ export const useConsoleStore = defineStore("console", {
      * authenticated channel lingers. Best-effort — a failed logout call still clears local state.
      */
     async logout(): Promise<void> {
+      let endSessionUrl: string | undefined;
       try {
-        await auth.logout();
+        ({ endSessionUrl } = await auth.logout());
       } catch (err) {
         console.error("[console] logout failed", err);
       }
       this.markSignedOut();
+      // POL-106: an SSO session with RP-initiated logout on — hand the browser to the IdP so the
+      // sign-out reaches it too. The local session is already revoked, so this is a courtesy, not a
+      // dependency: if the IdP never answers, the operator is still signed out of Polyptic.
+      if (endSessionUrl) window.location.assign(endSessionUrl);
     },
 
     /**

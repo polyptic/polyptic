@@ -1444,6 +1444,28 @@ export type LoginBody = z.infer<typeof LoginBody>;
 export const AuthUser = z.object({ id: z.string(), email: z.string().email() });
 export type AuthUser = z.infer<typeof AuthUser>;
 
+/**
+ * Which sign-in methods this deployment offers (POL-106). Public (pre-session) — the console's
+ * sign-in page reads it to decide whether to render the "Sign in with <provider>" button. Local
+ * accounts are ALWAYS available (the break-glass path), so `local` is informational; `oidc` is null
+ * whenever no IdP is configured, which is exactly the pre-POL-106 behaviour.
+ *
+ * Deliberately secret-free: the provider's display name comes from config (never hardcoded — no
+ * vendor names in core code paths) and `startUrl` is the API path that begins the redirect dance.
+ */
+export const AuthProviders = z.object({
+  local: z.boolean(),
+  oidc: z
+    .object({
+      /** Operator-chosen display name, e.g. "Company SSO" — rendered verbatim on the button. */
+      name: z.string(),
+      /** API path that starts the Authorization Code + PKCE flow (a top-level navigation). */
+      startUrl: z.string(),
+    })
+    .nullable(),
+});
+export type AuthProviders = z.infer<typeof AuthProviders>;
+
 /** Change the current operator's password. */
 export const ChangePasswordBody = z.object({
   currentPassword: z.string().min(1).max(200),

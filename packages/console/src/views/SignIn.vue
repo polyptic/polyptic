@@ -2,7 +2,8 @@
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useConsoleStore } from "../stores/console";
-import { ApiError, serverHealth } from "../api";
+import { ApiError, apiUrl, serverHealth } from "../api";
+import { getAuthProviders } from "../auth";
 import Logo from "../components/Logo.vue";
 
 // Real local-account sign-in (Phase 3f — D29). Credentials POST to /auth/login over the credentialed
@@ -24,6 +25,17 @@ const themeIcon = computed(() => (store.theme === "light" ? "☾ Dark" : "☼ Li
 // The REAL deployed version (was a hardcoded "v3.0" leftover from the Console-v2 design adoption).
 // /healthz is ungated so this works pre-auth; dev builds ("0.0.0") show no number at all.
 const version = ref<string | null>(null);
+
+// POL-106 — the deployment tells us which sign-in methods it offers. `ssoName` is the operator's own
+// display name for their IdP (config, never hardcoded: this console must work with ANY provider), and
+// `ssoUrl` starts the Authorization Code + PKCE dance. No IdP configured → neither is set and this
+// page renders exactly as it did before.
+const ssoName = ref<string | null>(null);
+const ssoUrl = ref<string | null>(null);
+// The IdP bounced the operator back with a reason (the callback redirects here on failure only when
+// the console is same-origin; a direct 401 body carries it too). Surface it plainly.
+const ssoError = computed(() => (typeof route.query.sso === "string" ? route.query.sso : null));
+
 onMounted(() => {
   void serverHealth()
     .then((h) => {
@@ -31,7 +43,24 @@ onMounted(() => {
       if (v && v !== "0.0.0") version.value = v;
     })
     .catch(() => {});
+
+  void getAuthProviders()
+    .then((providers) => {
+      if (!providers.oidc) return;
+      ssoName.value = providers.oidc.name;
+      // startUrl is the full API path ("/api/v1/auth/…"); apiUrl already carries the /api/v1 base,
+      // which in dev is the server origin (:8080) rather than Vite's.
+      ssoUrl.value = apiUrl(providers.oidc.startUrl.replace(/^\/api\/v1/, ""));
+    })
+    .catch(() => {
+      // An unreachable/old server just means no SSO button — the local form still works.
+    });
 });
+
+/** A TOP-LEVEL navigation (not a fetch): the IdP has to see the browser, and set its own cookies. */
+function onSsoSignIn(): void {
+  if (ssoUrl.value) window.location.assign(ssoUrl.value);
+}
 
 async function onSignIn(): Promise<void> {
   if (loading.value) return;
@@ -72,6 +101,13 @@ async function onSignIn(): Promise<void> {
 
       <div class="heading">Sign in to the console</div>
       <div class="sub">Operator access to your display fleet.</div>
+
+      <div v-if="ssoError" class="error">⚠ Single sign-on failed ({{ ssoError }}). Try again, or use an account below.</div>
+
+      <template v-if="ssoName && ssoUrl">
+        <button class="btn sso" :disabled="loading" @click="onSsoSignIn">Sign in with {{ ssoName }}</button>
+        <div class="divider"><span>or</span></div>
+      </template>
 
       <label class="field-label">Email</label>
       <input
@@ -177,6 +213,28 @@ async function onSignIn(): Promise<void> {
   border-radius: 8px;
   padding: 9px 11px;
   margin-bottom: 14px;
+}
+.sso {
+  width: 100%;
+  padding: 11px;
+  font-size: 13.5px;
+  margin-bottom: 16px;
+}
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  color: var(--muted2);
+  font-size: 11.5px;
+}
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border, var(--muted2));
+  opacity: 0.35;
 }
 .submit {
   width: 100%;

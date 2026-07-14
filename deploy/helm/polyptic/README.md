@@ -163,6 +163,60 @@ liveness probes and Prometheus scrapers, even with the auth gate on:
 - **Prometheus** scrape annotations for `/metrics` are added to the pod template when
   `metrics.enabled=true` (`prometheus.io/scrape|path|port`).
 
+## Sign in with your IdP — generic OIDC (POL-106 / D101)
+
+Operators can sign in with **any** OpenID Connect provider — self-hosted or SaaS. There
+is no provider-specific code path anywhere in Polyptic: you give it an **issuer URL, a
+client id and a client secret**, and it reads every endpoint (authorize, token, JWKS,
+end-session) from that issuer's own `/.well-known/openid-configuration`. Authorization
+Code + PKCE, JWKS-verified ID token, `state` + `nonce`, exact redirect-URI matching.
+
+**It is an add-on, not a replacement.** Local accounts keep working and remain the
+**break-glass** path (the IdP being down must never lock you out of your own wall). With
+`oidc.enabled=false` (the default) the deployment is exactly what it was before.
+
+Register a **confidential** client at your IdP with the **Authorization Code** grant and
+**PKCE (S256)**, the scopes `openid profile email`, and **one redirect URI, matched
+exactly**:
+
+```
+https://<your-polyptic-host>/api/v1/auth/oidc/callback
+```
+
+Then:
+
+```sh
+helm upgrade --install polyptic polyptic/polyptic \
+  --set config.publicBaseUrl=https://polyptic.example.com \
+  --set oidc.enabled=true \
+  --set oidc.issuer=https://id.example.com/realms/company \
+  --set oidc.clientId=polyptic-console \
+  --set oidc.clientSecret=… \
+  --set oidc.providerName="Company SSO"
+```
+
+The console's sign-in page then offers **"Sign in with Company SSO"** (your words —
+`oidc.providerName`), and a successful callback mints **the same session cookie a local
+login mints**, so every gate (REST, the `/admin` WS, the DevTools/shell tunnels) behaves
+identically for an SSO operator.
+
+Notes:
+
+- **The issuer shape differs per product** — a realm-style path
+  (`https://id.example.com/realms/company`), an application-slug path
+  (`https://id.example.com/application/o/polyptic/`), a tenant URL. Use whatever the IdP's
+  own docs call the *issuer*; Polyptic only ever fetches its discovery document.
+- `oidc.redirectUri` is **derived** from `config.publicBaseUrl` when left empty — name the
+  public host once and the URI is right by construction.
+- **Who may sign in** is your IdP's decision (client assignment / app policy). The optional
+  `oidc.allowedDomains` CSV adds an email-domain allowlist on our side. Per-operator roles
+  are RBAC — a separate ticket, deliberately not smuggled in here.
+- `oidc.rpLogout=true` also signs the operator out at the IdP on logout (when its discovery
+  document advertises `end_session_endpoint`). The local session is revoked either way.
+- A **half-configured** IdP (issuer without client id, say) makes the chart — and the
+  server — **refuse**, rather than quietly serve local-only auth to an operator who thinks
+  SSO is on.
+
 ## Media uploads (Phase 7)
 
 Operators can **upload** images/videos (`POST /api/v1/media`, gated) as well as
@@ -341,6 +395,8 @@ rebuild Jobs work here even though the host is macOS.
 | `config.captureIntervalMs` | `""` | Live-preview capture cadence (server default when empty). |
 | `tls.mode` / `tls.sans` | `""` / `[]` | `self-signed` → server-native TLS with a persisted, downloadable CA (see the self-signed section). |
 | `letsEncrypt.enabled` / `.email` / `.staging` / `.additionalDnsNames` / `.solverIngressClass` | `false` / `""` / `false` / `[]` / `traefik` | Real ACME certificates via the vendored cert-manager subchart (see the Let's Encrypt section). |
+| `oidc.enabled` / `.issuer` / `.clientId` / `.clientSecret` | `false` / `""` / `""` / `""` | Generic OIDC operator sign-in (POL-106/D101) — any IdP, via its discovery document. Off = local accounts only, unchanged. |
+| `oidc.providerName` / `.scopes` / `.redirectUri` / `.postLoginUrl` / `.allowedDomains` / `.rpLogout` | `SSO` / `openid profile email` / `""` (derived) / `""` (derived) / `""` (any) / `false` | Button label, requested scopes, the exact registered redirect URI, landing page, optional email-domain allowlist, RP-initiated logout. |
 | `secrets.cookieSecret` | `""` (generated) | Session signing key. |
 | `secrets.bootstrapToken` | `""` (OPEN) | Set for gated agent enrollment. |
 | `secrets.adminEmail` / `secrets.adminPassword` | `""` | Seed operator on first boot. |

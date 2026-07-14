@@ -19,6 +19,7 @@ import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettin
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import { AuthService, authConfigFromEnv } from "./auth-local";
+import { OidcService, oidcConfigFromEnv } from "./oidc";
 import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
 import { CaptureCoordinator, ThumbnailStore } from "./capture";
@@ -52,6 +53,11 @@ const AUTH_PUBLIC_PATHS = new Set([
   "/api/v1/auth/login",
   "/api/v1/auth/logout",
   "/api/v1/auth/me",
+  // POL-106 — the OIDC seam. `providers` is a pre-session capability probe (which sign-in buttons to
+  // draw); `start` and `callback` ARE the sign-in, and verify themselves (state/nonce/PKCE/JWKS).
+  "/api/v1/auth/providers",
+  "/api/v1/auth/oidc/start",
+  "/api/v1/auth/oidc/callback",
 ]);
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -298,7 +304,40 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
   await auth.requireAuth(request, reply);
 });
 
-registerAuthRoutes(fastify, auth, enrollment);
+// ── Generic OIDC operator sign-in (POL-106 / D101), Phase 6 — an ADD-ON on the D29 seam. ──
+// Configured (OIDC_ISSUER + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET) → the console offers "Sign in with
+// <name>" beside the local form, and a verified ID token mints the SAME session cookie a local login
+// mints. Unconfigured → this is a no-op and the deployment behaves exactly as it did before.
+// Half-configured → we refuse to boot rather than quietly serve local-only auth to an operator who
+// believes SSO is on.
+let oidcService: OidcService | undefined;
+try {
+  const oidcConfig = oidcConfigFromEnv();
+  if (oidcConfig) {
+    oidcService = new OidcService({ config: oidcConfig, log: fastify.log });
+    // Warm discovery so a typo in OIDC_ISSUER shows up in the boot log, not in an operator's face.
+    void oidcService
+      .discover()
+      .then(() =>
+        fastify.log.info(
+          { event: "oidc.ready", issuer: oidcConfig.issuer, provider: oidcConfig.providerName },
+          `OIDC sign-in enabled — "${oidcConfig.providerName}" (${oidcConfig.issuer}); redirect URI ${oidcConfig.redirectUri}`,
+        ),
+      )
+      .catch((err: unknown) =>
+        fastify.log.error(
+          { event: "oidc.discovery.failed", issuer: oidcConfig.issuer, err: String(err) },
+          "OIDC discovery failed — the sign-in button will 503 until the identity provider answers. " +
+            "Local accounts still work (the break-glass path).",
+        ),
+      );
+  }
+} catch (err) {
+  console.error(`FATAL: ${(err as Error).message}`);
+  process.exit(1);
+}
+
+registerAuthRoutes(fastify, auth, enrollment, oidcService);
 // The remote-DevTools relay (POL-67) bridges an operator's DevTools frontend to a wall's Chrome over
 // the agent WS — the POL-59 shell pattern. Built before the WS channels (agent frames route into it)
 // and handed to REST so disarming a screen closes its live sessions instantly.

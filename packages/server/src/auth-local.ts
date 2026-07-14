@@ -289,6 +289,39 @@ export class AuthService {
     return { ok: true, user: { id: user.id, email: user.email }, token };
   }
 
+  /**
+   * Sign in an operator who was authenticated ELSEWHERE (POL-106 / D101: a verified OIDC ID token).
+   * The IdP is the authority; this method never sees a password. It mints exactly the session
+   * `login()` mints — same opaque token, same row, same cookie — so every downstream gate is
+   * identical for an SSO operator and a local one.
+   *
+   * The account is JIT-provisioned on first sign-in, keyed on the (normalized) email so the activity
+   * feed reads the same for both paths. Such an account gets an UNUSABLE password hash — a random
+   * secret nobody, including us, ever holds — so a federated identity can never be signed into
+   * through the local password path, and an operator off-boarded at the IdP is off-boarded here.
+   * (Rate-limiting stays on the local path: brute force has nothing to attack here.)
+   */
+  async loginFederated(emailRaw: string): Promise<{ user: AuthUser; token: string }> {
+    const email = normalizeEmail(emailRaw);
+    let user = await this.store.getUserByEmail(email);
+    if (!user) {
+      const passwordHash = await hashPassword(randomBytes(32).toString("hex"));
+      user = {
+        id: `user_${randomUUID()}`,
+        email,
+        passwordHash,
+        createdAt: new Date().toISOString(),
+      };
+      await this.store.createUser(user);
+      this.log.info(
+        { event: "auth.federated.provisioned", userId: user.id, email },
+        "provisioned an operator account from the identity provider",
+      );
+    }
+    const token = await this.issueSession(user.id);
+    return { user: { id: user.id, email: user.email }, token };
+  }
+
   /** Mint + persist a fresh session for a user, returning the raw token for the cookie. */
   async issueSession(userId: string): Promise<string> {
     const now = Date.now();

@@ -466,6 +466,40 @@ imageUpdates:
   nodeSelector: {}
   tolerations: []
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic OIDC operator sign-in (POL-106/D101) — Phase 6. OFF by default, and an
+# ADD-ON when on: local accounts keep working and stay the break-glass path.
+#
+# Vendor-neutral by construction: point `issuer` at ANY provider that publishes a
+# /.well-known/openid-configuration document (self-hosted or SaaS) and register
+# the redirect URI below as a confidential client with Authorization Code + PKCE.
+# The chart names no provider, and neither does the code.
+# ─────────────────────────────────────────────────────────────────────────────
+oidc:
+  enabled: false
+  # The issuer URL — the base that serves /.well-known/openid-configuration.
+  issuer: ""
+  clientId: ""
+  # Lands in the chart Secret as OIDC_CLIENT_SECRET (or supply it yourself via
+  # secrets.existingSecret with that key).
+  clientSecret: ""
+  # The console's button reads "Sign in with <providerName>" — your words, not ours.
+  providerName: "SSO"
+  scopes: "openid profile email"
+  # Must match the IdP registration EXACTLY (character for character). Empty
+  # derives <publicBaseUrl>/api/v1/auth/oidc/callback — which is why naming the
+  # public host once (config.publicBaseUrl, D89) is usually all you need.
+  redirectUri: ""
+  # Where the browser lands after a successful sign-in. Empty → <publicBaseUrl>/wall.
+  postLoginUrl: ""
+  # Optional email-domain allowlist, CSV ("example.com,example.org"). Empty means
+  # every identity the IdP authenticates may sign in — gate access at the IdP's own
+  # client assignment (per-operator roles land with RBAC, POL-107).
+  allowedDomains: ""
+  # Offer RP-initiated logout: signing out of the console also signs the operator
+  # out at the IdP (when its discovery document advertises an end-session endpoint).
+  rpLogout: false
+
 secrets:
   # COOKIE_SECRET — signs the http-only session cookies. MUST be a long random
   # value in production. If left empty AND existingSecret is unset, the chart

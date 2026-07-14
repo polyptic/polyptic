@@ -11,6 +11,7 @@
  * wire. No secret (password or hash) is ever sent back by these routes or logged here.
  */
 import {
+  AuthProviders,
   AuthUser,
   ChangePasswordBody,
   DisplaySettings,
@@ -62,9 +63,27 @@ export async function login(body: LoginBodyT): Promise<AuthUser> {
   return unwrapUser(raw);
 }
 
-/** POST /api/v1/auth/logout — revoke the server-side session and clear the cookie. */
-export async function logout(): Promise<void> {
-  await send<unknown>("POST", `${BASE_AUTH}/logout`);
+/**
+ * POST /api/v1/auth/logout — revoke the server-side session and clear the cookie. When the session
+ * came from the IdP and RP-initiated logout is switched on, the server hands back the provider's
+ * end-session URL: the caller navigates there so the sign-out reaches the IdP too (POL-106).
+ */
+export async function logout(): Promise<{ endSessionUrl?: string }> {
+  const raw = await send<unknown>("POST", `${BASE_AUTH}/logout`);
+  const url = (raw as { endSessionUrl?: unknown } | null)?.endSessionUrl;
+  return typeof url === "string" && url.length > 0 ? { endSessionUrl: url } : {};
+}
+
+/**
+ * GET /api/v1/auth/providers → which sign-in methods this deployment offers (POL-106). Public, so the
+ * sign-in page can call it before there is any session. `oidc` is null unless an IdP is configured;
+ * its `name` is operator-chosen config (the console never hardcodes a provider).
+ */
+export async function getAuthProviders(): Promise<AuthProviders> {
+  const raw = await send<unknown>("GET", `${BASE_AUTH}/providers`, undefined, {
+    suppressAuthRedirect: true,
+  });
+  return AuthProviders.parse(raw);
 }
 
 /**

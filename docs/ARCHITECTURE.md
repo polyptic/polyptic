@@ -44,7 +44,52 @@ New integrations = new adapters; the core model never changes.
 
 **Bucket B — Polyptic's own auth ("can a *person* reconfigure the wall?").** This **is** our application layer. The admin UI/API is OIDC-gated via standard discovery (any IdP) so randoms on the network can't take over the wall. Agent↔server identity is separate again, and LAYERED (POL-25 / D69): the bootstrap token enrols a machine into a durable app-level credential (server keeps sha256 only), and — with `AGENT_MTLS_PORT` set — enrolment also signs the agent's CSR into a durable **mTLS client certificate** (CN = the machine id from `/etc/machine-id`; the private key never leaves the box) issued by the deployment's own persisted CA. Every reconnect then rides a dedicated TLS listener where a wrong/absent cert fails the handshake, before any app code; `AGENT_MTLS_REQUIRE=1` makes that the only admitted path. The cert is the fleet transport gate, the credential is the per-machine identity (per-connection CN binding waits on the runtime exposing peer certs on http upgrades).
 
-When we say "build the auth-strategy seam from day one," we mean Bucket A is a per-tile config field. Bucket B (admin OIDC) is its own thing (Phase 6).
+When we say "build the auth-strategy seam from day one," we mean Bucket A is a per-tile config field. Bucket B (operator sign-in) is its own thing — and **Phase 6 has now landed: see "Sign in with your IdP" below (POL-106 / D101)**.
+
+## Sign in with your IdP — generic OIDC (POL-106 / D101)
+
+Operator sign-in has two coexisting paths. **Local accounts** (D29: argon2id, signed httpOnly session cookies, dual-key rate limit) are always available and are the **break-glass** path. **OIDC** is an add-on: configure an IdP and the sign-in page grows a "Sign in with *&lt;your provider name&gt;*" button beside the form. **A deployment with no `OIDC_*` config behaves exactly as it did before this existed.**
+
+It is generic by construction — the only inputs are an **issuer URL, a client id and a client secret**. Every endpoint (authorize, token, JWKS, end-session), the signing algorithms and the token-endpoint auth method are read from the IdP's own **discovery document** (`/.well-known/openid-configuration`). No provider is named anywhere in the code, and none ever should be: any spec-compliant IdP works, self-hosted or SaaS.
+
+**The flow** is Authorization Code + PKCE (S256), the only appropriate flow for a confidential client:
+
+1. `GET /api/v1/auth/oidc/start` mints `state`, `nonce` and a PKCE verifier, parks them in a short-lived **signed, httpOnly transaction cookie** (deliberately *not* server state — a second replica must be able to service the callback) and 302s to the IdP.
+2. `GET /api/v1/auth/oidc/callback` requires `state` to match, exchanges the code **with the verifier and the exact same `redirect_uri`**, then verifies the ID token against the IdP's JWKS (`jose`): **signature, `iss`, `aud`, `exp`/`iat` (60s tolerance)** — and **`nonce`** against the transaction.
+3. On success it mints **exactly the session a local login mints** — the same opaque token, the same row, the same signed httpOnly cookie. Every downstream gate (`/api/v1`, the `/admin` WS origin+cookie check, the player-token minting of D88) is untouched and knows nothing about identity providers.
+
+**Claims → operator.** `sub` is the durable identifier; the account is keyed on `email` (falling back to an email-shaped `preferred_username`, then a synthetic `<sub>@<issuer-host>` so an IdP configured without the `email` scope still signs in), JIT-provisioned on first sign-in with an **unusable password hash** — so a federated identity can never be signed into through the local password path, and an operator off-boarded at the IdP is off-boarded here. **Groups/roles are deliberately ignored** (`identityFromClaims()` already receives the whole claim set — that is the RBAC seam; POL-107).
+
+**Every rejection is a flat 401 with no session**, and each has a test: bad/absent `state`, provider `?error=`, dead authorization code, wrong `nonce`, bad signature, wrong issuer, wrong audience, expired token.
+
+| Env | Default | Notes |
+| --- | --- | --- |
+| `OIDC_ISSUER` | — | The base that serves `/.well-known/openid-configuration`. Setting **any** `OIDC_*` value requires issuer + client id + secret; a **half-configured** IdP refuses to boot (never quietly serve local-only auth to an operator who believes SSO is on). |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — | A confidential client registered at the IdP. |
+| `OIDC_REDIRECT_URI` | derived | **Must match the IdP registration exactly.** Unset → `<PUBLIC_BASE_URL>/api/v1/auth/oidc/callback`. |
+| `OIDC_PROVIDER_NAME` | `SSO` | The button reads "Sign in with *this*". Your words. |
+| `OIDC_SCOPES` | `openid profile email` | `openid` is always included. |
+| `OIDC_POST_LOGIN_URL` | `<PUBLIC_BASE_URL>/wall` | Where the browser lands after the callback. |
+| `OIDC_ALLOWED_DOMAINS` | `` (any) | Optional CSV email-domain allowlist. Otherwise **access is gated at the IdP's own client assignment** — per-operator roles land with RBAC (POL-107). |
+| `OIDC_RP_LOGOUT` | off | Also sign the operator out at the IdP (when discovery advertises `end_session_endpoint`). The local session is destroyed either way. |
+
+Helm mirrors it one-for-one under `oidc.*` (`oidc.enabled`, `oidc.issuer`, `oidc.clientId`, `oidc.clientSecret` → the chart Secret, …) — see the chart README.
+
+**Registering the client** (the shape is the same at every provider): a **confidential** client, **Authorization Code** grant with **PKCE (S256)**, one **redirect URI** — `https://<your-host>/api/v1/auth/oidc/callback`, exact — and the `openid profile email` scopes. Then:
+
+```bash
+# A self-hosted, realm-style IdP:
+OIDC_ISSUER=https://id.example.com/realms/company
+# A self-hosted, application-slug-style IdP:
+OIDC_ISSUER=https://id.example.com/application/o/polyptic/
+# A hosted IdP: whatever issuer URL its docs give you.
+OIDC_CLIENT_ID=polyptic-console
+OIDC_CLIENT_SECRET=…                       # keep it in a secret store
+OIDC_REDIRECT_URI=https://polyptic.example.com/api/v1/auth/oidc/callback
+OIDC_PROVIDER_NAME="Company SSO"
+```
+
+Polyptic only ever asks that URL for its discovery document. Which product answers is your business.
 
 ## Deployment — HTTPS by default (POL-70 / D88)
 

@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Polyptic end-to-end suite — spawns the real control plane and drives it over WS + REST with bun test.",
+  "description": "Polyptic end-to-end suite \u2014 spawns the real control plane and drives it over WS + REST with bun test.",
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.1.0",
+    "jose": "^5.9.6",
     "typescript": "^5.5.0"
   }
 }

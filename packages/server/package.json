@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Polyptic control plane — Fastify REST + WebSocket hub holding the in-memory desired-state.",
+  "description": "Polyptic control plane \u2014 Fastify REST + WebSocket hub holding the in-memory desired-state.",
   "main": "./src/index.ts",
   "scripts": {
     "dev": "bun --watch src/index.ts",
@@ -19,6 +19,7 @@
     "@peculiar/x509": "^1.12.3",
     "@polyptic/protocol": "workspace:*",
     "fastify": "^4.28.0",
+    "jose": "^5.9.6",
     "postgres": "^3.4.0",
     "reflect-metadata": "^0.2.2",
     "ws": "^8.18.0",
