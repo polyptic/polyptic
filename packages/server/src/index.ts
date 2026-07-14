@@ -431,7 +431,15 @@ const imageUpdates = new ImageUpdates(
   // Builds retained per arch (POL-45). Each retained build costs ~1.5GB of ISO on the depot volume,
   // so the chart exposes this as imageUpdates.retainBuilds and sizes the PVC from it.
   Math.max(1, Number(process.env.IMAGE_RETAIN_BUILDS?.trim() || DEFAULT_RETAIN_BUILDS)),
+  // The first-image build (POL-121) narrates itself into the Live Activity feed: on a fresh install
+  // nothing in the fleet can netboot until it lands, so the operator hears it from the console rather
+  // than from a Job log.
+  (severity, text) => {
+    activity.push(severity, text);
+    broadcaster.broadcast();
+  },
 );
+// Starts the schedule ticker AND, on a depot with no image at all, the one-shot first-image build.
 imageUpdates.start();
 
 // Pass the live enrollment singleton so GET /boot/grub.cfg (POL-33/D47) bakes the CURRENT token, the

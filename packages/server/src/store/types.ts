@@ -279,6 +279,12 @@ export interface PersistedImageRollout {
   /** Server-local `HH:MM` the full rebuild fires at. */
   fullScheduleTime: string;
   urgent: boolean;
+  /** POL-121 — the FIRST-IMAGE LATCH: when the server auto-triggered the one-shot full build that
+   *  fills an empty depot on a fresh install. Written BEFORE the hook is spawned and never cleared,
+   *  so a crash-looping or rescheduled pod cannot launch a build storm: the very first server that
+   *  sees an empty depot claims it, everyone after reads the claim and stands down. Null on a
+   *  deployment that never needed one (an image was already in the depot). */
+  firstBuildAt: string | null;
   lastBuildStartedAt: string | null;
   lastBuildFinishedAt: string | null;
   lastBuildStatus: "running" | "success" | "failure" | null;

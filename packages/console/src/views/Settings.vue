@@ -170,6 +170,35 @@ const latestImage = computed(() => {
   return [...images].sort((a, b) => b.builtAt.localeCompare(a.builtAt))[0] ?? null;
 });
 
+/** Nothing published in the depot: the fleet cannot netboot AT ALL (POL-121). */
+const noImage = computed(() => (store.imageUpdates?.images.length ?? 0) === 0);
+
+/**
+ * The empty-depot notice (POL-121). A fresh install used to say nothing at all while its depot sat
+ * empty — and the boot medium it handed out was the silently-LEAN one baked against that empty depot.
+ * Now the card says, in its own words, what is happening and why it matters.
+ */
+const netbootNotice = computed<{ tone: "busy" | "warn"; text: string } | null>(() => {
+  const info = store.imageUpdates;
+  if (!info || !noImage.value) return null;
+  if (info.lastBuild?.status === "running") {
+    return {
+      tone: "busy",
+      text: "Building the first OS image — screens can't netboot until this finishes. It takes roughly 15 minutes; the boot loader download is rebuilt when it lands, so grab it after that.",
+    };
+  }
+  if (!info.fullRebuildConfigured) {
+    return {
+      tone: "warn",
+      text: "No OS image, and this deployment has no image-build hook — screens cannot netboot until an image is put in the depot.",
+    };
+  }
+  return {
+    tone: "warn",
+    text: "No OS image yet — screens cannot netboot. Build one now from the ⋯ menu above (Full rebuild).",
+  };
+});
+
 /** `20260709T110917Z-1bdb6281` → `20260709T110917Z · 1bdb6281`, the design's two-part id. */
 function formatImageId(imageId: string): string {
   const cut = imageId.lastIndexOf("-");
@@ -189,6 +218,15 @@ const buildChip = computed<{ label: string; title: string; tone: "busy" | "bad" 
   const b = store.imageUpdates?.lastBuild;
   if (!b) return null;
   if (b.status === "running") {
+    // POL-121: the FIRST build is a different event to a rebuild — until it lands, no screen in the
+    // fleet can netboot at all. Say that, rather than the routine "Rebuilding".
+    if (noImage.value) {
+      return {
+        label: "Building first image",
+        title: `Building the first OS image — screens can't netboot until this finishes. Started ${new Date(b.startedAt).toLocaleString()}; a full build takes roughly 15 minutes.`,
+        tone: "busy",
+      };
+    }
     const kind = b.kind === "full" ? "Full rebuild" : "Image update";
     return {
       label: b.kind === "full" ? "Rebuilding" : "Updating",
@@ -503,6 +541,13 @@ async function onSignOut(): Promise<void> {
           <p v-if="!store.netboot?.bootMediumUrl && store.netboot" class="hint gap-sm">
             No prebuilt bootloader is bundled. Build one into <code class="code">BOOT_DIST_DIR</code> with
             <code class="code">deploy/build-boot-medium.sh</code>.
+          </p>
+
+          <!-- POL-121: an empty depot is not a footnote — it is the difference between a fleet that
+               can boot and one that cannot. Say so on the card, unprompted. -->
+          <p v-if="netbootNotice" class="notice gap-sm" :class="`notice-${netbootNotice.tone}`" data-testid="netboot-notice">
+            <span v-if="netbootNotice.tone === 'busy'" class="spinner" />
+            {{ netbootNotice.text }}
           </p>
         </div>
 
@@ -1087,6 +1132,27 @@ async function onSignOut(): Promise<void> {
   color: var(--muted2);
   line-height: 1.55;
   margin: 0;
+}
+
+/* The empty-depot notice (POL-121) — louder than a hint, because a fleet that cannot netboot is not
+   a detail. Busy while the first image builds; warn-toned while there is no image and none coming. */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+.notice-busy {
+  color: var(--accent-fg);
+  background: var(--accent-soft);
+}
+.notice-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
 }
 
 /* HTTPS card (POL-70/D89): the per-OS trust steps. Hint-toned so the card stays calm. */

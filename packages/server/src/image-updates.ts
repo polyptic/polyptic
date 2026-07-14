@@ -1,7 +1,10 @@
 /**
  * Image updates (POL-41): the control plane's half of "a baked image that still gets security fixes".
  *
- * Two jobs:
+ * Three jobs:
+ *   0. THE FIRST IMAGE (POL-121) — on startup, a depot with no image at all gets ONE automatic full
+ *      build, so a fresh install converges to a bootable fleet with no operator clicks. See
+ *      {@link ImageUpdates.bootstrapFirstImage} for the guardrails (empty-only, one-shot, latched).
  *   1. SCHEDULED REBUILDS — at an operator-chosen server-local time (default 01:00) run the
  *      configured rebuild hook (`IMAGE_REBUILD_CMD`, e.g. `deploy/rebuild-image-docker.sh arm64`,
  *      which apt-upgrades the existing image inside a privileged Linux container and stamps a new
@@ -45,6 +48,7 @@ export const IMAGE_ROLLOUT_DEFAULTS: PersistedImageRollout = {
   fullScheduleDay: 0,
   fullScheduleTime: "02:00",
   urgent: false,
+  firstBuildAt: null,
   lastBuildStartedAt: null,
   lastBuildFinishedAt: null,
   lastBuildStatus: null,
@@ -55,6 +59,14 @@ export const IMAGE_ROLLOUT_DEFAULTS: PersistedImageRollout = {
 /** The two update cycles: the daily in-place apt refresh (kernel held, ~2 min) and the weekly full
  *  rebuild from the base ISO (kernel + everything, ~15 min) — the one that rolls kernel CVEs. */
 export type RebuildKind = "refresh" | "full";
+
+/** Who asked for a build: the schedule, the operator's button, or the FIRST-IMAGE bootstrap — the
+ *  one-shot full build the server fires at startup when a fresh install's depot is empty (POL-121). */
+export type RebuildTrigger = "schedule" | "manual" | "bootstrap";
+
+/** How the control plane says something out loud — the Live Activity feed (D25). Optional: an
+ *  ImageUpdates without one still builds, it just does so silently. */
+export type Announce = (severity: "good" | "warn" | "bad", text: string) => void;
 
 /** How much hook output we keep for the Settings card (the tail is where apt's verdict lives). */
 const LOG_TAIL_BYTES = 8 * 1024;
@@ -123,6 +135,10 @@ export class ImageUpdates {
     private readonly fullRebuildCmd: string | undefined = undefined,
     /** Builds retained per arch (IMAGE_RETAIN_BUILDS). The active build is never pruned. */
     readonly retainBuilds: number = DEFAULT_RETAIN_BUILDS,
+    /** Push a line to the Live Activity feed (POL-121). The first-image build is the one build an
+     *  operator MUST know about — a fresh install cannot netboot anything until it lands — so it
+     *  narrates itself into the console's feed rather than only a Job log. */
+    private readonly announce: Announce = () => {},
   ) {}
 
   /** The persisted state, with defaults before the first mutation. */
@@ -383,7 +399,7 @@ export class ImageUpdates {
    * (status + log tail) for the Settings card; `settled` exposes it for tests. No-ops when a run
    * is already in flight or no hook is configured.
    */
-  async trigger(trigger: "schedule" | "manual", kind: RebuildKind = "refresh"): Promise<PersistedImageRollout> {
+  async trigger(trigger: RebuildTrigger, kind: RebuildKind = "refresh"): Promise<PersistedImageRollout> {
     if (this.running) {
       this.log.warn({ event: "image.rebuild.busy", trigger, kind }, "image rebuild already running, ignoring trigger");
       return this.state();
@@ -417,7 +433,7 @@ export class ImageUpdates {
   settled: Promise<PersistedImageRollout> | null = null;
 
   private async execute(
-    trigger: "schedule" | "manual",
+    trigger: RebuildTrigger,
     kind: RebuildKind,
     cmd: string,
     startedAt: string,
@@ -469,19 +485,100 @@ export class ImageUpdates {
     // Never fatal: a depot we cannot file is still a depot we can serve.
     await this.retain();
     this.running = false;
+    const manifests = await this.manifests();
     this.log.info(
-      { event: "image.rebuild.done", trigger, kind, status, imageIds: (await this.manifests()).map((m) => `${m.arch}:${m.imageId}`) },
+      { event: "image.rebuild.done", trigger, kind, status, imageIds: manifests.map((m) => `${m.arch}:${m.imageId}`) },
       `image rebuild ${status}`,
     );
+    // The FIRST image is the one build the operator has to hear about: until it lands nothing in the
+    // fleet can netboot, and the boot medium the install hook baked against an empty depot is the
+    // LEAN one (D68). The full-rebuild Job re-bakes the medium as its last step, so a success here
+    // means the download is now the full, Wi-Fi-capable stick (POL-121).
+    if (trigger === "bootstrap") {
+      if (status === "success" && manifests.length > 0) {
+        this.announce(
+          "good",
+          "First OS image built — screens can netboot now, and the downloadable boot medium is the full one",
+        );
+      } else {
+        this.announce(
+          "bad",
+          "First OS image build failed — screens cannot netboot until an image exists. Retry from Onboard Screens ▸ ⋯ ▸ Full rebuild",
+        );
+      }
+    }
     return finished;
+  }
+
+  /**
+   * POL-121 — THE FIRST IMAGE. A fresh `helm install` starts with an EMPTY depot, and nothing used to
+   * fill it: the nightly cycle only REFRESHES an existing image, and the weekly full rebuild is up to
+   * seven days away. So the fleet could not netboot a single screen, and the boot-medium install hook,
+   * finding no image, quietly fell back to the LEAN wired-only medium (D68). This closes that: the
+   * server itself notices the empty depot at startup and fires the full build ONCE, asynchronously
+   * (it is a k8s Job — the server keeps serving), and the Job's own last step re-bakes the boot medium,
+   * so the download becomes the full one.
+   *
+   * The guardrails ARE the feature:
+   *  - EMPTY ONLY. One published image anywhere in the depot and this is a no-op — it never overwrites
+   *    and never re-triggers against an existing image.
+   *  - ONE SHOT, EVER. `firstBuildAt` is claimed in the STORE before the hook is spawned, so a
+   *    crash-looping or rescheduled pod re-reads the claim and stands down. A build that fails is
+   *    reported, not retried — a retry loop keyed on "the depot is still empty" is precisely the build
+   *    storm we must not have. (A `running` row from a previous pod is also respected: the Job it
+   *    started outlives the pod that asked for it.)
+   *  - OPERATOR'S CHOICE WINS. Weekly cycle switched off, or no `IMAGE_FULL_REBUILD_CMD` (a dev stack,
+   *    a laptop server, `imageUpdates.enabled: false`) → no build, ever; just a line saying netboot is
+   *    unavailable until an image exists.
+   */
+  async bootstrapFirstImage(): Promise<void> {
+    const st = await this.state();
+    if (st.firstBuildAt) return; // already claimed by us or by a previous pod — never twice
+    if ((await this.manifests()).length > 0) return; // the depot has an image: nothing to bootstrap
+
+    if (!this.fullRebuildConfigured) {
+      this.log.warn(
+        { event: "image.bootstrap.unconfigured" },
+        "the image depot is empty and no IMAGE_FULL_REBUILD_CMD is configured — netboot is unavailable until an image exists",
+      );
+      return;
+    }
+    if (!st.fullScheduleEnabled) {
+      this.log.warn(
+        { event: "image.bootstrap.disabled" },
+        "the image depot is empty but the full-rebuild cycle is switched off — not building behind the operator's back; netboot stays unavailable",
+      );
+      return;
+    }
+    if (this.running || st.lastBuildStatus === "running") {
+      // A build is already in flight — in this process, or one a previous pod started whose Job is
+      // still running (the Job outlives the pod). Either way it will fill the depot.
+      this.log.info({ event: "image.bootstrap.busy" }, "a build is already running — not starting a first-image build");
+      return;
+    }
+
+    // Claim the latch BEFORE spawning: whatever happens next, no other pod starts a second build.
+    await this.store.setImageRollout({ ...st, firstBuildAt: new Date().toISOString() });
+    this.log.warn(
+      { event: "image.bootstrap.start" },
+      "image depot is empty — building the first OS image now (screens cannot netboot until it finishes)",
+    );
+    this.announce("warn", "Building the first OS image — screens can't netboot until this finishes");
+    await this.trigger("bootstrap", "full");
   }
 
   /** Start the schedule ticker (idempotent). Fires at most once per matching minute. */
   start(): void {
     if (this.timer) return;
     // Fold a pre-POL-45 depot (artifacts loose at the arch root) into builds/ so history starts
-    // with whatever is already published, rather than staying empty until the next rebuild.
-    void this.retain();
+    // with whatever is already published, rather than staying empty until the next rebuild — then,
+    // on a depot that has NOTHING to fold because nothing was ever built, fire the one-shot
+    // first-image build (POL-121). Both are async: the server serves while the depot fills.
+    void this.retain()
+      .then(() => this.bootstrapFirstImage())
+      .catch((err) => {
+        this.log.error({ event: "image.bootstrap.error", err: (err as Error).message }, "first-image bootstrap failed");
+      });
     this.timer = setInterval(() => {
       void this.tick();
     }, TICK_MS);
