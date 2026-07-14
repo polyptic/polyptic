@@ -117,6 +117,27 @@ export interface PersistedCredentialProfile {
 }
 
 /**
+ * POL-99 — a data-source row: a JSON/CSV endpoint the server polls on behalf of the whole fleet.
+ * Only the CONFIG lives here — never the values it yields (those live in the poller's cache and reach
+ * a player only inside a page surface's send-time `data` bundle), and never a credential (the token
+ * comes from the referenced POL-24 profile at fetch time).
+ */
+export interface PersistedDataSource {
+  id: string;
+  name: string;
+  url: string;
+  /** "json" | "csv" (the contract's DataSourceFormat; re-validated on load). */
+  format: string;
+  pollSeconds: number;
+  /** POL-24 profile whose token authenticates the server's fetch. `null` = a public endpoint. */
+  credentialProfileId?: string | null;
+  /** "header" | "query" — how that token is applied. */
+  authIn?: string | null;
+  /** JSON only: dotted path to the row array inside the document. */
+  rowsPath?: string | null;
+}
+
+/**
  * POL-57 — a remembered page zoom for one (target, content) pair. `targetId` is a screen id or a
  * video-wall id; `sourceKey` identifies the page shown there (`source:<id>` for a library source,
  * `url:<url>` for an ad-hoc link). Assigning that content to that target again restores this zoom,
@@ -324,6 +345,8 @@ export interface PersistedState {
   credentialProfiles: PersistedCredentialProfile[];
   /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
   zoomPreferences: PersistedZoomPreference[];
+  /** POL-99 — polled JSON/CSV data-source configs (never their values). */
+  dataSources: PersistedDataSource[];
 }
 
 /**
@@ -407,6 +430,14 @@ export interface Store {
   deleteCredentialProfile(id: string): Promise<void>;
   /** All persisted credential profiles. */
   listCredentialProfiles(): Promise<PersistedCredentialProfile[]>;
+
+  // ── Data sources (POL-99) ──────────────────────────────────────────────────
+  /** Insert-or-update a data-source row (config only — never the polled values). */
+  upsertDataSource(source: PersistedDataSource): Promise<void>;
+  /** Delete a data-source row. No-op if absent. */
+  deleteDataSource(id: string): Promise<void>;
+  /** All persisted data sources. */
+  listDataSources(): Promise<PersistedDataSource[]>;
 
   // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
   /** Insert-or-update a scene row (id + name + mural + snapshot jsonb + schedule_at). */

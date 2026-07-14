@@ -14,12 +14,15 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useRouter } from "vue-router";
-import { CreateContentSourceBody, CreateCredentialProfileBody } from "@polyptic/protocol";
+import { CreateContentSourceBody, CreateCredentialProfileBody, CreateDataSourceBody } from "@polyptic/protocol";
 import type {
   ContentKind,
   ContentSource,
   CredentialProfileView,
+  DataSourceFormat,
+  DataSourceView,
   UpdateCredentialProfileBody,
+  UpdateDataSourceBody,
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
@@ -280,6 +283,133 @@ function statusLabel(p: CredentialProfileView): string {
   return "auth failing";
 }
 
+// ── data sources (POL-99) ─────────────────────────────────────────────────────
+// A data source is a JSON/CSV endpoint the SERVER polls once for the whole fleet; pages bind their
+// KPI/table/chart elements to its columns in the Studio. Rows show live poll health (ok / stale /
+// failing), because a wall quietly showing yesterday's numbers is the failure mode that matters.
+const dataSources = computed(() => store.datasources);
+
+const dsModalOpen = ref(false);
+const editingDsId = ref<string | null>(null);
+const dDraftName = ref("");
+const dDraftUrl = ref("");
+const dDraftFormat = ref<DataSourceFormat>("json");
+const dDraftPoll = ref(60);
+const dDraftRowsPath = ref("");
+const dDraftProfileId = ref("");
+const dDraftAuthIn = ref<"header" | "query">("header");
+const dErrorMsg = ref<string | null>(null);
+const dSaving = ref(false);
+/** Per-source Test state: id → "running", or the last inline result line. */
+const dsTestState = ref<Record<string, string>>({});
+
+const dsModalTitle = computed(() => (editingDsId.value ? "Edit data source" : "Add data source"));
+const dsSaveLabel = computed(() => (editingDsId.value ? "Save changes" : "Add data source"));
+
+function openAddDataSource() {
+  editingDsId.value = null;
+  dDraftName.value = "";
+  dDraftUrl.value = "";
+  dDraftFormat.value = "json";
+  dDraftPoll.value = 60;
+  dDraftRowsPath.value = "";
+  dDraftProfileId.value = "";
+  dDraftAuthIn.value = "header";
+  dErrorMsg.value = null;
+  dsModalOpen.value = true;
+}
+
+function openEditDataSource(d: DataSourceView) {
+  editingDsId.value = d.id;
+  dDraftName.value = d.name;
+  dDraftUrl.value = d.url;
+  dDraftFormat.value = d.format;
+  dDraftPoll.value = d.pollSeconds;
+  dDraftRowsPath.value = d.rowsPath;
+  dDraftProfileId.value = d.credentialProfileId ?? "";
+  dDraftAuthIn.value = d.authIn;
+  dErrorMsg.value = null;
+  dsModalOpen.value = true;
+}
+
+function closeDsModal() {
+  dsModalOpen.value = false;
+  dSaving.value = false;
+}
+
+async function saveDataSource() {
+  if (dSaving.value) return;
+  dErrorMsg.value = null;
+  const common = {
+    name: dDraftName.value.trim(),
+    url: dDraftUrl.value.trim(),
+    format: dDraftFormat.value,
+    pollSeconds: Number(dDraftPoll.value) || 60,
+    rowsPath: dDraftRowsPath.value.trim(),
+    authIn: dDraftAuthIn.value,
+  };
+  let ok: boolean;
+  if (editingDsId.value) {
+    const patch: UpdateDataSourceBody = {
+      ...common,
+      credentialProfileId: dDraftProfileId.value || null,
+    };
+    dSaving.value = true;
+    ok = await store.updateDataSource(editingDsId.value, patch);
+  } else {
+    const parsed = CreateDataSourceBody.safeParse({
+      ...common,
+      credentialProfileId: dDraftProfileId.value || null,
+    });
+    if (!parsed.success) {
+      dErrorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
+      return;
+    }
+    dSaving.value = true;
+    ok = await store.createDataSource(parsed.data);
+  }
+  dSaving.value = false;
+  if (ok) dsModalOpen.value = false;
+  else dErrorMsg.value = "Couldn't save. Check the URL and try again.";
+}
+
+async function removeDataSource(d: DataSourceView) {
+  if (d.inUseBy > 0) {
+    window.alert(
+      `"${d.name}" is bound by ${d.inUseBy} page${d.inUseBy === 1 ? "" : "s"}. Unbind those elements in the Studio first.`,
+    );
+    return;
+  }
+  if (!window.confirm(`Delete data source "${d.name}"?`)) return;
+  const result = await store.deleteDataSource(d.id);
+  if (result === "in-use") window.alert(`"${d.name}" is bound by a page — unbind it in the Studio first.`);
+}
+
+/** Fetch the endpoint NOW and show what came back (also warms the wall's cache). */
+async function testDataSource(d: DataSourceView) {
+  dsTestState.value = { ...dsTestState.value, [d.id]: "running" };
+  const result = await store.testDataSource(d.id);
+  const line = result.ok
+    ? `✓ ${result.rowCount} row${result.rowCount === 1 ? "" : "s"} · ${result.columns.slice(0, 4).join(", ")}${result.columns.length > 4 ? "…" : ""}`
+    : `✕ ${result.error ?? "Failed"}`;
+  dsTestState.value = { ...dsTestState.value, [d.id]: line };
+}
+
+function dsStatusLabel(d: DataSourceView): string {
+  if (d.status === "ok") return `${d.rowCount} rows`;
+  if (d.status === "stale") return "stale — last poll failed";
+  if (d.status === "pending") return "not polled yet";
+  return "failing";
+}
+
+function dsHost(d: DataSourceView): string {
+  try {
+    return new URL(d.url).host;
+  } catch {
+    return d.url;
+  }
+}
+
 // ── upload modal (Phase 7) ─────────────────────────────────────────────────────
 // An alternative to the "add by URL" path above: pick (or drop) an image/video file, it's uploaded
 // to the server's disk volume and comes back as a ContentSource (kind image|video) via the same
@@ -439,6 +569,60 @@ function thumbSrc(s: ContentSource): string {
         </div>
       </div>
 
+      <!-- ── data sources (POL-99) ────────────────────────────────────────────── -->
+      <header class="head section-head">
+        <div class="head-text">
+          <h1 class="title">Data sources</h1>
+          <p class="subtitle">
+            JSON or CSV endpoints the server polls once for the whole fleet. Bind their columns to
+            KPI, table and chart elements in the Studio — no dashboard product required. If an
+            endpoint goes down the wall keeps the last good numbers, visibly marked as stale.
+          </p>
+        </div>
+        <div class="head-actions">
+          <button class="add-btn ghost compact" @click="openAddDataSource">+ Add data source</button>
+        </div>
+      </header>
+
+      <div v-if="dataSources.length" class="list">
+        <div v-for="d in dataSources" :key="d.id" class="row">
+          <span class="glyph" :style="{ color: 'var(--accent)' }">#</span>
+          <div class="row-meta">
+            <div class="row-name">{{ d.name }}</div>
+            <div class="row-sub">
+              {{ d.format.toUpperCase() }} · {{ dsHost(d) }} · every {{ d.pollSeconds }}s ·
+              {{ d.inUseBy }} page{{ d.inUseBy === 1 ? "" : "s" }}
+              <template v-if="d.columns.length"> · {{ d.columns.slice(0, 4).join(", ") }}</template>
+              <template v-if="dsTestState[d.id] && dsTestState[d.id] !== 'running'">
+                · {{ dsTestState[d.id] }}
+              </template>
+            </div>
+            <div v-if="d.lastError" class="row-err">{{ d.lastError }}</div>
+          </div>
+          <span class="status-pill" :class="d.status === 'ok' ? 'ok' : d.status === 'pending' ? 'pending' : 'error'">
+            {{ d.status === "ok" ? "●" : d.status === "pending" ? "○" : "⚠" }}
+            {{ dsStatusLabel(d) }}
+          </span>
+          <button class="edit-btn" :disabled="dsTestState[d.id] === 'running'" @click="testDataSource(d)">
+            {{ dsTestState[d.id] === "running" ? "Testing…" : "Test" }}
+          </button>
+          <button class="edit-btn" @click="openEditDataSource(d)">Edit</button>
+          <button class="del-btn" title="Delete data source" @click="removeDataSource(d)">✕</button>
+        </div>
+      </div>
+
+      <div v-else class="empty">
+        <span class="empty-glyph">#</span>
+        <span class="empty-title">No data sources yet</span>
+        <span class="empty-sub">
+          Point Polyptic at any JSON or CSV endpoint — prices, rosters, queue depths, KPIs — and put
+          the numbers straight on the wall. The server polls it once, every screen shares the answer.
+        </span>
+        <div class="empty-actions">
+          <button class="add-btn ghost" @click="openAddDataSource">+ Add data source</button>
+        </div>
+      </div>
+
       <!-- ── access credentials (POL-24) ─────────────────────────────────────── -->
       <header class="head section-head">
         <div class="head-text">
@@ -549,6 +733,57 @@ function thumbSrc(s: ContentSource): string {
         <div class="modal-actions">
           <button class="btn-secondary" @click="closeModal">Cancel</button>
           <button class="btn-primary" :disabled="saving" @click="save">{{ saveLabel }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── data source modal (POL-99) ──────────────────────────────────────── -->
+    <div v-if="dsModalOpen" class="scrim" @mousedown.self="closeDsModal">
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="modal-title">{{ dsModalTitle }}</div>
+
+        <label class="field-label">Name</label>
+        <input v-model="dDraftName" class="field" placeholder="e.g. Line output (hourly)" @keyup.enter="saveDataSource" />
+
+        <label class="field-label">Endpoint</label>
+        <input v-model="dDraftUrl" class="field mono" placeholder="https://…/metrics.json" @keyup.enter="saveDataSource" />
+
+        <label class="field-label">Format</label>
+        <select v-model="dDraftFormat" class="field select">
+          <option value="json">JSON</option>
+          <option value="csv">CSV</option>
+        </select>
+
+        <template v-if="dDraftFormat === 'json'">
+          <label class="field-label">Rows path <span class="rail-hint">· optional</span></label>
+          <input v-model="dDraftRowsPath" class="field mono" placeholder="e.g. data.items — blank if the document IS the array" />
+        </template>
+
+        <label class="field-label">Poll every (seconds)</label>
+        <input v-model.number="dDraftPoll" class="field" type="number" min="10" max="86400" />
+
+        <label class="field-label">Authentication</label>
+        <select v-model="dDraftProfileId" class="field select">
+          <option value="">None — public endpoint</option>
+          <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+        <template v-if="dDraftProfileId">
+          <label class="field-label">Token sent as</label>
+          <select v-model="dDraftAuthIn" class="field select">
+            <option value="header">Authorization: Bearer …</option>
+            <option value="query">Query parameter (the profile's token parameter)</option>
+          </select>
+        </template>
+        <p class="field-hint">
+          The server fetches this endpoint — never a screen. The token is applied at request time and
+          never stored with the source.
+        </p>
+
+        <div v-if="dErrorMsg" class="error">⚠ {{ dErrorMsg }}</div>
+
+        <div class="modal-actions">
+          <button class="btn-secondary" @click="closeDsModal">Cancel</button>
+          <button class="btn-primary" :disabled="dSaving" @click="saveDataSource">{{ dsSaveLabel }}</button>
         </div>
       </div>
     </div>

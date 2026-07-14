@@ -10,3 +10,16 @@ export { ELEMENT_LIBRARY, defaultElement, libraryEntry } from "./library";
 export type { ElementLibraryEntry } from "./library";
 export { formatAge, formatClock, formatCountdown, useNow } from "./clock";
 export { qrSvgPath, qrModuleCount } from "./qr";
+export {
+  barRects,
+  chartPoints,
+  datasetFor,
+  formatValue,
+  linePoints,
+  numericValue,
+  resolveBinding,
+  tableColumns,
+  unresolvedBindings,
+} from "./data";
+export type { BindingMiss, BindingResolution } from "./data";
+export { SAMPLE_DATASET } from "./sample";

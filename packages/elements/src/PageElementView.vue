@@ -32,6 +32,17 @@ import type {
 } from "@polyptic/protocol";
 import { formatAge, formatClock, formatCountdown, useNow } from "./clock";
 import { qrSvgPath, qrModuleCount } from "./qr";
+import {
+  barRects,
+  chartPoints,
+  datasetFor,
+  formatValue,
+  linePoints,
+  numericValue,
+  resolveBinding,
+  tableColumns,
+} from "./data";
+import { SAMPLE_DATASET } from "./sample";
 
 const props = withDefaults(
   defineProps<{
@@ -165,6 +176,130 @@ const tickerDuration = computed(() => {
   if (props.element.kind !== "ticker") return 0;
   return Math.max(8, Math.round(1800 / (props.element.props.speed || 60)));
 });
+
+// ── data-bound elements (POL-99) ──────────────────────────────────────────────
+//
+// Three states, always one of them, never a blank: a VALUE, a HOLE (em-dash + a "no data" tell), or
+// a STALE value (the last-good numbers plus a visible stale mark). The Studio (live=false) falls back
+// to SAMPLE_DATASET so a page can be laid out before the endpoint exists; the wall never invents a
+// number — a missing field there is always drawn as a hole.
+
+/** The dataset an element sees: the real one, else (studio only) the generic sample. */
+const boundSet = computed(() => {
+  const el = props.element;
+  const id =
+    el.kind === "data-text" || el.kind === "kpi"
+      ? el.props.binding?.dataSourceId
+      : el.kind === "table" || el.kind === "chart"
+        ? el.props.dataSourceId
+        : undefined;
+  const real = datasetFor(props.data, id);
+  if (real) return real;
+  return props.live ? undefined : SAMPLE_DATASET;
+});
+
+/** True when what we are drawing is the GENERIC stand-in (studio, source never fetched) rather than
+ *  the source's own rows. Only then may an element invent a plausible-looking number. */
+const usingSample = computed(() => boundSet.value === SAMPLE_DATASET);
+
+/** In the Studio, an element bound to a source that has never been fetched reads against the generic
+ *  sample by COLUMN NAME; if the author's field isn't there either, we still show the sample's first
+ *  column so the layout reads. (With REAL rows in hand, a bad field draws the hole — see below.) */
+function sampleFallback(field: string | undefined): string {
+  const row = SAMPLE_DATASET.rows[0]!;
+  const key = field && field in row ? field : SAMPLE_DATASET.columns[0]!;
+  return formatValue(row[key] ?? null);
+}
+
+const dataTextResolution = computed(() =>
+  props.element.kind === "data-text" ? resolveBinding(props.data, props.element.props.binding) : undefined,
+);
+const dataTextValue = computed(() => {
+  if (props.element.kind !== "data-text") return "";
+  const resolution = dataTextResolution.value!;
+  if (resolution.miss) {
+    // A miss against REAL rows (a typo'd field) draws the hole even in the Studio — the author must
+    // see the mistake at authoring time, not discover it on a wall.
+    return !props.live && usingSample.value ? sampleFallback(props.element.props.binding?.field) : "—";
+  }
+  return formatValue(resolution.value);
+});
+
+const kpiResolution = computed(() =>
+  props.element.kind === "kpi" ? resolveBinding(props.data, props.element.props.binding) : undefined,
+);
+const kpiValue = computed(() => {
+  if (props.element.kind !== "kpi") return "—";
+  const resolution = kpiResolution.value!;
+  if (resolution.miss) {
+    return !props.live && usingSample.value ? sampleFallback(props.element.props.binding?.field) : "—";
+  }
+  return formatValue(resolution.value);
+});
+/** The delta column of the SAME row, when the author named one and it resolved to a number. */
+const kpiDelta = computed<number | undefined>(() => {
+  if (props.element.kind !== "kpi") return undefined;
+  const { binding, deltaField } = props.element.props;
+  if (!binding || !deltaField) return undefined;
+  const resolution = resolveBinding(props.data, { ...binding, field: deltaField });
+  return resolution.miss ? undefined : numericValue(resolution.value);
+});
+/** Threshold colouring: only ever applied to a value that actually RESOLVED to a number. A hole is
+ *  neutral-grey with a tell — never green, because "no data" must not read as "all good". */
+const kpiTone = computed<"ok" | "warn" | "bad" | "none">(() => {
+  if (props.element.kind !== "kpi") return "none";
+  const { warn, bad, worseWhen } = props.element.props;
+  const resolution = kpiResolution.value!;
+  if (resolution.miss) return "none";
+  const value = numericValue(resolution.value);
+  if (value === undefined || (warn === undefined && bad === undefined)) return "none";
+  const worseAbove = worseWhen === "above";
+  if (bad !== undefined && (worseAbove ? value >= bad : value <= bad)) return "bad";
+  if (warn !== undefined && (worseAbove ? value >= warn : value <= warn)) return "warn";
+  return "ok";
+});
+
+const tableCols = computed(() =>
+  props.element.kind === "table" ? tableColumns(props.element.props.columns, boundSet.value) : [],
+);
+/** Rows to draw — always WHOLE rows from one snapshot, so a half-rendered row is unrepresentable. */
+const tableRows = computed(() => {
+  if (props.element.kind !== "table") return [];
+  return (boundSet.value?.rows ?? []).slice(0, props.element.props.rows);
+});
+
+const chartData = computed(() => {
+  if (props.element.kind !== "chart") return [];
+  const { field, labelField, points } = props.element.props;
+  // The Studio sample is plotted against its own numeric column when the author hasn't picked one.
+  const set = boundSet.value;
+  const usable = field || (set === SAMPLE_DATASET ? "value" : "");
+  return chartPoints(set, usable, labelField, points);
+});
+const chartLine = computed(() => linePoints(chartData.value.map((p) => p.value)));
+const chartBars = computed(() => barRects(chartData.value.map((p) => p.value)));
+
+/** The one shared "this element has no data" mark: an honest, quiet tell on the wall. */
+const dataMiss = computed<string | undefined>(() => {
+  const el = props.element;
+  if (el.kind === "data-text" || el.kind === "kpi") {
+    const miss = (el.kind === "kpi" ? kpiResolution.value : dataTextResolution.value)?.miss;
+    if (!miss) return undefined;
+    if (!props.live && usingSample.value) return miss === "no-source" ? "unbound" : undefined;
+    return miss === "no-source" ? "no source" : miss === "no-field" ? "field missing" : "no data";
+  }
+  if (el.kind === "table" || el.kind === "chart") {
+    if (boundSet.value && (el.kind === "table" ? tableRows.value.length : chartData.value.length) > 0) {
+      return undefined;
+    }
+    if (!props.live) return el.props.dataSourceId ? undefined : "unbound";
+    return el.props.dataSourceId ? "no data" : "no source";
+  }
+  return undefined;
+});
+
+/** True when what's on glass is the poller's last-good after a failed poll (stale-with-a-tell). */
+const dataStale = computed(() => !usingSample.value && boundSet.value?.stale === true);
 </script>
 
 <template>
@@ -348,6 +483,113 @@ const tickerDuration = computed(() => {
     <span class="pel-countdown-sub" :style="{ fontSize: `max(9px, ${cq(0.16)})` }">
       {{ element.props.label || "Countdown" }} · {{ element.props.target }}
     </span>
+  </div>
+
+  <!-- DATA TEXT (POL-99) -->
+  <div
+    v-else-if="element.kind === 'data-text'"
+    class="pel-text"
+    :style="{
+      color: element.props.color,
+      fontSize: designPx(element.props.size),
+      justifyContent:
+        element.props.align === 'center' ? 'center' : element.props.align === 'right' ? 'flex-end' : 'flex-start',
+      textAlign: element.props.align,
+    }"
+  >
+    <span :class="{ 'pel-data-hole': dataMiss !== undefined }">
+      {{ element.props.prefix }}{{ dataTextValue }}{{ element.props.suffix }}
+    </span>
+    <span v-if="dataStale" class="pel-data-stale" :title="'last-good values'" />
+  </div>
+
+  <!-- KPI (POL-99) -->
+  <div v-else-if="element.kind === 'kpi'" class="pel-kpi">
+    <span class="pel-kpi-label" :style="{ fontSize: `max(8px, ${cq(0.11)})` }">
+      {{ element.props.label || "KPI" }}
+      <span v-if="dataStale" class="pel-data-stale" />
+    </span>
+    <span
+      class="pel-kpi-value"
+      :class="[`pel-kpi-value--${kpiTone}`, { 'pel-data-hole': dataMiss !== undefined }]"
+      :style="{ fontSize: cq(0.4) }"
+    >
+      {{ kpiValue }}<span v-if="element.props.unit" class="pel-kpi-unit" :style="{ fontSize: cq(0.16) }">{{ element.props.unit }}</span>
+    </span>
+    <span
+      v-if="kpiDelta !== undefined"
+      class="pel-kpi-delta"
+      :class="kpiDelta >= 0 ? 'pel-kpi-delta--up' : 'pel-kpi-delta--down'"
+      :style="{ fontSize: `max(8px, ${cq(0.12)})` }"
+    >
+      {{ kpiDelta >= 0 ? "▲" : "▼" }} {{ Math.abs(kpiDelta).toLocaleString() }}
+    </span>
+    <span v-else-if="dataMiss" class="pel-data-tell" :style="{ fontSize: `max(7px, ${cq(0.1)})` }">{{ dataMiss }}</span>
+  </div>
+
+  <!-- TABLE (POL-99) — rows are stamped whole from ONE snapshot; a half-rendered row is impossible -->
+  <div v-else-if="element.kind === 'table'" class="pel-table">
+    <div v-if="element.props.header" class="pel-table-row pel-table-row--head" :style="{ fontSize: `max(8px, ${cq(0.055)})` }">
+      <span
+        v-for="column in tableCols"
+        :key="column.field"
+        class="pel-table-cell"
+        :style="{ textAlign: column.align }"
+      >
+        {{ column.label || column.field }}
+      </span>
+      <span v-if="dataStale" class="pel-data-stale" />
+    </div>
+    <div
+      v-for="(row, i) in tableRows"
+      :key="i"
+      class="pel-table-row"
+      :style="{ fontSize: `max(9px, ${cq(0.06)})` }"
+    >
+      <span
+        v-for="column in tableCols"
+        :key="column.field"
+        class="pel-table-cell"
+        :class="{ 'pel-data-hole': !(column.field in row) || row[column.field] === null }"
+        :style="{ textAlign: column.align }"
+      >
+        {{ formatValue(row[column.field]) }}
+      </span>
+    </div>
+    <span v-if="dataMiss" class="pel-data-tell" :style="{ fontSize: `max(8px, ${cq(0.06)})` }">{{ dataMiss }}</span>
+  </div>
+
+  <!-- CHART (POL-99) — static SVG, re-rendered on push. No animation, no filters (D66-safe). -->
+  <div v-else-if="element.kind === 'chart'" class="pel-chart">
+    <svg
+      v-if="chartData.length > 0"
+      class="pel-chart-svg"
+      viewBox="0 0 100 100"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      <template v-if="element.props.type === 'bar'">
+        <rect
+          v-for="(bar, i) in chartBars"
+          :key="i"
+          :x="bar.x"
+          :y="bar.y"
+          :width="bar.w"
+          :height="bar.h"
+          :fill="element.props.color"
+        />
+      </template>
+      <polyline
+        v-else
+        :points="chartLine"
+        fill="none"
+        :stroke="element.props.color"
+        stroke-width="1.6"
+        vector-effect="non-scaling-stroke"
+      />
+    </svg>
+    <span v-if="dataMiss" class="pel-data-tell" :style="{ fontSize: `max(8px, ${cq(0.08)})` }">{{ dataMiss }}</span>
+    <span v-if="dataStale" class="pel-data-stale pel-data-stale--corner" />
   </div>
 </template>
 
@@ -601,6 +843,141 @@ const tickerDuration = computed(() => {
 }
 .pel-countdown-sub {
   color: rgba(255, 255, 255, 0.5);
+}
+
+/* Data-bound elements (POL-99) */
+
+/* A HOLE: the value that isn't there. Dim + dashed-underlined, so an operator walking past a wall
+   sees "this number is missing" rather than a plausible-looking blank. */
+.pel-data-hole {
+  color: rgba(255, 255, 255, 0.32);
+  text-decoration: underline dashed rgba(250, 204, 21, 0.5);
+  text-underline-offset: 0.18em;
+}
+/* A STALE mark: last-good values are on glass because the last poll failed. Static dot (D66). */
+.pel-data-stale {
+  display: inline-block;
+  width: 0.42em;
+  height: 0.42em;
+  margin-left: 0.4em;
+  border-radius: 50%;
+  background: #f59e0b;
+  vertical-align: middle;
+  flex: 0 0 auto;
+}
+.pel-data-stale--corner {
+  position: absolute;
+  top: 6%;
+  right: 5%;
+  width: 3%;
+  height: 5%;
+  margin: 0;
+}
+.pel-data-tell {
+  position: absolute;
+  bottom: 4%;
+  left: 5%;
+  color: rgba(250, 204, 21, 0.75);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pel-kpi {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2%;
+  padding: 4% 6%;
+  overflow: hidden;
+}
+.pel-kpi-label {
+  display: flex;
+  align-items: center;
+  color: rgba(255, 255, 255, 0.45);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pel-kpi-value {
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+  color: rgba(255, 255, 255, 0.94);
+  white-space: nowrap;
+}
+.pel-kpi-value--ok {
+  color: #4ade80;
+}
+.pel-kpi-value--warn {
+  color: #fbbf24;
+}
+.pel-kpi-value--bad {
+  color: #f87171;
+}
+.pel-kpi-unit {
+  margin-left: 0.15em;
+  color: rgba(255, 255, 255, 0.5);
+  font-weight: 500;
+}
+.pel-kpi-delta {
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.5);
+}
+.pel-kpi-delta--up {
+  color: #4ade80;
+}
+.pel-kpi-delta--down {
+  color: #f87171;
+}
+
+.pel-table {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 4px;
+  padding: 3% 4%;
+  overflow: hidden;
+}
+.pel-table-row {
+  display: flex;
+  align-items: center;
+  gap: 3%;
+  padding: 0.55% 0;
+  color: rgba(255, 255, 255, 0.86);
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  flex: 0 0 auto; /* whole rows, natural height: the LAST row clips at the card edge, never crushes */
+}
+.pel-table-row--head {
+  color: rgba(255, 255, 255, 0.42);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  border-bottom-color: rgba(255, 255, 255, 0.12);
+}
+.pel-table-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pel-chart {
+  position: absolute;
+  inset: 0;
+  padding: 4%;
+  display: flex;
+}
+.pel-chart-svg {
+  width: 100%;
+  height: 100%;
 }
 </style>
 

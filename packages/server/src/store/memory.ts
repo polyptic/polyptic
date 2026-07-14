@@ -12,6 +12,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedDataSource,
   PersistedDisplaySettings,
   PersistedImageRollout,
   PersistedMachine,
@@ -54,6 +55,8 @@ export class MemoryStore implements Store {
   private readonly scenes = new Map<string, PersistedScene>();
   /** Keyed by profile id — credential profiles for content auth (POL-24). */
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
+  /** Keyed by data-source id — polled JSON/CSV endpoints (POL-99). */
+  private readonly dataSources = new Map<string, PersistedDataSource>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
   private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
@@ -87,6 +90,7 @@ export class MemoryStore implements Store {
       scenes: [...this.scenes.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
       zoomPreferences: [...this.zoomPreferences.values()].map(clone),
+      dataSources: [...this.dataSources.values()].map(clone),
     };
   }
 
@@ -243,10 +247,27 @@ export class MemoryStore implements Store {
     for (const source of this.contentSources.values()) {
       if (source.credentialProfileId === id) source.credentialProfileId = null;
     }
+    for (const source of this.dataSources.values()) {
+      if (source.credentialProfileId === id) source.credentialProfileId = null;
+    }
   }
 
   async listCredentialProfiles(): Promise<PersistedCredentialProfile[]> {
     return [...this.credentialProfiles.values()].map(clone);
+  }
+
+  // ── Data sources (POL-99) ───────────────────────────────────────────────────
+
+  async upsertDataSource(source: PersistedDataSource): Promise<void> {
+    this.dataSources.set(source.id, clone(source));
+  }
+
+  async deleteDataSource(id: string): Promise<void> {
+    this.dataSources.delete(id);
+  }
+
+  async listDataSources(): Promise<PersistedDataSource[]> {
+    return [...this.dataSources.values()].map(clone);
   }
 
   // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────

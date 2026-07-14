@@ -34,6 +34,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedDataSource,
   PersistedDisplaySettings,
   PersistedImageRollout,
   PersistedMachine,
@@ -147,6 +148,31 @@ interface CredentialProfileRow {
   scope: string | null;
   audience: string | null;
   token_param: string;
+}
+
+/** One data_sources row → its DTO (POL-99). Legacy NULLs take the contract's defaults. */
+function dataSourceFromRow(row: DataSourceRow): PersistedDataSource {
+  return {
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    format: row.format,
+    pollSeconds: Number(row.poll_seconds),
+    credentialProfileId: row.credential_profile_id ?? null,
+    authIn: row.auth_in ?? "header",
+    rowsPath: row.rows_path ?? "",
+  };
+}
+
+interface DataSourceRow {
+  id: string;
+  name: string;
+  url: string;
+  format: string;
+  poll_seconds: number;
+  credential_profile_id: string | null;
+  auth_in: string | null;
+  rows_path: string | null;
 }
 
 interface ZoomPreferenceRow {
@@ -328,6 +354,21 @@ export class PostgresStore implements Store {
         token_param    text NOT NULL DEFAULT 'auth_token'
       )
     `;
+    // Data sources (POL-99): JSON/CSV endpoints the SERVER polls for the fleet. Config only — the
+    // polled VALUES never land in the DB (they live in the poller's cache and reach a player only
+    // inside a page surface's send-time `data` bundle), and no credential lives here either.
+    await sql`
+      CREATE TABLE IF NOT EXISTS data_sources (
+        id                    text PRIMARY KEY,
+        name                  text NOT NULL,
+        url                   text NOT NULL,
+        format                text NOT NULL,
+        poll_seconds          integer NOT NULL DEFAULT 60,
+        credential_profile_id text,
+        auth_in               text NOT NULL DEFAULT 'header',
+        rows_path             text NOT NULL DEFAULT ''
+      )
+    `;
     // Scenes (Phase 3d). A named SNAPSHOT of a mural's whole wall — layout + grouping + content live
     // in the `snapshot` jsonb. `schedule_at` is the illustrative "HH:MM" time (stored, NOT fired).
     await sql`
@@ -452,6 +493,7 @@ export class PostgresStore implements Store {
       sceneRows,
       credentialProfileRows,
       zoomPreferenceRows,
+      dataSourceRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
@@ -464,6 +506,7 @@ export class PostgresStore implements Store {
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
+      sql<DataSourceRow[]>`SELECT id, name, url, format, poll_seconds, credential_profile_id, auth_in, rows_path FROM data_sources`,
     ]);
 
     const machines: PersistedMachine[] = machineRows.map((row) => {
@@ -551,6 +594,8 @@ export class PostgresStore implements Store {
       zoom: Number(row.zoom),
     }));
 
+    const dataSources: PersistedDataSource[] = dataSourceRows.map(dataSourceFromRow);
+
     const scenes: PersistedScene[] = sceneRows.map((row) => {
       // jsonb comes back already parsed; shape it defensively (ControlPlane re-validates each scene).
       const raw =
@@ -582,6 +627,7 @@ export class PostgresStore implements Store {
       scenes,
       credentialProfiles,
       zoomPreferences,
+      dataSources,
     };
   }
 
@@ -880,7 +926,46 @@ export class PostgresStore implements Store {
     // Detach from any sources that referenced it (defensive — the control plane refuses to delete an
     // in-use profile, so this only matters for rows mutated outside the API).
     await sql`UPDATE content_sources SET credential_profile_id = NULL WHERE credential_profile_id = ${id}`;
+    await sql`UPDATE data_sources SET credential_profile_id = NULL WHERE credential_profile_id = ${id}`;
     await sql`DELETE FROM credential_profiles WHERE id = ${id}`;
+  }
+
+  // ── Data sources (POL-99) ────────────────────────────────────────────────────
+
+  async upsertDataSource(source: PersistedDataSource): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO data_sources (id, name, url, format, poll_seconds, credential_profile_id, auth_in, rows_path)
+      VALUES (
+        ${source.id},
+        ${source.name},
+        ${source.url},
+        ${source.format},
+        ${source.pollSeconds},
+        ${source.credentialProfileId ?? null},
+        ${source.authIn ?? "header"},
+        ${source.rowsPath ?? ""}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        name                  = EXCLUDED.name,
+        url                   = EXCLUDED.url,
+        format                = EXCLUDED.format,
+        poll_seconds          = EXCLUDED.poll_seconds,
+        credential_profile_id = EXCLUDED.credential_profile_id,
+        auth_in               = EXCLUDED.auth_in,
+        rows_path             = EXCLUDED.rows_path
+    `;
+  }
+
+  async deleteDataSource(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM data_sources WHERE id = ${id}`;
+  }
+
+  async listDataSources(): Promise<PersistedDataSource[]> {
+    const sql = this.sql;
+    const rows = await sql<DataSourceRow[]>`SELECT id, name, url, format, poll_seconds, credential_profile_id, auth_in, rows_path FROM data_sources`;
+    return rows.map(dataSourceFromRow);
   }
 
   async listCredentialProfiles(): Promise<PersistedCredentialProfile[]> {

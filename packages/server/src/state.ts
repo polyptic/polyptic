@@ -23,6 +23,7 @@
  */
 import {
   ContentSource,
+  DataSource,
   DashboardSurface,
   ImageSurface,
   PlaylistSurface,
@@ -39,8 +40,12 @@ import type {
   PlaylistEntry,
   PlaylistItem,
   CreateCredentialProfileBody,
+  CreateDataSourceBody,
   CredentialProfileView,
+  DataSet,
+  DataSourceView,
   DesiredState,
+  UpdateDataSourceBody,
   DisplayBackend,
   DisplaySettings,
   Geometry,
@@ -66,10 +71,12 @@ import type {
 
 import type {
   PersistedCredentialProfile,
+  PersistedDataSource,
   PersistedMachine,
   PersistedScene,
   Store,
 } from "./store/types";
+import type { DataSourceAuth, DataSourceHealth, DataSourceSpec } from "./page-data";
 import type { TokenService } from "./tokens";
 import type { ActivityLog } from "./activity";
 
@@ -225,6 +232,10 @@ function specUrl(spec: ResolvedSpec): string {
 export interface PageDataProvider {
   feedFor(url: string): PageFeedData | undefined;
   weatherFor(location: string): PageWeatherData | undefined;
+  /** POL-99 — the last-good table for a data source (carrying its own `stale` flag). */
+  datasetFor(dataSourceId: string): DataSet | undefined;
+  /** POL-99 — that source's poll health, for the console's views. */
+  dataSourceHealth(dataSourceId: string): DataSourceHealth;
 }
 
 /** POL-34 — the fallback hold time for a playlist entry that should be timed but carries no duration
@@ -300,6 +311,11 @@ export class ControlPlane {
 
   /** POL-42 — the poller's live feed/weather data, consumed at send time (buildPageData). */
   private pageDataProvider?: PageDataProvider;
+
+  /** POL-99 — the configured data sources (JSON/CSV endpoints), keyed by id. The VALUES they yield
+   *  live only in the poller's cache — never here, never in the DB. */
+  private readonly dataSources = new Map<string, DataSource>();
+  private dataSourceCounter = 0;
 
   /** POL-54 — mints the per-screen token stamped into every playerUrl the server hands an agent, so
    *  the /player WS can authenticate the hello that comes back. Wired after construction (same
@@ -570,6 +586,36 @@ export class ControlPlane {
     for (const source of this.contentSources.values()) {
       if (source.credentialProfileId && !this.credentialProfiles.has(source.credentialProfileId)) {
         source.credentialProfileId = null;
+      }
+    }
+
+    // ── Data sources (POL-99) ─────────────────────────────────────────────────
+    for (const ds of persisted.dataSources) {
+      // Re-validate at the edge (as everywhere): a malformed/legacy row is dropped, not fatal.
+      const parsed = DataSource.safeParse({
+        id: ds.id,
+        name: ds.name,
+        url: ds.url,
+        format: ds.format,
+        pollSeconds: ds.pollSeconds,
+        credentialProfileId: ds.credentialProfileId ?? null,
+        authIn: ds.authIn ?? "header",
+        rowsPath: ds.rowsPath ?? "",
+      });
+      if (parsed.success) this.dataSources.set(parsed.data.id, parsed.data);
+    }
+    let maxDataSource = 0;
+    for (const ds of this.dataSources.values()) {
+      const match = /^data-(\d+)$/.exec(ds.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxDataSource = Math.max(maxDataSource, n);
+      }
+    }
+    this.dataSourceCounter = maxDataSource;
+    for (const ds of this.dataSources.values()) {
+      if (ds.credentialProfileId && !this.credentialProfiles.has(ds.credentialProfileId)) {
+        ds.credentialProfileId = null;
       }
     }
 
@@ -2224,6 +2270,17 @@ export class ControlPlane {
     return this.slicesShowingSources(pageIds);
   }
 
+  /** POL-99 — the slices of every screen showing a page that BINDS this data source. What an operator
+   *  edits (or successfully tests) must reach the wall now, not on the next poll cadence. */
+  slicesShowingDataSource(dataSourceId: string): ScreenSlice[] {
+    const pageIds = new Set<string>();
+    for (const source of this.contentSources.values()) {
+      if (source.kind !== "page" || !source.definition) continue;
+      if (ControlPlane.dataSourceIdsOf(source.definition).has(dataSourceId)) pageIds.add(source.id);
+    }
+    return this.slicesShowingSources(pageIds);
+  }
+
   /** The slices of every screen showing any of these library sources, directly or via a video wall. */
   slicesShowingSources(sourceIds: ReadonlySet<string>): ScreenSlice[] {
     const byScreen = new Map<string, ScreenSlice>();
@@ -2245,12 +2302,21 @@ export class ControlPlane {
 
   /** POL-42 — what the poller needs to keep fresh: the feed URLs and weather locations used by pages
    *  currently assigned to ≥1 screen (directly or via a wall). Unassigned pages cost no polling. */
-  pageDataRequirements(): { feeds: Set<string>; locations: Set<string>; sourcesByFeed: Map<string, Set<string>>; sourcesByLocation: Map<string, Set<string>> } {
+  pageDataRequirements(): {
+    feeds: Set<string>;
+    locations: Set<string>;
+    sourcesByFeed: Map<string, Set<string>>;
+    sourcesByLocation: Map<string, Set<string>>;
+    dataSources: Set<string>;
+    sourcesByDataSource: Map<string, Set<string>>;
+  } {
     const assigned = new Set<string>([...this.screenSourceIds.values(), ...this.wallSourceIds.values()]);
     const feeds = new Set<string>();
     const locations = new Set<string>();
     const sourcesByFeed = new Map<string, Set<string>>();
     const sourcesByLocation = new Map<string, Set<string>>();
+    const dataSources = new Set<string>();
+    const sourcesByDataSource = new Map<string, Set<string>>();
     for (const source of this.contentSources.values()) {
       if (source.kind !== "page" || !source.definition || !assigned.has(source.id)) continue;
       for (const el of source.definition.elements) {
@@ -2264,8 +2330,182 @@ export class ControlPlane {
           (sourcesByLocation.get(location) ?? sourcesByLocation.set(location, new Set()).get(location)!).add(source.id);
         }
       }
+      // POL-99 — every data source this page binds, and which page(s) to re-push when it changes.
+      for (const id of ControlPlane.dataSourceIdsOf(source.definition)) {
+        if (!this.dataSources.has(id)) continue; // a binding to a deleted source polls nothing
+        dataSources.add(id);
+        (sourcesByDataSource.get(id) ?? sourcesByDataSource.set(id, new Set()).get(id)!).add(source.id);
+      }
     }
-    return { feeds, locations, sourcesByFeed, sourcesByLocation };
+    return { feeds, locations, sourcesByFeed, sourcesByLocation, dataSources, sourcesByDataSource };
+  }
+
+  // ── Data sources (POL-99) ────────────────────────────────────────────────────
+  //
+  // A data source is a JSON/CSV endpoint the SERVER polls (PageDataService) and normalises to a table.
+  // Pages BIND to cells of it; the values never touch the DB and never leave through anything but a
+  // page surface's send-time `data` bundle. Poll once, push to N screens.
+
+  /** Every data source id a page definition binds — the two binding shapes (a cell binding on
+   *  data-text/kpi, a whole-source binding on table/chart) collapse to one set here. */
+  private static dataSourceIdsOf(definition: PageDefinition): Set<string> {
+    const ids = new Set<string>();
+    for (const el of definition.elements) {
+      if (el.kind === "data-text" || el.kind === "kpi") {
+        const id = el.props.binding?.dataSourceId.trim();
+        if (id) ids.add(id);
+      } else if (el.kind === "table" || el.kind === "chart") {
+        const id = el.props.dataSourceId.trim();
+        if (id) ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  /** Every CONFIGURED data source, as the poller's spec (it decides which are due). */
+  dataSourceSpecs(): DataSourceSpec[] {
+    return [...this.dataSources.values()].map((ds) => ({
+      id: ds.id,
+      url: ds.url,
+      format: ds.format,
+      pollSeconds: ds.pollSeconds,
+      rowsPath: ds.rowsPath,
+    }));
+  }
+
+  /** The CURRENT token for a data source's credential profile, resolved per fetch (POL-24's seam —
+   *  the value is used and dropped, never persisted, never broadcast, never sent to a player). */
+  dataSourceAuth(id: string): DataSourceAuth | undefined {
+    const source = this.dataSources.get(id);
+    if (!source?.credentialProfileId) return undefined;
+    const profile = this.credentialProfiles.get(source.credentialProfileId);
+    if (!profile) return undefined;
+    const token = this.tokenProvider?.getToken(profile.id);
+    if (!token) return undefined;
+    return { in: source.authIn, param: profile.tokenParam, token };
+  }
+
+  getDataSources(): DataSource[] {
+    return [...this.dataSources.values()];
+  }
+
+  getDataSource(id: string): DataSource | undefined {
+    return this.dataSources.get(id);
+  }
+
+  /** How many PAGES bind a data source (the delete guard + the console's copy). */
+  private dataSourceInUseCount(id: string): number {
+    let count = 0;
+    for (const source of this.contentSources.values()) {
+      if (source.kind !== "page" || !source.definition) continue;
+      if (ControlPlane.dataSourceIdsOf(source.definition).has(id)) count += 1;
+    }
+    return count;
+  }
+
+  /** Config + live poll health + a sample of the rows. Never a credential. */
+  getDataSourceViews(): DataSourceView[] {
+    return [...this.dataSources.values()].map((ds) => {
+      const health = this.pageDataProvider?.dataSourceHealth(ds.id) ?? {
+        status: "pending" as const,
+        rowCount: 0,
+        columns: [],
+        sample: [],
+      };
+      return {
+        ...ds,
+        credentialProfileId: ds.credentialProfileId ?? null,
+        status: health.status,
+        ...(health.lastFetchedAt ? { lastFetchedAt: health.lastFetchedAt } : {}),
+        ...(health.lastError ? { lastError: health.lastError } : {}),
+        rowCount: health.rowCount,
+        columns: health.columns,
+        sample: health.sample,
+        inUseBy: this.dataSourceInUseCount(ds.id),
+      };
+    });
+  }
+
+  private nextDataSourceId(): string {
+    this.dataSourceCounter += 1;
+    return `data-${this.dataSourceCounter}`;
+  }
+
+  async createDataSource(body: CreateDataSourceBody): Promise<DataSource | { error: "unknown-profile" }> {
+    if (body.credentialProfileId && !this.credentialProfiles.has(body.credentialProfileId)) {
+      return { error: "unknown-profile" };
+    }
+    const source: DataSource = {
+      id: this.nextDataSourceId(),
+      name: body.name,
+      url: body.url,
+      format: body.format,
+      pollSeconds: body.pollSeconds ?? 60,
+      credentialProfileId: body.credentialProfileId ?? null,
+      authIn: body.authIn ?? "header",
+      rowsPath: body.rowsPath ?? "",
+    };
+    this.dataSources.set(source.id, source);
+    await this.store.upsertDataSource(ControlPlane.persistDataSource(source));
+    this.emit("good", `Data source ${source.name} added`);
+    return source;
+  }
+
+  async updateDataSource(
+    id: string,
+    patch: UpdateDataSourceBody,
+  ): Promise<DataSource | { error: "unknown-source" | "unknown-profile" }> {
+    const existing = this.dataSources.get(id);
+    if (!existing) return { error: "unknown-source" };
+    const credentialProfileId =
+      patch.credentialProfileId !== undefined
+        ? patch.credentialProfileId
+        : (existing.credentialProfileId ?? null);
+    if (credentialProfileId && !this.credentialProfiles.has(credentialProfileId)) {
+      return { error: "unknown-profile" };
+    }
+    const source: DataSource = {
+      id: existing.id,
+      name: patch.name ?? existing.name,
+      url: patch.url ?? existing.url,
+      format: patch.format ?? existing.format,
+      pollSeconds: patch.pollSeconds ?? existing.pollSeconds,
+      credentialProfileId,
+      authIn: patch.authIn ?? existing.authIn,
+      rowsPath: patch.rowsPath ?? existing.rowsPath,
+    };
+    this.dataSources.set(id, source);
+    await this.store.upsertDataSource(ControlPlane.persistDataSource(source));
+    this.emit("info", `Data source ${source.name} updated`);
+    return source;
+  }
+
+  /** Delete a data source. REFUSED while a page binds it — silently blanking a live wall's numbers is
+   *  worse than making the operator unbind first (same call as the credential-profile guard). */
+  async deleteDataSource(
+    id: string,
+  ): Promise<{ ok: true } | { ok: false; error: "unknown-source" | "in-use"; inUseBy?: number }> {
+    const existing = this.dataSources.get(id);
+    if (!existing) return { ok: false, error: "unknown-source" };
+    const inUseBy = this.dataSourceInUseCount(id);
+    if (inUseBy > 0) return { ok: false, error: "in-use", inUseBy };
+    this.dataSources.delete(id);
+    await this.store.deleteDataSource(id);
+    this.emit("warn", `Data source ${existing.name} removed`);
+    return { ok: true };
+  }
+
+  private static persistDataSource(source: DataSource): PersistedDataSource {
+    return {
+      id: source.id,
+      name: source.name,
+      url: source.url,
+      format: source.format,
+      pollSeconds: source.pollSeconds,
+      credentialProfileId: source.credentialProfileId ?? null,
+      authIn: source.authIn,
+      rowsPath: source.rowsPath,
+    };
   }
 
   /**
@@ -2404,10 +2644,14 @@ export class ControlPlane {
     return this.credentialProfiles.get(id);
   }
 
-  /** How many library sources reference a profile (drives the delete guard + console copy). */
+  /** How many library sources AND data sources (POL-99) reference a profile — the delete guard's
+   *  count. Deleting a profile out from under a polling data source would 401 a live wall. */
   private profileInUseCount(id: string): number {
     let count = 0;
     for (const source of this.contentSources.values()) {
+      if (source.credentialProfileId === id) count += 1;
+    }
+    for (const source of this.dataSources.values()) {
       if (source.credentialProfileId === id) count += 1;
     }
     return count;
@@ -2616,6 +2860,15 @@ export class ControlPlane {
     const images: Record<string, PageImageResolution> = {};
     const feeds: Record<string, PageFeedData> = {};
     const weather: Record<string, PageWeatherData> = {};
+    const datasets: Record<string, DataSet> = {};
+
+    // POL-99 — one payload per bound DATA SOURCE (not per element): three KPIs off one endpoint ship
+    // its rows once. A source with no last-good table yet contributes NOTHING, and the elements bound
+    // to it draw their no-data tell — a binding never silently blanks its element.
+    for (const id of ControlPlane.dataSourceIdsOf(definition)) {
+      const data = this.pageDataProvider?.datasetFor(id);
+      if (data) datasets[id] = data;
+    }
 
     for (const el of definition.elements) {
       if (el.kind === "embed") {
@@ -2638,6 +2891,7 @@ export class ControlPlane {
     if (Object.keys(images).length > 0) bundle.images = images;
     if (Object.keys(feeds).length > 0) bundle.feeds = feeds;
     if (Object.keys(weather).length > 0) bundle.weather = weather;
+    if (Object.keys(datasets).length > 0) bundle.datasets = datasets;
     return bundle;
   }
 

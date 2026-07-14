@@ -19,8 +19,11 @@ import type {
   ContentSource,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateDataSourceBody,
   CredentialProfileTestResult,
   CredentialProfileView,
+  DataSourceTestResult,
+  DataSourceView,
   DisplaySettings,
   EnrollmentInfo,
   LoginBody,
@@ -32,6 +35,7 @@ import type {
   ScreenView,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateDataSourceBody,
   UpdateSceneBody,
   VideoWall,
   ImageUpdateInfo,
@@ -135,6 +139,9 @@ export interface ConsoleState {
    *  admin/state.credentialProfiles (optional on the wire → [] against an older server). Never
    *  carries a client secret. */
   credentialProfiles: CredentialProfileView[];
+  /** POL-99 — the polled JSON/CSV data sources + their live poll health (admin/state.dataSources;
+   *  optional on the wire → [] against an older server). Never a credential. */
+  dataSources: DataSourceView[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
   /** The Live Activity feed (D25) — bounded, newest-first human event log, mirrored from
@@ -179,6 +186,7 @@ export const useConsoleStore = defineStore("console", {
     videoWalls: [],
     contentSources: [],
     credentialProfiles: [],
+    dataSources: [],
     scenes: [],
     activity: [],
     activeSceneId: null,
@@ -419,6 +427,20 @@ export const useConsoleStore = defineStore("console", {
 
     profileById(): (id: string) => CredentialProfileView | undefined {
       return (id: string) => this.credentialProfiles.find((p) => p.id === id);
+    },
+
+    /** POL-99 — every data source (config + poll health + sample rows). */
+    datasources(state): DataSourceView[] {
+      return state.dataSources;
+    },
+
+    dataSourceById(): (id: string) => DataSourceView | undefined {
+      return (id: string) => this.dataSources.find((d) => d.id === id);
+    },
+
+    /** The field names a binding picker can offer for a data source (from its last good fetch). */
+    dataSourceColumns(): (id: string) => string[] {
+      return (id: string) => this.dataSources.find((d) => d.id === id)?.columns ?? [];
     },
 
     /** The library source currently armed for click-to-assign on the canvas, if any. */
@@ -703,6 +725,7 @@ export const useConsoleStore = defineStore("console", {
         this.contentSources = msg.contentSources;
         // POL-24 — credential profiles are optional on the wire (older servers omit them).
         this.credentialProfiles = msg.credentialProfiles ?? [];
+        this.dataSources = msg.dataSources ?? [];
         this.scenes = msg.scenes;
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
@@ -1322,6 +1345,54 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] testProfile failed", err);
         return { ok: false, error: "Request failed — is the server reachable?" };
+      }
+    },
+
+    // ── Data sources (POL-99) ──────────────────────────────────────────────────
+
+    /** Create a data source. The server fetches it once immediately, so the broadcast that lands
+     *  already carries its columns (which is what the Studio's binding picker offers). */
+    async createDataSource(body: CreateDataSourceBody): Promise<boolean> {
+      try {
+        await api.createDataSource(body);
+        return true;
+      } catch (err) {
+        console.error("[console] createDataSource failed", err);
+        return false;
+      }
+    },
+
+    async updateDataSource(id: string, body: UpdateDataSourceBody): Promise<boolean> {
+      try {
+        await api.updateDataSource(id, body);
+        return true;
+      } catch (err) {
+        console.error("[console] updateDataSource failed", err);
+        return false;
+      }
+    },
+
+    /** Delete a data source. The server REFUSES (409) while any page binds it — surfaced as
+     *  "in-use" so the view can say "unbind it first" rather than a generic failure. */
+    async deleteDataSource(id: string): Promise<true | "in-use" | false> {
+      try {
+        await api.deleteDataSource(id);
+        this.dataSources = this.dataSources.filter((d) => d.id !== id);
+        return true;
+      } catch (err) {
+        if (err instanceof api.ApiError && err.status === 409) return "in-use";
+        console.error("[console] deleteDataSource failed", err);
+        return false;
+      }
+    },
+
+    /** Fetch the endpoint NOW: the operator sees the real answer, and the wall gets the fresh rows. */
+    async testDataSource(id: string): Promise<DataSourceTestResult> {
+      try {
+        return await api.testDataSource(id);
+      } catch (err) {
+        console.error("[console] testDataSource failed", err);
+        return { ok: false, columns: [], rowCount: 0, sample: [], error: "Request failed — is the server reachable?" };
       }
     },
 

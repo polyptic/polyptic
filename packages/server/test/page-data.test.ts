@@ -118,8 +118,12 @@ function controlWith(feeds: Record<string, string[]>, locations: Record<string, 
         locations: new Set(Object.keys(locations)),
         sourcesByFeed: new Map(Object.entries(feeds).map(([k, v]) => [k, new Set(v)])),
         sourcesByLocation: new Map(Object.entries(locations).map(([k, v]) => [k, new Set(v)])),
+        dataSources: new Set<string>(),
+        sourcesByDataSource: new Map<string, Set<string>>(),
       };
     },
+    dataSourceSpecs: () => [],
+    dataSourceAuth: () => undefined,
   };
 }
 
@@ -239,7 +243,11 @@ describe("PageDataService", () => {
         locations: new Set(),
         sourcesByFeed: new Map(Object.entries(feeds).map(([k, v]) => [k, new Set(v)])),
         sourcesByLocation: new Map(),
+        dataSources: new Set<string>(),
+        sourcesByDataSource: new Map<string, Set<string>>(),
       }),
+      dataSourceSpecs: () => [],
+      dataSourceAuth: () => undefined,
     };
     const service = new PageDataService({
       control,

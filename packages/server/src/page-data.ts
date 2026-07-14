@@ -22,7 +22,17 @@
  * timestamp), not an XML library: real-world feeds are routinely malformed, and the failure mode we
  * want is "fewer fields on a card", never a crash or a dependency.
  */
-import type { PageFeedData, PageFeedItem, PageWeatherData } from "@polyptic/protocol";
+import type {
+  DataRow,
+  DataSet,
+  DataSourceAuthIn,
+  DataSourceFormat,
+  DataSourceStatus,
+  DataValue,
+  PageFeedData,
+  PageFeedItem,
+  PageWeatherData,
+} from "@polyptic/protocol";
 import type { PageDataProvider } from "./state";
 
 const DEFAULT_FEED_POLL_MS = 5 * 60_000;
@@ -31,6 +41,13 @@ const DEFAULT_TICK_MS = 30_000;
 const FETCH_TIMEOUT_MS = 10_000;
 /** Cap parsed items per feed — element props show at most 8; keep a little slack for re-renders. */
 const MAX_FEED_ITEMS = 12;
+/** Ceilings on ONE data source's normalised table. A wall element shows tens of rows, not thousands;
+ *  these bound both the poller's memory and the slice we push to every player. */
+const MAX_DATA_ROWS = 200;
+const MAX_DATA_COLUMNS = 32;
+const MAX_CELL_CHARS = 500;
+/** Rows the console's binding picker previews. */
+const SAMPLE_ROWS = 5;
 
 /** A feed URL as operators type it ("feeds.bbci.co.uk/news/rss.xml") → fetchable (https-prefixed). */
 export function normalizeFeedUrl(raw: string): string {
@@ -145,6 +162,202 @@ export function weatherDescription(code: number): string {
   return "changeable";
 }
 
+// ── POL-99 — data sources (JSON/CSV → a normalised table) ─────────────────────
+//
+// The parsers below are TOLERANT by contract: a wall must degrade, never crash and never paint a
+// half-row. So every one of them returns a table whose rows all carry EVERY column (missing cells
+// null), or an empty table — never a partial row, never a throw. Garbage in ⇒ few columns and an
+// honest "no data" tell on glass, not a blank screen.
+
+/** One cell, normalised: numbers stay numbers (charts/KPIs need them), everything else becomes a
+ *  capped string, empty/absent becomes null. */
+function normalizeCell(raw: unknown): DataValue {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === "boolean") return raw ? "true" : "false";
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed === "") return null;
+    return trimmed.length > MAX_CELL_CHARS ? trimmed.slice(0, MAX_CELL_CHARS) : trimmed;
+  }
+  // Objects/arrays: a wall cell is a scalar. Stringify so the operator SEES what arrived.
+  try {
+    const json = JSON.stringify(raw) ?? "";
+    return json.slice(0, MAX_CELL_CHARS) || null;
+  } catch {
+    return null;
+  }
+}
+
+/** A CSV cell as a value: a clean number stays a number, everything else is text. */
+function coerceScalar(text: string): DataValue {
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+  if (/^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (Number.isFinite(n)) return n;
+  }
+  return trimmed.length > MAX_CELL_CHARS ? trimmed.slice(0, MAX_CELL_CHARS) : trimmed;
+}
+
+/** Build the table: column order = first appearance, and EVERY row is filled out to every column. */
+function tableFrom(records: Record<string, DataValue>[]): { columns: string[]; rows: DataRow[] } {
+  const columns: string[] = [];
+  for (const record of records) {
+    for (const key of Object.keys(record)) {
+      if (!columns.includes(key) && columns.length < MAX_DATA_COLUMNS) columns.push(key);
+    }
+  }
+  const rows: DataRow[] = records.slice(0, MAX_DATA_ROWS).map((record) => {
+    const row: DataRow = {};
+    for (const column of columns) row[column] = record[column] ?? null;
+    return row;
+  });
+  return { columns, rows };
+}
+
+/** Flatten one JSON row to dotted scalar keys ({a:{b:1}} → {"a.b":1}), depth-capped. */
+function flattenRow(value: unknown, prefix = "", depth = 0): Record<string, DataValue> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { [prefix || "value"]: normalizeCell(value) };
+  }
+  if (depth >= 2) return { [prefix || "value"]: normalizeCell(value) };
+  const out: Record<string, DataValue> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const name = prefix ? `${prefix}.${key}` : key;
+    if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+      Object.assign(out, flattenRow(child, name, depth + 1));
+    } else {
+      out[name] = normalizeCell(child);
+    }
+  }
+  return out;
+}
+
+/** Walk a dotted path ("data.items", "results.0") into a parsed document. Undefined if it dead-ends —
+ *  the caller reports "path not found", which is what the operator needs to see. */
+function atPath(doc: unknown, path: string): unknown {
+  if (!path.trim()) return doc;
+  let cursor: unknown = doc;
+  for (const segment of path.split(".")) {
+    const key = segment.trim();
+    if (key === "") continue;
+    if (Array.isArray(cursor)) {
+      const index = Number(key);
+      if (!Number.isInteger(index)) return undefined;
+      cursor = cursor[index];
+    } else if (cursor !== null && typeof cursor === "object") {
+      cursor = (cursor as Record<string, unknown>)[key];
+    } else {
+      return undefined;
+    }
+    if (cursor === undefined) return undefined;
+  }
+  return cursor;
+}
+
+/** JSON → table. An array of objects is the common case; an array of scalars becomes a single
+ *  `value` column; a lone object becomes a ONE-row table (the KPI-endpoint case). Throws only with a
+ *  human message the console shows verbatim. */
+export function parseJsonRows(body: string, rowsPath: string): { columns: string[]; rows: DataRow[] } {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(body);
+  } catch {
+    throw new Error("response is not valid JSON");
+  }
+  const at = atPath(doc, rowsPath);
+  if (at === undefined) throw new Error(`no data at path "${rowsPath}"`);
+  const records = Array.isArray(at) ? at.map((row) => flattenRow(row)) : [flattenRow(at)];
+  const table = tableFrom(records);
+  if (table.columns.length === 0) throw new Error("no fields found in the response");
+  return table;
+}
+
+/** Split one CSV line on commas, honouring "quoted, fields" and "" escapes. Never throws: an unclosed
+ *  quote simply swallows the rest of the line (better a long cell than a dropped row). */
+function splitCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          cell += '"';
+          i += 1;
+        } else quoted = false;
+      } else cell += ch;
+    } else if (ch === '"') {
+      quoted = true;
+    } else if (ch === ",") {
+      cells.push(cell);
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+  cells.push(cell);
+  return cells;
+}
+
+/** CSV → table. Row 1 is the header (blank/duplicate names get positional fallbacks). RAGGED rows are
+ *  the norm in the field: short rows are null-padded, long rows are truncated to the header — a row
+ *  is never dropped for being the wrong shape, and never rendered half-full. */
+export function parseCsv(body: string): { columns: string[]; rows: DataRow[] } {
+  const lines = body
+    .split(/\r\n|\n|\r/)
+    .filter((line) => line.trim() !== "");
+  if (lines.length === 0) throw new Error("the CSV is empty");
+  const header = splitCsvLine(lines[0]!).slice(0, MAX_DATA_COLUMNS);
+  const columns: string[] = [];
+  header.forEach((raw, i) => {
+    const name = raw.trim() || `column${i + 1}`;
+    columns.push(columns.includes(name) ? `${name}_${i + 1}` : name);
+  });
+  if (columns.length === 0) throw new Error("the CSV has no header row");
+
+  const rows: DataRow[] = [];
+  for (const line of lines.slice(1, MAX_DATA_ROWS + 1)) {
+    const cells = splitCsvLine(line);
+    const row: DataRow = {};
+    columns.forEach((column, i) => {
+      row[column] = i < cells.length ? coerceScalar(cells[i]!) : null;
+    });
+    rows.push(row);
+  }
+  return { columns, rows };
+}
+
+/** The auth a data source's SERVER-side fetch carries, resolved at request time from the POL-24
+ *  token cache. Held for the length of one fetch and never stored (D19's clean-at-rest rule). */
+export interface DataSourceAuth {
+  in: DataSourceAuthIn;
+  /** Query-parameter name (the profile's `tokenParam`), used when `in` is "query". */
+  param: string;
+  token: string;
+}
+
+/** One configured data source, as the poller needs it. */
+export interface DataSourceSpec {
+  id: string;
+  url: string;
+  format: DataSourceFormat;
+  pollSeconds: number;
+  rowsPath: string;
+}
+
+/** The poll health of one data source, denormalised into the console's DataSourceView. */
+export interface DataSourceHealth {
+  status: DataSourceStatus;
+  lastFetchedAt?: string;
+  lastError?: string;
+  rowCount: number;
+  columns: string[];
+  sample: DataRow[];
+}
+
 /** What the poller needs from the control plane — kept narrow so tests can stub it. */
 export interface PageDataControl {
   pageDataRequirements(): {
@@ -152,7 +365,14 @@ export interface PageDataControl {
     locations: Set<string>;
     sourcesByFeed: Map<string, Set<string>>;
     sourcesByLocation: Map<string, Set<string>>;
+    /** POL-99 — data-source ids bound by a page that is ON GLASS (assigned to ≥1 screen). */
+    dataSources: Set<string>;
+    sourcesByDataSource: Map<string, Set<string>>;
   };
+  /** POL-99 — every CONFIGURED data source (on glass or not): the poll specs + what health to keep. */
+  dataSourceSpecs(): DataSourceSpec[];
+  /** POL-99 — the CURRENT credential-profile token for a data source, resolved per fetch. */
+  dataSourceAuth(id: string): DataSourceAuth | undefined;
 }
 
 interface PageDataServiceOptions {
@@ -177,6 +397,19 @@ interface WeatherEntry {
   lastAttemptMs: number;
 }
 
+/** One data source's cache slot: the last-good table (which SURVIVES failures, flagged `stale`) plus
+ *  the last attempt/outcome. `data` absent + `lastError` set = the honest "never worked" case. */
+interface DataEntry {
+  data?: DataSet;
+  lastAttemptMs: number;
+  lastError?: string;
+}
+
+/** Did the VALUES change? (Cheap structural compare — `fetchedAt` always moves, so it can't be it.) */
+function sameRows(a: DataSet, b: DataSet): boolean {
+  return JSON.stringify(a.rows) === JSON.stringify(b.rows) && JSON.stringify(a.columns) === JSON.stringify(b.columns);
+}
+
 export class PageDataService implements PageDataProvider {
   private readonly control: PageDataControl;
   private readonly onChange: (sourceIds: Set<string>) => void;
@@ -193,6 +426,8 @@ export class PageDataService implements PageDataProvider {
   /** lower-cased location → geocoded coordinates, or null when the geocoder found nothing (also
    *  cached: retrying a typo every tick helps nobody). */
   private readonly geocode = new Map<string, { lat: number; lon: number; name: string } | null>();
+  /** POL-99 — data-source id → last-good table + last attempt/outcome. */
+  private readonly datasets = new Map<string, DataEntry>();
 
   private timer: ReturnType<typeof setInterval> | undefined;
   private ticking = false;
@@ -228,6 +463,54 @@ export class PageDataService implements PageDataProvider {
 
   weatherFor(location: string): PageWeatherData | undefined {
     return this.weather.get(location.trim().toLowerCase())?.data;
+  }
+
+  /** POL-99 — the last-good table for a data source (already carrying its `stale` flag), if the
+   *  poller ever got one. Absent = the elements bound to it draw their no-data tell. */
+  datasetFor(dataSourceId: string): DataSet | undefined {
+    return this.datasets.get(dataSourceId)?.data;
+  }
+
+  /** POL-99 — poll health for the console (per configured source). Unattempted = "pending". */
+  dataSourceHealth(dataSourceId: string): DataSourceHealth {
+    const entry = this.datasets.get(dataSourceId);
+    const rows = entry?.data?.rows ?? [];
+    const status: DataSourceStatus = !entry
+      ? "pending"
+      : entry.lastError === undefined
+        ? "ok"
+        : entry.data
+          ? "stale"
+          : "error";
+    return {
+      status,
+      ...(entry?.data ? { lastFetchedAt: entry.data.fetchedAt } : {}),
+      ...(entry?.lastError ? { lastError: entry.lastError } : {}),
+      rowCount: rows.length,
+      columns: entry?.data?.columns ?? [],
+      sample: rows.slice(0, SAMPLE_ROWS),
+    };
+  }
+
+  /**
+   * POL-99 — fetch ONE data source right now, regardless of cadence or whether a page shows it: the
+   * console's "Test" button and the Studio's binding picker (which needs field names for an endpoint
+   * that is not yet on any wall). The result is cached like any poll, so testing also warms the wall.
+   */
+  async testDataSource(spec: DataSourceSpec): Promise<{ ok: true; data: DataSet } | { ok: false; error: string }> {
+    const result = await this.fetchDataSet(spec);
+    const now = Date.now();
+    if (result.ok) {
+      this.datasets.set(spec.id, { data: result.data, lastAttemptMs: now });
+      return result;
+    }
+    const previous = this.datasets.get(spec.id)?.data;
+    this.datasets.set(spec.id, {
+      ...(previous ? { data: { ...previous, stale: true } } : {}),
+      lastAttemptMs: now,
+      lastError: result.error,
+    });
+    return result;
   }
 
   // ── The poll loop ────────────────────────────────────────────────────────────
@@ -272,16 +555,98 @@ export class PageDataService implements PageDataProvider {
         }
       }
 
+      // POL-99 — data sources: poll ONLY those a page on glass actually binds (an endpoint nobody
+      // shows costs nothing), each on its OWN cadence. A failure keeps the last-good table and flips
+      // it to `stale`, which is itself a change worth pushing: the wall must gain its stale tell.
+      const specs = this.control.dataSourceSpecs();
+      for (const spec of specs) {
+        if (!req.dataSources.has(spec.id)) continue;
+        const entry = this.datasets.get(spec.id);
+        const dueMs = Math.max(0, spec.pollSeconds) * 1000;
+        if (entry && now - entry.lastAttemptMs < dueMs) continue;
+
+        const result = await this.fetchDataSet(spec);
+        const previous = this.datasets.get(spec.id)?.data;
+        if (result.ok) {
+          this.datasets.set(spec.id, { data: result.data, lastAttemptMs: now });
+          if (!previous || previous.stale || !sameRows(previous, result.data)) {
+            for (const id of req.sourcesByDataSource.get(spec.id) ?? []) changed.add(id);
+          }
+        } else {
+          this.log?.warn(
+            { event: "page-data.dataset", dataSourceId: spec.id, err: result.error },
+            "data source poll failed",
+          );
+          this.datasets.set(spec.id, {
+            ...(previous ? { data: { ...previous, stale: true } } : {}),
+            lastAttemptMs: now,
+            lastError: result.error,
+          });
+          // Newly stale (or newly empty) → re-push so the wall shows the tell instead of pretending.
+          if (previous && !previous.stale) {
+            for (const id of req.sourcesByDataSource.get(spec.id) ?? []) changed.add(id);
+          }
+        }
+      }
+
       // Drop cache entries nothing requires any more (page unassigned/deleted) so memory is bounded
       // by what is on air. Geocode results stay — they are tiny and re-assigning is common.
       const wantedFeeds = new Set([...req.feeds].map(normalizeFeedUrl));
       for (const url of this.feeds.keys()) if (!wantedFeeds.has(url)) this.feeds.delete(url);
       const wantedLocations = new Set([...req.locations].map((l) => l.trim().toLowerCase()));
       for (const key of this.weather.keys()) if (!wantedLocations.has(key)) this.weather.delete(key);
+      // Dataset health outlives "on glass" (the console shows it for every CONFIGURED source) but a
+      // DELETED source's cache goes.
+      const configured = new Set(specs.map((s) => s.id));
+      for (const id of this.datasets.keys()) if (!configured.has(id)) this.datasets.delete(id);
 
       if (changed.size > 0) this.onChange(changed);
     } finally {
       this.ticking = false;
+    }
+  }
+
+  /**
+   * POL-99 — one data-source fetch: credential-stamped (POL-24 token, at REQUEST time — never stored),
+   * timeout-bounded, and normalised to the contract's table. Every failure — transport, timeout, a
+   * 500, unparseable body, an empty table — comes back as a HUMAN message, which becomes the console's
+   * health line and (via last-good + `stale`) the wall's tell.
+   */
+  private async fetchDataSet(spec: DataSourceSpec): Promise<{ ok: true; data: DataSet } | { ok: false; error: string }> {
+    const auth = this.control.dataSourceAuth(spec.id);
+    let url = spec.url;
+    const headers: Record<string, string> = { "user-agent": "polyptic-server (data-source poller)" };
+    if (auth?.in === "header") headers.authorization = `Bearer ${auth.token}`;
+    if (auth?.in === "query") {
+      try {
+        const parsed = new URL(spec.url);
+        parsed.searchParams.set(auth.param, auth.token);
+        url = parsed.toString();
+      } catch {
+        // The URL was validated at the edge; if it somehow won't parse, fetch it unstamped and let
+        // the endpoint's own 401 be the (visible) failure.
+      }
+    }
+
+    let body: string;
+    try {
+      const res = await this.fetchFn(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), headers });
+      if (!res.ok) return { ok: false, error: `endpoint returned HTTP ${res.status}` };
+      body = await res.text();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: /timed out|timeout|abort/i.test(message) ? "endpoint timed out" : message };
+    }
+
+    try {
+      const table = spec.format === "csv" ? parseCsv(body) : parseJsonRows(body, spec.rowsPath);
+      if (table.rows.length === 0) return { ok: false, error: "the endpoint returned no rows" };
+      return {
+        ok: true,
+        data: { columns: table.columns, rows: table.rows, fetchedAt: new Date().toISOString(), stale: false },
+      };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 

@@ -199,6 +199,59 @@ export type PlaylistSurface = z.infer<typeof PlaylistSurface>;
 export const PageAspect = z.enum(["16:9", "9:16"]);
 export type PageAspect = z.infer<typeof PageAspect>;
 
+// ── Data bindings (POL-99) ───────────────────────────────────────────────────
+//
+// A DATA SOURCE is a JSON/CSV endpoint the SERVER polls (once, for the whole fleet — see
+// PageDataService) and normalises to a TABLE: an ordered column list plus rows of scalars. A page
+// element then BINDS to a cell of that table.
+//
+// The binding language is deliberately tiny and TOTAL — three fields, no expressions, no filters, no
+// arithmetic, nothing that can throw:
+//
+//     { dataSourceId, field, row }   →   dataset[dataSourceId].rows[row][field]
+//
+// Every lookup is a plain map/array index, so resolution has exactly two outcomes: a value, or
+// NOTHING. "Nothing" is a first-class render state (the elements draw a visible em-dash + a
+// no-data tell), never a blank element and never a crash — a binding that names a field the
+// endpoint stopped sending must be OBVIOUS on the wall, not invisible (D78's spirit).
+//
+// Anything richer (filters, joins, computed columns) belongs in the endpoint, not here: the
+// endpoint's owner can express it in their own language, and we stay vendor-neutral.
+
+export const DataSourceFormat = z.enum(["json", "csv"]);
+export type DataSourceFormat = z.infer<typeof DataSourceFormat>;
+
+/** A normalised cell. Endpoint values that are neither string nor number (objects, arrays, booleans)
+ *  are stringified by the poller; absent/undefined cells become null. */
+export const DataValue = z.union([z.string(), z.number(), z.null()]);
+export type DataValue = z.infer<typeof DataValue>;
+
+/** One normalised row: EVERY column of the dataset is present (missing cells are null), so a
+ *  renderer can never paint a half-filled row. */
+export const DataRow = z.record(z.string(), DataValue);
+export type DataRow = z.infer<typeof DataRow>;
+
+/** One cell of one data source's table. `row` is 0-based (a KPI reads row 0 of a one-row endpoint). */
+export const DataBinding = z.object({
+  dataSourceId: z.string().min(1).max(64),
+  field: z.string().min(1).max(120),
+  row: z.number().int().min(0).max(999).default(0),
+});
+export type DataBinding = z.infer<typeof DataBinding>;
+
+/** The poller's last-good snapshot of one data source, shipped inside `PageSurface.data.datasets`
+ *  keyed by DATA SOURCE id (not element id — N elements bound to one source share one payload).
+ *  `stale` means "the last poll failed; these are the previous values" — the wall keeps showing them
+ *  with a visible tell rather than blanking (stale-with-a-tell beats blank). */
+export const DataSet = z.object({
+  columns: z.array(z.string()),
+  rows: z.array(DataRow),
+  /** When these rows were actually fetched (NOT when they were sent). */
+  fetchedAt: z.string(),
+  stale: z.boolean().default(false),
+});
+export type DataSet = z.infer<typeof DataSet>;
+
 /** A percent coordinate within the page (elements are placed in % so pages are resolution-free). */
 const PagePercent = z.number().min(0).max(100);
 
@@ -316,6 +369,79 @@ export const PageCountdownElement = PageElementBase.extend({
   }),
 });
 
+// ── Data-bound elements (POL-99) ─────────────────────────────────────────────
+// All four read from `PageSurface.data.datasets` (server-polled, last-good). None of them fetches
+// anything: the player never talks to a data endpoint, so 50 screens are 1 request, not 50.
+
+/** One bound value as text — the smallest possible data element ("Sheffield: £4.20"). */
+export const PageDataTextElement = PageElementBase.extend({
+  kind: z.literal("data-text"),
+  props: z.object({
+    binding: DataBinding.optional(),
+    prefix: z.string().max(40).default(""),
+    suffix: z.string().max(40).default(""),
+    /** Point size at 1080p-equivalent scale (as `text`). */
+    size: z.number().min(14).max(120).default(40),
+    color: z.string().max(32).default("#fafafa"),
+    align: z.enum(["left", "center", "right"]).default("left"),
+  }),
+});
+
+/** A big number with a label, an optional delta column, and threshold colouring. `warn`/`bad` are
+ *  compared against the bound NUMBER; `worseWhen` says which side of them is bad. */
+export const PageKpiElement = PageElementBase.extend({
+  kind: z.literal("kpi"),
+  props: z.object({
+    binding: DataBinding.optional(),
+    label: z.string().max(60).default(""),
+    unit: z.string().max(12).default(""),
+    /** A second column of the SAME row rendered as a delta (e.g. "change_pct"). */
+    deltaField: z.string().max(120).default(""),
+    warn: z.number().optional(),
+    bad: z.number().optional(),
+    worseWhen: z.enum(["above", "below"]).default("above"),
+  }),
+});
+
+/** Rows of the bound data source as a table — the menus/rosters/leaderboards case. A row is stamped
+ *  whole from the poller's normalised snapshot, so a partially-fetched row is unrepresentable. */
+export const PageTableElement = PageElementBase.extend({
+  kind: z.literal("table"),
+  props: z.object({
+    dataSourceId: z.string().max(64).default(""),
+    /** Columns to show, in order. Empty = the dataset's own first columns (up to 6). */
+    columns: z
+      .array(
+        z.object({
+          field: z.string().min(1).max(120),
+          label: z.string().max(60).default(""),
+          align: z.enum(["left", "right"]).default("left"),
+        }),
+      )
+      .max(8)
+      .default([]),
+    rows: z.number().int().min(1).max(24).default(8),
+    header: z.boolean().default(true),
+  }),
+});
+
+/** A static SVG chart, re-rendered on every push. No canvas, no animation, no opacity/transform
+ *  tricks — D66-safe on the software-rendered fallback boxes. */
+export const PageChartElement = PageElementBase.extend({
+  kind: z.literal("chart"),
+  props: z.object({
+    dataSourceId: z.string().max(64).default(""),
+    /** The numeric column plotted. */
+    field: z.string().max(120).default(""),
+    /** Optional column for the x-axis labels (bar chart only; blank = row index). */
+    labelField: z.string().max(120).default(""),
+    type: z.enum(["line", "bar", "spark"]).default("line"),
+    color: z.string().max(32).default("#3b82f6"),
+    /** Cap on the number of rows plotted (from the top of the dataset). */
+    points: z.number().int().min(2).max(60).default(20),
+  }),
+});
+
 export const PageElement = z.discriminatedUnion("kind", [
   PageEmbedElement,
   PageTickerElement,
@@ -327,6 +453,10 @@ export const PageElement = z.discriminatedUnion("kind", [
   PageWeatherElement,
   PageQrElement,
   PageCountdownElement,
+  PageDataTextElement,
+  PageKpiElement,
+  PageTableElement,
+  PageChartElement,
 ]);
 export type PageElement = z.infer<typeof PageElement>;
 export type PageElementKind = PageElement["kind"];
@@ -385,6 +515,9 @@ export const PageData = z.object({
   images: z.record(z.string(), PageImageResolution).optional(),
   feeds: z.record(z.string(), PageFeedData).optional(),
   weather: z.record(z.string(), PageWeatherData).optional(),
+  /** POL-99 — the poller's last-good table per DATA SOURCE id (keyed by source, not element: many
+   *  elements bind to one source, and the wire should carry the rows once). */
+  datasets: z.record(z.string(), DataSet).optional(),
 });
 export type PageData = z.infer<typeof PageData>;
 
@@ -1147,6 +1280,93 @@ export const CredentialProfileView = CredentialProfile.extend({
 });
 export type CredentialProfileView = z.infer<typeof CredentialProfileView>;
 
+// ── Data sources (POL-99) ────────────────────────────────────────────────────
+//
+// A named JSON/CSV endpoint, polled SERVER-side on its own cadence and normalised to the table
+// `DataSet` above. Poll once, push to N screens — a player never fetches a data endpoint, so a wall
+// of 50 panels is one request per cadence, not 50 (and no player ever needs CORS or a credential).
+//
+// Auth reuses the POL-24 credential-profile seam: the profile's CURRENT token is applied to the
+// SERVER's fetch — as a bearer header by default, or in the profile's `tokenParam` query parameter
+// for endpoints that only take one. The token is fetched at request time and never persisted, never
+// broadcast, and never reaches a player (players receive VALUES, not the endpoint).
+
+/** How a data source's fetch carries its credential-profile token. */
+export const DataSourceAuthIn = z.enum(["header", "query"]);
+export type DataSourceAuthIn = z.infer<typeof DataSourceAuthIn>;
+
+export const DataSource = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(120),
+  url: z.string().url(),
+  format: DataSourceFormat,
+  /** Server-side poll cadence. Floor of 10s: this is wall signage, not a trading desk. */
+  pollSeconds: z.number().int().min(10).max(86400).default(60),
+  /** POL-24 profile whose token authenticates the SERVER's fetch. null = public endpoint. */
+  credentialProfileId: z.string().nullable().optional(),
+  /** How that token is applied (bearer header by default). */
+  authIn: DataSourceAuthIn.default("header"),
+  /** JSON only: dotted path to the array of rows inside the document ("data.items"). Empty = the
+   *  document itself is the array (or a single object → a one-row table). */
+  rowsPath: z.string().max(200).default(""),
+});
+export type DataSource = z.infer<typeof DataSource>;
+
+/** Poll health, as the console shows it. `stale` = last poll failed but last-good rows are still on
+ *  glass; `error` = failing with NOTHING to show (the elements are drawing their no-data tell). */
+export const DataSourceStatus = z.enum(["ok", "stale", "error", "pending"]);
+export type DataSourceStatus = z.infer<typeof DataSourceStatus>;
+
+/** A data source plus its live poll health and a small sample — what the Studio's binding picker
+ *  offers as field names, and what the console's health strip reads. Never a credential. */
+export const DataSourceView = DataSource.extend({
+  status: DataSourceStatus,
+  lastFetchedAt: z.string().optional(),
+  /** The last failure, verbatim (status stale/error). */
+  lastError: z.string().optional(),
+  rowCount: z.number().int().nonnegative(),
+  columns: z.array(z.string()),
+  /** The first few rows — the binding picker's preview. */
+  sample: z.array(DataRow),
+  /** How many page sources bind to this data source (drives the delete guard). */
+  inUseBy: z.number().int().nonnegative(),
+});
+export type DataSourceView = z.infer<typeof DataSourceView>;
+
+export const CreateDataSourceBody = z.object({
+  name: z.string().min(1).max(120),
+  url: z.string().url(),
+  format: DataSourceFormat,
+  pollSeconds: z.number().int().min(10).max(86400).optional(),
+  credentialProfileId: z.string().nullable().optional(),
+  authIn: DataSourceAuthIn.optional(),
+  rowsPath: z.string().max(200).optional(),
+});
+export type CreateDataSourceBody = z.infer<typeof CreateDataSourceBody>;
+
+export const UpdateDataSourceBody = z.object({
+  name: z.string().min(1).max(120).optional(),
+  url: z.string().url().optional(),
+  format: DataSourceFormat.optional(),
+  pollSeconds: z.number().int().min(10).max(86400).optional(),
+  credentialProfileId: z.string().nullable().optional(),
+  authIn: DataSourceAuthIn.optional(),
+  rowsPath: z.string().max(200).optional(),
+});
+export type UpdateDataSourceBody = z.infer<typeof UpdateDataSourceBody>;
+
+/** Result of POST /data-sources/:id/test — one fetch NOW, so the operator sees the endpoint's real
+ *  answer (and the Studio gets column names for an endpoint no page is showing yet). */
+export const DataSourceTestResult = z.object({
+  ok: z.boolean(),
+  columns: z.array(z.string()).default([]),
+  rowCount: z.number().int().nonnegative().default(0),
+  sample: z.array(DataRow).default([]),
+  /** The failure, verbatim (failure only). */
+  error: z.string().optional(),
+});
+export type DataSourceTestResult = z.infer<typeof DataSourceTestResult>;
+
 /** A reusable, named entry in the content LIBRARY. A screen or video wall is assigned a source by id;
  *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
  *  media served from a disk volume (an upload becomes a source whose url points at the media route).
@@ -1369,6 +1589,7 @@ export const ServerToAdminState = z.object({
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  dataSources: z.array(DataSourceView).optional(), // POL-99 — polled JSON/CSV endpoints + poll health; optional = back-compat
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;

@@ -11,6 +11,7 @@ import {
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateDataSourceBody,
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
@@ -23,12 +24,15 @@ import {
   SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateDataSourceBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type {
   ContentSource,
   CredentialProfileTestResult,
   CredentialProfileView,
+  DataSourceTestResult,
+  DataSourceView,
   Scene,
   VideoWall,
 } from "@polyptic/protocol";
@@ -430,6 +434,43 @@ export function deleteCredentialProfile(profileId: string): Promise<unknown> {
 /** POST /api/v1/credential-profiles/:id/test — force a token exchange NOW; the IdP's live answer. */
 export function testCredentialProfile(profileId: string): Promise<CredentialProfileTestResult> {
   return send("POST", `/credential-profiles/${encodeURIComponent(profileId)}/test`) as Promise<CredentialProfileTestResult>;
+}
+
+// ── Data sources (POL-99) ────────────────────────────────────────────────────
+// JSON/CSV endpoints the SERVER polls for the whole fleet. Every response is a DataSourceView
+// (config + live poll health + a sample of the rows) — never a credential.
+
+/** POST /api/v1/data-sources — create a source; the server fetches it once immediately. */
+export async function createDataSource(body: CreateDataSourceBody): Promise<DataSourceView | undefined> {
+  const res = await send<{ dataSource?: DataSourceView }>(
+    "POST",
+    "/data-sources",
+    CreateDataSourceBody.parse(body),
+  );
+  return res?.dataSource;
+}
+
+/** PATCH /api/v1/data-sources/:id — partial update; the server re-fetches under the new config. */
+export async function updateDataSource(
+  id: string,
+  body: UpdateDataSourceBody,
+): Promise<DataSourceView | undefined> {
+  const res = await send<{ dataSource?: DataSourceView }>(
+    "PATCH",
+    `/data-sources/${encodeURIComponent(id)}`,
+    UpdateDataSourceBody.parse(body),
+  );
+  return res?.dataSource;
+}
+
+/** DELETE /api/v1/data-sources/:id — 409 (in-use) while any page binds it. */
+export function deleteDataSource(id: string): Promise<unknown> {
+  return send("DELETE", `/data-sources/${encodeURIComponent(id)}`);
+}
+
+/** POST /api/v1/data-sources/:id/test — one fetch NOW: the columns + a sample, or the failure. */
+export function testDataSource(id: string): Promise<DataSourceTestResult> {
+  return send("POST", `/data-sources/${encodeURIComponent(id)}/test`) as Promise<DataSourceTestResult>;
 }
 
 // ── Media uploads (Phase 7) ──────────────────────────────────────────────────

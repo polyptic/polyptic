@@ -393,6 +393,7 @@ registerRestRoutes(
   presence,
   shellRelay,
   devtoolsRelay,
+  pageData,
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);

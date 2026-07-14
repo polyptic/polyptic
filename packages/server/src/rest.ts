@@ -36,6 +36,7 @@ import {
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateDataSourceBody,
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
@@ -58,6 +59,7 @@ import {
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateDataSourceBody,
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
@@ -65,6 +67,7 @@ import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
+import type { PageDataService } from "./page-data";
 
 import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
@@ -109,6 +112,9 @@ const SurfacesBody = z.object({ surfaces: z.array(Surface) });
 const DemoWebBody = z.object({ screenId: z.string().min(1), url: z.string().url() });
 const RejectBody = z.object({ reason: z.string().optional() });
 
+/** Params for the POL-99 data-source routes. */
+const DataSourceParams = z.object({ id: z.string().min(1) });
+
 export function registerRestRoutes(
   fastify: FastifyInstance,
   control: ControlPlane,
@@ -123,7 +129,17 @@ export function registerRestRoutes(
   presence: Presence,
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
+  /** POL-99 — the page-data poller, for the data-source "test" fetch (and its cache warm-up). */
+  pageData: PageDataService,
 ): void {
+  /** POL-99 — re-push every screen showing a page bound to this data source (an operator's edit or a
+   *  successful test must reach the wall NOW, not on the next poll cadence — D5's "instant"). */
+  function pushDataSourceSlices(dataSourceId: string): void {
+    for (const slice of control.slicesShowingDataSource(dataSourceId)) {
+      pushRender(slice.screenId, slice);
+    }
+  }
+
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
       t: "server/render",
@@ -1443,6 +1459,132 @@ export function registerRestRoutes(
       ok: result.ok,
       ...(result.expiresIn !== undefined ? { expiresIn: result.expiresIn } : {}),
       ...(result.error !== undefined ? { error: result.error } : {}),
+    };
+  });
+
+
+  // ── POL-99 routes (data sources — polled JSON/CSV endpoints) ─────────────────
+  //
+  // CRUD over the endpoints the SERVER polls for the whole fleet (never a player: poll once, push to
+  // N screens). A data source holds NO credential of its own — it points at a POL-24 profile, whose
+  // current token is applied to the server's fetch at request time. /test forces one fetch NOW and
+  // returns the columns + a small sample: the console's health check AND how the Studio's binding
+  // picker learns the field names of an endpoint no wall is showing yet.
+
+  // GET /api/v1/data-sources -> DataSourceView[] (config + live poll health + sample rows)
+  fastify.get("/api/v1/data-sources", async () => control.getDataSourceViews());
+
+  // POST /api/v1/data-sources -> View (201)
+  fastify.post("/api/v1/data-sources", async (request, reply) => {
+    const body = CreateDataSourceBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const created = await control.createDataSource(body.data);
+    if ("error" in created) {
+      return reply.code(404).send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
+    }
+    fastify.log.info(
+      { event: "data-source.create", dataSourceId: created.id, name: created.name },
+      "data source created",
+    );
+    // Fetch once immediately: the operator sees whether the endpoint works before leaving the form.
+    await pageData.testDataSource({
+      id: created.id,
+      url: created.url,
+      format: created.format,
+      pollSeconds: created.pollSeconds,
+      rowsPath: created.rowsPath,
+    });
+    broadcaster.broadcast();
+    const view = control.getDataSourceViews().find((v) => v.id === created.id);
+    return reply.code(201).send({ ok: true, dataSource: view });
+  });
+
+  // PATCH /api/v1/data-sources/:id -> View
+  fastify.patch("/api/v1/data-sources/:id", async (request, reply) => {
+    const params = DataSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = UpdateDataSourceBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const updated = await control.updateDataSource(params.data.id, body.data);
+    if ("error" in updated) {
+      return updated.error === "unknown-source"
+        ? reply.code(404).send({ error: `unknown data source: ${params.data.id}` })
+        : reply.code(404).send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
+    }
+    fastify.log.info(
+      { event: "data-source.update", dataSourceId: updated.id, name: updated.name },
+      "data source updated",
+    );
+    // Re-fetch under the new config, then re-push every wall showing a page bound to it: an operator
+    // fixing a URL should see the wall heal, not wait out a poll cadence (D5).
+    await pageData.testDataSource({
+      id: updated.id,
+      url: updated.url,
+      format: updated.format,
+      pollSeconds: updated.pollSeconds,
+      rowsPath: updated.rowsPath,
+    });
+    pushDataSourceSlices(updated.id);
+    broadcaster.broadcast();
+    const view = control.getDataSourceViews().find((v) => v.id === updated.id);
+    return { ok: true, dataSource: view };
+  });
+
+  // DELETE /api/v1/data-sources/:id -> 409 while any page binds it (unbind first)
+  fastify.delete("/api/v1/data-sources/:id", async (request, reply) => {
+    const params = DataSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const result = await control.deleteDataSource(params.data.id);
+    if (!result.ok) {
+      if (result.error === "unknown-source") {
+        return reply.code(404).send({ error: `unknown data source: ${params.data.id}` });
+      }
+      return reply.code(409).send({ error: "in-use", inUseBy: result.inUseBy ?? 0 });
+    }
+    fastify.log.info({ event: "data-source.delete", dataSourceId: params.data.id }, "data source deleted");
+    broadcaster.broadcast();
+    return { ok: true, dataSourceId: params.data.id };
+  });
+
+  // POST /api/v1/data-sources/:id/test -> one fetch NOW: columns + sample, or the failure verbatim.
+  fastify.post("/api/v1/data-sources/:id/test", async (request, reply) => {
+    const params = DataSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const source = control.getDataSource(params.data.id);
+    if (!source) {
+      return reply.code(404).send({ error: `unknown data source: ${params.data.id}` });
+    }
+    const result = await pageData.testDataSource({
+      id: source.id,
+      url: source.url,
+      format: source.format,
+      pollSeconds: source.pollSeconds,
+      rowsPath: source.rowsPath,
+    });
+    fastify.log.info(
+      { event: "data-source.test", dataSourceId: source.id, ok: result.ok },
+      "data source tested",
+    );
+    pushDataSourceSlices(source.id); // a successful test warms the cache — let the wall have it now
+    broadcaster.broadcast();
+    if (!result.ok) {
+      return { ok: false, columns: [], rowCount: 0, sample: [], error: result.error };
+    }
+    return {
+      ok: true,
+      columns: result.data.columns,
+      rowCount: result.data.rows.length,
+      sample: result.data.rows.slice(0, 5),
     };
   });
 

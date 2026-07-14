@@ -58,7 +58,7 @@ import { SurfaceProber } from "./surface-prober";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle } from "./surface-style";
-import { PageCanvas } from "@polyptic/elements";
+import { PageCanvas, unresolvedBindings } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
@@ -230,6 +230,13 @@ function handleMessage(msg: ServerToPlayerMessage): void {
           : msg.slice.surfaces.map((s) => `${s.id}=${s.type}`).join(" ")
       }`,
     );
+    // POL-99 — a data binding that cannot resolve draws a visible hole on glass; say WHY in the diag
+    // trail too, so a wall full of em-dashes is diagnosable from the server's log alone (POL-86/D78)
+    // instead of by guesswork.
+    for (const surface of msg.slice.surfaces) {
+      if (surface.type !== "page") continue;
+      for (const line of unresolvedBindings(surface.definition, surface.data)) diag(line);
+    }
     // POL-32 — start caching what this render shows, and remember it for an outage boot.
     mediaCache?.sync(wantedMedia());
     persistSlice();

@@ -24,6 +24,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import type {
   ContentSource,
+  DataSet,
   PageAspect,
   PageData,
   PageDefinition,
@@ -217,7 +218,27 @@ const studioData = computed<PageData>(() => {
     const source = store.sources.find((s) => s.id === el.props.sourceId);
     if (source?.kind === "image" && source.url) images[el.id] = { src: source.url };
   }
-  return Object.keys(images).length > 0 ? { images } : {};
+
+  // POL-99 — the Studio previews a data element against the SOURCE'S OWN last-fetched sample rows
+  // (the server keeps a handful with each data source), so the canvas shows the operator the actual
+  // numbers a binding will put on the wall — the anti-drift rule holds: the preview IS the renderer.
+  // A source that has never been fetched contributes nothing, and the element falls back to the
+  // shared generic sample so the layout still reads.
+  const datasets: Record<string, DataSet> = {};
+  for (const source of store.datasources) {
+    if (source.sample.length === 0) continue;
+    datasets[source.id] = {
+      columns: source.columns,
+      rows: source.sample,
+      fetchedAt: source.lastFetchedAt ?? "",
+      stale: false, // a stale tell belongs on the WALL, not in the editor
+    };
+  }
+
+  return {
+    ...(Object.keys(images).length > 0 ? { images } : {}),
+    ...(Object.keys(datasets).length > 0 ? { datasets } : {}),
+  };
 });
 
 /** The placeholder label PageElementView shows for an embed/image element in the studio. */
@@ -472,7 +493,7 @@ function setProp(key: string, value: unknown) {
 interface PropSpec {
   key: string;
   label?: string;
-  control: "text" | "select" | "range" | "color" | "toggle" | "note";
+  control: "text" | "select" | "range" | "color" | "toggle" | "note" | "binding" | "number" | "columns";
   value?: unknown;
   valueLabel?: string;
   options?: { v: string; t: string }[];
@@ -522,6 +543,12 @@ const propSpecs = computed<PropSpec[]>(() => {
     valueLabel: p[key] ? "On" : "Off",
   });
   const note = (n: string): PropSpec => ({ key: "note", control: "note", note: n });
+  const number = (label: string, key: string): PropSpec => ({
+    key,
+    label,
+    control: "number",
+    value: p[key],
+  });
 
   switch (el.kind) {
     case "embed":
@@ -588,9 +615,133 @@ const propSpecs = computed<PropSpec[]>(() => {
       return [text("Link", "url"), note("Encoded to SVG on the client — static, no network.")];
     case "countdown":
       return [text("Label", "label"), text("Target (HH:MM)", "target"), color("Colour", "color")];
+    // POL-99 — data-bound elements. The binding control is a source picker + a field picker fed by
+    // the source's LAST FETCHED columns, so an operator never types a field name from memory.
+    case "data-text":
+      return [
+        { key: "binding", label: "Binding", control: "binding" },
+        text("Prefix", "prefix"),
+        text("Suffix", "suffix"),
+        range("Size", "size", 14, 120, " px"),
+        select("Align", "align", [
+          { v: "left", t: "Left" },
+          { v: "center", t: "Centre" },
+          { v: "right", t: "Right" },
+        ]),
+        color("Colour", "color"),
+      ];
+    case "kpi":
+      return [
+        { key: "binding", label: "Binding", control: "binding" },
+        text("Label", "label"),
+        text("Unit", "unit"),
+        select("Delta field", "deltaField", [
+          { v: "", t: "None" },
+          ...boundColumns.value.map((c) => ({ v: c, t: c })),
+        ]),
+        number("Warn at", "warn"),
+        number("Bad at", "bad"),
+        select("Worse when", "worseWhen", [
+          { v: "above", t: "Above the threshold" },
+          { v: "below", t: "Below the threshold" },
+        ]),
+        note("Thresholds only colour a value that actually resolved — a missing number never reads as green."),
+      ];
+    case "table":
+      return [
+        select("Data source", "dataSourceId", dataSourceOptions.value),
+        { key: "columns", label: "Columns", control: "columns" },
+        range("Rows shown", "rows", 1, 24, ""),
+        toggle("Header row", "header"),
+        note("Rows arrive whole from one server-side snapshot — a half-rendered row is impossible."),
+      ];
+    case "chart":
+      return [
+        select("Data source", "dataSourceId", dataSourceOptions.value),
+        select("Value column", "field", boundColumns.value.map((c) => ({ v: c, t: c }))),
+        select("Label column", "labelField", [
+          { v: "", t: "Row number" },
+          ...boundColumns.value.map((c) => ({ v: c, t: c })),
+        ]),
+        select("Type", "type", [
+          { v: "line", t: "Line" },
+          { v: "bar", t: "Bar" },
+          { v: "spark", t: "Spark" },
+        ]),
+        range("Points", "points", 2, 60, ""),
+        color("Colour", "color"),
+        note("Drawn as static SVG on every push — no canvas, no animation (safe on every box)."),
+      ];
   }
   return [];
 });
+
+// ── POL-99 — binding pickers ──────────────────────────────────────────────────
+// Everything an operator needs to bind an element comes from the data source's LAST FETCH (columns +
+// sample rows the server keeps): pick a source, pick a field from a list, pick a row. No expressions,
+// no typing field names from memory.
+const dataSourceOptions = computed(() =>
+  store.datasources.map((d) => ({ v: d.id, t: `${d.name} — ${d.format.toUpperCase()} · ${d.rowCount} rows` })),
+);
+
+/** The data source the SELECTED element is bound to (if any). */
+const boundDataSourceId = computed(() => {
+  const el = selected.value;
+  if (!el) return "";
+  if (el.kind === "data-text" || el.kind === "kpi") return el.props.binding?.dataSourceId ?? "";
+  if (el.kind === "table" || el.kind === "chart") return el.props.dataSourceId;
+  return "";
+});
+
+/** Its columns, as the server last saw them — the field picker's options. */
+const boundColumns = computed(() =>
+  boundDataSourceId.value ? store.dataSourceColumns(boundDataSourceId.value) : [],
+);
+
+/** A couple of sample values, so the operator SEES what a binding will put on the wall. */
+const bindingPreview = computed<string>(() => {
+  const el = selected.value;
+  if (!el || (el.kind !== "data-text" && el.kind !== "kpi")) return "";
+  const binding = el.props.binding;
+  if (!binding?.dataSourceId || !binding.field) return "";
+  const source = store.dataSourceById(binding.dataSourceId);
+  const row = source?.sample[binding.row];
+  if (!row) return "no such row in the last fetch";
+  if (!(binding.field in row)) return "field missing from the last fetch";
+  const value = row[binding.field];
+  return value === null || value === undefined ? "—" : String(value);
+});
+
+/** Patch the selected element's binding (creating it on first pick). Total by construction: a binding
+ *  always carries all three fields, so it can never half-exist. */
+function setBinding(patch: { dataSourceId?: string; field?: string; row?: number }) {
+  const el = selected.value;
+  if (!el || (el.kind !== "data-text" && el.kind !== "kpi")) return;
+  const current = el.props.binding ?? { dataSourceId: "", field: "", row: 0 };
+  const next = { ...current, ...patch };
+  // Switching source invalidates the field: a name from the old endpoint would silently miss.
+  if (patch.dataSourceId !== undefined && patch.dataSourceId !== current.dataSourceId) next.field = "";
+  setProp("binding", next.dataSourceId && next.field ? next : { ...next });
+}
+
+/** Toggle one column of a TABLE element's authored column list (order = order clicked). */
+function toggleTableColumn(field: string) {
+  const el = selected.value;
+  if (!el || el.kind !== "table") return;
+  const columns = el.props.columns;
+  const existing = columns.find((c) => c.field === field);
+  setProp(
+    "columns",
+    existing
+      ? columns.filter((c) => c.field !== field)
+      : [...columns, { field, label: field, align: "left" as const }],
+  );
+}
+
+function tableColumnPicked(field: string): boolean {
+  const el = selected.value;
+  return el?.kind === "table" ? el.props.columns.some((c) => c.field === field) : false;
+}
 
 /** Sources an EMBED can frame: everything except pages (no pages-in-pages, by design). */
 const embeddableSourceOptions = computed(() =>
@@ -898,6 +1049,77 @@ function badgeText(el: PageElement): string {
               >
                 <span class="toggle-knob"></span>
               </button>
+              <!-- POL-99 — the binding picker: source, field (from its last fetch), row. -->
+              <div v-else-if="spec.control === 'binding'" class="binding">
+                <select
+                  class="field select"
+                  :value="boundDataSourceId"
+                  @change="setBinding({ dataSourceId: ($event.target as HTMLSelectElement).value })"
+                >
+                  <option value="">Pick a data source…</option>
+                  <option v-for="o in dataSourceOptions" :key="o.v" :value="o.v">{{ o.t }}</option>
+                </select>
+                <select
+                  class="field select"
+                  :disabled="!boundDataSourceId"
+                  :value="
+                    selected && (selected.kind === 'data-text' || selected.kind === 'kpi')
+                      ? (selected.props.binding?.field ?? '')
+                      : ''
+                  "
+                  @change="setBinding({ field: ($event.target as HTMLSelectElement).value })"
+                >
+                  <option value="">
+                    {{ boundColumns.length ? "Pick a field…" : "No fields yet — test the source" }}
+                  </option>
+                  <option v-for="c in boundColumns" :key="c" :value="c">{{ c }}</option>
+                </select>
+                <label class="binding-row">
+                  <span>Row</span>
+                  <input
+                    type="number"
+                    min="0"
+                    :disabled="!boundDataSourceId"
+                    :value="
+                      selected && (selected.kind === 'data-text' || selected.kind === 'kpi')
+                        ? (selected.props.binding?.row ?? 0)
+                        : 0
+                    "
+                    @change="setBinding({ row: Math.max(0, Number(($event.target as HTMLInputElement).value) || 0) })"
+                  />
+                </label>
+                <div v-if="bindingPreview" class="binding-preview">Now: {{ bindingPreview }}</div>
+              </div>
+              <input
+                v-else-if="spec.control === 'number'"
+                class="field"
+                type="number"
+                :value="spec.value ?? ''"
+                placeholder="—"
+                @change="
+                  setProp(
+                    spec.key,
+                    ($event.target as HTMLInputElement).value === ''
+                      ? undefined
+                      : Number(($event.target as HTMLInputElement).value),
+                  )
+                "
+              />
+              <div v-else-if="spec.control === 'columns'" class="col-picker">
+                <button
+                  v-for="c in boundColumns"
+                  :key="c"
+                  class="col-chip"
+                  :class="{ on: tableColumnPicked(c) }"
+                  @click="toggleTableColumn(c)"
+                >
+                  {{ c }}
+                </button>
+                <span v-if="!boundColumns.length" class="prop-note">
+                  Pick a data source (and test it) to choose columns. With none picked, the table
+                  shows the source's own first columns.
+                </span>
+              </div>
               <div v-else-if="spec.control === 'note'" class="prop-note">{{ spec.note }}</div>
             </div>
           </div>
@@ -1493,6 +1715,54 @@ function badgeText(el: PageElement): string {
 .toggle.on .toggle-knob {
   left: 19px;
 }
+/* POL-99 — binding picker + column chips */
+.binding {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.binding-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted2);
+}
+.binding-row input {
+  width: 68px;
+  padding: 5px 7px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--field-bg, transparent);
+  color: inherit;
+  font: inherit;
+}
+.binding-preview {
+  font-size: 11px;
+  color: var(--muted2);
+  background: var(--muted-bg);
+  border-radius: 7px;
+  padding: 6px 9px;
+}
+.col-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.col-chip {
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted2);
+  cursor: pointer;
+}
+.col-chip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .prop-note {
   font-size: 11px;
   color: var(--muted2);

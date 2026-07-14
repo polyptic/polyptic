@@ -23,6 +23,10 @@ export const ELEMENT_LIBRARY: ElementLibraryEntry[] = [
   { kind: "weather", name: "Weather", glyph: "☁", hint: "Local conditions via Open-Meteo" },
   { kind: "qr", name: "QR code", glyph: "▩", hint: "Static QR code, encoded client-side" },
   { kind: "countdown", name: "Countdown", glyph: "◔", hint: "Time to a target" },
+  { kind: "kpi", name: "KPI", glyph: "◆", hint: "One bound number, with a delta and threshold colour" },
+  { kind: "table", name: "Table", glyph: "▤", hint: "Rows of a data source — rosters, menus, leaderboards" },
+  { kind: "chart", name: "Chart", glyph: "◲", hint: "Line / bar / spark of a numeric column, as static SVG" },
+  { kind: "data-text", name: "Data text", glyph: "#", hint: "A single bound value as text" },
 ];
 
 export function libraryEntry(kind: PageElementKind): ElementLibraryEntry {
@@ -65,5 +69,39 @@ export function defaultElement(kind: PageElementKind, id: string): PageElement {
       return { id, kind, x: 0, y: 0, w: 9, h: 16, props: { url: "https://example.com" } };
     case "countdown":
       return { id, kind, x: 0, y: 0, w: 20, h: 12, props: { label: "Next shift change", target: "17:00", color: "#fafafa" } };
+    // POL-99 — data-bound drops start UNBOUND: the inspector's binding picker is the next step, and
+    // until it is used the element draws its "pick a data source" tell (never a blank box).
+    case "kpi":
+      return {
+        id,
+        kind,
+        x: 0,
+        y: 0,
+        w: 18,
+        h: 16,
+        props: { label: "KPI", unit: "", deltaField: "", worseWhen: "above" },
+      };
+    case "table":
+      return { id, kind, x: 0, y: 0, w: 36, h: 40, props: { dataSourceId: "", columns: [], rows: 8, header: true } };
+    case "chart":
+      return {
+        id,
+        kind,
+        x: 0,
+        y: 0,
+        w: 32,
+        h: 24,
+        props: { dataSourceId: "", field: "", labelField: "", type: "line", color: "#3b82f6", points: 20 },
+      };
+    case "data-text":
+      return {
+        id,
+        kind,
+        x: 0,
+        y: 0,
+        w: 24,
+        h: 10,
+        props: { prefix: "", suffix: "", size: 40, color: "#fafafa", align: "left" },
+      };
   }
 }
