@@ -64,13 +64,14 @@ import {
 import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
 
-import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
+import { MediaTooLargeError, ingestUpload, isFileTooLargeError, kindForMime, readField } from "./media";
 
 import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, Presence } from "./admin";
+import type { MediaProber } from "./media-probe";
 import type { MediaStore } from "./media";
 import type { TokenService } from "./tokens";
 
@@ -80,6 +81,9 @@ export interface MediaConfig {
   publicBase: string;
   /** Byte cap enforced on an upload (mirrors the multipart fileSize limit). */
   maxBytes: number;
+  /** POL-109 — the ingest prober (metadata + poster frames + codec validation). Behind the adapter
+   *  seam: this route knows only the interface, and a server with no toolchain still accepts uploads. */
+  prober: MediaProber;
 }
 
 const ScreenParams = z.object({ screenId: z.string().min(1) });
@@ -1489,6 +1493,27 @@ export function registerRestRoutes(
       throw err;
     }
 
+    // POL-109 — INGEST, before the file is allowed to become a library source: probe it, make its
+    // poster, and refuse a codec/container the wall browser provably cannot decode. A rejected upload
+    // is unlinked and never appears in the library — the whole point is that "it's in your library"
+    // means "it will show on a wall". A server with no toolchain accepts and warns (D114).
+    const ingest = await ingestUpload(mediaConfig.prober, media, record, mediaConfig.publicBase);
+    if (!ingest.ok) {
+      await media.deleteById(record.id);
+      fastify.log.info(
+        {
+          event: "media.rejected",
+          reason: ingest.reason,
+          mime: record.mime,
+          size: record.size,
+          name: originalName,
+        },
+        "media upload rejected by ingest",
+      );
+      activity.push("warn", `Upload rejected: ${name} — ${ingest.message}`);
+      return reply.code(415).send({ error: ingest.message, reason: ingest.reason });
+    }
+
     const url = `${mediaConfig.publicBase}/media/${record.id}`;
     const created = await control.createContentSource({ name, kind, url });
     if (!created.ok) {
@@ -1507,11 +1532,22 @@ export function registerRestRoutes(
         mime: record.mime,
         size: record.size,
         name: source.name,
+        probed: ingest.metadata.probed,
+        ...(ingest.metadata.durationSeconds !== undefined
+          ? { durationSeconds: ingest.metadata.durationSeconds }
+          : {}),
+        ...(ingest.metadata.videoCodec !== undefined ? { videoCodec: ingest.metadata.videoCodec } : {}),
       },
       "media uploaded",
     );
     broadcaster.broadcast();
-    return reply.code(201).send({ ok: true, source });
+    // The created source is re-read so it carries the ingest decoration (`media`) the console renders.
+    const decorated = control.getContentSource(source.id) ?? source;
+    return reply.code(201).send({
+      ok: true,
+      source: decorated,
+      ...(ingest.metadata.warning ? { warning: ingest.metadata.warning } : {}),
+    });
   });
 
   // ── Phase 3d routes (scenes) ──────────────────────────────────────────────────

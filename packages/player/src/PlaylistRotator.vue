@@ -50,6 +50,12 @@ function mediaSrc(entry: PlaylistEntry): string {
   return resolveMediaSrc(entry.url, props.serverHttpBase);
 }
 
+/** POL-109 — a video step's ingest poster frame, re-homed like any media URL (POL-5). Painted while
+ *  the step buffers, so an advance never shows black before the first decoded frame. */
+function posterSrc(entry: PlaylistEntry): string | undefined {
+  return entry.poster ? resolveMediaSrc(entry.poster, props.serverHttpBase) : undefined;
+}
+
 /** Loop policy for a video entry: a TIMED video replays until its slot ends; an untimed video that is
  *  the whole playlist just loops forever; an untimed video in a longer rotation must actually END to
  *  yield the screen. */
@@ -138,6 +144,7 @@ onUnmounted(clearTimer);
       :key="`video-${index}`"
       class="surface-media"
       :src="mediaSrc(current)"
+      :poster="posterSrc(current)"
       :style="entryStyle"
       autoplay
       playsinline

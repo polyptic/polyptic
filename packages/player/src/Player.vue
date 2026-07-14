@@ -495,6 +495,13 @@ function rehomeMediaSrc(src: string): string {
 function isInteractive(surface: Surface): boolean {
   return surface.type === "web" ? surface.interactive : false;
 }
+/** POL-109 — the ingest poster frame for a video surface, re-homed like its src (POL-5). The <video>
+ *  paints it while the file buffers: the black gap between "surface arrives" and "first frame decodes"
+ *  is exactly the flash this ticket set out to remove. */
+function videoPoster(surface: Surface): string | undefined {
+  const raw = surface.type === "video" ? surface.poster : undefined;
+  return raw ? resolveMediaSrc(raw, SERVER_HTTP_BASE) : undefined;
+}
 function videoLoop(surface: Surface): boolean {
   return surface.type === "video" ? surface.loop : true;
 }
@@ -610,6 +617,7 @@ function connLabel(state: ConnState): string {
           :ref="(el) => bindEl(surface.id, el)"
           class="surface-media"
           :src="painted[surface.id]"
+          :poster="videoPoster(surface)"
           :style="mediaStyle(surface)"
           autoplay
           playsinline

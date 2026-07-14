@@ -1340,21 +1340,29 @@ export const useConsoleStore = defineStore("console", {
       file: File,
       name?: string,
       onProgress?: (fraction: number) => void,
-    ): Promise<{ ok: boolean; error?: string }> {
+    ): Promise<{ ok: boolean; error?: string; warning?: string }> {
       try {
-        await api.uploadMedia(file, name, onProgress);
-        return { ok: true };
+        // POL-109 — an accepted upload can still carry a caveat (an unprobeable file on a server with
+        // no media toolchain). The caller shows it as a note, not as a failure.
+        const result = await api.uploadMedia(file, name, onProgress);
+        return result.warning ? { ok: true, warning: result.warning } : { ok: true };
       } catch (err) {
         console.error("[console] uploadSource failed", err);
         if (err instanceof api.ApiError) {
           if (err.status === 413) return { ok: false, error: "File too large for upload." };
-          if (err.status === 415) {
-            return { ok: false, error: "Unsupported file type — upload an image or video." };
-          }
           const payloadMsg =
             err.payload && typeof err.payload === "object" && "error" in err.payload
               ? String((err.payload as { error: unknown }).error)
               : null;
+          // POL-109 — a 415 is now the INGEST verdict as often as it is a wrong file type, and the
+          // server's sentence already names the codec and says what to do about it. Show it verbatim;
+          // only fall back to the generic line when the server sent nothing.
+          if (err.status === 415) {
+            return {
+              ok: false,
+              error: payloadMsg ?? "Unsupported file type — upload an image or video.",
+            };
+          }
           return { ok: false, error: payloadMsg ?? "Upload failed. Please try again." };
         }
         return { ok: false, error: "Upload failed. Please try again." };

@@ -438,7 +438,10 @@ export function testCredentialProfile(profileId: string): Promise<CredentialProf
  * POST /api/v1/media — upload an image or video file to the server's disk volume. The server saves
  * it under MEDIA_DIR, records it, and mints a ContentSource (kind image|video) whose `url` is an
  * absolute URL to the ungated GET /media/:id serve route, so a player on another host can fetch it.
- * It then returns `{ source }`; we hand back the created ContentSource for the caller to surface.
+ * It then returns `{ source, warning? }`; we hand back both — POL-109's ingest may ACCEPT a file and
+ * still have something to say about it (e.g. this server has no media toolchain, so nothing about the
+ * file could be checked). A REJECTED file never gets here: it comes back as a 415 whose `error` is the
+ * operator-facing sentence (the codec named, the fix stated), which the store surfaces verbatim.
  *
  * This deliberately does NOT go through `send()`: the body is multipart/form-data (a FormData with
  * the file + optional display name), not JSON, and we want upload PROGRESS, which `fetch` can't
@@ -455,7 +458,7 @@ export function uploadMedia(
   file: File,
   name?: string,
   onProgress?: (fraction: number) => void,
-): Promise<ContentSource> {
+): Promise<{ source: ContentSource; warning?: string }> {
   const form = new FormData();
   // The server generates the stored id + derives the extension from the validated mime; the original
   // filename is sent only as a fallback display name (never used to build the on-disk path).
@@ -465,7 +468,7 @@ export function uploadMedia(
   if (trimmed) form.append("name", trimmed);
   form.append("file", file, file.name);
 
-  return new Promise<ContentSource>((resolve, reject) => {
+  return new Promise<{ source: ContentSource; warning?: string }>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${BASE}/media`);
     xhr.withCredentials = true;
@@ -487,10 +490,11 @@ export function uploadMedia(
       }
 
       if (xhr.status >= 200 && xhr.status < 300) {
-        const source = (payload as { source?: ContentSource } | undefined)?.source;
+        const body = payload as { source?: ContentSource; warning?: string } | undefined;
+        const source = body?.source;
         if (source) {
           onProgress?.(1);
-          resolve(source);
+          resolve(body?.warning ? { source, warning: body.warning } : { source });
         } else {
           reject(new ApiError(xhr.status, "POST /media -> missing source in response", payload));
         }

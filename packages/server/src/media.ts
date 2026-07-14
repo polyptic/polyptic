@@ -20,9 +20,14 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 
-import type { ContentKind } from "@polyptic/protocol";
+import { MediaMetadata as MediaMetadataSchema } from "@polyptic/protocol";
+
+import { POSTER_WIDTH, THUMBNAIL_WIDTH, assessPlayability } from "./media-probe";
+
+import type { ContentKind, MediaMetadata, MediaRejectionReason } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
 import type { Readable } from "node:stream";
+import type { MediaProber } from "./media-probe";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mime → extension + kind. We accept ANY image/* or video/*; the table gives a friendly extension for
@@ -109,6 +114,11 @@ export interface MediaRecord {
   originalName: string;
   /** The ContentSource this upload backs, once created (null between save and attach). */
   sourceId: string | null;
+  /** POL-109 — what ingest probed (absent on records written before the pipeline existed, and on a
+   *  server with no prober; consumers always treat it as optional). */
+  metadata?: MediaMetadata;
+  /** POL-109 — the generated poster/thumbnail, relative to MEDIA_DIR (`<id>.poster.jpg` / `.thumb.png`). */
+  poster?: string;
 }
 
 interface SidecarShape {
@@ -145,6 +155,9 @@ export class MediaStore {
       if (parsed && parsed.records && typeof parsed.records === "object") {
         for (const [id, rec] of Object.entries(parsed.records)) {
           if (rec && typeof rec.filename === "string" && typeof rec.mime === "string") {
+            // POL-109 — the ingest half is parsed through the contract: a sidecar written by an older
+            // build simply has none of it, and a hand-edited one can't inject a bad shape.
+            const metadata = MediaMetadataSchema.safeParse(rec.metadata);
             this.records.set(id, {
               id,
               filename: rec.filename,
@@ -152,6 +165,8 @@ export class MediaStore {
               size: typeof rec.size === "number" ? rec.size : 0,
               originalName: typeof rec.originalName === "string" ? rec.originalName : id,
               sourceId: typeof rec.sourceId === "string" ? rec.sourceId : null,
+              ...(metadata.success ? { metadata: metadata.data } : {}),
+              ...(typeof rec.poster === "string" ? { poster: rec.poster } : {}),
             });
           }
         }
@@ -246,16 +261,55 @@ export class MediaStore {
     await this.persist();
   }
 
-  /** Unlink an upload (file + sidecar record) by media id. Returns true if it existed. */
+  /** POL-109 — record what ingest learned (and the still it generated) against an upload. */
+  async setIngest(id: string, metadata: MediaMetadata, posterFilename?: string): Promise<void> {
+    const rec = this.records.get(id);
+    if (!rec) return;
+    rec.metadata = metadata;
+    if (posterFilename) rec.poster = posterFilename;
+    else delete rec.poster;
+    await this.persist();
+  }
+
+  /** POL-109 — where ingest should WRITE a still (absolute, traversal-safe). The name is generated
+   *  from the media id, never from anything the client sent. */
+  posterTargetPath(filename: string): string {
+    return this.safeJoin(filename);
+  }
+
+  /** POL-109 — absolute, traversal-safe path of an upload's poster/thumbnail, if one was generated. */
+  posterPathFor(id: string): string | undefined {
+    const rec = this.records.get(id);
+    if (!rec?.poster) return undefined;
+    return this.safeJoin(rec.poster);
+  }
+
+  /**
+   * POL-109 — the probed metadata behind a content URL, if that URL is one of OUR uploads. This is the
+   * seam the control plane reads at send/read time to decorate a ContentSource (`media`) and to hand
+   * the player a video's poster: the catalogue stays the single source of truth and the DB schema is
+   * untouched. A foreign URL (a linked image on someone else's server) returns undefined — we never
+   * probed it, so we claim nothing about it.
+   */
+  metadataForUrl(url: string): MediaMetadata | undefined {
+    const id = mediaIdFromUrl(url);
+    if (!id) return undefined;
+    return this.records.get(id)?.metadata;
+  }
+
+  /** Unlink an upload (file + poster + sidecar record) by media id. Returns true if it existed. */
   async deleteById(id: string): Promise<boolean> {
     const rec = this.records.get(id);
     if (!rec) return false;
     this.records.delete(id);
     await this.persist();
-    try {
-      await rm(this.safeJoin(rec.filename), { force: true });
-    } catch {
-      // Best-effort unlink — the record is already gone from the catalogue.
+    for (const name of [rec.filename, rec.poster]) {
+      if (!name) continue;
+      try {
+        await rm(this.safeJoin(name), { force: true });
+      } catch {
+        // Best-effort unlink — the record is already gone from the catalogue.
+      }
     }
     return true;
   }
@@ -267,6 +321,131 @@ export class MediaStore {
     }
     return false;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POL-109 — the INGEST pipeline. Runs between "the bytes are on disk" and "it is a ContentSource":
+// probe → validate → still. Its verdict decides whether the upload becomes a library source at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The media id inside one of our own serve URLs (`…/media/<id>` or `…/media/<id>/poster`), else null. */
+export function mediaIdFromUrl(url: string): string | null {
+  const m = /\/media\/([a-f0-9]{8,})(?:\/|$|\?)/i.exec(url);
+  return m?.[1] ?? null;
+}
+
+/** The ingest verdict: a file becomes a source (with what we learned), or it never lands in the library. */
+export type IngestResult =
+  | { ok: true; metadata: MediaMetadata }
+  | { ok: false; reason: MediaRejectionReason; message: string };
+
+/** The sentence an operator sees when the server has no probing toolchain (D114 — accept, don't guess). */
+const UNPROBED_WARNING =
+  "This server has no media toolchain installed, so the file couldn't be checked — if a screen shows " +
+  "it as black, the file's codec is the likely cause.";
+
+/** How far into a video the poster frame is taken (early, but past the black/fade-in first frame). */
+const POSTER_SEEK_SECONDS = 1;
+
+/**
+ * Ingest one saved upload. Returns the metadata to record (and, when it made one, the poster's
+ * filename) — or a REJECTION, which the caller turns into a 415 and an unlink: a file we know the wall
+ * cannot play must not reach the library, because the library is a promise that a source will show.
+ *
+ * Degradation is the whole game here (D114):
+ *  · no prober on this host          → accept, `probed: false`, warning, no poster (images still get a
+ *                                      picture: their own url).
+ *  · prober present, file unreadable → for a VIDEO that is evidence of a broken file: reject. For an
+ *                                      IMAGE it is not (SVG, exotic formats a decoder skips but a
+ *                                      browser renders natively) — accept, and let the browser judge.
+ *  · prober present, codec hostile   → reject with the codec named.
+ */
+export async function ingestUpload(
+  prober: MediaProber,
+  media: MediaStore,
+  record: MediaRecord,
+  publicBase: string,
+): Promise<IngestResult> {
+  const kind = kindForMime(record.mime);
+  const ownUrl = `${publicBase}/media/${record.id}`;
+  const posterUrl = `${publicBase}/media/${record.id}/poster`;
+  const path = media.pathFor(record.id);
+
+  if (kind === null || path === undefined) {
+    // Unreachable (the route validated the mime and just saved the file) — but stay honest.
+    return { ok: true, metadata: { probed: false, warning: UNPROBED_WARNING } };
+  }
+
+  if (!(await prober.available())) {
+    const metadata: MediaMetadata = {
+      probed: false,
+      warning: UNPROBED_WARNING,
+      // An image is its own thumbnail when we can't downscale one — the library is never empty.
+      ...(kind === "image" ? { posterUrl: ownUrl } : {}),
+    };
+    // Recorded, not just returned: the catalogue is what the control plane reads to decorate the
+    // source, so "we know nothing about this file" has to be a REMEMBERED fact, not a lost one.
+    await media.setIngest(record.id, metadata);
+    return { ok: true, metadata };
+  }
+
+  const probe = await prober.probe(path);
+
+  if (kind === "video") {
+    if (probe === null) {
+      return {
+        ok: false,
+        reason: "undecodable",
+        message:
+          "This file couldn't be read as a video — it may be corrupt or not really a video file. " +
+          "Re-export it as MP4 (H.264 + AAC) and upload it again.",
+      };
+    }
+    const verdict = assessPlayability(probe);
+    if (!verdict.ok) return { ok: false, reason: verdict.reason, message: verdict.message };
+
+    const at = probe.durationSeconds !== undefined
+      ? Math.min(POSTER_SEEK_SECONDS, probe.durationSeconds / 2)
+      : POSTER_SEEK_SECONDS;
+    const posterName = `${record.id}.poster.jpg`;
+    const made = await prober.poster(path, media.posterTargetPath(posterName), {
+      atSeconds: at,
+      maxWidth: POSTER_WIDTH,
+    });
+
+    const metadata: MediaMetadata = {
+      probed: true,
+      ...(probe.durationSeconds !== undefined ? { durationSeconds: probe.durationSeconds } : {}),
+      ...(probe.width !== undefined ? { width: probe.width } : {}),
+      ...(probe.height !== undefined ? { height: probe.height } : {}),
+      ...(probe.container !== undefined ? { container: probe.container } : {}),
+      ...(probe.videoCodec !== undefined ? { videoCodec: probe.videoCodec } : {}),
+      ...(probe.audioCodec !== undefined ? { audioCodec: probe.audioCodec } : {}),
+      ...(made ? { posterUrl } : {}),
+      ...(verdict.warning ? { warning: verdict.warning } : {}),
+    };
+    await media.setIngest(record.id, metadata, made ? posterName : undefined);
+    return { ok: true, metadata };
+  }
+
+  // ── images ────────────────────────────────────────────────────────────────
+  // An image is never rejected on codec grounds: the browser, not the decoder, is the judge (SVG is
+  // the standing counter-example — no frame to extract, renders perfectly on a wall).
+  const thumbName = `${record.id}.thumb.png`;
+  const made =
+    probe !== null &&
+    (await prober.poster(path, media.posterTargetPath(thumbName), { maxWidth: THUMBNAIL_WIDTH }));
+
+  const metadata: MediaMetadata = {
+    probed: true,
+    ...(probe?.width !== undefined ? { width: probe.width } : {}),
+    ...(probe?.height !== undefined ? { height: probe.height } : {}),
+    ...(probe?.container !== undefined ? { container: probe.container } : {}),
+    // Fall back to the image itself so an image source ALWAYS has a picture in the library.
+    posterUrl: made ? posterUrl : ownUrl,
+  };
+  await media.setIngest(record.id, metadata, made ? thumbName : undefined);
+  return { ok: true, metadata };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -304,8 +483,35 @@ function parseRange(header: string, size: number): ParsedRange {
   return { start, end };
 }
 
-/** Register GET /media/:id (UNgated). Pass the SAME MediaStore instance used by the upload route. */
+/** Register GET /media/:id (+ POL-109's /media/:id/poster) — UNgated. Pass the SAME MediaStore
+ *  instance used by the upload route. */
 export function registerMediaServeRoute(fastify: FastifyInstance, media: MediaStore): void {
+  // POL-109 — the ingest's poster frame / library thumbnail. Same posture as the media route itself:
+  // ungated (a wall paints it with no session), immutable, hard-cached. 404 when ingest made none
+  // (no toolchain, or a still it couldn't extract) — every consumer already treats it as optional.
+  fastify.get("/media/:id/poster", async (request, reply) => {
+    const id = (request.params as { id?: string }).id ?? "";
+    if (!/^[a-f0-9]{8,}$/i.test(id)) return reply.code(404).send({ error: "unknown media" });
+
+    const abs = media.posterPathFor(id);
+    if (!abs) return reply.code(404).send({ error: "no poster for this media" });
+
+    let st;
+    try {
+      st = await stat(abs);
+    } catch {
+      return reply.code(404).send({ error: "no poster for this media" });
+    }
+    if (!st.isFile()) return reply.code(404).send({ error: "no poster for this media" });
+
+    reply.header("Cache-Control", "public, max-age=31536000, immutable");
+    reply.header("Access-Control-Allow-Origin", "*");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.type(abs.endsWith(".png") ? "image/png" : "image/jpeg");
+    reply.header("Content-Length", String(st.size));
+    return reply.send(createReadStream(abs));
+  });
+
   fastify.get("/media/:id", async (request, reply) => {
     const id = (request.params as { id?: string }).id ?? "";
     // ids are 32 hex chars (randomBytes(16)). Reject anything else up front — also blocks traversal.

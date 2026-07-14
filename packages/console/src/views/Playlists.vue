@@ -94,12 +94,30 @@ function moveStep(i: number, delta: -1 | 1) {
   items[j] = a;
 }
 
-/** A newly-picked video step defaults to "until it ends" (blank); anything else needs seconds. */
+/** POL-109 — the probed length of an uploaded video, in whole seconds (rounded UP so the timer never
+ *  cuts the last frames off). Undefined for a linked video, or on a server with no media toolchain. */
+function probedSeconds(sourceId: string): number | undefined {
+  const seconds = store.sourceById(sourceId)?.media?.durationSeconds;
+  if (seconds === undefined) return undefined;
+  return Math.min(86400, Math.max(1, Math.ceil(seconds)));
+}
+
+/**
+ * A newly-picked step gets its hold time filled in for it (POL-109): a video that ingest measured is
+ * pre-filled with its real length — the operator can still clear it back to "until it ends" — and
+ * anything else keeps the 15 s default. Before ingest existed, a video step could only be left blank
+ * and the rotation depended entirely on the `ended` event firing; now the playlist can be fully TIMED,
+ * which is what lets every screen of a wall derive the same current entry from the clock (POL-34).
+ */
 function onStepSourceChange(i: number) {
   const item = draftItems.value[i];
   if (!item) return;
-  if (stepKind(item.sourceId) === "video") item.duration = "";
-  else if (!item.duration.trim()) item.duration = String(DEFAULT_ITEM_SECONDS);
+  if (stepKind(item.sourceId) === "video") {
+    const probed = probedSeconds(item.sourceId);
+    item.duration = probed !== undefined ? String(probed) : "";
+  } else if (!item.duration.trim()) {
+    item.duration = String(DEFAULT_ITEM_SECONDS);
+  }
 }
 
 async function save() {
@@ -254,8 +272,8 @@ async function remove(p: ContentSource) {
         </div>
         <button class="add-step" @click="addStep">+ Add step</button>
         <p class="field-hint steps-hint">
-          Web pages, dashboards and images show for the seconds you set. Leave a video's time blank
-          to let it play to the end before the playlist moves on.
+          Web pages, dashboards and images show for the seconds you set. An uploaded video's time is
+          filled in from the file itself — clear it to let the video play to the end instead.
         </p>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>

@@ -26,6 +26,7 @@ import { Enrollment } from "./enroll";
 import { AgentMtls } from "./mtls";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
+import { createMediaProber } from "./media-probe";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
 import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
@@ -262,6 +263,20 @@ await fastify.register(multipart, {
 const media = new MediaStore(MEDIA_DIR);
 await media.init();
 
+// ── Media ingest (POL-109 / D114): probe → validate → poster, behind the `MediaProber` seam. The
+// external toolchain is optional BY DESIGN: with none installed the prober reports itself unavailable,
+// uploads are still accepted (with a warning on the source) and the wall behaves as it always did.
+const mediaProber = createMediaProber();
+control.setMediaProvider(media);
+void mediaProber.available().then((ok) => {
+  fastify.log.info(
+    { event: "media.prober", prober: mediaProber.name, available: ok },
+    ok
+      ? "media ingest: probing enabled (metadata, poster frames, codec validation)"
+      : "media ingest: no media toolchain found — uploads are accepted UNPROBED (no metadata, no posters, no codec check)",
+  );
+});
+
 // ── Local operator auth (Phase 3f / D29): argon2id passwords, signed http-only session cookies. ──
 const authConfig = authConfigFromEnv();
 await fastify.register(cookie, { secret: authConfig.cookieSecret });
@@ -387,6 +402,7 @@ registerRestRoutes(
   {
     publicBase: MEDIA_PUBLIC_BASE,
     maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
+    prober: mediaProber,
   },
   tokens,
   activity,

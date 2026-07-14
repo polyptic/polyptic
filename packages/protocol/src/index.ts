@@ -145,6 +145,9 @@ export const VideoSurface = SurfaceBase.extend({
   src: z.string().url(),
   loop: z.boolean().default(true),
   muted: z.boolean().default(true),
+  /** POL-109 — the ingest's poster frame, when the upload was probed. The player paints it while the
+   *  video buffers, so a wall never flashes black between the paint and the first decoded frame. */
+  poster: z.string().url().optional(),
 });
 
 // ── Playlists (POL-34) ────────────────────────────────────────────────────────
@@ -167,6 +170,8 @@ export const PlaylistEntry = z.object({
   /** The library source this entry resolved from — how send-time auth stamping (POL-24) finds the
    *  entry's credential profile. Absent on an entry with nothing to stamp. */
   sourceId: z.string().optional(),
+  /** POL-109 — a video step's ingest poster frame, painted while that step buffers. */
+  poster: z.string().url().optional(),
 });
 export type PlaylistEntry = z.infer<typeof PlaylistEntry>;
 
@@ -1147,6 +1152,52 @@ export const CredentialProfileView = CredentialProfile.extend({
 });
 export type CredentialProfileView = z.infer<typeof CredentialProfileView>;
 
+// ── Media ingest (POL-109) ───────────────────────────────────────────────────
+// An upload is INGESTED, not merely stored: the server probes it (duration/dimensions/codecs), makes
+// a poster/thumbnail, and refuses a file a wall browser provably cannot play — at upload time, with a
+// sentence the operator can act on, instead of a black screen discovered on the glass. The probing
+// tool sits behind the server's `MediaProber` seam (no vendor in the contract), and a server with NO
+// prober available still accepts uploads: the metadata is simply absent (`probed: false`) and the
+// operator is told so. Every consumer therefore treats `MediaMetadata` as OPTIONAL, always.
+
+/** Why an upload was refused. `codec` = the file's video/audio codec or container is not one a wall
+ *  browser can decode; `undecodable` = the prober could read the file and found no playable video in
+ *  it at all (corrupt / not really a video). Anything else is accepted. */
+export const MediaRejectionReason = z.enum(["codec", "undecodable"]);
+export type MediaRejectionReason = z.infer<typeof MediaRejectionReason>;
+
+/** The body of a 415 from POST /api/v1/media when ingest refuses the file. `error` is the operator-
+ *  facing sentence (already says what to do about it); `reason` is the machine-readable cause. */
+export const MediaRejection = z.object({
+  error: z.string(),
+  reason: MediaRejectionReason.optional(),
+});
+export type MediaRejection = z.infer<typeof MediaRejection>;
+
+/** What ingest learned about one uploaded file. Present on an uploaded source only, and only for the
+ *  facts the prober could establish — a server with no probing tool installed still stores the file
+ *  and still shows it on a wall, it just knows nothing about it (`probed: false`). */
+export const MediaMetadata = z.object({
+  /** False = no probing tool was available on this server, so nothing below was measured. */
+  probed: z.boolean(),
+  /** Video duration in seconds (fractional). Absent for images and for an unprobed file. */
+  durationSeconds: z.number().positive().optional(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  /** Container/format short name, e.g. "mp4", "webm" — as reported by the prober, lowercased. */
+  container: z.string().max(64).optional(),
+  videoCodec: z.string().max(64).optional(),
+  audioCodec: z.string().max(64).optional(),
+  /** Absolute URL of the poster frame (video) or downscaled thumbnail (image) the ingest made. For an
+   *  image with no thumbnail (no prober) this falls back to the image's own url, so the library ALWAYS
+   *  has a picture for an image; for an unprobed video it is simply absent. */
+  posterUrl: z.string().url().optional(),
+  /** Set when the file was accepted but something could not be established (e.g. no prober) — the
+   *  console shows it as a caveat on the source, not as an error. */
+  warning: z.string().max(300).optional(),
+});
+export type MediaMetadata = z.infer<typeof MediaMetadata>;
+
 /** A reusable, named entry in the content LIBRARY. A screen or video wall is assigned a source by id;
  *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
  *  media served from a disk volume (an upload becomes a source whose url points at the media route).
@@ -1167,6 +1218,11 @@ export const ContentSource = z
     items: z.array(PlaylistItem).optional(),
     /** POL-42 — page kind only: the Studio's saved composition. */
     definition: PageDefinition.optional(),
+    /** POL-109 — image/video kind only, and only for an UPLOADED source: what ingest probed. This is
+     *  SERVER-DERIVED and decorated on at read time from the media catalogue (the same clean-at-rest
+     *  pattern as POL-24's token stamping) — it is never stored on the source row and never accepted
+     *  from a client. Absent on a linked (by-URL) image/video: the server never probed it. */
+    media: MediaMetadata.optional(),
   })
   .superRefine((s, ctx) => {
     if (s.kind === "playlist") {

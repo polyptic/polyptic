@@ -46,6 +46,7 @@ import type {
   Geometry,
   KioskBrowser,
   Machine,
+  MediaMetadata,
   Mural,
   Output,
   PageData,
@@ -220,6 +221,14 @@ function specUrl(spec: ResolvedSpec): string {
   return spec.kind === "page" ? "" : spec.url;
 }
 
+/** POL-109 — the ingest catalogue's READ seam: what the server probed about an uploaded media URL.
+ *  The MediaStore implements it; the ControlPlane consumes it to decorate a library source with its
+ *  metadata (`ContentSource.media`) and to hand a video surface its poster frame. Absent in unit tests
+ *  (and on a server with no probing toolchain) → sources simply carry no metadata, exactly as before. */
+export interface MediaMetadataProvider {
+  metadataForUrl(url: string): MediaMetadata | undefined;
+}
+
 /** POL-42 — the live data the poller holds for pages: last-good feed items + cached weather. The
  *  ControlPlane consumes it at send time (decorateSliceForSend); the PageDataService implements it. */
 export interface PageDataProvider {
@@ -300,6 +309,9 @@ export class ControlPlane {
 
   /** POL-42 — the poller's live feed/weather data, consumed at send time (buildPageData). */
   private pageDataProvider?: PageDataProvider;
+
+  /** POL-109 — what ingest probed about each uploaded file, read (never written) by the control plane. */
+  private mediaProvider?: MediaMetadataProvider;
 
   /** POL-54 — mints the per-screen token stamped into every playerUrl the server hands an agent, so
    *  the /player WS can authenticate the hello that comes back. Wired after construction (same
@@ -1496,8 +1508,19 @@ export class ControlPlane {
         return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url, zoom });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
-      case "video":
-        return VideoSurface.parse({ ...base, type: "video", src: spec.url, loop: true, muted: true });
+      case "video": {
+        // POL-109 — the ingest's poster frame rides along, so the panel paints the video's own first
+        // frame while it buffers instead of a black rectangle. Absent for a linked/unprobed video.
+        const poster = this.mediaFor(spec.url)?.posterUrl;
+        return VideoSurface.parse({
+          ...base,
+          type: "video",
+          src: spec.url,
+          loop: true,
+          muted: true,
+          ...(poster ? { poster } : {}),
+        });
+      }
       case "playlist":
         // POL-34 — the whole resolved rotation ships in one surface; the player advances it locally.
         // `startedAt` came off the spec (resolved once per assignment), so every wall member anchors
@@ -1642,6 +1665,9 @@ export class ControlPlane {
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
       if (!step || step.kind === "playlist" || step.kind === "page" || !step.url) continue;
+      // POL-109 — a video step carries its ingest poster, so each step of a rotation pre-paints its
+      // own first frame rather than flashing black on every advance.
+      const poster = step.kind === "video" ? this.mediaFor(step.url)?.posterUrl : undefined;
       entries.push({
         kind: step.kind,
         url: step.url,
@@ -1651,6 +1677,7 @@ export class ControlPlane {
             ? { durationSeconds: DEFAULT_PLAYLIST_ITEM_SECONDS }
             : {}),
         sourceId: step.id,
+        ...(poster ? { poster } : {}),
       });
     }
     return { kind: "playlist", url: "", entries, startedAt: new Date().toISOString() };
@@ -1978,12 +2005,36 @@ export class ControlPlane {
   // that editing or deleting an IN-USE source re-resolves (or clears) every screen/wall showing it and
   // returns those slices for the caller to push.
 
+  /** POL-109 — wire the ingest catalogue after construction (same pattern as setTokenProvider). */
+  setMediaProvider(provider: MediaMetadataProvider): void {
+    this.mediaProvider = provider;
+  }
+
+  /** POL-109 — the probed metadata for an uploaded media url, if we ingested it. */
+  private mediaFor(url: string | undefined): MediaMetadata | undefined {
+    if (!url || !this.mediaProvider) return undefined;
+    return this.mediaProvider.metadataForUrl(url);
+  }
+
+  /**
+   * POL-109 — hang the ingest facts (duration/dimensions/codec/poster) on a library source on the way
+   * OUT. Derived, never stored: the media catalogue (which travels with the media volume) is the one
+   * source of truth, so nothing has to be migrated and a re-ingest is instantly visible. Only uploaded
+   * image/video sources have any — a linked URL was never probed and honestly says nothing.
+   */
+  private decorateSource(source: ContentSource): ContentSource {
+    if (source.kind !== "image" && source.kind !== "video") return source;
+    const media = this.mediaFor(source.url);
+    return media ? { ...source, media } : source;
+  }
+
   getContentSources(): ContentSource[] {
-    return [...this.contentSources.values()];
+    return [...this.contentSources.values()].map((s) => this.decorateSource(s));
   }
 
   getContentSource(id: string): ContentSource | undefined {
-    return this.contentSources.get(id);
+    const source = this.contentSources.get(id);
+    return source ? this.decorateSource(source) : undefined;
   }
 
   private nextSourceId(): string {
