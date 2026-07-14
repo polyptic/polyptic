@@ -39,6 +39,7 @@ import type {
   PlaylistEntry,
   PlaylistItem,
   CreateCredentialProfileBody,
+  CredentialProfile,
   CredentialProfileView,
   DesiredState,
   DisplayBackend,
@@ -1725,6 +1726,10 @@ export class ControlPlane {
     muralId: string,
     memberScreenIds: string[],
     name?: string,
+    /** POL-113 — a restore re-creates a wall with the id it had in the backup (zoom preferences and
+     *  the wall's source assignment are keyed by it), so the id is caller-supplied on that one path.
+     *  Everywhere else it is minted here. */
+    withId?: string,
   ): Promise<CombineScreensResult> {
     if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
 
@@ -1745,7 +1750,8 @@ export class ControlPlane {
       }
     }
 
-    const id = this.nextWallId();
+    const id = withId ?? this.nextWallId();
+    if (withId) this.absorbId("wall", withId, (n) => (this.wallCounter = Math.max(this.wallCounter, n)));
     // Name the wall: use the operator-provided name (trimmed), else derive a default from the members'
     // friendly names joined " + " (e.g. "Screen 1 + Screen 2"), capped to the contract's 80 chars.
     const wallName = this.resolveWallName(name, ids);
@@ -2891,5 +2897,211 @@ export class ControlPlane {
     if (this.state.activeSceneId === id) this.state.activeSceneId = null;
     await this.store.deleteScene(id);
     return true;
+  }
+
+  // ── Backup / restore (POL-113) ──────────────────────────────────────────────
+  //
+  // Export reads the declarative state (`backup.ts` assembles the document); restore writes it back
+  // through these id-PRESERVING primitives. Ids are preserved rather than remapped because the
+  // document is a graph keyed by id — placements name screens, scenes name screens, playlists name
+  // sources, zoom preferences name screens and walls — so remapping would mean rewriting every edge
+  // and hoping. The same id means the same thing: an existing one is updated in place.
+  //
+  // These are the ONLY methods that take an id from outside. Everything else on the control plane
+  // still mints its own, and each of these carries the id counter forward so a later create can never
+  // collide with something a restore brought in.
+
+  /** Carry an id counter past an imported `<prefix>-<n>` id, so new ids can never collide with it. */
+  private absorbId(prefix: string, id: string, set: (n: number) => void): void {
+    const match = new RegExp(`^${prefix}-(\\d+)$`).exec(id);
+    if (!match) return;
+    const n = Number(match[1]);
+    if (Number.isFinite(n)) set(n);
+  }
+
+  /**
+   * Run a composition (a whole restore) with the per-operation activity lines SUPPRESSED — the caller
+   * emits one summary line, exactly as applyScene does. Restores the flag even if `fn` throws.
+   */
+  async runQuiet<T>(fn: () => Promise<T>): Promise<T> {
+    this.suppressEmit = true;
+    try {
+      return await fn();
+    } finally {
+      this.suppressEmit = false;
+    }
+  }
+
+  /** What a single screen is showing right now, as a re-appliable ASSIGNMENT (the Scene shape). */
+  contentForScreen(screenId: string): SceneContent {
+    return this.deriveScreenContent(screenId);
+  }
+
+  /** What a video wall is spanning right now, as a re-appliable ASSIGNMENT. */
+  contentForWall(wall: VideoWall): SceneContent {
+    return this.deriveWallContent(wall);
+  }
+
+  /** Every remembered page zoom (POL-57), flattened back out of the composite (target, page) key. */
+  getZoomPreferences(): Array<{ targetId: string; sourceKey: string; zoom: number }> {
+    const prefs: Array<{ targetId: string; sourceKey: string; zoom: number }> = [];
+    for (const [key, zoom] of this.zoomPrefs) {
+      const sep = key.indexOf("\u0000");
+      if (sep <= 0) continue;
+      prefs.push({ targetId: key.slice(0, sep), sourceKey: key.slice(sep + 1), zoom });
+    }
+    return prefs;
+  }
+
+  /** Upsert a mural with the id it had in the backup. */
+  async importMural(mural: Mural): Promise<Mural> {
+    this.absorbId("mural", mural.id, (n) => (this.muralCounter = Math.max(this.muralCounter, n)));
+    const next: Mural = { id: mural.id, name: mural.name };
+    this.murals.set(next.id, next);
+    await this.store.upsertMural(next);
+    return next;
+  }
+
+  /**
+   * Upsert a screen with the id it had in the backup.
+   *
+   * The one genuine identity collision in a restore lives here: a screen is keyed for the fleet by
+   * (machineId, connector) — that is how a box's `agent/hello` finds the screen it drives — but it is
+   * keyed for the CONFIGURATION by id, which is what placements, walls and scenes point at. If the
+   * target already auto-created a screen for the same panel under a DIFFERENT id (its box enrolled
+   * before the restore), keeping both would leave two rows fighting over one panel. The backup wins:
+   * the auto-created row is removed and the backup's screen takes the panel, so every edge in the
+   * document still resolves. The importer reports it.
+   */
+  async importScreen(screen: Screen): Promise<{ screen: Screen; replaced?: string }> {
+    this.absorbId("screen", screen.id, (n) => (this.screenCounter = Math.max(this.screenCounter, n)));
+
+    let replaced: string | undefined;
+    const conflict = this.state.screens.find(
+      (s) => s.machineId === screen.machineId && s.connector === screen.connector && s.id !== screen.id,
+    );
+    if (conflict) {
+      replaced = conflict.id;
+      await this.removeScreen(conflict.id);
+    }
+
+    const existing = this.state.screens.find((s) => s.id === screen.id);
+    if (existing) {
+      existing.friendlyName = screen.friendlyName;
+      existing.machineId = screen.machineId;
+      existing.connector = screen.connector;
+    } else {
+      this.state.screens.push({ ...screen });
+    }
+    await this.store.upsertScreen({
+      id: screen.id,
+      friendlyName: screen.friendlyName,
+      machineId: screen.machineId,
+      connector: screen.connector,
+    });
+
+    // Every known screen must have a slice (init() holds the same invariant). Size it from the
+    // machine's reported output when the box is already here, else the default canvas.
+    if (this.state.slices[screen.id] === undefined) {
+      const res = this.screenResolution(screen);
+      const slice: ScreenSlice = {
+        screenId: screen.id,
+        canvas: { x: 0, y: 0, w: res.w, h: res.h },
+        surfaces: [],
+      };
+      this.state.slices[screen.id] = slice;
+      await this.store.upsertContent({ screenId: slice.screenId, canvas: slice.canvas, surfaces: [] });
+    }
+    return { screen: { ...screen }, replaced };
+  }
+
+  /** Re-create a video wall with the id it had in the backup (content is assigned separately). */
+  async importVideoWall(wall: VideoWall): Promise<CombineScreensResult> {
+    const existing = this.videoWalls.get(wall.id);
+    if (existing) {
+      const same =
+        existing.muralId === wall.muralId &&
+        existing.memberScreenIds.length === wall.memberScreenIds.length &&
+        existing.memberScreenIds.every((id, i) => id === wall.memberScreenIds[i]);
+      if (same) {
+        if (wall.name && wall.name !== existing.name) await this.renameVideoWall(wall.id, wall.name);
+        return { ok: true, wall: this.videoWalls.get(wall.id)!, slices: [] };
+      }
+      // Membership changed — split it, then re-form it below with the same id.
+      await this.splitWall(wall.id);
+    }
+    return this.combineScreens(wall.muralId, wall.memberScreenIds, wall.name, wall.id);
+  }
+
+  /**
+   * Upsert a library source with the id it had in the backup, re-resolving anything already showing
+   * it (a restore over a live deployment updates the glass through the normal path). Playlist steps
+   * and page embeds are NOT re-validated here: they were validated when authored, and dropping a step
+   * because its source imports a moment later would corrupt the very thing being restored. Dangling
+   * references are reported by the importer instead.
+   */
+  async importContentSource(source: ContentSource): Promise<{ source: ContentSource; slices: ScreenSlice[] }> {
+    this.absorbId("source", source.id, (n) => (this.sourceCounter = Math.max(this.sourceCounter, n)));
+    const parsed = ContentSource.parse(source);
+    this.contentSources.set(parsed.id, parsed);
+    await this.store.upsertContentSource(this.toPersistedSource(parsed));
+
+    const slices = this.reresolveAssignments(parsed.id);
+    if (slices.length > 0) {
+      this.bumpRevision();
+      for (const slice of slices) {
+        await this.store.upsertContent({
+          screenId: slice.screenId,
+          canvas: slice.canvas,
+          surfaces: slice.surfaces,
+          sourceId: this.screenSourceIds.get(slice.screenId) ?? null,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+    return { source: parsed, slices };
+  }
+
+  /**
+   * Upsert a credential profile from a backup. The client secret is NOT in the document (it is never
+   * exported), so:
+   *   - a profile that already exists here KEEPS the secret it already has — a restore must never
+   *     blank a working credential;
+   *   - a profile that is new here arrives WITHOUT one and cannot authenticate until an operator
+   *     types it in. `needsSecret` says which.
+   */
+  async importCredentialProfile(
+    profile: CredentialProfile,
+  ): Promise<{ profile: PersistedCredentialProfile; needsSecret: boolean }> {
+    this.absorbId("credential", profile.id, (n) => (this.credentialCounter = Math.max(this.credentialCounter, n)));
+    const existing = this.credentialProfiles.get(profile.id);
+    const next: PersistedCredentialProfile = {
+      id: profile.id,
+      name: profile.name,
+      strategy: profile.strategy,
+      tokenEndpoint: profile.tokenEndpoint,
+      clientId: profile.clientId,
+      clientSecret: existing?.clientSecret ?? "",
+      scope: profile.scope ?? null,
+      audience: profile.audience ?? null,
+      tokenParam: profile.tokenParam,
+    };
+    this.credentialProfiles.set(next.id, next);
+    await this.store.upsertCredentialProfile(next);
+    return { profile: next, needsSecret: next.clientSecret === "" };
+  }
+
+  /** Upsert a scene with the id it had in the backup. */
+  async importScene(scene: Scene): Promise<Scene> {
+    this.absorbId("scene", scene.id, (n) => (this.sceneCounter = Math.max(this.sceneCounter, n)));
+    const parsed = Scene.parse(scene);
+    this.scenes.set(parsed.id, parsed);
+    await this.store.upsertScene(this.toPersistedScene(parsed));
+    return parsed;
+  }
+
+  /** Restore one remembered page zoom. Applied BEFORE content, so the assignment picks it up. */
+  async importZoomPreference(pref: { targetId: string; sourceKey: string; zoom: number }): Promise<void> {
+    await this.rememberZoom(pref.targetId, pref.sourceKey, pref.zoom);
   }
 }

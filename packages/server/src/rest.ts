@@ -30,9 +30,13 @@ import { z } from "zod";
 
 import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
+import { applyImport, buildBackup, mediaPort, planImport } from "./backup";
+import type { ImageSettingsPort } from "./backup";
 
 import {
+  BACKUP_FORMAT_VERSION,
   CombineScreensBody,
+  ImportBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
   CreateMuralBody,
@@ -122,6 +126,11 @@ export function registerRestRoutes(
   presence: Presence,
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
+  /** POL-113 — the image-update settings the backup document carries. Optional: a unit-test stack that
+   *  never constructs the ImageUpdates scheduler simply exports/imports without that section. */
+  imageSettings?: ImageSettingsPort,
+  /** POL-113 — the build stamped into an export's `generator` (operator-facing only). */
+  buildInfo?: { version?: string; revision?: string },
 ): void {
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
@@ -1553,5 +1562,88 @@ export function registerRestRoutes(
     fastify.log.info({ event: "scene.delete", sceneId: params.data.id }, "scene deleted");
     broadcaster.broadcast();
     return { ok: true, sceneId: params.data.id };
+  });
+
+  // ── Backup / restore + declarative state export (POL-113) ───────────────────
+  //
+  // Two endpoints, gated like everything else under /api/v1 (an export is not a secret, but it IS the
+  // whole shape of a customer's fleet). They are also the GitOps seam: desired wall state reviewed in
+  // a pull request, applied to a fresh cluster with one POST.
+
+  // GET /api/v1/export -> the portable, version-stamped BackupDocument (pretty-printed, downloadable)
+  fastify.get("/api/v1/export", async (_request, reply) => {
+    const doc = await buildBackup(control, mediaPort(media), imageSettings, {
+      version: buildInfo?.version,
+      revision: buildInfo?.revision,
+    });
+    const stamp = doc.exportedAt.replace(/[:.]/g, "-");
+    fastify.log.info(
+      {
+        event: "backup.export",
+        murals: doc.murals.length,
+        screens: doc.screens.length,
+        sources: doc.contentSources.length,
+        scenes: doc.scenes.length,
+      },
+      "exported declarative state",
+    );
+    return reply
+      .header("content-type", "application/json; charset=utf-8")
+      .header("content-disposition", `attachment; filename="polyptic-backup-${stamp}.json"`)
+      .header("cache-control", "no-store")
+      .send(JSON.stringify(doc, null, 2));
+  });
+
+  // POST /api/v1/import { document, mode?, dryRun? } -> ImportResult
+  //   dryRun: true  → the plan ONLY. Nothing is written. This is what the console shows an operator
+  //                   before they commit, and what `replace` mode's deletions are confirmed against.
+  //   dryRun: false → run that same plan, through the ordinary mutation paths, then push every touched
+  //                   slice: the restore fans out on the normal instant path and cannot strand a wall.
+  fastify.post("/api/v1/import", async (request, reply) => {
+    const body = ImportBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid backup document", issues: body.error.issues });
+    }
+    const { document, mode, dryRun } = body.data;
+    if (document.polypticBackup !== BACKUP_FORMAT_VERSION) {
+      // Refuse a format we do not understand rather than half-apply it.
+      return reply.code(400).send({
+        error: `unsupported backup format ${document.polypticBackup} (this server speaks ${BACKUP_FORMAT_VERSION})`,
+      });
+    }
+
+    if (dryRun) {
+      const plan = planImport(control, mediaPort(media), document, mode);
+      fastify.log.info(
+        { event: "backup.plan", mode, ...plan.summary },
+        "computed restore plan (dry run)",
+      );
+      return plan;
+    }
+
+    const { result, slices } = await applyImport(control, mediaPort(media), imageSettings, document, {
+      mode,
+      mediaPublicBase: mediaConfig.publicBase,
+      onCredentialProfile: (profileId) => {
+        const profile = control.getCredentialProfileInternal(profileId);
+        if (profile) tokens.upsertProfile(profile);
+      },
+    });
+
+    // The restore's own fan-out is the ordinary one: every touched slice goes out as `server/render`.
+    for (const slice of slices) pushRender(slice.screenId, slice);
+    // Settings ride the fleet-wide broadcast, exactly as the Settings toggle does.
+    if (document.settings.display) broadcastDisplaySettings();
+
+    activity.push(
+      "warn",
+      `Restored from a backup (${result.summary.create} added, ${result.summary.update} updated, ${result.summary.delete} removed)`,
+    );
+    fastify.log.warn(
+      { event: "backup.import", mode, ...result.summary, pushed: slices.length },
+      "restored declarative state from a backup",
+    );
+    broadcaster.broadcast();
+    return result;
   });
 }

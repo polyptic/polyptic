@@ -12,18 +12,23 @@
  */
 import {
   AuthUser,
+  BackupDocument,
   ChangePasswordBody,
   DisplaySettings,
   EnrollmentInfo,
   HttpsInfo,
+  ImportResult,
   LoginBody,
   ImageUpdateInfo,
   NetbootInfo,
   UpdateImageSettingsBody,
 } from "@polyptic/protocol";
 import type {
+  BackupDocument as BackupDocumentT,
   ChangePasswordBody as ChangePasswordBodyT,
   DisplaySettings as DisplaySettingsT,
+  ImportMode as ImportModeT,
+  ImportResult as ImportResultT,
   LoginBody as LoginBodyT,
 } from "@polyptic/protocol";
 
@@ -164,4 +169,33 @@ export async function getDisplaySettings(): Promise<DisplaySettingsT> {
 export async function updateDisplaySettings(showBadges: boolean): Promise<DisplaySettingsT> {
   const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/display`, { showBadges });
   return DisplaySettings.parse(raw);
+}
+
+// ── Backup / restore (POL-113) ─────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/export → the whole declarative state as one portable document (murals, screens, walls,
+ * scenes, the content library incl. page definitions and playlists, credential profiles WITHOUT their
+ * secrets, settings, and a media manifest). Validated at the edge like every other response.
+ */
+export async function exportBackup(): Promise<BackupDocumentT> {
+  const raw = await send<unknown>("GET", "/export");
+  return BackupDocument.parse(raw);
+}
+
+/**
+ * POST /api/v1/import → restore. `dryRun` computes the plan (adds/updates/deletes) and touches
+ * NOTHING; the same call with `dryRun: false` runs exactly that plan. `replace` additionally deletes
+ * what the document does not mention — the destructive option, named as such in the UI.
+ */
+export async function importBackup(
+  document: BackupDocumentT,
+  options: { mode: ImportModeT; dryRun: boolean },
+): Promise<ImportResultT> {
+  const raw = await send<unknown>("POST", "/import", {
+    document,
+    mode: options.mode,
+    dryRun: options.dryRun,
+  });
+  return ImportResult.parse(raw);
 }

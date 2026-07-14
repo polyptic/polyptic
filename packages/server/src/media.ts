@@ -189,6 +189,11 @@ export class MediaStore {
     return this.records.get(id);
   }
 
+  /** Every known upload (POL-113 — the backup's media MANIFEST: what a restore needs but can't carry). */
+  list(): MediaRecord[] {
+    return [...this.records.values()];
+  }
+
   /** Absolute, traversal-safe path for a media id, or undefined if unknown. */
   pathFor(id: string): string | undefined {
     const rec = this.records.get(id);

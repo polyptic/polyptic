@@ -1607,6 +1607,208 @@ export const UpdateDisplaySettingsBody = z.object({
 export type UpdateDisplaySettingsBody = z.infer<typeof UpdateDisplaySettingsBody>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Backup / restore + declarative state export (POL-113)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A control plane that owns the fleet's whole configuration needs a way to survive a dead volume,
+// move host, and show an operator what a week of edits changed. `GET /api/v1/export` produces ONE
+// portable, human-readable JSON document of the DECLARATIVE state; `POST /api/v1/import` applies it
+// back — dry-run first, then apply — through the ordinary mutation paths, so a restore fans out over
+// the normal instant push and can never strand a wall.
+//
+// What the document DOES carry: murals, screens (the first-class named entity), placements, video
+// walls, the content library (incl. every page definition and playlist), what each screen and wall is
+// currently showing, scenes, remembered zooms, credential profiles WITHOUT their secrets, display +
+// image-update settings, and a MEDIA MANIFEST.
+//
+// What it deliberately does NOT carry (and why) — mirrored into `notIncluded` so the file explains
+// itself to whoever opens it in a year:
+//   - SECRETS of any kind: credential-profile client secrets, the enrolment bootstrap token, machine
+//     credentials, the mTLS CA key, the player-token secret, operator password hashes and sessions.
+//     An export is a file that gets copied around; a file that gets copied around must not be a
+//     credential. Profiles come back with everything but the secret, flagged `secretExcluded`.
+//   - MACHINES and their enrolment: a machine credential is a per-box identity, minted by THIS
+//     deployment for THAT box. Re-homing a fleet means the boxes re-enrol (they dial out, they always
+//     did); replaying a machine row would forge an identity the new deployment never issued. Screens
+//     survive anyway: a screen is keyed by (machineId, connector), so when the box enrols against the
+//     restored deployment it ADOPTS its imported screen — name, placement, content and all.
+//   - LIVE state: presence, revisions, thumbnails, tokens, activity. Derived, not desired.
+//   - MEDIA BLOBS: uploads are files, not configuration, and can be gigabytes. The manifest lists them
+//     so a restore can tell the operator exactly which uploads are missing here.
+
+/** The export format's version. Bumped only on a breaking change to the document shape. */
+export const BACKUP_FORMAT_VERSION = 1;
+
+/** One screen as exported: the plain registry row. Its `machineId` may name a machine that does not
+ *  exist in the target deployment — that is expected and fine (see the note above). */
+export const BackupScreen = Screen;
+export type BackupScreen = z.infer<typeof BackupScreen>;
+
+/** A video wall plus what it currently spans (captured as the ASSIGNMENT, exactly like a Scene, so a
+ *  restore re-resolves a library source to its CURRENT url rather than replaying a stale one). */
+export const BackupVideoWall = VideoWall.extend({ content: SceneContent });
+export type BackupVideoWall = z.infer<typeof BackupVideoWall>;
+
+/** What a single (non-walled) screen is currently showing, as an assignment. */
+export const BackupScreenContent = z.object({
+  screenId: z.string(),
+  content: SceneContent,
+});
+export type BackupScreenContent = z.infer<typeof BackupScreenContent>;
+
+/** A credential profile as exported: every field EXCEPT the client secret, which is unexportable by
+ *  design. `secretExcluded` is a literal `true` so the omission is explicit in the file rather than
+ *  something a reader has to notice. On import the operator re-enters the secret (an existing
+ *  profile's secret in the target is preserved, never overwritten with a blank). */
+export const BackupCredentialProfile = CredentialProfile.extend({
+  secretExcluded: z.literal(true),
+});
+export type BackupCredentialProfile = z.infer<typeof BackupCredentialProfile>;
+
+/** One uploaded file, by reference. The BYTES are not in the document — this is what lets a restore
+ *  say "these 3 uploads aren't on this deployment" instead of silently rendering broken tiles. */
+export const BackupMediaItem = z.object({
+  id: z.string(),
+  mime: z.string(),
+  size: z.number().int().nonnegative(),
+  originalName: z.string(),
+  /** The library source this upload backs, when it has one. */
+  sourceId: z.string().nullable(),
+});
+export type BackupMediaItem = z.infer<typeof BackupMediaItem>;
+
+/** A remembered page zoom (POL-57), keyed by (screen-or-wall, content). */
+export const BackupZoomPreference = z.object({
+  targetId: z.string(),
+  sourceKey: z.string(),
+  zoom: Zoom,
+});
+export type BackupZoomPreference = z.infer<typeof BackupZoomPreference>;
+
+/** Deployment settings that are configuration rather than plumbing. Endpoints, ports, secrets and
+ *  volume paths stay in the environment where they belong — those describe the HOST, not the fleet. */
+export const BackupSettings = z.object({
+  display: DisplaySettings.optional(),
+  imageUpdates: z
+    .object({
+      scheduleEnabled: z.boolean(),
+      scheduleTime: z.string(),
+      fullScheduleEnabled: z.boolean(),
+      fullScheduleDay: z.number().int().min(0).max(6),
+      fullScheduleTime: z.string(),
+      urgent: z.boolean(),
+    })
+    .optional(),
+});
+export type BackupSettings = z.infer<typeof BackupSettings>;
+
+/** The whole export: one file, versioned, diffable, and safe to commit to a git repo. */
+export const BackupDocument = z.object({
+  /** Format discriminator + version. A future breaking change bumps this and the importer refuses
+   *  what it does not understand rather than half-applying it. */
+  polypticBackup: z.number().int().positive(),
+  /** ISO-8601 instant the document was produced. */
+  exportedAt: z.string(),
+  /** Which build produced it (for the operator; never trusted by the importer). */
+  generator: z.object({
+    product: z.literal("polyptic"),
+    version: z.string().optional(),
+    revision: z.string().optional(),
+  }),
+  murals: z.array(Mural).default([]),
+  screens: z.array(BackupScreen).default([]),
+  placements: z.array(Placement).default([]),
+  videoWalls: z.array(BackupVideoWall).default([]),
+  /** Live content of each placed, non-walled screen (a wall's content rides on the wall). */
+  screenContent: z.array(BackupScreenContent).default([]),
+  contentSources: z.array(ContentSource).default([]),
+  credentialProfiles: z.array(BackupCredentialProfile).default([]),
+  scenes: z.array(Scene).default([]),
+  zoomPreferences: z.array(BackupZoomPreference).default([]),
+  settings: BackupSettings.default({}),
+  media: z.array(BackupMediaItem).default([]),
+  /** Plain-English list of what this document deliberately leaves out. Written by the exporter, read
+   *  by humans; the importer ignores it. */
+  notIncluded: z.array(z.string()).default([]),
+});
+export type BackupDocument = z.infer<typeof BackupDocument>;
+
+/** How a restore treats what is already here.
+ *  - `merge` (default): upsert everything in the document by id; anything in the target the document
+ *    does not mention is LEFT ALONE. Nothing is deleted. This is the safe, additive restore.
+ *  - `replace`: merge, then DELETE every mural, screen, placement, wall, scene, content source and
+ *    credential profile the document does not mention — i.e. make the deployment look exactly like
+ *    the file. Destructive, named plainly in the console, and always previewable in the dry-run. */
+export const ImportMode = z.enum(["merge", "replace"]);
+export type ImportMode = z.infer<typeof ImportMode>;
+
+/** POST /api/v1/import — apply an export. `dryRun: true` computes and returns the plan WITHOUT
+ *  touching anything, which is how an operator sees what a restore will do before it does it. */
+export const ImportBody = z.object({
+  document: BackupDocument,
+  mode: ImportMode.default("merge"),
+  dryRun: z.boolean().default(false),
+});
+export type ImportBody = z.infer<typeof ImportBody>;
+
+/** Which kind of thing a planned change is about. */
+export const ImportEntity = z.enum([
+  "mural",
+  "screen",
+  "placement",
+  "videoWall",
+  "screenContent",
+  "contentSource",
+  "credentialProfile",
+  "scene",
+  "zoomPreference",
+  "settings",
+]);
+export type ImportEntity = z.infer<typeof ImportEntity>;
+
+/** One line of the dry-run diff: what will happen to which thing. Ids are PRESERVED across a
+ *  restore — a document is a graph keyed by id (placements → screens, scenes → screens, playlists →
+ *  sources), so the same id means the same thing and an existing one is UPDATED IN PLACE, never
+ *  duplicated and never remapped. */
+export const ImportChange = z.object({
+  entity: ImportEntity,
+  action: z.enum(["create", "update", "delete", "unchanged"]),
+  id: z.string(),
+  /** A human label for the console's diff list ("Atrium Wall", "Screen 3 → Grafana overview"). */
+  label: z.string(),
+});
+export type ImportChange = z.infer<typeof ImportChange>;
+
+/** What a restore will do (dry-run) or did (apply). The apply re-computes the plan from the same
+ *  code path, so what the operator confirmed is what runs. */
+export const ImportResult = z.object({
+  dryRun: z.boolean(),
+  mode: ImportMode,
+  /** The document's format version, echoed back. */
+  format: z.number().int().positive(),
+  exportedAt: z.string(),
+  changes: z.array(ImportChange),
+  summary: z.object({
+    create: z.number().int().nonnegative(),
+    update: z.number().int().nonnegative(),
+    delete: z.number().int().nonnegative(),
+    unchanged: z.number().int().nonnegative(),
+  }),
+  /** Screens whose machine is not enrolled here. They import anyway (a screen is first-class); they
+   *  render as soon as that box enrols and advertises the connector. */
+  screensWithoutMachine: z.array(z.string()).default([]),
+  /** Uploads the document references that are NOT on this deployment's media volume. Their sources
+   *  import, but the tile will 404 until the file is re-uploaded. */
+  missingMedia: z.array(BackupMediaItem).default([]),
+  /** Profiles that will arrive without a client secret and need one typed in before their content
+   *  authenticates (a profile that already exists here keeps the secret it already has). */
+  credentialProfilesNeedingSecret: z.array(z.string()).default([]),
+  /** Anything else worth an operator's eye (a dropped dangling reference, a skipped wall). */
+  warnings: z.array(z.string()).default([]),
+});
+export type ImportResult = z.infer<typeof ImportResult>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
