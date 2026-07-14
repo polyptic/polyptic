@@ -133,6 +133,9 @@ export interface ScreenAssignment {
   connector: string;
   screenId: string;
   playerUrl: string;
+  /** POL-119 — run a cast (AirPlay) receiver on this connector, advertised as `friendlyName`. */
+  castEnabled: boolean;
+  friendlyName: string;
 }
 
 export interface RegisterMachineInput {
@@ -392,6 +395,7 @@ export class ControlPlane {
         friendlyName: s.friendlyName,
         machineId: s.machineId,
         connector: s.connector,
+        castEnabled: s.castEnabled ?? false,
       });
     }
 
@@ -628,6 +632,7 @@ export class ControlPlane {
           friendlyName: `Screen ${this.screenCounter}`,
           machineId,
           connector: output.connector,
+          castEnabled: false,
         } satisfies Screen;
         this.state.screens.push(screen);
         const slice: ScreenSlice = {
@@ -655,6 +660,8 @@ export class ControlPlane {
         connector: output.connector,
         screenId: screen.id,
         playerUrl: this.playerUrlFor(screen.id),
+        castEnabled: screen.castEnabled,
+        friendlyName: screen.friendlyName,
       });
     }
 
@@ -711,6 +718,7 @@ export class ControlPlane {
         friendlyName: s.friendlyName,
         machineId: s.machineId,
         connector: s.connector,
+        castEnabled: s.castEnabled,
       });
     }
     for (const slice of result.touchedSlices) {
@@ -1113,8 +1121,33 @@ export class ControlPlane {
       friendlyName: screen.friendlyName,
       machineId: screen.machineId,
       connector: screen.connector,
+      castEnabled: screen.castEnabled,
     });
     if (previousName !== friendlyName) this.emit("info", `${previousName} renamed`);
+    return screen;
+  }
+
+  /**
+   * Enable/disable casting (the AirPlay receiver) on one screen (POL-119). Persistent and TTL-less —
+   * unlike the shell arm, a castable meeting-room panel is meant to STAY castable; the on-glass PIN
+   * is the per-session gate. Like renameScreen this is registry metadata: write-through, no revision
+   * bump. The caller re-applies to the driving agent (start/stop the receiver) and re-pushes the
+   * same-revision render (the player's badge glyph). Returns the screen, or null if unknown.
+   */
+  async setScreenCastEnabled(screenId: string, enabled: boolean): Promise<Screen | null> {
+    const screen = this.state.screens.find((s) => s.id === screenId);
+    if (screen === undefined) return null;
+    if (screen.castEnabled !== enabled) {
+      screen.castEnabled = enabled;
+      await this.store.upsertScreen({
+        id: screen.id,
+        friendlyName: screen.friendlyName,
+        machineId: screen.machineId,
+        connector: screen.connector,
+        castEnabled: enabled,
+      });
+      this.emit("info", `Casting ${enabled ? "enabled" : "disabled"} on ${screen.friendlyName}`);
+    }
     return screen;
   }
 
@@ -2331,6 +2364,22 @@ export class ControlPlane {
   /** POL-54 — wire the player-token minter after construction (same pattern as setTokenProvider). */
   setPlayerTokenMinter(minter: PlayerTokenMinter): void {
     this.playerTokenMinter = minter;
+  }
+
+  /** POL-119 — the current `server/apply` assignments for ONE machine, from the screen registry.
+   *  Re-pushed live when a cast toggle or a rename changes what the box's receiver should be doing,
+   *  so the agent reconciles NOW instead of on its next reconnect. Same revision: neither mutation
+   *  is render data. */
+  assignmentsFor(machineId: string): ScreenAssignment[] {
+    return this.state.screens
+      .filter((s) => s.machineId === machineId)
+      .map((s) => ({
+        connector: s.connector,
+        screenId: s.id,
+        playerUrl: this.playerUrlFor(s.id),
+        castEnabled: s.castEnabled,
+        friendlyName: s.friendlyName,
+      }));
   }
 
   /** The URL an agent points one output's browser at: base + `?screen=<id>` + the screen's bearer

@@ -28,6 +28,7 @@ import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
+import Toggle from "../Toggle.vue";
 import ZoomControl from "./ZoomControl.vue";
 
 const store = useConsoleStore();
@@ -182,13 +183,33 @@ const statusLabel = computed(() => {
   const s = single.value;
   if (!s) return "";
   if (identingSingle.value) return "Identing…";
+  if (castingSingle.value) return "Casting now";
   return s.online ? "Connected" : "Unreachable";
 });
 const statusColor = computed(() => {
   const s = single.value;
   if (!s) return "var(--ok)";
+  if (castingSingle.value) return "var(--accent)";
   return s.online ? "var(--ok)" : "var(--bad)";
 });
+
+// ── casting (POL-119) — the persistent per-screen AirPlay-receiver toggle ──
+// `castEnabled` is desired state (optimistic via the store, reconciled by admin/state);
+// `castActive` is the agent's own report of a receiver window on the glass — never set here.
+const castEnabledSingle = computed(() => single.value?.castEnabled === true);
+const castingSingle = computed(
+  () => castEnabledSingle.value && single.value?.castActive === true,
+);
+const castStateText = computed(() => {
+  const s = single.value;
+  if (!s || !castEnabledSingle.value) return "Off — screen is not discoverable";
+  if (castingSingle.value) return "Casting now — a device is mirroring to this screen";
+  return `Discoverable as “${s.friendlyName}” — new devices enter the PIN shown on the screen`;
+});
+function toggleCast(enabled: boolean): void {
+  const s = single.value;
+  if (s) void store.setScreenCast(s.id, enabled);
+}
 const machineName = computed(() => {
   const s = single.value;
   if (!s) return "";
@@ -460,7 +481,25 @@ function selectOne(id: string) {
         {{ identingSingle ? "Flashing on wall…" : "Ident — flash on wall" }}
       </button>
 
-      <div class="section-label">Content</div>
+      <!-- Casting (POL-119): persistent AirPlay-receiver toggle + live session state. -->
+      <div class="section-label gap-top">Casting</div>
+      <div class="cast-card" :class="{ live: castingSingle }">
+        <svg class="cast-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5 17a9 9 0 0 1 14 0" opacity="0.35" />
+          <path d="M12 15l4.5 6h-9z" fill="currentColor" stroke="none" />
+        </svg>
+        <span class="cast-meta">
+          <span class="cast-title">Cast (AirPlay)</span>
+          <span class="cast-state">{{ castStateText }}</span>
+        </span>
+        <Toggle
+          :model-value="castEnabledSingle"
+          label="Cast to this screen"
+          @update:model-value="toggleCast"
+        />
+      </div>
+
+      <div class="section-label gap-top">Content</div>
       <div v-if="hasContent" class="content-card">
         <span class="thumb"></span>
         <span class="content-meta">
@@ -778,6 +817,48 @@ function selectOne(id: string) {
   background: var(--muted-bg);
   border-radius: 5px;
   padding: 2px 7px;
+}
+
+/* casting (POL-119) — receiver toggle + live session state */
+.cast-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+}
+.cast-card.live {
+  border-color: var(--accent-line);
+}
+.cast-glyph {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  color: var(--muted);
+}
+.cast-card.live .cast-glyph {
+  color: var(--accent-fg);
+}
+.cast-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.cast-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.cast-state {
+  font-size: 11px;
+  color: var(--muted2);
+  line-height: 1.35;
+}
+.cast-card.live .cast-state {
+  color: var(--accent-fg);
 }
 
 .ident-btn {

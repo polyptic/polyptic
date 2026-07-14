@@ -81,6 +81,12 @@ export const Screen = z.object({
   friendlyName: z.string(), // "Nessie", "Big-Bertha"
   machineId: z.string(),
   connector: z.string(), // which Output on that machine
+  /** POL-119 — operator has enabled ad-hoc casting (AirPlay receiver) to this screen. Persistent and
+   *  TTL-less by design (unlike the shell arm): a meeting-room panel stays castable until an operator
+   *  turns it off. Part of desired state — the agent runs one receiver per cast-enabled connector,
+   *  advertised under the screen's friendlyName, and a sender's PIN entry (always on, displayed on the
+   *  glass) is the per-session gate, so leaving this enabled is not an open door. */
+  castEnabled: z.boolean().default(false),
 });
 export type Screen = z.infer<typeof Screen>;
 
@@ -456,7 +462,17 @@ export const AgentStatus = z.object({
   machineId: z.string(),
   observedRevision: z.number().int().nonnegative(),
   screens: z.array(
-    z.object({ connector: z.string(), ok: z.boolean(), note: z.string().optional() }),
+    z.object({
+      connector: z.string(),
+      ok: z.boolean(),
+      note: z.string().optional(),
+      /** POL-119 — a cast (AirPlay) session is live on this connector right now: the supervised
+       *  receiver owns at least one visible window (the mirror itself, or its PIN prompt). Level-
+       *  reported here (heartbeat + immediate status on change) so it self-heals across reconnects
+       *  instead of needing an edge-triggered ack that a dropped frame would strand. Optional =
+       *  back-compat with agents that predate casting. */
+      casting: z.boolean().optional(),
+    }),
   ),
 });
 
@@ -610,7 +626,19 @@ export const ServerToAgentApply = z.object({
   machineId: z.string(),
   /** For each output: which screen it is and the URL to point a player at. */
   screens: z.array(
-    z.object({ connector: z.string(), screenId: z.string(), playerUrl: z.string().url() }),
+    z.object({
+      connector: z.string(),
+      screenId: z.string(),
+      playerUrl: z.string().url(),
+      /** POL-119 — run a cast (AirPlay) receiver for this connector. Rides the apply payload — not a
+       *  session frame — because it is desired STATE: an agent that restarts or reconnects must
+       *  re-reach it from the next apply alone. Optional = back-compat with older servers. */
+      castEnabled: z.boolean().optional(),
+      /** POL-119 — the screen's friendly name, stamped at send time like the player render's: the
+       *  receiver advertises it on mDNS, so the Screen Mirroring menu shows "Boardroom Left", not a
+       *  connector id. A rename re-applies and restarts that receiver (brief advertisement blip). */
+      friendlyName: z.string().optional(),
+    }),
   ),
 });
 
@@ -848,6 +876,10 @@ export const ServerToPlayerRender = z.object({
    *  stored slice — see ControlPlane.renameScreen). The player labels its idle splash / dev badge
    *  with this so a console rename shows through live, instead of the raw `screen-N` id (POL-29). */
   friendlyName: z.string(),
+  /** POL-119 — this screen is cast-enabled (AirPlay receiver armed). Stamped at send time like
+   *  `friendlyName`; the player's status badge shows a cast glyph when badges are on, so someone at
+   *  the glass can tell which panels accept Screen Mirroring. Optional = back-compat. */
+  castEnabled: z.boolean().optional(),
   slice: ScreenSlice,
 });
 
@@ -917,6 +949,11 @@ export const ScreenView = Screen.extend({
    *  success, and when the machine drops. A refusal leaves `inspecting` false, i.e. UNCHANGED, so
    *  without this the console cannot tell "the wall said no" from "the wall hasn't answered yet". */
   inspectError: z.string().optional(),
+  /** POL-119 — a cast (AirPlay) session is live on this panel NOW: the box's receiver owns a visible
+   *  window (mirror or PIN prompt). Ephemeral, agent-reported via `agent/status.screens[].casting`,
+   *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
+   *  toggle — is inherited from `Screen`.) */
+  castActive: z.boolean().optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -1290,6 +1327,11 @@ export type ShellArmBody = z.infer<typeof ShellArmBody>;
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });
 export type InspectBody = z.infer<typeof InspectBody>;
+
+/** POST /api/v1/screens/:id/cast — enable or disable casting (AirPlay receiver) on one screen
+ *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
+export const CastArmBody = z.object({ enabled: z.boolean() });
+export type CastArmBody = z.infer<typeof CastArmBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

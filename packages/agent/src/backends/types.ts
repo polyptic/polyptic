@@ -52,4 +52,20 @@ export interface DisplayBackend {
 
   /** Grab a thumbnail of `connector`, or `null` if this backend can't capture. */
   capture(connector: string): Promise<Buffer | null>;
+
+  /**
+   * POL-119 — desired cast-receiver state for one output: `{ name }` runs an AirPlay receiver
+   * advertised under that (friendly) name; `null` tears it down along with any live session.
+   * Idempotent and level-driven from `server/apply`, like the rest of the reconciler. Throws when
+   * this backend cannot cast (dev-open, x11 — waylandsink is sway-only, POL-67 forbids the Xwayland
+   * fallback); a `null` never throws, so disable/retire paths stay safe everywhere.
+   */
+  setCast(connector: string, spec: { name: string } | null): Promise<void>;
+
+  /**
+   * POL-119 — register the (single) cast-session listener: fired with `(connector, active)` when a
+   * receiver window appears (mirror or PIN prompt) or the last one closes. Window presence on the
+   * box — never the operator's toggle — is what the console shows as "casting now".
+   */
+  onCastSession(listener: (connector: string, active: boolean) => void): void;
 }

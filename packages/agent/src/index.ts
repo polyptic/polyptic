@@ -203,6 +203,9 @@ class Agent {
   private readonly placed = new Map<string, string>();
   /** connector → last placement outcome, reported in heartbeats. */
   private readonly status = new Map<string, { ok: boolean; note?: string }>();
+  /** POL-119 — connector → is a cast session live NOW (receiver window on the glass)? Entries exist
+   *  only for cast-enabled connectors; reported in every status frame + immediately on change. */
+  private readonly casting = new Map<string, boolean>();
 
   constructor(
     private readonly url: string,
@@ -221,6 +224,15 @@ class Agent {
   }
 
   start(): void {
+    // POL-119 — the backend's account of window presence IS the cast-session signal: push it up
+    // the moment it changes (the console's "casting now"), on top of the level in every heartbeat.
+    this.backend.onCastSession((connector, active) => {
+      if (this.casting.get(connector) === active) return;
+      if (!this.casting.has(connector)) return; // receiver already retired — stale event
+      this.casting.set(connector, active);
+      log(`cast session on ${connector}: ${active ? "started" : "ended"}`);
+      this.sendStatus();
+    });
     this.connect();
   }
 
@@ -413,18 +425,19 @@ class Agent {
       if (this.placed.get(screen.connector) === screen.playerUrl) {
         // already pointed at this URL — nothing to do (content updates over the player channel)
         this.status.set(screen.connector, { ok: true });
-        continue;
+      } else {
+        try {
+          await this.backend.showScreen(screen.connector, screen.playerUrl);
+          this.placed.set(screen.connector, screen.playerUrl);
+          this.status.set(screen.connector, { ok: true });
+          log(`placed ${screen.screenId} on ${screen.connector}`);
+        } catch (err) {
+          const note = (err as Error).message;
+          this.status.set(screen.connector, { ok: false, note });
+          log(`FAILED to place ${screen.screenId} on ${screen.connector}: ${note}`);
+        }
       }
-      try {
-        await this.backend.showScreen(screen.connector, screen.playerUrl);
-        this.placed.set(screen.connector, screen.playerUrl);
-        this.status.set(screen.connector, { ok: true });
-        log(`placed ${screen.screenId} on ${screen.connector}`);
-      } catch (err) {
-        const note = (err as Error).message;
-        this.status.set(screen.connector, { ok: false, note });
-        log(`FAILED to place ${screen.screenId} on ${screen.connector}: ${note}`);
-      }
+      await this.reconcileCast(screen);
     }
 
     // Retire any output no longer in the desired set.
@@ -435,12 +448,44 @@ class Agent {
       } catch (err) {
         log(`hideScreen(${connector}) failed: ${(err as Error).message}`);
       }
+      try {
+        await this.backend.setCast(connector, null); // a retired output keeps no receiver either
+      } catch (err) {
+        log(`setCast(${connector}, off) failed: ${(err as Error).message}`);
+      }
       this.placed.delete(connector);
       this.status.delete(connector);
+      this.casting.delete(connector);
     }
 
     // Ack the new state immediately rather than waiting for the next heartbeat tick.
     this.sendStatus();
+  }
+
+  /**
+   * POL-119 — reconcile one connector's cast receiver to the apply's desired state. A cast failure
+   * must never fail the SCREEN (the wall renders fine without a receiver): it rides the status note
+   * instead, so the console can say why casting isn't up without painting the panel red.
+   */
+  private async reconcileCast(screen: ApplyMsg["screens"][number]): Promise<void> {
+    const enabled = screen.castEnabled === true;
+    try {
+      await this.backend.setCast(
+        screen.connector,
+        enabled ? { name: screen.friendlyName ?? screen.screenId } : null,
+      );
+      if (enabled && !this.casting.has(screen.connector)) this.casting.set(screen.connector, false);
+      if (!enabled) this.casting.delete(screen.connector);
+    } catch (err) {
+      const reason = (err as Error).message;
+      log(`setCast(${screen.connector}, ${enabled ? "on" : "off"}) failed: ${reason}`);
+      this.casting.delete(screen.connector);
+      const st = this.status.get(screen.connector);
+      this.status.set(screen.connector, {
+        ok: st?.ok ?? true,
+        note: st?.note ? `${st.note}; cast: ${reason}` : `cast: ${reason}`,
+      });
+    }
   }
 
   /**
@@ -742,11 +787,14 @@ class Agent {
 
   private sendStatus(): void {
     const screens = [...this.status.entries()].map(([connector, st]) => {
-      const entry: { connector: string; ok: boolean; note?: string } = {
+      const entry: { connector: string; ok: boolean; note?: string; casting?: boolean } = {
         connector,
         ok: st.ok,
       };
       if (st.note !== undefined) entry.note = st.note;
+      // POL-119 — level-report the live session per cast-enabled connector (absent = not castable).
+      const casting = this.casting.get(connector);
+      if (casting !== undefined) entry.casting = casting;
       return entry;
     });
     this.send({

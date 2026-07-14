@@ -7,6 +7,7 @@
  * Phase 3 murals & placement and Phase 3b combined surfaces (walls + content).
  */
 import {
+  CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
@@ -271,6 +272,12 @@ export function identScreen(screenId: string, body: IdentBody): Promise<unknown>
  */
 export function inspectScreen(screenId: string, body: InspectBody): Promise<unknown> {
   return send("POST", `/screens/${encodeURIComponent(screenId)}/inspect`, InspectBody.parse(body));
+}
+
+/** POST /api/v1/screens/:screenId/cast { enabled } — enable/disable casting (AirPlay) on one screen
+ *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
+export function setScreenCast(screenId: string, enabled: boolean): Promise<unknown> {
+  return send("POST", `/screens/${encodeURIComponent(screenId)}/cast`, CastArmBody.parse({ enabled }));
 }
 
 /**

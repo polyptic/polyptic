@@ -67,6 +67,9 @@ function buildData(screen: ScreenView) {
     machineLabel: machine ? machine.label : screen.machineId,
     connector: screen.connector,
     identing: identingIds.has(screen.id),
+    // POL-119 — `casting` = a session is live on the glass NOW (agent-reported); the enabled
+    // toggle alone doesn't badge the tile, or every castable screen would shout all day.
+    casting: screen.castEnabled === true && screen.castActive === true,
     selected,
     selectedAlone: selected && store.selectedScreenIds.length === 1,
   };

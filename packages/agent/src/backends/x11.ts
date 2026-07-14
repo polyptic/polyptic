@@ -330,6 +330,18 @@ export class X11Backend implements DisplayBackend {
     return null;
   }
 
+  /** POL-119 — casting is sway-only for now: the receiver renders via waylandsink natively, and
+   *  POL-67 rules out the Xwayland/X11 software sinks (they peg the CPU on real boxes). Disabling
+   *  (`null`) is always safe; enabling refuses with the reason the console shows the operator. */
+  async setCast(connector: string, spec: { name: string } | null): Promise<void> {
+    if (spec === null) return;
+    throw new Error(`casting needs the wayland-sway backend (this box runs x11-i3)`);
+  }
+
+  onCastSession(): void {
+    // Never fires: no receiver can run here.
+  }
+
   /** Crop the output's region out of the root window via ImageMagick `import`, else `scrot`. */
   async capture(connector: string): Promise<Buffer | null> {
     if (this.captureUnavailable) return null;

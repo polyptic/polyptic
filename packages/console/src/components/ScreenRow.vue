@@ -161,6 +161,15 @@ function remove(): void {
       />
       <div class="sub">
         <span class="chip">{{ screen.connector }}</span>
+        <!-- POL-119 — cast-enabled indicator (the toggle itself lives in the canvas Inspector) -->
+        <span
+          v-if="screen.castEnabled"
+          class="chip cast-chip"
+          :class="{ live: screen.castActive }"
+          :title="screen.castActive ? 'A device is casting to this screen now' : 'Casting enabled — discoverable via Screen Mirroring'"
+        >
+          {{ screen.castActive ? "Casting now" : "Cast on" }}
+        </span>
         <span class="driven">
           Driven by {{ machineLabel }} ·
           {{ screen.surfaceCount }} {{ screen.surfaceCount === 1 ? "surface" : "surfaces" }}
@@ -278,6 +287,15 @@ function remove(): void {
   font-weight: 500;
   padding: 2px 7px;
   border-radius: 6px;
+}
+/* POL-119 — casting indicator: calm when merely enabled, accent while a session is live. */
+.cast-chip {
+  color: var(--muted);
+}
+.cast-chip.live {
+  background: var(--accent-bg, var(--muted-bg));
+  color: var(--accent-fg);
+  font-weight: 600;
 }
 .driven {
   color: var(--muted);

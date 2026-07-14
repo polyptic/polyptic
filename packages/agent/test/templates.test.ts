@@ -73,3 +73,22 @@ describe("corePackages — xinput ships with the x11-i3 backend (POL-60)", () =>
     expect(corePackages("apt", "wayland-sway")).not.toContain("xinput");
   });
 });
+
+describe("corePackages — the cast set ships with wayland-sway only (POL-119)", () => {
+  test("apt wayland set carries the receiver, mDNS, and waylandsink", () => {
+    const pkgs = corePackages("apt", "wayland-sway");
+    expect(pkgs).toContain("uxplay");
+    expect(pkgs).toContain("avahi-daemon");
+    expect(pkgs).toContain("gstreamer1.0-plugins-bad");
+  });
+
+  test("x11-i3 gets none of it — the backend refuses setCast (POL-67 rules out X11 sinks)", () => {
+    const pkgs = corePackages("apt", "x11-i3");
+    expect(pkgs).not.toContain("uxplay");
+    expect(pkgs).not.toContain("avahi-daemon");
+  });
+
+  test("dev-open provisions only the base set, as before", () => {
+    expect(corePackages("apt", "dev-open")).not.toContain("uxplay");
+  });
+});

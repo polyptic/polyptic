@@ -1005,6 +1005,23 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Enable/disable casting (the AirPlay receiver) on one screen (POL-119). Persistent, no TTL.
+     * Optimistic so the Inspector toggle is snappy; revert on failure — the authoritative
+     * admin/state broadcast reconciles either way. (`castActive` — a session live NOW — is never
+     * touched here: only the agent's report drives it.)
+     */
+    async setScreenCast(screenId: string, enabled: boolean): Promise<void> {
+      const screen = this.screenById(screenId);
+      if (screen) screen.castEnabled = enabled; // optimistic
+      try {
+        await api.setScreenCast(screenId, enabled);
+      } catch (err) {
+        if (screen) screen.castEnabled = !enabled; // revert
+        console.error("[console] setScreenCast failed", err);
+      }
+    },
+
     /** Flash a screen's friendly name on the physical panel (fire-and-forget pulse). */
     async identScreen(screenId: string): Promise<void> {
       try {

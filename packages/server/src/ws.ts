@@ -543,6 +543,27 @@ function handleAgent(
     if (msg.t === "agent/hello") {
       void onHello(msg);
     } else if (msg.t === "agent/status") {
+      // POL-119 — the status report doubles as the cast-session signal: `casting` is the box's own
+      // account of whether its receiver owns a visible window (mirror or PIN prompt) on each
+      // connector. Level-reported on every heartbeat AND immediately on change, so ingest is
+      // idempotent; broadcast only on a real edge, or every heartbeat would fan out an admin/state.
+      let castChanged = false;
+      const screens = control.getScreens().filter((s) => s.machineId === msg.machineId);
+      for (const entry of msg.screens) {
+        if (entry.casting === undefined) continue; // pre-cast agent — leave presence alone
+        const screen = screens.find((s) => s.connector === entry.connector);
+        if (!screen) continue;
+        if (presence.setScreenCasting(screen.id, entry.casting)) {
+          castChanged = true;
+          activity.push(
+            "info",
+            entry.casting
+              ? `Casting to ${screen.friendlyName} started`
+              : `Casting to ${screen.friendlyName} ended`,
+          );
+        }
+      }
+      if (castChanged) broadcaster.broadcast();
       log.info(
         { event: "agent.status", machineId: msg.machineId, observedRevision: msg.observedRevision },
         "agent status",
@@ -731,6 +752,8 @@ function handlePlayer(
         revision: control.state.revision,
         // Stamp the current friendly name so the player labels itself with it, not the raw id (POL-29).
         friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
+        // POL-119: stamp the cast toggle the same way, for the badge's cast glyph.
+        castEnabled: control.getScreen(screenId)?.castEnabled ?? false,
         slice,
       });
       ws.send(JSON.stringify(render));

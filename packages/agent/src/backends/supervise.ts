@@ -70,17 +70,21 @@ export async function killStaleByToken(
 export type LaunchFn = (target: LaunchTarget) => Promise<ChildProcess>;
 
 /**
- * One supervised kiosk browser for one output. Owns the child's lifecycle:
+ * One supervised long-lived child process for one output. Owns the child's lifecycle:
  *   - `setTarget(t)` — no-op if already running that exact target, else (re)launch,
  *   - respawn-on-exit with capped exponential backoff while a target is still desired,
  *   - `stop()` — clear the desired target and terminate the child.
  *
  * A monotonically increasing generation guards against a just-killed child's `exit` handler
  * racing a fresh launch into a duplicate respawn.
+ *
+ * Generic over the launch target `T` (POL-119): the kiosk browser supervises `(url, inspector)`
+ * and the cast receiver supervises `(name, …)` — the lifecycle is identical, only what forces a
+ * relaunch differs, so `same` + `describe` are injected rather than duplicated.
  */
-export class SupervisedBrowser {
+export class SupervisedProcess<T> {
   private child: ChildProcess | null = null;
-  private desired: LaunchTarget | null = null;
+  protected desired: T | null = null;
   private stopping = false;
   private currentGen = 0;
   private restartAttempt = 0;
@@ -88,7 +92,11 @@ export class SupervisedBrowser {
 
   constructor(
     readonly connector: string,
-    private readonly launch: LaunchFn,
+    private readonly launch: (target: T) => Promise<ChildProcess>,
+    private readonly same: (a: T | null, b: T | null) => boolean,
+    private readonly describe: (target: T) => string,
+    /** What the log calls the child ("browser", "cast receiver"). */
+    private readonly kind: string,
     private readonly log: (msg: string) => void,
   ) {}
 
@@ -103,35 +111,10 @@ export class SupervisedBrowser {
     return this.running ? (this.child?.pid ?? null) : null;
   }
 
-  /** The URL this output is meant to show, or `null` if torn down. */
-  get url(): string | null {
-    return this.desired?.url ?? null;
-  }
-
-  /** Is this output's browser currently running with its Web Inspector enabled? */
-  get inspector(): boolean {
-    return this.desired?.inspector ?? false;
-  }
-
-  /** Point this output at `url`, preserving the current inspector setting. */
-  async setUrl(url: string): Promise<void> {
-    await this.setTarget({ url, inspector: this.inspector });
-  }
-
-  /**
-   * Relaunch this output's browser with its Web Inspector enabled/disabled. Throws when nothing is
-   * placed on the connector — there is no page to inspect.
-   */
-  async setInspector(on: boolean): Promise<void> {
-    const url = this.url;
-    if (url === null) throw new Error(`nothing is placed on ${this.connector}`);
-    await this.setTarget({ url, inspector: on });
-  }
-
   /** Launch (or relaunch) this output at `target`. Idempotent: a no-op when already running it. */
-  async setTarget(target: LaunchTarget): Promise<void> {
-    if (sameTarget(this.desired, target) && this.running) {
-      this.log(`${this.connector}: already showing ${target.url} — no-op`);
+  async setTarget(target: T): Promise<void> {
+    if (this.same(this.desired, target) && this.running) {
+      this.log(`${this.connector}: already showing ${this.describe(target)} — no-op`);
       return;
     }
     this.desired = target;
@@ -142,7 +125,7 @@ export class SupervisedBrowser {
     await this.spawnCycle();
   }
 
-  /** Tear down this output's browser and stop supervising it. */
+  /** Tear down this output's child and stop supervising it. */
   async stop(): Promise<void> {
     this.stopping = true;
     this.desired = null;
@@ -176,7 +159,7 @@ export class SupervisedBrowser {
       if (myGen !== this.currentGen) return; // intentional kill / superseded
       this.child = null;
       this.log(
-        `browser for ${this.connector} exited (code=${code ?? "null"} signal=${signal ?? "null"})`,
+        `${this.kind} for ${this.connector} exited (code=${code ?? "null"} signal=${signal ?? "null"})`,
       );
       if (this.stopping || this.desired === null) return;
       this.scheduleRestart();
@@ -188,7 +171,7 @@ export class SupervisedBrowser {
     const backoff = Math.min(RESTART_CAP_MS, RESTART_BASE_MS * 2 ** this.restartAttempt);
     const wait = backoff + Math.floor(Math.random() * 250);
     this.restartAttempt += 1;
-    this.log(`respawning browser for ${this.connector} in ${wait}ms (attempt ${this.restartAttempt})`);
+    this.log(`respawning ${this.kind} for ${this.connector} in ${wait}ms (attempt ${this.restartAttempt})`);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
       void this.spawnCycle().catch(() => {
@@ -248,5 +231,40 @@ export class SupervisedBrowser {
         // gone
       }
     }, KILL_GRACE_MS);
+  }
+}
+
+/**
+ * One supervised kiosk browser for one output — the `(url, inspector)` specialization the
+ * placement backends drive. See the target notes at the top of this file.
+ */
+export class SupervisedBrowser extends SupervisedProcess<LaunchTarget> {
+  constructor(connector: string, launch: LaunchFn, log: (msg: string) => void) {
+    super(connector, launch, sameTarget, (t) => t.url, "browser", log);
+  }
+
+  /** The URL this output is meant to show, or `null` if torn down. */
+  get url(): string | null {
+    return this.desired?.url ?? null;
+  }
+
+  /** Is this output's browser currently running with its Web Inspector enabled? */
+  get inspector(): boolean {
+    return this.desired?.inspector ?? false;
+  }
+
+  /** Point this output at `url`, preserving the current inspector setting. */
+  async setUrl(url: string): Promise<void> {
+    await this.setTarget({ url, inspector: this.inspector });
+  }
+
+  /**
+   * Relaunch this output's browser with its Web Inspector enabled/disabled. Throws when nothing is
+   * placed on the connector — there is no page to inspect.
+   */
+  async setInspector(on: boolean): Promise<void> {
+    const url = this.url;
+    if (url === null) throw new Error(`nothing is placed on ${this.connector}`);
+    await this.setTarget({ url, inspector: on });
   }
 }

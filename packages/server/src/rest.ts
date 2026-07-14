@@ -32,6 +32,7 @@ import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
 
 import {
+  CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
@@ -129,6 +130,8 @@ export function registerRestRoutes(
       revision: control.state.revision,
       // Stamp the screen's current friendly name so the player labels itself with it, not the raw id.
       friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
+      // POL-119: stamp the cast toggle the same way — the badge's cast glyph, not render data.
+      castEnabled: control.getScreen(screenId)?.castEnabled ?? false,
       // POL-24: stamp the current auth token into web/dashboard URLs at SEND time (stored slices keep
       // the clean url, so the DB never holds a token and every load gets a live one).
       slice: control.decorateSliceForSend(slice),
@@ -329,6 +332,21 @@ export function registerRestRoutes(
     // renameScreen deliberately does NOT bump the revision (the name isn't render data), so this
     // re-sends the SAME revision with the new name — an instant relabel, no reload, no "behind" ack.
     pushRender(screen.id, control.sliceForPlayer(screen.id));
+
+    // POL-119 — a cast-enabled screen advertises its friendly name on mDNS, so a rename must reach
+    // the box too: a same-revision apply re-push restarts that receiver under the new name (a brief
+    // advertisement blip, accepted in the pitch). Not sent for uncast screens — nothing to relabel.
+    if (screen.castEnabled) {
+      agentHub.send(
+        screen.machineId,
+        ServerToAgentApply.parse({
+          t: "server/apply",
+          revision: control.state.revision,
+          machineId: screen.machineId,
+          screens: control.assignmentsFor(screen.machineId),
+        }),
+      );
+    }
 
     fastify.log.info(
       { event: "screen.rename", screenId: screen.id, friendlyName: screen.friendlyName },
@@ -536,6 +554,58 @@ export function registerRestRoutes(
       "pushed inspector request to agent",
     );
     return reply.code(202).send({ ok: true, screenId: screen.id, on: body.data.on, delivered });
+  });
+
+  // POST /api/v1/screens/:screenId/cast  { enabled }  -> enable/disable casting (POL-119)
+  //
+  // The persistent per-screen AirPlay-receiver toggle. Persisted first (desired state — an offline
+  // box reconciles it from the apply it gets on its next hello), then, when the agent is connected
+  // NOW, a same-revision `server/apply` re-push makes it start/stop the receiver immediately, and a
+  // same-revision `server/render` re-push flips the player badge's cast glyph (the rename trick —
+  // neither mutation is render data, so the revision must not move).
+  fastify.post("/api/v1/screens/:screenId/cast", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = CastArmBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = await control.setScreenCastEnabled(params.data.screenId, body.data.enabled);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    const delivered = agentHub.send(
+      screen.machineId,
+      ServerToAgentApply.parse({
+        t: "server/apply",
+        revision: control.state.revision,
+        machineId: screen.machineId,
+        screens: control.assignmentsFor(screen.machineId),
+      }),
+    );
+    pushRender(screen.id, control.sliceForPlayer(screen.id));
+
+    // Disabling kills the receiver (and with it any live session) on the box; don't leave the
+    // console saying "casting" until the agent's next status lands — the operator's intent is now.
+    if (!body.data.enabled) presence.setScreenCasting(screen.id, false);
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.cast",
+        screenId: screen.id,
+        machineId: screen.machineId,
+        connector: screen.connector,
+        enabled: body.data.enabled,
+        delivered,
+      },
+      body.data.enabled ? "casting enabled" : "casting disabled",
+    );
+    return { ok: true, screen, delivered };
   });
 
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────
