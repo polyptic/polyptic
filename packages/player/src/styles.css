@@ -185,6 +185,14 @@ body {
   pointer-events: none;
 }
 
+/* POL-119 — the badge's cast glyph: this screen accepts Screen Mirroring. Static (wall-UI rules). */
+.badge-cast {
+  width: 13px;
+  height: 13px;
+  color: #cdd7e2;
+  flex: none;
+}
+
 .badge-dot {
   width: 8px;
   height: 8px;

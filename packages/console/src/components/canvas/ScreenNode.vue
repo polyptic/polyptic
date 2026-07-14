@@ -28,6 +28,8 @@ interface ScreenNodeData {
   machineLabel: string;
   connector: string;
   identing: boolean;
+  /** POL-119 — a cast (AirPlay) session is live on this panel NOW (agent-reported). */
+  casting?: boolean;
   selected: boolean;
   selectedAlone: boolean;
 }
@@ -137,6 +139,15 @@ function onDrop(e: DragEvent) {
       <span class="name">{{ data.name }}</span>
     </div>
 
+    <!-- casting badge (POL-119) — a session is live on the glass right now -->
+    <div v-if="data.casting && !data.identing" class="cast-badge" title="A device is casting to this screen">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 17a9 9 0 0 1 14 0" opacity="0.4" />
+        <path d="M12 15l4.5 6h-9z" fill="currentColor" stroke="none" />
+      </svg>
+      <span>Casting</span>
+    </div>
+
     <!-- ident overlay (wins over everything else) -->
     <div v-if="data.identing" class="state ident-state">
       <span class="ident-tag">IDENT</span>
@@ -220,6 +231,34 @@ function onDrop(e: DragEvent) {
 .screen-node.has-thumb .kind-label {
   color: rgba(244, 246, 251, 0.82);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+/* casting badge (POL-119) — top-right, opposite the label chip; same scrim treatment over thumbs
+   (grim captures the whole output, so during a session the thumb IS the cast — keep it legible). */
+.cast-badge {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  z-index: 4;
+  background: var(--label-bg);
+  backdrop-filter: blur(3px);
+  color: var(--accent-fg);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.cast-badge svg {
+  width: 12px;
+  height: 12px;
+}
+.screen-node.has-thumb .cast-badge {
+  background: rgba(8, 10, 14, 0.62);
+  backdrop-filter: blur(4px);
 }
 
 .label {

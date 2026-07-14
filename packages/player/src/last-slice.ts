@@ -38,6 +38,8 @@ export const SliceSnapshot = z.object({
   revision: z.number().int().nonnegative(),
   friendlyName: z.string(),
   showBadges: z.boolean().optional(),
+  /** POL-119 — cast-enabled at save time, so the badge's cast glyph survives an outage boot. */
+  castEnabled: z.boolean().optional(),
   savedAt: z.number(),
 });
 export type SliceSnapshot = z.infer<typeof SliceSnapshot>;

@@ -66,6 +66,9 @@ export class Presence {
   private readonly screenRevision = new Map<string, number>();
   /** screenIds whose panel currently shows the browser's Web Inspector (POL-50). */
   private readonly inspecting = new Set<string>();
+  /** POL-119 — screenIds with a LIVE cast (AirPlay) session: the box's receiver owns a visible
+   *  window (mirror or PIN prompt). Level-set from `agent/status.screens[].casting`. */
+  private readonly casting = new Set<string>();
   /** screenId → why the box last refused to show it (POL-50). */
   private readonly inspectErrors = new Map<string, string>();
   /** machineId → when the box ACCEPTED an operator reboot (POL-68). Live-only; cleared when the
@@ -109,6 +112,20 @@ export class Presence {
 
   isScreenInspecting(screenId: string): boolean {
     return this.inspecting.has(screenId);
+  }
+
+  /** POL-119 — record whether a cast session is live on a screen, per the agent's status report
+   *  (window presence on the box — never the operator's click — is the truth). Returns true when the
+   *  value CHANGED, so the caller broadcasts only on real edges, not every heartbeat. */
+  setScreenCasting(screenId: string, active: boolean): boolean {
+    const was = this.casting.has(screenId);
+    if (active) this.casting.add(screenId);
+    else this.casting.delete(screenId);
+    return was !== active;
+  }
+
+  isScreenCasting(screenId: string): boolean {
+    return this.casting.has(screenId);
   }
 
   /**
@@ -158,6 +175,8 @@ export class Presence {
     for (const id of screenIds) {
       this.inspecting.delete(id);
       this.inspectErrors.delete(id);
+      // POL-119 — a dropped machine's receiver windows are gone with it; no session survives.
+      this.casting.delete(id);
     }
   }
 }
@@ -191,6 +210,8 @@ export function buildAdminState(
           content: control.screenContentSummary(s.id),
           inspecting: presence.isScreenInspecting(s.id),
           inspectError: presence.screenInspectError(s.id),
+          castEnabled: s.castEnabled, // POL-119 — the persistent operator toggle
+          castActive: presence.isScreenCasting(s.id), // POL-119 — a session is live NOW
         } satisfies ScreenView;
       });
 

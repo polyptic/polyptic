@@ -128,6 +128,9 @@ const ident = ref<{ friendlyName: string; color: string } | null>(null);
 // build shows the badge instantly on load (and prod hides it) until the authoritative value lands right
 // after the first render; an operator's console toggle then flips it live on every screen.
 const showBadges = ref<boolean>(import.meta.env.DEV);
+// POL-119 — this screen accepts casting (AirPlay receiver armed). Stamped on every render like
+// `friendlyName`; shown as a glyph in the status badge so someone at the glass can tell.
+const castEnabled = ref<boolean>(false);
 
 // Pre-first-render the revision is -1; show an em-dash until the first slice lands.
 const revLabel = computed(() => (revision.value < 0 ? "—" : String(revision.value)));
@@ -204,6 +207,7 @@ function persistSlice(): void {
     revision: Math.max(revision.value, 0),
     friendlyName: screenName.value,
     showBadges: showBadges.value,
+    castEnabled: castEnabled.value,
     savedAt: Date.now(),
   });
 }
@@ -217,6 +221,8 @@ function handleMessage(msg: ServerToPlayerMessage): void {
     revision.value = msg.revision;
     // The name rides on every render, so a console rename relabels the idle splash / badge instantly.
     screenName.value = msg.friendlyName;
+    // POL-119 — the cast toggle rides the same way (a toggle re-pushes the same-revision render).
+    castEnabled.value = msg.castEnabled === true;
     diag(
       `render rev ${msg.revision}: ${
         msg.slice.surfaces.length === 0
@@ -364,6 +370,7 @@ onMounted(() => {
     revision.value = restored.revision;
     screenName.value = restored.friendlyName;
     if (restored.showBadges !== undefined) showBadges.value = restored.showBadges;
+    if (restored.castEnabled !== undefined) castEnabled.value = restored.castEnabled;
     diag(`restored last-good slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`);
   }
 
@@ -629,6 +636,24 @@ function connLabel(state: ConnState): string {
       <span class="badge-text">{{ screenName }}</span>
       <span class="badge-sep">·</span>
       <span class="badge-text">rev {{ revLabel }}</span>
+      <!-- POL-119 — this screen accepts casting. Static inline SVG with literal currentColor
+           (wall-UI rules: no fill="var()" attrs, no animated opacity/transform/filter). -->
+      <template v-if="castEnabled">
+        <span class="badge-sep">·</span>
+        <svg
+          class="badge-cast"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-label="casting enabled"
+        >
+          <path d="M5 17a9 9 0 0 1 14 0" opacity="0.45" />
+          <path d="M12 15l4.5 6h-9z" fill="currentColor" stroke="none" />
+        </svg>
+      </template>
     </div>
   </main>
 </template>

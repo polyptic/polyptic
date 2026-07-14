@@ -52,6 +52,9 @@ export interface PersistedScreen {
   friendlyName: string;
   machineId: string;
   connector: string;
+  /** POL-119 — operator enabled casting (AirPlay receiver) on this screen. Persistent, no TTL.
+   *  Undefined on legacy rows → false. */
+  castEnabled?: boolean;
 }
 
 /** A screen's renderable content: its canvas + the surfaces currently placed on it. */
