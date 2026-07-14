@@ -489,27 +489,83 @@ secrets:
   existingSecret: ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Database wiring.
-#   * postgresql.enabled=true  → deploy the Bitnami Postgres subchart; the chart
-#     derives DATABASE_URL from these credentials automatically.
-#   * postgresql.enabled=false → supply externalDatabase.url (or set
-#     secrets.existingSecret with a DATABASE_URL key, or config-level env override).
+# Database wiring (POL-123/D108) — BATTERIES INCLUDED.
+#
+#   * postgresql.enabled=true (the DEFAULT) → the chart deploys Postgres itself:
+#     a first-party StatefulSet + Service (templates/postgres.yaml), no subchart,
+#     no vendored tarball. DATABASE_URL is wired automatically; the operator sets
+#     nothing. `helm install polyptic …` is the whole deployment.
+#   * postgresql.enabled=false → bring your own: externalDatabase.url, or
+#     secrets.existingSecret carrying a DATABASE_URL key.
+#
+# These two are MUTUALLY EXCLUSIVE and the chart refuses to render both (and
+# refuses config.store=postgres with neither — that combination used to install
+# happily and crash-loop on `getaddrinfo ENOTFOUND`).
 # ─────────────────────────────────────────────────────────────────────────────
 postgresql:
-  enabled: false
+  enabled: true
+
+  image:
+    repository: postgres
+    # Track a MAJOR line, not `latest` — a major bump needs pg_upgrade, not a pod roll.
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+
   auth:
     username: polyptic
-    password: polyptic
     database: polyptic
-    # Optional: use an existing secret for the Postgres password.
+    # Password for the bundled database. Empty (the default) → the chart generates
+    # a random 32-char password on first install and PRESERVES it across upgrades
+    # (same lookup pattern as secrets.cookieSecret). There is deliberately no
+    # literal default: a chart that ships `password: polyptic` ships it to every
+    # install that forgets to override. Keep any explicit password URL-safe
+    # (alphanumeric) — it goes into a postgres:// connection string.
+    password: ""
+    # Bring your own Secret for the password instead (GitOps). It must exist
+    # before install and hold the key below; the chart never reads its contents.
     existingSecret: ""
-  # Bitnami chart sub-values pass through here (primary.persistence, etc.).
-  primary:
-    persistence:
-      enabled: true
-      size: 8Gi
+    existingSecretPasswordKey: POSTGRES_PASSWORD
+
+  service:
+    port: 5432
+
+  persistence:
+    # Back the data directory with a PersistentVolumeClaim. FALSE means the
+    # registry is wiped on every pod restart — dev only.
+    enabled: true
+    # ADOPTION (POL-123): point at a PVC you already have — e.g. the `polyptic-db`
+    # claim from the hand-rolled companion manifest this chart replaces — and the
+    # StatefulSet mounts it instead of creating its own. Your data comes with you.
+    # When empty, the StatefulSet's volumeClaimTemplate creates (and keeps, even
+    # across `helm uninstall`) a claim named data-<release>-db-0.
+    existingClaim: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 8Gi
+    # "" uses the cluster default StorageClass; "-" disables dynamic provisioning.
+    storageClass: ""
+
+  # Modest by default: the control plane's registry is a small OLTP database
+  # (screens, murals, scenes, content), not a warehouse.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  # The postgres image's entrypoint starts as root and drops to the `postgres`
+  # user itself (it must chown PGDATA first), so no runAsNonRoot here — unlike
+  # the server pod, which never needs root.
+  podSecurityContext: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 externalDatabase:
-  # Full Postgres connection string, used when postgresql.enabled=false.
+  # Full Postgres connection string for YOUR database. Requires
+  # postgresql.enabled=false — setting both is refused at template time.
   # e.g. postgres://user:pass@my-pg.rds.amazonaws.com:5432/polyptic
   url: ""

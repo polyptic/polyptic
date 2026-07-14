@@ -4,7 +4,10 @@ Deploys the **Polyptic server** (the control plane: Fastify REST + three WebSock
 channels on `:8080`) to Kubernetes. This mirrors `deploy/docker-compose.yml`,
 `deploy/server.Dockerfile`, and `deploy/.env.example`.
 
-> **Scope.** This chart deploys ONLY the server. The on-device **agent is installed
+> **Scope.** This chart deploys the server **and its database** (a bundled Postgres,
+> on by default — POL-123/D108; point it at your own with `postgresql.enabled=false` +
+> `externalDatabase.url`). There is no companion manifest to apply first: `helm install
+> polyptic … -f values.yaml` is the whole deployment. The on-device **agent is installed
 > per box** from the control-plane depot (`curl -sfL http://SERVER/install | sh -`; D41) —
 > it is never run in Kubernetes. Agents connect *out* to the server over a WebSocket; expose
 > the server (Ingress / LoadBalancer) so the fleet can reach it.
@@ -315,14 +318,58 @@ keeps the depot PVC (a full rebuild caches the ~3GB base ISO — don't redo it p
 pod roll). Note the bonus: your cluster's nodes are **Linux**, so the image
 rebuild Jobs work here even though the host is macOS.
 
-## Database options
+## Database — the chart brings its own (POL-123 / D108)
+
+**`helm install` is the whole deployment.** `postgresql.enabled` defaults to **true** and the chart
+deploys Postgres itself — a first-party StatefulSet + Service (`templates/postgres.yaml`,
+`postgres:16-alpine`), *not* a subchart, with `DATABASE_URL` wired to it automatically. There is no
+companion manifest to apply first.
+
+> Until POL-123 the `postgresql.*` values were a **lie**: they advertised a bundled database the
+> chart had never implemented (no dependency, no template). The shipped default — `store: postgres`,
+> `postgresql.enabled: false`, an empty `externalDatabase.url` — installed cleanly and then
+> crash-looped the server on `getaddrinfo ENOTFOUND`. That combination is now **refused at template
+> time**, with a message telling you what to set.
 
 | Goal | Settings |
 | --- | --- |
-| In-cluster Postgres (default) | `postgresql.enabled=true` — `DATABASE_URL` is derived from the subchart automatically. |
+| **Bundled Postgres (default)** | nothing — `postgresql.enabled=true`; the password is generated and preserved, `DATABASE_URL` is derived. |
 | External / managed Postgres | `postgresql.enabled=false` + `externalDatabase.url=postgres://…` |
-| Pre-made Secret (GitOps) | `secrets.existingSecret=my-secret` with keys `COOKIE_SECRET`, `POLYPTIC_BOOTSTRAP_TOKEN`, `POLYPTIC_ADMIN_EMAIL`, `POLYPTIC_ADMIN_PASSWORD`, `DATABASE_URL`. |
-| Ephemeral (dev only) | `config.store=memory`, `postgresql.enabled=false` — registry lost on restart. |
+| Pre-made Secret (GitOps) | `postgresql.enabled=false` + `secrets.existingSecret=my-secret` with keys `COOKIE_SECRET`, `POLYPTIC_BOOTSTRAP_TOKEN`, `POLYPTIC_ADMIN_EMAIL`, `POLYPTIC_ADMIN_PASSWORD`, `DATABASE_URL`. |
+| Bundled DB, your own password Secret | `postgresql.auth.existingSecret=my-db-secret` (+ `.existingSecretPasswordKey`, default `POSTGRES_PASSWORD`). |
+| Ephemeral (dev only) | `config.store=memory` — no database is deployed at all. |
+
+**Credentials.** Leave `postgresql.auth.password` empty (the default): the chart generates a random
+32-char password on first install, stores it in its own Secret as `POSTGRES_PASSWORD`, and preserves
+it across `helm upgrade` (the same lookup pattern as `secrets.cookieSecret`). The password is never
+baked into a rendered connection string — it is injected into the server pod as an env var and
+expanded into `DATABASE_URL` by the kubelet.
+
+**Data.** `postgresql.persistence` is on by default (8Gi, cluster-default StorageClass). The claim
+comes from the StatefulSet's `volumeClaimTemplate` — `data-<release>-db-0` — which Kubernetes and
+Helm both leave alone: **`helm uninstall` does not delete your registry**; `kubectl delete pvc` does.
+
+**Pre-flight refusals.** The chart `fail`s at template time rather than render a database config that
+cannot work: both a bundled and an external database configured; `store=postgres` with neither; an
+unknown `config.store`.
+
+### Upgrading from the hand-rolled `polyptic-db` manifest
+
+If you have been applying your own PVC + StatefulSet + Service (named `polyptic-db`) alongside the
+chart, adopt the data instead of re-creating it:
+
+```sh
+kubectl -n polyptic delete statefulset polyptic-db --cascade=orphan   # keep the PVC + the data
+helm upgrade polyptic … \
+  --set postgresql.enabled=true \
+  --set postgresql.persistence.existingClaim=<your-pvc-name> \
+  --set postgresql.auth.password='<the password your DATABASE_URL used>'
+# and REMOVE externalDatabase.url from your values (the chart refuses both at once).
+```
+
+The bundled Service is also named `polyptic-db` for a release called `polyptic`, so any
+`DATABASE_URL` you had pointing at it keeps resolving. Alternatively keep your manifest and set
+`postgresql.enabled=false` + `externalDatabase.url` — that posture is still fully supported.
 
 ## Key values
 
@@ -350,8 +397,13 @@ rebuild Jobs work here even though the host is macOS.
 | `media.maxBytes` | `209715200` | `MEDIA_MAX_BYTES` — max upload size (~200MB). |
 | `media.persistence.enabled` | `true` | Back `MEDIA_DIR` with a PVC (else ephemeral emptyDir). |
 | `media.persistence.size` / `.storageClass` / `.existingClaim` | `20Gi` / `""` / `""` | Media PVC sizing/class, or bring your own claim. |
-| `postgresql.enabled` | `true` | Bitnami Postgres subchart toggle. |
-| `externalDatabase.url` | `""` | Used when `postgresql.enabled=false`. |
+| `postgresql.enabled` | **`true`** | Deploy the bundled Postgres StatefulSet (POL-123/D108). |
+| `postgresql.image.repository` / `.tag` | `postgres` / `16-alpine` | Bundled database image. |
+| `postgresql.auth.username` / `.database` / `.password` | `polyptic` / `polyptic` / `""` (generated + preserved) | Bundled DB credentials. |
+| `postgresql.auth.existingSecret` / `.existingSecretPasswordKey` | `""` / `POSTGRES_PASSWORD` | Bring your own password Secret. |
+| `postgresql.persistence.enabled` / `.size` / `.storageClass` / `.existingClaim` | `true` / `8Gi` / `""` / `""` | Data volume; `existingClaim` adopts a PVC you already have. |
+| `postgresql.resources` | 100m/256Mi → 1/1Gi | Bundled DB resources. |
+| `externalDatabase.url` | `""` | Your own Postgres. Requires `postgresql.enabled=false` (both at once is refused). |
 
 ## Render / lint locally
 
@@ -368,4 +420,10 @@ helm uninstall polyptic --namespace polyptic
 ```
 
 The chart-managed Secret carries `helm.sh/resource-policy: keep` so a generated
-`COOKIE_SECRET` survives a reinstall — delete it manually if you want a clean slate.
+`COOKIE_SECRET` (and the bundled database's password) survives a reinstall — delete it
+manually if you want a clean slate. The database's own PVC (`data-<release>-db-0`) also
+survives: uninstalling a release must not destroy a wall's registry. To wipe it:
+
+```sh
+kubectl -n polyptic delete pvc data-polyptic-db-0
+```
