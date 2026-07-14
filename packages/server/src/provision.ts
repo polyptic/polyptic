@@ -208,7 +208,11 @@ export function toWsAgentUrl(httpBase: string): string {
  * the boot depot is plain http by contract) and the token (when gated) is a baked literal. The caller
  * appends `polyptic.offload=1` on the offload entry only.
  */
-function bootKernelCmdline(httpBase: string, token: string | undefined): string {
+function bootKernelCmdline(
+  httpBase: string,
+  token: string | undefined,
+  opts: { watch?: boolean } = {},
+): string {
   const parts = [
     `root=live:${httpBase}/dist/image/$arch/rootfs.squashfs`,
     "rd.overlay=1",
@@ -227,7 +231,13 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
   // plymouth assume a headless server and never paint the local display (verified live with
   // plymouthd --debug in the POL-38 UTM boot). A wall renders on its panel by definition.
   // `multipath=off` is a dracut cmdline gate; the image also omits the module outright.
-  parts.push("multipath=off", "quiet", "splash", "plymouth.ignore-serial-consoles");
+  parts.push("multipath=off");
+  // `watch` is the verbose entry (POL-118): the operator deliberately chose to SEE the boot, so the
+  // splash that normally hides it is exactly what they do not want. Dropping `quiet splash` leaves
+  // the kernel and systemd printing to the console, which is where GRUB's own `debug=net,efinet,http`
+  // narration has just been going — one continuous transcript from the first DHCP packet onwards.
+  if (!opts.watch) parts.push("quiet", "splash");
+  parts.push("plymouth.ignore-serial-consoles");
   return parts.join(" ");
 }
 
@@ -265,6 +275,7 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
   const httpBase = `http://${hostPort}`;
   const cmdline = bootKernelCmdline(httpBase, token);
+  const watchCmdline = bootKernelCmdline(httpBase, token, { watch: true });
   const lines = [
     "# Polyptic netboot (POL-33/D47), generated for THIS control plane from the request Host.",
     "# Ownership is by KEY: the box belongs to the server whose enrolment token it carries.",
@@ -290,8 +301,12 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
     ...bootGfxPreamble("$net/boot/theme.txt"),
     "set timeout=5",
     "set default=live",
+    // The echo names the next few seconds (POL-118). What follows it is a multi-megabyte kernel +
+    // initrd fetch that GRUB makes in silence, and on a slow LAN that silence is long enough to read
+    // as a dead box. Narrating it is progress, not diagnostics — the thing D65 moved off this screen
+    // was the technical detail (RAM, arch, "image"), and none of that comes back here.
     'menuentry "Polyptic" --id live {',
-    '  echo "Starting Polyptic ..."',
+    '  echo "Starting Polyptic - downloading the operating system ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
@@ -305,6 +320,19 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
     'menuentry "Debug console" --id debug {',
     '  echo "Starting Polyptic with a root shell on tty9 (Ctrl+Alt+F9) ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} systemd.debug-shell=1`,
+    "  initrd $net/dist/image/$arch/initrd",
+    "}",
+    // The operator's window into the boot (POL-118). A wired box that is slow has, until now, been
+    // impossible to WATCH: GRUB's network conversation happens behind the splash. This entry turns it
+    // on — `debug=net,efinet,http` narrates every card, DHCP packet and HTTP request, `pager=1` stops
+    // it scrolling past — and then boots the same kernel WITHOUT `quiet splash`, so the transcript
+    // continues into the initramfs instead of hitting a curtain. Same exemption as the debug entry:
+    // nobody sees any of it unless they deliberately chose it, so D65's happy path is untouched.
+    'menuentry "Watch this screen boot (verbose)" --id verbose {',
+    '  echo "Showing everything this screen does. Press a key each time it pauses ..."',
+    "  set debug=net,efinet,http",
+    "  set pager=1",
+    `  linux  $net/dist/image/$arch/vmlinuz ${watchCmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
   );
