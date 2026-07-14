@@ -129,6 +129,58 @@ describe("the stage-1 config (boot medium + offloaded ESP)", () => {
     expect(DONGLE_TMPL).toContain("Could not reach the Polyptic control plane at $net");
     expect(DONGLE_TMPL).toContain("--id retry");
   });
+
+  test("narrates the wait, so a slow wired boot is legible instead of silent (POL-118)", () => {
+    // A box that is looking for a network and a box that has died looked identical: one line, then
+    // minutes of nothing. These two lines are PROGRESS, not diagnostics — D65 threw the second off
+    // the happy path, never the first. The address is echoed because it is the one fact that proves
+    // the network came up, and it is the fact an operator standing at the wall is about to ask for.
+    expect(DONGLE_TMPL).toContain('echo "Looking for a wired network ..."');
+    expect(DONGLE_TMPL).toContain(
+      'if [ -n "$nic_ip" ]; then echo "Got an address ($nic_ip) - fetching the boot menu ..." ; fi',
+    );
+  });
+});
+
+describe("stage 1 DHCPs ONE CARD AT A TIME, first lease wins (POL-118)", () => {
+  // The GRUB-stage twin of POL-76/D71. `net_dhcp` with no argument runs DHCP on every card GRUB
+  // enumerates and keeps polling until the LAST of them gives up, so a dual-NIC box with one cable in
+  // waited out the carrier-less port long after the live one had an address. Reproduced under OVMF
+  // with the real signed grubnet and two NICs, one of them going nowhere: 18.3 s to chain before,
+  // 6.3 s after. GRUB script cannot enumerate cards (`net_ls_cards` only PRINTS, and there is no
+  // command substitution), but `net_dhcp [CARD]` takes a card name and EFI names them efinet0..N.
+  const stage1 = DONGLE_TMPL.slice(0, DONGLE_TMPL.indexOf("configfile $net/boot/grub.cfg"));
+
+  test("walks the EFI cards by name and stops at the first that answers", () => {
+    for (const card of ["efinet0", "efinet1", "efinet2", "efinet3"]) {
+      expect(stage1).toContain(`net_dhcp ${card} ; set nic_rc="$?"`);
+    }
+    // The lease is read back from the variable GRUB itself registers for the interface it configured
+    // (`net_<card>_dhcp_ip`, colon rewritten to underscore) — checked live, not from documentation.
+    expect(stage1).toContain('set nic_ip="$net_efinet0_dhcp_ip"');
+    // `$?` is the grub_err_t: 36 = GRUB_ERR_NET_NO_CARD, i.e. we have run off the end of the box's
+    // real ports, so the walk stops rather than probing cards that do not exist.
+    expect(stage1).toContain('if [ "$nic_rc" = 36 ]; then set nic_next= ; fi');
+  });
+
+  test("the bare all-cards sweep survives ONLY on the failure menu, never on the happy path", () => {
+    // A box with more than four ports, or a GRUB that names its cards some other way, still has an
+    // exhaustive fallback — it just no longer sits in front of every healthy boot.
+    expect(stage1).not.toMatch(/^net_dhcp$/m);
+    expect(DONGLE_TMPL).toContain("menuentry \"Try again\" --id retry { net_dhcp ; configfile");
+  });
+
+  test("carries a verbose entry that shows GRUB's own network conversation", () => {
+    // Verified under OVMF against the pinned signed grubnet: `debug=net,efinet,http` printed 78 lines
+    // of DHCP/HTTP narration on a single boot. `pager=1` stops it scrolling past the operator.
+    expect(DONGLE_TMPL).toContain("--id verbose");
+    expect(DONGLE_TMPL).toContain("set debug=net,efinet,http");
+    expect(DONGLE_TMPL).toContain("set pager=1");
+    // …and none of it may touch the boot a wall does on its own.
+    const happyPath = DONGLE_TMPL.slice(0, DONGLE_TMPL.indexOf("configfile $net/boot/grub.cfg"));
+    expect(happyPath).not.toContain("set debug=");
+    expect(happyPath).not.toContain("set pager=");
+  });
 });
 
 describe("the offline (Wi-Fi) local menu carries its own splash (POL-74)", () => {
@@ -207,5 +259,35 @@ describe("the cluster Jobs carry the committed splash assets into /repo (POL-88)
     expect(command).not.toBe(""); // the deploy copy is still there…
     expect(command).toContain("cp -a /app/packages/server/assets/. /repo/packages/server/assets/");
     expect(command).toContain("mkdir -p /repo/deploy /repo/packages/server/assets");
+  });
+});
+
+describe("the player reports the build it is actually running (POL-117)", () => {
+  // `packages/player/package.json` is permanently 0.0.0 — the real version exists only as the git tag,
+  // which release.yml hands the image build as POLYPTIC_VERSION (the agent binary reads exactly that;
+  // agent/src/version.ts). The player's vite.config used package.json, so every wall's badge, idle
+  // splash and diag line said `v0.0.0` — worthless exactly when you are staring at a misbehaving screen
+  // asking which build it is. Caught on the real box, 2026-07-14. Two halves, both pinned here: the
+  // config must READ the env, and the Dockerfile must declare the ARG BEFORE the SPA builds (an ARG is
+  // only in scope for the RUNs that follow it — declared after, vite saw nothing).
+  const VITE = read("packages", "player", "vite.config.ts");
+  const DOCKERFILE = read("deploy", "server.Dockerfile");
+
+  test("vite stamps POLYPTIC_VERSION into __APP_VERSION__, falling back to package.json", () => {
+    expect(VITE).toContain("process.env.POLYPTIC_VERSION");
+    expect(VITE).toContain("__APP_VERSION__: JSON.stringify(buildVersion)");
+    expect(VITE).toMatch(/\|\|\s*pkg\.version/); // a dev build still says something
+  });
+
+  test("the leading `v` of a tag is stripped, so the wall shows 0.2.30 not v0.2.30", () => {
+    expect(VITE).toMatch(/replace\(\/\^v\/, ""\)/);
+  });
+
+  test("the Dockerfile declares POLYPTIC_VERSION BEFORE it builds the SPAs", () => {
+    const argAt = DOCKERFILE.indexOf("ARG POLYPTIC_VERSION");
+    const playerBuildAt = DOCKERFILE.indexOf("cd packages/player && bun run build");
+    expect(argAt).toBeGreaterThan(-1);
+    expect(playerBuildAt).toBeGreaterThan(-1);
+    expect(argAt).toBeLessThan(playerBuildAt); // the whole bug, in one assertion
   });
 });

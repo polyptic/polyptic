@@ -2,8 +2,13 @@ import { readFileSync } from "node:fs";
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
-// Read our own version at config time so the idle splash can stamp the build (see IdleSplash.vue).
+// The build version stamped onto the idle splash, the corner badge and every diag line (POL-86).
+// `packages/player/package.json` is permanently 0.0.0 — the real version only exists as the git tag,
+// which release.yml passes into the image build as POLYPTIC_VERSION (the agent binary reads exactly
+// the same value; see agent/src/version.ts). Without this the wall reports `v0.0.0` forever, which is
+// worthless precisely when you are staring at a misbehaving screen asking "which build is this?".
 const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf-8"));
+const buildVersion = (process.env.POLYPTIC_VERSION ?? "").trim().replace(/^v/, "") || pkg.version;
 
 // The player is the headless page shown fullscreen on each wall screen.
 // Dev server is pinned to 5173 (the SERVER advertises PLAYER_BASE_URL=http://localhost:5173).
@@ -16,7 +21,7 @@ export default defineConfig(({ command }) => ({
   base: command === "build" ? "/player/" : "/",
   plugins: [vue()],
   define: {
-    __APP_VERSION__: JSON.stringify(pkg.version),
+    __APP_VERSION__: JSON.stringify(buildVersion),
   },
   server: {
     // Bind 0.0.0.0 so a remote display/agent (a wall box on the LAN) can reach the dev player.

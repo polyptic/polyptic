@@ -76,7 +76,7 @@ Boot medium (USB dongle)   or   offloaded ESP entry   or   UEFI HTTP Boot / site
         │  firmware db (Microsoft UEFI CA 2011) verifies + runs…
         ▼
 shim (Microsoft-signed) → verifies + loads → network GRUB "grubnet" (Canonical-signed)
-        │  DHCP on all NICs, then fetches
+        │  DHCP on each NIC IN TURN, first lease wins (POL-118), then fetches
         ▼
 GET /boot/grub.cfg   (control plane = BOOT DEPOT, ungated)
         │  GRUB menu: control-plane base + (gated) enrolment token baked in from THIS request
@@ -281,6 +281,39 @@ dark against Plymouth's, and the committed PNG against the size the theme asks G
 > resolution here would be the same mistake D64 rejected — no generic image knows the panel's size.
 > Under OVMF/QEMU the whole chain resolves to 800x600 because its GOP starts there and exposes no EDID;
 > that is a VM artifact, not what a panel does.
+
+---
+
+## The wired wait: one card at a time, and it talks (POL-118)
+
+Stage 1 used to run `net_dhcp` with no argument. That runs DHCP on **every** card GRUB enumerates,
+sharing one retransmit loop, and it does not stop when a card gets an address — it stops when the
+**last** card gives up. On a dual-NIC box with one cable in, the empty port therefore held the boot
+long after the live port was already online: minutes of `Starting Polyptic ...` on the glass, with the
+box looking dead. It is the same failure [D71](DECISIONS.md) fixed one stage later, in the initramfs.
+
+So stage 1 now walks the cards itself and **takes the first lease**:
+
+```
+net_dhcp efinet0 ; set nic_rc="$?"     # 0 = leased; 36 = GRUB_ERR_NET_NO_CARD, i.e. no such port
+```
+
+EFI names network cards `efinet0..N` in enumeration order, `net_dhcp` takes a card name, and after a
+lease GRUB registers the address in `net_<card>_dhcp_ip` — which is where the screen's
+`Got an address (…)` line comes from. **What GRUB cannot do is see carrier**, and it cannot enumerate
+its own cards from script (`net_ls_cards` only *prints* them, and GRUB script has no command
+substitution). So an unplugged port can no longer outlive a working one, but if the unplugged port is
+enumerated **first**, its own DHCP schedule is still paid before the live one is tried. Fixing *that*
+means changing the loop inside `grub_cmd_bootp` — a **signed binary we neither build nor touch**
+([D47](DECISIONS.md)). The bare all-cards sweep stays on the failure menu's **Try again**, which is the
+escape hatch for a box with more than four ports.
+
+**Watching a boot.** Both menus carry a verbose entry — **Watch this screen boot (verbose)** on the
+served menu, **Try again, and show the network conversation** on the medium's fallback menu. It sets
+`debug=net,efinet,http` and `pager=1`, so GRUB prints every card, every DHCP packet and every HTTP
+request it makes, and (on the served menu) boots the kernel **without** `quiet splash`, so the
+transcript carries on into the initramfs instead of disappearing behind the Plymouth splash. It is
+never the default: an unattended wall boots the same silent-and-branded path it always did.
 
 ---
 

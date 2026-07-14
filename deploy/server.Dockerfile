@@ -40,6 +40,10 @@ RUN bun install --frozen-lockfile
 RUN cd packages/protocol && bun run build
 
 # Production builds of both SPAs. Vite emits to packages/<app>/dist by default.
+# The ARG must come BEFORE these builds: an ARG is only in scope for the RUNs that follow it, and the
+# player's vite.config reads POLYPTIC_VERSION to stamp the badge/splash/diag (POL-117). Declared below
+# it, the SPA builds saw nothing and every wall reported v0.0.0.
+ARG POLYPTIC_VERSION=0.0.0
 RUN cd packages/console && bun run build
 RUN cd packages/player && bun run build
 
