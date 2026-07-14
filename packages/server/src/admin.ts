@@ -17,7 +17,12 @@
  */
 import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
+import type {
+  Alert as AlertType,
+  MachineView,
+  ScreenView,
+  ServerToAdminMessage,
+} from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
@@ -72,6 +77,12 @@ export class Presence {
    *  machine reconnects, and expired after REBOOTING_TTL_MS so a box that dies mid-reboot doesn't
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
+
+  /** screenId → the agent's last per-connector verdict from `agent/status` (POL-91). The heartbeat
+   *  has always carried `{connector, ok, note}` and the server has always thrown it away; it is the
+   *  only signal that says the BOX thinks the browser is not on the glass, so alerting reads it here.
+   *  Live-only: cleared when the machine drops (an offline box's last verdict is not news). */
+  private readonly screenPlacements = new Map<string, { ok: boolean; note?: string }>();
 
   /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
   private static readonly REBOOTING_TTL_MS = 3 * 60_000;
@@ -149,6 +160,21 @@ export class Presence {
     return wasRebooting;
   }
 
+  /** Record the agent's per-connector placement verdict for a screen (POL-91, from `agent/status`). */
+  setScreenPlacement(screenId: string, ok: boolean, note?: string): void {
+    this.screenPlacements.set(screenId, { ok, ...(note ? { note } : {}) });
+  }
+
+  /** The last placement verdict for a screen, or undefined if its box has never reported one. */
+  screenPlacement(screenId: string): { ok: boolean; note?: string } | undefined {
+    return this.screenPlacements.get(screenId);
+  }
+
+  /** Forget the placement verdicts for these screens (their box dropped — see setScreenPlacement). */
+  clearScreenPlacements(screenIds: readonly string[]): void {
+    for (const id of screenIds) this.screenPlacements.delete(id);
+  }
+
   /**
    * Forget the inspector state for these screens — their machine dropped, so whatever was on those
    * panels is gone. Without this a box that reboots while being inspected comes back showing a stale
@@ -172,6 +198,7 @@ export function buildAdminState(
   playerHub: PlayerHub,
   presence: Presence,
   activity: ActivityLog,
+  alerts: readonly AlertType[] = [],
 ): ServerToAdminMessage {
   const screens = control.getScreens();
 
@@ -224,6 +251,7 @@ export function buildAdminState(
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
+    alerts: [...alerts], // POL-91 — the live alerts behind the topbar chip (firing only)
   });
 }
 
@@ -234,6 +262,9 @@ interface BroadcasterDeps {
   adminHub: AdminHub;
   activity: ActivityLog;
   log: FastifyBaseLogger;
+  /** POL-91 — the currently firing alerts. Wired late (the engine is built after the broadcaster),
+   *  so it is a getter rather than a value; absent = a snapshot with no alerts. */
+  alerts?: () => readonly AlertType[];
 }
 
 /**
@@ -246,6 +277,11 @@ export class AdminBroadcaster {
 
   constructor(private readonly deps: BroadcasterDeps) {}
 
+  /** POL-91 — hand the broadcaster the live alert source once the engine exists. */
+  setAlertSource(alerts: () => readonly AlertType[]): void {
+    this.deps.alerts = alerts;
+  }
+
   /** Current `admin/state` for a single recipient (e.g. on connect). */
   snapshot(): ServerToAdminMessage {
     return buildAdminState(
@@ -253,6 +289,7 @@ export class AdminBroadcaster {
       this.deps.playerHub,
       this.deps.presence,
       this.deps.activity,
+      this.deps.alerts?.() ?? [],
     );
   }
 

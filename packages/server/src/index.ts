@@ -18,6 +18,10 @@ import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettin
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import { AlertEngine, DEFAULT_DEBOUNCE_MS, defaultProbes } from "./alerts";
+import { registerAlertRoutes } from "./alert-routes";
+import { NotificationService } from "./notify";
+import { SmtpClient, smtpConfigFromEnv } from "./smtp";
 import { AuthService, authConfigFromEnv } from "./auth-local";
 import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
@@ -434,6 +438,55 @@ const imageUpdates = new ImageUpdates(
 );
 imageUpdates.start();
 
+// ── Alerting (POL-91): the control plane calls YOU when a box or its content goes dark. ──
+// The engine evaluates probes over signals the server ALREADY holds (machine presence, screens with
+// content but no player, the agent heartbeat's per-connector verdict, a failed image rebuild) and
+// hands each alert's lifecycle — debounced firing, and the resolve that closes it — to the rules an
+// operator configured: an HMAC-signed webhook POST (Slack, Teams, PagerDuty, ntfy, Alertmanager are
+// all just URLs) or SMTP. Nothing here touches the player path.
+const smtpConfig = smtpConfigFromEnv();
+const notifications = new NotificationService({
+  store,
+  log: fastify.log,
+  smtp: smtpConfig ? new SmtpClient(smtpConfig) : undefined,
+  deployment: process.env.PUBLIC_BASE_URL?.trim() || undefined,
+  onChange: () => broadcaster.broadcast(),
+});
+await notifications.init();
+const alertEngine = new AlertEngine({
+  notifications,
+  log: fastify.log,
+  activity,
+  deployment: process.env.PUBLIC_BASE_URL?.trim() || undefined,
+  onChange: () => broadcaster.broadcast(),
+  defaultDebounceMs: Number(process.env.ALERT_DEBOUNCE_MS ?? DEFAULT_DEBOUNCE_MS),
+  probes: defaultProbes({
+    control,
+    presence,
+    playerHub: hub,
+    lastImageBuild: async () => {
+      const st = await imageUpdates.state();
+      return {
+        status: st.lastBuildStatus,
+        startedAt: st.lastBuildStartedAt,
+        logTail: st.lastBuildLog,
+      };
+    },
+  }),
+});
+broadcaster.setAlertSource(() => alertEngine.active());
+alertEngine.start(Number(process.env.ALERT_TICK_MS ?? 15_000));
+registerAlertRoutes(fastify, notifications, alertEngine, broadcaster, activity);
+fastify.log.info(
+  {
+    event: "alerts.up",
+    rules: notifications.views().length,
+    smtp: smtpConfig ? `${smtpConfig.host}:${smtpConfig.port} (${smtpConfig.tls})` : "not configured",
+  },
+  `alerting up: ${notifications.views().length} notification rule(s)` +
+    (smtpConfig ? "" : " — SMTP_HOST is unset, so smtp rules cannot deliver (webhooks are unaffected)"),
+);
+
 // Pass the live enrollment singleton so GET /boot/grub.cfg (POL-33/D47) bakes the CURRENT token, the
 // same one the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
 // The last argument lands a box's bootloader-install verdict (POL-58) in the Live Activity feed: the
@@ -634,6 +687,7 @@ async function shutdown(signal: string): Promise<void> {
   capture.stop();
   tokens.stop();
   pageData.stop();
+  alertEngine.stop();
   agentMtlsChannel?.server.close();
   try {
     await fastify.close();

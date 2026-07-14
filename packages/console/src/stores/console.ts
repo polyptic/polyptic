@@ -13,12 +13,14 @@ import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
   ActivityEvent,
+  Alert,
   AuthUser,
   ChangePasswordBody,
   ContentKind,
   ContentSource,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateNotificationRuleBody,
   CredentialProfileTestResult,
   CredentialProfileView,
   DisplaySettings,
@@ -27,11 +29,14 @@ import type {
   MachineView,
   Mural,
   NetbootInfo,
+  NotificationRuleView,
+  NotificationTestResult,
   Placement,
   Scene,
   ScreenView,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateNotificationRuleBody,
   UpdateSceneBody,
   VideoWall,
   ImageUpdateInfo,
@@ -137,6 +142,11 @@ export interface ConsoleState {
   credentialProfiles: CredentialProfileView[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
+  /** POL-91 — the alerts currently FIRING, mirrored from admin/state.alerts (optional on the wire →
+   *  [] against an older server). The topbar chip lists them and click-navigates to the subject. */
+  alerts: Alert[];
+  /** POL-91 — the notification rules (webhook / SMTP), fetched by Settings. Never a signing secret. */
+  notificationRules: NotificationRuleView[];
   /** The Live Activity feed (D25) — bounded, newest-first human event log, mirrored from
    *  admin/state.activity. The field is OPTIONAL on the wire (back-compat), so it defaults to []
    *  when a server omits it. */
@@ -180,6 +190,8 @@ export const useConsoleStore = defineStore("console", {
     contentSources: [],
     credentialProfiles: [],
     scenes: [],
+    alerts: [],
+    notificationRules: [],
     activity: [],
     activeSceneId: null,
     activeMuralId: null,
@@ -419,6 +431,13 @@ export const useConsoleStore = defineStore("console", {
 
     profileById(): (id: string) => CredentialProfileView | undefined {
       return (id: string) => this.credentialProfiles.find((p) => p.id === id);
+    },
+
+    // ── Alerting (POL-91) ────────────────────────────────────────────────────
+
+    /** How many alerts are firing right now — the number the topbar chip shows. */
+    alertCount(state): number {
+      return state.alerts.length;
     },
 
     /** The library source currently armed for click-to-assign on the canvas, if any. */
@@ -704,6 +723,8 @@ export const useConsoleStore = defineStore("console", {
         // POL-24 — credential profiles are optional on the wire (older servers omit them).
         this.credentialProfiles = msg.credentialProfiles ?? [];
         this.scenes = msg.scenes;
+        // POL-91 — the firing alerts. Optional on the wire (older servers omit them); default to [].
+        this.alerts = msg.alerts ?? [];
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
         this.activity = msg.activity ?? [];
@@ -1305,6 +1326,65 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         console.error("[console] testProfile failed", err);
         return { ok: false, error: "Request failed — is the server reachable?" };
+      }
+    },
+
+    // ── Alerting (POL-91) ───────────────────────────────────────────────────────
+
+    /** Load the notification rules for the Settings card. Non-throwing, like fetchNetboot. */
+    async fetchNotificationRules(): Promise<void> {
+      try {
+        this.notificationRules = await api.listNotificationRules();
+      } catch (err) {
+        console.error("[console] fetchNotificationRules failed", err);
+      }
+    },
+
+    /** Create a rule (the id is server-assigned, so no optimistic insert — we re-read the list). */
+    async createNotificationRule(body: CreateNotificationRuleBody): Promise<boolean> {
+      try {
+        await api.createNotificationRule(body);
+        await this.fetchNotificationRules();
+        return true;
+      } catch (err) {
+        console.error("[console] createNotificationRule failed", err);
+        return false;
+      }
+    },
+
+    /** Update a rule (webhookSecret omitted = unchanged — the server keeps the one it has). */
+    async updateNotificationRule(id: string, body: UpdateNotificationRuleBody): Promise<boolean> {
+      try {
+        await api.updateNotificationRule(id, body);
+        await this.fetchNotificationRules();
+        return true;
+      } catch (err) {
+        console.error("[console] updateNotificationRule failed", err);
+        return false;
+      }
+    },
+
+    async deleteNotificationRule(id: string): Promise<boolean> {
+      this.notificationRules = this.notificationRules.filter((r) => r.id !== id); // optimistic
+      try {
+        await api.deleteNotificationRule(id);
+        return true;
+      } catch (err) {
+        console.error("[console] deleteNotificationRule failed", err);
+        await this.fetchNotificationRules(); // put it back — the delete didn't take
+        return false;
+      }
+    },
+
+    /** Fire a REAL signed test delivery and return the notifier's own verdict (the test-fire button). */
+    async testNotificationRule(id: string): Promise<NotificationTestResult> {
+      try {
+        const result = await api.testNotificationRule(id);
+        await this.fetchNotificationRules(); // the delivery health just changed either way
+        return result;
+      } catch (err) {
+        console.error("[console] testNotificationRule failed", err);
+        return { ok: false, error: "Request failed — is the control plane reachable?" };
       }
     },
 

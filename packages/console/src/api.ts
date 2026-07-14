@@ -10,6 +10,7 @@ import {
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateNotificationRuleBody,
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
@@ -22,12 +23,15 @@ import {
   SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateNotificationRuleBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type {
   ContentSource,
   CredentialProfileTestResult,
   CredentialProfileView,
+  NotificationRuleView,
+  NotificationTestResult,
   Scene,
   VideoWall,
 } from "@polyptic/protocol";
@@ -532,4 +536,49 @@ export async function updateScene(sceneId: string, body: UpdateSceneBody): Promi
 /** DELETE /api/v1/scenes/:sceneId — delete a saved scene. */
 export function deleteScene(sceneId: string): Promise<unknown> {
   return send("DELETE", `/scenes/${encodeURIComponent(sceneId)}`);
+}
+
+// ── Alerting (POL-91) ────────────────────────────────────────────────────────
+// Notification rules route alert kinds into a notifier (a generic HMAC-signed webhook, or SMTP). The
+// webhook SIGNING SECRET crosses the wire INBOUND ONLY — every response carries a
+// NotificationRuleView (config + live delivery health, never the secret).
+
+/** GET /api/v1/notification-rules — every rule, with its live delivery health. */
+export function listNotificationRules(): Promise<NotificationRuleView[]> {
+  return send<NotificationRuleView[]>("GET", "/notification-rules");
+}
+
+/** POST /api/v1/notification-rules — create a rule. A webhook rule without a secret gets a minted one. */
+export async function createNotificationRule(
+  body: CreateNotificationRuleBody,
+): Promise<NotificationRuleView | undefined> {
+  const res = await send<{ rule?: NotificationRuleView }>(
+    "POST",
+    "/notification-rules",
+    CreateNotificationRuleBody.parse(body),
+  );
+  return res?.rule;
+}
+
+/** PATCH /api/v1/notification-rules/:id — partial update (webhookSecret omitted = unchanged). */
+export async function updateNotificationRule(
+  ruleId: string,
+  body: UpdateNotificationRuleBody,
+): Promise<NotificationRuleView | undefined> {
+  const res = await send<{ rule?: NotificationRuleView }>(
+    "PATCH",
+    `/notification-rules/${encodeURIComponent(ruleId)}`,
+    UpdateNotificationRuleBody.parse(body),
+  );
+  return res?.rule;
+}
+
+/** DELETE /api/v1/notification-rules/:id */
+export function deleteNotificationRule(ruleId: string): Promise<unknown> {
+  return send("DELETE", `/notification-rules/${encodeURIComponent(ruleId)}`);
+}
+
+/** POST /api/v1/notification-rules/:id/test — fire a REAL signed delivery; the notifier's verdict. */
+export function testNotificationRule(ruleId: string): Promise<NotificationTestResult> {
+  return send<NotificationTestResult>("POST", `/notification-rules/${encodeURIComponent(ruleId)}/test`);
 }

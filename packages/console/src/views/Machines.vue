@@ -25,7 +25,8 @@
   ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints, no direct fetch.
 -->
 <script setup lang="ts">
-import { ref, computed, reactive, onMounted, onUnmounted } from "vue";
+import { ref, computed, reactive, onMounted, onUnmounted, nextTick, watch } from "vue";
+import { useRoute } from "vue-router";
 import type { MachineView } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
@@ -34,6 +35,22 @@ import ColdStartWizard from "../components/ColdStartWizard.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
 
 const store = useConsoleStore();
+const route = useRoute();
+
+// POL-91 — the alerts drawer navigates here with ?machine=<id>: scroll that box into view and mark
+// it, so an operator who clicked "Atrium box is offline" lands ON the atrium box, not on a list.
+const highlighted = ref<string | null>(null);
+watch(
+  () => [route.query.machine, store.machines.length] as const,
+  async () => {
+    const id = typeof route.query.machine === "string" ? route.query.machine : null;
+    highlighted.value = id;
+    if (!id) return;
+    await nextTick();
+    document.getElementById(`machine-${id}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+  },
+  { immediate: true },
+);
 
 const pending = computed(() => store.pendingMachines);
 const approved = computed(() => store.approvedMachines);
@@ -266,7 +283,13 @@ function showToast(message: string): void {
             Approved <span class="count-muted">· {{ approved.length }}</span>
           </div>
           <div v-if="approved.length" class="stack">
-            <div v-for="m in approved" :key="m.id" class="machine">
+            <div
+              v-for="m in approved"
+              :key="m.id"
+              :id="`machine-${m.id}`"
+              class="machine"
+              :class="{ highlighted: highlighted === m.id }"
+            >
               <div class="machine-row">
                 <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
                 <div class="machine-id">
@@ -593,6 +616,11 @@ function showToast(message: string): void {
   padding: 14px 16px;
   background: var(--card);
   box-shadow: var(--shadow-sm);
+}
+/* POL-91 — the box the alerts drawer sent you to. */
+.machine.highlighted {
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .machine.pending {
   border-color: var(--warn-soft);

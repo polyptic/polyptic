@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import type { AlertKind, HttpsInfo, ImageBuild, NotificationRuleView } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
@@ -20,6 +20,7 @@ onMounted(() => {
   void store.fetchNetboot();
   void store.fetchDisplaySettings();
   void store.fetchImageUpdates();
+  void store.fetchNotificationRules();
   void loadHttps();
   document.addEventListener("keydown", onKeydown);
 });
@@ -27,7 +28,8 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onKeydown));
 
 function onKeydown(e: KeyboardEvent): void {
   if (e.key !== "Escape") return;
-  if (usbModal.value) usbModal.value = false;
+  if (ruleModal.value) closeRuleModal();
+  else if (usbModal.value) usbModal.value = false;
   else if (menuOpen.value) menuOpen.value = false;
   else if (rowMenu.value) rowMenu.value = null;
 }
@@ -320,6 +322,175 @@ async function onSignOut(): Promise<void> {
   await store.logout();
   await router.replace({ name: "signin" });
 }
+
+// ── Alerts & notifications (POL-91) ────────────────────────────────────────────
+// A rule maps alert kinds onto ONE notifier. The webhook is the vendor-neutral primitive — Slack,
+// Teams, PagerDuty, ntfy and Alertmanager are all just URLs, and the payload is HMAC-signed so the
+// receiver can tell it really came from this wall. SMTP is the second, because every operator has it.
+const ALERT_KINDS: { kind: AlertKind; label: string; hint: string }[] = [
+  { kind: "machine-offline", label: "A box goes offline", hint: "its agent stops answering" },
+  { kind: "screen-dark", label: "A screen goes dark", hint: "content assigned, nothing rendering it" },
+  { kind: "screen-placement-failed", label: "A browser won't stay up", hint: "the box says the page is not on the glass" },
+  { kind: "image-build-failed", label: "An image rebuild fails", hint: "the nightly / full rebuild job" },
+];
+
+const ruleModal = ref(false);
+const ruleTesting = ref<string | null>(null);
+const ruleSaving = ref(false);
+const ruleError = ref("");
+const editingRuleId = ref<string | null>(null);
+
+const ruleForm = reactive({
+  name: "",
+  notifier: "webhook" as "webhook" | "smtp",
+  webhookUrl: "",
+  webhookSecret: "",
+  emailTo: "",
+  kinds: ["machine-offline"] as AlertKind[],
+  debounceMinutes: 3,
+  quietEnabled: false,
+  quietStart: "22:00",
+  quietEnd: "07:00",
+});
+
+function openNewRule(): void {
+  editingRuleId.value = null;
+  ruleError.value = "";
+  Object.assign(ruleForm, {
+    name: "",
+    notifier: "webhook",
+    webhookUrl: "",
+    webhookSecret: "",
+    emailTo: "",
+    kinds: ["machine-offline"] as AlertKind[],
+    debounceMinutes: 3,
+    quietEnabled: false,
+    quietStart: "22:00",
+    quietEnd: "07:00",
+  });
+  ruleModal.value = true;
+}
+
+function openEditRule(rule: NotificationRuleView): void {
+  editingRuleId.value = rule.id;
+  ruleError.value = "";
+  Object.assign(ruleForm, {
+    name: rule.name,
+    notifier: rule.notifier,
+    webhookUrl: rule.webhookUrl ?? "",
+    webhookSecret: "", // never returned; blank means "keep the one you have"
+    emailTo: (rule.emailTo ?? []).join(", "),
+    kinds: [...rule.kinds],
+    debounceMinutes: Math.round(rule.debounceSeconds / 60),
+    quietEnabled: Boolean(rule.quietHours),
+    quietStart: rule.quietHours?.start ?? "22:00",
+    quietEnd: rule.quietHours?.end ?? "07:00",
+  });
+  ruleModal.value = true;
+}
+
+function closeRuleModal(): void {
+  ruleModal.value = false;
+  editingRuleId.value = null;
+}
+
+function toggleKind(kind: AlertKind): void {
+  const i = ruleForm.kinds.indexOf(kind);
+  if (i >= 0) ruleForm.kinds.splice(i, 1);
+  else ruleForm.kinds.push(kind);
+}
+
+async function saveRule(): Promise<void> {
+  if (ruleSaving.value) return;
+  ruleError.value = "";
+  const name = ruleForm.name.trim();
+  if (!name) return void (ruleError.value = "Give the rule a name.");
+  if (ruleForm.kinds.length === 0) return void (ruleError.value = "Pick at least one thing to be told about.");
+
+  const recipients = ruleForm.emailTo
+    .split(/[,\s]+/)
+    .map((a) => a.trim())
+    .filter(Boolean);
+  if (ruleForm.notifier === "webhook" && !ruleForm.webhookUrl.trim()) {
+    return void (ruleError.value = "A webhook rule needs a URL to POST to.");
+  }
+  if (ruleForm.notifier === "smtp" && recipients.length === 0) {
+    return void (ruleError.value = "An email rule needs at least one recipient.");
+  }
+
+  const quietHours = ruleForm.quietEnabled
+    ? { start: ruleForm.quietStart, end: ruleForm.quietEnd }
+    : null;
+  const debounceSeconds = Math.max(0, Math.round(ruleForm.debounceMinutes * 60));
+
+  ruleSaving.value = true;
+  const ok = editingRuleId.value
+    ? await store.updateNotificationRule(editingRuleId.value, {
+        name,
+        kinds: ruleForm.kinds,
+        notifier: ruleForm.notifier,
+        ...(ruleForm.notifier === "webhook" ? { webhookUrl: ruleForm.webhookUrl.trim() } : {}),
+        ...(ruleForm.webhookSecret.trim() ? { webhookSecret: ruleForm.webhookSecret.trim() } : {}),
+        ...(ruleForm.notifier === "smtp" ? { emailTo: recipients } : {}),
+        debounceSeconds,
+        quietHours,
+      })
+    : await store.createNotificationRule({
+        name,
+        enabled: true,
+        kinds: ruleForm.kinds,
+        notifier: ruleForm.notifier,
+        ...(ruleForm.notifier === "webhook" ? { webhookUrl: ruleForm.webhookUrl.trim() } : {}),
+        ...(ruleForm.webhookSecret.trim() ? { webhookSecret: ruleForm.webhookSecret.trim() } : {}),
+        ...(ruleForm.notifier === "smtp" ? { emailTo: recipients } : {}),
+        debounceSeconds,
+        quietHours,
+      });
+  ruleSaving.value = false;
+
+  if (!ok) return void (ruleError.value = "The control plane refused that rule. Check the URL or the addresses.");
+  closeRuleModal();
+  showToast(editingRuleId.value ? "Rule saved" : "Notification rule created");
+}
+
+async function toggleRule(rule: NotificationRuleView): Promise<void> {
+  await store.updateNotificationRule(rule.id, { enabled: !rule.enabled });
+}
+
+async function removeRule(rule: NotificationRuleView): Promise<void> {
+  if (!window.confirm(`Delete the "${rule.name}" rule? Alerts will stop going out through it.`)) return;
+  await store.deleteNotificationRule(rule.id);
+  showToast("Rule deleted");
+}
+
+/** Fire a REAL, signed delivery through the rule. The notifier's own verdict comes back — a webhook
+ *  sink that 404s says so here, not in an incident three weeks from now. */
+async function testRule(rule: NotificationRuleView): Promise<void> {
+  if (ruleTesting.value) return;
+  ruleTesting.value = rule.id;
+  const result = await store.testNotificationRule(rule.id);
+  ruleTesting.value = null;
+  showToast(result.ok ? `Test alert delivered through "${rule.name}"` : `Test failed: ${result.error}`);
+}
+
+function ruleTargetLabel(rule: NotificationRuleView): string {
+  if (rule.notifier === "webhook") return rule.webhookUrl ?? "";
+  return (rule.emailTo ?? []).join(", ");
+}
+
+function ruleKindsLabel(rule: NotificationRuleView): string {
+  return rule.kinds
+    .map((k) => ALERT_KINDS.find((entry) => entry.kind === k)?.label ?? k)
+    .join(" · ");
+}
+
+function debounceLabel(seconds: number): string {
+  if (seconds === 0) return "immediately";
+  if (seconds < 60) return `after ${seconds}s`;
+  const mins = Math.round(seconds / 60);
+  return `after ${mins} min${mins === 1 ? "" : "s"}`;
+}
+
 </script>
 
 <template>
@@ -651,6 +822,62 @@ async function onSignOut(): Promise<void> {
             {{ store.showBadges ? "Shown on every connected screen." : "Hidden on every connected screen." }}
           </span>
         </div>
+      </section>
+
+      <!-- Alerts & notifications (POL-91) --------------------------------------- -->
+      <section id="sec-alerts" class="card">
+        <div class="card-head">
+          <div class="min-w-0">
+            <h2 class="card-title">Alerts &amp; notifications</h2>
+            <p class="card-sub wrap">
+              When a box or its content goes dark, the control plane calls you. A webhook posts to any
+              URL — chat, on-call, a script — and the payload is signed so the receiver knows it is
+              really yours. Email goes through your SMTP relay. Recovery sends an all-clear.
+            </p>
+          </div>
+          <button type="button" class="btn-ghost-sm" @click="openNewRule">Add rule</button>
+        </div>
+
+        <div v-if="store.notificationRules.length" class="rule-list">
+          <div v-for="rule in store.notificationRules" :key="rule.id" class="rule" :class="{ off: !rule.enabled }">
+            <div class="rule-main">
+              <div class="rule-line">
+                <span class="rule-name">{{ rule.name }}</span>
+                <span class="chip" :class="rule.notifier === 'webhook' ? 'chip-accent' : 'chip-neutral'">
+                  {{ rule.notifier === "webhook" ? "Webhook" : "Email" }}
+                </span>
+                <span v-if="rule.notifier === 'webhook' && rule.hasSecret" class="chip chip-neutral" title="Payloads are HMAC-SHA256 signed">
+                  Signed
+                </span>
+                <span v-if="!rule.enabled" class="chip chip-neutral">Paused</span>
+                <span v-if="rule.lastDeliveryOk === false" class="chip chip-bad" :title="rule.lastError">
+                  Last delivery failed
+                </span>
+              </div>
+              <p class="rule-target ellipsis">{{ ruleTargetLabel(rule) }}</p>
+              <p class="rule-meta">
+                {{ ruleKindsLabel(rule) }} · fires {{ debounceLabel(rule.debounceSeconds) }}
+                <template v-if="rule.quietHours">
+                  · quiet {{ rule.quietHours.start }}–{{ rule.quietHours.end }}
+                </template>
+              </p>
+            </div>
+            <div class="rule-actions">
+              <button type="button" class="btn-ghost-sm" :disabled="ruleTesting === rule.id" @click="testRule(rule)">
+                {{ ruleTesting === rule.id ? "Sending…" : "Test" }}
+              </button>
+              <button type="button" class="btn-ghost-sm" @click="openEditRule(rule)">Edit</button>
+              <button type="button" class="btn-ghost-sm" @click="toggleRule(rule)">
+                {{ rule.enabled ? "Pause" : "Resume" }}
+              </button>
+              <button type="button" class="btn-ghost-sm" @click="removeRule(rule)">Delete</button>
+            </div>
+          </div>
+        </div>
+
+        <p v-else class="hint">
+          No rules yet — nothing calls you when a screen goes dark. Add one: any URL will do.
+        </p>
       </section>
 
       <!-- Enrolment token ------------------------------------------------------ -->
@@ -999,6 +1226,117 @@ async function onSignOut(): Promise<void> {
       <div v-if="toast" class="toast">{{ toast }}</div>
     </Transition>
   </div>
+
+    <!-- Notification-rule modal (POL-91) ----------------------------------------- -->
+    <div v-if="ruleModal" class="rule-scrim" @click.self="closeRuleModal">
+      <div class="rule-modal">
+        <h3 class="rule-modal-title">{{ editingRuleId ? "Edit rule" : "New notification rule" }}</h3>
+
+        <label class="field-label" for="rule-name">Name</label>
+        <input id="rule-name" v-model="ruleForm.name" class="text-input" placeholder="On-call webhook" />
+
+        <label class="field-label gap-top">Tell me when</label>
+        <div class="kind-list">
+          <label v-for="entry in ALERT_KINDS" :key="entry.kind" class="kind">
+            <input
+              type="checkbox"
+              :checked="ruleForm.kinds.includes(entry.kind)"
+              @change="toggleKind(entry.kind)"
+            />
+            <span class="kind-meta">
+              <span class="kind-label">{{ entry.label }}</span>
+              <span class="kind-hint">{{ entry.hint }}</span>
+            </span>
+          </label>
+        </div>
+
+        <label class="field-label gap-top">Deliver through</label>
+        <div class="seg">
+          <button
+            type="button"
+            class="seg-btn"
+            :class="{ on: ruleForm.notifier === 'webhook' }"
+            @click="ruleForm.notifier = 'webhook'"
+          >
+            Webhook
+          </button>
+          <button
+            type="button"
+            class="seg-btn"
+            :class="{ on: ruleForm.notifier === 'smtp' }"
+            @click="ruleForm.notifier = 'smtp'"
+          >
+            Email
+          </button>
+        </div>
+
+        <template v-if="ruleForm.notifier === 'webhook'">
+          <label class="field-label gap-top" for="rule-url">URL</label>
+          <input
+            id="rule-url"
+            v-model="ruleForm.webhookUrl"
+            class="text-input"
+            placeholder="https://hooks.example.com/services/…"
+          />
+          <label class="field-label gap-top" for="rule-secret">Signing secret</label>
+          <input
+            id="rule-secret"
+            v-model="ruleForm.webhookSecret"
+            class="text-input"
+            :placeholder="editingRuleId ? 'Unchanged — type a new one to replace it' : 'Leave blank and one is generated'"
+          />
+          <p class="hint gap-sm">
+            Every payload carries <code class="code">X-Polyptic-Signature: v1=&lt;hex&gt;</code> — an
+            HMAC-SHA256 over <code class="code">timestamp.body</code> with this secret.
+          </p>
+        </template>
+
+        <template v-else>
+          <label class="field-label gap-top" for="rule-emails">Recipients</label>
+          <input
+            id="rule-emails"
+            v-model="ruleForm.emailTo"
+            class="text-input"
+            placeholder="ops@example.com, avteam@example.com"
+          />
+          <p class="hint gap-sm">Sent through the relay the server is configured with (SMTP_HOST).</p>
+        </template>
+
+        <label class="field-label gap-top" for="rule-debounce">Only after the problem lasts (minutes)</label>
+        <input
+          id="rule-debounce"
+          v-model.number="ruleForm.debounceMinutes"
+          class="text-input"
+          type="number"
+          min="0"
+          max="1440"
+          step="1"
+        />
+        <p class="hint gap-sm">A box that blips for twenty seconds should not wake anyone up. 0 = tell me instantly.</p>
+
+        <label class="kind gap-top">
+          <input v-model="ruleForm.quietEnabled" type="checkbox" />
+          <span class="kind-meta">
+            <span class="kind-label">Quiet hours</span>
+            <span class="kind-hint">Hold new alerts inside this window; anything still broken when it ends is sent then.</span>
+          </span>
+        </label>
+        <div v-if="ruleForm.quietEnabled" class="field-row gap-sm">
+          <input v-model="ruleForm.quietStart" class="text-input" type="time" />
+          <span class="hint">to</span>
+          <input v-model="ruleForm.quietEnd" class="text-input" type="time" />
+        </div>
+
+        <p v-if="ruleError" class="rule-error">{{ ruleError }}</p>
+
+        <div class="rule-modal-actions">
+          <button type="button" class="btn-ghost-sm" @click="closeRuleModal">Cancel</button>
+          <button type="button" class="btn-ghost-sm primary" :disabled="ruleSaving" @click="saveRule">
+            {{ ruleSaving ? "Saving…" : editingRuleId ? "Save rule" : "Create rule" }}
+          </button>
+        </div>
+      </div>
+    </div>
 </template>
 
 <style scoped>
@@ -1936,5 +2274,165 @@ async function onSignOut(): Promise<void> {
 .toast-leave-to {
   opacity: 0;
   transform: translate(-50%, 8px);
+}
+
+/* ── Alerts & notifications (POL-91) ───────────────────────────────────────── */
+.rule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.rule {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.rule.off {
+  opacity: 0.62;
+}
+.rule-main {
+  min-width: 0;
+}
+.rule-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.rule-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg2);
+}
+.rule-target {
+  margin: 4px 0 0;
+  font-family: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+  overflow: hidden;
+}
+.rule-meta {
+  margin: 3px 0 0;
+  font-size: 11px;
+  color: var(--muted2);
+  line-height: 1.5;
+}
+.rule-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.chip-neutral {
+  color: var(--muted);
+  background: var(--muted-bg);
+}
+.rule-error {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--bad);
+}
+.kind-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kind {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  cursor: pointer;
+}
+.kind-meta {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+.kind-label {
+  font-size: 12.5px;
+  color: var(--fg2);
+  font-weight: 500;
+}
+.kind-hint {
+  font-size: 11px;
+  color: var(--muted2);
+}
+.seg {
+  display: flex;
+  gap: 6px;
+}
+.seg-btn {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.seg-btn.on {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+.text-input {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--fg2);
+  font-family: inherit;
+  font-size: 12.5px;
+}
+.gap-top {
+  margin-top: 14px;
+}
+.rule-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 42%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+  padding: 24px;
+}
+.rule-modal {
+  width: 100%;
+  max-width: 470px;
+  max-height: 88vh;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 20px 22px;
+  box-shadow: var(--shadow-lg);
+}
+.rule-modal-title {
+  margin: 0 0 16px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.rule-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+.btn-ghost-sm.primary {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+  font-weight: 600;
 }
 </style>

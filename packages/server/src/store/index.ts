@@ -19,6 +19,7 @@ export type {
   PersistedCredentialProfile,
   PersistedMachine,
   PersistedMtlsCa,
+  PersistedNotificationRule,
   PersistedMural,
   PersistedPlacement,
   PersistedScene,

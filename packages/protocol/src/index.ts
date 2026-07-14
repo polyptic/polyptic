@@ -1246,6 +1246,170 @@ export const BootReportBody = z.object({
 });
 export type BootReportBody = z.infer<typeof BootReportBody>;
 
+// ── Alerting (POL-91) ────────────────────────────────────────────────────────
+//
+// The control plane already SEES every failure an operator cares about — it just never told anyone.
+// An ALERT is one problem, observed on signals the server already holds, held open until the problem
+// goes away (and then resolved, because an alert that never clears is noise). A NOTIFICATION RULE
+// maps alert kinds onto a notifier — a generic HMAC-signed webhook POST, or SMTP — with a per-rule
+// debounce and quiet hours. There are no vendor code paths anywhere: Slack, Teams, PagerDuty, ntfy and
+// Alertmanager are all just URLs (non-negotiable #5).
+
+/** What went dark. One value per SIGNAL the server already has; adding a kind is one enum entry plus
+ *  one probe (POL-92 machine vitals and POL-94 per-source health drop in here without a redesign). */
+export const AlertKind = z.enum([
+  "machine-offline", // an approved machine's agent socket is gone (and it is not mid-reboot)
+  "screen-dark", // a screen has content assigned but no player is connected to render it
+  "screen-placement-failed", // the agent's per-connector heartbeat says the browser is not on the glass
+  "image-build-failed", // the last image rebuild (the k8s Job / hook) failed
+]);
+export type AlertKind = z.infer<typeof AlertKind>;
+
+/** An alert is FIRING while the problem persists and RESOLVED exactly once, when it clears. */
+export const AlertState = z.enum(["firing", "resolved"]);
+export type AlertState = z.infer<typeof AlertState>;
+
+/** What the alert is ABOUT — the ids the console's drawer navigates to, plus the names a human reads. */
+export const AlertSubject = z.object({
+  machineId: z.string().optional(),
+  machineLabel: z.string().optional(),
+  screenId: z.string().optional(),
+  screenName: z.string().optional(),
+});
+export type AlertSubject = z.infer<typeof AlertSubject>;
+
+/** One live problem. `id` is STABLE for the lifetime of the problem (`<kind>:<key>`), so a firing and
+ *  its later resolve carry the same id — a receiving system can correlate them without heuristics. */
+export const Alert = z.object({
+  id: z.string(),
+  kind: AlertKind,
+  state: AlertState,
+  /** One line, written for a human: "Atrium box is offline". */
+  title: z.string(),
+  /** Optional second line — the box's own words where it has any (a placement note, a build log tail). */
+  detail: z.string().optional(),
+  subject: AlertSubject,
+  /** ISO — when the underlying problem was FIRST observed (before debounce). */
+  since: z.string(),
+  /** ISO — when it cleared debounce and became a real alert. Absent while still debouncing. */
+  firedAt: z.string().optional(),
+});
+export type Alert = z.infer<typeof Alert>;
+
+/** The delivered payload — the body of the webhook POST, and what the email is rendered from. Its
+ *  shape is the contract third parties integrate against, so it is versioned. */
+export const AlertEvent = z.object({
+  version: z.literal(1),
+  /** Unique per DELIVERY (a firing and its resolve are two deliveries of one alert). Echoed in the
+   *  `X-Polyptic-Delivery` header so a receiver can dedupe retries. */
+  id: z.string(),
+  at: z.string(),
+  state: AlertState,
+  alert: Alert,
+  /** Which Polyptic sent this (its public base URL) — several deployments may share one sink. */
+  deployment: z.string().optional(),
+  /** True for the console's test-fire: a real delivery through the real signing path, over a
+   *  fabricated alert, so a receiver can filter it out of a real incident queue. */
+  test: z.boolean().optional(),
+});
+export type AlertEvent = z.infer<typeof AlertEvent>;
+
+/** The notifier a rule delivers through. The webhook is the vendor-neutral primitive; SMTP is the one
+ *  channel that is not a URL and that every operator already has. */
+export const NotifierKind = z.enum(["webhook", "smtp"]);
+export type NotifierKind = z.infer<typeof NotifierKind>;
+
+const HourMinute = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "expected HH:MM");
+
+/** A daily window, in the SERVER's local time, during which this rule delivers nothing. May wrap
+ *  midnight (22:00 → 07:00). Quiet hours DEFER a firing (it delivers when the window ends, if the
+ *  problem is still there) rather than dropping it — and a problem that clears inside the window is
+ *  never sent at all, which is the whole point of not being paged at 3am for a flap. */
+export const QuietHours = z.object({ start: HourMinute, end: HourMinute });
+export type QuietHours = z.infer<typeof QuietHours>;
+
+/** A rule as configured. The webhook SIGNING SECRET is deliberately not part of this shape — like a
+ *  credential profile's client secret it is write-only (accepted on create/update, never returned). */
+export const NotificationRule = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(120),
+  enabled: z.boolean().default(true),
+  /** Which kinds this rule delivers. Empty is meaningless, so at least one. */
+  kinds: z.array(AlertKind).min(1),
+  notifier: NotifierKind,
+  /** webhook only: where to POST. Any URL — that is the whole integration story. */
+  webhookUrl: z.string().url().optional(),
+  /** smtp only: the recipients. */
+  emailTo: z.array(z.string().email()).optional(),
+  /** How long a problem must persist CONTINUOUSLY before this rule delivers ("offline > 3 min").
+   *  0 = deliver on the first observation. */
+  debounceSeconds: z.number().int().min(0).max(86_400).default(180),
+  quietHours: QuietHours.nullable().optional(),
+});
+export type NotificationRule = z.infer<typeof NotificationRule>;
+
+/** A rule plus its live delivery health, denormalized for the console. Never carries the secret. */
+export const NotificationRuleView = NotificationRule.extend({
+  /** Whether a webhook signing secret is set (the payloads are signed) — never the secret itself. */
+  hasSecret: z.boolean(),
+  lastDeliveryAt: z.string().optional(),
+  lastDeliveryOk: z.boolean().optional(),
+  /** The transport's own words when the last delivery failed — what an operator can act on. */
+  lastError: z.string().optional(),
+});
+export type NotificationRuleView = z.infer<typeof NotificationRuleView>;
+
+const notifierShapeIsCoherent = <
+  T extends { notifier?: NotifierKind; webhookUrl?: string; emailTo?: string[] },
+>(
+  value: T,
+): boolean => {
+  if (value.notifier === "webhook") return typeof value.webhookUrl === "string";
+  if (value.notifier === "smtp") return Array.isArray(value.emailTo) && value.emailTo.length > 0;
+  return true; // a PATCH that doesn't touch the notifier is validated against the merged rule server-side
+};
+
+export const CreateNotificationRuleBody = z
+  .object({
+    name: z.string().min(1).max(120),
+    enabled: z.boolean().default(true),
+    kinds: z.array(AlertKind).min(1),
+    notifier: NotifierKind,
+    webhookUrl: z.string().url().optional(),
+    /** webhook only, WRITE-ONLY: the HMAC-SHA256 signing secret. Omitted → the server mints one, so a
+     *  payload is never unsigned. */
+    webhookSecret: z.string().min(8).max(200).optional(),
+    emailTo: z.array(z.string().email()).optional(),
+    debounceSeconds: z.number().int().min(0).max(86_400).default(180),
+    quietHours: QuietHours.nullable().optional(),
+  })
+  .refine(notifierShapeIsCoherent, {
+    message: "a webhook rule needs a webhookUrl; an smtp rule needs at least one emailTo address",
+  });
+export type CreateNotificationRuleBody = z.infer<typeof CreateNotificationRuleBody>;
+
+/** Partial update. Omitting `webhookSecret` leaves the stored secret unchanged (the credential-profile
+ *  convention); sending `null` for `quietHours` clears them. */
+export const UpdateNotificationRuleBody = z.object({
+  name: z.string().min(1).max(120).optional(),
+  enabled: z.boolean().optional(),
+  kinds: z.array(AlertKind).min(1).optional(),
+  notifier: NotifierKind.optional(),
+  webhookUrl: z.string().url().optional(),
+  webhookSecret: z.string().min(8).max(200).optional(),
+  emailTo: z.array(z.string().email()).optional(),
+  debounceSeconds: z.number().int().min(0).max(86_400).optional(),
+  quietHours: QuietHours.nullable().optional(),
+});
+export type UpdateNotificationRuleBody = z.infer<typeof UpdateNotificationRuleBody>;
+
+/** The answer to the console's test-fire button: the transport's real verdict, never a fake success. */
+export const NotificationTestResult = z.object({
+  ok: z.boolean(),
+  error: z.string().optional(),
+});
+export type NotificationTestResult = z.infer<typeof NotificationTestResult>;
+
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
   t: z.literal("admin/state"),
@@ -1259,6 +1423,7 @@ export const ServerToAdminState = z.object({
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  alerts: z.array(Alert).optional(), // POL-91 — live alerts (firing only); optional = back-compat
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;

@@ -57,6 +57,32 @@ The **operator surface** (console, REST, `/admin` + `/player` WS, media) is HTTP
 - **Secure cookies follow the declared scheme.** Precedence: explicit `SECURE_COOKIES` → `PUBLIC_BASE_URL` scheme (`https://` → Secure on; `http://` → Secure OFF, because a Secure cookie over plain http is silently dropped and login "succeeds" without persisting — POL-43) → `NODE_ENV=production`.
 - **Plain HTTP degrades, never refuses.** Zero-click boot on a trusted plain-HTTP homelab keeps working (non-negotiable #4); the server prints a loud `auth.cookie.insecure` banner — operator credentials in cleartext, and the POL-59/POL-67 shell/DevTools tunnels are only as trustworthy as the network. HTTPS is the prerequisite for hostile networks.
 
+## Alerting — the control plane calls you (POL-91 / D96)
+
+A dead box used to be a stale `lastSeen` somebody had to notice by walking past the console. Now the server watches the signals it already has, and when one of them stays wrong it calls you.
+
+- **Signals → probes.** A probe is `() => Problem[]`: the problems of one kind that exist *right now*. Four ship: `machine-offline` (an approved machine's agent socket is gone and it is not mid-reboot), `screen-dark` (a screen has content, its box is up, and no player is attached), `screen-placement-failed` (the agent heartbeat's per-connector `{ok, note}` — the box's own verdict that the browser is not on the glass; it was previously logged and dropped), and `image-build-failed` (POL-41's rebuild hook/Job). A probe is stateless; **the engine owns everything temporal**, so a new signal is one `AlertKind` in the contract plus one probe — no engine change.
+- **Debounce.** A problem must persist *continuously* for a rule's `debounceSeconds` before that rule delivers ("offline > 3 min"): a box that flaps for twenty seconds pages nobody. Debounce is **per rule**; the console's alert chip lights up at the shortest debounce among the enabled rules that cover the kind (or `ALERT_DEBOUNCE_MS`, default 60s, when no rule does — an unwatched deployment still shows its own alerts).
+- **It clears.** Each (alert, rule) pair delivers **one** firing and, when the problem goes away, **one** resolve — and only if that pair actually delivered the firing (an alert you were never told about is not news when it clears). Firing and resolve carry the **same `alert.id`** (`<kind>:<key>`) and different delivery ids, so a receiver correlates them without heuristics. A failed delivery is retried on the next tick, up to five attempts.
+- **Quiet hours** (server-local `HH:MM`, may wrap midnight) **defer** a firing rather than dropping it: still broken when the window ends → it goes out then; healed inside the window → it is never sent at all. A *resolve* is never held — it can only silence an alarm the operator already has.
+- **Alerts are not persisted.** They are a pure function of live signals, so a restart re-derives them (with the debounce clock restarting — a control plane that just booted should not page you about a box it has not heard from yet). **Rules are** persisted, in `notification_rules`.
+
+**Notifiers (there are two, and neither knows a vendor's name).** `webhook` POSTs the `AlertEvent` as JSON to *any* URL — Slack, Teams, PagerDuty, ntfy, Alertmanager and a bash script behind nginx are all "any URL", which is exactly why the product ships no vendor branch (D1). `smtp` hands the same event to a relay (`SMTP_HOST`/`SMTP_PORT`/`SMTP_TLS=starttls|tls|none`/`SMTP_USER`/`SMTP_PASS`/`SMTP_FROM`) as a short plain-text mail. The SMTP client is ~200 lines of `node:net`/`node:tls` rather than a mail library: the whole conversation (EHLO → STARTTLS → AUTH PLAIN → MAIL FROM → RCPT TO → DATA) is testable in-process against a fake relay, and a library would drag OAuth/attachment/DKIM/pool machinery we will never use.
+
+### Webhook signature scheme (implement the other half of this)
+
+Every POST carries:
+
+```
+Content-Type:         application/json
+X-Polyptic-Event:     alert.firing | alert.resolved
+X-Polyptic-Delivery:  <uuid>            # unique per delivery — dedupe retries on it
+X-Polyptic-Timestamp: <unix seconds>
+X-Polyptic-Signature: v1=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>
+```
+
+The signing secret is **per rule** and write-only: it is accepted on create/update, stored (and never returned — the console only ever learns *that* one exists), and if the operator supplies none the server mints one, because an unsigned payload is not something we offer. To verify: recompute `HMAC-SHA256(secret, timestamp + "." + rawBody)` over the **raw** body bytes and compare in constant time; the timestamp is *inside* the signed string, so a captured payload cannot be replayed later past a freshness check. The body is the contract's versioned `AlertEvent` (`version: 1`).
+
 ## API sketch (REST + WS)
 ```
 GET    /api/v1/machines | /screens | /layouts | /scenes
@@ -68,6 +94,9 @@ POST   /api/v1/fleet:activate-scene {sceneId}
 GET    /api/v1/screens/:id/preview            # latest grim thumbnail
 POST   /api/v1/screens/:id/inspect {on}       # chrome: arm the remote-DevTools tunnel · surf: pop the on-panel inspector
 GET    /api/v1/screens/:id/devtools[/**]      # remote DevTools entry + proxied frontend/CDP (POL-67; armed screens only)
+GET    /api/v1/alerts                         # the alerts firing right now (POL-91)
+GET/POST/PATCH/DELETE /api/v1/notification-rules[/:id]   # webhook + SMTP rules (secret write-only)
+POST   /api/v1/notification-rules/:id/test    # fire a real, signed test delivery; the notifier's verdict
 GET    /metrics                               # Prometheus
 WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack, reboot
 WS     /ui         (browser → server)          live layout, thumbnails, health

@@ -114,6 +114,32 @@ export interface PersistedCredentialProfile {
 }
 
 /**
+ * POL-91 — a notification rule row: which alert kinds go out through which notifier, with the
+ * per-rule debounce and quiet hours. The webhook SIGNING SECRET lives here and nowhere else — it is
+ * never broadcast, never returned by REST, never logged (the credential-profile convention). Alerts
+ * themselves are NOT persisted: they are derived from live signals and re-derived on boot.
+ */
+export interface PersistedNotificationRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** The alert kinds this rule delivers (stored as jsonb). */
+  kinds: string[];
+  /** "webhook" | "smtp" — the D1 adapter seam, not a vendor list. */
+  notifier: string;
+  webhookUrl?: string | null;
+  /** HMAC-SHA256 signing key for this rule's webhook payloads. Always set for a webhook rule (the
+   *  server mints one when the operator doesn't supply one — an unsigned payload is not an option). */
+  webhookSecret?: string | null;
+  /** SMTP recipients (stored as jsonb). */
+  emailTo?: string[] | null;
+  debounceSeconds: number;
+  /** Server-local "HH:MM" window during which this rule stays silent; null = always on. */
+  quietStart?: string | null;
+  quietEnd?: string | null;
+}
+
+/**
  * POL-57 — a remembered page zoom for one (target, content) pair. `targetId` is a screen id or a
  * video-wall id; `sourceKey` identifies the page shown there (`source:<id>` for a library source,
  * `url:<url>` for an ad-hoc link). Assigning that content to that target again restores this zoom,
@@ -398,6 +424,14 @@ export interface Store {
   deleteCredentialProfile(id: string): Promise<void>;
   /** All persisted credential profiles. */
   listCredentialProfiles(): Promise<PersistedCredentialProfile[]>;
+
+  // ── Notification rules (POL-91) ────────────────────────────────────────────
+  /** Insert-or-update a notification-rule row (the only home of the webhook signing secret). */
+  upsertNotificationRule(rule: PersistedNotificationRule): Promise<void>;
+  /** Delete a notification-rule row. No-op if absent. */
+  deleteNotificationRule(id: string): Promise<void>;
+  /** All persisted notification rules. */
+  listNotificationRules(): Promise<PersistedNotificationRule[]>;
 
   // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
   /** Insert-or-update a scene row (id + name + mural + snapshot jsonb + schedule_at). */

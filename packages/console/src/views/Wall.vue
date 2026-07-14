@@ -19,10 +19,9 @@ import WallCanvas from "../components/canvas/WallCanvas.vue";
 import Inspector from "../components/canvas/Inspector.vue";
 import UnplacedTray from "../components/canvas/UnplacedTray.vue";
 import ActivityBell from "../components/canvas/ActivityBell.vue";
+import AlertsChip from "../components/canvas/AlertsChip.vue";
 
 const store = useConsoleStore();
-
-const screenCount = computed(() => store.screens.length);
 
 // ── content library (left panel) ───────────────────────────────────────────
 const librarySources = computed(() => store.sources);
@@ -32,14 +31,6 @@ const pickedSourceId = computed(() => store.pickedSourceId);
 function pickSource(id: string) {
   store.pickSource(id);
 }
-
-const alerts = computed(() => store.screens.filter((s) => !s.online).length);
-const alertText = computed(() =>
-  alerts.value > 0
-    ? `· ${alerts.value} ${alerts.value === 1 ? "alert" : "alerts"}`
-    : "· healthy",
-);
-const alertColor = computed(() => (alerts.value > 0 ? "var(--warn)" : "var(--ok)"));
 
 /** Drag a library source onto a screen/surface to assign it (distinct DnD type from screen placement). */
 function onSourceDragStart(e: DragEvent, id: string) {
@@ -62,10 +53,9 @@ function onSourceDragStart(e: DragEvent, id: string) {
       <div class="live" :class="{ off: !store.connected }">
         <span class="live-dot"></span>{{ store.connected ? "Live" : "Offline" }}
       </div>
-      <div class="screens-chip">
-        {{ screenCount }} screens
-        <span class="alert" :style="{ color: alertColor }">{{ alertText }}</span>
-      </div>
+      <!-- POL-91 — the chip is the server's real alert set now, and it opens a drawer that
+           navigates to whatever is broken. -->
+      <AlertsChip />
       <ActivityBell />
     </header>
 
@@ -172,21 +162,6 @@ function onSourceDragStart(e: DragEvent, id: string) {
   background: var(--bad);
   animation: none;
 }
-.screens-chip {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 10px;
-  border-radius: 8px;
-  background: var(--muted-bg);
-  font-size: 12px;
-  color: var(--fg2);
-  font-weight: 500;
-}
-.alert {
-  font-weight: 600;
-}
-
 /* body */
 .body {
   flex: 1;
