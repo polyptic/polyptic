@@ -22,9 +22,10 @@ import { pipeline } from "node:stream/promises";
 
 import { MediaMetadata as MediaMetadataSchema } from "@polyptic/protocol";
 
+import { documentExtForMime } from "./document-convert";
 import { POSTER_WIDTH, THUMBNAIL_WIDTH, assessPlayability } from "./media-probe";
 
-import type { ContentKind, MediaMetadata, MediaRejectionReason } from "@polyptic/protocol";
+import type { ContentKind, Deck, MediaMetadata, MediaRejectionReason } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
 import type { Readable } from "node:stream";
 import type { MediaProber } from "./media-probe";
@@ -64,10 +65,12 @@ export function kindForMime(mime: string): ContentKind | null {
   return null;
 }
 
-/** A safe file extension for a validated mime (table first, then a sanitized subtype, then "bin"). */
+/** A safe file extension for a validated mime (table first, then a sanitized subtype, then "bin").
+ *  POL-114 — document mimes come from the pipeline's own table (an Office mime's subtype is a 60-char
+ *  monster; "pptx" is what the converter and the operator both call it). */
 function extForMime(mime: string): string {
   const m = mime.toLowerCase();
-  const known = MIME_EXT[m];
+  const known = MIME_EXT[m] ?? documentExtForMime(m);
   if (known) return known;
   const subtype = m.split("/")[1] ?? "bin";
   const cleaned = subtype.replace(/[^a-z0-9]+/g, "").slice(0, 12);
@@ -119,11 +122,40 @@ export interface MediaRecord {
   metadata?: MediaMetadata;
   /** POL-109 — the generated poster/thumbnail, relative to MEDIA_DIR (`<id>.poster.jpg` / `.thumb.png`). */
   poster?: string;
+  /** POL-114 — a DOCUMENT upload that was converted to page images. `pages` are filenames relative to
+   *  MEDIA_DIR, in page order; `pageUrls` their absolute serve URLs; `dwellSeconds` the one authored
+   *  field of a deck (how long each page holds the screen). Lives in the catalogue, not the DB — the
+   *  pages travel with the media volume, and no migration is needed for a new content kind. */
+  deck?: DeckRecord;
+}
+
+/** POL-114 — the deck half of a media record (see `MediaRecord.deck`). */
+export interface DeckRecord {
+  pages: string[];
+  pageUrls: string[];
+  dwellSeconds: number;
+  /** The uploaded document's format, e.g. "pdf" / "pptx" — for the library row. */
+  format: string;
 }
 
 interface SidecarShape {
   version: number;
   records: Record<string, MediaRecord>;
+}
+
+/** Is this sidecar fragment a well-formed deck? (A hand-edited index must not inject a bad shape.) */
+function isDeckRecord(value: unknown): value is DeckRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const d = value as Partial<DeckRecord>;
+  return (
+    Array.isArray(d.pages) &&
+    d.pages.every((p) => typeof p === "string") &&
+    Array.isArray(d.pageUrls) &&
+    d.pageUrls.every((u) => typeof u === "string") &&
+    typeof d.dwellSeconds === "number" &&
+    d.dwellSeconds > 0 &&
+    typeof d.format === "string"
+  );
 }
 
 /**
@@ -167,6 +199,8 @@ export class MediaStore {
               sourceId: typeof rec.sourceId === "string" ? rec.sourceId : null,
               ...(metadata.success ? { metadata: metadata.data } : {}),
               ...(typeof rec.poster === "string" ? { poster: rec.poster } : {}),
+              // POL-114 — a deck's pages (a sidecar from before the pipeline simply has none).
+              ...(isDeckRecord(rec.deck) ? { deck: rec.deck } : {}),
             });
           }
         }
@@ -297,13 +331,66 @@ export class MediaStore {
     return this.records.get(id)?.metadata;
   }
 
-  /** Unlink an upload (file + poster + sidecar record) by media id. Returns true if it existed. */
+  // ── POL-114 — decks ────────────────────────────────────────────────────────
+
+  /** The file-name stem the converter writes a document's page images under (`<id>.page-<n>.png`).
+   *  Derived from the generated media id, NEVER from anything the client sent. */
+  deckBasename(id: string): string {
+    return `${id}.page`;
+  }
+
+  /** Record a converted document's pages (and make page 1 the record's poster: a deck's library tile
+   *  is its first slide, served by the poster route POL-109 already registered). */
+  async setDeck(id: string, deck: DeckRecord): Promise<void> {
+    const rec = this.records.get(id);
+    if (!rec) return;
+    rec.deck = deck;
+    const first = deck.pages[0];
+    if (first) rec.poster = first;
+    await this.persist();
+  }
+
+  /** Change a deck's per-page dwell (the ONE authored field of a deck). False for a non-deck id. */
+  async setDeckDwell(id: string, dwellSeconds: number): Promise<boolean> {
+    const rec = this.records.get(id);
+    if (!rec?.deck) return false;
+    rec.deck = { ...rec.deck, dwellSeconds };
+    await this.persist();
+    return true;
+  }
+
+  /** Absolute, traversal-safe path of a deck's page image (1-based), or undefined. */
+  pagePathFor(id: string, page: number): string | undefined {
+    const rec = this.records.get(id);
+    const name = rec?.deck?.pages[page - 1];
+    if (!name) return undefined;
+    return this.safeJoin(name);
+  }
+
+  /** The deck behind a content URL, if that URL is one of OUR document uploads — the read seam the
+   *  control plane uses to decorate a `deck` source and to resolve it to an image rotation. */
+  deckForUrl(url: string): Deck | undefined {
+    const id = mediaIdFromUrl(url);
+    const rec = id ? this.records.get(id) : undefined;
+    if (!rec?.deck) return undefined;
+    const { pages, pageUrls, dwellSeconds, format } = rec.deck;
+    const poster = pageUrls[0];
+    return {
+      pageCount: pages.length,
+      pageUrls,
+      dwellSeconds,
+      ...(poster ? { posterUrl: poster } : {}),
+      ...(format ? { format } : {}),
+    };
+  }
+
+  /** Unlink an upload (file + poster + deck pages + sidecar record) by media id. */
   async deleteById(id: string): Promise<boolean> {
     const rec = this.records.get(id);
     if (!rec) return false;
     this.records.delete(id);
     await this.persist();
-    for (const name of [rec.filename, rec.poster]) {
+    for (const name of [rec.filename, rec.poster, ...(rec.deck?.pages ?? [])]) {
       if (!name) continue;
       try {
         await rm(this.safeJoin(name), { force: true });
@@ -508,6 +595,37 @@ export function registerMediaServeRoute(fastify: FastifyInstance, media: MediaSt
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("X-Content-Type-Options", "nosniff");
     reply.type(abs.endsWith(".png") ? "image/png" : "image/jpeg");
+    reply.header("Content-Length", String(st.size));
+    return reply.send(createReadStream(abs));
+  });
+
+  // POL-114 — one page image of a converted document deck (1-based). Same posture as every other
+  // media route: UNGATED (the wall paints it with no session), immutable, hard-cached, CORS-open so
+  // the player's OFFLINE blob cache can fetch it. This is why a deck works offline for free — its
+  // pages are just media URLs, cached exactly like any other image.
+  fastify.get("/media/:id/page/:n", async (request, reply) => {
+    const params = request.params as { id?: string; n?: string };
+    const id = params.id ?? "";
+    const page = Number(params.n);
+    if (!/^[a-f0-9]{8,}$/i.test(id) || !Number.isInteger(page) || page < 1) {
+      return reply.code(404).send({ error: "unknown page" });
+    }
+
+    const abs = media.pagePathFor(id, page);
+    if (!abs) return reply.code(404).send({ error: "unknown page" });
+
+    let st;
+    try {
+      st = await stat(abs);
+    } catch {
+      return reply.code(404).send({ error: "unknown page" });
+    }
+    if (!st.isFile()) return reply.code(404).send({ error: "unknown page" });
+
+    reply.header("Cache-Control", "public, max-age=31536000, immutable");
+    reply.header("Access-Control-Allow-Origin", "*");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.type("image/png");
     reply.header("Content-Length", String(st.size));
     return reply.send(createReadStream(abs));
   });

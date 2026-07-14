@@ -27,6 +27,8 @@ import { AgentMtls } from "./mtls";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
 import { createMediaProber } from "./media-probe";
+import { createDocumentConverter } from "./document-convert";
+import { DocumentJobs } from "./documents";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
 import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
@@ -178,7 +180,21 @@ const hub = new PlayerHub();
 const agentHub = new AgentHub();
 const adminHub = new AdminHub();
 const presence = new Presence();
-const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, log: fastify.log });
+// ── Document pipeline (POL-114 / D115): conversions in flight + what this server can convert. The
+// jobs registry pushes every progress tick onto the admin/state broadcast the console already reads —
+// that IS the progress channel (no new socket, no polling). `capabilities.documents` is levelled once
+// the converter has answered `available()`, so the console never offers an upload we would refuse.
+const documentCapabilities = { documents: false };
+const documentJobs = new DocumentJobs(() => broadcaster.broadcast());
+const broadcaster = new AdminBroadcaster({
+  control,
+  playerHub: hub,
+  presence,
+  adminHub,
+  activity,
+  log: fastify.log,
+  documents: { jobs: documentJobs, capabilities: documentCapabilities },
+});
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
 // profiles; refreshes in the background at ~75% of each token's lifetime. When a profile's token
@@ -268,6 +284,22 @@ await media.init();
 // uploads are still accepted (with a warning on the source) and the wall behaves as it always did.
 const mediaProber = createMediaProber();
 control.setMediaProvider(media);
+
+// ── Document conversion (POL-114 / D115): PDF/slides → page images, behind the `DocumentConverter`
+// seam. Unlike probing, conversion IS the content: with no toolchain there are no page images, so the
+// server advertises `documents: false` and REFUSES a document upload rather than storing a file no
+// wall could ever paint.
+const documentConverter = createDocumentConverter();
+void documentConverter.available().then((ok) => {
+  documentCapabilities.documents = ok;
+  broadcaster.broadcast();
+  fastify.log.info(
+    { event: "document.converter", converter: documentConverter.name, available: ok },
+    ok
+      ? "document pipeline: enabled (PDF/slides convert to image decks on upload)"
+      : "document pipeline: no document toolchain found — document uploads will be REFUSED with a reason",
+  );
+});
 void mediaProber.available().then((ok) => {
   fastify.log.info(
     { event: "media.prober", prober: mediaProber.name, available: ok },
@@ -403,6 +435,8 @@ registerRestRoutes(
     publicBase: MEDIA_PUBLIC_BASE,
     maxBytes: Number.isFinite(MEDIA_MAX_BYTES) && MEDIA_MAX_BYTES > 0 ? MEDIA_MAX_BYTES : 200 * 1024 * 1024,
     prober: mediaProber,
+    converter: documentConverter,
+    documentJobs,
   },
   tokens,
   activity,

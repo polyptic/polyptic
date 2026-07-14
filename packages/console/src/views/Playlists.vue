@@ -19,7 +19,11 @@ const store = useConsoleStore();
 const playlists = computed(() => store.sources.filter((s) => s.kind === "playlist"));
 
 /** What a playlist may contain: every library source except playlists themselves (no nesting). */
-const stepSources = computed(() => store.sources.filter((s) => s.kind !== "playlist"));
+// POL-114 — a deck is itself a rotation (of its converted pages), so it can't be a playlist STEP any
+// more than a playlist can: the server refuses both, for the same reason. Assign a deck directly.
+const stepSources = computed(() =>
+  store.sources.filter((s) => s.kind !== "playlist" && s.kind !== "deck"),
+);
 
 /** The row's sub-line: step count plus the running order by name, e.g. "3 steps · A → B → C". */
 function rowSub(p: ContentSource): string {

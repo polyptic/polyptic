@@ -19,6 +19,7 @@ const LABELS: Record<ContentKind, string> = {
   video: "Video",
   playlist: "Playlist",
   page: "Page",
+  deck: "Deck",
 };
 
 const SHORT_LABELS: Record<ContentKind, string> = {
@@ -28,6 +29,7 @@ const SHORT_LABELS: Record<ContentKind, string> = {
   video: "Video",
   playlist: "Playlist",
   page: "Page",
+  deck: "Deck",
 };
 
 const GLYPHS: Record<ContentKind, string> = {
@@ -37,6 +39,8 @@ const GLYPHS: Record<ContentKind, string> = {
   video: "▷",
   playlist: "≣",
   page: "▣",
+  // POL-114 — a converted document: a stack of pages.
+  deck: "▤",
 };
 
 /** A CSS custom-property name carrying the accent colour for a kind's glyph badge. */
@@ -47,6 +51,7 @@ const COLOR_VARS: Record<ContentKind, string> = {
   video: "--warn",
   playlist: "--accent",
   page: "--accent",
+  deck: "--ok",
 };
 
 export function kindLabel(kind: ContentKind): string {

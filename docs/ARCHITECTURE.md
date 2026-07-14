@@ -32,7 +32,8 @@ adapter.resolve(source) -> { url | launchSpec, surfaceType, auth: AuthStrategy, 
 ```
 - `web` — any URL, rendered as an iframe (`web-url`) or a top-level window (`web-window`) if framing is blocked.
 - `dashboard` — builds a single-panel embed URL (or a full `kiosk`-mode dashboard page) from a logical panel reference; picks `anonymous-viewer` or `reverse-proxy-header` auth.
-- `media` — `image | video | slideshow` from an asset store; Office docs are pre-converted to images/PDF/MP4 (e.g. `soffice --headless --convert-to`) at upload time.
+- `media` — `image | video` from an asset store, INGESTED at upload (POL-109/D114: probed, postered, codec-validated behind the `MediaProber` seam).
+- `deck` — a PDF/slide document, CONVERTED at upload into page images behind the `DocumentConverter` seam (POL-114/D115) and resolved to a **playlist of images** with a per-page dwell. A wall never renders a document live. Conversion is a JOB (202 + `DocumentJob`, progress pushed on `admin/state`); a server with no converter refuses the upload and advertises `capabilities.documents: false`.
 - `native` — a launch-spec for a non-web app, placed by the agent.
 
 New integrations = new adapters; the core model never changes.

@@ -40,6 +40,7 @@ import type {
   PlaylistItem,
   CreateCredentialProfileBody,
   CredentialProfileView,
+  Deck,
   DesiredState,
   DisplayBackend,
   DisplaySettings,
@@ -212,7 +213,14 @@ export interface ContentAssignment {
  *  page (POL-42) has no url either — it carries the authored definition (embeds inside it resolve
  *  at send time). */
 type ResolvedSpec =
-  | { kind: Exclude<ContentKind, "page">; url: string; entries?: PlaylistEntry[]; startedAt?: string }
+  // POL-114 — a `deck` never appears here: it RESOLVES to a playlist of its converted page images, so
+  // no surface builder (and no player) ever sees the kind. That is the whole point of the deck.
+  | {
+      kind: Exclude<ContentKind, "page" | "deck">;
+      url: string;
+      entries?: PlaylistEntry[];
+      startedAt?: string;
+    }
   | { kind: "page"; definition: PageDefinition };
 
 /** The url half of a zoom/name key. Pages carry no url (and take no zoom), so they contribute an
@@ -227,6 +235,9 @@ function specUrl(spec: ResolvedSpec): string {
  *  (and on a server with no probing toolchain) → sources simply carry no metadata, exactly as before. */
 export interface MediaMetadataProvider {
   metadataForUrl(url: string): MediaMetadata | undefined;
+  /** POL-114 — the converted page images behind a `deck` source's url. Optional so a fake provider in
+   *  a unit test (and any older implementation) still satisfies the seam: no decks, no decoration. */
+  deckForUrl?(url: string): Deck | undefined;
 }
 
 /** POL-42 — the live data the poller holds for pages: last-good feed items + cached weather. The
@@ -1660,11 +1671,27 @@ export class ControlPlane {
         definition: source.definition ?? { aspect: "16:9", bg: "#0b0b0e", elements: [] },
       };
     }
+    // POL-114 — a DECK renders as what it is: a rotation of the page images the server converted it
+    // into. It resolves to a PLAYLIST spec, so the player, the offline cache and video-wall spanning
+    // all handle it with machinery that already exists — a document never reaches the glass.
+    if (source.kind === "deck") {
+      const deck = this.deckFor(source.url);
+      const entries: PlaylistEntry[] = (deck?.pageUrls ?? []).map((url) => ({
+        kind: "image" as const,
+        url,
+        durationSeconds: deck?.dwellSeconds ?? DEFAULT_PLAYLIST_ITEM_SECONDS,
+        sourceId: source.id,
+      }));
+      return { kind: "playlist", url: "", entries, startedAt: new Date().toISOString() };
+    }
     if (source.kind !== "playlist") return { kind: source.kind, url: source.url ?? "" };
     const entries: PlaylistEntry[] = [];
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
-      if (!step || step.kind === "playlist" || step.kind === "page" || !step.url) continue;
+      // A deck is itself a rotation — a playlist cannot nest one (same rule, same reason, as a
+      // playlist inside a playlist). Authoring-time validation refuses it; this is the belt.
+      if (!step || step.kind === "playlist" || step.kind === "page" || step.kind === "deck") continue;
+      if (!step.url) continue;
       // POL-109 — a video step carries its ingest poster, so each step of a rotation pre-paints its
       // own first frame rather than flashing black on every advance.
       const poster = step.kind === "video" ? this.mediaFor(step.url)?.posterUrl : undefined;
@@ -2016,6 +2043,12 @@ export class ControlPlane {
     return this.mediaProvider.metadataForUrl(url);
   }
 
+  /** POL-114 — the converted page images for a deck source's url, if the document pipeline made any. */
+  private deckFor(url: string | undefined): Deck | undefined {
+    if (!url || !this.mediaProvider?.deckForUrl) return undefined;
+    return this.mediaProvider.deckForUrl(url);
+  }
+
   /**
    * POL-109 — hang the ingest facts (duration/dimensions/codec/poster) on a library source on the way
    * OUT. Derived, never stored: the media catalogue (which travels with the media volume) is the one
@@ -2023,6 +2056,12 @@ export class ControlPlane {
    * image/video sources have any — a linked URL was never probed and honestly says nothing.
    */
   private decorateSource(source: ContentSource): ContentSource {
+    // POL-114 — a deck's pages are the conversion's output, held in the media catalogue: derived on
+    // the way out, exactly like `media`, so the DB knows nothing about page images.
+    if (source.kind === "deck") {
+      const deck = this.deckFor(source.url);
+      return deck ? { ...source, deck } : source;
+    }
     if (source.kind !== "image" && source.kind !== "video") return source;
     const media = this.mediaFor(source.url);
     return media ? { ...source, media } : source;
@@ -2073,7 +2112,9 @@ export class ControlPlane {
     for (const item of items) {
       const step = this.contentSources.get(item.sourceId);
       if (!step) return { ok: false, error: "unknown-item-source", itemSourceId: item.sourceId };
-      if (step.kind === "playlist")
+      // POL-114 — a deck IS a rotation (of its converted pages), so it nests exactly as badly as a
+      // playlist does. Same error, because it is the same mistake.
+      if (step.kind === "playlist" || step.kind === "deck")
         return { ok: false, error: "nested-playlist", itemSourceId: item.sourceId };
       if (step.kind !== "video" && item.durationSeconds === undefined)
         return { ok: false, error: "item-needs-duration", itemSourceId: item.sourceId };
@@ -2257,6 +2298,29 @@ export class ControlPlane {
     const pageSlices = this.slicesShowingPagesEmbedding(id).filter((s) => !seen.has(s.screenId));
 
     return { ok: true, source, slices: [...slices, ...pageSlices] };
+  }
+
+  /**
+   * POL-114 — re-resolve everything showing a source whose SERVER-SIDE facts changed underneath it,
+   * without any change to the source row. A deck's pages and its dwell live in the media catalogue
+   * (they are the conversion's output, not the operator's typing), so a dwell edit — or a finished
+   * conversion — has to reach the glass through here rather than through `updateContentSource`.
+   */
+  async refreshSource(id: string): Promise<ScreenSlice[]> {
+    if (!this.contentSources.has(id)) return [];
+    const slices = this.reresolveAssignments(id);
+    if (slices.length === 0) return [];
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: id,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+    return slices;
   }
 
   /** POL-42 — the slices of every screen currently showing a PAGE whose definition embeds (or draws
@@ -2701,7 +2765,10 @@ export class ControlPlane {
   ): PageEmbedResolution | undefined {
     if (sourceId) {
       const source = this.contentSources.get(sourceId);
-      if (!source || source.kind === "page" || source.kind === "playlist" || !source.url) return undefined;
+      // POL-114 — a deck is a rotation, not a single addressable page: it cannot be embedded either.
+      if (!source || source.kind === "page" || source.kind === "playlist" || source.kind === "deck")
+        return undefined;
+      if (!source.url) return undefined;
       let url = source.url;
       if (source.credentialProfileId && this.tokenProvider) {
         const profile = this.credentialProfiles.get(source.credentialProfileId);

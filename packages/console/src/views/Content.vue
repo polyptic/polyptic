@@ -12,7 +12,7 @@
   the Pinia store.
 -->
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { useRouter } from "vue-router";
 import { CreateContentSourceBody, CreateCredentialProfileBody } from "@polyptic/protocol";
 import type {
@@ -63,7 +63,13 @@ const saving = ref(false);
 /** Auth applies to browser-loaded sources; images/videos are fetched directly by the player. */
 const authPickable = computed(() => draftKind.value === "web" || draftKind.value === "dashboard");
 
-const modalTitle = computed(() => (editingId.value ? "Edit source" : "Add content source"));
+/** POL-114 — a deck has no address and no kind to change: it IS a converted document. The edit modal
+ *  therefore offers exactly one thing, its name. */
+const editingDeck = computed(() => editingId.value !== null && draftKind.value === "deck");
+
+const modalTitle = computed(() =>
+  editingDeck.value ? "Rename deck" : editingId.value ? "Edit source" : "Add content source",
+);
 const saveLabel = computed(() => (editingId.value ? "Save changes" : "Add source"));
 
 function openAdd() {
@@ -94,6 +100,22 @@ function closeModal() {
 async function save() {
   if (saving.value) return;
   errorMsg.value = null;
+
+  // A deck: rename only (its url + pages are the conversion's, not the operator's).
+  if (editingDeck.value && editingId.value) {
+    const name = draftName.value.trim();
+    if (name.length === 0) {
+      errorMsg.value = "Please give the deck a name.";
+      return;
+    }
+    saving.value = true;
+    const renamed = await store.updateSource(editingId.value, { name });
+    saving.value = false;
+    if (renamed) modalOpen.value = false;
+    else errorMsg.value = "Couldn't save. Please try again.";
+    return;
+  }
+
   const parsed = CreateContentSourceBody.safeParse({
     name: draftName.value.trim(),
     kind: draftKind.value,
@@ -314,12 +336,49 @@ function closeUpload() {
   uploadOpen.value = false;
 }
 
+/** POL-114 — the document mimes the deck pipeline converts. Kept in step with the server's own table
+ *  (`document-convert.ts`); the server is the authority and refuses anything else by name. */
+const DOCUMENT_MIMES = [
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.oasis.opendocument.presentation",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/msword",
+  "application/vnd.oasis.opendocument.text",
+];
+
+/** Whether THIS server can convert documents at all (it advertises it — see D115). With no converter
+ *  the picker doesn't offer documents, because the server would (rightly) refuse the upload. */
+const canConvertDocuments = computed(() => store.capabilities.documents);
+
+/** What the file picker accepts — documents only when the server said it can convert them. */
+const acceptTypes = computed(() =>
+  canConvertDocuments.value
+    ? `image/*,video/*,${DOCUMENT_MIMES.join(",")}`
+    : "image/*,video/*",
+);
+
+function isDocument(file: File): boolean {
+  return DOCUMENT_MIMES.includes(file.type) || /\.(pdf|pptx?|odp|docx?|odt)$/i.test(file.name);
+}
+
 /** Validate locally (type + size) before accepting a file — cheap feedback before any network hop. */
 function acceptFile(file: File | null | undefined): void {
   if (!file) return;
   const isMedia = file.type.startsWith("image/") || file.type.startsWith("video/");
-  if (!isMedia) {
-    uploadError.value = "Unsupported file type — choose an image or video.";
+  const isDoc = isDocument(file);
+  if (isDoc && !canConvertDocuments.value) {
+    uploadError.value =
+      "This server can't convert documents — no document toolchain is installed. Export your slides " +
+      "to PDF or images on a server that can, or upload images instead.";
+    uploadFile.value = null;
+    return;
+  }
+  if (!isMedia && !isDoc) {
+    uploadError.value = canConvertDocuments.value
+      ? "Unsupported file type — choose an image, a video, a PDF or a slide deck."
+      : "Unsupported file type — choose an image or video.";
     uploadFile.value = null;
     return;
   }
@@ -350,14 +409,69 @@ function fmtSize(bytes: number): string {
   return `${bytes} B`;
 }
 
+// ── document conversion (POL-114) ────────────────────────────────────────────
+// A document is not a request/response: the server answers 202 with a JOB and converts it off the
+// request, pushing progress on the admin/state broadcast the store already folds in. So the modal
+// stays open on the job — pages land one by one — and closes itself when the deck is ready. A failed
+// conversion shows the server's sentence in the same place a rejected media upload's does.
+const jobId = ref<string | null>(null);
+const job = computed(() => (jobId.value ? store.documentJob(jobId.value) : undefined));
+
+const converting = computed(
+  () => job.value?.status === "converting" || job.value?.status === "rendering",
+);
+
+/** The line under the progress bar while a document converts — real page counts, never a lie. */
+const jobLine = computed(() => {
+  const j = job.value;
+  if (!j) return "";
+  if (j.status === "converting") return "Converting the document…";
+  if (j.status === "rendering") {
+    return j.pageCount
+      ? `Rendering pages… ${j.pagesDone} of ${j.pageCount}`
+      : `Rendering pages… ${j.pagesDone} so far`;
+  }
+  if (j.status === "ready") return `Converted — ${j.pageCount ?? j.pagesDone} pages`;
+  return "";
+});
+
+/** The bar's fill while converting. The rasterizer does not know the page total until it is done, so
+ *  an unknown total shows a full-width, muted "working" bar and lets the LABEL carry the real count —
+ *  a fake percentage is worse than an honest one. */
+const convertFraction = computed(() => {
+  const j = job.value;
+  if (!j) return 0;
+  if (j.pageCount && j.pageCount > 0) return Math.min(1, j.pagesDone / j.pageCount);
+  return 1;
+});
+
+watch(job, (j) => {
+  if (!j) return;
+  if (j.status === "ready") {
+    jobId.value = null;
+    uploading.value = false;
+    uploadOpen.value = false; // the deck is in the library now (via admin/state)
+  } else if (j.status === "failed") {
+    jobId.value = null;
+    uploading.value = false;
+    uploadError.value = j.error ?? "Converting this document failed.";
+  }
+});
+
 async function doUpload() {
   if (uploading.value || !uploadFile.value) return;
   uploadError.value = null;
   uploading.value = true;
   uploadProgress.value = 0;
+  jobId.value = null;
   const res = await store.uploadSource(uploadFile.value, uploadName.value, (f) => {
     uploadProgress.value = f;
   });
+  if (res.ok && res.jobId) {
+    // POL-114 — a document: the bytes are up, the conversion has begun. Stay open on the job.
+    jobId.value = res.jobId;
+    return;
+  }
   uploading.value = false;
   if (res.ok) {
     // POL-109 — an accepted-with-a-caveat upload (nothing could be checked) says so ONCE, above the
@@ -369,6 +483,23 @@ async function doUpload() {
   }
 }
 
+/** A deck's library sub-line: what it is, how many pages, and how long each holds the screen. */
+function deckSubtitle(s: ContentSource): string {
+  const d = s.deck;
+  if (!d) return "Deck · converting…";
+  const fmt = d.format ? d.format.toUpperCase() : "Document";
+  const pages = `${d.pageCount} page${d.pageCount === 1 ? "" : "s"}`;
+  return `${fmt} · ${pages} · ${d.dwellSeconds}s per page`;
+}
+
+/** Change a deck's per-page dwell. The server re-times the rotation and re-pushes every wall showing
+ *  it — the same instant path as any other content edit. */
+async function setDwell(s: ContentSource, seconds: number): Promise<void> {
+  const dwellSeconds = Math.max(1, Math.min(3600, Math.round(seconds)));
+  if (!Number.isFinite(dwellSeconds) || dwellSeconds === s.deck?.dwellSeconds) return;
+  await store.updateSource(s.id, { dwellSeconds });
+}
+
 // ── ingest read-outs (POL-109) ────────────────────────────────────────────────
 // The library now shows what the server PROBED at upload: a real thumbnail/poster for every image and
 // video, and the facts (duration · dimensions · codec) on the row. A source with no `media` was never
@@ -377,6 +508,8 @@ const notice = ref<string | null>(null);
 
 /** The picture for a row: the ingest poster/thumbnail, or (for a linked image) the image itself. */
 function thumbSrc(s: ContentSource): string | null {
+  // POL-114 — a deck's tile is its first slide (the poster route serves page 1).
+  if (s.kind === "deck") return s.deck?.posterUrl ?? null;
   const poster = s.media?.posterUrl;
   if (poster) return poster;
   return s.kind === "image" && s.url ? s.url : null;
@@ -454,6 +587,7 @@ function mediaFacts(s: ContentSource): string {
             </div>
             <div class="row-sub">
               <template v-if="c.kind === 'page'">{{ pageSubtitle(c) }}</template>
+              <template v-else-if="c.kind === 'deck'">{{ deckSubtitle(c) }}</template>
               <template v-else>
                 {{ rowSub(c) }}
                 <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
@@ -461,7 +595,20 @@ function mediaFacts(s: ContentSource): string {
             </div>
           </div>
           <span class="kind-badge">{{ kindLabel(c.kind) }}</span>
+          <!-- POL-114 — a deck has exactly ONE authored setting: how long each page holds the screen. -->
+          <label v-if="c.kind === 'deck' && c.deck" class="dwell" title="Seconds each page is shown">
+            <input
+              class="dwell-input"
+              type="number"
+              min="1"
+              max="3600"
+              :value="c.deck.dwellSeconds"
+              @change="setDwell(c, Number(($event.target as HTMLInputElement).value))"
+            />
+            <span class="dwell-unit">s / page</span>
+          </label>
           <button v-if="c.kind === 'page'" class="edit-btn" @click="openStudio(c)">Edit in Studio</button>
+          <button v-else-if="c.kind === 'deck'" class="edit-btn" @click="openEdit(c)">Rename</button>
           <button v-else class="edit-btn" @click="openEdit(c)">Edit</button>
           <button class="del-btn" title="Delete source" @click="remove(c)">✕</button>
         </div>
@@ -549,6 +696,9 @@ function mediaFacts(s: ContentSource): string {
           @keyup.enter="save"
         />
 
+        <!-- POL-114 — a deck has no type to pick and no address to type: it is a converted document.
+             Only its name (and, on the row, its per-page dwell) is the operator's. -->
+        <template v-if="!editingDeck">
         <label class="field-label">Type</label>
         <div class="type-row">
           <button
@@ -571,9 +721,12 @@ function mediaFacts(s: ContentSource): string {
           @keyup.enter="save"
         />
 
+
+        </template>
+
         <!-- POL-24 — the design's deferred "Authentication" picker. Web/dashboard only: images and
              videos are fetched directly by the player, not loaded as an authenticated page. -->
-        <template v-if="authPickable">
+        <template v-if="authPickable && !editingDeck">
           <label class="field-label">Authentication</label>
           <select v-model="draftProfileId" class="field select">
             <option value="">None — public or anonymous access</option>
@@ -657,7 +810,9 @@ function mediaFacts(s: ContentSource): string {
     <!-- ── upload modal (Phase 7) ────────────────────────────────────────────── -->
     <div v-if="uploadOpen" class="scrim" @mousedown.self="closeUpload">
       <div class="modal" role="dialog" aria-modal="true">
-        <div class="modal-title">Upload image or video</div>
+        <div class="modal-title">
+          {{ canConvertDocuments ? "Upload a file" : "Upload image or video" }}
+        </div>
 
         <!-- drop zone / picker -->
         <div
@@ -671,7 +826,7 @@ function mediaFacts(s: ContentSource): string {
           <input
             ref="fileInput"
             type="file"
-            accept="image/*,video/*"
+            :accept="acceptTypes"
             class="file-input"
             @change="onPick"
           />
@@ -683,7 +838,12 @@ function mediaFacts(s: ContentSource): string {
           <template v-else>
             <span class="drop-glyph">⤓</span>
             <span class="drop-name">Drop a file here, or click to browse</span>
-            <span class="drop-sub">Images and videos · up to 200 MB</span>
+            <span class="drop-sub">
+              <template v-if="canConvertDocuments">
+                Images, videos, PDFs and slide decks · up to 200 MB
+              </template>
+              <template v-else>Images and videos · up to 200 MB</template>
+            </span>
           </template>
         </div>
 
@@ -695,11 +855,22 @@ function mediaFacts(s: ContentSource): string {
           :disabled="uploading"
         />
 
-        <!-- progress -->
+        <!-- progress: bytes going up, then (POL-114) the server-side conversion, page by page -->
         <div v-if="uploading" class="progress-wrap">
-          <div class="progress-bar" :style="{ width: `${Math.round(uploadProgress * 100)}%` }"></div>
-          <span class="progress-label">Uploading… {{ Math.round(uploadProgress * 100) }}%</span>
+          <div
+            class="progress-bar"
+            :class="{ indeterminate: converting && !job?.pageCount }"
+            :style="{ width: `${Math.round((converting ? convertFraction : uploadProgress) * 100)}%` }"
+          ></div>
+          <span class="progress-label">
+            <template v-if="converting">{{ jobLine }}</template>
+            <template v-else>Uploading… {{ Math.round(uploadProgress * 100) }}%</template>
+          </span>
         </div>
+        <p v-if="converting" class="field-hint">
+          Slides are converted to images on the server — a wall never runs an Office viewer. Large
+          decks take a little while; you can leave this open.
+        </p>
 
         <div v-if="uploadError" class="error">⚠ {{ uploadError }}</div>
 
@@ -715,6 +886,34 @@ function mediaFacts(s: ContentSource): string {
 </template>
 
 <style scoped>
+/* POL-114 — a deck's per-page dwell, edited in place on its library row. */
+.dwell {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.dwell-input {
+  width: 54px;
+  padding: 5px 6px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: right;
+}
+.dwell-unit {
+  font-size: 11.5px;
+}
+/* An unknown page total shows a muted, full-width "working" bar — an honest unknown, not a fake %. */
+.progress-bar.indeterminate {
+  opacity: 0.5;
+}
+
 .page {
   flex: 1;
   overflow-y: auto;

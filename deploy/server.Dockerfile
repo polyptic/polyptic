@@ -73,6 +73,26 @@ WORKDIR /app
 ARG POLYPTIC_VERSION=0.0.0
 ARG POLYPTIC_REVISION=dev
 
+# ── Document pipeline (POL-114 / D115) ───────────────────────────────────────
+# Slides and PDFs are pre-converted to page IMAGES on the server — a wall never runs an Office viewer.
+# The toolchain lives ONLY behind the server's `DocumentConverter` adapter, and it is a BUILD choice:
+#   full (default) — office suite + PDF rasterizer: PDF, PPTX, ODP, DOCX all convert.
+#   pdf            — PDF rasterizer only (~15 MB): PDFs convert; a PPTX is refused BY NAME, telling the
+#                    operator to export to PDF. A good trade for a size-sensitive deployment.
+#   none           — no toolchain: document uploads are refused, `capabilities.documents` is false, and
+#                    the console does not offer them. Everything else is unaffected.
+# The server never assumes any of this: it asks the adapter, and degrades with a sentence (D115).
+ARG DOCUMENT_TOOLCHAIN=full
+RUN set -eux; \
+    case "${DOCUMENT_TOOLCHAIN}" in \
+      none) echo "document pipeline: no toolchain baked in (uploads of PDFs/slides will be refused)" ;; \
+      pdf) apt-get update && apt-get install -y --no-install-recommends poppler-utils \
+           && rm -rf /var/lib/apt/lists/* ;; \
+      *) apt-get update && apt-get install -y --no-install-recommends \
+             poppler-utils libreoffice-impress libreoffice-writer fonts-dejavu \
+           && rm -rf /var/lib/apt/lists/* ;; \
+    esac
+
 # node_modules is built linux-native in stage 1 — copy it rather than reinstalling
 # (bun hoists the workspace deps to the root node_modules).
 COPY --from=build /app/node_modules ./node_modules

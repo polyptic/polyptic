@@ -1002,7 +1002,7 @@ export const ScreenView = Screen.extend({
     .object({
       name: z.string(),
       // Mirrors ContentKind (declared below); inlined because this schema evaluates first.
-      kind: z.enum(["web", "dashboard", "image", "video", "playlist", "page"]),
+      kind: z.enum(["web", "dashboard", "image", "video", "playlist", "page", "deck"]),
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
@@ -1094,8 +1094,11 @@ export type VideoWall = z.infer<typeof VideoWall>;
 
 /** The kind of a content source — mirrors the renderable Surface types. `playlist` (POL-34) is the
  *  composite kind: a carousel over the other renderables. `page` (POL-42) is an authored composition
- *  created in the console's Studio; it has a `definition`, not a `url`. */
-export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist", "page"]);
+ *  created in the console's Studio; it has a `definition`, not a `url`. `deck` (POL-114) is an
+ *  uploaded DOCUMENT (PDF/slides) that the server pre-converted to page images: its `url` addresses
+ *  the original document and its pages are server-derived (`deck`) — it RENDERS as a playlist of
+ *  images, so the player needs no new surface for it. */
+export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist", "page", "deck"]);
 export type ContentKind = z.infer<typeof ContentKind>;
 
 /** One AUTHORED step of a playlist source (POL-34): a reference to another library source plus how
@@ -1198,6 +1201,72 @@ export const MediaMetadata = z.object({
 });
 export type MediaMetadata = z.infer<typeof MediaMetadata>;
 
+// ── Documents → decks (POL-114) ──────────────────────────────────────────────
+// A wall NEVER renders a document live: no PDF viewer, no Office iframe, no plugin (DESIGN.md commits
+// to this — a document viewer on a kiosk is a scrollbar, a toolbar and a "trial expired" dialog away
+// from a broken wall). An uploaded PDF/PPTX is CONVERTED SERVER-SIDE, once, into a sequence of page
+// IMAGES; the source that lands in the library is a `deck`, and the server resolves it to a PLAYLIST
+// of those images at assignment time. So the player, the offline media cache, the video-wall span and
+// the <150 ms diff path all work UNCHANGED — a deck is an image rotation, which the wall already does.
+//
+// The converting toolchain is named ONLY inside the server's `DocumentConverter` adapter; the contract
+// says nothing about it. A server with no converter cannot make a deck AT ALL (there is no content to
+// show without conversion) — it refuses the upload and advertises `capabilities.documents = false`, so
+// the console can say so BEFORE an operator uploads 60 MB.
+
+/** What the server converted an uploaded document into. `pageUrls`/`pageCount`/`posterUrl` are
+ *  SERVER-DERIVED at read time from the media catalogue (like `ContentSource.media`); `dwellSeconds`
+ *  is the one AUTHORED field — how long each page holds the screen. */
+export const Deck = z.object({
+  /** How many page images the conversion produced. */
+  pageCount: z.number().int().nonnegative(),
+  /** Absolute URLs of the page images, in page order (`…/media/<id>/page/<n>`). */
+  pageUrls: z.array(z.string().url()),
+  /** Seconds each page holds the screen before the deck advances. Operator-editable. */
+  dwellSeconds: z.number().int().min(1).max(3600),
+  /** Page 1 — the library thumbnail for the deck. */
+  posterUrl: z.string().url().optional(),
+  /** The uploaded document's own format, as a short label ("pdf", "pptx") — for the library row. */
+  format: z.string().max(32).optional(),
+});
+export type Deck = z.infer<typeof Deck>;
+
+/** The lifecycle of one document conversion. A 60-slide deck is NOT a request/response — the upload
+ *  route answers 202 with a job, and the job is pushed live in `admin/state` (the same <150 ms
+ *  broadcast the console already listens to), so an operator watches pages appear instead of a
+ *  spinner. `converting` = the document is being turned into a page-image source; `rendering` = pages
+ *  are landing (`pagesDone` climbs). */
+export const DocumentJobStatus = z.enum(["converting", "rendering", "ready", "failed"]);
+export type DocumentJobStatus = z.infer<typeof DocumentJobStatus>;
+
+export const DocumentJob = z.object({
+  id: z.string(),
+  /** The display name the deck will take (the operator's, or the file's). */
+  name: z.string().max(120),
+  status: DocumentJobStatus,
+  /** Pages written so far — real progress, counted off the converter's output. */
+  pagesDone: z.number().int().nonnegative(),
+  /** Total pages, once the conversion knows (absent while it is still working it out). */
+  pageCount: z.number().int().nonnegative().optional(),
+  /** The deck source that was created — set exactly when `status: "ready"`. */
+  sourceId: z.string().optional(),
+  /** The operator-facing failure sentence — set exactly when `status: "failed"`. */
+  error: z.string().max(400).optional(),
+  startedAt: z.string(),
+  updatedAt: z.string(),
+});
+export type DocumentJob = z.infer<typeof DocumentJob>;
+
+/** POST /api/v1/media with a DOCUMENT answers 202 with the job to watch (never a finished source —
+ *  conversion is slow, and blocking an HTTP request on it is how you meet a proxy's read timeout). */
+export const DocumentJobAccepted = z.object({ ok: z.literal(true), job: DocumentJob });
+export type DocumentJobAccepted = z.infer<typeof DocumentJobAccepted>;
+
+/** What this server can actually do, advertised in `admin/state` so the console never offers an
+ *  affordance the server would refuse. `documents` = a document converter is installed and enabled. */
+export const ServerCapabilities = z.object({ documents: z.boolean() });
+export type ServerCapabilities = z.infer<typeof ServerCapabilities>;
+
 /** A reusable, named entry in the content LIBRARY. A screen or video wall is assigned a source by id;
  *  the server resolves it to the surface(s) it renders. 3c carries linkable URLs; Phase 7 adds uploaded
  *  media served from a disk volume (an upload becomes a source whose url points at the media route).
@@ -1223,8 +1292,13 @@ export const ContentSource = z
      *  pattern as POL-24's token stamping) — it is never stored on the source row and never accepted
      *  from a client. Absent on a linked (by-URL) image/video: the server never probed it. */
     media: MediaMetadata.optional(),
+    /** POL-114 — deck kind only: the converted page images + the authored per-page dwell. Like
+     *  `media`, everything but `dwellSeconds` is derived at read time from the media catalogue. */
+    deck: Deck.optional(),
   })
   .superRefine((s, ctx) => {
+    if (s.kind !== "deck" && s.deck !== undefined)
+      ctx.addIssue({ code: "custom", message: "a deck is only valid on a deck source" });
     if (s.kind === "playlist") {
       if (s.url !== undefined) ctx.addIssue({ code: "custom", message: "a playlist has no url" });
       if (s.items === undefined) ctx.addIssue({ code: "custom", message: "a playlist needs items" });
@@ -1425,6 +1499,12 @@ export const ServerToAdminState = z.object({
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  /** POL-114 — document conversions in flight (and the recently finished ones). This IS the progress
+   *  channel: the console watches the job it started on the state broadcast it is already listening
+   *  to, so a 60-slide deck shows pages landing instead of an unmoving spinner. */
+  documentJobs: z.array(DocumentJob).optional(),
+  /** POL-114 — what this server can do (document conversion needs a toolchain that may be absent). */
+  capabilities: ServerCapabilities.optional(),
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -1533,6 +1613,10 @@ export const CreateContentSourceBody = z
       ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
     if (b.kind !== "page" && b.definition !== undefined)
       ctx.addIssue({ code: "custom", message: "a definition is only valid on a page" });
+    // POL-114 — a deck is MINTED by the document pipeline (upload → convert → pages), never declared:
+    // a deck without converted pages is a library row that cannot render. The route refuses it too.
+    if (b.kind === "deck")
+      ctx.addIssue({ code: "custom", message: "a deck is created by uploading a document" });
   });
 export type CreateContentSourceBody = z.infer<typeof CreateContentSourceBody>;
 
@@ -1547,6 +1631,9 @@ export const UpdateContentSourceBody = z.object({
   items: z.array(PlaylistItem).min(1).max(100).optional(),
   /** POL-42 — replace a page source's composition (the Studio's Save). */
   definition: PageDefinition.optional(),
+  /** POL-114 — deck kind only: how long each converted page holds the screen. The ONLY authored part
+   *  of a deck (its pages are the conversion's output, not an operator's to edit). */
+  dwellSeconds: z.number().int().min(1).max(3600).optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 

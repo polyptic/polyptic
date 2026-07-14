@@ -17,7 +17,14 @@
  */
 import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { MachineVitals, MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
+import type {
+  DocumentJob,
+  MachineVitals,
+  MachineView,
+  ScreenView,
+  ServerCapabilities,
+  ServerToAdminMessage,
+} from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
@@ -236,11 +243,20 @@ export class Presence {
  * counts) merged with live status (machine online from Presence, screen online from the PlayerHub,
  * screen observed revision from Presence). Validated against the contract before it leaves.
  */
+/** POL-114 — what the document pipeline contributes to `admin/state`: the conversions in flight (the
+ *  console's progress channel) and whether this server can convert at all. Optional, so a unit test
+ *  that builds a state snapshot without a pipeline stays a two-line call. */
+export interface DocumentStateSource {
+  jobs: { list(): DocumentJob[] };
+  capabilities: ServerCapabilities;
+}
+
 export function buildAdminState(
   control: ControlPlane,
   playerHub: PlayerHub,
   presence: Presence,
   activity: ActivityLog,
+  documents?: DocumentStateSource,
 ): ServerToAdminMessage {
   const screens = control.getScreens();
 
@@ -299,6 +315,11 @@ export function buildAdminState(
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
+    // POL-114 — document conversions in flight: THIS is the progress channel (no new socket, no
+    // polling — the console watches the job it started on the broadcast it already receives).
+    ...(documents
+      ? { documentJobs: documents.jobs.list(), capabilities: documents.capabilities }
+      : {}),
   });
 }
 
@@ -309,6 +330,8 @@ interface BroadcasterDeps {
   adminHub: AdminHub;
   activity: ActivityLog;
   log: FastifyBaseLogger;
+  /** POL-114 — the document pipeline's contribution (conversions + capability). */
+  documents?: DocumentStateSource;
 }
 
 /**
@@ -328,6 +351,7 @@ export class AdminBroadcaster {
       this.deps.playerHub,
       this.deps.presence,
       this.deps.activity,
+      this.deps.documents,
     );
   }
 

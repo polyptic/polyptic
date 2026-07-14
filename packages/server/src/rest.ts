@@ -64,8 +64,12 @@ import {
 import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
 
-import { MediaTooLargeError, ingestUpload, isFileTooLargeError, kindForMime, readField } from "./media";
+import { MediaTooLargeError, ingestUpload, isFileTooLargeError, kindForMime, mediaIdFromUrl, readField } from "./media";
+import { NO_CONVERTER_MESSAGE, documentExtForMime, documentFormatLabel } from "./document-convert";
+import { DEFAULT_DWELL_SECONDS, deckDisplayName, ingestDocument } from "./documents";
 
+import type { DocumentConverter } from "./document-convert";
+import type { DocumentJobs } from "./documents";
 import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
@@ -84,6 +88,11 @@ export interface MediaConfig {
   /** POL-109 — the ingest prober (metadata + poster frames + codec validation). Behind the adapter
    *  seam: this route knows only the interface, and a server with no toolchain still accepts uploads. */
   prober: MediaProber;
+  /** POL-114 — the document converter (PDF/slides → page images). Same seam, opposite degradation:
+   *  with no converter there is no deck to show, so a document upload is REFUSED, not accepted (D115). */
+  converter: DocumentConverter;
+  /** POL-114 — the live conversion jobs, pushed to the console on `admin/state`. */
+  documentJobs: DocumentJobs;
 }
 
 const ScreenParams = z.object({ screenId: z.string().min(1) });
@@ -1276,7 +1285,32 @@ export function registerRestRoutes(
       return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
     }
 
-    const result = await control.updateContentSource(params.data.id, body.data);
+    // POL-114 — a deck's dwell is the ONE authored field of a converted document, and it lives in the
+    // media catalogue with the pages it times (not on the source row — nothing to migrate). Write it
+    // first, then let the ordinary update path re-resolve + push, so every wall showing the deck picks
+    // the new page timing up on the same instant path as any other content edit.
+    const { dwellSeconds, ...patch } = body.data;
+    if (dwellSeconds !== undefined) {
+      const source = control.getContentSource(params.data.id);
+      if (!source) return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+      if (source.kind !== "deck") {
+        return reply.code(400).send({ error: "only a deck has a per-page dwell time" });
+      }
+      const mediaId = mediaIdFromUrl(source.url ?? "");
+      const written = mediaId ? await media.setDeckDwell(mediaId, dwellSeconds) : false;
+      if (!written) {
+        return reply.code(409).send({ error: "this deck's converted pages are no longer on disk" });
+      }
+      const slices = await control.refreshSource(params.data.id);
+      for (const slice of slices) pushRender(slice.screenId, slice);
+      broadcaster.broadcast();
+      if (Object.keys(patch).length === 0) {
+        const updated = control.getContentSource(params.data.id);
+        return { ok: true, source: updated, screens: slices.map((s) => s.screenId) };
+      }
+    }
+
+    const result = await control.updateContentSource(params.data.id, patch);
     if (!result.ok) {
       if (result.error === "unknown-source") {
         return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
@@ -1450,6 +1484,95 @@ export function registerRestRoutes(
     };
   });
 
+  /**
+   * POL-114 — run one document upload through the converter, OFF the request that accepted it.
+   *
+   * Everything an operator sees while this runs comes from the job (pushed on `admin/state`): the
+   * status, the pages landing one by one, and — on failure — the sentence to act on. The deck source
+   * is created ONLY when pages actually exist; a failed conversion unlinks the upload, so a document
+   * that cannot be shown never becomes a library row (the POL-109 rule, applied to documents).
+   */
+  async function convertDocument(
+    jobId: string,
+    mediaId: string,
+    deckName: string,
+    format: string,
+    originalName: string,
+  ): Promise<void> {
+    const jobs = mediaConfig.documentJobs;
+    const record = media.get(mediaId);
+    if (!record) {
+      jobs.update(jobId, { status: "failed", error: "The upload disappeared before it was converted." });
+      broadcaster.broadcast();
+      return;
+    }
+
+    try {
+      const result = await ingestDocument(mediaConfig.converter, media, record, mediaConfig.publicBase, {
+        onProgress: (pagesDone) => {
+          jobs.update(jobId, { status: "rendering", pagesDone });
+          broadcaster.broadcast();
+        },
+      });
+
+      if (!result.ok) {
+        await media.deleteById(mediaId);
+        jobs.update(jobId, { status: "failed", error: result.message.slice(0, 400) });
+        activity.push("warn", `Couldn't convert ${originalName} — ${result.message}`);
+        fastify.log.info(
+          { event: "document.failed", jobId, mediaId, format, error: result.message },
+          "document conversion failed",
+        );
+        broadcaster.broadcast();
+        return;
+      }
+
+      const url = `${mediaConfig.publicBase}/media/${mediaId}`;
+      const created = await control.createContentSource({ name: deckName, kind: "deck", url });
+      if (!created.ok) {
+        await media.deleteById(mediaId);
+        jobs.update(jobId, { status: "failed", error: "The converted deck could not be added to the library." });
+        broadcaster.broadcast();
+        return;
+      }
+      await media.attachSource(mediaId, created.source.id);
+
+      jobs.update(jobId, {
+        status: "ready",
+        pagesDone: result.pageCount,
+        pageCount: result.pageCount,
+        sourceId: created.source.id,
+      });
+      activity.push(
+        "good",
+        `Converted ${originalName} → ${result.pageCount} page${result.pageCount === 1 ? "" : "s"} (${documentFormatLabel(format)})`,
+      );
+      fastify.log.info(
+        {
+          event: "document.converted",
+          jobId,
+          mediaId,
+          sourceId: created.source.id,
+          format,
+          pages: result.pageCount,
+          dwellSeconds: DEFAULT_DWELL_SECONDS,
+        },
+        "document converted to a deck",
+      );
+      broadcaster.broadcast();
+    } catch (err) {
+      // A converter must not throw for a bad file, but a disk error can still land here — the upload
+      // must not be left half-converted in the catalogue.
+      await media.deleteById(mediaId);
+      jobs.update(jobId, {
+        status: "failed",
+        error: "Converting this document failed unexpectedly. Try exporting it to PDF and uploading that.",
+      });
+      fastify.log.error({ event: "document.error", jobId, mediaId, err }, "document conversion threw");
+      broadcaster.broadcast();
+    }
+  }
+
   // ── Phase 7 routes (media upload) ─────────────────────────────────────────────
   //
   // POST /api/v1/media — GATED (operator only; it lives under /api/v1, behind the session gate). A
@@ -1471,8 +1594,9 @@ export function registerRestRoutes(
       return reply.code(400).send({ error: "no file in multipart upload" });
     }
 
-    const kind = kindForMime(data.mimetype);
-    if (!kind) {
+    const docExt = documentExtForMime(data.mimetype);
+    const kind = docExt ? null : kindForMime(data.mimetype);
+    if (!kind && !docExt) {
       // Drain the rejected stream so busboy/the connection isn't left hanging on an unconsumed file.
       data.file.resume();
       return reply.code(415).send({ error: `unsupported media type: ${data.mimetype}` });
@@ -1482,6 +1606,53 @@ export function registerRestRoutes(
     const providedName = readField(data.fields, "name");
     const name = (providedName && providedName.trim().length > 0 ? providedName.trim() : originalName)
       .slice(0, 120);
+
+    // ── POL-114 — a DOCUMENT takes the deck pipeline, not the media one ───────────────────────────
+    // Refuse BEFORE a byte lands if this server cannot convert: a document is not content until it
+    // has been converted, so storing it would create a library row that provably cannot paint (D115).
+    if (docExt) {
+      if (!(await mediaConfig.converter.available())) {
+        data.file.resume();
+        fastify.log.info(
+          { event: "document.refused", reason: "no-converter", mime: data.mimetype, name: originalName },
+          "document upload refused — no converter on this server",
+        );
+        return reply.code(415).send({ error: NO_CONVERTER_MESSAGE, reason: "no-converter" });
+      }
+
+      let docRecord;
+      try {
+        docRecord = await media.save(data.file, data.mimetype, originalName, mediaConfig.maxBytes);
+      } catch (err) {
+        if (err instanceof MediaTooLargeError || isFileTooLargeError(err)) {
+          return reply.code(413).send({ error: "file too large" });
+        }
+        throw err;
+      }
+
+      const deckName = providedName?.trim()
+        ? providedName.trim().slice(0, 120)
+        : deckDisplayName(originalName, docExt);
+      const job = mediaConfig.documentJobs.start(deckName);
+
+      // Conversion runs OFF the request (a 60-slide deck is tens of seconds; an HTTP request held
+      // that long meets a proxy's read timeout). Progress rides the admin/state broadcast.
+      void convertDocument(job.id, docRecord.id, deckName, docExt, originalName);
+
+      fastify.log.info(
+        { event: "document.accepted", jobId: job.id, mediaId: docRecord.id, mime: data.mimetype, format: docExt },
+        "document accepted for conversion",
+      );
+      broadcaster.broadcast();
+      return reply.code(202).send({ ok: true, job });
+    }
+
+    // Not a document → the media (image/video) path. `kind` is non-null here by the guard above; the
+    // check keeps that provable rather than asserted.
+    if (!kind) {
+      data.file.resume();
+      return reply.code(415).send({ error: `unsupported media type: ${data.mimetype}` });
+    }
 
     let record;
     try {
