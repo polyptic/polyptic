@@ -16,6 +16,7 @@ import type {
   PersistedImageRollout,
   PersistedMachine,
   PersistedMtlsCa,
+  PersistedNotificationRule,
   PersistedServerTls,
   PersistedMural,
   PersistedPlacement,
@@ -54,6 +55,8 @@ export class MemoryStore implements Store {
   private readonly scenes = new Map<string, PersistedScene>();
   /** Keyed by profile id — credential profiles for content auth (POL-24). */
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
+  /** Keyed by rule id — notification rules (POL-91). */
+  private readonly notificationRules = new Map<string, PersistedNotificationRule>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
   private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
@@ -247,6 +250,20 @@ export class MemoryStore implements Store {
 
   async listCredentialProfiles(): Promise<PersistedCredentialProfile[]> {
     return [...this.credentialProfiles.values()].map(clone);
+  }
+
+  // ── Notification rules (POL-91) ──────────────────────────────────────────────
+
+  async upsertNotificationRule(rule: PersistedNotificationRule): Promise<void> {
+    this.notificationRules.set(rule.id, clone(rule));
+  }
+
+  async deleteNotificationRule(id: string): Promise<void> {
+    this.notificationRules.delete(id);
+  }
+
+  async listNotificationRules(): Promise<PersistedNotificationRule[]> {
+    return [...this.notificationRules.values()].map(clone);
   }
 
   // ── Scenes (Phase 3d) ───────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ import type {
   PersistedImageRollout,
   PersistedMachine,
   PersistedMtlsCa,
+  PersistedNotificationRule,
   PersistedServerTls,
   PersistedMural,
   PersistedPlacement,
@@ -134,6 +135,20 @@ function contentSourceFromRow(row: ContentSourceRow): PersistedContentSource[] {
       items: kind.data === "playlist" ? (items.success ? items.data : []) : null,
     },
   ];
+}
+
+interface NotificationRuleRow {
+  id: string;
+  name: string;
+  enabled: boolean;
+  kinds: string[] | null;
+  notifier: string;
+  webhook_url: string | null;
+  webhook_secret: string | null;
+  email_to: string[] | null;
+  debounce_seconds: number;
+  quiet_start: string | null;
+  quiet_end: string | null;
 }
 
 interface CredentialProfileRow {
@@ -322,6 +337,24 @@ export class PostgresStore implements Store {
         scope          text,
         audience       text,
         token_param    text NOT NULL DEFAULT 'auth_token'
+      )
+    `;
+    // Notification rules (POL-91): which alert kinds go out through which notifier, with the per-rule
+    // debounce + quiet hours. `webhook_secret` is the HMAC signing key — the same posture as a
+    // credential profile's client secret: this row is its only home, and it never leaves the server.
+    await sql`
+      CREATE TABLE IF NOT EXISTS notification_rules (
+        id               text PRIMARY KEY,
+        name             text NOT NULL,
+        enabled          boolean NOT NULL DEFAULT true,
+        kinds            jsonb NOT NULL DEFAULT '[]'::jsonb,
+        notifier         text NOT NULL,
+        webhook_url      text,
+        webhook_secret   text,
+        email_to         jsonb,
+        debounce_seconds integer NOT NULL DEFAULT 180,
+        quiet_start      text,
+        quiet_end        text
       )
     `;
     // Scenes (Phase 3d). A named SNAPSHOT of a mural's whole wall — layout + grouping + content live
@@ -864,6 +897,65 @@ export class PostgresStore implements Store {
         audience       = EXCLUDED.audience,
         token_param    = EXCLUDED.token_param
     `;
+  }
+
+  // ── Notification rules (POL-91) ──────────────────────────────────────────────
+
+  async upsertNotificationRule(rule: PersistedNotificationRule): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO notification_rules (id, name, enabled, kinds, notifier, webhook_url, webhook_secret, email_to, debounce_seconds, quiet_start, quiet_end)
+      VALUES (
+        ${rule.id},
+        ${rule.name},
+        ${rule.enabled},
+        ${sql.json(rule.kinds)},
+        ${rule.notifier},
+        ${rule.webhookUrl ?? null},
+        ${rule.webhookSecret ?? null},
+        ${rule.emailTo ? sql.json(rule.emailTo) : null},
+        ${rule.debounceSeconds},
+        ${rule.quietStart ?? null},
+        ${rule.quietEnd ?? null}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        name             = EXCLUDED.name,
+        enabled          = EXCLUDED.enabled,
+        kinds            = EXCLUDED.kinds,
+        notifier         = EXCLUDED.notifier,
+        webhook_url      = EXCLUDED.webhook_url,
+        webhook_secret   = EXCLUDED.webhook_secret,
+        email_to         = EXCLUDED.email_to,
+        debounce_seconds = EXCLUDED.debounce_seconds,
+        quiet_start      = EXCLUDED.quiet_start,
+        quiet_end        = EXCLUDED.quiet_end
+    `;
+  }
+
+  async deleteNotificationRule(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM notification_rules WHERE id = ${id}`;
+  }
+
+  async listNotificationRules(): Promise<PersistedNotificationRule[]> {
+    const sql = this.sql;
+    const rows = await sql<NotificationRuleRow[]>`
+      SELECT id, name, enabled, kinds, notifier, webhook_url, webhook_secret, email_to, debounce_seconds, quiet_start, quiet_end
+      FROM notification_rules
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      enabled: row.enabled,
+      kinds: Array.isArray(row.kinds) ? row.kinds : [],
+      notifier: row.notifier,
+      webhookUrl: row.webhook_url ?? null,
+      webhookSecret: row.webhook_secret ?? null,
+      emailTo: Array.isArray(row.email_to) ? row.email_to : null,
+      debounceSeconds: Number(row.debounce_seconds),
+      quietStart: row.quiet_start ?? null,
+      quietEnd: row.quiet_end ?? null,
+    }));
   }
 
   async deleteCredentialProfile(id: string): Promise<void> {

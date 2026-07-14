@@ -543,8 +543,22 @@ function handleAgent(
     if (msg.t === "agent/hello") {
       void onHello(msg);
     } else if (msg.t === "agent/status") {
+      // POL-91 — the heartbeat's per-connector `{ok, note}` is the BOX's own verdict on whether the
+      // browser is on the glass. It used to be logged and dropped; now it lands in Presence, where the
+      // alert engine's placement probe reads it (a browser that won't stay up is a dark screen the
+      // control plane can otherwise see nothing wrong with).
+      const screens = control.getScreens().filter((s) => s.machineId === msg.machineId);
+      for (const report of msg.screens) {
+        const screen = screens.find((s) => s.connector === report.connector);
+        if (screen) presence.setScreenPlacement(screen.id, report.ok, report.note);
+      }
       log.info(
-        { event: "agent.status", machineId: msg.machineId, observedRevision: msg.observedRevision },
+        {
+          event: "agent.status",
+          machineId: msg.machineId,
+          observedRevision: msg.observedRevision,
+          failing: msg.screens.filter((s) => !s.ok).length,
+        },
         "agent status",
       );
     } else if (msg.t === "agent/reboot-ack") {
@@ -649,9 +663,11 @@ function handleAgent(
         }
         // POL-50 — the box is gone, so its panels are no longer showing an inspector. Drop the flag,
         // or a reboot-while-inspecting leaves the console badging a wall that came back sealed.
-        presence.clearScreensInspecting(
-          control.getScreens().filter((s) => s.machineId === machineId).map((s) => s.id),
-        );
+        const screenIds = control.getScreens().filter((s) => s.machineId === machineId).map((s) => s.id);
+        presence.clearScreensInspecting(screenIds);
+        // POL-91 — and its last placement verdicts go with it: the box being unreachable IS the alert,
+        // and a stale "the browser is down" from before the drop would double-page the same outage.
+        presence.clearScreenPlacements(screenIds);
       }
       broadcaster.broadcast();
     }
