@@ -90,6 +90,35 @@ body {
   animation: badge-blink 1.6s steps(1, end) infinite;
 }
 
+/* Playlist (POL-110): one rotation entry's box. In the default HARD CUT there is exactly one of these
+   and its element patches in place — no animation, no promoted layer, identical to POL-34's rendering.
+   A second layer exists only while an opt-in crossfade runs. */
+.playlist-layer {
+  position: absolute;
+  inset: 0;
+}
+
+/* The crossfade. This deliberately BREAKS D66's "never animate opacity" rule, which is why it is
+   opt-in (PLAYLIST_TRANSITION=crossfade) AND capability-gated: the rotator only ever mounts this class
+   on a box whose WebGL renderer proves GPU acceleration (gpu.ts). On a software-rendering box the
+   fade would drop the promoted layer, repaint the region on the CPU and peg a core — so such a box
+   never reaches this rule and hard-cuts instead. One element animates, once, for transitionMs. */
+.playlist-layer--in {
+  z-index: 1;
+  animation-name: playlist-fade-in;
+  animation-timing-function: linear;
+  animation-fill-mode: both;
+}
+
+@keyframes playlist-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* Playlist (POL-34): the NEXT entry pre-warming invisibly behind the current one, so a rotation
    swaps without flashing a blank region. Same box as the content, just never seen or clicked. */
 .playlist-preload {

@@ -9,8 +9,9 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { MediaCache } from "../src/media-cache";
+import { MediaCache, wantedMediaFor } from "../src/media-cache";
 import type { MediaCacheStore, MediaMeta, WantedMedia } from "../src/media-cache";
+import { resolveMediaSrc } from "../src/media-url";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Harness
@@ -381,5 +382,87 @@ describe("MediaCache — discard (a corrupt cached blob must not re-serve)", () 
     await h.settle();
     expect(h.readies).toHaveLength(2);
     expect(h.readies[1]!.objectUrl).not.toBe(served);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POL-110 — a playlist's media is cached too (the POL-34 gap: the one surface that changes content
+// by itself was the one with no local copy to change to).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("wantedMediaFor — what a rendered slice asks the cache for", () => {
+  const base = "http://wall.test:8080";
+  const region = { x: 0, y: 0, w: 100, h: 100 };
+
+  test("a playlist's image and video entries are cached like any media surface", () => {
+    const wanted = wantedMediaFor(
+      [
+        {
+          id: "s1",
+          type: "playlist",
+          region,
+          startedAt: "2026-07-13T00:00:00.000Z",
+          transition: "cut",
+          transitionMs: 400,
+          prewarmVideo: true,
+          prewarmLeadMs: 6000,
+          items: [
+            { kind: "image", url: `${base}/media/img-1`, durationSeconds: 10 },
+            { kind: "video", url: "https://cdn.test/clip.mp4" },
+            { kind: "web", url: "https://grafana.test/d/abc", durationSeconds: 30 },
+          ],
+        },
+      ] as unknown as Parameters<typeof wantedMediaFor>[0],
+      base,
+      resolveMediaSrc,
+    );
+    expect(wanted).toEqual([
+      { url: `${base}/media/img-1`, immutable: true }, // an upload can never change under its id
+      { url: "https://cdn.test/clip.mp4", immutable: false }, // a CDN URL revalidates
+    ]);
+    // A web entry has no bytes to cache — the iframe is the page's own business.
+  });
+
+  test("a loopback-baked entry URL is re-homed before it is cached (POL-5)", () => {
+    const wanted = wantedMediaFor(
+      [
+        {
+          id: "s1",
+          type: "playlist",
+          region,
+          startedAt: "2026-07-13T00:00:00.000Z",
+          transition: "cut",
+          transitionMs: 400,
+          prewarmVideo: true,
+          prewarmLeadMs: 6000,
+          items: [{ kind: "video", url: "http://localhost:8080/media/vid-9" }],
+        },
+      ] as unknown as Parameters<typeof wantedMediaFor>[0],
+      base,
+      resolveMediaSrc,
+    );
+    expect(wanted).toEqual([{ url: `${base}/media/vid-9`, immutable: true }]);
+  });
+
+  test("plain media surfaces still count, and a URL shared with a playlist is asked for once", () => {
+    const wanted = wantedMediaFor(
+      [
+        { id: "s0", type: "video", region, src: `${base}/media/vid-1`, loop: true, muted: true },
+        {
+          id: "s1",
+          type: "playlist",
+          region,
+          startedAt: "2026-07-13T00:00:00.000Z",
+          transition: "cut",
+          transitionMs: 400,
+          prewarmVideo: true,
+          prewarmLeadMs: 6000,
+          items: [{ kind: "video", url: `${base}/media/vid-1`, durationSeconds: 5 }],
+        },
+      ] as unknown as Parameters<typeof wantedMediaFor>[0],
+      base,
+      resolveMediaSrc,
+    );
+    expect(wanted).toEqual([{ url: `${base}/media/vid-1`, immutable: true }]);
   });
 });

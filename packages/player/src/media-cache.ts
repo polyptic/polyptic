@@ -25,6 +25,8 @@
  * timers, clock, object-URL factory) so the logic is unit-testable under bun with no browser.
  */
 
+import type { Surface } from "@polyptic/protocol";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Store seam — IndexedDB in the player, an in-memory Map in tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +97,39 @@ export interface WantedMedia {
 /** Only http(s) URLs are cacheable — `data:`/`blob:` srcs are already local. */
 function isCacheable(url: string): boolean {
   return url.startsWith("http://") || url.startsWith("https://");
+}
+
+/**
+ * The media a rendered slice wants on the glass, resolved to what the box actually fetches (POL-5).
+ *
+ * POL-110: PLAYLIST entries count. Before, only top-level image/video surfaces were declared here, so a
+ * rotation's media was never cached and a rotating wall broke in an outage that a plain media wall
+ * sailed through — the one surface that changes content on its own was the one with no local copy.
+ * Uploaded control-plane media (`/media/<id>`) is immutable by construction (a re-upload mints a new
+ * id), so it caches forever; anything else revalidates in the background.
+ */
+export function wantedMediaFor(
+  surfaces: Surface[],
+  serverHttpBase: string,
+  resolve: (raw: string, base: string) => string,
+): WantedMedia[] {
+  const wanted: WantedMedia[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string): void => {
+    const url = resolve(raw, serverHttpBase);
+    if (!isCacheable(url) || seen.has(url)) return;
+    seen.add(url);
+    wanted.push({ url, immutable: url.startsWith(`${serverHttpBase}/media/`) });
+  };
+  for (const surface of surfaces) {
+    if (surface.type === "image" || surface.type === "video") add(surface.src);
+    else if (surface.type === "playlist") {
+      for (const entry of surface.items) {
+        if (entry.kind === "image" || entry.kind === "video") add(entry.url);
+      }
+    }
+  }
+  return wanted;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

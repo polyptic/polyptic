@@ -90,6 +90,21 @@ const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
 /** POL-57 — an unzoomed page: 100%, the same scale a browser opens a tab at. */
 const DEFAULT_ZOOM = 1;
 
+/**
+ * POL-110 — the fleet's playlist playback policy, stamped onto every resolved rotation. Deployment
+ * config rather than per-playlist authoring (no console surface for it yet): the two knobs exist
+ * because both carry a real hardware risk, and an operator who hits it must be able to turn them off
+ * for the whole fleet in one place. `PLAYLIST_TRANSITION=crossfade` opts INTO the fade (the player
+ * still hard-cuts unless it can prove the box is GPU-accelerated — D66); `PLAYLIST_VIDEO_PREWARM=off`
+ * opts OUT of buffering the next video.
+ */
+const PLAYLIST_TRANSITION =
+  process.env.PLAYLIST_TRANSITION?.trim().toLowerCase() === "crossfade" ? "crossfade" : "cut";
+const PLAYLIST_TRANSITION_MS = Number(process.env.PLAYLIST_TRANSITION_MS ?? 400);
+const PLAYLIST_VIDEO_PREWARM = !/^(0|false|no|off)$/i.test(
+  process.env.PLAYLIST_VIDEO_PREWARM?.trim() ?? "",
+);
+
 /** The two surface kinds that frame a page, and so are the only ones that can be zoomed. */
 type FramedSurface = Extract<Surface, { type: "web" | "dashboard" }>;
 
@@ -1474,6 +1489,10 @@ export class ControlPlane {
           type: "playlist",
           items: spec.entries ?? [],
           startedAt: spec.startedAt ?? new Date().toISOString(),
+          // POL-110 — the fleet's playback policy rides on the surface, so a player never guesses.
+          transition: PLAYLIST_TRANSITION,
+          transitionMs: PLAYLIST_TRANSITION_MS,
+          prewarmVideo: PLAYLIST_VIDEO_PREWARM,
         });
     }
   }
