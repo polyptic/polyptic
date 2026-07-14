@@ -72,10 +72,57 @@ Reusable **`ContentSource`** library entries — `web` · `dashboard` · `image`
 
 ### Auth
 - **Operator console / API:** **local accounts**, done properly — argon2id password hashing (Bun's built-in), signed **HTTP-only** session cookies (secure over HTTPS), per-email + per-IP login **rate-limiting/lockout**, anti-CSWSH origin checks. Every `/api/v1/**` route and the `/admin` WebSocket are session-gated by default (`AUTH_ENABLED`); the device channels (`/agent`, `/player`) and `/healthz`,`/metrics`,`/media` are not. **OIDC/SSO** is a planned add-on on the same seam.
+- **Machines & automation:** **scoped API tokens** for external systems (below), and the agent's own credential (next).
 - **Agent ↔ server:** a one-time **bootstrap token** (gated mode) → the machine appears *pending* → an operator **approves** it → a durable per-machine credential (the server stores only its `sha256`). Open mode auto-approves for dev, loudly. No inbound ports.
 
 ### Live preview, health & activity
 Per-output **JPEG thumbnails** (`grim`/`scrot`) flow up the agent channel and paint the actual render onto each tile in the console. `GET /healthz` + a hand-rolled Prometheus `GET /metrics` (build info, revision, agents/players/machines/screens). A **Live Activity feed** streams notable events (machine connected/unreachable, screen approved, content assigned, scene applied, combine/split/rename).
+
+## Automating Polyptic
+
+The wall should be scriptable, not just clickable: a CI job puts a build-status page up, an incident
+tool casts a dashboard when an alert fires, a cron rotates a scene at the start of the day. Those
+systems get a credential of their own — a **scoped API token** — rather than a scraped operator login.
+
+Create one in **Settings → API tokens**: give it a name, tick the scopes it needs, optionally set an
+expiry. The secret is shown **once** (the server keeps only its `sha256`), so copy it into your CI
+secret store there and then; a lost token is revoked and replaced, never recovered. Every token-driven
+call lands in the activity feed and the server log by token *name* — never by secret.
+
+Send it as a bearer token on any `/api/v1` call:
+
+```bash
+# An incident tool casts the "Incident" scene onto the NOC wall.
+curl -sS -X POST https://polyptic.example.com/api/v1/scenes/scene_7c1f/apply \
+  -H "Authorization: Bearer plp_9f3c…"
+
+# A CI job points one screen at the build-status page it just published.
+curl -sS -X PUT https://polyptic.example.com/api/v1/screens/screen_atrium_left/content \
+  -H "Authorization: Bearer plp_9f3c…" \
+  -H "content-type: application/json" \
+  -d '{"url":"https://ci.example.com/status/main"}'
+```
+
+The scopes are the whole contract — a token can do what they name and nothing else:
+
+| Scope | What it unlocks |
+|---|---|
+| `read` | `GET` the wall: `/state`, `/machines`, `/screens`, `/murals`, `/walls`, `/scenes`, `/content-sources` |
+| `scenes:apply` | `POST /scenes/:id/apply` — recall a saved layout (the alarm/CI verb) |
+| `content:write` | `PUT /screens/:id/content` · `PUT /walls/:id/content` (and `/zoom` on either) |
+| `machines:operate` | `POST /screens/:id/ident` · `/walls/:id/ident` · `/machines/:id/ident` · `POST /machines/:id/reboot` |
+| `admin` | all of the above |
+
+Everything else is closed to tokens no matter what they hold — the auth routes, token management
+itself (a token can never mint another token), the enrolment secret, the DevTools tunnel, and every
+destructive registry verb (approve/reject/remove, delete a scene or a source, rebuild an image).
+Those stay operator-only. A wrong, revoked or expired token is a `401`; a genuine token off its scope
+is a `403` naming the scope it lacks; repeated bad tokens from one address trip the same lockout that
+guards login (`429`).
+
+Any generic JSON webhook can call this directly — Alertmanager, Grafana and Zabbix all let you set an
+`Authorization` header on a webhook receiver — so an alert firing can flip the wall to an incident
+scene with no glue code and no Polyptic-specific plugin.
 
 ## Provisioning the edge (air-gappable)
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import type { ApiToken, ApiTokenScope, HttpsInfo, ImageBuild } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
@@ -21,6 +21,7 @@ onMounted(() => {
   void store.fetchDisplaySettings();
   void store.fetchImageUpdates();
   void loadHttps();
+  void loadTokens();
   document.addEventListener("keydown", onKeydown);
 });
 onBeforeUnmount(() => document.removeEventListener("keydown", onKeydown));
@@ -83,6 +84,103 @@ async function regenerate(): Promise<void> {
   await store.regenerateEnrollment();
   regenerating.value = false;
   showToast("New enrolment token generated");
+}
+
+// ── API tokens (POL-102/D97) ───────────────────────────────────────────────────
+// Named, scoped bearer tokens so an external system (CI, an incident tool, a cron) can drive the
+// wall without scraping a login. The secret is shown ONCE, right after minting — the server keeps
+// only its sha256, so a lost token is replaced, never recovered.
+const tokens = ref<ApiToken[] | null>(null);
+const tokenName = ref("");
+const tokenScopes = ref<ApiTokenScope[]>(["read"]);
+const tokenExpiryDays = ref("0"); // "0" = never expires
+const tokenCreating = ref(false);
+const tokenError = ref("");
+const tokenRevoking = ref<string | null>(null);
+/** The just-minted secret, held in memory only, until the operator dismisses it. Never persisted. */
+const mintedSecret = ref<{ name: string; secret: string } | null>(null);
+
+const SCOPE_OPTIONS: { value: ApiTokenScope; label: string; detail: string }[] = [
+  { value: "read", label: "read", detail: "read the wall: state, machines, screens, scenes, content" },
+  { value: "scenes:apply", label: "scenes:apply", detail: "apply a saved scene to its mural" },
+  { value: "content:write", label: "content:write", detail: "assign content (and zoom) to a screen or a wall" },
+  { value: "machines:operate", label: "machines:operate", detail: "ident a screen/wall/machine, reboot a machine" },
+  { value: "admin", label: "admin", detail: "everything above — read and write" },
+];
+
+async function loadTokens(): Promise<void> {
+  try {
+    tokens.value = await auth.listApiTokens();
+  } catch (err) {
+    console.error("[console] loadTokens failed", err);
+    tokens.value = [];
+  }
+}
+
+function toggleScope(scope: ApiTokenScope): void {
+  const next = tokenScopes.value.includes(scope)
+    ? tokenScopes.value.filter((s) => s !== scope)
+    : [...tokenScopes.value, scope];
+  tokenScopes.value = next;
+}
+
+async function createToken(): Promise<void> {
+  if (tokenCreating.value) return;
+  const name = tokenName.value.trim();
+  if (!name) {
+    tokenError.value = "Give the token a name — you'll recognise it in the activity feed.";
+    return;
+  }
+  if (tokenScopes.value.length === 0) {
+    tokenError.value = "Pick at least one scope.";
+    return;
+  }
+  tokenCreating.value = true;
+  tokenError.value = "";
+  try {
+    const days = Number(tokenExpiryDays.value);
+    const created = await auth.createApiToken({
+      name,
+      scopes: tokenScopes.value,
+      ...(days > 0 ? { expiresInDays: days } : {}),
+    });
+    mintedSecret.value = { name: created.token.name, secret: created.secret };
+    tokenName.value = "";
+    tokenScopes.value = ["read"];
+    tokenExpiryDays.value = "0";
+    await loadTokens();
+  } catch (err) {
+    console.error("[console] createToken failed", err);
+    tokenError.value = "Could not create the token.";
+  } finally {
+    tokenCreating.value = false;
+  }
+}
+
+async function revokeToken(token: ApiToken): Promise<void> {
+  if (tokenRevoking.value) return;
+  if (!window.confirm(`Revoke "${token.name}"? Anything using it stops working immediately.`)) return;
+  tokenRevoking.value = token.id;
+  try {
+    await auth.revokeApiToken(token.id);
+    await loadTokens();
+    showToast(`Revoked "${token.name}"`);
+  } catch (err) {
+    console.error("[console] revokeToken failed", err);
+    showToast("Revoke failed");
+  } finally {
+    tokenRevoking.value = null;
+  }
+}
+
+/** "never" / "in 30d" / "expired" — the token's lifecycle at a glance. */
+function expiryLabel(token: ApiToken): string {
+  if (!token.expiresAt) return "never expires";
+  const ms = Date.parse(token.expiresAt) - Date.now();
+  if (Number.isNaN(ms)) return "";
+  if (ms <= 0) return "expired";
+  const days = Math.ceil(ms / 86_400_000);
+  return days <= 1 ? "expires today" : `expires in ${days}d`;
 }
 
 // ── HTTPS (POL-70/D89) ─────────────────────────────────────────────────────────
@@ -680,6 +778,98 @@ async function onSignOut(): Promise<void> {
           </div>
           <p class="hint gap-sm">Regenerating revokes access for machines that haven't dialled in yet.</p>
         </template>
+      </section>
+
+      <!-- API tokens (POL-102/D97) ---------------------------------------------- -->
+      <section id="sec-api-tokens" class="card">
+        <h2 class="card-title">API tokens</h2>
+        <p class="card-sub wrap gap">
+          Let an external system drive the wall — a CI job that posts a build status, an incident tool that casts a
+          dashboard, a cron that rotates a scene. A token is sent as
+          <code class="code">Authorization: Bearer …</code> and can only do what its scopes allow.
+        </p>
+
+        <!-- The secret, shown exactly once. -->
+        <div v-if="mintedSecret" class="callout callout-ok token-secret">
+          <span class="callout-icon">✓</span>
+          <div class="min-w-0 secret-body">
+            <div class="secret-title">“{{ mintedSecret.name }}” created — copy it now.</div>
+            <p class="hint gap-sm">
+              <b>Treat this like a password.</b> It is shown once and never again: the server keeps only a hash of it. If
+              you lose it, revoke the token and create another.
+            </p>
+            <div class="field-row gap-sm">
+              <code class="mono-field ellipsis">{{ mintedSecret.secret }}</code>
+              <button type="button" class="btn-ghost-sm" @click="copy(mintedSecret.secret, 'API token copied')">
+                Copy
+              </button>
+              <button type="button" class="btn-ghost-sm" @click="mintedSecret = null">Done</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Create -->
+        <div class="token-create">
+          <div class="token-create-row">
+            <div class="min-w-0 grow">
+              <label class="field-label" for="tok-name">Name</label>
+              <input
+                id="tok-name" v-model="tokenName" class="input" type="text" placeholder="CI — build status"
+                :disabled="tokenCreating" @keyup.enter="createToken"
+              />
+            </div>
+            <div>
+              <label class="field-label" for="tok-exp">Expires</label>
+              <select id="tok-exp" v-model="tokenExpiryDays" class="select-input" :disabled="tokenCreating">
+                <option value="0">Never</option>
+                <option value="30">In 30 days</option>
+                <option value="90">In 90 days</option>
+                <option value="365">In a year</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="scope-list">
+            <label v-for="opt in SCOPE_OPTIONS" :key="opt.value" class="scope-row">
+              <input
+                type="checkbox" :checked="tokenScopes.includes(opt.value)" :disabled="tokenCreating"
+                @change="toggleScope(opt.value)"
+              />
+              <code class="code">{{ opt.label }}</code>
+              <span class="hint">{{ opt.detail }}</span>
+            </label>
+          </div>
+
+          <div v-if="tokenError" class="callout callout-bad"><span class="callout-icon">⚠</span>{{ tokenError }}</div>
+
+          <button type="button" class="btn btn-primary" :disabled="tokenCreating" @click="createToken">
+            {{ tokenCreating ? "Creating…" : "Create token" }}
+          </button>
+        </div>
+
+        <!-- List -->
+        <div v-if="tokens === null" class="hint gap">Loading…</div>
+        <div v-else-if="tokens.length === 0" class="hint gap">No API tokens yet.</div>
+        <ul v-else class="token-list">
+          <li v-for="t in tokens" :key="t.id" class="token-row">
+            <div class="min-w-0 token-main">
+              <div class="token-name">{{ t.name }}</div>
+              <div class="token-meta">
+                <code class="code">{{ t.prefix }}…</code>
+                <span v-for="s in t.scopes" :key="s" class="chip chip-accent">{{ s }}</span>
+              </div>
+            </div>
+            <div class="token-when">
+              <div>{{ t.lastUsedAt ? `used ${formatRelativeShort(t.lastUsedAt, nowMs)}` : "never used" }}</div>
+              <div class="hint">{{ expiryLabel(t) }}</div>
+            </div>
+            <button
+              type="button" class="btn-ghost-sm" :disabled="tokenRevoking === t.id" @click="revokeToken(t)"
+            >
+              {{ tokenRevoking === t.id ? "Revoking…" : "Revoke" }}
+            </button>
+          </li>
+        </ul>
       </section>
 
       <!-- HTTPS (POL-70/D89) ----------------------------------------------------- -->
@@ -1716,6 +1906,84 @@ async function onSignOut(): Promise<void> {
 .callout-ok {
   color: var(--ok);
   background: var(--ok-soft);
+}
+
+/* ── API tokens (POL-102) ──────────────────────────────────────────────────── */
+.token-secret {
+  align-items: flex-start;
+}
+.secret-body {
+  flex: 1;
+}
+.secret-title {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.token-create {
+  padding-bottom: 4px;
+}
+.token-create-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.grow {
+  flex: 1;
+}
+.token-create .input {
+  padding: 10px 12px;
+  font-size: 13.5px;
+}
+.token-create .field-label {
+  color: var(--fg2);
+  margin-bottom: 6px;
+}
+.scope-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.scope-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+}
+.token-list {
+  list-style: none;
+  margin: 18px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--line);
+}
+.token-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.token-main {
+  flex: 1;
+}
+.token-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.token-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+.token-when {
+  flex: 0 0 auto;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--muted2);
 }
 
 /* ── Password ──────────────────────────────────────────────────────────────── */

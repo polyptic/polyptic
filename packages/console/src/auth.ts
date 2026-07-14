@@ -11,8 +11,11 @@
  * wire. No secret (password or hash) is ever sent back by these routes or logged here.
  */
 import {
+  ApiToken,
+  ApiTokenCreated,
   AuthUser,
   ChangePasswordBody,
+  CreateApiTokenBody,
   DisplaySettings,
   EnrollmentInfo,
   HttpsInfo,
@@ -22,7 +25,10 @@ import {
   UpdateImageSettingsBody,
 } from "@polyptic/protocol";
 import type {
+  ApiToken as ApiTokenT,
+  ApiTokenCreated as ApiTokenCreatedT,
   ChangePasswordBody as ChangePasswordBodyT,
+  CreateApiTokenBody as CreateApiTokenBodyT,
   DisplaySettings as DisplaySettingsT,
   LoginBody as LoginBodyT,
 } from "@polyptic/protocol";
@@ -152,6 +158,34 @@ export async function rebuildImageNow(kind: "refresh" | "full" = "refresh"): Pro
 export async function activateImage(arch: "arm64" | "amd64", imageId: string): Promise<ImageUpdateInfo> {
   const raw = await send<unknown>("POST", `${BASE_SETTINGS}/image/activate`, { arch, imageId });
   return ImageUpdateInfo.parse(raw);
+}
+
+// ── Scoped API tokens (POL-102/D97) ──────────────────────────────────────────
+// The credential an external system (CI, an incident tool, a cron) presents as
+// `Authorization: Bearer <secret>` instead of scraping a login. The secret exists in exactly one
+// response — the create call — and is never retrievable again: the server stores only its sha256.
+// These routes are OPERATOR-ONLY (a token cannot mint another token), so they ride the session
+// cookie like every other Settings call.
+
+/** GET /api/v1/settings/api-tokens → every token, newest first (safe view — never a secret). */
+export async function listApiTokens(): Promise<ApiTokenT[]> {
+  const raw = await send<{ tokens?: unknown }>("GET", `${BASE_SETTINGS}/api-tokens`);
+  const list = Array.isArray(raw?.tokens) ? raw.tokens : [];
+  return list.map((token) => ApiToken.parse(token));
+}
+
+/**
+ * POST /api/v1/settings/api-tokens { name, scopes, expiresInDays? } → { token, secret }. THE ONLY
+ * time the secret exists — show it once, let the operator copy it, and never store it in the app.
+ */
+export async function createApiToken(body: CreateApiTokenBodyT): Promise<ApiTokenCreatedT> {
+  const raw = await send<unknown>("POST", `${BASE_SETTINGS}/api-tokens`, CreateApiTokenBody.parse(body));
+  return ApiTokenCreated.parse(raw);
+}
+
+/** DELETE /api/v1/settings/api-tokens/:id → revoke it; the next request carrying it is refused. */
+export async function revokeApiToken(id: string): Promise<void> {
+  await send<unknown>("DELETE", `${BASE_SETTINGS}/api-tokens/${encodeURIComponent(id)}`);
 }
 
 /** GET /api/v1/settings/display → the current fleet-wide display settings (badge toggle) (POL-6). */

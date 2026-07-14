@@ -26,6 +26,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { AuthUser } from "@polyptic/protocol";
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { bearerFrom } from "./api-tokens";
+import type { ApiTokenService } from "./api-tokens";
 import type { EnrollmentMode, PersistedBootstrap, Store } from "./store/types";
 
 /** Make the resolved operator available to handlers after the auth gate runs. */
@@ -166,6 +168,11 @@ export class AuthService {
   private readonly log: FastifyBaseLogger;
   readonly config: AuthConfig;
 
+  /** POL-102 — the scoped-API-token service, wired after construction (index.ts). When absent (or
+   *  when a request carries no bearer header) the gate behaves exactly as it did before: session or
+   *  401. A token can never substitute for a session on a route the token allow-list doesn't name. */
+  private apiTokens: ApiTokenService | null = null;
+
   /** Per-(email,IP) failed-attempt records (in-memory; per-process). */
   private readonly fails = new Map<string, FailRecord>();
   /** A precomputed argon2id hash used to equalize timing on the no-such-user path. */
@@ -181,6 +188,12 @@ export class AuthService {
   /** Whether auth is enforced. When false the gate + admin-WS check are no-ops. */
   get enabled(): boolean {
     return this.config.enabled;
+  }
+
+  /** POL-102 — teach the gate to accept `Authorization: Bearer` scoped API tokens as well as the
+   *  session cookie. Purely additive: without this the gate is session-only, as before. */
+  setApiTokens(apiTokens: ApiTokenService): void {
+    this.apiTokens = apiTokens;
   }
 
   /** Cookie options for the signed, http-only session cookie. */
@@ -368,15 +381,41 @@ export class AuthService {
    * Fastify preHandler used by the global API gate. When auth is enabled it requires a valid session on
    * every `/api/v1/**` route except the public auth endpoints; otherwise it replies 401. Stashes the
    * resolved operator on `request.authUser`.
+   *
+   * POL-102: a request with NO session but an `Authorization: Bearer <secret>` header is offered to
+   * the scoped-API-token service instead. The session path above is untouched — the cookie is still
+   * tried first and still wins — and a token is admitted only for the routes on the token allow-list
+   * with the right scope; the authorizing token is stashed on `request.apiToken` for the audit trail.
+   * `apiPath` is the path RELATIVE to `/api/v1` (the caller has already collapsed duplicate slashes).
    */
-  requireAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+  requireAuth = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    apiPath?: string,
+  ): Promise<void> => {
     if (!this.config.enabled) return;
     const user = await this.verifyRequest(request);
-    if (!user) {
-      await reply.code(401).send({ error: "unauthorized" });
+    if (user) {
+      request.authUser = user;
       return;
     }
-    request.authUser = user;
+
+    const secret = bearerFrom(request.headers.authorization);
+    if (secret && this.apiTokens && apiPath) {
+      const verdict = await this.apiTokens.authorize(secret, request.method, apiPath, request.ip);
+      if (verdict.ok) {
+        request.apiToken = verdict.token;
+        return;
+      }
+      if (verdict.retryAfterSec !== undefined) {
+        reply.header("retry-after", String(verdict.retryAfterSec));
+      }
+      // Never echo the presented secret — only the verdict's own (secret-free) message.
+      await reply.code(verdict.status).send({ error: verdict.error });
+      return;
+    }
+
+    await reply.code(401).send({ error: "unauthorized" });
   };
 
   // ── Login rate-limiter (in-memory, per-process) ───────────────────────────────

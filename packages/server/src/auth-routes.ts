@@ -9,21 +9,29 @@
  *                                      session cookie (all old sessions are revoked). 401/400.
  *   GET  /api/v1/settings/enrollment            EnrollmentInfo {mode, token} (auth-gated).
  *   POST /api/v1/settings/enrollment/regenerate new gated token → EnrollmentInfo (auth-gated).
+ *   GET    /api/v1/settings/api-tokens          POL-102 — the scoped API tokens (safe view).
+ *   POST   /api/v1/settings/api-tokens          mint one → {token, secret}; the secret is shown ONCE.
+ *   DELETE /api/v1/settings/api-tokens/:id      revoke one (delete the row).
  *
  * The global gate (registered in index.ts) protects every /api/v1/** route EXCEPT login, logout and
  * me (which authenticate themselves). NEVER log a password or hash.
  */
-import { ChangePasswordBody, EnrollmentInfo, LoginBody } from "@polyptic/protocol";
+import { ApiTokenCreated, ChangePasswordBody, CreateApiTokenBody, EnrollmentInfo, LoginBody } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
+import { z } from "zod";
 
 import { SESSION_COOKIE } from "./auth-local";
 import type { AuthService } from "./auth-local";
+import type { ApiTokenService } from "./api-tokens";
 import type { Enrollment } from "./enroll";
+
+const ApiTokenParams = z.object({ id: z.string().min(1) });
 
 export function registerAuthRoutes(
   fastify: FastifyInstance,
   auth: AuthService,
   enrollment: Enrollment,
+  apiTokens: ApiTokenService,
 ): void {
   // POST /api/v1/auth/login  { email, password }
   fastify.post("/api/v1/auth/login", async (request, reply) => {
@@ -113,5 +121,53 @@ export function registerAuthRoutes(
     enrollment.setToken(boot.token ?? undefined);
     fastify.log.info({ event: "enrollment.regenerate", mode: boot.mode }, "enrollment token regenerated");
     return EnrollmentInfo.parse({ mode: boot.mode, token: boot.token });
+  });
+
+  // ── Scoped API tokens (POL-102/D97) ─────────────────────────────────────────
+  // OPERATOR-ONLY by construction: these paths are absent from the token allow-list (api-tokens.ts),
+  // so the gate refuses a bearer token here with a 403 no matter what scopes it holds — a token can
+  // never mint another token. The secret is returned exactly ONCE, by the create call, and is never
+  // logged (the log line below carries the token's public name + prefix only).
+
+  // GET /api/v1/settings/api-tokens  -> { tokens: ApiToken[] } (safe view — no secrets exist to leak)
+  fastify.get("/api/v1/settings/api-tokens", async () => {
+    return { tokens: await apiTokens.list() };
+  });
+
+  // POST /api/v1/settings/api-tokens  { name, scopes, expiresInDays? } -> ApiTokenCreated {token, secret}
+  fastify.post("/api/v1/settings/api-tokens", async (request, reply) => {
+    const body = CreateApiTokenBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    // With auth disabled (dev) there is no operator to attribute the mint to — record it as such.
+    const createdBy = request.authUser?.id ?? "auth-disabled";
+    const minted = await apiTokens.mint(
+      body.data.name,
+      body.data.scopes,
+      createdBy,
+      body.data.expiresInDays,
+    );
+    fastify.log.info(
+      {
+        event: "api.token.created",
+        tokenId: minted.token.id,
+        token: minted.token.prefix,
+        scopes: minted.token.scopes,
+        createdBy,
+      },
+      `minted API token "${minted.token.name}"`,
+    );
+    return reply.code(201).send(ApiTokenCreated.parse(minted));
+  });
+
+  // DELETE /api/v1/settings/api-tokens/:id  -> revoke (the row is deleted; 404 if unknown)
+  fastify.delete("/api/v1/settings/api-tokens/:id", async (request, reply) => {
+    const params = ApiTokenParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: "invalid id" });
+    const revoked = await apiTokens.revoke(params.data.id);
+    if (!revoked) return reply.code(404).send({ error: "unknown api token" });
+    fastify.log.info({ event: "api.token.revoked", tokenId: params.data.id }, "API token revoked");
+    return { ok: true };
   });
 }

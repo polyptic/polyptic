@@ -8,6 +8,7 @@
  */
 import type { EnrollmentStatus } from "@polyptic/protocol";
 import type {
+  PersistedApiToken,
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
@@ -60,6 +61,8 @@ export class MemoryStore implements Store {
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
   private readonly sessions = new Map<string, PersistedSession>();
+  /** Keyed by token id — scoped API tokens (POL-102). The row holds sha256(secret), never the secret. */
+  private readonly apiTokens = new Map<string, PersistedApiToken>();
   /** The enrollment bootstrap (mode + token), seeded on first boot. */
   private bootstrap: PersistedBootstrap | undefined;
   /** The mTLS agent CA (POL-25), generated on the first boot with AGENT_MTLS_PORT set. */
@@ -314,6 +317,32 @@ export class MemoryStore implements Store {
     for (const [id, session] of this.sessions) {
       if (Date.parse(session.expiresAt) <= cutoff) this.sessions.delete(id);
     }
+  }
+
+  // ── Scoped API tokens (POL-102) ──────────────────────────────────────────────
+
+  async createApiToken(token: PersistedApiToken): Promise<void> {
+    this.apiTokens.set(token.id, clone(token));
+  }
+
+  async getApiTokenByHash(secretHash: string): Promise<PersistedApiToken | undefined> {
+    for (const token of this.apiTokens.values()) {
+      if (token.secretHash === secretHash) return clone(token);
+    }
+    return undefined;
+  }
+
+  async listApiTokens(): Promise<PersistedApiToken[]> {
+    return [...this.apiTokens.values()].map(clone);
+  }
+
+  async touchApiToken(id: string, lastUsedAt: string): Promise<void> {
+    const token = this.apiTokens.get(id);
+    if (token) token.lastUsedAt = lastUsedAt;
+  }
+
+  async deleteApiToken(id: string): Promise<void> {
+    this.apiTokens.delete(id);
   }
 
   // ── Enrollment bootstrap token (Phase 3f) ────────────────────────────────────

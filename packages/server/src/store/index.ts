@@ -13,6 +13,7 @@ import type { Store } from "./types";
 
 export type {
   EnrollmentMode,
+  PersistedApiToken,
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,

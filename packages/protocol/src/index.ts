@@ -1478,6 +1478,67 @@ export const NetbootInfo = z.object({
 });
 export type NetbootInfo = z.infer<typeof NetbootInfo>;
 
+// ── Scoped API tokens (POL-102/D97) ──────────────────────────────────────────
+// The second credential on the operator surface: a NAMED, SCOPED bearer token an external system
+// (CI, an incident tool, a cron) presents as `Authorization: Bearer <secret>` on /api/v1 instead of
+// scraping a login. The secret is shown ONCE at creation and stored only as sha256 (same discipline
+// as the 2b machine credential + the session id); everything below is the SAFE view — it never
+// carries the secret.
+
+/**
+ * What a token may do. A token carries one or more; the gate maps each allowed route to exactly one
+ * required scope and refuses anything not on that list (so a token can never reach the auth routes,
+ * token management, the enrolment secret, or the DevTools tunnel — no scope grants those).
+ *   - `read`             every GET under /api/v1 (state, machines, screens, scenes, content…).
+ *   - `scenes:apply`     POST /scenes/:id/apply — the alarm/CI "recall this layout" verb.
+ *   - `content:write`    PUT screen/wall content + zoom — cast a URL or a library source at a target.
+ *   - `machines:operate` ident (screen/wall/machine) + reboot a machine.
+ *   - `admin`            all of the above (read-write), and nothing more.
+ */
+export const ApiTokenScope = z.enum([
+  "read",
+  "scenes:apply",
+  "content:write",
+  "machines:operate",
+  "admin",
+]);
+export type ApiTokenScope = z.infer<typeof ApiTokenScope>;
+
+/** A token as the console sees it — id, name, scopes, and its lifecycle. NEVER the secret. `prefix`
+ *  is the first few characters of the secret, kept purely so an operator can tell two tokens apart
+ *  in a log line or an `Authorization` header without the server holding anything usable. */
+export const ApiToken = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(80),
+  scopes: z.array(ApiTokenScope).min(1),
+  /** Leading, non-secret characters of the token (e.g. "plp_1a2b3c4d") — an identifier, not a key. */
+  prefix: z.string(),
+  createdAt: z.string(),
+  /** ISO expiry, or null for a token that never expires. */
+  expiresAt: z.string().nullable(),
+  /** ISO time the token last authorized a request (coarse — updated at most once a minute). */
+  lastUsedAt: z.string().nullable(),
+});
+export type ApiToken = z.infer<typeof ApiToken>;
+
+/** Mint a token. `expiresInDays` omitted = never expires. */
+export const CreateApiTokenBody = z.object({
+  name: z.string().min(1).max(80),
+  scopes: z.array(ApiTokenScope).min(1),
+  expiresInDays: z.number().int().min(1).max(3650).optional(),
+});
+export type CreateApiTokenBody = z.infer<typeof CreateApiTokenBody>;
+
+/** The ONLY response that ever carries the secret — the create call, once. It is not stored in
+ *  plaintext anywhere and cannot be recovered afterwards; the console shows it with a copy button
+ *  and a "treat this like a password" warning, and a lost token is replaced, not recovered. */
+export const ApiTokenCreated = z.object({
+  token: ApiToken,
+  /** The raw bearer secret. Shown once, never logged, never returned again. */
+  secret: z.string(),
+});
+export type ApiTokenCreated = z.infer<typeof ApiTokenCreated>;
+
 /** HTTPS surface for Settings (POL-70/D89): how THIS listener is serving TLS, if at all.
  *  `off` = plain HTTP (TLS, if any, terminates upstream at an ingress — the server can't see it);
  *  `provided` = native TLS from operator-supplied TLS_CERT_FILE/TLS_KEY_FILE;

@@ -209,6 +209,31 @@ export interface PersistedSession {
   expiresAt: string;
 }
 
+/**
+ * POL-102 — a scoped API token row. The SECRET is never stored: `id` is a public identifier and
+ * `secretHash` is the sha256 of the raw bearer token (hex), exactly the discipline used for the 2b
+ * machine credential and the session id — a database read never yields a usable token. `prefix` is
+ * the leading, non-secret characters of the token, kept only so an operator (and an audit line) can
+ * tell two tokens apart. Revocation = delete the row; expiry = `expiresAt` in the past.
+ */
+export interface PersistedApiToken {
+  id: string;
+  name: string;
+  /** sha256(secret) hex — the ONLY trace of the token the server keeps. */
+  secretHash: string;
+  /** Leading, non-secret characters of the token, for display/audit (e.g. "plp_1a2b3c4d"). */
+  prefix: string;
+  /** The granted scopes (see the protocol's `ApiTokenScope`). */
+  scopes: string[];
+  createdAt: string;
+  /** Operator id that minted it (audit). */
+  createdBy: string;
+  /** ISO expiry, or null/undefined for a token that never expires. */
+  expiresAt?: string | null;
+  /** ISO time the token last authorized a request (coarse — written at most once a minute). */
+  lastUsedAt?: string | null;
+}
+
 /** Enrollment mode for the agent bootstrap token (mirrors the protocol `EnrollmentInfo.mode`). */
 export type EnrollmentMode = "open" | "gated";
 
@@ -429,6 +454,18 @@ export interface Store {
   deleteSessionsForUser(userId: string): Promise<void>;
   /** Sweep sessions whose expires_at is at or before `nowIso`. */
   deleteExpiredSessions(nowIso: string): Promise<void>;
+
+  // ── Scoped API tokens (POL-102) ────────────────────────────────────────────
+  /** Insert a token row (its secretHash is sha256(secret); the raw secret is never stored). */
+  createApiToken(token: PersistedApiToken): Promise<void>;
+  /** Look up a token by sha256(secret). Undefined if revoked/unknown. */
+  getApiTokenByHash(secretHash: string): Promise<PersistedApiToken | undefined>;
+  /** Every token, for the Settings list (safe fields only — there is no secret to leak). */
+  listApiTokens(): Promise<PersistedApiToken[]>;
+  /** Stamp a token's lastUsedAt. No-op if absent. */
+  touchApiToken(id: string, lastUsedAt: string): Promise<void>;
+  /** Revoke a token (delete the row). No-op if absent. */
+  deleteApiToken(id: string): Promise<void>;
 
   // ── Enrollment bootstrap token (Phase 3f) ──────────────────────────────────
   /** The persisted enrollment bootstrap (mode + token). Undefined before first seed. */

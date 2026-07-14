@@ -18,6 +18,7 @@ import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettin
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import { ApiTokenService } from "./api-tokens";
 import { AuthService, authConfigFromEnv } from "./auth-local";
 import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
@@ -285,8 +286,16 @@ fastify.log.info(
     : "player channel OPEN (AUTH_ENABLED=false) — hellos are not token-checked",
 );
 
-// THE GATE: require a valid session on every /api/v1/** route except the public auth endpoints. The
-// device channels (/agent, /player), health/metrics and the WS upgrades are NOT /api/v1 and untouched.
+// ── Scoped API tokens (POL-102/D97): the gate's second credential. Operator-minted, named, scoped,
+// stored as sha256, revocable — accepted as `Authorization: Bearer` on the token allow-list ONLY
+// (see api-tokens.ts). The session path below is unchanged, and with AUTH_ENABLED=false the whole
+// gate is still a no-op, so dev stacks keep working. ──
+const apiTokens = new ApiTokenService({ store });
+auth.setApiTokens(apiTokens);
+
+// THE GATE: require a valid session (or an in-scope API token) on every /api/v1/** route except the
+// public auth endpoints. The device channels (/agent, /player), health/metrics and the WS upgrades
+// are NOT /api/v1 and untouched.
 fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyReply) => {
   if (!auth.enabled) return;
   // Collapse duplicate slashes the SAME way find-my-way does under ignoreDuplicateSlashes (above),
@@ -295,10 +304,22 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
   const path = (request.url.split("?")[0] ?? request.url).replace(/\/{2,}/g, "/");
   if (!path.startsWith("/api/v1/")) return;
   if (AUTH_PUBLIC_PATHS.has(path)) return;
-  await auth.requireAuth(request, reply);
+  // The path RELATIVE to /api/v1 — what the token allow-list matches against.
+  await auth.requireAuth(request, reply, path.slice("/api/v1".length));
+
+  // AUDIT (POL-102): a token-driven MUTATION is attributable — which token, which verb, which path.
+  // Never the secret; the token's public name + prefix are the identity in the feed and the log.
+  const token = request.apiToken;
+  if (token && request.method.toUpperCase() !== "GET") {
+    activity.push("info", `API token "${token.name}" → ${request.method} ${path}`);
+    fastify.log.info(
+      { event: "api.token.use", tokenId: token.id, token: token.prefix, method: request.method, path },
+      `API token "${token.name}" called ${request.method} ${path}`,
+    );
+  }
 });
 
-registerAuthRoutes(fastify, auth, enrollment);
+registerAuthRoutes(fastify, auth, enrollment, apiTokens);
 // The remote-DevTools relay (POL-67) bridges an operator's DevTools frontend to a wall's Chrome over
 // the agent WS — the POL-59 shell pattern. Built before the WS channels (agent frames route into it)
 // and handed to REST so disarming a screen closes its live sessions instantly.

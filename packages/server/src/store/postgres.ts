@@ -30,6 +30,7 @@ import {
 
 import type {
   EnrollmentMode,
+  PersistedApiToken,
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
@@ -174,6 +175,18 @@ interface SessionRow {
   user_id: string;
   created_at: Date;
   expires_at: Date;
+}
+
+interface ApiTokenRow {
+  id: string;
+  name: string;
+  secret_hash: string;
+  prefix: string;
+  scopes: unknown; // jsonb array of scope strings
+  created_at: Date;
+  created_by: string;
+  expires_at: Date | null;
+  last_used_at: Date | null;
 }
 
 interface BootstrapRow {
@@ -357,6 +370,23 @@ export class PostgresStore implements Store {
     `;
     await sql`CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions (user_id)`;
     await sql`CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at)`;
+    // Scoped API tokens (POL-102). `secret_hash` is sha256(secret) — the same discipline as the
+    // session id and the 2b machine credential, so a database read never yields a usable token.
+    // Revocation is a DELETE; expiry is enforced at verify time (a stale row can never authorize).
+    await sql`
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id           text PRIMARY KEY,
+        name         text NOT NULL,
+        secret_hash  text UNIQUE NOT NULL,
+        prefix       text NOT NULL,
+        scopes       jsonb NOT NULL DEFAULT '[]'::jsonb,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        created_by   text NOT NULL,
+        expires_at   timestamptz,
+        last_used_at timestamptz
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS api_tokens_secret_hash_idx ON api_tokens (secret_hash)`;
     // Enrollment bootstrap (Phase 3f): a single row holding the agent enrollment mode + token,
     // seeded on first boot from POLYPTIC_BOOTSTRAP_TOKEN and mutated by the Settings "regenerate".
     await sql`
@@ -1025,6 +1055,69 @@ export class PostgresStore implements Store {
       email: row.email,
       passwordHash: row.password_hash,
       createdAt: row.created_at.toISOString(),
+    };
+  }
+
+  // ── Scoped API tokens (POL-102) ──────────────────────────────────────────────
+
+  async createApiToken(token: PersistedApiToken): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO api_tokens (id, name, secret_hash, prefix, scopes, created_at, created_by, expires_at, last_used_at)
+      VALUES (
+        ${token.id},
+        ${token.name},
+        ${token.secretHash},
+        ${token.prefix},
+        ${sql.json(token.scopes)},
+        ${new Date(token.createdAt)},
+        ${token.createdBy},
+        ${token.expiresAt ? new Date(token.expiresAt) : null},
+        ${token.lastUsedAt ? new Date(token.lastUsedAt) : null}
+      )
+    `;
+  }
+
+  async getApiTokenByHash(secretHash: string): Promise<PersistedApiToken | undefined> {
+    const sql = this.sql;
+    const rows = await sql<ApiTokenRow[]>`
+      SELECT id, name, secret_hash, prefix, scopes, created_at, created_by, expires_at, last_used_at
+      FROM api_tokens WHERE secret_hash = ${secretHash} LIMIT 1
+    `;
+    const row = rows[0];
+    return row ? this.toApiToken(row) : undefined;
+  }
+
+  async listApiTokens(): Promise<PersistedApiToken[]> {
+    const sql = this.sql;
+    const rows = await sql<ApiTokenRow[]>`
+      SELECT id, name, secret_hash, prefix, scopes, created_at, created_by, expires_at, last_used_at
+      FROM api_tokens ORDER BY created_at DESC
+    `;
+    return rows.map((row) => this.toApiToken(row));
+  }
+
+  async touchApiToken(id: string, lastUsedAt: string): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE api_tokens SET last_used_at = ${new Date(lastUsedAt)} WHERE id = ${id}`;
+  }
+
+  async deleteApiToken(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM api_tokens WHERE id = ${id}`;
+  }
+
+  private toApiToken(row: ApiTokenRow): PersistedApiToken {
+    return {
+      id: row.id,
+      name: row.name,
+      secretHash: row.secret_hash,
+      prefix: row.prefix,
+      scopes: Array.isArray(row.scopes) ? (row.scopes as string[]) : [],
+      createdAt: row.created_at.toISOString(),
+      createdBy: row.created_by,
+      expiresAt: row.expires_at ? row.expires_at.toISOString() : null,
+      lastUsedAt: row.last_used_at ? row.last_used_at.toISOString() : null,
     };
   }
 
