@@ -28,12 +28,18 @@
 import { ref, computed, reactive, onMounted, onUnmounted } from "vue";
 import type { MachineView } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
+import { useToastStore } from "../stores/toasts";
+import { useDialogStore } from "../stores/dialogs";
 import { formatLastSeen, countLabel } from "../time";
 import ScreenRow from "../components/ScreenRow.vue";
 import ColdStartWizard from "../components/ColdStartWizard.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
 
 const store = useConsoleStore();
+// POL-93 — one rail (App.vue's ToastHost) and one dialog for the whole console; this view's own
+// toast + the native confirm/prompt boxes it used to raise are gone.
+const toasts = useToastStore();
+const dialogs = useDialogStore();
 
 const pending = computed(() => store.pendingMachines);
 const approved = computed(() => store.approvedMachines);
@@ -50,7 +56,6 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (clock) clearInterval(clock);
-  window.clearTimeout(toastTimer);
 });
 
 /** "just now" while online, "rebooting…" while an operator reboot is in flight, else relative. */
@@ -64,18 +69,29 @@ function approve(m: MachineView): void {
   void store.approveMachine(m.id);
 }
 
-function reject(m: MachineView): void {
-  const reason = window.prompt(`Reject "${m.label}"? Optionally add a reason (sent to the agent):`);
+async function reject(m: MachineView): Promise<void> {
+  const reason = await dialogs.promptText({
+    title: `Reject "${m.label}"?`,
+    message:
+      "It stays listed as rejected — you can restore access later — but it shows nothing and its " +
+      "screens are not admitted. The reason, if you give one, is sent to the agent.",
+    label: "Reason (optional)",
+    placeholder: "e.g. not one of ours",
+    confirmLabel: "Reject machine",
+  });
   // Cancel (null) aborts; an empty string rejects without a reason.
   if (reason === null) return;
   void store.rejectMachine(m.id, reason);
 }
 
-function revoke(m: MachineView): void {
+async function revoke(m: MachineView): Promise<void> {
   menuFor.value = null;
-  const yes = window.confirm(
-    `Revoke "${m.label}"? Its screens go dark until it is approved again.`,
-  );
+  const yes = await dialogs.confirm({
+    title: `Revoke access for "${m.label}"?`,
+    message: "Its screens go dark until it is approved again. You can undo this from the toast.",
+    confirmLabel: "Revoke access",
+    danger: true,
+  });
   if (yes) void store.rejectMachine(m.id);
 }
 
@@ -87,14 +103,18 @@ function reapprove(m: MachineView): void {
  * Permanently forget a machine (POL-14) — deletes it, its screens, layout + content. Distinct from
  * Revoke (a remembered "rejected" state): a removed machine must be set up again to return.
  */
-function remove(m: MachineView): void {
+async function remove(m: MachineView): Promise<void> {
   menuFor.value = null;
   const n = m.screens.length;
   const what = n > 0 ? `its ${countLabel(n, "screen")} plus their layout and content` : "it";
-  const yes = window.confirm(
-    `Remove "${m.label}"? This permanently forgets the machine and deletes ${what} from the console. ` +
-      `If it reconnects it will have to be set up again.`,
-  );
+  const yes = await dialogs.confirm({
+    title: `Remove "${m.label}"?`,
+    message:
+      `This permanently forgets the machine and deletes ${what} from the console. There is no undo: ` +
+      `if it reconnects it will have to be set up again.`,
+    confirmLabel: "Remove machine",
+    danger: true,
+  });
   if (yes) void store.removeMachine(m.id);
 }
 
@@ -111,12 +131,16 @@ async function reboot(m: MachineView): Promise<void> {
   menuFor.value = null;
   const n = m.screens.length;
   const what = n > 0 ? `Its ${countLabel(n, "screen")} go dark` : "It goes dark";
-  const yes = window.confirm(
-    `Reboot "${m.label}"? ${what} until it boots back up and reconnects — about a minute.`,
-  );
+  const yes = await dialogs.confirm({
+    title: `Reboot "${m.label}"?`,
+    message: `${what} until it boots back up and reconnects — about a minute.`,
+    confirmLabel: "Reboot",
+    danger: true,
+  });
   if (!yes) return;
-  const error = await store.rebootMachine(m.id);
-  showToast(error ?? `Rebooting ${m.label}…`);
+  // A refusal (offline, not approved) toasts the server's own sentence from the store; we only get
+  // to claim it's rebooting when the box actually took the order.
+  if (await store.rebootMachine(m.id)) toasts.info(`Rebooting ${m.label}…`);
 }
 
 // ── Console lifecycle (POL-59 arm/disarm, POL-68 UI) ─────────────────────────
@@ -128,11 +152,13 @@ const enabling = reactive(new Set<string>());
 
 async function enableConsole(m: MachineView): Promise<void> {
   if (enabling.has(m.id)) return;
-  const yes = window.confirm(
-    `Enable the console on "${m.label}"? While enabled, an operator can open an unprivileged ` +
-      `terminal on this box. It cannot change what the screen displays. Sessions are logged to the ` +
-      `activity feed. Disable it when you're done.`,
-  );
+  const yes = await dialogs.confirm({
+    title: `Enable the console on "${m.label}"?`,
+    message:
+      "While enabled, an operator can open an unprivileged terminal on this box. It cannot change " +
+      "what the screen displays. Sessions are logged to the activity feed. Disable it when you're done.",
+    confirmLabel: "Enable console",
+  });
   if (!yes) return;
   enabling.add(m.id);
   try {
@@ -178,14 +204,6 @@ function shellArmedHint(m: MachineView): string {
   if (!m.shellArmedAt) return "The console is enabled on this box";
   const mins = Math.round((now.value - new Date(m.shellArmedAt).getTime()) / 60000);
   return `Console enabled ${mins < 1 ? "just now" : `${mins} min ago`} — auto-disables when idle`;
-}
-
-const toast = ref("");
-let toastTimer: number | undefined;
-function showToast(message: string): void {
-  window.clearTimeout(toastTimer);
-  toast.value = message;
-  toastTimer = window.setTimeout(() => (toast.value = ""), 2600);
 }
 </script>
 
@@ -384,7 +402,7 @@ function showToast(message: string): void {
                   :machine-label="m.label"
                   :machine-online="m.online"
                   :browser="m.browser"
-                  @notify="showToast"
+                  @notify="(message: string) => toasts.error(message)"
                 />
               </div>
               <div v-else class="no-screens">
@@ -433,10 +451,6 @@ function showToast(message: string): void {
       :machine-label="terminalFor.label"
       @close="terminalFor = null"
     />
-
-    <Transition name="toast">
-      <div v-if="toast" class="toast">{{ toast }}</div>
-    </Transition>
   </div>
 </template>
 
@@ -929,28 +943,5 @@ function showToast(message: string): void {
   color: var(--muted2);
 }
 
-/* toast (reboot feedback) */
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 26px;
-  transform: translateX(-50%);
-  background: var(--primary);
-  color: var(--primary-fg);
-  font-size: 12.5px;
-  font-weight: 500;
-  padding: 10px 16px;
-  border-radius: 9px;
-  box-shadow: var(--shadow-lg);
-  z-index: 70;
-}
-.toast-enter-active,
-.toast-leave-active {
-  transition: opacity 0.22s ease, transform 0.22s ease;
-}
-.toast-enter-from,
-.toast-leave-to {
-  opacity: 0;
-  transform: translate(-50%, 8px);
-}
+/* Reboot / inspector feedback now lives in the app-wide toast rail (POL-93, App.vue). */
 </style>

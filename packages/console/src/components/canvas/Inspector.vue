@@ -22,8 +22,10 @@
   All reads/writes go through the Pinia store; ident uses the shared composable.
 -->
 <script setup lang="ts">
-import { ref, computed, watch, onUnmounted } from "vue";
+import { ref, computed, watch } from "vue";
 import { useConsoleStore } from "../../stores/console";
+import { useToastStore } from "../../stores/toasts";
+import { useDialogStore } from "../../stores/dialogs";
 import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
 import { devtoolsUrl } from "../../api";
@@ -31,6 +33,8 @@ import { useScreenInspect, type InspectTarget } from "../useInspect";
 import ZoomControl from "./ZoomControl.vue";
 
 const store = useConsoleStore();
+const toasts = useToastStore();
+const dialogs = useDialogStore();
 const { ident, identMany, flash, isIdenting } = useIdent();
 
 // The content library, for the "Assign from library" pickers (single screen + combined surface).
@@ -202,17 +206,9 @@ const machineName = computed(() => {
 // on-panel Web Inspector (confirmed first — it shows ON the glass and reloads the page). Offline
 // machines leave the item disabled with the explanatory tooltip.
 const menuOpen = ref(false);
-// Refusals/timeouts surface as a transient inline notice — the Wall view has no toast rail.
-const notice = ref("");
-let noticeTimer: ReturnType<typeof setTimeout> | null = null;
-function showNotice(message: string): void {
-  notice.value = message;
-  if (noticeTimer) clearTimeout(noticeTimer);
-  noticeTimer = setTimeout(() => (notice.value = ""), 5000);
-}
-onUnmounted(() => {
-  if (noticeTimer) clearTimeout(noticeTimer);
-});
+// Refusals/timeouts used to land in a transient inline notice here, because the Wall view had no
+// toast rail. POL-93 gave the whole console one rail (App.vue), so they go where every other
+// failure goes — the operator reads them in the same place, in the same words.
 
 const inspectTarget = computed<InspectTarget | undefined>(() => {
   const s = single.value;
@@ -235,7 +231,13 @@ const {
 } = useScreenInspect(inspectTarget, {
   inspect: (id, on) => store.inspectScreen(id, on),
   devtoolsUrl,
-  notify: showNotice,
+  notify: (message) => toasts.error(message),
+  confirm: (message) =>
+    dialogs.confirm({
+      title: `Open the Web Inspector on "${single.value?.friendlyName ?? "this screen"}"?`,
+      message,
+      confirmLabel: "Open on the panel",
+    }),
 });
 const inspectItemLabel = computed(() => {
   if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
@@ -246,13 +248,12 @@ function launchInspect(): void {
   menuOpen.value = false;
   void toggleInspect();
 }
-// Close the menu (and drop any stale notice) when the selection moves to a different screen —
-// keyed on the id, NOT the object, which is fresh on every broadcast.
+// Close the menu when the selection moves to a different screen — keyed on the id, NOT the object,
+// which is fresh on every broadcast.
 watch(
   () => single.value?.id,
   () => {
     menuOpen.value = false;
-    notice.value = "";
   },
 );
 
@@ -426,9 +427,6 @@ function selectOne(id: string) {
           </template>
         </div>
       </div>
-
-      <!-- transient notice (inspector refusals/timeouts — nobody is standing at that screen) -->
-      <div v-if="notice" class="notice">{{ notice }}</div>
 
       <!-- Live preview — mirrors the screen's canvas state, status chip overlaid top-left. -->
       <div class="preview" :class="previewState">
@@ -656,18 +654,6 @@ function selectOne(id: string) {
     opacity: 1;
     transform: none;
   }
-}
-
-/* transient inline notice (inspector refusals/timeouts) */
-.notice {
-  margin-bottom: 10px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  background: var(--warn-soft);
-  color: var(--warn);
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.5;
 }
 
 .dot {

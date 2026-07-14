@@ -25,8 +25,9 @@
  *     pending silently — whatever was in flight belonged to the old screen, whose ack will land in
  *     admin/state regardless.
  *
- * Transport is injected (`inspect` = the store action, `devtoolsUrl` = the api helper) so the state
- * machine is testable without a Pinia instance or a browser; window.open/confirm default in.
+ * Transport is injected (`inspect` = the store action, `devtoolsUrl` = the api helper, `confirm` = the
+ * console's in-app dialog since POL-93) so the state machine is testable without a Pinia instance or
+ * a browser; only window.open defaults in.
  */
 import { computed, onScopeDispose, ref, watch, type Ref } from "vue";
 import type { KioskBrowser, ScreenView } from "@polyptic/protocol";
@@ -48,9 +49,14 @@ export interface InspectDeps {
   devtoolsUrl: (screenId: string) => string;
   /** Where refusals/timeouts surface (a toast on Machines, the inline notice in the Inspector). */
   notify: (message: string) => void;
-  /** Test seams; default window.open(url, "_blank", "noopener") / window.confirm. */
+  /** Test seam; defaults to window.open(url, "_blank", "noopener"). */
   openTab?: (url: string) => void;
-  confirm?: (message: string) => boolean;
+  /**
+   * Ask before the on-panel inspector (surf) — it appears ON the glass and reloads the page. Injected
+   * rather than defaulted to `window.confirm`: since POL-93 the console asks with its own dialog
+   * (which is async, hence the awaited return), and the native box is gone from the codebase.
+   */
+  confirm: (message: string) => boolean | Promise<boolean>;
   /** How long to wait for the agent's ack before giving up (surf relaunches the browser, so its
    *  ack takes a few seconds; chrome acks near-instantly). */
   timeoutMs?: number;
@@ -63,7 +69,6 @@ export function useScreenInspect(target: Ref<InspectTarget | undefined>, deps: I
     ((url: string) => {
       window.open(url, "_blank", "noopener");
     });
-  const confirmAsk = deps.confirm ?? ((message: string) => window.confirm(message));
 
   const pending = ref(false);
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -130,12 +135,12 @@ export function useScreenInspect(target: Ref<InspectTarget | undefined>, deps: I
       // the tab and the handshake race safely.
       openTab(deps.devtoolsUrl(t.screen.id));
     } else if (!isChrome.value && on) {
-      const yes = confirmAsk(
-        `Open the Web Inspector on "${t.screen.friendlyName}"?\n\n` +
-          `It appears ON that panel, so anyone looking at the screen will see it, and the page reloads ` +
+      const yes = await deps.confirm(
+        `It appears ON that panel, so anyone looking at the screen will see it, and the page reloads ` +
           `so the inspector captures the whole load.`,
       );
-      if (!yes) return;
+      // The operator may have moved on while the dialog was up — re-check before arming.
+      if (!yes || target.value?.screen.id !== t.screen.id || pending.value) return;
     }
 
     pending.value = true;

@@ -26,6 +26,7 @@ import { ref, computed, watch, onUnmounted } from "vue";
 import type { KioskBrowser, ScreenView } from "@polyptic/protocol";
 import { devtoolsUrl } from "../api";
 import { useConsoleStore } from "../stores/console";
+import { useDialogStore } from "../stores/dialogs";
 import { useScreenThumbnail } from "./canvas/useThumbnails";
 import { useScreenInspect, type InspectTarget } from "./useInspect";
 
@@ -41,6 +42,7 @@ const props = defineProps<{
 const emit = defineEmits<{ notify: [message: string] }>();
 
 const store = useConsoleStore();
+const dialogs = useDialogStore();
 
 // Live preview of what's actually on this panel, refreshed on a throttle by the shared manager and
 // paused automatically while the screen is offline (falls back to the neutral placeholder tile).
@@ -105,6 +107,13 @@ const {
   inspect: (id, on) => store.inspectScreen(id, on),
   devtoolsUrl,
   notify: (message) => emit("notify", message),
+  // POL-93 — the surf path's "this shows ON the glass" warning is now an in-app dialog.
+  confirm: (message) =>
+    dialogs.confirm({
+      title: `Open the Web Inspector on "${props.screen.friendlyName}"?`,
+      message,
+      confirmLabel: "Open on the panel",
+    }),
 });
 const inspectLabel = computed(() => {
   if (inspectPending.value) return inspecting.value ? "Closing…" : "Opening…";
@@ -118,12 +127,16 @@ onUnmounted(() => {
 
 // Permanently forget this screen (POL-14) — deletes it, its placement + content. Aimed at stale
 // screens (an output the machine no longer drives); a still-reported output reappears on reconnect.
-function remove(): void {
-  const yes = window.confirm(
-    `Remove screen "${props.screen.friendlyName}"? This permanently deletes it, its placement and ` +
-      `content from the console. If its machine still drives this output, the screen reappears when the ` +
-      `machine next reconnects.`,
-  );
+async function remove(): Promise<void> {
+  const yes = await dialogs.confirm({
+    title: `Remove screen "${props.screen.friendlyName}"?`,
+    message:
+      "This permanently deletes it, its placement and its content from the console. If its machine " +
+      "still drives this output, the screen reappears — as a new, unplaced screen — when the machine " +
+      "next reconnects.",
+    confirmLabel: "Remove screen",
+    danger: true,
+  });
   if (yes) void store.removeScreen(props.screen.id);
 }
 </script>

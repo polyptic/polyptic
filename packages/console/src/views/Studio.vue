@@ -32,9 +32,11 @@ import type {
 } from "@polyptic/protocol";
 import { ELEMENT_LIBRARY, PageElementView, defaultElement, libraryEntry } from "@polyptic/elements";
 import { useConsoleStore } from "../stores/console";
+import { useDialogStore } from "../stores/dialogs";
 import { kindLabel } from "../content";
 
 const store = useConsoleStore();
+const dialogs = useDialogStore();
 const route = useRoute();
 const router = useRouter();
 
@@ -154,8 +156,16 @@ async function save() {
   }
 }
 
-function goBack() {
-  if (dirty.value && !window.confirm("Leave the Studio? Unsaved changes will be discarded.")) return;
+async function goBack() {
+  if (dirty.value) {
+    const yes = await dialogs.confirm({
+      title: "Leave the Studio?",
+      message: "This page has unsaved changes. They will be discarded.",
+      confirmLabel: "Discard changes",
+      danger: true,
+    });
+    if (!yes) return;
+  }
   void router.push({ name: "content" });
 }
 

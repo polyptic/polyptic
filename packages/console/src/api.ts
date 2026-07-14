@@ -73,6 +73,31 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The operator-readable REASON a request failed (POL-93) — the sentence a toast shows under "what
+ * failed". The server's REST layer answers `{ error: string }` and those sentences are written for
+ * a human ("wall-1 is offline — nothing to reboot"), so they are ALWAYS preferred; an ApiError's own
+ * `message` is just method/path/status and is no use to anybody. Falls back to the status (a bare
+ * 500 with no body still deserves to be named) and then to the transport error (the control plane is
+ * unreachable). Returns undefined only when there is genuinely nothing to say.
+ */
+export function errorReason(err: unknown): string | undefined {
+  if (err instanceof ApiError) {
+    const payload = err.payload as { error?: unknown } | undefined;
+    if (payload && typeof payload.error === "string" && payload.error.trim()) {
+      return payload.error;
+    }
+    if (err.status === 0) return "The control plane could not be reached.";
+    if (err.status === 401) return "Your session has expired — sign in again.";
+    if (err.status === 403) return "You are not allowed to do that.";
+    if (err.status === 404) return "The server no longer knows about that.";
+    return `The server refused it (HTTP ${err.status}).`;
+  }
+  if (err instanceof TypeError) return "The control plane could not be reached.";
+  if (err instanceof Error && err.message.trim()) return err.message;
+  return undefined;
+}
+
 /** Per-request transport knobs. */
 export interface SendOptions {
   /**

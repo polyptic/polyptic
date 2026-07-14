@@ -22,9 +22,13 @@ import type {
   UpdateCredentialProfileBody,
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
+import { useDialogStore } from "../stores/dialogs";
+import { useToastStore } from "../stores/toasts";
 import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
 
 const store = useConsoleStore();
+const dialogs = useDialogStore();
+const toasts = useToastStore();
 const router = useRouter();
 
 // ── pages (POL-42) ────────────────────────────────────────────────────────────
@@ -119,9 +123,14 @@ async function save() {
 }
 
 async function remove(s: ContentSource) {
-  const yes = window.confirm(
-    `Delete "${s.name}"? Any screen or video wall currently showing it will be cleared.`,
-  );
+  const yes = await dialogs.confirm({
+    title: `Delete "${s.name}"?`,
+    message:
+      "Any screen or video wall currently showing it is cleared. Undo puts the source back in the " +
+      "library, but not back on those screens.",
+    confirmLabel: "Delete source",
+    danger: true,
+  });
   if (yes) await store.deleteSource(s.id);
 }
 
@@ -241,17 +250,28 @@ async function saveProfile() {
 
 async function removeProfile(p: CredentialProfileView) {
   if (p.inUseBy > 0) {
-    window.alert(
-      `"${p.name}" authenticates ${p.inUseBy} content source${p.inUseBy === 1 ? "" : "s"}. ` +
-        `Reassign or remove their authentication first.`,
-    );
+    toasts.error(`"${p.name}" is still in use`, {
+      detail:
+        `It authenticates ${p.inUseBy} content source${p.inUseBy === 1 ? "" : "s"} — reassign or ` +
+        `remove their authentication first.`,
+    });
     return;
   }
-  const yes = window.confirm(`Delete credential profile "${p.name}"?`);
+  const yes = await dialogs.confirm({
+    title: `Delete the credential profile "${p.name}"?`,
+    message:
+      "Its client secret is held only by the server and is deleted with it. There is no undo — " +
+      "restoring the profile means entering the secret again.",
+    confirmLabel: "Delete profile",
+    danger: true,
+  });
   if (!yes) return;
+  // The server has the last word: it refuses (409) if a source grabbed the profile since we looked.
   const result = await store.deleteProfile(p.id);
   if (result === "in-use") {
-    window.alert(`"${p.name}" is in use by one or more content sources — reassign them first.`);
+    toasts.error(`"${p.name}" is still in use`, {
+      detail: "One or more content sources authenticate with it — reassign them first.",
+    });
   }
 }
 

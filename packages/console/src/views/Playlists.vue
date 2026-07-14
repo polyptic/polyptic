@@ -12,9 +12,11 @@ import { ref, computed } from "vue";
 import { CreateContentSourceBody } from "@polyptic/protocol";
 import type { ContentKind, ContentSource } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
+import { useDialogStore } from "../stores/dialogs";
 import { kindGlyph, kindColorVar } from "../content";
 
 const store = useConsoleStore();
+const dialogs = useDialogStore();
 
 const playlists = computed(() => store.sources.filter((s) => s.kind === "playlist"));
 
@@ -149,9 +151,14 @@ async function save() {
 }
 
 async function remove(p: ContentSource) {
-  const yes = window.confirm(
-    `Delete "${p.name}"? Any screen or video wall currently showing it will be cleared.`,
-  );
+  const yes = await dialogs.confirm({
+    title: `Delete "${p.name}"?`,
+    message:
+      "Any screen or video wall currently showing it is cleared. Undo puts the playlist back in the " +
+      "library, but not back on those screens.",
+    confirmLabel: "Delete playlist",
+    danger: true,
+  });
   if (yes) await store.deleteSource(p.id);
 }
 </script>

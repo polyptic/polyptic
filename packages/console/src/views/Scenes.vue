@@ -18,8 +18,10 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useConsoleStore } from "../stores/console";
+import { useDialogStore } from "../stores/dialogs";
 
 const store = useConsoleStore();
+const dialogs = useDialogStore();
 
 const activeMural = computed(() => store.activeMural);
 const scenes = computed(() => store.activeMuralScenes);
@@ -61,7 +63,14 @@ function apply(id: string) {
 }
 async function remove(id: string) {
   const scene = store.sceneById(id);
-  const yes = window.confirm(`Delete scene "${scene?.name ?? id}"? This can't be undone.`);
+  const yes = await dialogs.confirm({
+    title: `Delete the scene "${scene?.name ?? id}"?`,
+    message:
+      "The wall it captured is not affected — but the snapshot itself is gone, and it cannot be " +
+      "rebuilt from the wall as it is now. There is no undo.",
+    confirmLabel: "Delete scene",
+    danger: true,
+  });
   if (yes) await store.deleteScene(id);
 }
 </script>

@@ -4,8 +4,11 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import * as auth from "../auth";
+import { errorReason } from "../api";
 import Toggle from "../components/Toggle.vue";
 import { useConsoleStore } from "../stores/console";
+import { useDialogStore } from "../stores/dialogs";
+import { useToastStore } from "../stores/toasts";
 import { formatRelativeShort } from "../time";
 
 // Settings (POL-45): one card per concern. "Onboard Screens" is the fleet's front door — the
@@ -13,6 +16,8 @@ import { formatRelativeShort } from "../time";
 // force-deploys them. "Update schedule" owns when new images are cut; the rollout window explains
 // when boxes take them.
 const store = useConsoleStore();
+const dialogs = useDialogStore();
+const toasts = useToastStore();
 const router = useRouter();
 
 onMounted(() => {
@@ -32,22 +37,21 @@ function onKeydown(e: KeyboardEvent): void {
   else if (rowMenu.value) rowMenu.value = null;
 }
 
-// ── Toast ──────────────────────────────────────────────────────────────────────
-const toast = ref("");
-let toastTimer: number | undefined;
-function showToast(message: string): void {
-  window.clearTimeout(toastTimer);
-  toast.value = message;
-  toastTimer = window.setTimeout(() => (toast.value = ""), 1900);
+// ── Feedback (POL-93) ──────────────────────────────────────────────────────────
+// This view's private toast is gone: it speaks through the app-wide rail (App.vue's ToastHost) like
+// everything else, and a failure names the server's reason rather than "Could not …".
+function failed(what: string, err: unknown): void {
+  console.error(`[console] ${what}`, err);
+  toasts.error(what, { detail: errorReason(err) });
 }
 
 async function copy(text: string, message: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
-    showToast(message);
+    toasts.success(message);
   } catch {
     // Clipboard is unavailable outside a secure context — Copy is a best-effort convenience.
-    showToast("Copy failed — clipboard unavailable");
+    toasts.error("Copy failed", { detail: "The clipboard is unavailable outside a secure context." });
   }
 }
 
@@ -76,13 +80,19 @@ const regenerating = ref(false);
 
 async function regenerate(): Promise<void> {
   if (regenerating.value) return;
-  if (!window.confirm("Regenerate the enrolment token? Machines still using the old token can no longer dial in.")) {
-    return;
-  }
+  const yes = await dialogs.confirm({
+    title: "Regenerate the enrolment token?",
+    message:
+      "Machines still holding the old token can no longer dial in, and any boot medium written with " +
+      "it stops enrolling. Existing approved machines are unaffected.",
+    confirmLabel: "Regenerate token",
+    danger: true,
+  });
+  if (!yes) return;
   regenerating.value = true;
-  await store.regenerateEnrollment();
+  // A failure toasts the server's reason from the store; only claim success when it landed.
+  if (await store.regenerateEnrollment()) toasts.success("New enrolment token generated");
   regenerating.value = false;
-  showToast("New enrolment token generated");
 }
 
 // ── HTTPS (POL-70/D89) ─────────────────────────────────────────────────────────
@@ -98,7 +108,7 @@ async function loadHttps(): Promise<void> {
   try {
     https.value = await auth.getHttpsInfo();
   } catch (err) {
-    console.error("[console] loadHttps failed", err);
+    failed("Couldn't load the HTTPS settings", err);
   }
 }
 
@@ -113,10 +123,9 @@ async function downloadCa(): Promise<void> {
     a.download = "polyptic-ca.crt";
     a.click();
     URL.revokeObjectURL(url);
-    showToast("CA certificate downloaded");
+    toasts.success("CA certificate downloaded");
   } catch (err) {
-    console.error("[console] CA download failed", err);
-    showToast("Download failed");
+    failed("Couldn't download the CA certificate", err);
   } finally {
     caDownloading.value = false;
   }
@@ -134,10 +143,9 @@ async function rebuildNow(kind: "refresh" | "full"): Promise<void> {
   imgSaving.value = true;
   try {
     store.imageUpdates = await auth.rebuildImageNow(kind);
-    showToast(kind === "full" ? "Full rebuild queued" : "Build update queued");
+    toasts.success(kind === "full" ? "Full rebuild queued" : "Build update queued");
   } catch (err) {
-    console.error("[console] rebuild trigger failed", err);
-    showToast("Could not start the rebuild");
+    failed("Couldn't start the rebuild", err);
   } finally {
     imgSaving.value = false;
   }
@@ -146,17 +154,22 @@ async function rebuildNow(kind: "refresh" | "full"): Promise<void> {
 /** The urgent switch, framed as what it does: skip the nightly window and reboot the fleet now. */
 async function setUrgent(urgent: boolean): Promise<void> {
   menuOpen.value = false;
-  if (
-    urgent &&
-    !window.confirm(
-      "Deploy the latest image to the whole fleet now? Every netbooted box on a different image reboots within minutes.",
-    )
-  ) {
-    return;
+  if (urgent) {
+    const yes = await dialogs.confirm({
+      title: "Deploy the latest image to the whole fleet now?",
+      message:
+        "Every netbooted box on a different image reboots within minutes — screens go dark while " +
+        "they come back up. Turning this off again stops further reboots.",
+      confirmLabel: "Deploy now",
+      danger: true,
+    });
+    if (!yes) return;
   }
   await applyImageSettings({ urgent });
   if (store.imageUpdates?.urgent === urgent) {
-    showToast(urgent ? "Deploying latest to fleet — boxes reboot within minutes" : "Immediate deployment stopped");
+    toasts.success(
+      urgent ? "Deploying latest to fleet — boxes reboot within minutes" : "Immediate deployment stopped",
+    );
   }
 }
 
@@ -223,20 +236,19 @@ const rowKey = (b: ImageBuild): string => `${b.arch}-${b.imageId}`;
 async function activate(build: ImageBuild): Promise<void> {
   rowMenu.value = null;
   if (activating.value || build.active) return;
-  if (
-    !window.confirm(
-      `Serve ${formatImageId(build.imageId)} (${build.arch}) to the fleet? Boxes on a different image will reboot into it.`,
-    )
-  ) {
-    return;
-  }
+  const yes = await dialogs.confirm({
+    title: `Serve ${formatImageId(build.imageId)} (${build.arch}) to the fleet?`,
+    message: "Boxes on a different image reboot into it — their screens go dark until they are back.",
+    confirmLabel: "Serve this build",
+    danger: true,
+  });
+  if (!yes) return;
   activating.value = build.imageId;
   try {
     store.imageUpdates = await auth.activateImage(build.arch, build.imageId);
-    showToast(`Now serving ${build.arch} · ${build.imageId.split("-").pop()}`);
+    toasts.success(`Now serving ${build.arch} · ${build.imageId.split("-").pop()}`);
   } catch (err) {
-    console.error("[console] activate failed", err);
-    showToast("Could not activate that build");
+    failed("Couldn't activate that build", err);
   } finally {
     activating.value = null;
   }
@@ -258,8 +270,7 @@ async function applyImageSettings(patch: {
   try {
     store.imageUpdates = await auth.updateImageSettings(patch);
   } catch (err) {
-    console.error("[console] image settings update failed", err);
-    showToast("Could not save image settings");
+    failed("Couldn't save the image settings", err);
   } finally {
     imgSaving.value = false;
   }
@@ -995,9 +1006,6 @@ async function onSignOut(): Promise<void> {
       </div>
     </Transition>
 
-    <Transition name="toast">
-      <div v-if="toast" class="toast">{{ toast }}</div>
-    </Transition>
   </div>
 </template>
 
@@ -1913,28 +1921,5 @@ async function onSignOut(): Promise<void> {
   opacity: 0;
 }
 
-/* ── Toast ─────────────────────────────────────────────────────────────────── */
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 26px;
-  transform: translateX(-50%);
-  background: var(--primary);
-  color: var(--primary-fg);
-  font-size: 12.5px;
-  font-weight: 500;
-  padding: 10px 16px;
-  border-radius: 9px;
-  box-shadow: var(--shadow-lg);
-  z-index: 70;
-}
-.toast-enter-active,
-.toast-leave-active {
-  transition: opacity 0.22s ease, transform 0.22s ease;
-}
-.toast-enter-from,
-.toast-leave-to {
-  opacity: 0;
-  transform: translate(-50%, 8px);
-}
+/* Feedback lives in the app-wide toast rail (POL-93, App.vue). */
 </style>

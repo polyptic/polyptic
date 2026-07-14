@@ -7,6 +7,14 @@
  * out through `src/api.ts` (REST) and are reflected optimistically for a snappy feel — the server's
  * coalesced `admin/state` broadcast is always authoritative and overwrites local state on arrival.
  *
+ * POL-93 closed the gap in that sentence. An optimistic patch whose REST call was REFUSED used to be
+ * logged to `console.error` and left on screen until a later broadcast quietly took it away: the UI
+ * lied, then un-lied, and never said why. Now every action that can fail (a) rolls its optimistic
+ * patch back VISIBLY and immediately, and (b) surfaces the server's own sentence in a toast (see
+ * `stores/toasts.ts`). Where a true inverse exists — a rename, an unplace, a content swap, a deleted
+ * source — the toast carries an Undo that simply calls it (`src/undo.ts`). Where one doesn't, it
+ * says what happened and offers nothing (D90).
+ *
  * The wall view (owned by console-wall) reads exclusively through this store's getters/actions.
  */
 import { defineStore } from "pinia";
@@ -39,6 +47,8 @@ import type {
 
 import * as api from "../api";
 import * as auth from "../auth";
+import { useToastStore, type ToastAction } from "./toasts";
+import { previousAssignment, previousName, recreateSourceBody, restorePlacementBody } from "../undo";
 
 /** Assigning content takes EITHER a library source by id OR an ad-hoc URL — exactly one (the
  *  contract's SetContentBody refinement). The ad-hoc URL path is the Phase-3b behaviour. */
@@ -91,6 +101,22 @@ function normalizeAssignment(content: ContentAssignment): ContentAssignment | nu
   }
   const trimmed = content.url.trim();
   return trimmed ? { url: trimmed } : null;
+}
+
+/**
+ * Say a mutation FAILED, and why (POL-93). Every store action that reaches the server routes its
+ * catch through here: the operator sees what didn't happen and the server's own sentence for why,
+ * rather than a `console.error` nobody has open and an optimistic patch that quietly reverts on the
+ * next broadcast. The console log line stays — it's still the place a stack trace belongs.
+ */
+function reportFailure(what: string, err: unknown): void {
+  console.error(`[console] ${what}`, err);
+  useToastStore().error(what, { detail: api.errorReason(err) });
+}
+
+/** Say a mutation LANDED, optionally offering the inverse call as an Undo (see src/undo.ts). */
+function reportSuccess(what: string, undo?: ToastAction | null): void {
+  useToastStore().success(what, { action: undo ?? undefined });
 }
 
 function initialTheme(): "light" | "dark" {
@@ -263,6 +289,12 @@ export const useConsoleStore = defineStore("console", {
 
     screenById(): (id: string) => ScreenView | undefined {
       return (id: string) => this.screens.find((s) => s.id === id);
+    },
+
+    /** The screen's operator-facing name, for the sentences in toasts (POL-93). Falls back rather
+     *  than saying nothing when the screen has already been pruned from local state. */
+    screenName(): (id: string) => string {
+      return (id: string) => this.screens.find((s) => s.id === id)?.friendlyName ?? "that screen";
     },
 
     placementForScreen(): (screenId: string) => Placement | undefined {
@@ -510,10 +542,14 @@ export const useConsoleStore = defineStore("console", {
      * authenticated channel lingers. Best-effort — a failed logout call still clears local state.
      */
     async logout(): Promise<void> {
+      // Nothing from the old session should linger over the sign-in screen — clear FIRST, so a
+      // failing logout still gets to say so.
+      useToastStore().clear();
       try {
         await auth.logout();
       } catch (err) {
-        console.error("[console] logout failed", err);
+        // Local state is cleared regardless, but a server session that did NOT die is worth saying.
+        reportFailure("Couldn't end the session on the server", err);
       }
       this.markSignedOut();
     },
@@ -541,7 +577,7 @@ export const useConsoleStore = defineStore("console", {
       try {
         this.enrollment = await auth.getEnrollment();
       } catch (err) {
-        console.error("[console] fetchEnrollment failed", err);
+        reportFailure("Couldn't load the enrolment token", err);
       }
     },
 
@@ -551,7 +587,7 @@ export const useConsoleStore = defineStore("console", {
         this.enrollment = await auth.regenerateEnrollment();
         return true;
       } catch (err) {
-        console.error("[console] regenerateEnrollment failed", err);
+        reportFailure("Couldn't regenerate the enrolment token", err);
         return false;
       }
     },
@@ -561,7 +597,7 @@ export const useConsoleStore = defineStore("console", {
       try {
         this.imageUpdates = await auth.getImageUpdates();
       } catch (err) {
-        console.error("[console] fetchImageUpdates failed", err);
+        reportFailure("Couldn't load the image-update settings", err);
       }
     },
 
@@ -570,7 +606,7 @@ export const useConsoleStore = defineStore("console", {
       try {
         this.netboot = await auth.getNetboot();
       } catch (err) {
-        console.error("[console] fetchNetboot failed", err);
+        reportFailure("Couldn't load the network-boot settings", err);
       }
     },
 
@@ -582,20 +618,24 @@ export const useConsoleStore = defineStore("console", {
       try {
         this.settings = await auth.getDisplaySettings();
       } catch (err) {
-        console.error("[console] fetchDisplaySettings failed", err);
+        reportFailure("Couldn't load the display settings", err);
       }
     },
 
     /** Flip on-screen badges fleet-wide. Optimistic (snappy toggle); the authoritative admin/state
-     *  broadcast reconciles. Reverts the optimistic value and rethrows on failure so the UI can react. */
+     *  broadcast reconciles. Reverts the optimistic value — visibly, and with the server's reason —
+     *  and rethrows so the calling switch can settle. */
     async setShowBadges(showBadges: boolean): Promise<void> {
       const previous = this.settings;
       this.settings = { showBadges };
       try {
         this.settings = await auth.updateDisplaySettings(showBadges);
       } catch (err) {
-        this.settings = previous;
-        console.error("[console] setShowBadges failed", err);
+        this.settings = previous; // the switch springs back, and now the operator knows why
+        reportFailure(
+          showBadges ? "Couldn't turn on-screen badges on" : "Couldn't turn on-screen badges off",
+          err,
+        );
         throw err;
       }
     },
@@ -777,11 +817,14 @@ export const useConsoleStore = defineStore("console", {
      */
     async approveMachine(id: string): Promise<void> {
       const machine = this.machines.find((m) => m.id === id);
+      const previous = machine?.status;
+      const label = machine?.label ?? "that machine";
       if (machine) machine.status = "approved"; // optimistic
       try {
         await api.approveMachine(id);
       } catch (err) {
-        console.error("[console] approveMachine failed", err);
+        if (machine && previous) machine.status = previous; // roll the card back where it came from
+        reportFailure(`Couldn't approve ${label}`, err);
       }
     },
 
@@ -789,23 +832,42 @@ export const useConsoleStore = defineStore("console", {
      * Reject a pending machine, or revoke an already-approved one (same endpoint). Optimistically
      * marks it `rejected`; the server clears its screens and re-broadcasts. The optional reason is
      * advisory and only sent when provided.
+     *
+     * REVOKING an approved machine has a true inverse (approve it again, which re-admits exactly the
+     * screens the server just parked), so that path — and only that path — carries an Undo. Rejecting
+     * a PENDING machine does not: approving it would admit a box the operator just refused, which is
+     * the opposite of what "undo" means here.
      */
     async rejectMachine(id: string, reason?: string): Promise<void> {
       const machine = this.machines.find((m) => m.id === id);
+      const previous = machine?.status;
+      const label = machine?.label ?? "that machine";
+      const wasApproved = previous === "approved";
       if (machine) machine.status = "rejected"; // optimistic
       try {
         await api.rejectMachine(id, reason);
+        if (wasApproved) {
+          reportSuccess(`Revoked access for ${label}`, {
+            label: "Undo",
+            run: () => this.approveMachine(id),
+          });
+        }
       } catch (err) {
-        console.error("[console] rejectMachine failed", err);
+        if (machine && previous) machine.status = previous;
+        reportFailure(
+          wasApproved ? `Couldn't revoke ${label}` : `Couldn't reject ${label}`,
+          err,
+        );
       }
     },
 
     /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box. */
     async identMachine(id: string): Promise<void> {
+      const label = this.machines.find((m) => m.id === id)?.label ?? "that machine";
       try {
         await api.identMachine(id, { on: true, ttlMs: 3000 });
       } catch (err) {
-        console.error("[console] identMachine failed", err);
+        reportFailure(`Couldn't flash the screens on ${label}`, err);
       }
     },
 
@@ -816,12 +878,18 @@ export const useConsoleStore = defineStore("console", {
      */
     async setMachineShell(id: string, enabled: boolean): Promise<void> {
       const machine = this.machines.find((m) => m.id === id);
+      const label = machine?.label ?? "that machine";
       if (machine) machine.shellEnabled = enabled; // optimistic
       try {
         await api.setMachineShell(id, enabled);
       } catch (err) {
         if (machine) machine.shellEnabled = !enabled; // revert
-        console.error("[console] setMachineShell failed", err);
+        reportFailure(
+          enabled
+            ? `Couldn't enable the console on ${label}`
+            : `Couldn't disable the console on ${label}`,
+          err,
+        );
       }
     },
 
@@ -840,22 +908,18 @@ export const useConsoleStore = defineStore("console", {
 
     /**
      * Power-cycle one box (POL-55). There is nothing to update optimistically — the machine goes
-     * offline of its own accord a moment later and the admin/state broadcast reflects it. Returns an
-     * operator-readable error when the server refused (offline, or not approved), else null.
+     * offline of its own accord a moment later and the admin/state broadcast reflects it. A refusal
+     * (offline, not approved) toasts the server's own sentence; the boolean lets the caller say
+     * "Rebooting …" only when the box actually took it.
      */
-    async rebootMachine(id: string): Promise<string | null> {
+    async rebootMachine(id: string): Promise<boolean> {
+      const label = this.machines.find((m) => m.id === id)?.label ?? "that machine";
       try {
         await api.rebootMachine(id);
-        return null;
+        return true;
       } catch (err) {
-        console.error("[console] rebootMachine failed", err);
-        // The server's 409s explain themselves ("… is offline — nothing to reboot"); ApiError.message
-        // is only the method/path/status, so prefer the payload's own sentence when there is one.
-        const detail =
-          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
-            ? (err.payload as { error: string }).error
-            : null;
-        return detail ?? "Reboot failed — the control plane could not reach that machine.";
+        reportFailure(`Couldn't reboot ${label}`, err);
+        return false;
       }
     },
 
@@ -867,7 +931,16 @@ export const useConsoleStore = defineStore("console", {
      */
     async removeMachine(id: string): Promise<void> {
       const machine = this.machines.find((m) => m.id === id);
+      const label = machine?.label ?? "that machine";
       const screenIds = new Set(machine?.screens.map((s) => s.id) ?? []);
+      // Everything the optimistic prune is about to throw away, so a refusal can put it back.
+      const before = {
+        machines: this.machines,
+        placements: this.placements,
+        videoWalls: this.videoWalls,
+        selectedScreenIds: this.selectedScreenIds,
+        selectedWallId: this.selectedWallId,
+      };
       // optimistic prune — machine, its placements, any wall touching its screens, and selection
       this.machines = this.machines.filter((m) => m.id !== id);
       this.placements = this.placements.filter((p) => !screenIds.has(p.screenId));
@@ -880,8 +953,15 @@ export const useConsoleStore = defineStore("console", {
       }
       try {
         await api.deleteMachine(id);
+        // No Undo: the credential is gone with it — the box has to enrol again to come back.
+        reportSuccess(`Removed ${label}`);
       } catch (err) {
-        console.error("[console] removeMachine failed", err);
+        this.machines = before.machines;
+        this.placements = before.placements;
+        this.videoWalls = before.videoWalls;
+        this.selectedScreenIds = before.selectedScreenIds;
+        this.selectedWallId = before.selectedWallId;
+        reportFailure(`Couldn't remove ${label}`, err);
       }
     },
 
@@ -893,31 +973,53 @@ export const useConsoleStore = defineStore("console", {
       try {
         await api.createMural(trimmed);
       } catch (err) {
-        console.error("[console] createMural failed", err);
+        reportFailure(`Couldn't create the mural "${trimmed}"`, err);
       }
     },
 
+    /** Rename a mural. Optimistic, rolled back on refusal — and undoable: the inverse is the same
+     *  call with the old name (POL-93). */
     async renameMural(id: string, name: string): Promise<void> {
       const trimmed = name.trim();
       if (!trimmed) return;
       const mural = this.murals.find((m) => m.id === id);
+      const before = previousName(mural?.name, trimmed);
       if (mural) mural.name = trimmed; // optimistic
       try {
         await api.renameMural(id, trimmed);
+        if (before) {
+          reportSuccess(`Renamed the mural to "${trimmed}"`, {
+            label: "Undo",
+            run: () => this.renameMural(id, before),
+          });
+        }
       } catch (err) {
-        console.error("[console] renameMural failed", err);
+        if (mural && before) mural.name = before;
+        reportFailure(`Couldn't rename the mural to "${trimmed}"`, err);
       }
     },
 
+    /** Delete a mural (and, server-side, the placements on it). NOT undoable: re-creating it makes a
+     *  new, EMPTY mural under a new id — the layout it carried is gone, so no Undo is offered. */
     async deleteMural(id: string): Promise<void> {
+      const name = this.murals.find((m) => m.id === id)?.name ?? "that mural";
+      const before = {
+        murals: this.murals,
+        placements: this.placements,
+        activeMuralId: this.activeMuralId,
+      };
       // optimistic — drop the mural and any placements on it
       this.murals = this.murals.filter((m) => m.id !== id);
       this.placements = this.placements.filter((p) => p.muralId !== id);
       if (this.activeMuralId === id) this.activeMuralId = this.murals[0]?.id ?? null;
       try {
         await api.deleteMural(id);
+        reportSuccess(`Deleted the mural "${name}" — its screens are back in Unplaced`);
       } catch (err) {
-        console.error("[console] deleteMural failed", err);
+        this.murals = before.murals;
+        this.placements = before.placements;
+        this.activeMuralId = before.activeMuralId;
+        reportFailure(`Couldn't delete the mural "${name}"`, err);
       }
     },
 
@@ -931,6 +1033,7 @@ export const useConsoleStore = defineStore("console", {
      *  placement; an existing placement keeps its current size while it moves murals. */
     async placeScreen(screenId: string, muralId: string, x: number, y: number): Promise<void> {
       const existing = this.placements.find((p) => p.screenId === screenId);
+      const before = existing ? { ...existing } : null;
       if (existing) {
         existing.muralId = muralId;
         existing.x = x;
@@ -953,14 +1056,24 @@ export const useConsoleStore = defineStore("console", {
             : { muralId, x, y },
         );
       } catch (err) {
-        console.error("[console] placeScreen failed", err);
+        // The tile must not sit on a mural the server never accepted it onto: put it back, or take
+        // it off the canvas entirely if this was its first placement.
+        if (before) {
+          const p = this.placements.find((q) => q.screenId === screenId);
+          if (p) Object.assign(p, before);
+        } else {
+          this.placements = this.placements.filter((p) => p.screenId !== screenId);
+        }
+        reportFailure(`Couldn't place ${this.screenName(screenId)} on the mural`, err);
       }
     },
 
-    /** Move an already-placed screen within its mural, preserving its size. */
+    /** Move an already-placed screen within its mural, preserving its size. A drag is its own undo,
+     *  so a successful move says nothing — only a refused one does, and it snaps back. */
     async moveScreen(screenId: string, x: number, y: number): Promise<void> {
       const existing = this.placements.find((p) => p.screenId === screenId);
       if (!existing) return;
+      const before = { x: existing.x, y: existing.y };
       existing.x = x; // optimistic
       existing.y = y;
       try {
@@ -972,45 +1085,94 @@ export const useConsoleStore = defineStore("console", {
           h: existing.h,
         });
       } catch (err) {
-        console.error("[console] moveScreen failed", err);
+        const p = this.placements.find((q) => q.screenId === screenId);
+        if (p) {
+          p.x = before.x; // the tile visibly snaps back to where the server still has it
+          p.y = before.y;
+        }
+        reportFailure(`Couldn't move ${this.screenName(screenId)}`, err);
       }
     },
 
+    /** Return a screen to the Unplaced tray. Undoable — we hold the exact placement it had. */
     async unplaceScreen(screenId: string): Promise<void> {
+      const before = this.placements.find((p) => p.screenId === screenId);
+      const restore = before ? restorePlacementBody(before) : null;
+      const name = this.screenName(screenId);
       this.placements = this.placements.filter((p) => p.screenId !== screenId); // optimistic
       try {
         await api.unplaceScreen(screenId);
+        reportSuccess(
+          `${name} is back in Unplaced`,
+          restore
+            ? { label: "Undo", run: () => this.restorePlacement(screenId, restore) }
+            : null,
+        );
       } catch (err) {
-        console.error("[console] unplaceScreen failed", err);
+        if (before) this.placements = [...this.placements, before];
+        reportFailure(`Couldn't unplace ${name}`, err);
+      }
+    },
+
+    /**
+     * Put a screen back at an EXACT placement (the inverse of `unplaceScreen`, POL-93). Distinct
+     * from `placeScreen`, which leaves the size to the server for a fresh placement — an undo must
+     * restore the tile the operator had, size included, not a default-sized one.
+     */
+    async restorePlacement(
+      screenId: string,
+      body: { muralId: string; x: number; y: number; w: number; h: number },
+    ): Promise<void> {
+      const existing = this.placements.find((p) => p.screenId === screenId);
+      if (existing) Object.assign(existing, body);
+      else this.placements.push({ screenId, ...body }); // optimistic
+      try {
+        await api.placeScreen(screenId, body);
+      } catch (err) {
+        this.placements = this.placements.filter((p) => p.screenId !== screenId);
+        reportFailure(`Couldn't put ${this.screenName(screenId)} back on the mural`, err);
       }
     },
 
     // ── Screen registry / content ─────────────────────────────────────────────
 
+    /** Rename a screen. Optimistic, rolled back on refusal, and undoable (rename it back). */
     async renameScreen(screenId: string, name: string): Promise<void> {
       const trimmed = name.trim();
       if (!trimmed) return;
+      const before = previousName(this.screenById(screenId)?.friendlyName, trimmed);
       // optimistic — patch the screen wherever it lives
-      for (const machine of this.machines) {
-        const screen = machine.screens.find((s) => s.id === screenId);
-        if (screen) {
-          screen.friendlyName = trimmed;
-          break;
+      const patch = (value: string): void => {
+        for (const machine of this.machines) {
+          const screen = machine.screens.find((s) => s.id === screenId);
+          if (screen) {
+            screen.friendlyName = value;
+            break;
+          }
         }
-      }
+      };
+      patch(trimmed);
       try {
         await api.renameScreen(screenId, trimmed);
+        if (before) {
+          reportSuccess(`Renamed "${before}" to "${trimmed}"`, {
+            label: "Undo",
+            run: () => this.renameScreen(screenId, before),
+          });
+        }
       } catch (err) {
-        console.error("[console] renameScreen failed", err);
+        if (before) patch(before); // the field springs back to the name the server still holds
+        reportFailure(`Couldn't rename that screen to "${trimmed}"`, err);
       }
     },
 
     /** Flash a screen's friendly name on the physical panel (fire-and-forget pulse). */
     async identScreen(screenId: string): Promise<void> {
+      const name = this.screenName(screenId);
       try {
         await api.identScreen(screenId, { on: true, ttlMs: 3000 });
       } catch (err) {
-        console.error("[console] identScreen failed", err);
+        reportFailure(`Couldn't flash ${name}`, err);
       }
     },
 
@@ -1028,12 +1190,11 @@ export const useConsoleStore = defineStore("console", {
         return null;
       } catch (err) {
         console.error("[console] inspectScreen failed", err);
-        // The server's 409s explain themselves ("… is offline — nothing to show an inspector on").
-        const detail =
-          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
-            ? (err.payload as { error: string }).error
-            : null;
-        return detail ?? "The control plane could not reach that screen's machine.";
+        // The one action that does NOT toast from here: the caller (useScreenInspect) owns the
+        // whole ack-driven state machine — refusals, timeouts and this error all leave through its
+        // single `notify` seam, which the views then toast. Two toasts for one click is worse noise
+        // than none. The server's 409s explain themselves ("… is offline — nothing to inspect").
+        return api.errorReason(err) ?? "The control plane could not reach that screen's machine.";
       }
     },
 
@@ -1044,6 +1205,14 @@ export const useConsoleStore = defineStore("console", {
      * reappears on the machine's next reconnect (this targets stale/decommissioned screens).
      */
     async removeScreen(screenId: string): Promise<void> {
+      const name = this.screenName(screenId);
+      const before = {
+        machines: this.machines.map((m) => ({ ...m, screens: [...m.screens] })),
+        placements: this.placements,
+        videoWalls: this.videoWalls,
+        selectedScreenIds: this.selectedScreenIds,
+        selectedWallId: this.selectedWallId,
+      };
       // optimistic prune — remove the screen from whichever machine holds it
       for (const machine of this.machines) {
         const idx = machine.screens.findIndex((s) => s.id === screenId);
@@ -1060,8 +1229,16 @@ export const useConsoleStore = defineStore("console", {
       }
       try {
         await api.deleteScreen(screenId);
+        // No Undo: the server has forgotten the screen. A machine still driving the output re-registers
+        // it on its next reconnect — as a NEW screen, with no placement and no content.
+        reportSuccess(`Removed ${name}`);
       } catch (err) {
-        console.error("[console] removeScreen failed", err);
+        this.machines = before.machines;
+        this.placements = before.placements;
+        this.videoWalls = before.videoWalls;
+        this.selectedScreenIds = before.selectedScreenIds;
+        this.selectedWallId = before.selectedWallId;
+        reportFailure(`Couldn't remove ${name}`, err);
       }
     },
 
@@ -1073,10 +1250,31 @@ export const useConsoleStore = defineStore("console", {
     async setScreenContent(screenId: string, content: ContentAssignment): Promise<void> {
       const body = normalizeAssignment(content);
       if (!body) return;
+      const name = this.screenName(screenId);
+      // What was on the glass a moment ago — the inverse, when the library can name it unambiguously
+      // (src/undo.ts explains why an ad-hoc URL cannot be put back).
+      const before = previousAssignment(this.screenById(screenId)?.content, this.contentSources);
       try {
         await api.setScreenContent(screenId, body);
+        reportSuccess(
+          `${this.assignmentName(body)} is now on ${name}`,
+          before ? { label: "Undo", run: () => this.setScreenContent(screenId, before) } : null,
+        );
       } catch (err) {
-        console.error("[console] setScreenContent failed", err);
+        reportFailure(`Couldn't put content on ${name}`, err);
+      }
+    },
+
+    /** @internal What an assignment is called, for a toast sentence: the library source's name, or
+     *  the ad-hoc URL's host. */
+    assignmentName(content: ContentAssignment): string {
+      if ("sourceId" in content) {
+        return `"${this.sourceById(content.sourceId)?.name ?? "That source"}"`;
+      }
+      try {
+        return new URL(content.url).host;
+      } catch {
+        return content.url;
       }
     },
 
@@ -1086,11 +1284,15 @@ export const useConsoleStore = defineStore("console", {
      * the − / + buttons step from the value the operator can see rather than from a stale one.
      */
     async setScreenZoom(screenId: string, zoom: number): Promise<void> {
+      const before = this.screenById(screenId)?.content?.zoom;
       this.patchScreenZoom([screenId], zoom);
       try {
         await api.setScreenZoom(screenId, zoom);
       } catch (err) {
-        console.error("[console] setScreenZoom failed", err);
+        // The − / + buttons step from the value on screen, so a refused zoom must not leave a number
+        // the wall never took: step it back.
+        if (before !== undefined) this.patchScreenZoom([screenId], before);
+        reportFailure(`Couldn't zoom ${this.screenName(screenId)}`, err);
       }
     },
 
@@ -1135,18 +1337,28 @@ export const useConsoleStore = defineStore("console", {
         if (pendingWallMembers && sameMembers(pendingWallMembers, placedHere)) {
           pendingWallMembers = null;
         }
-        console.error("[console] combine failed", err);
+        reportFailure("Couldn't combine those screens", err);
       }
     },
 
-    /** Split a combined surface back into its individual screens. */
+    /**
+     * Split a combined surface back into its individual screens. NO Undo: re-combining the same
+     * members is a new wall — the server dissolves the old one, taking its name and the content that
+     * spanned it. Offering an "Undo" that silently drops both would be a lie; the operator can
+     * re-combine and re-assign deliberately.
+     */
     async split(wallId: string): Promise<void> {
+      const before = this.videoWalls.find((w) => w.id === wallId);
+      const previousSelection = this.selectedWallId;
+      const name = this.wallName(wallId);
       this.videoWalls = this.videoWalls.filter((w) => w.id !== wallId); // optimistic
       if (this.selectedWallId === wallId) this.selectedWallId = null;
       try {
         await api.splitWall(wallId);
       } catch (err) {
-        console.error("[console] split failed", err);
+        if (before) this.videoWalls = [...this.videoWalls, before];
+        this.selectedWallId = previousSelection;
+        reportFailure(`Couldn't split ${name}`, err);
       }
     },
 
@@ -1159,12 +1371,24 @@ export const useConsoleStore = defineStore("console", {
       const body = normalizeAssignment(content);
       if (!body) return;
       // A freshly-combined wall is optimistic until the authoritative admin/state arrives with its real
-      // id; sending content against the temp id would 404 (and be swallowed). Wait for the real wall.
-      if (wallId.startsWith("wall-pending")) return;
+      // id; sending content against the temp id would 404. Wait for the real wall — and SAY so, rather
+      // than dropping the operator's assignment on the floor as this used to.
+      if (wallId.startsWith("wall-pending")) {
+        useToastStore().info("That combined surface is still settling — try again in a moment");
+        return;
+      }
+      const name = this.wallName(wallId);
+      // The members all span the same content, so the first member's read-out is the wall's.
+      const firstMember = this.wallMembers(wallId)[0]?.screen;
+      const before = previousAssignment(firstMember?.content, this.contentSources);
       try {
         await api.setWallContent(wallId, body);
+        reportSuccess(
+          `${this.assignmentName(body)} now spans ${name}`,
+          before ? { label: "Undo", run: () => this.setWallContent(wallId, before) } : null,
+        );
       } catch (err) {
-        console.error("[console] setWallContent failed", err);
+        reportFailure(`Couldn't put content on ${name}`, err);
       }
     },
 
@@ -1172,11 +1396,13 @@ export const useConsoleStore = defineStore("console", {
     async setWallZoom(wallId: string, zoom: number): Promise<void> {
       if (wallId.startsWith("wall-pending")) return;
       const wall = this.videoWalls.find((w) => w.id === wallId);
+      const before = wall ? this.wallMembers(wallId)[0]?.screen.content?.zoom : undefined;
       if (wall) this.patchScreenZoom(wall.memberScreenIds, zoom);
       try {
         await api.setWallZoom(wallId, zoom);
       } catch (err) {
-        console.error("[console] setWallZoom failed", err);
+        if (wall && before !== undefined) this.patchScreenZoom(wall.memberScreenIds, before);
+        reportFailure(`Couldn't zoom ${this.wallName(wallId)}`, err);
       }
     },
 
@@ -1192,20 +1418,31 @@ export const useConsoleStore = defineStore("console", {
       if (!trimmed) return;
       if (wallId.startsWith("wall-pending")) return;
       const wall = this.videoWalls.find((w) => w.id === wallId);
+      // A wall with no name derives one from its members; there is no earlier NAME to put back, so
+      // that first naming carries no Undo (renaming it again does).
+      const before = previousName(wall?.name, trimmed);
       if (wall) wall.name = trimmed; // optimistic
       try {
         await api.renameVideoWall(wallId, trimmed);
+        if (before) {
+          reportSuccess(`Renamed the combined surface to "${trimmed}"`, {
+            label: "Undo",
+            run: () => this.renameWall(wallId, before),
+          });
+        }
       } catch (err) {
-        console.error("[console] renameWall failed", err);
+        if (wall) wall.name = before ?? undefined;
+        reportFailure(`Couldn't rename that combined surface to "${trimmed}"`, err);
       }
     },
 
     /** Flash every panel of a combined surface so an operator can map it on the wall. */
     async identWall(wallId: string): Promise<void> {
+      const name = this.wallName(wallId);
       try {
         await api.identWall(wallId, { on: true, ttlMs: 3000 });
       } catch (err) {
-        console.error("[console] identWall failed", err);
+        reportFailure(`Couldn't flash ${name}`, err);
       }
     },
 
@@ -1217,7 +1454,7 @@ export const useConsoleStore = defineStore("console", {
       try {
         return await api.createContentSource(body);
       } catch (err) {
-        console.error("[console] createSource failed", err);
+        reportFailure(`Couldn't save "${body.name}"`, err);
         return null;
       }
     },
@@ -1229,26 +1466,58 @@ export const useConsoleStore = defineStore("console", {
      */
     async updateSource(id: string, body: UpdateContentSourceBody): Promise<boolean> {
       const existing = this.contentSources.find((s) => s.id === id);
+      const before = existing ? { ...existing } : null;
       if (existing) Object.assign(existing, body); // optimistic
       try {
         await api.updateContentSource(id, body);
         return true;
       } catch (err) {
-        console.error("[console] updateSource failed", err);
+        if (existing && before) Object.assign(existing, before); // the row reverts to the stored source
+        reportFailure(`Couldn't save "${before?.name ?? "that source"}"`, err);
         return false;
       }
     },
 
-    /** Delete a library source. The server clears any screen/wall assignment that referenced it. */
+    /**
+     * Delete a library source. The server clears any screen/wall assignment that referenced it.
+     *
+     * Undoable, with a caveat said out loud in the toast: the inverse re-creates the source (POST,
+     * new id), so the LIBRARY entry comes back but the screens the server cleared do not re-arm —
+     * there is no server-side undo journal to restore them from (D90).
+     */
     async deleteSource(id: string): Promise<boolean> {
+      const before = this.contentSources.find((s) => s.id === id);
+      const wasPicked = this.pickedSourceId === id;
       this.contentSources = this.contentSources.filter((s) => s.id !== id); // optimistic
-      if (this.pickedSourceId === id) this.pickedSourceId = null;
+      if (wasPicked) this.pickedSourceId = null;
       try {
         await api.deleteContentSource(id);
+        reportSuccess(
+          `Deleted "${before?.name ?? "that source"}"`,
+          before
+            ? { label: "Undo", run: () => this.recreateSource(before) }
+            : null,
+        );
         return true;
       } catch (err) {
-        console.error("[console] deleteSource failed", err);
+        if (before) this.contentSources = [...this.contentSources, before];
+        if (wasPicked) this.pickedSourceId = id;
+        reportFailure(`Couldn't delete "${before?.name ?? "that source"}"`, err);
         return false;
+      }
+    },
+
+    /** @internal Put a deleted source back in the library (the inverse of `deleteSource`). */
+    async recreateSource(source: ContentSource): Promise<void> {
+      const body = recreateSourceBody(source) as CreateContentSourceBody;
+      try {
+        const created = await api.createContentSource(body);
+        useToastStore().info(`"${created.name}" is back in the library`, {
+          detail:
+            "Screens that were showing it were cleared when it was deleted — assign it again.",
+        });
+      } catch (err) {
+        reportFailure(`Couldn't restore "${source.name}"`, err);
       }
     },
 
@@ -1261,7 +1530,7 @@ export const useConsoleStore = defineStore("console", {
         await api.createCredentialProfile(body);
         return true;
       } catch (err) {
-        console.error("[console] createProfile failed", err);
+        reportFailure(`Couldn't save the credential profile "${body.name}"`, err);
         return false;
       }
     },
@@ -1269,6 +1538,7 @@ export const useConsoleStore = defineStore("console", {
     /** Update a profile (clientSecret omitted = unchanged). Optimistic on the non-secret fields. */
     async updateProfile(id: string, body: UpdateCredentialProfileBody): Promise<boolean> {
       const existing = this.credentialProfiles.find((p) => p.id === id);
+      const before = existing ? { ...existing } : null;
       if (existing) {
         const { clientSecret: _secret, ...visible } = body; // the view never holds the secret
         Object.assign(existing, visible);
@@ -1277,34 +1547,42 @@ export const useConsoleStore = defineStore("console", {
         await api.updateCredentialProfile(id, body);
         return true;
       } catch (err) {
-        console.error("[console] updateProfile failed", err);
+        if (existing && before) Object.assign(existing, before);
+        reportFailure(`Couldn't save the credential profile "${before?.name ?? body.name}"`, err);
         return false;
       }
     },
 
     /**
      * Delete a profile. The server REFUSES (409) while any source references it; that surfaces here
-     * as `"in-use"` so the view can tell the operator to reassign first, distinct from a plain failure.
+     * as `"in-use"` so the view can tell the operator to reassign first, distinct from a plain failure
+     * (and 409 is the one case that does NOT toast from here — the view says the reassign sentence).
+     *
+     * No Undo: re-creating a profile needs its client SECRET, which is write-only and has never been
+     * in the console's hands. Saying "Undo" and then asking for the secret back is not an undo.
      */
     async deleteProfile(id: string): Promise<true | "in-use" | false> {
+      const name = this.profileById(id)?.name ?? "that profile";
       try {
         await api.deleteCredentialProfile(id);
         this.credentialProfiles = this.credentialProfiles.filter((p) => p.id !== id);
+        reportSuccess(`Deleted the credential profile "${name}"`);
         return true;
       } catch (err) {
         if (err instanceof api.ApiError && err.status === 409) return "in-use";
-        console.error("[console] deleteProfile failed", err);
+        reportFailure(`Couldn't delete the credential profile "${name}"`, err);
         return false;
       }
     },
 
-    /** Force a token exchange NOW and return the IdP's live answer (the modal's Test button). */
+    /** Force a token exchange NOW and return the IdP's live answer (the modal's Test button, which
+     *  renders the result inline on the row — so this one reports rather than toasts). */
     async testProfile(id: string): Promise<CredentialProfileTestResult> {
       try {
         return await api.testCredentialProfile(id);
       } catch (err) {
         console.error("[console] testProfile failed", err);
-        return { ok: false, error: "Request failed — is the server reachable?" };
+        return { ok: false, error: api.errorReason(err) ?? "Request failed — is the server reachable?" };
       }
     },
 
@@ -1328,6 +1606,8 @@ export const useConsoleStore = defineStore("console", {
         await api.uploadMedia(file, name, onProgress);
         return { ok: true };
       } catch (err) {
+        // Reported, not toasted: the upload modal is still open in front of the operator and shows
+        // this sentence in place, right under the file they picked.
         console.error("[console] uploadSource failed", err);
         if (err instanceof api.ApiError) {
           if (err.status === 413) return { ok: false, error: "File too large for upload." };
@@ -1396,7 +1676,7 @@ export const useConsoleStore = defineStore("console", {
         if (scene && typeof scene.id === "string") this.activeSceneId = scene.id;
         return true;
       } catch (err) {
-        console.error("[console] saveScene failed", err);
+        reportFailure(`Couldn't save the scene "${trimmed}"`, err);
         return false;
       }
     },
@@ -1410,13 +1690,16 @@ export const useConsoleStore = defineStore("console", {
     async applyScene(id: string): Promise<void> {
       const scene = this.scenes.find((sc) => sc.id === id);
       if (!scene) return;
+      const beforeScene = this.activeSceneId;
       this.activeSceneId = id; // optimistic
       // Switch the canvas to the scene's mural so the operator watches it re-lay live.
       if (this.murals.some((m) => m.id === scene.muralId)) this.activeMuralId = scene.muralId;
       try {
         await api.applyScene(id);
       } catch (err) {
-        console.error("[console] applyScene failed", err);
+        // The wall never changed, so the "active" marker must not claim it did.
+        this.activeSceneId = beforeScene;
+        reportFailure(`Couldn't apply the scene "${scene.name}"`, err);
       }
     },
 
@@ -1427,6 +1710,7 @@ export const useConsoleStore = defineStore("console", {
      */
     async updateScene(id: string, body: UpdateSceneBody): Promise<void> {
       const scene = this.scenes.find((sc) => sc.id === id);
+      const before = scene ? { name: scene.name, scheduleAt: scene.scheduleAt } : null;
       if (scene) {
         // optimistic patch
         if (body.name !== undefined) scene.name = body.name;
@@ -1437,15 +1721,28 @@ export const useConsoleStore = defineStore("console", {
       try {
         await api.updateScene(id, body);
       } catch (err) {
-        console.error("[console] updateScene failed", err);
+        if (scene && before) {
+          scene.name = before.name; // the row's inputs revert to the stored scene
+          scene.scheduleAt = before.scheduleAt;
+        }
+        reportFailure(`Couldn't save the scene "${before?.name ?? "that scene"}"`, err);
       }
     },
 
-    /** Convenience: rename a scene (a thin wrapper over updateScene). Ignores a blank name. */
+    /** Convenience: rename a scene (a thin wrapper over updateScene). Ignores a blank name. Undoable
+     *  — the inverse is the same call with the old name. */
     async renameSceneTo(id: string, name: string): Promise<void> {
       const trimmed = name.trim();
       if (!trimmed) return;
+      const before = previousName(this.sceneById(id)?.name, trimmed);
       await this.updateScene(id, { name: trimmed });
+      // Only claim the rename landed if it survived the round-trip (updateScene reverts on refusal).
+      if (before && this.sceneById(id)?.name === trimmed) {
+        reportSuccess(`Renamed the scene to "${trimmed}"`, {
+          label: "Undo",
+          run: () => this.renameSceneTo(id, before),
+        });
+      }
     },
 
     /** Convenience: set (or clear, with "") a scene's illustrative schedule time. */
@@ -1454,14 +1751,24 @@ export const useConsoleStore = defineStore("console", {
       await this.updateScene(id, { scheduleAt: trimmed === "" ? null : trimmed });
     },
 
-    /** Delete a saved scene. */
+    /**
+     * Delete a saved scene. NOT undoable: a scene is a SNAPSHOT of a wall as it was, and the only
+     * way to make one is POST /scenes, which snapshots the wall as it is NOW. Re-saving would mint a
+     * scene with the same name and different contents — the most dangerous kind of lie a wall tool
+     * can tell — so the toast reports the deletion and offers nothing.
+     */
     async deleteScene(id: string): Promise<void> {
+      const before = this.scenes.find((sc) => sc.id === id);
+      const wasActive = this.activeSceneId === id;
       this.scenes = this.scenes.filter((sc) => sc.id !== id); // optimistic
-      if (this.activeSceneId === id) this.activeSceneId = null;
+      if (wasActive) this.activeSceneId = null;
       try {
         await api.deleteScene(id);
+        reportSuccess(`Deleted the scene "${before?.name ?? "that scene"}"`);
       } catch (err) {
-        console.error("[console] deleteScene failed", err);
+        if (before) this.scenes = [...this.scenes, before];
+        if (wasActive) this.activeSceneId = id;
+        reportFailure(`Couldn't delete the scene "${before?.name ?? "that scene"}"`, err);
       }
     },
 

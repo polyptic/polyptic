@@ -3,14 +3,19 @@
 
   Shows the active mural's name with a caret; the dropdown lists every mural
   (click to switch), plus create / rename / delete affordances backed by the
-  store. Matches the design's "Reception Mural ▾" switcher. Create/rename use a
-  lightweight prompt — a dedicated dialog is out of scope for 3a.
+  store. Matches the design's "Reception Mural ▾" switcher. Create/rename/delete ask through the
+  console's own dialog (POL-93); the "you need at least one mural" refusal is a statement, not a
+  question, so it goes to the toast rail rather than blocking on an OK button.
 -->
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useConsoleStore } from "../../stores/console";
+import { useDialogStore } from "../../stores/dialogs";
+import { useToastStore } from "../../stores/toasts";
 
 const store = useConsoleStore();
+const dialogs = useDialogStore();
+const toasts = useToastStore();
 const open = ref(false);
 
 const active = computed(() => store.activeMural);
@@ -21,31 +26,50 @@ function pick(id: string) {
   open.value = false;
 }
 
-function create() {
+async function create() {
   open.value = false;
-  const name = window.prompt("Name the new mural", "New mural");
-  if (name && name.trim()) store.createMural(name.trim());
+  const name = await dialogs.promptText({
+    title: "New mural",
+    message: "A mural is one wall of screens — a canvas you lay screens out on.",
+    label: "Name",
+    value: "New mural",
+    confirmLabel: "Create mural",
+  });
+  if (name && name.trim()) void store.createMural(name.trim());
 }
 
-function rename() {
+async function rename() {
   open.value = false;
   const m = active.value;
   if (!m) return;
-  const name = window.prompt("Rename mural", m.name);
-  if (name && name.trim() && name.trim() !== m.name) store.renameMural(m.id, name.trim());
+  const name = await dialogs.promptText({
+    title: "Rename mural",
+    label: "Name",
+    value: m.name,
+    confirmLabel: "Rename",
+  });
+  if (name && name.trim() && name.trim() !== m.name) void store.renameMural(m.id, name.trim());
 }
 
-function remove() {
+async function remove() {
   open.value = false;
   const m = active.value;
   if (!m) return;
   if (murals.value.length <= 1) {
-    window.alert("You need at least one mural.");
+    toasts.error("You need at least one mural", {
+      detail: "Create another mural before deleting this one.",
+    });
     return;
   }
-  if (window.confirm(`Delete mural “${m.name}”? Screens on it return to Unplaced.`)) {
-    store.deleteMural(m.id);
-  }
+  const yes = await dialogs.confirm({
+    title: `Delete the mural "${m.name}"?`,
+    message:
+      "The screens on it return to Unplaced and keep their content. The layout itself is gone — " +
+      "there is no undo for a deleted mural.",
+    confirmLabel: "Delete mural",
+    danger: true,
+  });
+  if (yes) void store.deleteMural(m.id);
 }
 </script>
 
