@@ -30,6 +30,7 @@ import { z } from "zod";
 
 import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
+import { probeFraming } from "./framing";
 
 import {
   CombineScreensBody,
@@ -123,6 +124,44 @@ export function registerRestRoutes(
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
 ): void {
+  // POL-18 — machines whose LAST synced apply carried placed windows. A content change on such a
+  // machine must push a fresh apply even when the new state has none (so the agent tears the
+  // window down); a machine that never had windows skips the extra frame entirely.
+  const machinesWithWindows = new Set<string>();
+
+  /**
+   * POL-18 — keep a machine's agent in step with its screens' WINDOW placements. Content changes
+   * ride the player channel (instant, D5) — but a `placement: "window"` surface is rendered by the
+   * AGENT, so whenever a render might have changed a window set we push a full `server/apply` for
+   * that machine (always the complete per-output list: the agent retires unlisted connectors).
+   * No-op for machines that neither have nor had windows, so the common path costs nothing.
+   */
+  function syncWindowsToAgent(screenId: string): void {
+    const screen = control.getScreen(screenId);
+    if (!screen) return;
+    const assignments = control.assignmentsForMachine(screen.machineId);
+    const hasWindows = assignments.some((a) => (a.windows?.length ?? 0) > 0);
+    if (!hasWindows && !machinesWithWindows.has(screen.machineId)) return;
+    if (hasWindows) machinesWithWindows.add(screen.machineId);
+    else machinesWithWindows.delete(screen.machineId);
+    const apply = ServerToAgentApply.parse({
+      t: "server/apply",
+      revision: control.state.revision,
+      machineId: screen.machineId,
+      screens: assignments,
+    });
+    const delivered = agentHub.send(screen.machineId, apply);
+    fastify.log.info(
+      {
+        event: "apply.windows",
+        machineId: screen.machineId,
+        windows: assignments.flatMap((a) => (a.windows ?? []).map((w) => `${a.connector}:${w.id}`)),
+        delivered,
+      },
+      "pushed window placements to agent",
+    );
+  }
+
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
       t: "server/render",
@@ -134,6 +173,8 @@ export function registerRestRoutes(
       slice: control.decorateSliceForSend(slice),
     });
     const delivered = hub.send(screenId, message);
+    // POL-18 — a render change may have added/removed/moved a placed window; tell the agent too.
+    syncWindowsToAgent(screenId);
     fastify.log.info(
       {
         event: "render.push",
@@ -145,6 +186,25 @@ export function registerRestRoutes(
       "pushed render to player(s)",
     );
     return delivered;
+  }
+
+  /**
+   * POL-18 — probe a web/dashboard source's framing headers and store the verdict. When the verdict
+   * changes how the source renders (auto mode), the returned slices are pushed live — the automatic
+   * web → web-window fallback — and the agents of the affected machines get fresh window placements
+   * through pushRender's sync. Fire-and-forget from create/update (a slow target site must never
+   * hold an operator's save hostage); awaited by the explicit re-probe route.
+   */
+  async function probeSourceFraming(sourceId: string, url: string): Promise<void> {
+    const verdict = await probeFraming(url);
+    const result = await control.setSourceFraming(sourceId, verdict);
+    if (!result.changed) return;
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "content-source.framing", sourceId, verdict, screens: result.slices.map((s) => s.screenId) },
+      "framing verdict stored",
+    );
+    broadcaster.broadcast();
   }
 
   /** Fan the current fleet-wide display settings out to EVERY connected player (POL-6). */
@@ -1184,6 +1244,11 @@ export function registerRestRoutes(
       { event: "content-source.create", sourceId: source.id, kind: source.kind, name: source.name },
       "content source created",
     );
+    // POL-18 — probe the new source's framing in the background; a "blocked" verdict flips its
+    // (auto) placement to a window when it is later assigned. Never blocks the operator's save.
+    if ((source.kind === "web" || source.kind === "dashboard") && source.url) {
+      void probeSourceFraming(source.id, source.url);
+    }
     broadcaster.broadcast();
     return reply.code(201).send({ ok: true, source });
   });
@@ -1224,6 +1289,16 @@ export function registerRestRoutes(
     // Re-resolved every screen/wall showing this source — push the new render to each affected player.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
 
+    // POL-18 — a URL change dropped the stored framing verdict (it described the old address);
+    // re-probe the new one in the background.
+    if (
+      (result.source.kind === "web" || result.source.kind === "dashboard") &&
+      result.source.url &&
+      result.source.framing === undefined
+    ) {
+      void probeSourceFraming(result.source.id, result.source.url);
+    }
+
     fastify.log.info(
       {
         event: "content-source.update",
@@ -1236,6 +1311,26 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return { ok: true, source: result.source, screens: result.slices.map((s) => s.screenId) };
+  });
+
+  // POST /api/v1/content-sources/:id/probe-framing  -> re-run the framing probe NOW (POL-18) and
+  // return the verdict. Awaited on purpose: the console's "re-check" and the e2e suite both want a
+  // deterministic answer, and a single header fetch is cheap.
+  fastify.post("/api/v1/content-sources/:id/probe-framing", async (request, reply) => {
+    const params = ContentSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const source = control.getContentSource(params.data.id);
+    if (!source) {
+      return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+    }
+    if ((source.kind !== "web" && source.kind !== "dashboard") || !source.url) {
+      return reply.code(400).send({ error: "only web/dashboard sources have framing to probe" });
+    }
+    await probeSourceFraming(source.id, source.url);
+    const probed = control.getContentSource(params.data.id);
+    return { ok: true, framing: probed?.framing ?? "unknown" };
   });
 
   // DELETE /api/v1/content-sources/:id  -> clear in-use assignments (empty render) + push

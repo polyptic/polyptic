@@ -113,6 +113,8 @@ interface ContentSourceRow {
   credential_profile_id: string | null;
   items: unknown;
   definition: unknown | null;
+  framing: string | null;
+  placement_mode: string | null;
 }
 
 /** Row → DTO for a content source, re-validating at the edge (shared by load + list). Returns []
@@ -131,6 +133,8 @@ function contentSourceFromRow(row: ContentSourceRow): PersistedContentSource[] {
       credentialProfileId: row.credential_profile_id ?? null,
       definition: row.definition ?? null,
       items: kind.data === "playlist" ? (items.success ? items.data : []) : null,
+      framing: row.framing ?? null,
+      placementMode: row.placement_mode ?? null,
     },
   ];
 }
@@ -298,6 +302,10 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS items jsonb`;
     await sql`ALTER TABLE content_sources ALTER COLUMN url DROP NOT NULL`;
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS definition jsonb`;
+    // Web-window placement (POL-18): the framing-probe verdict + the operator's placement override.
+    // Both nullable on purpose — legacy rows read as "never probed" / "auto".
+    await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS framing text`;
+    await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS placement_mode text`;
     // Page zoom preferences (POL-57). One row per (screen-or-wall, content) pair, so re-assigning a
     // page to a screen restores the zoom that screen last used FOR THAT PAGE.
     await sql`
@@ -437,7 +445,7 @@ export class PostgresStore implements Store {
       sql<MuralRow[]>`SELECT id, name FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
-      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition FROM content_sources`,
+      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
@@ -767,16 +775,19 @@ export class PostgresStore implements Store {
   async upsertContentSource(source: PersistedContentSource): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items, definition)
+      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode)
       VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url ?? null}, ${source.credentialProfileId ?? null}, ${source.items ? sql.json(source.items) : null},
-        ${source.definition != null ? sql.json(source.definition as Parameters<typeof sql.json>[0]) : null})
+        ${source.definition != null ? sql.json(source.definition as Parameters<typeof sql.json>[0]) : null},
+        ${source.framing ?? null}, ${source.placementMode ?? null})
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         kind = EXCLUDED.kind,
         url  = EXCLUDED.url,
         credential_profile_id = EXCLUDED.credential_profile_id,
         items = EXCLUDED.items,
-        definition = EXCLUDED.definition
+        definition = EXCLUDED.definition,
+        framing = EXCLUDED.framing,
+        placement_mode = EXCLUDED.placement_mode
     `;
   }
 
@@ -791,7 +802,7 @@ export class PostgresStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     const sql = this.sql;
-    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition FROM content_sources`;
+    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode FROM content_sources`;
     return rows.flatMap(contentSourceFromRow);
   }
 

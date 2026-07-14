@@ -74,7 +74,11 @@ const wallSurfaceText = computed(() => {
 const singleContent = computed(() => single.value?.content ?? null);
 const wallContent = computed(() => wallMembers.value.map((m) => m.screen.content).find((c) => !!c) ?? null);
 const singleContentKind = computed(() =>
-  singleContent.value ? kindLabel(singleContent.value.kind) : surfaceText.value,
+  singleContent.value
+    ? // POL-18 — "windowed" = this content is a top-level window the BOX places over the player
+      // (framing-blocked escape hatch), which is why the player's own region reads as empty.
+      `${kindLabel(singleContent.value.kind)}${singleContent.value.windowed ? " · windowed" : ""}`
+    : surfaceText.value,
 );
 const wallContentKind = computed(() =>
   wallContent.value ? `${kindLabel(wallContent.value.kind)} · spans all panels` : wallSurfaceText.value,

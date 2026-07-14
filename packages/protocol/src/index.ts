@@ -50,6 +50,37 @@ export type DisplayBackend = z.infer<typeof DisplayBackend>;
 export const KioskBrowser = z.enum(["chrome", "surf"]);
 export type KioskBrowser = z.infer<typeof KioskBrowser>;
 
+// ── Web-window placement (POL-18) ────────────────────────────────────────────
+// Some sources refuse to be framed (CSP `frame-ancestors` / `X-Frame-Options` dashboards) — in an
+// iframe they render as a dead tile. The escape hatch is a TOP-LEVEL browser window placed by the
+// agent over the player's region. The SERVER probes each web/dashboard source's response headers and
+// stores the verdict; resolution turns a blocked source's surface into `placement: "window"`, the
+// player leaves that region empty, and the agent (told over its own channel, riding `server/apply`)
+// launches + positions a second kiosk browser window there.
+
+/** The server's framing probe verdict for a web/dashboard source. `unknown` = not probed yet, or the
+ *  probe itself failed (network error, timeout) — treated like `ok` at resolution time, because a
+ *  false "blocked" would windowize content that frames fine. */
+export const FramingVerdict = z.enum(["ok", "blocked", "unknown"]);
+export type FramingVerdict = z.infer<typeof FramingVerdict>;
+
+/** The operator's placement override on a source. `auto` (the default) follows the probe verdict;
+ *  the other two force it either way, because header detection can never be perfect. */
+export const PlacementMode = z.enum(["auto", "iframe", "window"]);
+export type PlacementMode = z.infer<typeof PlacementMode>;
+
+/** One top-level window the agent must place over a screen's player (POL-18). `region` is in the
+ *  slice's CANVAS pixel space; `canvas` rides along so the agent can scale region → output pixels
+ *  when the output's mode differs from the canvas. The `id` is the surface's stable id, so repeat
+ *  applies reconcile to the SAME placed window (url change = in-place relaunch, not a duplicate). */
+export const WindowPlacement = z.object({
+  id: z.string(),
+  url: z.string().url(),
+  region: Geometry,
+  canvas: Geometry,
+});
+export type WindowPlacement = z.infer<typeof WindowPlacement>;
+
 /** Enrollment lifecycle of a machine (Phase 2b). New machines arrive `pending`; an operator
  * approves them. Existing/auto-registered machines default to `approved`. */
 export const EnrollmentStatus = z.enum(["pending", "approved", "rejected"]);
@@ -115,7 +146,9 @@ export type Zoom = z.infer<typeof Zoom>;
 export const WebSurface = SurfaceBase.extend({
   type: z.literal("web"),
   url: z.string().url(),
-  /** "iframe" (default) or "window" — a top-level OS window placed by the agent (framing-blocked/native escape hatch). */
+  /** "iframe" (default) or "window" — a top-level OS window placed by the agent (framing-blocked/native escape hatch, POL-18).
+   *  A "window" surface is a HOLE in the player: the player renders nothing for it (and never probes
+   *  it) because the real content is a browser window the AGENT places over that region. */
   placement: z.enum(["iframe", "window"]).default("iframe"),
   interactive: z.boolean().default(false),
   zoom: Zoom.default(1),
@@ -124,6 +157,9 @@ export const WebSurface = SurfaceBase.extend({
 export const DashboardSurface = SurfaceBase.extend({
   type: z.literal("dashboard"),
   url: z.string().url(), // adapter-built (e.g. a single-panel dashboard embed URL)
+  /** POL-18 — same escape hatch as WebSurface: a dashboard that refuses to be framed becomes a
+   *  top-level window placed by the agent; the player leaves its region empty. */
+  placement: z.enum(["iframe", "window"]).default("iframe"),
   refreshSeconds: z.number().int().positive().optional(),
   zoom: Zoom.default(1),
 });
@@ -608,9 +644,16 @@ export const ServerToAgentApply = z.object({
   t: z.literal("server/apply"),
   revision: z.number().int().nonnegative(),
   machineId: z.string(),
-  /** For each output: which screen it is and the URL to point a player at. */
+  /** For each output: which screen it is, the URL to point a player at, and (POL-18) any top-level
+   *  windows to place OVER that player. `windows` is optional so a pre-POL-18 server frame still
+   *  parses; an absent/empty list means "no windows on this output" and retires any placed ones. */
   screens: z.array(
-    z.object({ connector: z.string(), screenId: z.string(), playerUrl: z.string().url() }),
+    z.object({
+      connector: z.string(),
+      screenId: z.string(),
+      playerUrl: z.string().url(),
+      windows: z.array(WindowPlacement).optional(),
+    }),
   ),
 });
 
@@ -905,6 +948,10 @@ export const ScreenView = Screen.extend({
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
+      /** POL-18 — true when this content renders as a top-level window placed by the agent (not an
+       *  iframe in the player). The inspector labels the selection so the operator knows why the
+       *  player's own region is empty. Absent = framed as normal. */
+      windowed: z.boolean().optional(),
     })
     .nullable()
     .optional(),
@@ -1062,6 +1109,11 @@ export const ContentSource = z
     items: z.array(PlaylistItem).optional(),
     /** POL-42 — page kind only: the Studio's saved composition. */
     definition: PageDefinition.optional(),
+    /** POL-18 — the server's framing-probe verdict (web/dashboard kinds; server-managed, re-probed
+     *  when the url changes). Absent = never probed (legacy rows / non-frameable kinds). */
+    framing: FramingVerdict.optional(),
+    /** POL-18 — the operator's placement override. Absent = "auto" (follow the probe verdict). */
+    placementMode: PlacementMode.optional(),
   })
   .superRefine((s, ctx) => {
     if (s.kind === "playlist") {
@@ -1345,6 +1397,8 @@ export const CreateContentSourceBody = z
     items: z.array(PlaylistItem).min(1).max(100).optional(),
     /** POL-42 — required when kind is `page`; the Studio's saved composition. */
     definition: PageDefinition.optional(),
+    /** POL-18 — placement override (web/dashboard kinds). Omitted = "auto". */
+    placementMode: PlacementMode.optional(),
   })
   .superRefine((b, ctx) => {
     if (b.kind === "playlist") {
@@ -1376,6 +1430,8 @@ export const UpdateContentSourceBody = z.object({
   items: z.array(PlaylistItem).min(1).max(100).optional(),
   /** POL-42 — replace a page source's composition (the Studio's Save). */
   definition: PageDefinition.optional(),
+  /** POL-18 — change the placement override. `framing` is server-managed and NOT settable here. */
+  placementMode: PlacementMode.optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 

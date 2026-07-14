@@ -9,7 +9,7 @@
  * The agent stays unprivileged and dumb: it never decides *what* to show (the control plane
  * does that and pushes content straight to the player), only *where* a player lives.
  */
-import type { DisplayBackend as BackendId } from "@polyptic/protocol";
+import type { DisplayBackend as BackendId, WindowPlacement } from "@polyptic/protocol";
 
 export interface DisplayBackend {
   /** Which `DisplayBackend` enum value this implementation reports in `agent/hello`. */
@@ -29,6 +29,19 @@ export interface DisplayBackend {
 
   /** Tear down whatever `showScreen` placed on `connector`. */
   hideScreen(connector: string): Promise<void>;
+
+  /**
+   * POL-18 — place (or re-place) ONE top-level browser window over the player on `connector`:
+   * launch a second, supervised kiosk browser window for `window.url` and position it at
+   * `window.region` (slice-canvas pixels, scaled onto the output's mode). Keyed by `window.id`:
+   * calling again with the same id relaunches/moves that window in place. Backends that cannot
+   * place windows throw — but the SERVER already gates on backend capability, so in practice only
+   * `wayland-sway` ever receives one (the throw is defence in depth + an honest status note).
+   */
+  showWindow(connector: string, window: WindowPlacement): Promise<void>;
+
+  /** POL-18 — tear down the placed window keyed `id`. Idempotent; unknown ids are a logged no-op. */
+  hideWindow(id: string): Promise<void>;
 
   /** Toggle an operator "which panel is this?" overlay across the host's outputs. */
   ident(on: boolean): Promise<void>;
