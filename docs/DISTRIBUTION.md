@@ -96,6 +96,8 @@ Set on `docker run -e …`, the compose `environment:` / `.env`, or Helm `config
 | `MEDIA_PUBLIC_BASE` | Absolute base URL prepended to `/media/<id>` | Must be reachable by players/public wall — your public HTTPS origin. |
 | `MEDIA_MAX_BYTES` | Max upload size in bytes | Default ~200 MB (`209715200`). |
 | `CAPTURE_INTERVAL_MS` | Live-preview thumbnail capture cadence | Empty → server default. Server polls agents for `server/capture`. |
+| `PLAYLIST_VIDEO_PREWARM` | Buffer a playlist's next video before its slot (POL-110) | Default on. One hidden element, never played — bytes, not a second decoder. `off` disables it fleet-wide if a kiosk GPU objects. |
+| `PLAYLIST_TRANSITION` / `PLAYLIST_TRANSITION_MS` | Transition between playlist entries | Default `cut` (the only transition that runs everywhere). `crossfade` opts in — and even then the player refuses to fade on a box whose renderer is a software rasteriser (D66/D104), so a software-rendering wall silently hard-cuts. |
 | `CONSOLE_DIR` / `PLAYER_DIR` | Where the server reads the built console/player SPA assets | Baked into the image; override only if you relocate the bundles. |
 
 ---

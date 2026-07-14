@@ -12,8 +12,13 @@ import type { PlaylistEntry } from "@polyptic/protocol";
 import {
   FALLBACK_HOLD_SECONDS,
   allTimed,
+  displayIndexFor,
   entryHoldMs,
+  entryProbeId,
+  entryProbeIndex,
+  prewarmIndex,
   rotationSignature,
+  slotHoldMs,
   timedPosition,
 } from "../src/playlist";
 
@@ -115,5 +120,188 @@ describe("rotationSignature — what restarts the rotation and what must not", (
     expect(rotationSignature(items, startedAt)).not.toBe(
       rotationSignature(items, "2026-07-10T13:00:00.000Z"),
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POL-110 — per-entry health: skip a dead entry, rejoin a healed one, KEEP THE PHASE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const image = (url: string, durationSeconds: number): PlaylistEntry => ({
+  kind: "image",
+  url,
+  durationSeconds,
+  sourceId: `src-${url}`,
+});
+
+/** A box's local view of which entries have proven reachable. */
+const health = (...alive: number[]): ((i: number) => boolean) => (i) => alive.includes(i);
+
+describe("entryProbeId — one prober target per entry", () => {
+  test("round-trips the entry index", () => {
+    const id = entryProbeId("surface-7", 3);
+    expect(entryProbeIndex("surface-7", id)).toBe(3);
+  });
+
+  test("ignores an id belonging to another surface", () => {
+    expect(entryProbeIndex("surface-7", entryProbeId("surface-8", 3))).toBeUndefined();
+    expect(entryProbeIndex("surface-7", "surface-7")).toBeUndefined();
+  });
+});
+
+describe("displayIndexFor — a dead entry is SKIPPED, never painted", () => {
+  const items = [
+    image("https://a.test/1.png", 10),
+    image("https://dead.test/2.png", 10),
+    image("https://c.test/3.png", 10),
+  ];
+
+  test("a healthy slot shows itself", () => {
+    expect(displayIndexFor(items, 0, health(0, 1, 2))).toBe(0);
+  });
+
+  test("a dead slot is filled by the next healthy entry — the one that takes over anyway", () => {
+    expect(displayIndexFor(items, 1, health(0, 2))).toBe(2);
+  });
+
+  test("the search wraps: a dead LAST entry falls back to the top of the rotation", () => {
+    expect(displayIndexFor(items, 2, health(0, 1))).toBe(0);
+  });
+
+  test("a healed entry REJOINS: the same slot shows itself again once it proves", () => {
+    expect(displayIndexFor(items, 1, health(0, 2))).toBe(2);
+    expect(displayIndexFor(items, 1, health(0, 1, 2))).toBe(1);
+  });
+
+  test("nothing provable → nothing painted (the calm placeholder, not a broken frame)", () => {
+    expect(displayIndexFor(items, 0, health())).toBeUndefined();
+    expect(displayIndexFor([], 0, health(0))).toBeUndefined();
+  });
+
+  test("a ten-item playlist with one dead URL shows the other NINE, in order", () => {
+    const ten = Array.from({ length: 10 }, (_, i) => image(`https://e${i}.test/x.png`, 10));
+    const alive = [0, 1, 2, 3, 5, 6, 7, 8, 9]; // entry 4 is dead
+    const shown = ten.map((_, slot) => displayIndexFor(ten, slot, health(...alive)));
+    expect(shown).toEqual([0, 1, 2, 3, 5, 5, 6, 7, 8, 9]); // slot 4 is absorbed by entry 5's dwell
+    expect(new Set(shown)).toEqual(new Set(alive)); // every healthy entry still gets the screen
+    expect(shown).not.toContain(4); // and the dead one NEVER paints
+  });
+});
+
+describe("phase preservation — a skipped entry must not desync a video wall", () => {
+  const items = [
+    image("https://a.test/1.png", 10),
+    image("https://dead.test/2.png", 20),
+    image("https://c.test/3.png", 30),
+  ];
+  const anchor = Date.parse("2026-07-10T12:00:00.000Z");
+  const cycleMs = 60_000;
+
+  test("the canonical timeline is derived from EVERY entry, healthy or not", () => {
+    // Health is not an input to timedPosition — that is the whole point. Two wall members that
+    // disagree about entry 1 still compute identical slot boundaries.
+    for (let t = 0; t < cycleMs * 2; t += 1_000) {
+      const pos = timedPosition(items, anchor, anchor + t);
+      const expected = t % cycleMs < 10_000 ? 0 : t % cycleMs < 30_000 ? 1 : 2;
+      expect(pos.index).toBe(expected);
+    }
+  });
+
+  test("two members disagreeing about one entry's health share every boundary, and re-converge", () => {
+    const boxA = health(0, 1, 2); // proved all three
+    const boxB = health(0, 2); // entry 1 not (yet) reachable from this box
+    const boundariesA: number[] = [];
+    const boundariesB: number[] = [];
+    const shownA: (number | undefined)[] = [];
+    const shownB: (number | undefined)[] = [];
+    for (let t = 0; t < cycleMs; t += 1_000) {
+      const pos = timedPosition(items, anchor, anchor + t);
+      boundariesA.push(t + pos.remainingMs);
+      boundariesB.push(t + pos.remainingMs);
+      shownA.push(displayIndexFor(items, pos.index, boxA));
+      shownB.push(displayIndexFor(items, pos.index, boxB));
+    }
+    // Same slot turnovers, to the millisecond.
+    expect(boundariesA).toEqual(boundariesB);
+    // They differ ONLY while the dead entry's slot is on air (10s–30s), and agree everywhere else.
+    for (let i = 0; i < shownA.length; i += 1) {
+      const inDeadSlot = i >= 10 && i < 30;
+      if (inDeadSlot) expect(shownB[i]).toBe(2);
+      else expect(shownB[i]).toBe(shownA[i]);
+    }
+    // ...and from the very next slot they are identical again: no accumulating drift.
+    expect(shownB.slice(30)).toEqual(shownA.slice(30));
+  });
+
+  test("the counterfactual: SPLICING the dead entry out would desync the wall forever", () => {
+    // If a box removed what it can't reach, its cycle would be 40s while its neighbour's is 60s —
+    // the two would drift apart without bound. This test pins WHY the timeline stays canonical.
+    const spliced = [items[0]!, items[2]!];
+    const late = anchor + 5 * cycleMs;
+    expect(timedPosition(items, anchor, late + 35_000).index).toBe(2);
+    expect(timedPosition(spliced, anchor, late + 35_000).index).not.toBe(
+      timedPosition(items, anchor, late + 35_000).index,
+    );
+  });
+});
+
+describe("slotHoldMs — a dead slot never stretches (or stalls) the rotation", () => {
+  test("the canonical entry's own hold wins, even when it is the dead one", () => {
+    const items = [image("https://a.test/1.png", 10), image("https://dead.test/2.png", 25)];
+    expect(slotHoldMs(items, 1, 0)).toBe(25_000); // showing entry 0, still yielding on 1's clock
+  });
+
+  test("a PLAYING untimed video yields on `ended` (no hold)", () => {
+    const items = [video("https://v.test/a.mp4"), image("https://b.test/1.png", 10)];
+    expect(slotHoldMs(items, 0, 0)).toBeUndefined();
+  });
+
+  test("a DEAD untimed video has no `ended` to wait for — it borrows its stand-in's hold", () => {
+    const items = [video("https://dead.test/a.mp4"), image("https://b.test/1.png", 10)];
+    expect(slotHoldMs(items, 0, 1)).toBe(10_000);
+  });
+
+  test("a dead untimed video with nothing healthy still ticks (the fallback hold)", () => {
+    const items = [video("https://dead.test/a.mp4"), image("https://b.test/1.png", 10)];
+    expect(slotHoldMs(items, 0, undefined)).toBe(FALLBACK_HOLD_SECONDS * 1000);
+  });
+});
+
+describe("prewarmIndex — bounded to ONE video, one slot ahead, and disable-able", () => {
+  const items = [
+    image("https://a.test/1.png", 30),
+    video("https://v.test/b.mp4", 30),
+    image("https://c.test/2.png", 30),
+  ];
+  const opts = { enabled: true, remainingMs: 3_000, leadMs: 6_000 };
+
+  test("the next slot's video warms once we are inside the lead window", () => {
+    expect(prewarmIndex(items, 0, 0, health(0, 1, 2), opts)).toBe(1);
+  });
+
+  test("outside the lead window nothing warms — a rotation is never more than one video ahead", () => {
+    expect(prewarmIndex(items, 0, 0, health(0, 1, 2), { ...opts, remainingMs: 20_000 })).toBeUndefined();
+  });
+
+  test("disabled means disabled (D84's kiosk-GPU escape hatch)", () => {
+    expect(prewarmIndex(items, 0, 0, health(0, 1, 2), { ...opts, enabled: false })).toBeUndefined();
+  });
+
+  test("only videos warm — frames and images have their own (existing) pre-warm", () => {
+    expect(prewarmIndex(items, 1, 1, health(0, 1, 2), opts)).toBeUndefined(); // next is an image
+  });
+
+  test("an UNPROVEN next video is not warmed (probe first, fetch second)", () => {
+    expect(prewarmIndex(items, 0, 0, health(0, 2), opts)).toBeUndefined();
+  });
+
+  test("the entry already on the glass is never 'warmed' twice", () => {
+    const two = [video("https://v.test/b.mp4", 30), image("https://dead.test/2.png", 30)];
+    // Slot 1 is dead, so the next slot would show entry 0 — which IS the live one. Nothing to warm.
+    expect(prewarmIndex(two, 0, 0, health(0), opts)).toBeUndefined();
+  });
+
+  test("a single-entry playlist never warms anything", () => {
+    expect(prewarmIndex([items[1]!], 0, 0, health(0), opts)).toBeUndefined();
   });
 });

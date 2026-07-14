@@ -60,8 +60,9 @@ import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle } from "./surface-style";
 import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
-import { MediaCache } from "./media-cache";
+import { MediaCache, wantedMediaFor } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
+import { detectGpuAccelerated } from "./gpu";
 import { openIdbMediaStore } from "./media-cache-idb";
 import { loadLastSlice, saveLastSlice } from "./last-slice";
 import IdleSplash from "./IdleSplash.vue";
@@ -148,17 +149,18 @@ let socket: PlayerSocket | undefined;
 const blobSrcs = ref<ReadonlyMap<string, string>>(new Map());
 let mediaCache: MediaCache | undefined;
 
-/** The media URLs the current surfaces want, resolved to what the box actually fetches. Uploaded
- *  control-plane media (`/media/<id>`) is immutable by construction (a re-upload mints a new id),
- *  so it caches forever; anything else revalidates in the background. */
+/** The media URLs the current surfaces want, resolved to what the box actually fetches — INCLUDING a
+ *  playlist's image/video entries (POL-110), which POL-34 left out: a rotation was the one surface
+ *  that changed content by itself and the one with no local copy to change to. */
 function wantedMedia(): WantedMedia[] {
-  const wanted: WantedMedia[] = [];
-  for (const surface of surfaces.value) {
-    if (surface.type !== "image" && surface.type !== "video") continue;
-    const url = resolveMediaSrc(surface.src, SERVER_HTTP_BASE);
-    wanted.push({ url, immutable: url.startsWith(`${SERVER_HTTP_BASE}/media/`) });
-  }
-  return wanted;
+  return wantedMediaFor(surfaces.value, SERVER_HTTP_BASE, resolveMediaSrc);
+}
+
+/** POL-110 — the same media resolution the top-level surfaces get (re-home + prefer the cached blob),
+ *  handed to the rotator so a playlist entry and a plain media surface share ONE cache and one path. */
+function resolveEntrySrc(rawUrl: string): string {
+  const resolved = resolveMediaSrc(rawUrl, SERVER_HTTP_BASE);
+  return blobSrcs.value.get(resolved) ?? resolved;
 }
 
 /**
@@ -282,10 +284,11 @@ const prober = new SurfaceProber({
 });
 
 /** What each on-screen surface will actually fetch — the exact URLs the prober must prove.
- *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
- *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
- *  (POL-42) are excluded for the same reason: a page renders locally (text/clock/shapes need no
- *  network) and its embeds carry send-time-resolved data with their own calm placeholders. */
+ *  Playlist surfaces are excluded HERE because a rotation has no single URL: since POL-110 the rotator
+ *  runs its OWN SurfaceProber with one target per entry (same class, not a fork), so every entry is
+ *  proven before it paints and a dead one is skipped. Page surfaces (POL-42) are excluded because a
+ *  page renders locally (text/clock/shapes need no network) and its embeds carry send-time-resolved
+ *  data with their own calm placeholders. */
 const probeTargets = computed(() =>
   surfaces.value
     .filter((s) => s.type !== "playlist" && s.type !== "page")
@@ -306,23 +309,32 @@ function onContentLoad(id: string, kind: string): void {
  *  deterministic signal the first watchdog never listened for — the broken-image boot, seen. */
 function onContentError(id: string, kind: string): void {
   diag(`${id}: ${kind} FAILED to load (element error event)`);
-  // POL-32 — if what failed is a CACHED blob (torn write, corrupt download), re-proving it would
-  // succeed forever (a local fetch can't fail) and re-paint the corpse. Drop the cache entry so the
-  // prober's re-prove falls back to the network URL and a fresh download.
-  const shown = painted[id];
-  if (shown?.startsWith("blob:")) {
-    for (const [url, objectUrl] of blobSrcs.value) {
-      if (objectUrl !== shown) continue;
-      const next = new Map(blobSrcs.value);
-      next.delete(url);
-      blobSrcs.value = next;
-      void mediaCache?.discard(url);
-      diag(`${id}: cached copy failed to decode — dropped ${redactUrl(url)} from the cache`);
-      break;
-    }
-  }
+  dropCachedBlob(painted[id], id);
   prober.elementError(id);
 }
+
+/**
+ * POL-32 — the element that failed was showing a CACHED blob (torn write, corrupt download): re-proving
+ * it would succeed forever (a local fetch can't fail) and re-paint the corpse. Drop the cache entry so
+ * the next probe falls back to the network URL and a fresh download. Shared with the playlist rotator
+ * (POL-110), whose entries live in the same cache.
+ */
+function dropCachedBlob(shown: string | undefined, who: string): void {
+  if (!shown?.startsWith("blob:")) return;
+  for (const [url, objectUrl] of blobSrcs.value) {
+    if (objectUrl !== shown) continue;
+    const next = new Map(blobSrcs.value);
+    next.delete(url);
+    blobSrcs.value = next;
+    void mediaCache?.discard(url);
+    diag(`${who}: cached copy failed to decode — dropped ${redactUrl(url)} from the cache`);
+    return;
+  }
+}
+
+// POL-110/D66 — may this box be animated on? Answered once, locally (WebGL renderer string): a
+// software-rasterising box NEVER crossfades, whatever the fleet setting says. See gpu.ts.
+const gpuAccelerated = ref(false);
 
 // Browser network hints — demoted from reload-triggers to probe-triggers. Any of them means
 // in-flight loads may have been killed; the prober re-proves every surface and heals what it must.
@@ -344,6 +356,12 @@ function onResourceError(event: Event): void {
 }
 
 onMounted(() => {
+  const gpu = detectGpuAccelerated();
+  gpuAccelerated.value = gpu.accelerated;
+  diag(
+    `renderer: ${gpu.renderer ?? "unknown"} — ${gpu.accelerated ? "GPU-accelerated" : "SOFTWARE (no crossfade; D66)"}`,
+  );
+
   window.addEventListener("online", onOnline);
   window.addEventListener("offline", onOffline);
   window.addEventListener("error", onResourceError, true);
@@ -555,12 +573,16 @@ function connLabel(state: ConnState): string {
       class="surface"
       :style="regionStyle(surface.region, canvas)"
     >
-      <!-- POL-34: the rotator owns its own elements and timers, and renders ungated (a rotation
-           has no single URL for the prober to prove; each entry swap is local). -->
+      <!-- POL-34/POL-110: the rotator owns its own elements and timers, and probes EACH entry with its
+           own SurfaceProber — a dead entry is skipped, never painted. Media entries share this page's
+           blob cache through `resolve-src`, and the crossfade is gated on this box's real renderer. -->
       <PlaylistRotator
         v-if="surface.type === 'playlist'"
         :surface="surface"
         :server-http-base="SERVER_HTTP_BASE"
+        :resolve-src="resolveEntrySrc"
+        :gpu-accelerated="gpuAccelerated"
+        @media-error="(src: string) => dropCachedBlob(src, surface.id)"
       />
       <!-- POL-42: a page renders locally through the shared elements package (the Studio previews
            with the SAME renderer). Ungated like the rotator — its embeds arrive with send-time

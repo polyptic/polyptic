@@ -164,11 +164,29 @@ export const PlaylistEntry = z.object({
 });
 export type PlaylistEntry = z.infer<typeof PlaylistEntry>;
 
+/** POL-110 — how one entry gives way to the next. `cut` is the default and always works; `crossfade`
+ *  animates opacity, which D66 forbids on a software-rendering box (the fallback drops promoted layers
+ *  and pegs a core), so the PLAYER hard-cuts anyway unless it can prove it is GPU-accelerated. */
+export const PlaylistTransition = z.enum(["cut", "crossfade"]);
+export type PlaylistTransition = z.infer<typeof PlaylistTransition>;
+
 export const PlaylistSurface = SurfaceBase.extend({
   type: z.literal("playlist"),
   /** The resolved rotation, in order. May be empty if every referenced source was since deleted —
    *  the player treats an empty playlist as nothing to show. */
   items: z.array(PlaylistEntry),
+  /** POL-110 — transition between entries. Defaults to the hard cut: the only transition that is
+   *  safe on every box we ship to (see PlaylistTransition). */
+  transition: PlaylistTransition.default("cut"),
+  /** POL-110 — crossfade length in ms (ignored for `cut`). Short by design: a wall is not a slideshow
+   *  app, and a long fade means both entries are composited for longer. */
+  transitionMs: z.number().int().min(100).max(5000).default(400),
+  /** POL-110 — buffer the NEXT entry's video shortly before its slot. Bounded to one element at a
+   *  time and never played, so at most one decoder is ever live (D84's kiosk-GPU worry); operators
+   *  who still don't want it turn it off fleet-wide. */
+  prewarmVideo: z.boolean().default(true),
+  /** POL-110 — how long before an entry's slot its video starts buffering. */
+  prewarmLeadMs: z.number().int().min(1000).max(60000).default(6000),
   /** ISO instant the playlist was (re-)assigned — the rotation anchor. A fully-TIMED playlist derives
    *  its current entry from (now − startedAt) mod cycle, so wall members stay in phase with each other
    *  and a rebooting box rejoins the rotation mid-cycle instead of restarting it. A playlist with any
