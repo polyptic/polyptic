@@ -21,6 +21,13 @@
  *   POST /api/v1/machines/:machineId/reboot   -> server/reboot to a connected, approved agent;
  *                                                404 unknown; 409 not-approved or offline
  *
+ * POL-103 tags + selector-targeted bulk operations:
+ *   PUT  /api/v1/machines/:machineId/tags     -> replace a machine's whole tag set; 404 unknown
+ *   POST /api/v1/machines/bulk/reboot         -> each takes {selector} (e.g. "tag=atrium") or
+ *   POST /api/v1/machines/bulk/shell             {machineIds}, fans out, and answers a per-machine
+ *   POST /api/v1/machines/bulk/ident             result list. Offline boxes are an OUTCOME, not a
+ *   POST /api/v1/machines/bulk/approve           failed call. 400 if no target is named.
+ *
  * POL-50 operator route:
  *   POST /api/v1/screens/:screenId/inspect    -> server/inspect: pop the kiosk browser's Web Inspector
  *                                                ON that panel; 202 delivered (the agent's ack decides
@@ -32,6 +39,11 @@ import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
 
 import {
+  BulkApproveBody,
+  BulkIdentBody,
+  BulkOpResponse,
+  BulkRebootBody,
+  BulkShellBody,
   CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
@@ -54,6 +66,7 @@ import {
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetMachineTagsBody,
   SetZoomBody,
   Surface,
   UpdateContentSourceBody,
@@ -62,7 +75,9 @@ import {
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
-import type { Screen, ScreenSlice } from "@polyptic/protocol";
+import type { BulkMachineResult, Screen, ScreenSlice } from "@polyptic/protocol";
+
+import { appliedCount, fanOut, resolveTarget, unknownIdResults } from "./bulk";
 
 import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
 
@@ -103,6 +118,11 @@ function playlistItemErrorDetail(
       return `playlist items that are not videos need a duration (${itemSourceId})`;
   }
 }
+/** "1 machine" / "12 machines" — a bulk op leaves ONE activity line, and it counts the blast radius. */
+function countMachines(n: number): string {
+  return `${n} ${n === 1 ? "machine" : "machines"}`;
+}
+
 const CredentialProfileParams = z.object({ id: z.string().min(1) });
 const SceneParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
@@ -486,6 +506,221 @@ export function registerRestRoutes(
       body.data.enabled ? "remote shell armed" : "remote shell disarmed",
     );
     return { ok: true, machineId: machine.id, shellEnabled: machine.shellEnabled ?? false };
+  });
+
+  // ── Tags + selector-targeted bulk operations (POL-103) ──────────────────────
+  //
+  // At fifty boxes every fleet action is fifty clicks. Tags group them ("atrium", "floor:2",
+  // "canary"); a selector (`tag=atrium`, or an AND: `tag=floor:2,tag=canary`) targets a whole group;
+  // the bulk verbs below fan out over it and answer a RESULT PER MACHINE. Three offline boxes are a
+  // reported outcome, not a failed call — partial success is the normal case at this scale.
+  //
+  // Every bulk body must NAME its target (a selector, or an explicit machineIds list). A bulk verb
+  // with no target is a 400 and never means "the whole fleet"; likewise a selector that parses but
+  // matches nothing is an honest `matched: 0`, not a fan-out over everything.
+
+  // PUT /api/v1/machines/:machineId/tags  { tags }  -> replace the machine's whole tag set
+  fastify.put("/api/v1/machines/:machineId/tags", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetMachineTagsBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = await control.setMachineTags(params.data.machineId, body.data.tags);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.tags", machineId: machine.id, tags: machine.tags },
+      "machine tags set",
+    );
+    return { ok: true, machineId: machine.id, tags: machine.tags };
+  });
+
+  /** The one shape every bulk verb answers with (+ its single summarized activity line). */
+  function bulkReply(
+    action: string,
+    target: string,
+    results: BulkMachineResult[],
+    summary: (applied: number) => string,
+  ): unknown {
+    const applied = appliedCount(results);
+    if (applied > 0) activity.push("accent", summary(applied));
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: `machines.bulk.${action}`, target, matched: results.length, applied },
+      "bulk operation fanned out",
+    );
+    return BulkOpResponse.parse({
+      ok: true,
+      action,
+      target,
+      matched: results.length,
+      applied,
+      results,
+    });
+  }
+
+  // POST /api/v1/machines/bulk/reboot  { selector | machineIds, reason? }
+  fastify.post("/api/v1/machines/bulk/reboot", async (request, reply) => {
+    const body = BulkRebootBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const reason = body.data.reason?.trim() || "requested by an operator from the console";
+    const results = await fanOut(resolved.machines, (machine) => {
+      if (machine.status !== "approved") {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "skipped" as const,
+          detail: `${machine.status}, not approved — cannot reboot it`,
+        };
+      }
+      const delivered = agentHub.send(
+        machine.id,
+        ServerToAgentReboot.parse({ t: "server/reboot", reason }),
+      );
+      return delivered === 0
+        ? {
+            machineId: machine.id,
+            label: machine.label,
+            outcome: "offline" as const,
+            detail: "offline — nothing to reboot",
+          }
+        : { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply("reboot", resolved.target, results, (n) => `Rebooting ${countMachines(n)}`);
+  });
+
+  // POST /api/v1/machines/bulk/shell  { selector | machineIds, enabled }  -> arm/disarm a group
+  fastify.post("/api/v1/machines/bulk/shell", async (request, reply) => {
+    const body = BulkShellBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const enabled = body.data.enabled;
+    const results = await fanOut(resolved.machines, async (machine) => {
+      const updated = await control.setShellEnabled(machine.id, enabled);
+      if (!updated) {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "failed" as const,
+          detail: "unknown machine — it may have been removed",
+        };
+      }
+      // Disarming must not leave a terminal open on a box the operator just locked down.
+      if (!enabled) shellRelay.closeMachineSessions(machine.id, "console disabled");
+      return { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply(
+      "shell",
+      resolved.target,
+      results,
+      (n) => `Console ${enabled ? "enabled" : "disabled"} on ${countMachines(n)}`,
+    );
+  });
+
+  // POST /api/v1/machines/bulk/ident  { selector | machineIds, on, ttlMs? }  -> ident a whole group
+  fastify.post("/api/v1/machines/bulk/ident", async (request, reply) => {
+    const body = BulkIdentBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const { on, ttlMs } = body.data;
+    const results = await fanOut(resolved.machines, (machine) => {
+      const screens = control.getScreens().filter((s) => s.machineId === machine.id);
+      if (screens.length === 0) {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "skipped" as const,
+          detail: "no screens yet — nothing to flash",
+        };
+      }
+      let delivered = 0;
+      for (const screen of screens) {
+        delivered += sendIdentPulse(screen, on);
+        if (on && ttlMs) scheduleIdentOff(screen.id, ttlMs);
+      }
+      return delivered === 0
+        ? {
+            machineId: machine.id,
+            label: machine.label,
+            outcome: "offline" as const,
+            detail: "no player connected — nothing to flash",
+          }
+        : { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply("ident", resolved.target, results, (n) => `Ident pulsed on ${countMachines(n)}`);
+  });
+
+  // POST /api/v1/machines/bulk/approve  { selector | machineIds }  -> admit a batch of pending boxes
+  fastify.post("/api/v1/machines/bulk/approve", async (request, reply) => {
+    const body = BulkApproveBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const results = await fanOut(resolved.machines, async (machine) => {
+      if (machine.status === "approved") {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "skipped" as const,
+          detail: "already approved",
+        };
+      }
+      const result = await control.approveMachine(machine.id);
+      if (!result) {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "failed" as const,
+          detail: "unknown machine — it may have been removed",
+        };
+      }
+      // Live admit: if the agent is connected NOW, push it server/apply for its (new) screens. An
+      // offline box is still APPROVED — it collects its state on its next hello, so this is not an
+      // `offline` outcome, unlike a reboot that was never delivered.
+      agentHub.send(
+        machine.id,
+        ServerToAgentApply.parse({
+          t: "server/apply",
+          revision: control.state.revision,
+          machineId: machine.id,
+          screens: result.assignments,
+        }),
+      );
+      return { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply("approve", resolved.target, results, (n) => `Approved ${countMachines(n)}`);
   });
 
   // POST /api/v1/screens/:screenId/inspect  { on }  -> pop the Web Inspector ON that panel (POL-50)

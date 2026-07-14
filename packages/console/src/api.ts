@@ -7,6 +7,10 @@
  * Phase 3 murals & placement and Phase 3b combined surfaces (walls + content).
  */
 import {
+  BulkApproveBody,
+  BulkIdentBody,
+  BulkRebootBody,
+  BulkShellBody,
   CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
@@ -20,12 +24,14 @@ import {
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
+  SetMachineTagsBody,
   SetZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type {
+  BulkOpResponse,
   ContentSource,
   CredentialProfileTestResult,
   CredentialProfileView,
@@ -237,6 +243,44 @@ export function rebootMachine(machineId: string): Promise<unknown> {
 /** Arm or disarm a box for the remote shell (POL-59). */
 export function setMachineShell(machineId: string, enabled: boolean): Promise<unknown> {
   return send("POST", `/machines/${encodeURIComponent(machineId)}/shell`, { enabled });
+}
+
+// ── Tags + selector-targeted bulk operations (POL-103) ──────────────────────
+
+/** PUT /api/v1/machines/:machineId/tags — replace the machine's whole tag set (add == remove). */
+export function setMachineTags(machineId: string, tags: string[]): Promise<{ tags: string[] }> {
+  return send(
+    "PUT",
+    `/machines/${encodeURIComponent(machineId)}/tags`,
+    SetMachineTagsBody.parse({ tags }),
+  );
+}
+
+/** What a bulk verb targets: a tag selector (`tag=atrium`) or the checkbox selection. Never both. */
+export type BulkTarget = { selector: string } | { machineIds: string[] };
+
+/**
+ * The bulk verbs (POL-103). Each answers a per-machine result list — an offline box is an OUTCOME,
+ * never a failed call — so the caller can tell the operator exactly what landed and what did not.
+ */
+export function bulkReboot(target: BulkTarget, reason?: string): Promise<BulkOpResponse> {
+  return send("POST", "/machines/bulk/reboot", BulkRebootBody.parse({ ...target, reason }));
+}
+
+export function bulkShell(target: BulkTarget, enabled: boolean): Promise<BulkOpResponse> {
+  return send("POST", "/machines/bulk/shell", BulkShellBody.parse({ ...target, enabled }));
+}
+
+export function bulkIdent(target: BulkTarget): Promise<BulkOpResponse> {
+  return send(
+    "POST",
+    "/machines/bulk/ident",
+    BulkIdentBody.parse({ ...target, on: true, ttlMs: 3000 }),
+  );
+}
+
+export function bulkApprove(target: BulkTarget): Promise<BulkOpResponse> {
+  return send("POST", "/machines/bulk/approve", BulkApproveBody.parse(target));
 }
 
 /**

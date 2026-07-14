@@ -25,6 +25,7 @@ import {
   ContentSource,
   DashboardSurface,
   ImageSurface,
+  normalizeTag,
   PlaylistSurface,
   PageSurface,
   Scene,
@@ -361,6 +362,7 @@ export class ControlPlane {
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
+      tags: machine.tags ?? [],
     };
   }
 
@@ -385,6 +387,8 @@ export class ControlPlane {
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
         shellArmedAt: m.shellArmedAt,
+        // POL-103 — legacy rows have no tags column value; they load untagged.
+        tags: m.tags ?? [],
       });
       if (m.credentialHash) this.credentialHashes.set(m.id, m.credentialHash);
     }
@@ -763,6 +767,9 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
+      // anything the box reports about itself.
+      tags: existing?.tags ?? [],
     };
     this.machines.set(input.machineId, machine);
 
@@ -797,6 +804,9 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
+      // anything the box reports about itself.
+      tags: existing?.tags ?? [],
     };
     this.machines.set(input.machineId, machine);
     await this.store.upsertMachine(this.toPersistedMachine(machine));
@@ -865,6 +875,34 @@ export class ControlPlane {
     await this.store.setMachineStatus(machineId, "rejected");
     this.emit("bad", `${machine.label} rejected`);
     return true;
+  }
+
+  /**
+   * POL-103 — replace a machine's whole tag set. Registry state, like a rename: it changes nothing a
+   * player or an agent renders, so it does NOT bump the revision (a tag edit must not restate the
+   * fleet's desired state). Tags are normalized (trimmed + lowercased) and de-duplicated, so
+   * "Atrium " and "atrium" are the same tag and a selector can never miss a box on casing.
+   * Returns the machine, or null if it is unknown.
+   */
+  async setMachineTags(machineId: string, tags: string[]): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+
+    const next: string[] = [];
+    for (const raw of tags) {
+      const tag = normalizeTag(raw);
+      if (tag !== "" && !next.includes(tag)) next.push(tag);
+    }
+    machine.tags = next;
+    await this.store.setMachineTags(machineId, next);
+
+    this.emit(
+      "info",
+      next.length > 0
+        ? `${machine.label} tagged ${next.join(", ")}`
+        : `${machine.label} untagged`,
+    );
+    return machine;
   }
 
   /**

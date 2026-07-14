@@ -23,6 +23,7 @@ import {
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
+  MachineTags,
   Output,
   PlaylistItem,
   Surface,
@@ -64,6 +65,7 @@ interface MachineRow {
   last_seen: Date | null;
   shell_enabled: boolean | null;
   shell_armed_at: Date | null;
+  tags: unknown;
 }
 
 interface ScreenRow {
@@ -221,6 +223,9 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS credential_hash text`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_enabled boolean NOT NULL DEFAULT false`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_armed_at timestamptz`;
+    // POL-103 — operator tags. jsonb, not a join table: a tag set is small, always read whole, and
+    // only ever replaced whole; a `machine_tags` table would buy nothing but a second write path.
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS tags jsonb NOT NULL DEFAULT '[]'::jsonb`;
     await sql`
       CREATE TABLE IF NOT EXISTS screens (
         id            text PRIMARY KEY,
@@ -453,7 +458,7 @@ export class PostgresStore implements Store {
       credentialProfileRows,
       zoomPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
@@ -482,6 +487,8 @@ export class PostgresStore implements Store {
         lastSeen: row.last_seen ? row.last_seen.toISOString() : undefined,
         shellEnabled: row.shell_enabled ?? false,
         shellArmedAt: row.shell_armed_at ? row.shell_armed_at.toISOString() : undefined,
+        // POL-103 — legacy rows (NULL) and anything unrecognised load as untagged.
+        tags: MachineTags.safeParse(row.tags).data ?? [],
       };
     });
 
@@ -588,7 +595,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -599,7 +606,8 @@ export class PostgresStore implements Store {
         ${machine.credentialHash ?? null},
         ${machine.lastSeen ? new Date(machine.lastSeen) : null},
         ${machine.shellEnabled ?? false},
-        ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null}
+        ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null},
+        ${sql.json(machine.tags ?? [])}
       )
       ON CONFLICT (id) DO UPDATE SET
         label           = EXCLUDED.label,
@@ -610,8 +618,14 @@ export class PostgresStore implements Store {
         credential_hash = EXCLUDED.credential_hash,
         last_seen       = EXCLUDED.last_seen,
         shell_enabled   = EXCLUDED.shell_enabled,
-        shell_armed_at  = EXCLUDED.shell_armed_at
+        shell_armed_at  = EXCLUDED.shell_armed_at,
+        tags            = EXCLUDED.tags
     `;
+  }
+
+  async setMachineTags(id: string, tags: string[]): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET tags = ${sql.json(tags)} WHERE id = ${id}`;
   }
 
   async setMachineStatus(id: string, status: EnrollmentStatus): Promise<void> {
