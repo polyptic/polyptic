@@ -17,7 +17,12 @@
  */
 import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
+import type {
+  MachineView,
+  PanelPowerMethod,
+  ScreenView,
+  ServerToAdminMessage,
+} from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
@@ -72,6 +77,13 @@ export class Presence {
    *  machine reconnects, and expired after REBOOTING_TTL_MS so a box that dies mid-reboot doesn't
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
+
+  /** POL-101 — screenIds whose panel is ASLEEP, with the rungs that got it there. Ephemeral by
+   *  design: a box that drops comes back with its panels LIT (the compositor re-asserts `dpms on` at
+   *  startup), so a remembered "asleep" would be a lie the operator can't see through. */
+  private readonly asleep = new Map<string, PanelPowerMethod[]>();
+  /** POL-101 — screenId → why the box last refused a power request (same role as `inspectErrors`). */
+  private readonly powerErrors = new Map<string, string>();
 
   /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
   private static readonly REBOOTING_TTL_MS = 3 * 60_000;
@@ -160,6 +172,49 @@ export class Presence {
       this.inspectErrors.delete(id);
     }
   }
+
+  /**
+   * POL-101 — record a panel's power state. Written ONLY from the agent's `agent/power-ack`: the
+   * operator's click is a request, the box's answer is the truth. A screen that is not in the map is
+   * awake, which is the safe default — the console must never show a wall as dark when it might be lit.
+   */
+  setScreenAsleep(screenId: string, asleep: boolean, methods: PanelPowerMethod[] = []): void {
+    if (asleep) this.asleep.set(screenId, methods);
+    else this.asleep.delete(screenId);
+  }
+
+  isScreenAsleep(screenId: string): boolean {
+    return this.asleep.has(screenId);
+  }
+
+  /** How the panel was slept (`["dpms"]` = the output is dark; `["dpms","cec"]` = the display is off). */
+  screenPowerMethods(screenId: string): PanelPowerMethod[] | undefined {
+    return this.asleep.get(screenId);
+  }
+
+  /** POL-101 — why the box last refused a power request (or `null` to clear a stale one). */
+  setScreenPowerError(screenId: string, reason: string | null): void {
+    if (reason === null) this.powerErrors.delete(screenId);
+    else this.powerErrors.set(screenId, reason);
+  }
+
+  screenPowerError(screenId: string): string | undefined {
+    return this.powerErrors.get(screenId);
+  }
+
+  /**
+   * POL-101 — forget the power state for these screens: their machine dropped. A box that comes back
+   * has LIT panels (the compositor asserts `output * dpms on` at startup), so keeping "asleep" across
+   * a drop would strand the console showing a dark wall that is, in fact, showing content. The
+   * scheduler re-applies the desired state on the box's next hello, which is what re-sleeps a screen
+   * that rebooted outside its panel hours.
+   */
+  clearScreensPower(screenIds: readonly string[]): void {
+    for (const id of screenIds) {
+      this.asleep.delete(id);
+      this.powerErrors.delete(id);
+    }
+  }
 }
 
 /**
@@ -191,6 +246,12 @@ export function buildAdminState(
           content: control.screenContentSummary(s.id),
           inspecting: presence.isScreenInspecting(s.id),
           inspectError: presence.screenInspectError(s.id),
+          // POL-101 — asleep is NOT offline: the player is still connected, still holding its slice,
+          // and the box is healthy. The console renders the two differently, deliberately.
+          asleep: presence.isScreenAsleep(s.id),
+          powerMethods: presence.screenPowerMethods(s.id),
+          powerError: presence.screenPowerError(s.id),
+          panelHours: control.getPanelHours(s.id),
         } satisfies ScreenView;
       });
 
@@ -208,6 +269,7 @@ export function buildAdminState(
       shellEnabled: machine.shellEnabled ?? false,
       rebooting: presence.isMachineRebooting(machine.id),
       shellArmedAt: machine.shellArmedAt,
+      power: machine.power, // POL-101 — dpms / cec, as the box itself reported it
       screens: machineScreens,
     } satisfies MachineView;
   });
@@ -223,6 +285,7 @@ export function buildAdminState(
     scenes: control.getScenes(),
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
+    panelPower: control.getPanelPowerConfig(), // POL-101 — the panel-hours timezone
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
   });
 }

@@ -296,6 +296,22 @@ export interface PersistedDisplaySettings {
   showBadges: boolean;
 }
 
+/**
+ * Panel power (POL-101): the deployment's timezone plus each screen's daily on/off window. ONE row,
+ * because that is genuinely all this is — a per-screen window and the zone to read it in. Kept
+ * deliberately small: the full recurrence machinery belongs to the scene scheduler, and the two are
+ * meant to converge (D100), so this must not grow a private calendar in the meantime.
+ *
+ * Absent until an operator first sets panel hours; a deployment that never does keeps its walls on
+ * 24/7, exactly as before POL-101.
+ */
+export interface PersistedPanelPower {
+  /** IANA zone the windows are read in ("Europe/London"). Explicit — never the server's own TZ. */
+  timezone: string;
+  /** screenId → its daily window. A screen with no entry is never touched by the scheduler. */
+  hours: Record<string, { enabled: boolean; on: string; off: string }>;
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -466,6 +482,12 @@ export interface Store {
   getDisplaySettings(): Promise<PersistedDisplaySettings | undefined>;
   /** Persist the fleet-wide display settings (single row). */
   setDisplaySettings(settings: PersistedDisplaySettings): Promise<void>;
+
+  // ── Panel power (POL-101) ──────────────────────────────────────────────────
+  /** The persisted panel-power config (timezone + per-screen hours). Undefined until first set. */
+  getPanelPower(): Promise<PersistedPanelPower | undefined>;
+  /** Replace the panel-power config (single row). */
+  setPanelPower(power: PersistedPanelPower): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

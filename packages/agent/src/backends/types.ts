@@ -9,7 +9,11 @@
  * The agent stays unprivileged and dumb: it never decides *what* to show (the control plane
  * does that and pushes content straight to the player), only *where* a player lives.
  */
-import type { DisplayBackend as BackendId } from "@polyptic/protocol";
+import type {
+  DisplayBackend as BackendId,
+  PanelPowerMethod,
+  PowerCapabilities,
+} from "@polyptic/protocol";
 
 export interface DisplayBackend {
   /** Which `DisplayBackend` enum value this implementation reports in `agent/hello`. */
@@ -49,6 +53,23 @@ export interface DisplayBackend {
    * in depth under the server's own gate.
    */
   devtoolsEndpoint(connector: string): { port: number } | null;
+
+  /**
+   * POL-101 — what this box can do about panel power, probed once at startup and reported on hello:
+   * DPMS on any real compositor, CEC only where an adapter is present. `dev-open` reports neither.
+   */
+  powerCapabilities(): Promise<PowerCapabilities>;
+
+  /**
+   * POL-101 — sleep (`on: false`) or wake (`on: true`) the panel driven by `connector`, returning the
+   * rungs that were actually applied (`["dpms"]`, or `["dpms","cec"]` on a box with a CEC adapter).
+   *
+   * ONLY ever called for an explicit operator action or a panel-hours boundary the operator set —
+   * never on idleness. The player underneath is left running, so waking puts the existing content back
+   * on the glass with no reload. Throws when the panel could not be powered (a dev backend, no
+   * compositor, a connector nothing is placed on), and the reason reaches the operator on the ack.
+   */
+  setPower(connector: string, on: boolean): Promise<PanelPowerMethod[]>;
 
   /** Grab a thumbnail of `connector`, or `null` if this backend can't capture. */
   capture(connector: string): Promise<Buffer | null>;

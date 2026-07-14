@@ -28,6 +28,8 @@ import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
+import { useScreenPower, powerMethodLabel, type PowerTarget } from "../usePanelPower";
+import type { PanelHours } from "@polyptic/protocol";
 import ZoomControl from "./ZoomControl.vue";
 
 const store = useConsoleStore();
@@ -182,11 +184,16 @@ const statusLabel = computed(() => {
   const s = single.value;
   if (!s) return "";
   if (identingSingle.value) return "Identing…";
+  // POL-101 — asleep is a THIRD status, between connected and unreachable, and it is not a fault: the
+  // player is still connected and still holding its content; the glass is dark on purpose. An operator
+  // who reads "Unreachable" here goes and checks a cable that is fine.
+  if (s.asleep) return "Asleep";
   return s.online ? "Connected" : "Unreachable";
 });
 const statusColor = computed(() => {
   const s = single.value;
   if (!s) return "var(--ok)";
+  if (s.asleep) return "var(--accent)";
   return s.online ? "var(--ok)" : "var(--bad)";
 });
 const machineName = computed(() => {
@@ -242,6 +249,90 @@ const inspectItemLabel = computed(() => {
   if (isChrome.value) return inspecting.value ? "Disarm DevTools" : "Open DevTools";
   return inspecting.value ? "Close on-panel inspector" : "Inspect on panel";
 });
+
+// ── Panel power + panel hours (POL-101) ──────────────────────────────────────
+// Wake/sleep rides the same ack-driven composable as the Machines view, so the Inspector can never
+// claim a panel is dark before the box has said so. The hours editor below it is the whole schedule
+// UI: ONE daily window per screen, in the deployment's timezone. That is a deliberate floor, not an
+// oversight — full recurrence belongs to the scene scheduler, and the two are meant to converge.
+const powerTarget = computed<PowerTarget | undefined>(() => {
+  const s = single.value;
+  if (!s) return undefined;
+  const m = store.machineForScreen(s.id);
+  return {
+    screen: s,
+    machineLabel: m?.label ?? s.machineId,
+    machineOnline: m?.online === true,
+    power: m?.power,
+  };
+});
+const {
+  asleep,
+  pending: powerPending,
+  supported: powerSupported,
+  disabled: powerDisabled,
+  title: powerTitle,
+  toggle: togglePower,
+} = useScreenPower(powerTarget, {
+  setPower: (id, on) => store.setScreenPower(id, on),
+  notify: showNotice,
+});
+const powerLabel = computed(() => {
+  if (powerPending.value) return asleep.value ? "Waking…" : "Sleeping…";
+  return asleep.value ? "Wake panel" : "Sleep panel";
+});
+const powerDetail = computed(() =>
+  asleep.value ? powerMethodLabel(single.value?.powerMethods) : "",
+);
+
+/** The deployment's zone, shown next to the times so "19:00" is never ambiguous. */
+const panelTimezone = computed(() => store.panelPower?.timezone ?? "");
+
+// The hours draft. Re-synced from the authoritative snapshot whenever the selection moves or the
+// server's value changes — but never while the operator is mid-edit, exactly like the rename field.
+const hoursEnabled = ref(false);
+const onDraft = ref("08:00");
+const offDraft = ref("18:00");
+const hoursEditing = ref(false);
+const hoursError = ref("");
+
+function syncHours(h: PanelHours | undefined): void {
+  hoursEnabled.value = h?.enabled ?? false;
+  onDraft.value = h?.on ?? "08:00";
+  offDraft.value = h?.off ?? "18:00";
+}
+watch(
+  () => [single.value?.id, single.value?.panelHours] as const,
+  ([, h]) => {
+    if (!hoursEditing.value) syncHours(h as PanelHours | undefined);
+  },
+  { immediate: true },
+);
+
+/** Save (or clear) the window. Clearing = the screen runs 24/7 and the scheduler never touches it. */
+async function saveHours(): Promise<void> {
+  const s = single.value;
+  if (!s) return;
+  hoursError.value = "";
+  if (hoursEnabled.value && onDraft.value === offDraft.value) {
+    hoursError.value = "The on and off times must differ.";
+    return;
+  }
+  const hours: PanelHours | null = hoursEnabled.value
+    ? { enabled: true, on: onDraft.value, off: offDraft.value }
+    : null;
+  const error = await store.setScreenPanelHours(s.id, hours);
+  hoursEditing.value = false;
+  if (error) {
+    hoursError.value = error;
+    return;
+  }
+  showNotice(
+    hours
+      ? `Panel hours saved — ${hours.on}–${hours.off} (${panelTimezone.value})`
+      : "Panel hours cleared — this screen runs 24/7",
+  );
+}
 function launchInspect(): void {
   menuOpen.value = false;
   void toggleInspect();
@@ -459,6 +550,64 @@ function selectOne(id: string) {
         <span class="dot accent"></span>
         {{ identingSingle ? "Flashing on wall…" : "Ident — flash on wall" }}
       </button>
+
+      <!-- Panel power (POL-101). Only for a box that reported it can drive DPMS — a dev backend has
+           no panel, and a pre-POL-101 agent has told us nothing, so we offer nothing rather than a
+           button that will fail. -->
+      <template v-if="powerSupported">
+        <div class="section-label gap-top">Panel</div>
+        <button
+          class="power-btn"
+          :class="{ asleep, pending: powerPending }"
+          :disabled="powerDisabled"
+          :title="powerTitle"
+          :aria-pressed="asleep"
+          @click="togglePower"
+        >
+          <span class="power-glyph" aria-hidden="true">{{ asleep ? "☀" : "☾" }}</span>
+          {{ powerLabel }}
+        </button>
+        <!-- The honest half: DPMS alone leaves plenty of panels lit-but-black. An operator standing
+             in front of one should know that is expected, not a fault. -->
+        <p v-if="asleep" class="power-detail">{{ powerDetail }}</p>
+
+        <div class="hours">
+          <label class="hours-toggle">
+            <input
+              v-model="hoursEnabled"
+              type="checkbox"
+              @change="hoursEditing = true"
+            />
+            <span>Panel hours</span>
+          </label>
+          <div v-if="hoursEnabled" class="hours-row">
+            <input
+              v-model="onDraft"
+              class="time-input"
+              type="time"
+              aria-label="Wake at"
+              @focus="hoursEditing = true"
+            />
+            <span class="hours-dash">→</span>
+            <input
+              v-model="offDraft"
+              class="time-input"
+              type="time"
+              aria-label="Sleep at"
+              @focus="hoursEditing = true"
+            />
+          </div>
+          <p class="hours-caption">
+            <template v-if="hoursEnabled">
+              Wakes and sleeps daily, in {{ panelTimezone || "the deployment timezone" }}. In hours it
+              is never blanked; out of hours the panel powers down.
+            </template>
+            <template v-else> No schedule — this screen runs 24/7. </template>
+          </p>
+          <p v-if="hoursError" class="hours-error">{{ hoursError }}</p>
+          <button class="hours-save" @click="saveHours">Save panel hours</button>
+        </div>
+      </template>
 
       <div class="section-label">Content</div>
       <div v-if="hasContent" class="content-card">
@@ -780,6 +929,113 @@ function selectOne(id: string) {
   padding: 2px 7px;
 }
 
+/* ── Panel power (POL-101) ───────────────────────────────────────────────────
+   Cool + calm, sharing the accent (never the "bad" red): a sleeping panel is healthy. */
+.power-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+}
+.power-btn:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.power-btn.asleep {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.power-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.power-btn.pending {
+  cursor: progress;
+}
+.power-glyph {
+  font-size: 13px;
+}
+.power-detail {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted2);
+}
+.hours {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--muted-bg);
+}
+.hours-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg2);
+  cursor: pointer;
+}
+.hours-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.time-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12.5px;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.hours-dash {
+  color: var(--muted2);
+  font-size: 12px;
+}
+.hours-caption {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted2);
+}
+.hours-error {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--bad);
+}
+.hours-save {
+  margin-top: 8px;
+  width: 100%;
+  padding: 7px;
+  border-radius: 7px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg2);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+}
+.hours-save:hover {
+  background: var(--muted-bg);
+}
 .ident-btn {
   display: flex;
   align-items: center;

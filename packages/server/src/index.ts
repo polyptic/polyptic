@@ -34,6 +34,7 @@ import type { ServerTlsRuntime, TlsEnvConfig } from "./server-tls";
 import { PageDataService } from "./page-data";
 import { registerRestRoutes } from "./rest";
 import { DevtoolsRelay } from "./devtools-relay";
+import { PanelPowerScheduler } from "./panel-power";
 import { registerDevtoolsRoutes } from "./devtools-routes";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
@@ -304,6 +305,21 @@ registerAuthRoutes(fastify, auth, enrollment);
 // and handed to REST so disarming a screen closes its live sessions instantly.
 const devtoolsRelay = new DevtoolsRelay(agentHub, control, presence, activity, fastify.log);
 
+// POL-101 — panel power. The scheduler owns the daily on/off windows and is the only thing in the
+// server that can darken a wall; the WS layer reconciles a box's panels to their window when it says
+// hello (a box that reboots at 3am comes back LIT and must be re-slept), and REST drives the manual
+// wake/sleep. In hours, the only command it ever sends is WAKE: a screen that should be showing
+// content is never blanked.
+const panelPower = new PanelPowerScheduler({
+  control,
+  agentHub,
+  presence,
+  activity,
+  broadcaster,
+  log: fastify.log,
+});
+panelPower.start();
+
 // ── mTLS agent channel (POL-25): CA + dedicated TLS listener + the boot self-test. ──
 // The self-test is load-bearing, not paranoia: Bun ≤ 1.2 implemented `requestCert` as PRESENCE-only
 // (any cert from any CA passed the handshake, measured on 1.2.2). A server that cannot actually
@@ -370,6 +386,7 @@ const shellRelay = attachWebSockets({
   activity,
   capture,
   devtoolsRelay,
+  panelPower,
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
   agentMtls: agentMtlsChannel,
@@ -392,6 +409,7 @@ registerRestRoutes(
   presence,
   shellRelay,
   devtoolsRelay,
+  panelPower,
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);

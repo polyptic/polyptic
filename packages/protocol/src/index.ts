@@ -50,6 +50,71 @@ export type DisplayBackend = z.infer<typeof DisplayBackend>;
 export const KioskBrowser = z.enum(["chrome", "surf"]);
 export type KioskBrowser = z.infer<typeof KioskBrowser>;
 
+// ── Panel power (POL-101) ────────────────────────────────────────────────────
+//
+// Turning panels off OUTSIDE operating hours is a feature. Blanking them DURING them is the bug the
+// on-device stack already forbids (`output * dpms on`, no swayidle — D41/Phase 4), and nothing here
+// re-opens it: a panel only ever sleeps on an explicit operator action or a schedule an operator set.
+//
+// Two rungs, because they do different things:
+//   - dpms — always available on a real compositor. Stops driving the output; the PANEL usually drops
+//     to standby by itself, but many (especially TVs) just show a black backlight and keep burning.
+//   - cec  — best-effort, capability-detected. If the box has a CEC adapter (`cec-ctl` on /dev/cec*,
+//     or libcec's `cec-client`) we ALSO tell the display itself to go to standby, which is the only
+//     thing that reliably powers a TV down. A box without it degrades to DPMS-only: loud in the log,
+//     silent on the glass.
+//
+// The browser keeps rendering underneath either way — nothing is torn down, so waking is instant and
+// the wall comes back with the content it already had (no reload, D5).
+
+/** How a panel was actually put to sleep/woken. `dpms` = the compositor stopped driving the output;
+ *  `cec` = the display was told to stand by / wake over HDMI-CEC. Both may apply on one box. */
+export const PanelPowerMethod = z.enum(["dpms", "cec"]);
+export type PanelPowerMethod = z.infer<typeof PanelPowerMethod>;
+
+/** What a box can actually do about panel power, probed at agent startup and reported on hello. The
+ *  console shows this honestly — an operator should know whether "sleep" means "the output is dark"
+ *  or "the TV is off". */
+export const PowerCapabilities = z.object({
+  /** The display backend can drive DPMS (any real compositor; false on dev-open). */
+  dpms: z.boolean(),
+  /** A usable HDMI-CEC adapter was found on this box (so standby/wake reaches the panel itself). */
+  cec: z.boolean(),
+});
+export type PowerCapabilities = z.infer<typeof PowerCapabilities>;
+
+/** A time of day on the box's wall clock, "HH:MM" (24h). The zone is the deployment's, not the
+ *  browser's — see `PanelPowerConfig.timezone`. */
+export const TimeOfDay = z
+  .string()
+  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'expected a 24-hour "HH:MM" time');
+export type TimeOfDay = z.infer<typeof TimeOfDay>;
+
+/** A daily panel-hours window for ONE screen: wake at `on`, sleep at `off`, every day, in the
+ *  deployment's timezone. Deliberately the simplest thing that pays the power/panel-life bill — the
+ *  full recurrence machinery (weekdays, holidays, exceptions) belongs to the scene scheduler, and the
+ *  two are meant to converge (see D100). A window that wraps midnight (on 20:00 / off 06:00) is a
+ *  legal overnight window. `on === off` is rejected: it means nothing. */
+export const PanelHours = z
+  .object({
+    /** Off = this screen is never slept or woken by the schedule (manual control still works). */
+    enabled: z.boolean(),
+    /** Wake the panel at this time, every day. */
+    on: TimeOfDay,
+    /** Sleep the panel at this time, every day. */
+    off: TimeOfDay,
+  })
+  .refine((h) => h.on !== h.off, { message: "panel hours must have a start and an end that differ" });
+export type PanelHours = z.infer<typeof PanelHours>;
+
+/** Deployment-wide panel-power config. The timezone is EXPLICIT — a wall in a lobby keeps local
+ *  hours, and neither the server's TZ nor the operator's browser is allowed to decide that silently. */
+export const PanelPowerConfig = z.object({
+  /** An IANA zone ("Europe/London"). Validated against the runtime's own tz database. */
+  timezone: z.string().min(1),
+});
+export type PanelPowerConfig = z.infer<typeof PanelPowerConfig>;
+
 /** Enrollment lifecycle of a machine (Phase 2b). New machines arrive `pending`; an operator
  * approves them. Existing/auto-registered machines default to `approved`. */
 export const EnrollmentStatus = z.enum(["pending", "approved", "rejected"]);
@@ -63,6 +128,9 @@ export const Machine = z.object({
   backend: DisplayBackend.optional(),
   /** POL-67 — the kiosk browser the agent reported on hello (absent for dev-open / older agents). */
   browser: KioskBrowser.optional(),
+  /** POL-101 — what the box can do about panel power, as probed on the box and reported on hello.
+   *  Absent for a pre-POL-101 agent; the console then offers it no wake/sleep affordance. */
+  power: PowerCapabilities.optional(),
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
   lastSeen: z.string().datetime().optional(),
@@ -433,6 +501,10 @@ export const AgentHello = z.object({
   /** POL-67 — which kiosk browser this box drives (chrome = remote DevTools available). Omitted by
    *  dev-open (no kiosk browser) and by pre-POL-67 agents. */
   browser: KioskBrowser.optional(),
+  /** POL-101 — what this box can do about panel power, probed at startup (DPMS always on a real
+   *  compositor; CEC only if an adapter is present). Optional: a pre-POL-101 agent simply reports
+   *  nothing, and the console then offers no power affordance for it rather than guessing. */
+  power: PowerCapabilities.optional(),
   outputs: z.array(Output),
   /** The box's os.hostname(), used as the human machine label (additive-safe; optional). */
   hostname: z.string().optional(),
@@ -476,6 +548,25 @@ export const AgentRebootAck = z.object({
   machineId: z.string(),
   accepted: z.boolean(),
   /** Why the agent declined, when `accepted` is false. */
+  reason: z.string().optional(),
+});
+
+/** POL-101 — the agent's answer to `server/display-power`: what actually happened to that panel.
+ *  The SOLE writer of `ScreenView.asleep`, for the same reason `agent/inspect-ack` is the sole writer
+ *  of `inspecting`: only the box knows whether the compositor took the DPMS command, and whether the
+ *  CEC bus answered. `ok: false` leaves the screen AWAKE in the console (the safe reading — a wall
+ *  that might still be lit must not be shown as dark) and carries why. */
+export const AgentPowerAck = z.object({
+  t: z.literal("agent/power-ack"),
+  machineId: z.string(),
+  connector: z.string(),
+  /** The power state the agent actually reached (true = awake). */
+  on: z.boolean(),
+  ok: z.boolean(),
+  /** Which rungs were applied — `["dpms"]` on a box with no CEC adapter, `["dpms","cec"]` with one.
+   *  Empty on a failure. The console uses this to tell "the output is dark" from "the TV is off". */
+  methods: z.array(PanelPowerMethod).default([]),
+  /** Why the box could not honour the request (no compositor, a dev backend, swaymsg refused). */
   reason: z.string().optional(),
 });
 
@@ -593,6 +684,7 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentStatus,
   AgentThumbnail,
   AgentRebootAck,
+  AgentPowerAck,
   AgentShellOpened,
   AgentShellData,
   AgentShellClosed,
@@ -658,6 +750,27 @@ export const ServerToAgentInspect = z.object({
   /** Which output to pop the inspector on. */
   connector: z.string(),
   on: z.boolean(),
+});
+
+/**
+ * POL-101 — put ONE panel to sleep, or wake it. Sent on an explicit operator action or when a
+ * panel-hours boundary passes; NEVER on idleness, and never as a side effect of anything else. The
+ * agent drives its display backend (`swaymsg output <connector> dpms off|on`, `xset dpms force off`
+ * on the x11-i3 fallback) and, if the box has a CEC adapter, also tells the display itself to stand
+ * by — the only rung that actually powers a TV down.
+ *
+ * The player is left running underneath: waking is a DPMS/CEC command, not a re-render, so content is
+ * on the glass the moment the panel lights (D5). The agent answers `agent/power-ack`, and that ack —
+ * never the operator's click — is what marks a screen asleep in the console.
+ */
+export const ServerToAgentDisplayPower = z.object({
+  t: z.literal("server/display-power"),
+  /** Which output to power. One frame per connector: a machine is plumbing, screens are the subject. */
+  connector: z.string(),
+  /** true = wake, false = sleep. */
+  on: z.boolean(),
+  /** Advisory, logged on the box ("panel hours", "requested by an operator"). */
+  reason: z.string().optional(),
 });
 
 /**
@@ -786,6 +899,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentCapture,
   ServerToAgentReboot,
   ServerToAgentInspect,
+  ServerToAgentDisplayPower,
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
@@ -917,6 +1031,26 @@ export const ScreenView = Screen.extend({
    *  success, and when the machine drops. A refusal leaves `inspecting` false, i.e. UNCHANGED, so
    *  without this the console cannot tell "the wall said no" from "the wall hasn't answered yet". */
   inspectError: z.string().optional(),
+  /**
+   * POL-101 — the panel is asleep ON PURPOSE (an operator slept it, or it is outside its panel
+   * hours). This is NOT `online: false`: a sleeping screen's player is still connected and still
+   * holding its content — the box is healthy, the glass is simply dark. The console MUST render the
+   * two differently, or an operator will chase a "dead" screen that is doing exactly what they asked.
+   *
+   * Ephemeral, like `inspecting`: set only from the agent's `agent/power-ack`, and cleared when the
+   * machine drops (a box that reboots comes back with its panels lit — the compositor asserts
+   * `dpms on` at startup — so a remembered "asleep" would be a lie).
+   */
+  asleep: z.boolean().optional(),
+  /** POL-101 — how it was slept: `["dpms"]` = the output is dark but the panel may still be lit;
+   *  `["dpms","cec"]` = the display itself was told to stand by. Honest, per the ScreenCloud-matrix
+   *  posture: an operator should know which of the two they actually got. */
+  powerMethods: z.array(PanelPowerMethod).optional(),
+  /** POL-101 — why the box last refused a power request. Same role as `inspectError`: a refusal
+   *  leaves `asleep` unchanged, so this is the only edge the console can see. */
+  powerError: z.string().optional(),
+  /** POL-101 — this screen's daily panel-hours window, when one is set. */
+  panelHours: PanelHours.optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -941,6 +1075,9 @@ export const MachineView = z.object({
   rebooting: z.boolean().optional(),
   /** POL-59 — when the arming was set / last refreshed (for the "auto-disarms in N min" hint). */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-101 — what this box can do about panel power (probed on the box, reported on hello). Absent
+   *  for a pre-POL-101 agent, in which case the console offers no wake/sleep for it. */
+  power: PowerCapabilities.optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;
@@ -1257,6 +1394,7 @@ export const ServerToAdminState = z.object({
   contentSources: z.array(ContentSource), // Phase 3c — the content library
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
+  panelPower: PanelPowerConfig.optional(), // POL-101 — the deployment's panel-hours timezone
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
 });
@@ -1285,6 +1423,23 @@ export type ShellArmBody = z.infer<typeof ShellArmBody>;
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });
 export type InspectBody = z.infer<typeof InspectBody>;
+
+/** POL-101 — wake (`on: true`) or sleep (`on: false`) a panel: one screen, or every screen a machine
+ *  drives. A manual action overrides that screen's panel-hours until the NEXT boundary — an operator
+ *  who wakes a wall for an evening visit gets their evening, not a fight with the scheduler. */
+export const PanelPowerBody = z.object({ on: z.boolean() });
+export type PanelPowerBody = z.infer<typeof PanelPowerBody>;
+
+/** POL-101 — set (or clear) one screen's daily panel-hours window. `null` clears it: the screen is
+ *  then never touched by the scheduler and runs 24/7 unless an operator sleeps it by hand. */
+export const PanelHoursBody = z.object({ hours: PanelHours.nullable() });
+export type PanelHoursBody = z.infer<typeof PanelHoursBody>;
+
+/** POL-101 — the deployment's panel-hours timezone (an IANA zone). Explicit by design: the server's
+ *  own TZ is an accident of where it is hosted, and the operator's browser is an accident of where
+ *  they happen to be standing. */
+export const UpdatePanelPowerBody = PanelPowerConfig;
+export type UpdatePanelPowerBody = z.infer<typeof UpdatePanelPowerBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

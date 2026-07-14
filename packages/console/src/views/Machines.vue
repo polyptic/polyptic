@@ -119,6 +119,36 @@ async function reboot(m: MachineView): Promise<void> {
   showToast(error ?? `Rebooting ${m.label}…`);
 }
 
+/**
+ * Sleep or wake EVERY panel a box drives (POL-101). Offered only while the box is online and only if
+ * it reported the capability, because panel power rides its live agent socket.
+ *
+ * Deliberately NOT a confirm-dialog on wake, and a light one on sleep: sleeping a wall is reversible,
+ * instant, and non-destructive — the players keep running underneath, so waking puts the content
+ * straight back with no reload. What it is NOT is a reboot, and the copy says so.
+ */
+async function powerAll(m: MachineView, on: boolean): Promise<void> {
+  menuFor.value = null;
+  if (!on) {
+    const n = m.screens.length;
+    const yes = window.confirm(
+      `Sleep ${m.label}'s ${countLabel(n, "panel")}? The glass goes dark — the box stays up, content ` +
+        `keeps rendering underneath, and waking is instant.` +
+        (m.power?.cec
+          ? "\n\nThis box has HDMI-CEC, so the displays themselves will power down."
+          : "\n\nThis box has no HDMI-CEC, so the outputs go dark but the panels may stay lit."),
+    );
+    if (!yes) return;
+  }
+  const error = await store.setMachinePower(m.id, on);
+  showToast(error ?? `${on ? "Waking" : "Sleeping"} ${m.label}'s panels…`);
+}
+
+/** Do ALL of this box's panels currently read asleep? Drives the single Sleep/Wake menu item. */
+function allAsleep(m: MachineView): boolean {
+  return m.screens.length > 0 && m.screens.every((s) => s.asleep === true);
+}
+
 // ── Console lifecycle (POL-59 arm/disarm, POL-68 UI) ─────────────────────────
 // A box's console must be ENABLED before an operator can launch a terminal; it is off by default so
 // a console compromise can't silently reach a shell on the fleet. The terminal is a full-screen view.
@@ -361,6 +391,23 @@ function showToast(message: string): void {
                     <div class="menu-scrim" @click="closeMenus" />
                     <div class="menu">
                       <button
+                        v-if="m.power?.dpms"
+                        class="menu-item"
+                        :disabled="!m.online || !m.screens.length"
+                        :title="
+                          !m.online
+                            ? `${m.label} is offline — panel power rides its agent connection`
+                            : allAsleep(m)
+                              ? 'Wake every panel this machine drives'
+                              : m.power?.cec
+                                ? 'Sleep every panel — outputs go dark and the displays power down (HDMI-CEC)'
+                                : 'Sleep every panel — outputs go dark (DPMS; no HDMI-CEC on this box)'
+                        "
+                        @click="powerAll(m, allAsleep(m))"
+                      >
+                        {{ allAsleep(m) ? "Wake panels" : "Sleep panels" }}
+                      </button>
+                      <button
                         class="menu-item"
                         :disabled="!m.online"
                         :title="m.online ? 'Power-cycle this machine' : `${m.label} is offline — nothing to reboot`"
@@ -384,6 +431,7 @@ function showToast(message: string): void {
                   :machine-label="m.label"
                   :machine-online="m.online"
                   :browser="m.browser"
+                  :power="m.power"
                   @notify="showToast"
                 />
               </div>

@@ -65,7 +65,7 @@ import {
   parseMessage,
   PROTOCOL_VERSION,
 } from "@polyptic/protocol";
-import type { KioskBrowser, Output } from "@polyptic/protocol";
+import type { KioskBrowser, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { selectKioskBrowser } from "./backends/chrome";
@@ -150,6 +150,7 @@ type IdentMsg = Extract<ServerToAgentMessage, { t: "server/ident" }>;
 type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
 type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
 type InspectMsg = Extract<ServerToAgentMessage, { t: "server/inspect" }>;
+type DisplayPowerMsg = Extract<ServerToAgentMessage, { t: "server/display-power" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
@@ -214,6 +215,8 @@ class Agent {
     credential: string | null,
     /** Which kiosk browser this box drives (POL-67); undefined on dev-open (no kiosk browser). */
     private readonly browser: KioskBrowser | undefined,
+    /** POL-101 — what this box can do about panel power (DPMS / CEC), probed once at startup. */
+    private readonly power: PowerCapabilities,
     mtls: MtlsBundleFile | null = null,
   ) {
     this.credential = credential;
@@ -362,6 +365,9 @@ class Agent {
         break;
       case "server/inspect":
         await this.onInspect(msg);
+        break;
+      case "server/display-power":
+        await this.onDisplayPower(msg);
         break;
       case "server/enrolled":
         this.onEnrolled(msg);
@@ -612,6 +618,52 @@ class Agent {
   }
 
   /**
+   * `server/display-power` — sleep or wake ONE panel (POL-101).
+   *
+   * This is the ONLY thing in the agent that darkens a wall, and it fires only when the control plane
+   * says so — an operator's click, or a panel-hours boundary an operator set. Nothing here is driven
+   * by idleness; the compositor's no-blank discipline (`output * dpms on`, no swayidle) is untouched.
+   *
+   * The browser is deliberately NOT torn down: the player keeps its socket and its slice, so waking is
+   * a DPMS/CEC command rather than a reload, and the wall lights up already showing its content (D5).
+   *
+   * The ack carries the state we actually reached and WHICH rungs got us there — DPMS alone means the
+   * output is dark but the panel may still be lit; DPMS+CEC means the display itself was told to power
+   * down. A failure acks `ok: false` and leaves the console reading the screen as awake, which is the
+   * safe direction: never claim a wall is dark when it might not be.
+   */
+  private async onDisplayPower(msg: DisplayPowerMsg): Promise<void> {
+    log(
+      `server/display-power received (connector=${msg.connector} on=${msg.on})` +
+        (msg.reason ? ` — ${msg.reason}` : ""),
+    );
+    try {
+      const methods = await this.backend.setPower(msg.connector, msg.on);
+      this.send({
+        t: "agent/power-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: msg.on,
+        ok: true,
+        methods,
+      });
+      log(`panel ${msg.on ? "awake" : "asleep"} on ${msg.connector} via ${methods.join("+")}`);
+    } catch (err) {
+      const reason = (err as Error).message;
+      this.send({
+        t: "agent/power-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: msg.on,
+        ok: false,
+        methods: [],
+        reason,
+      });
+      logError(`display-power(${msg.connector}, ${msg.on}) failed: ${reason}`);
+    }
+  }
+
+  /**
    * `server/enrolled` — the server issued (or re-issued) this machine's durable credential and/or
    * its mTLS client-cert bundle (POL-25). Persist the RAW credential locally so future reconnects
    * authenticate without the bootstrap token. A cert bundle is paired with the private key whose
@@ -731,6 +783,7 @@ class Agent {
       agentVersion: this.agentVersion,
       backend: this.backend.id,
       browser: this.browser,
+      power: this.power,
       outputs: this.outputs,
       hostname: osHostname(),
       bootstrapToken: this.bootstrapToken,
@@ -819,11 +872,16 @@ async function main(): Promise<void> {
   const browser: KioskBrowser | undefined =
     backend.id === "wayland-sway" ? await selectKioskBrowser() : backend.id === "x11-i3" ? "surf" : undefined;
   const mtlsBundle = loadMtlsBundle(machineId);
+  // POL-101 — probe panel power ONCE at startup (is there a CEC adapter this user can open?) and
+  // report it on hello, so the console can be honest about whether "sleep" darkens the output or
+  // actually powers the display down. A box with no CEC is a normal box, not a broken one.
+  const power = await backend.powerCapabilities();
 
   log(
     `polyptic-agent v${agentVersion} · machineId=${machineId} · outputs=${outputs
       .map((o) => o.connector)
-      .join(",")} · backend=${backend.id}${browser ? ` · browser=${browser}` : ""}`,
+      .join(",")} · backend=${backend.id}${browser ? ` · browser=${browser}` : ""}` +
+      ` · panel power: ${power.dpms ? (power.cec ? "dpms+cec" : "dpms only") : "none"}`,
   );
   log(
     `enrollment: ${credential ? "stored credential found" : "no stored credential"}${
@@ -840,6 +898,7 @@ async function main(): Promise<void> {
     bootstrapToken,
     credential,
     browser,
+    power,
     mtlsBundle,
   );
   agent.start();

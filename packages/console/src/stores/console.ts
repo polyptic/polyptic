@@ -27,6 +27,8 @@ import type {
   MachineView,
   Mural,
   NetbootInfo,
+  PanelHours,
+  PanelPowerConfig,
   Placement,
   Scene,
   ScreenView,
@@ -120,6 +122,9 @@ export interface ConsoleState {
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
+  /** POL-101 — the deployment's panel-hours timezone, mirrored from admin/state.panelPower. Optional
+   *  on the wire (an older server omits it) → null until the first snapshot that carries it. */
+  panelPower: PanelPowerConfig | null;
   connected: boolean;
   /** True once the FIRST admin/state snapshot has been folded in — the difference between "the
    *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
@@ -170,6 +175,7 @@ export const useConsoleStore = defineStore("console", {
     netboot: null,
     imageUpdates: null,
     settings: null,
+    panelPower: null,
     connected: false,
     stateReceived: false,
     revision: 0,
@@ -710,6 +716,8 @@ export const useConsoleStore = defineStore("console", {
         // POL-6 — fleet-wide display settings (badge toggle). Optional on the wire (back-compat); keep
         // the last known value when a snapshot omits it rather than clobbering the toggle to null.
         if (msg.settings) this.settings = msg.settings;
+        // POL-101 — the panel-hours timezone; same back-compat rule as settings above.
+        if (msg.panelPower) this.panelPower = msg.panelPower;
 
         // Forget an active-scene marker whose scene the server no longer knows (e.g. deleted).
         if (this.activeSceneId && !this.scenes.some((sc) => sc.id === this.activeSceneId)) {
@@ -1034,6 +1042,71 @@ export const useConsoleStore = defineStore("console", {
             ? (err.payload as { error: string }).error
             : null;
         return detail ?? "The control plane could not reach that screen's machine.";
+      }
+    },
+
+    /**
+     * POL-101 — wake or sleep ONE panel. NOT optimistic, for the same reason as inspectScreen: only
+     * the box knows whether the compositor took the DPMS command, so `asleep` is written solely by the
+     * agent's ack arriving on the next admin/state. Showing a wall as dark when it might still be lit
+     * is precisely the lie an operator cannot check from their desk.
+     */
+    async setScreenPower(screenId: string, on: boolean): Promise<string | null> {
+      try {
+        await api.setScreenPower(screenId, { on });
+        return null;
+      } catch (err) {
+        console.error("[console] setScreenPower failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? `The control plane could not ${on ? "wake" : "sleep"} that screen.`;
+      }
+    },
+
+    /** POL-101 — wake/sleep every panel a box drives (the bulk action on the Machines card). */
+    async setMachinePower(machineId: string, on: boolean): Promise<string | null> {
+      try {
+        await api.setMachinePower(machineId, { on });
+        return null;
+      } catch (err) {
+        console.error("[console] setMachinePower failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? `The control plane could not ${on ? "wake" : "sleep"} that machine's panels.`;
+      }
+    },
+
+    /** POL-101 — set (or clear, with `null`) a screen's daily panel-hours window. */
+    async setScreenPanelHours(screenId: string, hours: PanelHours | null): Promise<string | null> {
+      try {
+        await api.setScreenPanelHours(screenId, hours);
+        return null;
+      } catch (err) {
+        console.error("[console] setScreenPanelHours failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "Could not save those panel hours.";
+      }
+    },
+
+    /** POL-101 — the deployment's panel-hours timezone (Settings). */
+    async setPanelTimezone(timezone: string): Promise<string | null> {
+      try {
+        this.panelPower = await api.setPanelPowerTimezone(timezone);
+        return null;
+      } catch (err) {
+        console.error("[console] setPanelTimezone failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "Could not save that timezone.";
       }
     },
 

@@ -128,6 +128,8 @@ interface PkgSet {
   splash: string[];
   /** Video decode for the kiosk browser's <video> (Phase 7 media). See the comment below. */
   codecs: string[];
+  /** POL-101 — HDMI-CEC tools. OPTIONAL by construction (see `optionalPackages`). */
+  cec: string[];
 }
 
 // POL-7 (D43): our theme uses the `script` plugin and draws text via `Image.Text` (the live status
@@ -157,6 +159,9 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // (REQUIRED, see above); `librsvg2-bin` = rsvg-convert.
     splash: ["plymouth", "plymouth-label", "librsvg2-bin"],
     codecs: ["gstreamer1.0-libav", "gstreamer1.0-plugins-good"],
+    // `v4l-utils` carries `cec-ctl` (the KERNEL CEC API — preferred, no daemon); `cec-utils` carries
+    // libcec's `cec-client` as the fallback stack.
+    cec: ["v4l-utils", "cec-utils"],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -168,6 +173,7 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     splash: ["plymouth", "plymouth-scripts", "plymouth-plugin-script", "plymouth-plugin-label", "librsvg2-tools"],
     // Fedora ships the ffmpeg-backed decoders in `gstreamer1-libav` (RPMFusion on stock Fedora).
     codecs: ["gstreamer1-libav", "gstreamer1-plugins-good"],
+    cec: ["v4l-utils", "libcec"],
   },
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -177,6 +183,7 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // Arch's `plymouth` bundles ALL plugins (script, label, set-default-theme); `librsvg` = rsvg-convert.
     splash: ["plymouth", "librsvg"],
     codecs: ["gst-libav", "gst-plugins-good"],
+    cec: ["v4l-utils", "libcec"],
   },
 };
 
@@ -185,6 +192,24 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
  * only the base set (greetd) — it is not a real kiosk backend, but kept usable for completeness.
  * `splash` adds Plymouth + the rasteriser for the real kiosk backends (POL-7); pass `false` to skip.
  */
+/**
+ * POL-101 — packages we WANT but can live without: the HDMI-CEC tool-chain (`cec-ctl` from v4l-utils,
+ * libcec's `cec-client`). These are installed in their OWN, failure-tolerant apt/dnf/pacman
+ * transaction, deliberately separate from `corePackages`:
+ *
+ *   - a box with no CEC adapter loses nothing (panels still sleep via DPMS — see backends/power.ts);
+ *   - `cec-utils` is not in every suite/arch, and an unresolvable optional package must NEVER take
+ *     down an image build. A wall that boots without CEC is a working wall. A wall that doesn't boot
+ *     is not.
+ *
+ * The caller runs this with `allowFail` and reports the outcome; the agent then PROBES at runtime
+ * rather than assuming the install worked (setup and boot are years apart on a long-lived box).
+ */
+export function optionalPackages(pm: PkgManager, backend: Backend): string[] {
+  if (backend === "dev-open") return []; // a dev host has no panel to power
+  return [...PACKAGES[pm].cec];
+}
+
 export function corePackages(pm: PkgManager, backend: Backend, splash = true): string[] {
   const set = PACKAGES[pm];
   const splashPkgs = splash ? set.splash : [];

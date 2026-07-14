@@ -54,7 +54,10 @@ import type {
   PageFeedData,
   PageImageResolution,
   PageWeatherData,
+  PanelHours,
+  PanelPowerConfig,
   Placement,
+  PowerCapabilities,
   SceneContent,
   Screen,
   ScreenSlice,
@@ -89,6 +92,20 @@ const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
 
 /** POL-57 — an unzoomed page: 100%, the same scale a browser opens a tab at. */
 const DEFAULT_ZOOM = 1;
+
+/**
+ * POL-101 — the zone panel hours START in, before an operator has said anything. This is the server's
+ * own zone (or UTC if the runtime won't say), and it is a SEED, not a policy: the console shows it,
+ * the operator confirms or changes it, and from then on the deployment's choice is explicit and
+ * persisted. A wall in a lobby keeps the lobby's hours, not the datacentre's.
+ */
+function defaultTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
 
 /** The two surface kinds that frame a page, and so are the only ones that can be zoomed. */
 type FramedSurface = Extract<Surface, { type: "web" | "dashboard" }>;
@@ -142,6 +159,10 @@ export interface RegisterMachineInput {
   /** POL-67 — the kiosk browser the agent reported (chrome = remote DevTools). Held in memory only:
    *  it is re-reported on every hello, and only matters while the box is online. */
   browser?: KioskBrowser;
+  /** POL-101 — what the box can do about panel power (DPMS / CEC), as probed on the box. Memory-only
+   *  for the same reason as `browser`: it is re-reported on every hello, and a box that is offline
+   *  has no panels to power anyway. A pre-POL-101 agent reports nothing and gets no power affordance. */
+  power?: PowerCapabilities;
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
@@ -306,6 +327,13 @@ export class ControlPlane {
   /** POL-6 — fleet-wide display settings (on-screen badge visibility) pushed to every player. Starts
    *  at the env default; `init()` loads any persisted operator override on top. */
   private displaySettings: DisplaySettings = { showBadges: DEFAULT_SHOW_BADGES };
+
+  /** POL-101 — the zone every panel-hours window is read in. Defaults to the SERVER's zone purely so
+   *  the console's picker opens somewhere sane; an operator's save makes it explicit and persisted. */
+  private panelTimezone: string = defaultTimezone();
+  /** POL-101 — screenId → its daily on/off window. A screen with no entry is never touched by the
+   *  scheduler (it runs 24/7, the pre-POL-101 behaviour, which stays the default for every screen). */
+  private readonly panelHours = new Map<string, PanelHours>();
 
   /**
    * @param store    the durable backing store.
@@ -581,6 +609,66 @@ export class ControlPlane {
     // default (so a deployment that never touches the setting follows its NODE_ENV each boot).
     const persistedSettings = await this.store.getDisplaySettings();
     if (persistedSettings) this.displaySettings = { showBadges: persistedSettings.showBadges };
+
+    // POL-101 — panel hours. Absent until an operator sets one, in which case every wall runs 24/7,
+    // exactly as it did before this feature existed. The default zone is the server's own only as a
+    // starting value for the console's picker; the moment an operator saves, the choice is explicit.
+    const persistedPower = await this.store.getPanelPower();
+    if (persistedPower) {
+      this.panelTimezone = persistedPower.timezone;
+      this.panelHours.clear();
+      for (const [screenId, hours] of Object.entries(persistedPower.hours)) {
+        this.panelHours.set(screenId, { ...hours });
+      }
+    }
+  }
+
+  // ── Panel power (POL-101) ────────────────────────────────────────────────────
+
+  /** The deployment's panel-hours timezone (an IANA zone). Read on every scheduler tick. */
+  getPanelPowerConfig(): PanelPowerConfig {
+    return { timezone: this.panelTimezone };
+  }
+
+  /** One screen's daily window, or undefined when it has none (→ the scheduler never touches it). */
+  getPanelHours(screenId: string): PanelHours | undefined {
+    const hours = this.panelHours.get(screenId);
+    return hours ? { ...hours } : undefined;
+  }
+
+  /** Every screen that HAS a window, for the scheduler. Screens without one are simply absent. */
+  listPanelHours(): Array<{ screenId: string; hours: PanelHours }> {
+    return [...this.panelHours.entries()].map(([screenId, hours]) => ({
+      screenId,
+      hours: { ...hours },
+    }));
+  }
+
+  /** Set (or, with `null`, clear) one screen's panel hours. Persisted; no revision bump — panel hours
+   *  are not part of any render slice, so nothing on the glass changes when they are edited. */
+  async setPanelHours(screenId: string, hours: PanelHours | null): Promise<void> {
+    if (hours) this.panelHours.set(screenId, { ...hours });
+    else this.panelHours.delete(screenId);
+    await this.persistPanelPower();
+  }
+
+  /** Set the deployment's panel-hours timezone. */
+  async setPanelTimezone(timezone: string): Promise<PanelPowerConfig> {
+    this.panelTimezone = timezone;
+    await this.persistPanelPower();
+    return this.getPanelPowerConfig();
+  }
+
+  private async persistPanelPower(): Promise<void> {
+    const hours: Record<string, { enabled: boolean; on: string; off: string }> = {};
+    for (const [screenId, h] of this.panelHours) hours[screenId] = { ...h };
+    await this.store.setPanelPower({ timezone: this.panelTimezone, hours });
+  }
+
+  /** Forget a removed screen's panel hours, so a re-created screen doesn't inherit a ghost schedule. */
+  private async forgetPanelHours(screenId: string): Promise<void> {
+    if (!this.panelHours.delete(screenId)) return;
+    await this.persistPanelPower();
   }
 
   private nextMuralId(): string {
@@ -750,6 +838,7 @@ export class ControlPlane {
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
+      power: input.power,
       outputs: input.outputs,
       status: "approved",
       lastSeen: new Date().toISOString(),
@@ -784,6 +873,7 @@ export class ControlPlane {
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
+      power: input.power,
       outputs: input.outputs,
       status: "pending",
       lastSeen: new Date().toISOString(),
@@ -958,6 +1048,7 @@ export class ControlPlane {
       const idx = this.state.screens.findIndex((s) => s.id === id);
       if (idx >= 0) this.state.screens.splice(idx, 1);
       await this.forgetZooms(id);
+      await this.forgetPanelHours(id); // POL-101 — a screen that no longer exists keeps no schedule
     }
 
     // Drop the machine itself (+ its off-band credential). deleteMachine cascades screens/content/placements.
@@ -1312,6 +1403,7 @@ export class ControlPlane {
     await this.store.deletePlacement(screenId);
     await this.store.deleteScreen(screenId);
     await this.forgetZooms(screenId);
+    await this.forgetPanelHours(screenId); // POL-101 — no screen, no schedule
 
     this.bumpRevision();
     // Persist the cleared content of SURVIVING screens only — the removed one's row is already gone.

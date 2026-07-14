@@ -61,6 +61,8 @@ import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
+import { powerAckLine } from "./panel-power";
+import type { PanelPowerScheduler } from "./panel-power";
 
 interface WsDeps {
   /** The main listener the three channels' upgrades hang off — plain HTTP, or the native-TLS
@@ -83,6 +85,8 @@ interface WsDeps {
   capture: CaptureCoordinator;
   /** Remote-DevTools relay (POL-67) — bridges an operator's DevTools frontend to a wall's Chrome. */
   devtoolsRelay: DevtoolsRelay;
+  /** POL-101 — panel-hours scheduler; reconciles a box's panels to their window when it says hello. */
+  panelPower: PanelPowerScheduler;
   log: FastifyBaseLogger;
   /** Allowed browser origins for the /admin WS upgrade (anti-CSWSH); from CORS_ORIGIN. */
   allowedOrigins: string[];
@@ -133,7 +137,7 @@ export function parseDevtoolsUpgradePath(pathname: string): { screenId: string; 
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, log, allowedOrigins, agentMtls } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -242,7 +246,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   });
 
   agentWss.on("connection", (ws: WebSocket, channel: AgentChannel) =>
-    handleAgent(ws, channel ?? "plain", agentMtls, control, enrollment, agentHub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, log),
+    handleAgent(ws, channel ?? "plain", agentMtls, control, enrollment, agentHub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, log),
   );
 
   // POL-25 — the mTLS agent channel: a second listener whose TLS handshake already rejected any
@@ -287,6 +291,7 @@ function handleAgent(
   capture: CaptureCoordinator,
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
+  panelPower: PanelPowerScheduler,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected", channel }, "agent socket opened");
@@ -410,6 +415,9 @@ function handleAgent(
       agentVersion: msg.agentVersion,
       backend: msg.backend,
       browser: msg.browser,
+      // POL-101 — what this box can do about panel power, as IT reports it (dpms / cec). Re-read on
+      // every hello, so a box that grows a CEC adapter (or loses one) tells the truth after a restart.
+      power: msg.power,
       outputs: msg.outputs,
       hostname: msg.hostname,
     };
@@ -442,6 +450,10 @@ function handleAgent(
             break;
           }
           sendApply(msg.machineId, assignments);
+          // POL-101 — the box is back and its panels are LIT (the compositor asserts `dpms on` at
+          // startup). If a screen is outside its panel hours right now, sleep it again; in hours,
+          // this does nothing at all — a wall that should be showing content is never blanked.
+          panelPower.reconcileMachine(msg.machineId);
           log.info(
             {
               event: "agent.hello",
@@ -581,6 +593,42 @@ function handleAgent(
       devtoolsRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
     } else if (msg.t === "agent/devtools-closed") {
       devtoolsRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
+    } else if (msg.t === "agent/power-ack") {
+      // POL-101 — the box's answer to `server/display-power`, and the ONLY writer of `asleep`. The
+      // operator's click is a request; only the box knows whether the compositor took the DPMS command
+      // and whether the CEC bus answered. A refusal therefore leaves the screen AWAKE in the console:
+      // never show a wall as dark when it might still be lit.
+      const screen = control
+        .getScreens()
+        .find((s) => s.machineId === msg.machineId && s.connector === msg.connector);
+      if (screen) {
+        presence.setScreenAsleep(screen.id, msg.ok && !msg.on, msg.methods);
+        presence.setScreenPowerError(screen.id, msg.ok ? null : (msg.reason ?? "the box did not say why"));
+        if (!msg.ok) {
+          activity.push(
+            "bad",
+            `Could not ${msg.on ? "wake" : "sleep"} ${screen.friendlyName}: ${msg.reason ?? "no reason given"}`,
+          );
+        } else {
+          // "info", not "warn": a sleeping panel is a HEALTHY panel doing what it was told. The feed
+          // must not train an operator to read a scheduled sleep as a fault.
+          activity.push("info", powerAckLine(screen.friendlyName, msg.on, msg.methods));
+        }
+        broadcaster.broadcast();
+      }
+      log.info(
+        {
+          event: "agent.power_ack",
+          machineId: msg.machineId,
+          connector: msg.connector,
+          screenId: screen?.id,
+          on: msg.on,
+          ok: msg.ok,
+          methods: msg.methods,
+          reason: msg.reason,
+        },
+        msg.ok ? "agent applied panel power" : "agent could not apply panel power",
+      );
     } else if (msg.t === "agent/inspect-ack") {
       // POL-50 — the box's answer to `server/inspect`, and the ONLY writer of the `inspecting` flag:
       // the operator's click is a request, but only the wall knows whether surf relaunched and took
@@ -649,9 +697,15 @@ function handleAgent(
         }
         // POL-50 — the box is gone, so its panels are no longer showing an inspector. Drop the flag,
         // or a reboot-while-inspecting leaves the console badging a wall that came back sealed.
-        presence.clearScreensInspecting(
-          control.getScreens().filter((s) => s.machineId === machineId).map((s) => s.id),
-        );
+        const screenIds = control
+          .getScreens()
+          .filter((s) => s.machineId === machineId)
+          .map((s) => s.id);
+        presence.clearScreensInspecting(screenIds);
+        // POL-101 — likewise the power state: a box that comes back comes back LIT, so a remembered
+        // "asleep" would strand the console showing a dark wall that is actually showing content. The
+        // scheduler re-sleeps it on hello if it is still outside its hours.
+        presence.clearScreensPower(screenIds);
       }
       broadcaster.broadcast();
     }

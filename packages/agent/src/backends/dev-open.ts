@@ -9,6 +9,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { PanelPowerMethod, PowerCapabilities } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
 
 const run = promisify(execFile);
@@ -80,6 +81,24 @@ export class DevOpenBackend implements DisplayBackend {
   /** dev-open does not own its browser — never a DevTools port to tunnel to. */
   devtoolsEndpoint(): { port: number } | null {
     return null;
+  }
+
+  /** POL-101 — a dev box has no wall to power. Reporting `false` is what stops the console offering
+   *  a wake/sleep affordance for it at all. */
+  async powerCapabilities(): Promise<PowerCapabilities> {
+    return { dpms: false, cec: false };
+  }
+
+  /**
+   * POL-101 — REFUSE, exactly as `rebootHost` refuses on a dev backend (D59): a stray "sleep the
+   * fleet" must never black out a developer's laptop, and a schedule pointed at a dev box is a
+   * mistake worth surfacing rather than obeying. The reason rides the ack into the activity feed.
+   */
+  async setPower(connector: string, on: boolean): Promise<PanelPowerMethod[]> {
+    throw new Error(
+      `the dev-open backend cannot ${on ? "wake" : "sleep"} ${connector} — it owns no compositor ` +
+        `and no panel (this is a development host, not a wall)`,
+    );
   }
 
   async capture(): Promise<Buffer | null> {
