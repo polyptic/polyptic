@@ -626,6 +626,8 @@ export function registerProvisionRoutes(
   enrollment: Enrollment,
   imageUpdates?: ImageManifestSource,
   onBootReport?: ActivitySink,
+  /** POL-92 — called for every depot artifact actually served, for the `/metrics` fetch counter. */
+  onDepotFetch?: (arch: string, file: string) => void,
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
 
@@ -785,6 +787,7 @@ export function registerProvisionRoutes(
       st = await statFileOrNull(abs);
     }
     if (!st) return reply.code(404).send({ error: "build artifact not retained" });
+    onDepotFetch?.(arch, file);
     return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 
@@ -806,6 +809,7 @@ export function registerProvisionRoutes(
     // vmlinuz + initrd are fetched (and vmlinuz shim_lock-verified) by GRUB, which needs Content-Length;
     // sendBootAsset buffers those two. The root image + live ISO stream (curl/browser fetch them,
     // and buffering a ~500 MB body OOM-killed the pod in the field). Range-aware (206/416).
+    onDepotFetch?.(arch, file);
     return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 

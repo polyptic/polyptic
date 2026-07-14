@@ -1,0 +1,164 @@
+# Polyptic — sample Prometheus alert rules (POL-92)
+#
+# The control plane exports the whole fleet at GET /metrics (ungated, no session — scrapers carry no
+# cookie), one series per machine, labelled `machine` (the id) and `label` (the operator's name for
+# it). That means the Prometheus + Alertmanager stack you already run becomes Polyptic's fleet
+# monitoring: no agent, no exporter on the box, no vendor.
+#
+# COPY THIS FILE and edit it — the thresholds below are a starting point, not a recommendation. A
+# reception panel that renders one static dashboard and a video wall driving nine 4K surfaces have
+# nothing in common but the metric names.
+#
+# Load it into Prometheus:
+#
+#   rule_files:
+#     - /etc/prometheus/polyptic-alerts.yaml
+#
+# and scrape the control plane:
+#
+#   scrape_configs:
+#     - job_name: polyptic
+#       metrics_path: /metrics
+#       static_configs:
+#         - targets: ["polyptic.example.com"]
+#
+# (In Kubernetes, the chart's Service exposes the same path; a ServiceMonitor pointed at it works
+# identically.)
+
+groups:
+  - name: polyptic-fleet
+    rules:
+      # ── The wall is dark ────────────────────────────────────────────────────
+      # An approved machine whose agent is not connected. It is NOT necessarily showing nothing (the
+      # player keeps painting its last slice, and cached media survives an outage — D83), but the
+      # control plane can no longer change what it shows, and a box that stays down is a box someone
+      # has to walk to. 5m rides out a reboot (~1 min) and a network blip.
+      - alert: PolypticMachineDown
+        expr: polyptic_machine_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Polyptic machine {{ $labels.label }} is offline"
+          description: >-
+            {{ $labels.label }} ({{ $labels.machine }}) has had no agent connection for 5 minutes.
+            Its screens are frozen on whatever they last rendered.
+
+      # A machine that is "up" but has stopped heartbeating — a wedged agent holding a socket open.
+      # `polyptic_machine_up` alone cannot see this; the last-seen timestamp can.
+      - alert: PolypticMachineStale
+        expr: time() - polyptic_machine_last_seen_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Polyptic machine {{ $labels.label }} has stopped heartbeating"
+          description: >-
+            No status frame from {{ $labels.label }} for over two minutes, though its socket is open.
+            The agent may be wedged; a reboot from the console is the usual fix.
+
+      # ── The D77 failure: a browser rendering the wall on the CPU ────────────
+      # The kiosk browser holds no /dev/dri handle, so it has no GPU path and is software-rendering.
+      # This is the bug that pegged a real wall at 300% CPU (surf under Xwayland could not get DRI3).
+      # It is a HARD failure of the wall's whole reason to exist and it never heals by itself.
+      - alert: PolypticSoftwareRendering
+        expr: polyptic_machine_gpu_accelerated == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.label }} is rendering {{ $labels.connector }} in software"
+          description: >-
+            The kiosk browser on {{ $labels.connector }} holds no /dev/dri file descriptor: it is
+            painting the wall on the CPU. Expect a pegged processor, a hot box and dropped frames.
+            Check the box's graphics stack (driver, session type, browser flavour).
+
+      # ── The box is struggling ───────────────────────────────────────────────
+      - alert: PolypticMachineCpuSaturated
+        expr: polyptic_machine_cpu_percent >= 90
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.label }} is CPU-saturated"
+          description: >-
+            CPU has been at or above 90% for 15 minutes. Animated content — including the console's
+            Ident flash — will drop frames.
+
+      - alert: PolypticMachineMemoryHigh
+        expr: polyptic_machine_memory_percent >= 90
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.label }} is nearly out of memory"
+          description: >-
+            Memory has been at or above 90% for 15 minutes. A netbooted box runs its whole root
+            filesystem in RAM, so this is also disk pressure.
+
+      - alert: PolypticMachineDiskFull
+        expr: polyptic_machine_disk_percent >= 90
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.label }}'s root filesystem is nearly full"
+
+      - alert: PolypticMachineHot
+        expr: polyptic_machine_temperature_celsius >= 85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.label }} is running hot ({{ $value | printf \"%.0f\" }}°C)"
+          description: >-
+            Sustained high temperature. A thermally throttled box drops frames; check airflow, and
+            check whether it is also software-rendering (PolypticSoftwareRendering).
+
+      # ── A browser crash loop ────────────────────────────────────────────────
+      # The wall can look fine between respawns, which is exactly why nobody notices this by eye.
+      - alert: PolypticBrowserCrashLooping
+        expr: increase(polyptic_machine_browser_respawns_total[30m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.label }}: the browser on {{ $labels.connector }} keeps crashing"
+          description: >-
+            The agent has respawned this output's kiosk browser {{ $value | printf "%.0f" }} times in
+            30 minutes. The screen goes blank on each restart.
+
+  - name: polyptic-control-plane
+    rules:
+      - alert: PolypticControlPlaneDown
+        expr: up{job="polyptic"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Polyptic control plane is not scrapeable"
+
+      # The whole fleet, or most of it, dropped at once — this is the control plane's problem, not
+      # thirty machines' problem, and it should page differently.
+      - alert: PolypticFleetMostlyDown
+        expr: >-
+          count(polyptic_machine_up == 0) / count(polyptic_machine_up) > 0.5
+          and count(polyptic_machine_up) > 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than half the Polyptic fleet is offline"
+          description: >-
+            Suspect the control plane, its ingress, or the site network — not the boxes.
+
+      # The image the depot serves every netbooting box has not been rebuilt in a fortnight, so a box
+      # that reboots comes up on a kernel that is two weeks behind on CVEs (POL-43's whole point).
+      - alert: PolypticImageStale
+        expr: polyptic_image_build_age_seconds > 14 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The {{ $labels.arch }} live image is {{ $value | humanizeDuration }} old"
+          description: >-
+            The scheduled rebuild may be failing. Check Console ▸ Settings ▸ Onboard Screens.

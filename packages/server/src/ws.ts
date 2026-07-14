@@ -564,8 +564,24 @@ function handleAgent(
         }
       }
       if (castChanged) broadcaster.broadcast();
+
+      // POL-92 — the heartbeat now carries the box's own vitals. Ring them in Presence (live-only,
+      // never persisted) and broadcast, so the Machines view's stats strip is as live as the
+      // heartbeat. A pre-POL-92 agent sends no `vitals`; the heartbeat is still recorded, so the box
+      // has a last-seen for `polyptic_machine_last_seen_seconds` either way.
+      const hadVitals = presence.machineVitals(msg.machineId) !== undefined;
+      presence.noteHeartbeat(msg.machineId, msg.vitals);
+      // Coalesced downstream; the first sample matters most (it fills an empty strip).
+      if (msg.vitals || hadVitals) broadcaster.broadcast();
       log.info(
-        { event: "agent.status", machineId: msg.machineId, observedRevision: msg.observedRevision },
+        {
+          event: "agent.status",
+          machineId: msg.machineId,
+          observedRevision: msg.observedRevision,
+          cpu: msg.vitals?.cpuPercent,
+          mem: msg.vitals?.memPercent,
+          gpuAccel: msg.vitals?.browsers?.some((b) => b.gpuAccel === true),
+        },
         "agent status",
       );
     } else if (msg.t === "agent/reboot-ack") {

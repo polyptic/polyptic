@@ -27,6 +27,7 @@ import { AgentMtls } from "./mtls";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
+import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
 import { initSelfSignedTls, registerHttpsRoutes, requiredSans, resolveTlsEnv } from "./server-tls";
@@ -401,20 +402,13 @@ registerHttpsRoutes(fastify, serverTls);
 // TOP-LEVEL media serve route (GET /media/:id) — NOT /api/v1, so UNgated: players + the public wall
 // load uploads without a session, exactly like any external content URL (ids are unguessable).
 registerMediaServeRoute(fastify, media);
-// TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.
-registerOpsRoutes(fastify, {
-  control,
-  agentHub,
-  playerHub: hub,
-  thumbnails,
-  storeKind,
-  version: BUILD_VERSION,
-  revision: BUILD_REVISION,
-  startedAt: STARTED_AT,
-});
 // TOP-LEVEL, UNGATED provisioning routes (the netboot depot + GET /dist/agent/:arch) — NOT /api/v1,
 // so a machine with no operator session can boot and enrol entirely from the server.
 const provisionConfig = provisionConfigFromEnv();
+
+// POL-92 — cumulative counters for /metrics (depot artifact fetches). Held here, incremented by the
+// routes that serve the artifacts, rendered by the ops exporter.
+const counters = new CounterRegistry();
 
 // ── Image updates (POL-41): the scheduled rebuild hooks + the published manifest + urgency. The
 // daily refresh comes from IMAGE_REBUILD_CMD (e.g. `deploy/rebuild-image-docker.sh arm64`); the
@@ -446,9 +440,40 @@ imageUpdates.start();
 // same one the agent WS accepts, so a regenerate re-keys the netboot flow on the next boot with no drift.
 // The last argument lands a box's bootloader-install verdict (POL-58) in the Live Activity feed: the
 // operator finds out whether the install took from the console, not by rebooting the box to see.
-registerProvisionRoutes(fastify, provisionConfig, enrollment, imageUpdates, (severity, text) => {
-  activity.push(severity, text);
-  broadcaster.broadcast();
+registerProvisionRoutes(
+  fastify,
+  provisionConfig,
+  enrollment,
+  imageUpdates,
+  (severity, text) => {
+    activity.push(severity, text);
+    broadcaster.broadcast();
+  },
+  // POL-92 — every depot artifact a booting box pulls. `rate()` over this is what tells an operator
+  // a roll-out is actually reaching the fleet (and what a stampede looks like when it isn't).
+  (arch, file) =>
+    counters.inc(
+      "polyptic_depot_fetches_total",
+      "Netboot depot artifacts served (kernel, initrd, root image, …).",
+      { arch, file },
+    ),
+);
+
+// TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.
+// Registered here (after the depot) because the fleet metrics read the depot's manifests and the
+// counters the provisioning routes increment (POL-92).
+registerOpsRoutes(fastify, {
+  control,
+  agentHub,
+  playerHub: hub,
+  thumbnails,
+  presence,
+  counters,
+  images: imageUpdates,
+  storeKind,
+  version: BUILD_VERSION,
+  revision: BUILD_REVISION,
+  startedAt: STARTED_AT,
 });
 
 // ── Image-updates operator surface (POL-41), GATED under /api/v1. ──

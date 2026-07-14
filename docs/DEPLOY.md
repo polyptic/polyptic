@@ -165,6 +165,36 @@ If a screen's machine is offline the button is disabled — the request rides th
 | `output * dpms on` | sway config | outputs forced on at session start |
 | autologin via greetd `initial_session` | greetd config | no login prompt, no typed password on cold boot |
 
+### Fleet health — the stats strip and `/metrics` (POL-92 / D91)
+
+Every heartbeat (10s) carries the box's own **vitals**, sampled straight from `/proc` and `/sys`: CPU, memory, root-filesystem usage (on a netbooted box that **is** the RAM image), the hottest thermal zone, load, uptime, the **running image id**, and per-output browser health — resident memory, respawn count, and whether the browser holds an open fd on **`/dev/dri`**.
+
+That last one is the whole point. A kiosk browser with no `/dev/dri` handle has no GPU path and is **painting the wall on the CPU** — the D77 failure that pegged a real box at 300% and took a remote shell plus `top` to find. It now shows up in two places without touching the box:
+
+- **Console ▸ Machines** — each approved card carries a live CPU / Memory / Disk strip, an amber banner when the box is under sustained load (it may drop frames on animated content, including Ident flashes) and a **red "Rendering in software"** banner naming the connector. Offline machines read *"System stats unavailable while offline"* — a reading from a box that has gone dark is not health data.
+- **`GET /metrics`** — one labelled series per machine, ungated like `/healthz` (scrapers carry no session):
+
+  ```
+  polyptic_machine_up{machine="…",label="Atrium NUC"}                 1
+  polyptic_machine_cpu_percent{machine="…"}                          91.5
+  polyptic_machine_gpu_accelerated{machine="…",connector="DP-1"}      0     # ← software rendering
+  polyptic_machine_browser_respawns_total{machine="…",connector="DP-1"} 4
+  polyptic_machine_last_seen_seconds{machine="…"}          1.7684e+09
+  polyptic_image_build_age_seconds{arch="amd64",image_id="…"}      86400
+  ```
+
+  An approved box that goes dark stays in the exposition at `0` — a series that vanishes cannot fire an alert. An unknown reading emits **no sample at all** (an agent that couldn't tell is not an accusation).
+
+**Sample alert rules ship at [`deploy/prometheus-alerts.example.yaml`](../deploy/prometheus-alerts.example.yaml)** — machine down, agent wedged (socket open, no heartbeat), software rendering, CPU/memory/disk/temperature, browser crash-looping, and a stale live image. Copy it, edit the thresholds (a reception panel and a nine-surface video wall have nothing in common but the metric names), and point Prometheus at the control plane:
+
+```yaml
+scrape_configs:
+  - job_name: polyptic
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["polyptic.example.com"]
+```
+
 ---
 
 ## Prerequisites & supported targets

@@ -712,6 +712,9 @@ export function registerRestRoutes(
     // If the agent is connected NOW, close its socket — the machine is gone, so it must re-enrol to
     // return (a lingering socket would otherwise sit idle until its next reconnect).
     const closed = agentHub.close(params.data.machineId);
+    // POL-92 — and forget its live state (vitals ring, last heartbeat), so a re-enrolling box with
+    // the same machine id never inherits the dead one's readings.
+    presence.forgetMachine(params.data.machineId);
 
     // Dissolving its screens' walls cleared surviving members' slices — push the (now empty) renders.
     for (const slice of result.slices) pushRender(slice.screenId, slice);

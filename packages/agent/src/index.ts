@@ -65,7 +65,7 @@ import {
   parseMessage,
   PROTOCOL_VERSION,
 } from "@polyptic/protocol";
-import type { KioskBrowser, Output } from "@polyptic/protocol";
+import type { KioskBrowser, MachineVitals, Output } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { selectKioskBrowser } from "./backends/chrome";
@@ -87,6 +87,7 @@ import { ShellManager } from "./shell";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
+import { VitalsSampler } from "./vitals";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -206,6 +207,10 @@ class Agent {
   /** POL-119 — connector → is a cast session live NOW (receiver window on the glass)? Entries exist
    *  only for cast-enabled connectors; reported in every status frame + immediately on change. */
   private readonly casting = new Map<string, boolean>();
+
+  /** POL-92 — host vitals, sampled from /proc on each heartbeat. Holds the previous CPU jiffy totals
+   *  between samples (busy% is a delta), so it lives for the life of the agent, not the socket. */
+  private readonly vitals = new VitalsSampler();
 
   constructor(
     private readonly url: string,
@@ -785,7 +790,15 @@ class Agent {
     this.send(hello);
   }
 
-  private sendStatus(): void {
+  /**
+   * The heartbeat. Carries the observed revision + per-connector placement outcome, and — POL-92 —
+   * a cheap /proc sample of the box's own health (CPU/mem/disk/temp, per-browser RSS + respawns, and
+   * the `/dev/dri` GPU tell that catches a software-rendering browser before it cooks the box).
+   *
+   * The sample is best-effort and NEVER blocks the heartbeat: a host with no /proc (a dev laptop)
+   * samples nothing and the frame goes out without `vitals` — exactly what a pre-POL-92 agent sends.
+   */
+  private async sendStatus(): Promise<void> {
     const screens = [...this.status.entries()].map(([connector, st]) => {
       const entry: { connector: string; ok: boolean; note?: string; casting?: boolean } = {
         connector,
@@ -797,11 +810,19 @@ class Agent {
       if (casting !== undefined) entry.casting = casting;
       return entry;
     });
+    let vitals: MachineVitals | undefined;
+    try {
+      vitals = await this.vitals.sample(this.backend.browserProbes?.() ?? []);
+    } catch (err) {
+      // Telemetry must never cost a heartbeat: a machine that stops heartbeating reads as OFFLINE.
+      log(`vitals sample failed (heartbeat continues without them): ${(err as Error).message}`);
+    }
     this.send({
       t: "agent/status",
       machineId: this.machineId,
       observedRevision: this.lastAppliedRevision,
       screens,
+      vitals,
     });
   }
 
@@ -820,8 +841,8 @@ class Agent {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
-    this.sendStatus();
-    this.heartbeatTimer = setInterval(() => this.sendStatus(), HEARTBEAT_MS);
+    void this.sendStatus();
+    this.heartbeatTimer = setInterval(() => void this.sendStatus(), HEARTBEAT_MS);
   }
 
   private stopHeartbeat(): void {
