@@ -10,6 +10,21 @@
  */
 import { z } from "zod";
 
+import { MachineTags } from "./selector";
+
+/** POL-103 — machine tags + the selector grammar that targets bulk operations. */
+export {
+  MACHINE_TAG_PATTERN,
+  MachineTag,
+  MachineTags,
+  distinctTags,
+  matchesSelector,
+  normalizeTag,
+  parseSelector,
+  selectByTags,
+} from "./selector";
+export type { MachineSelector, ParseSelectorResult } from "./selector";
+
 export const PROTOCOL_VERSION = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +80,9 @@ export const Machine = z.object({
   browser: KioskBrowser.optional(),
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
+  /** POL-103 — free-form operator tags ("atrium", "floor:2", "canary"). Flat and opaque: a selector
+   *  matches them by set membership, never by parsing them. They are what bulk operations target. */
+  tags: MachineTags.default([]),
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
    *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
@@ -931,6 +949,8 @@ export const MachineView = z.object({
   browser: KioskBrowser.optional(),
   online: z.boolean(), // is the agent's WS currently connected?
   status: EnrollmentStatus, // pending machines await operator approval
+  /** POL-103 — the machine's operator tags; the console renders them as chips and filters on them. */
+  tags: MachineTags.default([]),
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
@@ -1285,6 +1305,95 @@ export type ShellArmBody = z.infer<typeof ShellArmBody>;
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });
 export type InspectBody = z.infer<typeof InspectBody>;
+
+// ── Tags + selector-targeted bulk operations (POL-103) ───────────────────────
+//
+// PUT /api/v1/machines/:id/tags replaces a machine's whole tag set — add and remove are the same
+// call, so the console never has to reconcile two half-applied mutations.
+//
+// The bulk routes take a TARGET, which is either a `selector` (the tag grammar in selector.ts) or an
+// explicit `machineIds` list (the console's checkboxes). Never both-optional-and-absent: a bulk verb
+// with no target is a 400, never a fleet-wide fan-out. Each answers a per-machine RESULT list —
+// partial success is the normal case, and three offline boxes must not fail the other nine.
+
+export const SetMachineTagsBody = z.object({ tags: MachineTags });
+export type SetMachineTagsBody = z.infer<typeof SetMachineTagsBody>;
+
+const bulkTargetShape = {
+  /** A tag selector, e.g. `tag=atrium` or `tag=floor:2,tag=canary` (AND). */
+  selector: z.string().max(200).optional(),
+  /** Or an explicit set of machines — what the console's checkboxes send. */
+  machineIds: z.array(z.string().min(1)).max(500).optional(),
+};
+
+/** Exactly-one-target: a bulk verb that names nothing must never mean "everything". */
+function requireTarget(
+  value: { selector?: string; machineIds?: string[] },
+  ctx: z.RefinementCtx,
+): void {
+  const hasSelector = typeof value.selector === "string" && value.selector.trim() !== "";
+  const hasIds = Array.isArray(value.machineIds) && value.machineIds.length > 0;
+  if (!hasSelector && !hasIds) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "name a target: a tag selector (e.g. tag=atrium) or a non-empty machineIds list",
+    });
+  }
+  if (hasSelector && hasIds) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "name ONE target: a selector or a machineIds list, not both",
+    });
+  }
+}
+
+export const BulkRebootBody = z
+  .object({ ...bulkTargetShape, reason: z.string().max(200).optional() })
+  .superRefine(requireTarget);
+export type BulkRebootBody = z.infer<typeof BulkRebootBody>;
+
+export const BulkIdentBody = z
+  .object({ ...bulkTargetShape, on: z.boolean(), ttlMs: z.number().int().positive().optional() })
+  .superRefine(requireTarget);
+export type BulkIdentBody = z.infer<typeof BulkIdentBody>;
+
+export const BulkShellBody = z
+  .object({ ...bulkTargetShape, enabled: z.boolean() })
+  .superRefine(requireTarget);
+export type BulkShellBody = z.infer<typeof BulkShellBody>;
+
+export const BulkApproveBody = z.object({ ...bulkTargetShape }).superRefine(requireTarget);
+export type BulkApproveBody = z.infer<typeof BulkApproveBody>;
+
+/**
+ * What happened to ONE machine in a bulk fan-out:
+ *   applied — the verb reached the box (or changed persisted state, for approve/tag)
+ *   offline — matched, but its agent socket is down: reported, never fatal
+ *   skipped — matched, but the verb does not apply (rebooting a pending box, approving an approved one)
+ *   failed  — the control plane tried and errored (the sentence says how)
+ */
+export const BulkOutcome = z.enum(["applied", "offline", "skipped", "failed"]);
+export type BulkOutcome = z.infer<typeof BulkOutcome>;
+
+export const BulkMachineResult = z.object({
+  machineId: z.string(),
+  label: z.string(),
+  outcome: BulkOutcome,
+  /** A plain sentence when the outcome is not `applied` — shown to the operator verbatim. */
+  detail: z.string().optional(),
+});
+export type BulkMachineResult = z.infer<typeof BulkMachineResult>;
+
+export const BulkOpResponse = z.object({
+  ok: z.literal(true),
+  action: z.string(),
+  /** How the target was named, echoed back (the selector text, or "N machines"). */
+  target: z.string(),
+  matched: z.number().int().nonnegative(),
+  applied: z.number().int().nonnegative(),
+  results: z.array(BulkMachineResult),
+});
+export type BulkOpResponse = z.infer<typeof BulkOpResponse>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });

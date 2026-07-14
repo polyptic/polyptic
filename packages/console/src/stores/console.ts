@@ -14,6 +14,7 @@ import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/
 import type {
   ActivityEvent,
   AuthUser,
+  BulkOpResponse,
   ChangePasswordBody,
   ContentKind,
   ContentSource,
@@ -39,6 +40,15 @@ import type {
 
 import * as api from "../api";
 import * as auth from "../auth";
+
+/** A server 4xx explains itself in `{error: "<sentence>"}`; ApiError.message is only method+status. */
+function errorSentence(err: unknown, fallback: string): string {
+  const detail =
+    err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+      ? (err.payload as { error: string }).error
+      : null;
+  return detail ?? fallback;
+}
 
 /** Assigning content takes EITHER a library source by id OR an ad-hoc URL — exactly one (the
  *  contract's SetContentBody refinement). The ad-hoc URL path is the Phase-3b behaviour. */
@@ -766,6 +776,54 @@ export const useConsoleStore = defineStore("console", {
         this.openSocket();
       }, delay);
       backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+    },
+
+    // ── Tags + bulk operations (POL-103) ────────────────────────────────────────
+
+    /**
+     * Replace a machine's whole tag set. Optimistic (the chips redraw at once); the authoritative
+     * admin/state broadcast reconciles — including the server's normalization (lowercase, de-duped).
+     */
+    async setMachineTags(id: string, tags: string[]): Promise<string | null> {
+      const machine = this.machines.find((m) => m.id === id);
+      const previous = machine ? [...(machine.tags ?? [])] : [];
+      if (machine) machine.tags = tags;
+      try {
+        await api.setMachineTags(id, tags);
+        return null;
+      } catch (err) {
+        if (machine) machine.tags = previous; // revert
+        console.error("[console] setMachineTags failed", err);
+        return errorSentence(err, "Could not save those tags.");
+      }
+    },
+
+    /**
+     * Fan a verb out over a target (a tag selector, or the operator's checkbox selection) and hand
+     * back the server's per-machine result. Partial success is NORMAL — three offline boxes are
+     * reported, not thrown — so the caller summarizes rather than treating it as a failure.
+     */
+    async bulkAction(
+      action: "reboot" | "arm" | "disarm" | "ident" | "approve",
+      target: api.BulkTarget,
+    ): Promise<BulkOpResponse | string> {
+      try {
+        switch (action) {
+          case "reboot":
+            return await api.bulkReboot(target);
+          case "arm":
+            return await api.bulkShell(target, true);
+          case "disarm":
+            return await api.bulkShell(target, false);
+          case "ident":
+            return await api.bulkIdent(target);
+          case "approve":
+            return await api.bulkApprove(target);
+        }
+      } catch (err) {
+        console.error(`[console] bulk ${action} failed`, err);
+        return errorSentence(err, `The ${action} could not be sent to those machines.`);
+      }
     },
 
     // ── Machines / enrollment (Phase 2b) ────────────────────────────────────────

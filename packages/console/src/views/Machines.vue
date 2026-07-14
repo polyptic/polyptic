@@ -21,12 +21,21 @@
   A "Connect a machine" button (and a first-run empty state) opens the cold-start wizard. Screens are
   first-class and named; machines are plumbing — so the rich, per-screen affordances live here.
 
-  Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine, and via
-  ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints, no direct fetch.
+  POL-103 adds GROUPING, because at fifty boxes every fleet action is fifty clicks: tag chips on each
+  card (click one to filter to it), a filter box that takes a name OR a selector (`tag=atrium`,
+  `tag=floor:2,tag=canary` = AND), checkboxes, and a bulk bar over whichever is active — ident,
+  approve, enable/disable console, reboot. Each verb confirms with the blast radius spelled out
+  ("Reboot 12 machines?") and reports back what landed ("reboot: 9 of 12 machines · 3 offline"): an
+  offline box is an outcome, never a failed call.
+
+  Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine /
+  setMachineTags / bulkAction, and via ScreenRow: identScreen / renameScreen / inspectScreen). No
+  direct fetch.
 -->
 <script setup lang="ts">
 import { ref, computed, reactive, onMounted, onUnmounted } from "vue";
-import type { MachineView } from "@polyptic/protocol";
+import type { BulkMachineResult, MachineView } from "@polyptic/protocol";
+import { MachineTag, matchesSelector, normalizeTag, parseSelector } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
 import ScreenRow from "../components/ScreenRow.vue";
@@ -35,10 +44,146 @@ import MachineTerminal from "../components/MachineTerminal.vue";
 
 const store = useConsoleStore();
 
-const pending = computed(() => store.pendingMachines);
-const approved = computed(() => store.approvedMachines);
-const rejected = computed(() => store.rejectedMachines);
 const hasAnyMachine = computed(() => store.machines.length > 0);
+
+// ── Tags, the filter, and bulk targeting (POL-103) ───────────────────────────
+// The filter box takes EITHER a selector (`tag=atrium`, or an AND: `tag=floor:2,tag=canary`) or plain
+// text (matched against a machine's name, id, or tags). A selector is also what a bulk verb TARGETS,
+// so the same string the operator narrowed the list with is the one the server fans out over.
+const filterText = ref("");
+const parsed = computed(() =>
+  filterText.value.trim() === "" ? null : parseSelector(filterText.value),
+);
+/** The active selector, when the filter is one AND it parses. */
+const selector = computed(() => (parsed.value?.ok ? parsed.value.selector : null));
+/** A selector that was clearly INTENDED (starts with `tag`) but doesn't parse — say why, don't guess. */
+const selectorError = computed(() =>
+  parsed.value && !parsed.value.ok && /^\s*tag\b/i.test(filterText.value) ? parsed.value.error : null,
+);
+
+function matchesFilter(m: MachineView): boolean {
+  const sel = selector.value;
+  if (sel) return matchesSelector(m.tags, sel);
+  const q = filterText.value.trim().toLowerCase();
+  if (q === "" || selectorError.value) return q === "" ? true : false;
+  return (
+    m.label.toLowerCase().includes(q) ||
+    m.id.toLowerCase().includes(q) ||
+    (m.tags ?? []).some((t) => t.includes(q))
+  );
+}
+
+const pending = computed(() => store.pendingMachines.filter(matchesFilter));
+const approved = computed(() => store.approvedMachines.filter(matchesFilter));
+const rejected = computed(() => store.rejectedMachines.filter(matchesFilter));
+const shown = computed(() => [...pending.value, ...approved.value, ...rejected.value]);
+const filtering = computed(() => filterText.value.trim() !== "");
+
+/** Hand-picked machines (the checkboxes). Wins over the selector when non-empty. */
+const picked = reactive(new Set<string>());
+
+function togglePick(id: string): void {
+  if (picked.has(id)) picked.delete(id);
+  else picked.add(id);
+}
+function pickAllShown(): void {
+  for (const m of shown.value) picked.add(m.id);
+}
+function clearPicks(): void {
+  picked.clear();
+}
+
+/**
+ * The blast radius: exactly the machines a bulk verb would touch. Hand-picked boxes if there are
+ * any; otherwise everything the ACTIVE SELECTOR matches. A plain-text filter targets nothing — you
+ * cannot reboot a substring search, only a set you named (a selector) or a set you saw (checkboxes).
+ */
+const targeted = computed<MachineView[]>(() => {
+  if (picked.size > 0) return store.machines.filter((m) => picked.has(m.id));
+  if (selector.value) return store.machines.filter((m) => matchesSelector(m.tags, selector.value!));
+  return [];
+});
+const targetLabel = computed(() =>
+  picked.size > 0 ? `${countLabel(picked.size, "machine")} selected` : (selector.value?.source ?? ""),
+);
+/** What goes on the wire: the checkbox set, or the selector the operator typed. */
+function bulkTarget(): { machineIds: string[] } | { selector: string } {
+  if (picked.size > 0) return { machineIds: targeted.value.map((m) => m.id) };
+  return { selector: selector.value?.source ?? "" };
+}
+
+const BULK_PROMPT: Record<string, (n: string) => string> = {
+  reboot: (n) => `Reboot ${n}? Their screens go dark until they boot back up — about a minute.`,
+  arm: (n) => `Enable the console on ${n}? While enabled, an operator can open an unprivileged terminal on each. Sessions are logged.`,
+  disarm: (n) => `Disable the console on ${n}? Any open terminal is closed.`,
+  ident: (n) => `Flash the ident overlay on every screen of ${n}?`,
+  approve: (n) => `Approve ${n}? Their screens are admitted and land in the Unplaced tray.`,
+};
+
+/** One line of truth after a fan-out: what landed, and what did not (offline boxes are NOT a failure). */
+function summarize(action: string, results: BulkMachineResult[]): string {
+  const applied = results.filter((r) => r.outcome === "applied").length;
+  const parts = [`${action}: ${applied} of ${countLabel(results.length, "machine")}`];
+  const offline = results.filter((r) => r.outcome === "offline").length;
+  const skipped = results.filter((r) => r.outcome === "skipped").length;
+  const failed = results.filter((r) => r.outcome === "failed").length;
+  if (offline) parts.push(`${offline} offline`);
+  if (skipped) parts.push(`${skipped} skipped`);
+  if (failed) parts.push(`${failed} failed`);
+  return parts.join(" · ");
+}
+
+async function bulk(action: "reboot" | "arm" | "disarm" | "ident" | "approve"): Promise<void> {
+  const machines = targeted.value;
+  if (machines.length === 0) return;
+  // The confirm NAMES the blast radius — "Reboot 12 machines?" — before anything is sent.
+  const yes = window.confirm(BULK_PROMPT[action]!(countLabel(machines.length, "machine")));
+  if (!yes) return;
+
+  const result = await store.bulkAction(action, bulkTarget());
+  if (typeof result === "string") {
+    showToast(result);
+    return;
+  }
+  showToast(summarize(action, result.results));
+  clearPicks();
+}
+
+/** How many of the targeted machines are still pending — the bulk Approve button's own blast radius. */
+const targetedPending = computed(() => targeted.value.filter((m) => m.status === "pending").length);
+
+/**
+ * Edit a machine's tags. Free-form and flat ("atrium", "floor:2", "canary"): the selector matches a
+ * tag, it never parses one, so `:` is a convention and not a key/value model.
+ */
+async function editTags(m: MachineView): Promise<void> {
+  menuFor.value = null;
+  const answer = window.prompt(
+    `Tags for "${m.label}" — comma-separated (e.g. atrium, floor:2, canary). Empty clears them.`,
+    (m.tags ?? []).join(", "),
+  );
+  if (answer === null) return;
+
+  const tags: string[] = [];
+  for (const raw of answer.split(",")) {
+    const tag = normalizeTag(raw);
+    if (tag === "") continue;
+    if (!MachineTag.safeParse(tag).success) {
+      showToast(`"${tag}" is not a valid tag — use a–z, 0–9, and . _ : - (max 32 chars).`);
+      return;
+    }
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+
+  const error = await store.setMachineTags(m.id, tags);
+  showToast(error ?? (tags.length ? `${m.label} tagged ${tags.join(", ")}` : `${m.label} untagged`));
+}
+
+/** Clicking a chip filters to that tag — the one-click path from "I see it" to "I can target it". */
+function filterByTag(tag: string): void {
+  filterText.value = `tag=${tag}`;
+  clearPicks();
+}
 
 const wizardOpen = ref(false);
 
@@ -216,6 +361,28 @@ function showToast(message: string): void {
       </div>
 
       <template v-else>
+        <!-- filter / selector (POL-103) — a name, or a selector the bulk bar can target -->
+        <div class="filter-bar">
+          <input
+            v-model="filterText"
+            class="filter-input"
+            type="search"
+            placeholder="Filter by name, or a selector — tag=atrium · tag=floor:2,tag=canary"
+            aria-label="Filter machines by name or tag selector"
+          />
+          <span v-if="selector" class="filter-hint">
+            {{ countLabel(shown.length, "machine") }} match {{ selector.source }}
+          </span>
+          <span v-else-if="filtering" class="filter-hint">
+            {{ countLabel(shown.length, "machine") }} match
+          </span>
+          <button v-if="filtering" class="btn-ghost-sm" @click="filterText = ''">Clear</button>
+          <button v-if="shown.length && picked.size < shown.length" class="btn-ghost-sm" @click="pickAllShown">
+            Select {{ shown.length }}
+          </button>
+        </div>
+        <div v-if="selectorError" class="selector-error">{{ selectorError }}</div>
+
         <!-- enrolment guidance -->
         <div class="card enrol">
           <div class="enrol-text">
@@ -237,6 +404,13 @@ function showToast(message: string): void {
           <div class="stack">
             <div v-for="m in pending" :key="m.id" class="machine pending">
               <div class="machine-row">
+                <input
+                  class="pick"
+                  type="checkbox"
+                  :checked="picked.has(m.id)"
+                  :aria-label="`Select ${m.label}`"
+                  @change="togglePick(m.id)"
+                />
                 <div class="machine-id">
                   <div class="machine-id-line">
                     <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
@@ -252,6 +426,22 @@ function showToast(message: string): void {
                 <button class="btn-reject" @click="reject(m)">Reject</button>
                 <button class="btn-approve" @click="approve(m)">Approve</button>
               </div>
+              <!-- tags (POL-103): chips that double as a one-click filter into a selector -->
+              <div class="tags">
+                <button
+                  v-for="t in m.tags"
+                  :key="t"
+                  class="chip-tag"
+                  :title="`Filter to tag=${t}`"
+                  @click="filterByTag(t)"
+                >
+                  {{ t }}
+                </button>
+                <button class="chip-add" @click="editTags(m)">
+                  {{ m.tags.length ? "Edit tags" : "+ Tag" }}
+                </button>
+              </div>
+
               <div class="pending-note">
                 Not yet admitted — shows nothing until you approve it. Its
                 {{ countLabel(m.outputCount, "screen") }} will land in the Unplaced tray.
@@ -268,6 +458,13 @@ function showToast(message: string): void {
           <div v-if="approved.length" class="stack">
             <div v-for="m in approved" :key="m.id" class="machine">
               <div class="machine-row">
+                <input
+                  class="pick"
+                  type="checkbox"
+                  :checked="picked.has(m.id)"
+                  :aria-label="`Select ${m.label}`"
+                  @change="togglePick(m.id)"
+                />
                 <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
                 <div class="machine-id">
                   <div class="machine-id-line">
@@ -369,11 +566,26 @@ function showToast(message: string): void {
                         Reboot
                       </button>
                       <div class="menu-sep"></div>
+                      <button class="menu-item" @click="editTags(m)">Edit tags</button>
+                      <div class="menu-sep"></div>
                       <button class="menu-item danger" @click="revoke(m)">Revoke access</button>
                       <button class="menu-item danger" @click="remove(m)">Remove machine</button>
                     </div>
                   </template>
                 </div>
+              </div>
+
+              <!-- tags (POL-103): chips that double as a one-click filter into a selector -->
+              <div v-if="m.tags.length" class="tags">
+                <button
+                  v-for="t in m.tags"
+                  :key="t"
+                  class="chip-tag"
+                  :title="`Filter to tag=${t}`"
+                  @click="filterByTag(t)"
+                >
+                  {{ t }}
+                </button>
               </div>
 
               <div v-if="m.screens.length" class="screens">
@@ -421,6 +633,25 @@ function showToast(message: string): void {
         </section>
       </template>
     </div>
+
+    <!-- bulk-action bar (POL-103) — visible whenever a selection OR a selector names machines.
+         Every verb confirms with the blast radius spelled out ("Reboot 12 machines?") first. -->
+    <Transition name="bulkbar">
+      <div v-if="targeted.length" class="bulkbar">
+        <span class="bulkbar-count">{{ countLabel(targeted.length, "machine") }}</span>
+        <span class="bulkbar-target">{{ targetLabel }}</span>
+        <div class="bulkbar-actions">
+          <button class="bulk-btn" @click="bulk('ident')">Ident all</button>
+          <button v-if="targetedPending" class="bulk-btn" @click="bulk('approve')">
+            Approve {{ targetedPending }}
+          </button>
+          <button class="bulk-btn" @click="bulk('arm')">Enable console</button>
+          <button class="bulk-btn" @click="bulk('disarm')">Disable console</button>
+          <button class="bulk-btn danger" @click="bulk('reboot')">Reboot</button>
+        </div>
+        <button v-if="picked.size" class="bulk-clear" @click="clearPicks">Clear selection</button>
+      </div>
+    </Transition>
 
     <!-- cold-start wizard overlay -->
     <ColdStartWizard :open="wizardOpen" :now="now" @close="wizardOpen = false" />
@@ -927,6 +1158,161 @@ function showToast(message: string): void {
   margin-top: 12px;
   font-size: 12px;
   color: var(--muted2);
+}
+
+/* filter / selector (POL-103) */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.filter-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+.filter-input:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+.filter-hint {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.selector-error {
+  font-size: 12px;
+  color: var(--bad);
+  background: var(--bad-soft);
+  padding: 7px 11px;
+  border-radius: 8px;
+  margin: -6px 0 14px;
+}
+
+/* per-card selection checkbox */
+.pick {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+/* tag chips */
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.chip-tag,
+.chip-add {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  border: 1px solid var(--line2);
+  background: var(--muted-bg);
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+}
+.chip-tag:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.chip-add {
+  background: none;
+  border-style: dashed;
+  color: var(--muted);
+  font-weight: 500;
+}
+.chip-add:hover {
+  color: var(--fg2);
+}
+
+/* bulk-action bar */
+.bulkbar {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px 9px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: var(--shadow-lg);
+  max-width: min(92vw, 860px);
+}
+.bulkbar-count {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.bulkbar-target {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bulkbar-actions {
+  display: flex;
+  gap: 6px;
+}
+.bulk-btn {
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+.bulk-btn:hover {
+  background: var(--muted-bg);
+}
+.bulk-btn.danger {
+  color: var(--bad);
+}
+.bulk-btn.danger:hover {
+  background: var(--bad-soft);
+  border-color: var(--bad);
+}
+.bulk-clear {
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bulk-clear:hover {
+  color: var(--fg2);
+}
+.bulkbar-enter-active,
+.bulkbar-leave-active {
+  transition: opacity 0.18s ease;
+}
+.bulkbar-enter-from,
+.bulkbar-leave-to {
+  opacity: 0;
 }
 
 /* toast (reboot feedback) */
