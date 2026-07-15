@@ -60,6 +60,7 @@ import type {
   DesiredState,
   DisplayBackend,
   DisplaySettings,
+  FramingVerdict,
   Geometry,
   HostIdentity,
   KioskBrowser,
@@ -84,6 +85,7 @@ import type {
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
+  WindowPlacement,
 } from "@polyptic/protocol";
 
 import type {
@@ -197,11 +199,14 @@ function labelForHello(existing: Machine | undefined, input: RegisterMachineInpu
   return meaningfulHostname(input.hostname) ?? input.machineId;
 }
 
-/** One entry of the `server/apply` payload: which screen an output is, and where to point its player. */
+/** One entry of the `server/apply` payload: which screen an output is, where to point its player,
+ *  and (POL-18) any top-level windows the agent must place over that player. */
 export interface ScreenAssignment {
   connector: string;
   screenId: string;
   playerUrl: string;
+  /** Present (non-empty) only when this screen's slice carries `placement: "window"` surfaces. */
+  windows?: WindowPlacement[];
   /** POL-119 — run a cast (AirPlay) receiver on this connector, advertised as `friendlyName`. */
   castEnabled: boolean;
   friendlyName: string;
@@ -345,7 +350,15 @@ export interface ContentAssignment {
  *  page (POL-42) has no url either — it carries the authored definition (embeds inside it resolve
  *  at send time). */
 type ResolvedSpec =
-  | { kind: Exclude<ContentKind, "page">; url: string; entries?: PlaylistEntry[]; startedAt?: string }
+  | {
+      kind: Exclude<ContentKind, "page">;
+      url: string;
+      entries?: PlaylistEntry[];
+      startedAt?: string;
+      /** POL-18 — the placement the SOURCE wants (override, else the framing verdict). Only set for
+       *  web/dashboard kinds; capability gating per target machine happens at build time. */
+      placement?: "iframe" | "window";
+    }
   | { kind: "page"; definition: PageDefinition };
 
 /** The url half of a zoom/name key. Pages carry no url (and take no zoom), so they contribute an
@@ -682,6 +695,8 @@ export class ControlPlane {
         credentialProfileId: cs.credentialProfileId ?? null,
         items: cs.items ?? undefined,
         definition: cs.definition ?? undefined,
+        framing: cs.framing ?? undefined,
+        placementMode: cs.placementMode ?? undefined,
       });
       if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
     }
@@ -932,10 +947,14 @@ export class ControlPlane {
         changed = true;
       }
 
+      // POL-18 — a screen may already hold windowed content (persisted across a restart / an agent
+      // reconnect), so the hello-path apply carries its windows too, not just the player URL.
+      const windows = this.windowsForScreen(screen.id);
       assignments.push({
         connector: output.connector,
         screenId: screen.id,
         playerUrl: this.playerUrlFor(screen.id),
+        ...(windows.length > 0 ? { windows } : {}),
         castEnabled: screen.castEnabled,
         friendlyName: screen.friendlyName,
       });
@@ -1884,12 +1903,16 @@ export class ControlPlane {
     name: string;
     kind: ContentKind;
     zoom?: number;
+    windowed?: boolean;
     entries?: { sourceId?: string; name: string; kind: PlaylistEntry["kind"]; zoom?: number }[];
   } | null {
     const surface = this.state.slices[screenId]?.surfaces[0];
     // POL-57 — the live zoom, present only for framed content. Its absence is how the console knows
     // this screen has nothing to zoom (media, or no content at all) and hides the control.
     const zoom = surface && isFramed(surface) ? surface.zoom : undefined;
+    // POL-18 — flagged when the content renders as an agent-placed window, not a player iframe.
+    const windowed =
+      surface && isFramed(surface) && surface.placement === "window" ? true : undefined;
     // POL-133 — for a playlist, the rotation's steps with each framed step's live zoom on THIS
     // screen, so the console can draw one zoom control per zoomable step.
     const entries =
@@ -1908,12 +1931,12 @@ export class ControlPlane {
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind, zoom, entries };
+      if (src) return { name: src.name, kind: src.kind, zoom, windowed, entries };
     }
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, entries };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, windowed, entries };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -1997,12 +2020,18 @@ export class ControlPlane {
           ...base,
           type: "web",
           url: spec.url,
-          placement: "iframe",
+          placement: spec.placement ?? "iframe",
           interactive: false,
           zoom,
         });
       case "dashboard":
-        return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url, zoom });
+        return DashboardSurface.parse({
+          ...base,
+          type: "dashboard",
+          url: spec.url,
+          placement: spec.placement ?? "iframe",
+          zoom,
+        });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
       case "video":
@@ -2282,6 +2311,47 @@ export class ControlPlane {
    * playlist) is skipped, and a timed kind that lost its duration to authoring-time drift falls back
    * to the default hold — and stamps the rotation anchor once, shared by every surface built from it.
    */
+  /**
+   * POL-18 — the placement a web/dashboard SOURCE wants: the operator's override when set, else
+   * "window" iff the framing probe said the source refuses to be framed. `unknown` (unprobed / probe
+   * failed) resolves to "iframe" — a false "blocked" would windowize content that frames fine.
+   */
+  private desiredPlacement(source: ContentSource): "iframe" | "window" {
+    if (source.kind !== "web" && source.kind !== "dashboard") return "iframe";
+    const mode = source.placementMode ?? "auto";
+    if (mode !== "auto") return mode;
+    return source.framing === "blocked" ? "window" : "iframe";
+  }
+
+  /**
+   * POL-18 — can this screen's machine actually PLACE a top-level window? Only the wayland-sway
+   * backend implements window placement (swaymsg floating + absolute move); everything else — the
+   * x11-i3 fallback, dev-open — degrades to the iframe rather than showing nothing. The degrade is
+   * decided HERE (the server knows the machine) so the wall never renders a hole nobody will fill.
+   */
+  private canPlaceWindows(screenId: string): boolean {
+    const screen = this.getScreen(screenId);
+    const machine = screen ? this.machines.get(screen.machineId) : undefined;
+    return machine?.backend === "wayland-sway";
+  }
+
+  /**
+   * POL-18 — the spec as it must resolve ON THIS SCREEN: a window-wanting spec degrades to the
+   * iframe when the box can't place windows (and says so in the activity feed — the operator asked
+   * for a window and should learn from the console, not from a dead tile, why they got a frame).
+   */
+  private specForScreen(spec: ResolvedSpec, screenId: string): ResolvedSpec {
+    if (spec.kind !== "web" && spec.kind !== "dashboard") return spec;
+    if (spec.placement !== "window") return spec;
+    if (this.canPlaceWindows(screenId)) return spec;
+    const screen = this.getScreen(screenId);
+    this.emit(
+      "warn",
+      `${screen?.friendlyName ?? screenId} cannot place windows (backend without window placement) — showing framed instead`,
+    );
+    return { ...spec, placement: "iframe" };
+  }
+
   private specFor(source: ContentSource): ResolvedSpec {
     if (source.kind === "page") {
       // A malformed row that lost its definition resolves to an EMPTY page rather than crashing.
@@ -2290,7 +2360,16 @@ export class ControlPlane {
         definition: source.definition ?? { aspect: "16:9", bg: "#0b0b0e", elements: [] },
       };
     }
-    if (source.kind !== "playlist") return { kind: source.kind, url: source.url ?? "" };
+    if (source.kind !== "playlist") {
+      return {
+        kind: source.kind,
+        url: source.url ?? "",
+        // POL-18 — web/dashboard carry the source's desired placement; media ignores it.
+        ...(source.kind === "web" || source.kind === "dashboard"
+          ? { placement: this.desiredPlacement(source) }
+          : {}),
+      };
+    }
     const entries: PlaylistEntry[] = [];
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
@@ -2355,6 +2434,16 @@ export class ControlPlane {
    * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
    */
   private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
+    // POL-18 — a video wall never windows: a spanned surface is one CONTENT sliced across members,
+    // and a top-level window can neither be sliced nor span outputs. A window-wanting source on a
+    // wall degrades to the iframe (with a console-visible note) rather than leaving member holes.
+    if ((spec.kind === "web" || spec.kind === "dashboard") && spec.placement === "window") {
+      this.emit(
+        "warn",
+        `${wall.name ?? wall.id}: windowed placement is not supported on a video wall — showing framed instead`,
+      );
+      spec = { ...spec, placement: "iframe" };
+    }
     const members: { screenId: string; placement: Placement }[] = [];
     for (const screenId of wall.memberScreenIds) {
       const placement = this.placements.get(screenId);
@@ -2617,7 +2706,9 @@ export class ControlPlane {
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
     // POL-133 — a playlist's framed steps pick up this screen's remembered per-step zooms.
     const surface = this.buildSurface(
-      this.specForTarget(screenId, resolved.spec),
+      // POL-18 — degrade a window-wanting spec on a box that can't place windows.
+      // POL-133 — stamp this screen's remembered per-step zoom into a playlist's framed steps.
+      this.specForScreen(this.specForTarget(screenId, resolved.spec), screenId),
       "content-web",
       { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
       undefined,
@@ -2930,6 +3021,8 @@ export class ControlPlane {
       credentialProfileId: source.credentialProfileId ?? null,
       items: source.items ?? null,
       definition: source.definition ?? null,
+      framing: source.framing ?? null,
+      placementMode: source.placementMode ?? null,
     };
   }
 
@@ -2988,6 +3081,11 @@ export class ControlPlane {
       credentialProfileId,
       items: body.items,
       definition: body.definition,
+      // POL-18 — the override only means something on frameable kinds; framing arrives later, from
+      // the caller's async probe (setSourceFraming).
+      ...(body.kind === "web" || body.kind === "dashboard"
+        ? { placementMode: body.placementMode }
+        : {}),
     });
     this.contentSources.set(id, source);
     await this.store.upsertContentSource(this.toPersistedSource(source));
@@ -3011,7 +3109,9 @@ export class ControlPlane {
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
       const surface = this.buildSurface(
-        this.specForTarget(screenId, spec),
+        // POL-18 — degrade a window-wanting spec per screen (a mixed fleet resolves per machine).
+        // POL-133 — stamp this screen's remembered per-step zoom into a playlist's framed steps.
+        this.specForScreen(this.specForTarget(screenId, spec), screenId),
         "content-web",
         { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
         undefined,
@@ -3094,6 +3194,15 @@ export class ControlPlane {
       credentialProfileId,
       items,
       definition,
+      // POL-18 — placement fields live on web/dashboard kinds only. A changed URL DROPS the framing
+      // verdict (it described the old address; the caller re-probes and stamps the new one), and a
+      // kind change away from web/dashboard sheds both.
+      ...(kind === "web" || kind === "dashboard"
+        ? {
+            framing: nextUrl === existing.url ? existing.framing : undefined,
+            placementMode: patch.placementMode ?? existing.placementMode,
+          }
+        : {}),
     });
     if (!merged.success) return { ok: false, error: "invalid-source" };
     const source = merged.data;
@@ -3136,6 +3245,104 @@ export class ControlPlane {
     const pageSlices = this.slicesShowingPagesEmbedding(id).filter((s) => !seen.has(s.screenId));
 
     return { ok: true, source, slices: [...slices, ...pageSlices] };
+  }
+
+  /**
+   * POL-18 — record a framing-probe verdict on a web/dashboard source. Persists the verdict and,
+   * when it can change how the source RENDERS (the override is "auto"), re-resolves every screen
+   * showing it — the automatic web → web-window fallback. Returns the touched slices for the caller
+   * to push (renders to players + a fresh apply to the affected machines). No-ops (changed: false)
+   * on unknown sources, non-frameable kinds, and an unchanged verdict.
+   */
+  async setSourceFraming(
+    id: string,
+    verdict: FramingVerdict,
+  ): Promise<{ changed: boolean; source?: ContentSource; slices: ScreenSlice[] }> {
+    const existing = this.contentSources.get(id);
+    if (!existing || (existing.kind !== "web" && existing.kind !== "dashboard")) {
+      return { changed: false, slices: [] };
+    }
+    if ((existing.framing ?? "unknown") === verdict) {
+      return { changed: false, source: existing, slices: [] };
+    }
+    const source: ContentSource = { ...existing, framing: verdict };
+    this.contentSources.set(id, source);
+    await this.store.upsertContentSource(this.toPersistedSource(source));
+
+    // Only an "auto" source renders differently on a verdict change — a forced source is pinned.
+    const slices =
+      (source.placementMode ?? "auto") === "auto" ? this.reresolveAssignments(id) : [];
+    if (slices.length > 0) {
+      this.bumpRevision();
+      for (const slice of slices) {
+        await this.store.upsertContent({
+          screenId: slice.screenId,
+          canvas: slice.canvas,
+          surfaces: slice.surfaces,
+          sourceId: id,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+    if (verdict === "blocked" && (source.placementMode ?? "auto") === "auto") {
+      this.emit("info", `${source.name} refuses framing — it will show as a placed window`);
+    }
+    return { changed: true, source, slices };
+  }
+
+  /**
+   * POL-18 — the top-level windows the agent must place over ONE screen's player: every
+   * `placement: "window"` surface of its slice, URL credential-stamped AT SEND TIME (the same
+   * decorate pass the player render uses, so the placed window loads authenticated too). `region`
+   * is canvas px; the slice canvas rides along for the agent's region → output-pixel scale.
+   */
+  windowsForScreen(screenId: string): WindowPlacement[] {
+    const slice = this.state.slices[screenId];
+    if (!slice || slice.surfaces.length === 0) return [];
+    const decorated = this.decorateSliceForSend(slice);
+    const windows: WindowPlacement[] = [];
+    for (const surface of decorated.surfaces) {
+      if (
+        (surface.type === "web" || surface.type === "dashboard") &&
+        surface.placement === "window"
+      ) {
+        windows.push({
+          id: surface.id,
+          url: surface.url,
+          region: surface.region,
+          canvas: decorated.canvas,
+        });
+      }
+    }
+    return windows;
+  }
+
+  /**
+   * POL-18 — the full per-output assignment list for ONE machine, for a live `server/apply` push
+   * outside the hello path (content changed → the window set on some output changed). Always the
+   * COMPLETE list: the agent retires any connector not listed, so a partial apply would tear down
+   * healthy screens.
+   */
+  assignmentsForMachine(machineId: string): ScreenAssignment[] {
+    const machine = this.machines.get(machineId);
+    if (!machine) return [];
+    const assignments: ScreenAssignment[] = [];
+    for (const output of machine.outputs) {
+      const screen = this.state.screens.find(
+        (s) => s.machineId === machineId && s.connector === output.connector,
+      );
+      if (!screen) continue;
+      const windows = this.windowsForScreen(screen.id);
+      assignments.push({
+        connector: output.connector,
+        screenId: screen.id,
+        playerUrl: this.playerUrlFor(screen.id),
+        ...(windows.length > 0 ? { windows } : {}),
+        castEnabled: screen.castEnabled,
+        friendlyName: screen.friendlyName,
+      });
+    }
+    return assignments;
   }
 
   /** POL-42 — the slices of every screen currently showing a PAGE whose definition embeds (or draws

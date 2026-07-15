@@ -119,6 +119,12 @@ export interface PersistedContentSource {
   /** POL-42 — the authored composition (a `PageDefinition` as JSON), present only for `page`
    *  sources. The control plane re-validates it against the contract on load. */
   definition?: unknown | null;
+  /** POL-18 — the framing-probe verdict ("ok" | "blocked" | "unknown") for web/dashboard sources.
+   *  `null`/undefined = never probed (also legacy rows persisted before the column). */
+  framing?: string | null;
+  /** POL-18 — the operator's placement override ("auto" | "iframe" | "window"). `null`/undefined =
+   *  auto (also legacy rows persisted before the column). */
+  placementMode?: string | null;
 }
 
 /**

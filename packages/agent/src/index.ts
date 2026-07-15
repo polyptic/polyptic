@@ -86,6 +86,8 @@ import {
 import type { MtlsBundleFile } from "./mtls";
 import { rebootHost } from "./host";
 import { ShellManager } from "./shell";
+import { diffWindows } from "./windows";
+import type { PlacedWindow } from "./windows";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
@@ -205,6 +207,9 @@ class Agent {
   private lastAppliedRevision = 0;
   /** connector → player URL currently placed (dedupes repeat opens on reconnect/re-apply). */
   private readonly placed = new Map<string, string>();
+  /** POL-18 — window id → what is placed (connector + spec signature); diffed on every apply so an
+   *  unchanged window is never relaunched and a vanished one is torn down. */
+  private readonly placedWindows = new Map<string, PlacedWindow>();
   /** connector → last placement outcome, reported in heartbeats. */
   private readonly status = new Map<string, { ok: boolean; note?: string }>();
   /** POL-119 — connector → is a cast session live NOW (receiver window on the glass)? Entries exist
@@ -489,6 +494,40 @@ class Agent {
       this.status.delete(connector);
       this.casting.delete(connector);
       this.castPins.delete(connector);
+    }
+
+    // POL-18 — reconcile the placed WEB-WINDOWS: place what's new/changed, retire what vanished.
+    // Retire first so a window moving between outputs never briefly exists twice. A placement
+    // failure is reported on the connector's status note (console-visible) but never fails the
+    // apply — the player underneath keeps rendering everything else.
+    const { toPlace, toRemove } = diffWindows(
+      this.placedWindows,
+      msg.screens.map((s) => ({ connector: s.connector, windows: s.windows ?? [] })),
+    );
+    for (const id of toRemove) {
+      try {
+        await this.backend.hideWindow(id);
+      } catch (err) {
+        log(`hideWindow(${id}) failed: ${(err as Error).message}`);
+      }
+      this.placedWindows.delete(id);
+    }
+    for (const place of toPlace) {
+      try {
+        await this.backend.showWindow(place.connector, place.window);
+        this.placedWindows.set(place.window.id, {
+          connector: place.connector,
+          signature: place.signature,
+        });
+        log(`placed web-window ${place.window.id} on ${place.connector}`);
+      } catch (err) {
+        const note = `web-window ${place.window.id}: ${(err as Error).message}`;
+        // Keep the screen's ok flag (the player itself placed fine); surface the window's failure
+        // on that connector's note so the console can show why the region is empty.
+        const st = this.status.get(place.connector);
+        this.status.set(place.connector, { ok: st?.ok ?? true, note });
+        log(`FAILED to place web-window ${place.window.id} on ${place.connector}: ${note}`);
+      }
     }
 
     // Ack the new state immediately rather than waiting for the next heartbeat tick.

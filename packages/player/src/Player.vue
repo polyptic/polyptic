@@ -57,7 +57,7 @@ import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
-import { contentStyle as spanContentStyle } from "./surface-style";
+import { contentStyle as spanContentStyle, isAgentPlacedWindow } from "./surface-style";
 import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
@@ -329,10 +329,13 @@ const prober = new SurfaceProber({
  *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
  *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
  *  (POL-42) are excluded for the same reason: a page renders locally (text/clock/shapes need no
- *  network) and its embeds carry send-time-resolved data with their own calm placeholders. */
+ *  network) and its embeds carry send-time-resolved data with their own calm placeholders.
+ *  Agent-placed WINDOW surfaces (POL-18) are excluded because the player fetches NOTHING for them —
+ *  the content is a top-level window the agent places over the region; probing its URL would be
+ *  probing on behalf of a load this page never makes. */
 const probeTargets = computed(() =>
   surfaces.value
-    .filter((s) => s.type !== "playlist" && s.type !== "page")
+    .filter((s) => s.type !== "playlist" && s.type !== "page" && !isAgentPlacedWindow(s))
     .map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
 );
 
@@ -651,6 +654,16 @@ function connLabel(state: ConnState): string {
           live
         />
       </div>
+      <!-- POL-18: an agent-placed WINDOW surface is a hole — the real content is a top-level
+           browser window the agent floats over this region. Render nothing (a transparent region,
+           never a placeholder dot: the window above is the content, and a spinner peeking out from
+           under it would read as a fault). NOTE, honestly: the player's badge/ident overlays CANNOT
+           sit above an OS-level window — they win the page's z-order, not the compositor's. -->
+      <div
+        v-else-if="isAgentPlacedWindow(surface)"
+        class="surface-window-hole"
+        aria-hidden="true"
+      />
       <template v-else-if="painted[surface.id]">
         <iframe
           v-if="isFrame(surface)"

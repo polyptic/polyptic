@@ -328,6 +328,19 @@ export class X11Backend implements DisplayBackend {
     this.log(`hideScreen(${connector}): torn down`);
   }
 
+  /** POL-18 — not implemented on the i3 fallback yet (the server capability-gates on wayland-sway
+   *  and degrades such content to the iframe there, with a console note). Defence in depth: an
+   *  unexpected window placement is refused loudly, never silently dropped. */
+  async showWindow(connector: string): Promise<void> {
+    throw new Error(
+      `web-window placement is not implemented by the x11-i3 backend (connector ${connector})`,
+    );
+  }
+
+  async hideWindow(id: string): Promise<void> {
+    this.log(`hideWindow(${id}): nothing placed (x11-i3 places no windows)`);
+  }
+
   async ident(on: boolean): Promise<void> {
     this.log(`ident ${on ? "on" : "off"} — visible ident is server→player; agent no-op`);
   }
