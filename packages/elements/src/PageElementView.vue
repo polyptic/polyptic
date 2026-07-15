@@ -32,6 +32,7 @@ import type {
 } from "@polyptic/protocol";
 import { formatAge, formatClock, formatCountdown, useNow } from "./clock";
 import { qrSvgPath, qrModuleCount } from "./qr";
+import { embedZoomStyle, feedFontSizes } from "./style";
 
 const props = withDefaults(
   defineProps<{
@@ -70,6 +71,13 @@ const embedLabel = computed(() => {
   if (props.element.props.url) return props.element.props.url.replace(/^https?:\/\//, "");
   return props.element.props.sourceId ? "Source unavailable" : "Pick a source";
 });
+/** POL-133 — the authored per-element page zoom, applied to the live frame the same way the player
+ *  zooms a directly-assigned page (1/zoom layout, scale back up). Part of the composition, so the
+ *  Studio preview and every wall agree by construction (D74). */
+const embedZoom = computed(() =>
+  props.element.kind === "embed" ? (props.element.props.zoom ?? 1) : 1,
+);
+const embedFrameStyle = computed(() => embedZoomStyle(embedZoom.value));
 
 // ── image ─────────────────────────────────────────────────────────────────────
 const imageSrc = computed(() => {
@@ -101,6 +109,13 @@ const feedItems = computed<PageFeedItem[]>(() => {
 });
 const feedSkeletonCount = computed(() =>
   props.element.kind === "feed" && props.live && !feedData.value ? props.element.props.items : 0,
+);
+/** POL-133 — the card's three font sizes at the authored scale (100 = the pre-POL-133 sizing). */
+const feedFonts = computed(() =>
+  feedFontSizes(
+    props.element.h,
+    props.element.kind === "feed" ? (props.element.props.fontScale ?? 100) : 100,
+  ),
 );
 const feedHeader = computed(() => {
   if (props.element.kind !== "feed") return "";
@@ -174,6 +189,7 @@ const tickerDuration = computed(() => {
       v-if="live && embedResolution && (embedResolution.kind === 'web' || embedResolution.kind === 'dashboard')"
       class="pel-embed-frame"
       :src="embedResolution.url"
+      :style="embedFrameStyle"
       allow="autoplay; encrypted-media; fullscreen"
     />
     <img
@@ -198,7 +214,9 @@ const tickerDuration = computed(() => {
       </svg>
       <span class="pel-embed-kicker" :style="{ fontSize: `clamp(8px, ${cq(0.08)}, 2.2cqh)` }">EMBED</span>
       <span class="pel-embed-label" :style="{ fontSize: `clamp(11px, ${cq(0.14)}, 4cqh)` }">{{ embedLabel }}</span>
-      <span class="pel-embed-note" :style="{ fontSize: `clamp(8px, ${cq(0.085)}, 2.2cqh)` }">credentials stamped by the control plane</span>
+      <span class="pel-embed-note" :style="{ fontSize: `clamp(8px, ${cq(0.085)}, 2.2cqh)` }">
+        credentials stamped by the control plane{{ embedZoom !== 1 ? ` · zoom ${Math.round(embedZoom * 100)}%` : "" }}
+      </span>
     </div>
   </template>
 
@@ -223,11 +241,11 @@ const tickerDuration = computed(() => {
 
   <!-- FEED -->
   <div v-else-if="element.kind === 'feed'" class="pel-feed">
-    <span class="pel-feed-header" :style="{ fontSize: `max(8px, ${cq(0.05)})` }">{{ feedHeader }}</span>
+    <span class="pel-feed-header" :style="{ fontSize: feedFonts.header }">{{ feedHeader }}</span>
     <template v-if="feedItems.length">
       <div v-for="(item, i) in feedItems" :key="i" class="pel-feed-item">
-        <span class="pel-feed-title" :style="{ fontSize: `max(10px, ${cq(0.055)})` }">{{ item.title }}</span>
-        <span class="pel-feed-meta" :style="{ fontSize: `max(8px, ${cq(0.042)})` }">{{ formatAge(item.publishedAt, now) }}</span>
+        <span class="pel-feed-title" :style="{ fontSize: feedFonts.title }">{{ item.title }}</span>
+        <span class="pel-feed-meta" :style="{ fontSize: feedFonts.meta }">{{ formatAge(item.publishedAt, now) }}</span>
       </div>
     </template>
     <template v-else>
@@ -328,8 +346,13 @@ const tickerDuration = computed(() => {
     </div>
   </div>
 
-  <!-- QR -->
-  <div v-else-if="element.kind === 'qr'" class="pel-qr">
+  <!-- QR — POL-133: authored module/background colours (defaults = the old hardcoded pair). The
+       path fill is a LITERAL colour value, never fill="var(…)" (D66/D74's SVG rule). -->
+  <div
+    v-else-if="element.kind === 'qr'"
+    class="pel-qr"
+    :style="{ background: element.props.bg ?? '#ffffff' }"
+  >
     <svg
       v-if="qrPath"
       width="100%"
@@ -338,7 +361,7 @@ const tickerDuration = computed(() => {
       preserveAspectRatio="xMidYMid meet"
       aria-hidden="true"
     >
-      <path :d="qrPath" fill="#09090b" fill-rule="evenodd" />
+      <path :d="qrPath" :fill="element.props.fg ?? '#09090b'" fill-rule="evenodd" />
     </svg>
   </div>
 

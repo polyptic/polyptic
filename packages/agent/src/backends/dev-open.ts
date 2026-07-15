@@ -97,4 +97,8 @@ export class DevOpenBackend implements DisplayBackend {
   onCastSession(): void {
     // Never fires: no receiver can run here.
   }
+
+  onCastPin(): void {
+    // Never fires: no receiver can run here (POL-136).
+  }
 }

@@ -18,8 +18,10 @@ import { fileURLToPath } from "node:url";
 
 import { SPLASH_COLORS } from "../agent/src/setup/plymouth";
 import {
+  BOOT_BG_SIZE,
   BOOT_LOGO_HEIGHT,
   BOOT_LOGO_WIDTH,
+  bootBgPng,
   bootGfxPreamble,
   buildBootThemeTxt,
 } from "../server/src/boot-theme";
@@ -43,6 +45,19 @@ describe("buildBootThemeTxt — the theme GRUB draws", () => {
     expect(theme).toContain('file = "logo.png"');
     expect(theme).not.toContain("http://");
     expect(theme).not.toContain("$net");
+  });
+
+  test("carries a desktop-image — LOAD-BEARING, not decoration (POL-130)", () => {
+    // GRUB 2.12's gfxmenu runs init_background() on EVERY view draw, and it hands
+    // view->raw_desktop_image to grub_video_bitmap_create_scaled() UNCONDITIONALLY. A theme with
+    // only desktop-color leaves that image NULL: the scaler stashes GRUB_ERR_BUG in grub_errno,
+    // the menu still paints perfectly off desktop-color, and the pending error then surfaces the
+    // instant the chosen entry executes — "error: null src bitmap ... Press any key to continue"
+    // on a wall with no keyboard. Reproduced frame-by-frame under OVMF on the operator's actual
+    // failing medium; gone with this line. Relative for the same reason logo.png is.
+    expect(theme).toContain('desktop-image: "bg.png"');
+    // …and desktop-color STAYS, as the fallback for a GRUB that fails the stretch some other way.
+    expect(theme).toContain(`desktop-color: "${SPLASH_COLORS.bg}"`);
   });
 
   test("suppresses GRUB's own banner and wires the countdown label", () => {
@@ -75,6 +90,52 @@ describe("the committed boot logo", () => {
     expect(png.readUInt8(24)).toBe(8); // bit depth
     expect([2, 6]).toContain(png.readUInt8(25)); // colour type: truecolour, with or without alpha
     expect(png.readUInt8(28)).toBe(0); // no interlace
+  });
+});
+
+describe("the committed desktop background (boot-bg.png, POL-130)", () => {
+  const committed = readFileSync(resolve(repoRoot, "packages", "server", "assets", "boot-bg.png"));
+
+  test("is byte-identical to what the server serves at /boot/bg.png", () => {
+    // bootBgPng() is byte-deterministic by construction (a stored DEFLATE block, no zlib), so the
+    // committed asset the medium bake copies and the route the wired path fetches CANNOT drift.
+    // Regenerate with `bun deploy/render-boot-theme.ts` if this fails.
+    expect(committed).toEqual(Buffer.from(bootBgPng()));
+  });
+
+  test("is a PNG in the exact form GRUB 2.12's png.c decodes", () => {
+    expect(committed.subarray(0, 8)).toEqual(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
+    expect(committed.readUInt32BE(16)).toBe(BOOT_BG_SIZE);
+    expect(committed.readUInt32BE(20)).toBe(BOOT_BG_SIZE);
+    expect(committed.readUInt8(24)).toBe(8); // bit depth
+    expect(committed.readUInt8(25)).toBe(2); // truecolour, no alpha — nothing to composite
+    expect(committed.readUInt8(28)).toBe(0); // no interlace
+  });
+
+  test("every pixel is the splash dark, so the stretch is invisible", () => {
+    // The IDAT is ONE stored (uncompressed) deflate block: zlib header (2) + BFINAL/BTYPE (1) +
+    // LEN/NLEN (4), then the raw scanlines — decodable here without any inflate.
+    const idatAt = committed.indexOf(Buffer.from("IDAT"));
+    expect(idatAt).toBeGreaterThan(-1);
+    const raw = committed.subarray(idatAt + 4 + 7, idatAt + 4 + 7 + (1 + BOOT_BG_SIZE * 3) * BOOT_BG_SIZE);
+    const [r, g, b] = [1, 3, 5].map((i) => Number.parseInt(SPLASH_COLORS.bg.slice(i, i + 2), 16));
+    for (let y = 0; y < BOOT_BG_SIZE; y++) {
+      const row = raw.subarray(y * (1 + BOOT_BG_SIZE * 3), (y + 1) * (1 + BOOT_BG_SIZE * 3));
+      expect(row[0]).toBe(0); // filter: None
+      for (let x = 0; x < BOOT_BG_SIZE; x++) {
+        expect([row[1 + x * 3], row[2 + x * 3], row[3 + x * 3]]).toEqual([r, g, b]);
+      }
+    }
+  });
+
+  test("passes the SAME bake-time check build-boot-medium.sh runs (grub-png-check.sh)", () => {
+    const check = resolve(repoRoot, "deploy", "live", "usr", "local", "lib", "polyptic", "grub-png-check.sh");
+    for (const asset of ["boot-bg.png", "boot-logo.png"]) {
+      const run = spawnSync("sh", [check, resolve(repoRoot, "packages", "server", "assets", asset)]);
+      expect(run.status).toBe(0);
+    }
   });
 });
 
@@ -206,12 +267,15 @@ describe("the offline (Wi-Fi) local menu carries its own splash (POL-74)", () =>
 
   test("sets the theme from the on-medium copy, guarded so a theme-less medium still boots", () => {
     // Device-relative ($root), so it resolves on the USB stick AND an offloaded ESP; guarded on
-    // BOTH files (POL-87): the theme references logo.png, and a theme whose bitmap is missing makes
-    // GRUB paint "error: null src bitmap ... Press any key to continue" on a keyboard-less screen.
-    // A LEAN/theme-less/half-healed medium must degrade to a plain menu instead. Nested ifs, not
-    // `-a` — plain `[ -f ]` is the only test form every GRUB build is guaranteed to have.
+    // ALL THREE files (POL-87, then POL-130): the theme references logo.png AND bg.png — bg.png is
+    // the desktop-image GRUB 2.12's gfxmenu scales on every draw, and a theme missing ANY bitmap
+    // makes GRUB paint "error: null src bitmap ... Press any key to continue" on a keyboard-less
+    // screen (at entry-boot time for bg.png — the menu itself looks perfect until the countdown
+    // hits zero). A LEAN/theme-less/half-healed medium must degrade to a plain menu instead.
+    // Nested ifs, not `-a` — plain `[ -f ]` is the only test form every GRUB build is guaranteed
+    // to have. This string is the FAIL-CLOSED pin: loosen it and a wall gets the error prompt back.
     expect(LOCAL_MENU).toContain(
-      "if [ -f ($root)/polyptic/boot/theme/theme.txt ]; then if [ -f ($root)/polyptic/boot/theme/logo.png ]; then set theme=($root)/polyptic/boot/theme/theme.txt ; fi ; fi",
+      "if [ -f ($root)/polyptic/boot/theme/theme.txt ]; then if [ -f ($root)/polyptic/boot/theme/logo.png ]; then if [ -f ($root)/polyptic/boot/theme/bg.png ]; then set theme=($root)/polyptic/boot/theme/theme.txt ; fi ; fi ; fi",
     );
     // The theme is desktop-agnostic (no baked URL), which is exactly why a local copy is legitimate.
     expect(buildBootThemeTxt()).toContain('file = "logo.png"');
@@ -233,8 +297,21 @@ describe("boot-theme.txt — the committed offline splash asset (POL-82)", () =>
   test("build-boot-medium.sh bakes it by plain copy — no bun, no network at build time", () => {
     const sh = read("deploy", "build-boot-medium.sh");
     expect(sh).toContain("assets/boot-theme.txt"); // sources the committed asset
+    expect(sh).toContain("assets/boot-bg.png"); // …including the POL-130 desktop-image
     expect(sh).toContain('cp "$THEME_SRC"'); // by copy
     expect(sh).not.toMatch(/\bbun\s+["$]/); // no `bun <script>` invocation in the bake
+  });
+
+  test("the bake VALIDATES both bitmaps against GRUB's decoder and REJECTS the build (POL-130)", () => {
+    // "File exists" is not "file loads": an interlaced/greyscale/torn PNG passes every [ -f ] and
+    // still errors on the glass. The bake runs grub-png-check.sh on logo + bg and exits 1 with a
+    // message naming the file — a medium that errors on the wall must be unbuildable.
+    const sh = read("deploy", "build-boot-medium.sh");
+    expect(sh).toContain("grub-png-check.sh");
+    expect(sh).toMatch(/for png in "\$LOGO_SRC" "\$BG_SRC"/);
+    expect(sh).toContain("not a PNG GRUB can decode");
+    const reject = sh.slice(sh.indexOf("not a PNG GRUB can decode"));
+    expect(reject.slice(0, 400)).toContain("exit 1"); // rejected at BUILD, not on a wall
   });
 });
 

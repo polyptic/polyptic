@@ -235,6 +235,29 @@ helm upgrade --install polyptic deploy/helm/polyptic \
 (`ingressRoute.host` also derives `PUBLIC_BASE_URL`, `CORS_ORIGIN`,
 `PLAYER_BASE_URL` and `MEDIA_PUBLIC_BASE` as `https://<host>` — POL-70/D89.)
 
+### Upgrading from v0.2.31 or v0.2.32 — one manual step (POL-127/D113)
+
+Those two releases stamped the chart version into the bundled database's
+`volumeClaimTemplates`. That is an **immutable** field of a StatefulSet, so the
+next `helm upgrade` is rejected and the release wedges in `failed`:
+
+```
+Error: UPGRADE FAILED: cannot patch "polyptic-db" with kind StatefulSet:
+StatefulSet.apps "polyptic-db" is invalid: spec: Forbidden: updates to statefulset
+spec for fields other than 'replicas', 'ordinals', 'template', ... are forbidden
+```
+
+Drop the StatefulSet **without touching its data**, then upgrade as normal:
+
+```sh
+kubectl delete statefulset polyptic-db -n polyptic --cascade=orphan
+helm upgrade polyptic … # recreates it with stable labels
+```
+
+`--cascade=orphan` leaves the PVC *and the running Postgres pod* in place, so the
+database stays up and its data is untouched — the StatefulSet is re-adopted on the
+next upgrade. Fresh installs on v0.2.33+ are unaffected.
+
 ## Netboot depot + automated image updates (POL-33…43)
 
 The server serves the netboot artifacts — the live image (`GET /dist/image/<arch>/…`)
