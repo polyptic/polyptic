@@ -168,7 +168,17 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // does the mDNS advertisement (shipped rather than relying on UxPlay 1.74's experimental
     // built-in responder); `plugins-bad` carries `waylandsink`, the ONLY sink we allow — POL-67
     // established that Xwayland software paths peg the CPU on real amdgpu boxes.
-    cast: ["uxplay", "avahi-daemon", "gstreamer1.0-plugins-bad"],
+    //
+    // POL-144/D135 — HARDWARE H.264 DECODE. `plugins-bad` also carries the modern GStreamer `va`
+    // decode plugin (`vah264dec`), but it registers no hardware decoder without a VA DRIVER present:
+    // on a bare image UxPlay's `decodebin` falls back to `avdec_h264` (ffmpeg, software) and on a
+    // busy Intel wall box the mirror came through torn and banded — CPU-bound software decode
+    // repacking frames through waylandsink's SHM stride path (the same "keep the GPU in the path"
+    // trap POL-67 hit for the browser, one layer down in the cast pipeline). `va-driver-all` is the
+    // vendor-NEUTRAL driver set (pulls the Intel-media + i965 + Mesa-Gallium VA backends; the box's
+    // own GPU picks its backend at runtime), so `vah264dec` lights up and hands waylandsink dmabuf
+    // frames it scans out directly. `vainfo` is the operator's one-line proof the driver bound.
+    cast: ["uxplay", "avahi-daemon", "gstreamer1.0-plugins-bad", "va-driver-all", "vainfo"],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -182,8 +192,9 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     codecs: ["gstreamer1-libav", "gstreamer1-plugins-good"],
     cec: ["v4l-utils", "libcec"],
     // Fedora has no packaged uxplay — casting stays best-effort there (the agent refuses with a
-    // clear reason when the binary is absent), but avahi + waylandsink are installable.
-    cast: ["avahi", "gstreamer1-plugins-bad-free"],
+    // clear reason when the binary is absent), but avahi + waylandsink are installable. The
+    // vendor-neutral VA driver + diagnostics ride along for the hardware-decode path (POL-144).
+    cast: ["avahi", "gstreamer1-plugins-bad-free", "mesa-va-drivers", "libva-utils"],
   },
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -194,8 +205,9 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     splash: ["plymouth", "librsvg"],
     codecs: ["gst-libav", "gst-plugins-good"],
     cec: ["v4l-utils", "libcec"],
-    // Arch ships uxplay in the AUR only — casting stays best-effort (see the Fedora note).
-    cast: ["avahi", "gst-plugins-bad"],
+    // Arch ships uxplay in the AUR only — casting stays best-effort (see the Fedora note). The
+    // Mesa VA driver + diagnostics ride along for the hardware-decode path (POL-144).
+    cast: ["avahi", "gst-plugins-bad", "libva-mesa-driver", "libva-utils"],
   },
 };
 

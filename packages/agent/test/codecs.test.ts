@@ -28,3 +28,28 @@ describe("kiosk video decode", () => {
     expect(corePackages("apt", "dev-open")).not.toContain("gstreamer1.0-libav");
   });
 });
+
+/**
+ * Cast hardware-decode packages (POL-144/D135 regression).
+ *
+ * A real iPhone mirror came through torn and banded on an Intel wall box: the image shipped the
+ * GStreamer `va` decode plugin (in plugins-bad) but no VA DRIVER, so UxPlay's decodebin fell back to
+ * software avdec_h264 and the CPU-bound frames reached waylandsink through its SHM stride path. The
+ * fix ships a vendor-neutral VA driver so H.264 decodes in hardware to dmabuf. These tests pin it so
+ * a future package trim cannot silently reintroduce the software path.
+ */
+describe("cast hardware decode", () => {
+  test("apt wayland-sway ships the VA driver + diagnostics behind the cast receiver", () => {
+    const pkgs = corePackages("apt", "wayland-sway");
+    expect(pkgs).toContain("va-driver-all");
+    expect(pkgs).toContain("vainfo");
+    // The `va` decode plugin itself rides inside plugins-bad, which cast already pulls.
+    expect(pkgs).toContain("gstreamer1.0-plugins-bad");
+  });
+
+  test("the VA driver rides ONLY with the cast-capable backend, never x11-i3 or dev-open", () => {
+    // Cast is wayland-sway-only (POL-67/D111); the VA path has no reason to land elsewhere.
+    expect(corePackages("apt", "x11-i3")).not.toContain("va-driver-all");
+    expect(corePackages("apt", "dev-open")).not.toContain("va-driver-all");
+  });
+});
