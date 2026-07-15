@@ -34,6 +34,8 @@ import { initSelfSignedTls, registerHttpsRoutes, requiredSans, resolveTlsEnv } f
 import type { ServerTlsRuntime, TlsEnvConfig } from "./server-tls";
 import { PageDataService } from "./page-data";
 import { registerRestRoutes } from "./rest";
+import { registerScheduleRoutes } from "./schedule-routes";
+import { DEFAULT_TICK_MS, SceneScheduler } from "./scheduler";
 import { DevtoolsRelay } from "./devtools-relay";
 import { registerDevtoolsRoutes } from "./devtools-routes";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
@@ -68,6 +70,13 @@ const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS ?? 4000);
 const SHELL_ARM_TTL_MS = Number(process.env.SHELL_ARM_TTL_MS ?? 60 * 60 * 1000);
 // Max thumbnails held in memory at once (LRU cap).
 const THUMBNAIL_CAPACITY = Number(process.env.CAPTURE_THUMBNAIL_CAP ?? 300);
+// POL-89 — how often the scene scheduler re-resolves "what should be on the wall right now". A
+// scheduled scene therefore lands within this of its window boundary (default 10s).
+const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS ?? DEFAULT_TICK_MS);
+// POL-89 — a TEST SEAM, and nothing else: shifts the scheduler's clock so a suite can stand a few
+// seconds before a window boundary and watch it fire, instead of sleeping through a real one. Unset
+// (0) in every real deployment; the ticker then reads the plain wall clock.
+const SCHEDULER_CLOCK_OFFSET_MS = Number(process.env.SCHEDULER_CLOCK_OFFSET_MS ?? 0);
 const CORS_ORIGIN = (
   process.env.CORS_ORIGIN ??
   // 5173 player, 5175 Vue console.
@@ -509,6 +518,39 @@ registerRestRoutes(
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);
+
+// ── The scene scheduler (POL-89/D93): dayparts + priorities, resolved on a ticker. ──
+// It applies scenes through the EXISTING applyScene path — the same code the operator's Apply button
+// runs — so a scheduled switch fans out over the ordinary `server/render` push, in the ordinary
+// <150ms, with no reload, and neither the agent nor the player knows a scheduler exists.
+const scheduler = new SceneScheduler({
+  control,
+  log: fastify.log,
+  activity,
+  tickMs: Number.isFinite(SCHEDULER_TICK_MS) && SCHEDULER_TICK_MS > 0 ? SCHEDULER_TICK_MS : DEFAULT_TICK_MS,
+  now: () => Date.now() + (Number.isFinite(SCHEDULER_CLOCK_OFFSET_MS) ? SCHEDULER_CLOCK_OFFSET_MS : 0),
+  apply: async (sceneId) => {
+    const result = await control.applyScene(sceneId);
+    if (!result) return false;
+    for (const slice of result.slices) {
+      const message = ServerToPlayerRender.parse({
+        t: "server/render",
+        revision: control.state.revision,
+        friendlyName: control.getScreen(slice.screenId)?.friendlyName ?? slice.screenId,
+        slice: control.decorateSliceForSend(slice),
+      });
+      const delivered = hub.send(slice.screenId, message);
+      fastify.log.info(
+        { event: "render.push.schedule", screenId: slice.screenId, sceneId, revision: control.state.revision, delivered },
+        "pushed render for a scheduled scene",
+      );
+    }
+    broadcaster.broadcast();
+    return true;
+  },
+});
+registerScheduleRoutes(fastify, control, scheduler, broadcaster);
+scheduler.start();
 // The HTTPS settings surface (POL-70/D89), GATED under /api/v1: the TLS posture + (in self-signed
 // mode) the CA download the console's trust instructions hang off.
 registerHttpsRoutes(fastify, serverTls);
@@ -801,6 +843,7 @@ async function shutdown(signal: string): Promise<void> {
   capture.stop();
   tokens.stop();
   pageData.stop();
+  scheduler.stop();
   agentMtlsChannel?.server.close();
   try {
     await fastify.close();
