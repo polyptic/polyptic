@@ -19,6 +19,7 @@ import type {
   EnrollmentStatus,
   Geometry,
   HostIdentity,
+  ImageRing,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -49,6 +50,10 @@ export interface PersistedMachine {
   shellArmedAt?: string;
   /** POL-103 — operator tags ("atrium", "floor:2"). Undefined on legacy rows → no tags. */
   tags?: string[];
+  /** POL-105 — the OS image id this box last reported booting, and when. Persisted (not live-only
+   *  like the vitals ring) because the box a roll-out stranded is the box that is now offline. */
+  imageId?: string;
+  imageIdAt?: string;
   /** POL-104 — the box's physical identity as it last reported it (MACs / DMI serial / arch). Kept on
    *  the ROW, not just in presence, so a pending card is informative while the box is offline. */
   hardware?: HostIdentity;
@@ -382,6 +387,13 @@ export interface PersistedImageRollout {
   /** Server-local `HH:MM` the full rebuild fires at. */
   fullScheduleTime: string;
   urgent: boolean;
+  /**
+   * POL-105 — the staged roll-out RINGS, ordered, first match wins. Each pins one build for the
+   * machines a POL-103 selector matches (`tag=canary` → build X); every machine matching no ring
+   * follows the arch's ACTIVE build, so an empty list is exactly the pre-POL-105 fleet-wide roll-out.
+   * Persisted as a whole (jsonb): small, always read whole, only ever replaced whole.
+   */
+  rings: ImageRing[];
   /** POL-121 — the FIRST-IMAGE LATCH: when the server auto-triggered the one-shot full build that
    *  fills an empty depot on a fresh install. Written BEFORE the hook is spawned and never cleared,
    *  so a crash-looping or rescheduled pod cannot launch a build storm: the very first server that
@@ -446,6 +458,8 @@ export interface Store {
   setMachineShellEnabled(id: string, enabled: boolean, armedAt: string | null): Promise<void>;
   /** POL-103 — replace a machine's whole tag set (add + remove are the same call). No-op if absent. */
   setMachineTags(id: string, tags: string[]): Promise<void>;
+  /** POL-105 — record the OS image id a box reported BOOTING, and when. No-op if absent. */
+  setMachineImage(id: string, imageId: string, at: string): Promise<void>;
   /**
    * Permanently forget a machine: delete its row AND cascade its screens, their content, and their
    * placements (defensive — the control plane also removes each in memory + dissolves walls first, so

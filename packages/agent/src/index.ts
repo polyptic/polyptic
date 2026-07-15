@@ -809,6 +809,9 @@ class Agent {
       browser: this.browser,
       outputs: this.outputs,
       hostname: osHostname(),
+      // POL-105 — the OS image this box actually BOOTED (`/etc/polyptic/image-id`). Undefined on a
+      // dev box with no live image, and dropped by JSON.stringify, so an old server ignores it.
+      imageId: await this.vitals.bootedImageId().catch(() => undefined),
       // POL-104 — what this box IS (MACs / DMI serial / arch). Descriptive, never a credential: the
       // server uses it to match a pre-registration (after the token gate) and to make a pending
       // approval card readable. Sampled per hello so a re-cabled box re-reports honestly.
