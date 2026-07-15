@@ -644,20 +644,25 @@ describe("netboot: the GRUB boot theme", () => {
         expect(res.headers.get("content-length")).toBe(String(Buffer.byteLength(body)));
         expect(body).toContain("desktop-color:");
         expect(body).toContain('file = "logo.png"');
+        // POL-130: the desktop-image is load-bearing — without it GRUB 2.12's gfxmenu scales a
+        // NULL bitmap on every draw and errors onto the wall the moment a menu entry boots.
+        expect(body).toContain('desktop-image: "bg.png"');
       }
     },
     TEST_TIMEOUT,
   );
 
   test(
-    "serves the logo GRUB resolves relative to the theme, as a real PNG with a Content-Length",
+    "serves the bitmaps GRUB resolves relative to the theme, as real PNGs with a Content-Length",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/boot/logo.png`);
-      expect(res.status).toBe(200);
-      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/png");
-      const png = Buffer.from(await res.arrayBuffer());
-      expect(res.headers.get("content-length")).toBe(String(png.length));
-      expect(png.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      for (const file of ["logo.png", "bg.png"]) {
+        const res = await fetch(`${OPEN_BASE}/boot/${file}`);
+        expect(res.status).toBe(200);
+        expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/png");
+        const png = Buffer.from(await res.arrayBuffer());
+        expect(res.headers.get("content-length")).toBe(String(png.length));
+        expect(png.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      }
     },
     TEST_TIMEOUT,
   );

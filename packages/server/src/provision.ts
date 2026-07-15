@@ -18,7 +18,7 @@
  *   GET /grub/grub.cfg (+ per-arch aliases)       → the SAME menu where an HTTP-booted grubnet looks:
  *                                                   its baked prefix resolves to (http,host:port)/grub
  *                                                   at the server root, not next to the shim URL.
- *   GET /boot/theme.txt, GET /boot/logo.png       → the GRUB theme that makes that menu the Polyptic
+ *   GET /boot/{theme.txt,logo.png,bg.png}         → the GRUB theme that makes that menu the Polyptic
  *                                                   splash rather than a text console (POL-47).
  *   GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
@@ -42,7 +42,7 @@ import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from 
 import type { BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
+import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
 import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
 
@@ -698,6 +698,20 @@ export function registerProvisionRoutes(
     } catch {
       return reply.code(404).send({ error: "boot logo not bundled" });
     }
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    // A complete Buffer (not a stream) is the only way Bun emits Content-Length; GRUB requires it.
+    reply.header("Content-Length", String(png.length));
+    reply.type("image/png");
+    return reply.send(png);
+  });
+
+  // The theme's desktop-image (POL-130): a tiny solid-dark PNG GRUB stretches over the panel. It is
+  // LOAD-BEARING — GRUB 2.12's gfxmenu scales the desktop image on every view draw, and a theme with
+  // only desktop-color hands the scaler a NULL bitmap whose stashed error paints
+  // "error: null src bitmap ... Press any key to continue" the moment a menu entry boots.
+  fastify.get("/boot/bg.png", async (_request, reply) => {
+    const png = Buffer.from(bootBgPng());
     reply.header("Cache-Control", "no-store");
     reply.header("X-Content-Type-Options", "nosniff");
     // A complete Buffer (not a stream) is the only way Bun emits Content-Length; GRUB requires it.
