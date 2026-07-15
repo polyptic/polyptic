@@ -41,6 +41,7 @@ import type { LaunchTarget } from "./supervise";
 import {
   CAST_PORT_BASE,
   CAST_PORT_STRIDE,
+  CastPairingTracker,
   buildUxplayArgs,
   castDeviceMac,
   castRegFileFor,
@@ -48,6 +49,7 @@ import {
   matchesUxplayWindow,
   resolveUxplay,
   sameCastTarget,
+  wrapLineBuffered,
 } from "./cast";
 import type { CastTarget } from "./cast";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
@@ -160,9 +162,10 @@ function startSwayWindowSubscription(
 
 /** A live, PERSISTENT window watch for one supervised pid (POL-119). Unlike the launch-time
  *  `waitForWindow` (one window, right after spawn, then closed), a cast receiver grows windows at
- *  sender-connect time — and its PIN prompt is a window too — so this stays subscribed for the
- *  receiver's whole life, calling back on every appearance/disappearance. The subscription child is
- *  respawned if it dies: losing it silently would freeze the console's "casting" signal. */
+ *  MIRROR-START time — the PIN prompt is NOT a window (POL-136: it goes to stdout; see cast.ts) —
+ *  so this stays subscribed for the receiver's whole life, calling back on every
+ *  appearance/disappearance. The subscription child is respawned if it dies: losing it silently
+ *  would freeze the console's "casting" signal. */
 interface PidWindowWatch {
   close(): void;
 }
@@ -234,10 +237,14 @@ function startPidWindowWatch(
 interface CastInstance {
   supervised: SupervisedProcess<CastTarget>;
   watch: PidWindowWatch;
-  /** The receiver's live windows (PIN prompt / mirror). Non-empty = a session is on the glass. */
+  /** The receiver's live windows (the mirror; POL-136 established the PIN prompt is NOT a window).
+   *  Non-empty = a session is on the glass. */
   windows: Set<number>;
   /** This connector's fixed UxPlay base port, stable across relaunches. */
   basePort: number;
+  /** POL-136 — the PIN lifecycle, fed from the receiver's stdout/stderr. The receiver never draws
+   *  its PIN (stdout only), so this is how the number reaches the panel at all. */
+  tracker: CastPairingTracker;
 }
 
 export class SwayBackend implements DisplayBackend {
@@ -268,6 +275,8 @@ export class SwayBackend implements DisplayBackend {
   private readonly castPorts = new Map<string, number>();
   /** The agent's cast-session listener — told when a connector's receiver gains/loses its windows. */
   private castSession: ((connector: string, active: boolean) => void) | null = null;
+  /** POL-136 — the agent's PIN listener: told the PIN a pairing sender must type (null = clear). */
+  private castPin: ((connector: string, pin: string | null) => void) | null = null;
 
   private log(msg: string): void {
     console.log(`[${ts()}] [sway] ${msg}`);
@@ -621,6 +630,10 @@ export class SwayBackend implements DisplayBackend {
     this.castSession = listener;
   }
 
+  onCastPin(listener: (connector: string, pin: string | null) => void): void {
+    this.castPin = listener;
+  }
+
   /**
    * Reconcile one connector's cast receiver to `spec`. `{ name }` ensures a supervised UxPlay is
    * running and advertised under that name (a name change relaunches it — the mDNS rename);
@@ -632,6 +645,7 @@ export class SwayBackend implements DisplayBackend {
       if (!inst) return;
       this.casts.delete(connector);
       inst.watch.close();
+      inst.tracker.processEnded(); // clears any on-glass PIN with the receiver (POL-136)
       await inst.supervised.stop();
       if (inst.windows.size > 0) {
         // The operator pulled the plug mid-session: the windows die with the receiver, but sway's
@@ -685,6 +699,26 @@ export class SwayBackend implements DisplayBackend {
       ),
       windows: new Set(),
       basePort,
+      // POL-136 — the receiver prints its per-pairing PIN to stdout and never draws it, so the PIN
+      // lifecycle rides the process output we supervise. Both callbacks are deliberately LOUD: a
+      // pairing the panel can't explain is this ticket's whole failure mode.
+      tracker: new CastPairingTracker({
+        onPinChange: (pin) => {
+          this.log(
+            pin === null
+              ? `cast(${connector}): pairing PIN cleared`
+              : `cast(${connector}): sender pairing — PIN ${pin} must be visible on the panel now`,
+          );
+          this.castPin?.(connector, pin);
+        },
+        onPinMissing: () => {
+          this.log(
+            `cast(${connector}): *** a sender started pairing but NO PIN could be learned from the ` +
+              `receiver's output — the phone is asking for a code the wall cannot show ` +
+              `(uxplay output format changed?)`,
+          );
+        },
+      }),
     };
     this.casts.set(connector, created);
     return created;
@@ -711,8 +745,27 @@ export class SwayBackend implements DisplayBackend {
       regFile,
       mac: castDeviceMac(`${osHostname()}:${connector}`),
     });
-    const child = spawnChild(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    // POL-136 — the PIN only ever exists on the receiver's stdout, and UxPlay never flushes: into a
+    // pipe, libc block-buffers its printf output at ~4 KiB, which can hold the PIN lines back past
+    // the whole pairing window. `stdbuf -oL -eL` forces line buffering (and execs uxplay, so the
+    // pid and cmdline stay pid-match/reap compatible). coreutils is Essential on the image, but a
+    // box without stdbuf must still cast — just with the delayed-PIN risk called out LOUDLY.
+    const hasStdbuf = await which("stdbuf");
+    if (!hasStdbuf) {
+      this.log(
+        `cast(${connector}): *** stdbuf not found — the receiver's stdout will be block-buffered ` +
+          `and pairing PINs may reach neither the panel nor the journal in time (install coreutils)`,
+      );
+    }
+    const { cmd, argv } = wrapLineBuffered(bin, args, hasStdbuf);
+    const child = spawnChild(cmd, argv, { stdio: ["ignore", "pipe", "pipe"] });
     this.pipeBrowserOutput(child, "uxplay", connector);
+    // POL-136 — the PIN pairing lifecycle lives in the receiver's output (see cast.ts): feed every
+    // line to this connector's tracker. This is SEPARATE from pipeBrowserOutput above, whose
+    // "interesting lines only" journal filter would drop the PIN lines (none of them look like an
+    // error — which is exactly how this stayed invisible in the logs too).
+    this.pipeCastPairingOutput(child, connector);
+    child.on("exit", () => this.casts.get(connector)?.tracker.processEnded());
     this.log(
       `spawned uxplay pid=${child.pid ?? "?"} for ${connector} — advertising "${target.name}" ` +
         `(ports ${basePort}-${basePort + 2}, PIN mode)`,
@@ -720,12 +773,37 @@ export class SwayBackend implements DisplayBackend {
     return child;
   }
 
-  /** A receiver window appeared (PIN prompt or mirror): fullscreen it on the right output and, on
-   *  the first window, report the session live. Placement is best-effort, like the browsers'. */
+  /** Feed the receiver's stdout+stderr, line by line, to its connector's pairing tracker. */
+  private pipeCastPairingOutput(child: ChildProcess, connector: string): void {
+    const sink = (): ((chunk: Buffer) => void) => {
+      let buf = "";
+      return (chunk: Buffer): void => {
+        buf += chunk.toString("utf8");
+        for (;;) {
+          const nl = buf.indexOf("\n");
+          if (nl < 0) break;
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          this.casts.get(connector)?.tracker.onLine(line);
+        }
+        // An unterminated tail longer than any real log line is noise (or binary). Keep the TAIL
+        // rather than dropping wholesale, so a PIN line arriving right after a large newline-less
+        // burst isn't truncated with it; the classifier shrugs at the garbled joint line.
+        if (buf.length > 8192) buf = buf.slice(-4096);
+      };
+    };
+    child.stdout?.on("data", sink());
+    child.stderr?.on("data", sink());
+  }
+
+  /** A receiver window appeared (the mirror — POL-136 established the PIN prompt never is one):
+   *  fullscreen it on the right output and, on the first window, report the session live.
+   *  Placement is best-effort, like the browsers'. */
   private onCastWindow(connector: string, output: string, conId: number): void {
     const inst = this.casts.get(connector);
     if (!inst) return;
     inst.windows.add(conId);
+    inst.tracker.windowAppeared(); // mirroring is starting — the pairing PIN has served its purpose
     if (inst.windows.size === 1) this.castSession?.(connector, true);
     void this.moveToOutput(conId, output)
       .then(() => this.log(`cast(${connector}): placed receiver window con_id=${conId} on ${output}`))

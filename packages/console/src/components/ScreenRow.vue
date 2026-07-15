@@ -177,11 +177,15 @@ function remove(): void {
       </div>
     </div>
 
-    <button class="ident-btn" :class="{ active: identing }" @click="ident">
+    <!-- POL-107 — Ident is an OPERATOR verb (flash a panel to find it); a viewer gets neither it nor
+         the two below. Inspect opens a live debugger inside the wall's browser and removing a screen
+         forgets a device: both are ADMIN. Every one of these routes 403s for a lesser role. -->
+    <button v-if="store.canAuthor" class="ident-btn" :class="{ active: identing }" @click="ident">
       <span class="ident-dot"></span>{{ identing ? "Flashing…" : "Ident" }}
     </button>
 
     <button
+      v-if="store.isAdmin"
       class="inspect-btn"
       :class="{ active: inspecting, pending: inspectPending }"
       :disabled="!machineOnline || inspectPending"
@@ -192,7 +196,7 @@ function remove(): void {
       <span class="inspect-glyph" aria-hidden="true">&lt;/&gt;</span>{{ inspectLabel }}
     </button>
 
-    <button class="remove-btn" title="Remove screen" aria-label="Remove screen" @click="remove">
+    <button v-if="store.isAdmin" class="remove-btn" title="Remove screen" aria-label="Remove screen" @click="remove">
       ✕
     </button>
   </div>

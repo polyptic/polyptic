@@ -33,7 +33,7 @@ export function libraryEntry(kind: PageElementKind): ElementLibraryEntry {
 export function defaultElement(kind: PageElementKind, id: string): PageElement {
   switch (kind) {
     case "embed":
-      return { id, kind, x: 0, y: 0, w: 56, h: 52, props: {} };
+      return { id, kind, x: 0, y: 0, w: 56, h: 52, props: { zoom: 1 } };
     case "ticker":
       return {
         id,
@@ -50,7 +50,7 @@ export function defaultElement(kind: PageElementKind, id: string): PageElement {
         },
       };
     case "feed":
-      return { id, kind, x: 0, y: 0, w: 26, h: 42, props: { url: "feeds.bbci.co.uk/news/rss.xml", items: 4 } };
+      return { id, kind, x: 0, y: 0, w: 26, h: 42, props: { url: "feeds.bbci.co.uk/news/rss.xml", items: 4, fontScale: 100 } };
     case "image":
       return { id, kind, x: 0, y: 0, w: 14, h: 16, props: { fit: "contain" } };
     case "text":
@@ -62,7 +62,7 @@ export function defaultElement(kind: PageElementKind, id: string): PageElement {
     case "weather":
       return { id, kind, x: 0, y: 0, w: 18, h: 13, props: { location: "Sheffield", units: "C" } };
     case "qr":
-      return { id, kind, x: 0, y: 0, w: 9, h: 16, props: { url: "https://example.com" } };
+      return { id, kind, x: 0, y: 0, w: 9, h: 16, props: { url: "https://example.com", fg: "#09090b", bg: "#ffffff" } };
     case "countdown":
       return { id, kind, x: 0, y: 0, w: 20, h: 12, props: { label: "Next shift change", target: "17:00", color: "#fafafa" } };
   }

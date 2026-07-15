@@ -6,7 +6,7 @@
  * deep-cloned on the way in and out so callers can never mutate the store's copy by reference —
  * mirroring the isolation a real database gives you.
  */
-import type { EnrollmentStatus } from "@polyptic/protocol";
+import type { EnrollmentStatus, OperatorRole } from "@polyptic/protocol";
 import type {
   PersistedBootstrap,
   PersistedContent,
@@ -14,8 +14,11 @@ import type {
   PersistedCredentialProfile,
   PersistedDisplaySettings,
   PersistedImageRollout,
+  PersistedEnrollmentToken,
   PersistedMachine,
+  PersistedAgentMtlsPosture,
   PersistedMtlsCa,
+  PersistedPreRegistration,
   PersistedServerTls,
   PersistedMural,
   PersistedPlacement,
@@ -65,8 +68,14 @@ export class MemoryStore implements Store {
   private readonly sessions = new Map<string, PersistedSession>();
   /** The enrollment bootstrap (mode + token), seeded on first boot. */
   private bootstrap: PersistedBootstrap | undefined;
+  /** Keyed by token id — the POL-104 enrolment tokens (insertion-ordered). */
+  private readonly enrollmentTokens = new Map<string, PersistedEnrollmentToken>();
+  /** Keyed by record id — the POL-104 pre-registrations (insertion-ordered). */
+  private readonly preRegistrations = new Map<string, PersistedPreRegistration>();
   /** The mTLS agent CA (POL-25), generated on the first boot with AGENT_MTLS_PORT set. */
   private mtlsCa: PersistedMtlsCa | undefined;
+  /** The require-mTLS posture (POL-134), written by auto-promotion or a pinned env. */
+  private agentMtlsPosture: PersistedAgentMtlsPosture | undefined;
   /** The player-token HMAC secret (POL-54), generated on first boot. */
   private playerTokenSecret: string | undefined;
   /** Fleet-wide display settings (POL-6), undefined until first changed. */
@@ -315,6 +324,28 @@ export class MemoryStore implements Store {
     if (user) user.passwordHash = passwordHash;
   }
 
+  async listUsers(): Promise<PersistedUser[]> {
+    return [...this.users.values()]
+      .map(clone)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  }
+
+  async updateUserRole(id: string, role: OperatorRole): Promise<void> {
+    const user = this.users.get(id);
+    if (user) user.role = role;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    this.users.delete(id);
+    await this.deleteSessionsForUser(id);
+  }
+
+  async countAdmins(): Promise<number> {
+    let n = 0;
+    for (const user of this.users.values()) if (user.role === "admin") n += 1;
+    return n;
+  }
+
   async createSession(session: PersistedSession): Promise<void> {
     this.sessions.set(session.id, clone(session));
   }
@@ -351,6 +382,32 @@ export class MemoryStore implements Store {
     this.bootstrap = clone(bootstrap);
   }
 
+  // ── Enrolment tokens + pre-registration (POL-104) ────────────────────────────
+
+  async listEnrollmentTokens(): Promise<PersistedEnrollmentToken[]> {
+    return [...this.enrollmentTokens.values()].map(clone);
+  }
+
+  async upsertEnrollmentToken(token: PersistedEnrollmentToken): Promise<void> {
+    this.enrollmentTokens.set(token.id, clone(token));
+  }
+
+  async deleteEnrollmentToken(id: string): Promise<void> {
+    this.enrollmentTokens.delete(id);
+  }
+
+  async listPreRegistrations(): Promise<PersistedPreRegistration[]> {
+    return [...this.preRegistrations.values()].map(clone);
+  }
+
+  async upsertPreRegistration(record: PersistedPreRegistration): Promise<void> {
+    this.preRegistrations.set(record.id, clone(record));
+  }
+
+  async deletePreRegistration(id: string): Promise<void> {
+    this.preRegistrations.delete(id);
+  }
+
   // ── mTLS agent CA (POL-25) ───────────────────────────────────────────────────
 
   async getMtlsCa(): Promise<PersistedMtlsCa | undefined> {
@@ -359,6 +416,16 @@ export class MemoryStore implements Store {
 
   async setMtlsCa(ca: PersistedMtlsCa): Promise<void> {
     this.mtlsCa = clone(ca);
+  }
+
+  // ── Agent-mTLS posture (POL-134) ─────────────────────────────────────────────
+
+  async getAgentMtlsPosture(): Promise<PersistedAgentMtlsPosture | undefined> {
+    return this.agentMtlsPosture ? clone(this.agentMtlsPosture) : undefined;
+  }
+
+  async setAgentMtlsPosture(posture: PersistedAgentMtlsPosture): Promise<void> {
+    this.agentMtlsPosture = clone(posture);
   }
 
   // ── Player-token secret (POL-54) ─────────────────────────────────────────────

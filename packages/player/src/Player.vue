@@ -65,6 +65,7 @@ import type { WantedMedia } from "./media-cache";
 import { openIdbMediaStore } from "./media-cache-idb";
 import { loadLastSlice, saveLastSlice } from "./last-slice";
 import { applyAudio, ensurePlaying, surfaceAudio } from "./audio";
+import { initShellWorker, shellFromCache, shellServerContact } from "./sw-register";
 import IdleSplash from "./IdleSplash.vue";
 
 // Injected by Vite (see vite.config.ts) from package.json — the build version shown on the idle splash.
@@ -103,6 +104,14 @@ function readPendingMachineId(): string {
 }
 
 const pendingMachineId = readPendingMachineId();
+
+/** POL-117 — `&ident=1` alongside `?pending=`: the operator asked this still-pending box to flash so
+ *  they know which physical panel they're approving. The server re-points the holding board at this
+ *  variant over the AGENT channel (a pending box has no player WS), so "ident on" is simply this
+ *  page with the overlay up, and "ident off" is the plain board again. */
+const pendingIdent =
+  pendingMachineId !== "" && new URLSearchParams(window.location.search).get("ident") === "1";
+
 const screenId = readScreenId();
 const playerToken = readPlayerToken();
 
@@ -132,6 +141,28 @@ const showBadges = ref<boolean>(import.meta.env.DEV);
 // POL-119 — this screen accepts casting (AirPlay receiver armed). Stamped on every render like
 // `friendlyName`; shown as a glyph in the status badge so someone at the glass can tell.
 const castEnabled = ref<boolean>(false);
+
+// POL-136 — the AirPlay pairing PIN to show fullscreen RIGHT NOW (null = no pairing). Server-pushed
+// (`server/cast-pin`) and server-cleared; the local timeout is a backstop so a lost clear frame or a
+// dead server can never strand a four-digit code on the wall. Matches the agent-side TTL.
+const castPin = ref<string | null>(null);
+const CAST_PIN_BACKSTOP_MS = 150_000;
+let castPinTimer: ReturnType<typeof setTimeout> | undefined;
+
+function setCastPin(pin: string | null): void {
+  if (castPinTimer !== undefined) {
+    clearTimeout(castPinTimer);
+    castPinTimer = undefined;
+  }
+  castPin.value = pin;
+  if (pin !== null) {
+    castPinTimer = setTimeout(() => {
+      castPin.value = null;
+      castPinTimer = undefined;
+      diag("cast PIN overlay cleared by local backstop timeout");
+    }, CAST_PIN_BACKSTOP_MS);
+  }
+}
 
 // Pre-first-render the revision is -1; show an em-dash until the first slice lands.
 const revLabel = computed(() => (revision.value < 0 ? "—" : String(revision.value)));
@@ -240,6 +271,13 @@ function handleMessage(msg: ServerToPlayerMessage): void {
     // POL-6 — fleet-wide display settings: show/hide the corner status badge on this screen live.
     showBadges.value = msg.settings.showBadges;
     persistSlice();
+  } else if (msg.t === "server/cast-pin") {
+    // POL-136 — someone is standing at this panel with a phone that is asking for this code: the
+    // receiver prints its pairing PIN to stdout only (it draws no window until mirroring starts),
+    // so THIS overlay is the only thing that puts the number on the glass. Ephemeral like ident —
+    // never persisted — with a local timeout backstop so a lost clear frame can't strand a code.
+    setCastPin(msg.pin);
+    diag(msg.pin === null ? "cast PIN overlay cleared" : "cast PIN overlay shown");
   } else {
     // server/ident-pulse → flash the friendly name so an operator can map physical panels.
     ident.value = msg.on ? { friendlyName: msg.friendlyName, color: msg.color } : null;
@@ -355,6 +393,16 @@ onMounted(() => {
   window.addEventListener("offline", onOffline);
   window.addEventListener("error", onResourceError, true);
 
+  // POL-132 — the player APP survives a page reload while the control plane is down: a service
+  // worker serves the shell cache-first (prod builds only; ?sw=off is the kill switch). A newer
+  // build swaps in only at a safe moment — when the player WS is open, i.e. the reload it costs
+  // repaints instantly from the last-good slice and reconnects immediately.
+  initShellWorker({
+    log: diag,
+    version: APP_VERSION,
+    safeToSwap: () => connState.value === "open",
+  });
+
   if (!screenId) {
     connState.value = "closed";
     return;
@@ -372,7 +420,12 @@ onMounted(() => {
     screenName.value = restored.friendlyName;
     if (restored.showBadges !== undefined) showBadges.value = restored.showBadges;
     if (restored.castEnabled !== undefined) castEnabled.value = restored.castEnabled;
-    diag(`restored last-good slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`);
+    // POL-132 acceptance line: a reload-from-cache must SAY it painted from cache in the trail.
+    diag(
+      shellFromCache()
+        ? `shell from cache, restored slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`
+        : `restored last-good slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`,
+    );
   }
 
   // POL-32 — bring up the blob cache. If IndexedDB is unavailable the player runs uncached (media
@@ -396,6 +449,12 @@ onMounted(() => {
     {
       onMessage: handleMessage,
       onState: (state) => {
+        // Update the reactive state FIRST: everything below (and everything IT calls) must see the
+        // socket's true state. shellServerContact()'s safe-swap gate once read a stale "connecting"
+        // here and deferred a shell update at every contact, forever (caught in review) — the gate
+        // no longer depends on this ordering (serverContact() IS the safe moment), but stale-state
+        // callbacks are a bug class, not a one-off.
+        connState.value = state;
         diag(`player socket ${state}`);
         if (state === "open") {
           // A RECONNECT (not the first connect) means the socket dropped — itself evidence the network
@@ -403,8 +462,10 @@ onMounted(() => {
           if (everOpen) prober.recheck("player socket reconnected");
           everOpen = true;
           flushDiag();
+          // POL-132 — server contact is the safe moment: revalidate the cached shell, and if a
+          // newer build already finished installing, swap into it now (logged in the trail).
+          shellServerContact();
         }
-        connState.value = state;
       },
     },
     playerToken,
@@ -561,14 +622,20 @@ function connLabel(state: ConnState): string {
     rather than dead, and tells the operator exactly what to do. No WS: a pending machine has no
     screen to subscribe to. The amber dot says "waiting", not "broken".
   -->
-  <IdleSplash
-    v-if="pendingMachineId"
-    :name="pendingMachineId"
-    conn-state="connecting"
-    :version="APP_VERSION"
-    sub="Pending Approval"
-    caption="Approve this machine in Console ▸ Machines"
-  />
+  <template v-if="pendingMachineId">
+    <IdleSplash
+      :name="pendingMachineId"
+      conn-state="connecting"
+      :version="APP_VERSION"
+      sub="Pending Approval"
+      caption="Approve this machine in Console ▸ Machines"
+    />
+    <!-- POL-117 — pre-approval ident: the same flash overlay approved screens get, labelled with the
+         machine id (the one identity a pending box has), so the operator can match panel to card. -->
+    <div v-if="pendingIdent" class="ident" style="background-color: #00c2ff">
+      <span class="ident-name pending-ident-name">{{ pendingMachineId }}</span>
+    </div>
+  </template>
 
   <div v-else-if="!screenId" class="notice">
     <p>
@@ -668,6 +735,17 @@ function connLabel(state: ConnState): string {
 
     <div v-if="ident" class="ident" :style="{ backgroundColor: ident.color }">
       <span class="ident-name">{{ ident.friendlyName }}</span>
+    </div>
+
+    <!-- POL-136 — the AirPlay pairing PIN, fullscreen and unmissable: at pairing time the receiver
+         draws nothing (its window only appears once mirroring starts), so this overlay is the only
+         way the person at the panel can read the code their phone is asking for. Static — no
+         animation at all (wall-chrome motion rules, D66). Above ident: a pairing in progress
+         outranks a mapping flash. -->
+    <div v-if="castPin" class="cast-pin">
+      <span class="cast-pin-title">Enter this code on your device</span>
+      <span class="cast-pin-code">{{ castPin }}</span>
+      <span class="cast-pin-hint">{{ screenName }} · Screen Mirroring</span>
     </div>
 
     <div v-if="showBadges" class="badge">

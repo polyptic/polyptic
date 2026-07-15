@@ -343,6 +343,10 @@ export class X11Backend implements DisplayBackend {
     // Never fires: no receiver can run here.
   }
 
+  onCastPin(): void {
+    // Never fires: no receiver can run here (POL-136).
+  }
+
   /** POL-92 — the browsers this backend supervises, for the heartbeat's vitals sampler. On X11 that
    *  is surf under Xwayland, the very stack whose lost DRI3 path (D77) the GPU tell exists to catch. */
   browserProbes(): BrowserProbe[] {

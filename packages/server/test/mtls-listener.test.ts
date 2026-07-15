@@ -174,6 +174,9 @@ interface Stack {
   mtls: AgentMtls;
   control: ControlPlane;
   enrollment: Enrollment;
+  activity: ActivityLog;
+  /** POL-134 — flip the require posture mid-suite (what the auto-promotion does at runtime). */
+  setRequire(value: boolean): void;
   close(): Promise<void>;
 }
 
@@ -207,12 +210,27 @@ async function buildStack(require_: boolean): Promise<Stack> {
   await new Promise<void>((r) => mtlsServer.listen(0, "127.0.0.1", () => r()));
   const mtlsPort = (mtlsServer.address() as { port: number }).port;
 
+  // POL-134 — `required` became a live read (the posture self-promotes at runtime); the test drives
+  // it through a mutable holder so a suite can flip the posture mid-flow.
+  const requireState = { value: require_ };
   const agentMtls: AgentMtlsChannel = {
     server: mtlsServer,
     caPem: mtls.caPem,
     signCsr: (csrPem, machineId) => mtls.signCsr(csrPem, machineId),
     advertise: { port: mtlsPort },
-    require: require_,
+    required: () => requireState.value,
+    noteCertIssued: (machineId) => {
+      void control.noteMachineCertIssued(machineId);
+    },
+    noteMtlsHello: (machineId) => {
+      void (async () => {
+        const first = await control.noteMachineMtlsSeen(machineId);
+        if (first) {
+          const label = control.getMachine(machineId)?.label ?? machineId;
+          activity.push("good", `${label} now on mTLS`);
+        }
+      })();
+    },
   };
 
   const devtoolsRelay = new DevtoolsRelay(agentHub, control, presence, activity, noopLog);
@@ -242,6 +260,10 @@ async function buildStack(require_: boolean): Promise<Stack> {
     mtls,
     control,
     enrollment,
+    activity,
+    setRequire: (value: boolean) => {
+      requireState.value = value;
+    },
     close: async () => {
       plainServer.close();
       mtlsServer.close();
@@ -351,6 +373,75 @@ describe.skipIf(!runtimeVerifies)("mTLS enrolment flow (roll-out mode)", () => {
     });
     const rejected = res.frames.find((f) => f.t === "server/rejected");
     expect(rejected).toBeDefined();
+  });
+});
+
+describe.skipIf(!runtimeVerifies)("POL-134 — migration is recorded + narrated, and require closes the certless door", () => {
+  let stack: Stack;
+  beforeAll(async () => {
+    stack = await buildStack(false);
+  });
+  afterAll(async () => {
+    await stack.close();
+  });
+
+  test("a machine's first mTLS hello records mtlsSeenAt and narrates 'now on mTLS' in the feed", async () => {
+    const { keyPem, csrPem } = await keyAndCsr("machine-mig");
+    const first = await driveAgentHello(stack.plainUrl, agentHello("machine-mig", { bootstrapToken: TOKEN, csrPem }), {
+      until: 2,
+    });
+    const enrolled = first.frames.find((f) => f.t === "server/enrolled");
+    expect(enrolled?.mtls?.certPem).toContain("BEGIN CERTIFICATE");
+    await stack.control.approveMachine("machine-mig");
+
+    // Cert issuance was persisted onto the machine row (the Settings card's "cert issued" state).
+    expect(stack.control.getMachine("machine-mig")?.mtlsCertIssuedAt).toBeDefined();
+    expect(stack.control.getMachine("machine-mig")?.mtlsSeenAt).toBeUndefined();
+
+    // The box comes back over the mTLS listener — the migration edge.
+    const second = await driveAgentHello(
+      stack.mtlsUrl,
+      agentHello("machine-mig", { credential: enrolled.credential }),
+      { tls: { key: keyPem, cert: enrolled.mtls.certPem, ca: stack.mtls.caPem }, until: 1 },
+    );
+    expect(second.frames.some((f) => f.t === "server/apply")).toBe(true);
+
+    // noteMtlsHello runs async off the hello — poll briefly for the persisted edge.
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && !stack.control.getMachine("machine-mig")?.mtlsSeenAt) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(stack.control.getMachine("machine-mig")?.mtlsSeenAt).toBeDefined();
+    const feed = stack.activity.recent().map((e) => e.text);
+    expect(feed.some((t) => t.includes("now on mTLS"))).toBe(true);
+  });
+
+  test("once required, a certless-but-credentialed machine gets NO session on the plain channel (and no cert without a CSR)", async () => {
+    // The graduation: what MtlsPosture does once every known machine has been seen on mTLS.
+    stack.setRequire(true);
+
+    // Enrol a second machine the old-fashioned way (no CSR at all — an agent that cannot mTLS).
+    const first = await driveAgentHello(stack.plainUrl, agentHello("machine-old", { bootstrapToken: TOKEN }));
+    const enrolled = first.frames.find((f) => f.t === "server/enrolled");
+    expect(enrolled?.mtls).toBeUndefined();
+    expect(first.closedByServer).toBe(true);
+    await stack.control.approveMachine("machine-old");
+
+    // Approved + valid credential, still certless: answered, never admitted, closed.
+    const retry = await driveAgentHello(stack.plainUrl, agentHello("machine-old", { credential: enrolled.credential }));
+    expect(retry.frames.some((f) => f.t === "server/apply")).toBe(false);
+    expect(retry.closedByServer).toBe(true);
+
+    // And the mTLS listener without a cert is a handshake failure — no app frame ever flows.
+    expect(await tlsHandshake(stack.mtlsPort, {})).toBe(false);
+
+    // The first-contact door STAYS open under require: the same certless machine presenting a CSR
+    // is handed a bundle (issue-only), which is exactly how it migrates itself out of the hole.
+    const { csrPem } = await keyAndCsr("machine-old");
+    const heal = await driveAgentHello(stack.plainUrl, agentHello("machine-old", { credential: enrolled.credential, csrPem }));
+    const reissued = heal.frames.find((f) => f.t === "server/enrolled");
+    expect(reissued?.mtls?.certPem).toContain("BEGIN CERTIFICATE");
+    expect(heal.frames.some((f) => f.t === "server/apply")).toBe(false);
   });
 });
 

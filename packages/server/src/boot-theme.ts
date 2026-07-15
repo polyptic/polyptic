@@ -55,6 +55,79 @@ const BRIGHT = "#fafafa";
 const FONT = "GNU Unifont Regular 16";
 
 /**
+ * The theme's desktop background image, `bg.png` — a tiny solid-`BG` PNG GRUB stretches over the
+ * whole panel (POL-130). It exists because of how GRUB 2.12's gfxmenu initialises: EVERY view draw
+ * runs `init_background()`, which hands `view->raw_desktop_image` to
+ * `grub_video_bitmap_create_scaled()` UNCONDITIONALLY — and for a theme that sets only
+ * `desktop-color`, that image is NULL. The scaler stashes `GRUB_ERR_BUG` ("null src bitmap in
+ * grub_video_bitmap_create_scaled") in `grub_errno`, the menu still paints fine off `desktop-color`,
+ * and the pending error then SURFACES the instant the chosen entry executes: an error line plus
+ * "Press any key to continue" on a wall with no keyboard (the POL-87/POL-130 symptom, reproduced
+ * frame-by-frame under OVMF — the menu is pixel-perfect at "Starting in 1 s" and errors at 0).
+ * A real, decodable desktop-image is the only config-level fix; visually it is identical to the
+ * `desktop-color` fill it replaces. `desktop-color` stays as the fallback for a GRUB that fails the
+ * stretch for some other reason.
+ *
+ * The bytes are built HERE, dependency-free and byte-deterministic (a stored/uncompressed DEFLATE
+ * block, so no zlib version can change the output): 8x8, 8-bit truecolour (colour type 2),
+ * non-interlaced — the exact profile GRUB 2.12's `png.c` decodes. Committed as
+ * `packages/server/assets/boot-bg.png` (regenerate with `bun deploy/render-boot-theme.ts`) and
+ * served at `GET /boot/bg.png`; a test pins committed == generated.
+ */
+export const BOOT_BG_SIZE = 8;
+
+export function bootBgPng(): Uint8Array {
+  const [r, g, b] = [1, 3, 5].map((i) => Number.parseInt(BG.slice(i, i + 2), 16));
+  const size = BOOT_BG_SIZE;
+
+  const crcTable = new Uint32Array(256).map((_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c;
+  });
+  const crc32 = (bytes: Uint8Array): number => {
+    let c = 0xffffffff;
+    for (const byte of bytes) c = (crcTable[(c ^ byte) & 0xff] as number) ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const be32 = (n: number): number[] => [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+  const chunk = (type: string, data: number[]): number[] => {
+    const body = new Uint8Array([...type].map((ch) => ch.charCodeAt(0)).concat(data));
+    return [...be32(data.length), ...body, ...be32(crc32(body))];
+  };
+
+  // Raw scanlines: each row is one filter byte (0 = None) + size solid-BG pixels.
+  const raw: number[] = [];
+  for (let y = 0; y < size; y++) {
+    raw.push(0);
+    for (let x = 0; x < size; x++) raw.push(r as number, g as number, b as number);
+  }
+  // zlib stream around ONE stored (uncompressed) DEFLATE block: header, BFINAL=1/BTYPE=00,
+  // LEN/NLEN little-endian, the raw bytes, then the Adler-32 of them. GRUB's own inflate
+  // handles stored blocks explicitly (png.c INFLATE_STORED).
+  let a1 = 1;
+  let a2 = 0;
+  for (const byte of raw) {
+    a1 = (a1 + byte) % 65521;
+    a2 = (a2 + a1) % 65521;
+  }
+  const idat = [
+    0x78, 0x01, 0x01,
+    raw.length & 0xff, (raw.length >>> 8) & 0xff,
+    ~raw.length & 0xff, (~raw.length >>> 8) & 0xff,
+    ...raw,
+    ...be32(((a2 << 16) | a1) >>> 0),
+  ];
+
+  return new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ...chunk("IHDR", [...be32(size), ...be32(size), 8, 2, 0, 0, 0]),
+    ...chunk("IDAT", idat),
+    ...chunk("IEND", []),
+  ]);
+}
+
+/**
  * The GRUB shell fragment that turns the text console into a graphical, Polyptic-branded one.
  * Emitted by BOTH stages of the boot chain — the boot medium's stage-1 config (which has no network
  * yet, so it gets the background but no theme) and the control plane's menu — because either can be
@@ -119,7 +192,13 @@ export function buildBootThemeTxt(): string {
   const menuWidth = 448;
   return `# Polyptic boot theme (POL-47), served by the control plane at /boot/theme.txt.
 # GRUB draws this while it fetches the kernel; the Plymouth splash takes over from the same dark.
+# desktop-image is LOAD-BEARING, not decoration (POL-130): GRUB 2.12's gfxmenu scales the desktop
+# image on EVERY view draw, and a theme with only desktop-color hands the scaler a NULL bitmap —
+# the stashed error then paints "error: null src bitmap ... Press any key to continue" on the wall
+# the moment the menu entry boots. bg.png is a tiny solid-colour PNG stretched over the panel;
+# visually identical to the desktop-color fill, which stays as the fallback.
 desktop-color: "${BG}"
+desktop-image: "bg.png"
 title-text: ""
 terminal-font: "${FONT}"
 
