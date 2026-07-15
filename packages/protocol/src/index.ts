@@ -389,6 +389,36 @@ export const VideoSurface = SurfaceBase.extend({
   poster: z.string().url().optional(),
 });
 
+// ── Live streams (POL-108) ───────────────────────────────────────────────────
+// A `stream` is a LIVE source — a camera feed, a channel — as opposed to a `video`, which is a file
+// with a beginning and an end. The distinction is not cosmetic: a file is fetched once and can be
+// cached, looped and seeked; a live source has a moving window, no end, and fails in ways a file
+// cannot (the origin goes down mid-play, a segment 404s, the playlist stops advancing while the
+// element still reports itself "playing"). The player therefore renders it with its own engine —
+// reconnect, stall watchdog, plain-English "no signal" board — rather than as a `<video src>`.
+//
+// The TRANSPORT is an enum, and that enum is the vendor-neutral seam. `hls` is what ships: it is a
+// plain-HTTP, firewall-friendly, universally-restreamable format. RTSP cameras are explicitly OUT of
+// scope of the core — an operator puts any RTSP→HLS restreamer in front, and Polyptic never learns a
+// vendor's name. `whep` (WebRTC-HTTP Egress Protocol) is declared here as the sub-second seam the
+// same surface will grow into; a player build that cannot play a declared protocol says so on the
+// glass instead of showing black.
+
+/** How a live stream is delivered. `hls` today; `whep` is the declared WebRTC seam (POL-108). */
+export const StreamProtocol = z.enum(["hls", "whep"]);
+export type StreamProtocol = z.infer<typeof StreamProtocol>;
+
+export const StreamSurface = SurfaceBase.extend({
+  type: z.literal("stream"),
+  /** The live source's address — for `hls`, the .m3u8 playlist. */
+  url: z.string().url(),
+  protocol: StreamProtocol.default("hls"),
+  /** Walls are silent by default; an operator may unmute one screen deliberately. */
+  muted: z.boolean().default(true),
+  fit: z.enum(["cover", "contain"]).default("contain"),
+});
+export type StreamSurface = z.infer<typeof StreamSurface>;
+
 // ── Playlists (POL-34) ────────────────────────────────────────────────────────
 // A playlist is a library-authored CAROUSEL of content. The server resolves each step's source to a
 // concrete PlaylistEntry at assignment time and ships the whole rotation to the player in ONE surface;
@@ -741,6 +771,7 @@ export const Surface = z.discriminatedUnion("type", [
   DashboardSurface,
   ImageSurface,
   VideoSurface,
+  StreamSurface,
   PlaylistSurface,
   PageSurface,
 ]);
@@ -1452,7 +1483,7 @@ export const ScreenView = Screen.extend({
     .object({
       name: z.string(),
       // Mirrors ContentKind (declared below); inlined because this schema evaluates first.
-      kind: z.enum(["web", "dashboard", "image", "video", "playlist", "page"]),
+      kind: z.enum(["web", "dashboard", "image", "video", "stream", "playlist", "page"]),
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
@@ -1615,8 +1646,18 @@ export type VideoWall = z.infer<typeof VideoWall>;
 
 /** The kind of a content source — mirrors the renderable Surface types. `playlist` (POL-34) is the
  *  composite kind: a carousel over the other renderables. `page` (POL-42) is an authored composition
- *  created in the console's Studio; it has a `definition`, not a `url`. */
-export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist", "page"]);
+ *  created in the console's Studio; it has a `definition`, not a `url`. `stream` (POL-108) is a LIVE
+ *  source (an HLS playlist), distinct from `video` (a file): it never ends, is never cached, and is
+ *  not a playlist step — a rotation over a live feed is a contradiction. */
+export const ContentKind = z.enum([
+  "web",
+  "dashboard",
+  "image",
+  "video",
+  "stream",
+  "playlist",
+  "page",
+]);
 export type ContentKind = z.infer<typeof ContentKind>;
 
 /** One AUTHORED step of a playlist source (POL-34): a reference to another library source plus how

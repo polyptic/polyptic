@@ -74,6 +74,12 @@ export interface SurfaceProberOptions {
   reload: (id: string) => void;
   /** Reachability oracle; resolves = reachable. Injected for tests. */
   probe?: (url: string) => Promise<void>;
+  /** POL-108 — a probe FAILED (with how many in a row, and why). The prober itself needs no such
+   *  hook: it just keeps trying, calmly, forever. A LIVE surface does — a wall whose camera was
+   *  already unreachable when the box booted would otherwise sit on "Connecting…" for ever, which is
+   *  true but useless. The player turns a repeated failure into "No signal · cannot reach the source"
+   *  on the glass. Optional; nothing else listens. */
+  onProbeFail?: (id: string, attempts: number, error: string) => void;
   /** POL-94 — the probe's verdict CHANGED for a surface. Fired on transitions only (never per probe,
    *  never per retry), so reporting a fleet's content health to the control plane is a handful of
    *  frames rather than a poll. The player forwards these as `player/surface-health`. */
@@ -149,6 +155,7 @@ export class SurfaceProber {
   private readonly clearEl: (id: string) => void;
   private readonly reloadEl: (id: string) => void;
   private readonly probe: (url: string) => Promise<void>;
+  private readonly onProbeFail: (id: string, attempts: number, error: string) => void;
   private readonly onHealth: (change: SurfaceHealthChange) => void;
   private readonly log: (msg: string) => void;
   private readonly backoffMinMs: number;
@@ -164,6 +171,7 @@ export class SurfaceProber {
     this.clearEl = opts.clear;
     this.reloadEl = opts.reload;
     this.probe = opts.probe ?? defaultProbe(opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
+    this.onProbeFail = opts.onProbeFail ?? ((): void => {});
     this.onHealth = opts.onHealth ?? ((): void => {});
     this.log = opts.log ?? ((): void => {});
     this.backoffMinMs = opts.probeBackoffMinMs ?? PROBE_BACKOFF_MIN_MS;
@@ -358,6 +366,7 @@ export class SurfaceProber {
       this.log(
         `${id}: probe of ${redactUrl(url)} failed (${describeError(error)}) — retry ${current.attempts} in ${delay}ms [${why}]`,
       );
+      this.onProbeFail(id, current.attempts, describeError(error));
       this.setHealth(id, current, "unreachable", describeError(error).slice(0, 200));
       current.timer = setTimeout(() => {
         current.timer = null;

@@ -130,7 +130,7 @@ const ContentSourceParams = z.object({ id: z.string().min(1) });
 
 /** A plain sentence for each playlist authoring error (POL-34), shown to the operator verbatim. */
 function playlistItemErrorDetail(
-  error: "unknown-item-source" | "nested-playlist" | "item-needs-duration",
+  error: "unknown-item-source" | "nested-playlist" | "live-stream-step" | "item-needs-duration",
   itemSourceId?: string,
 ): string {
   switch (error) {
@@ -138,6 +138,8 @@ function playlistItemErrorDetail(
       return `playlist item references an unknown source: ${itemSourceId}`;
     case "nested-playlist":
       return `a playlist cannot contain another playlist (${itemSourceId})`;
+    case "live-stream-step":
+      return `a playlist cannot contain a live stream — assign it to a screen directly (${itemSourceId})`;
     case "item-needs-duration":
       return `playlist items that are not videos need a duration (${itemSourceId})`;
   }

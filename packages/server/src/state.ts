@@ -36,6 +36,7 @@ import {
   SceneDiff,
   Schedule,
   SchedulerSettings,
+  StreamSurface,
   VideoSurface,
   VideoWall,
   WebSurface,
@@ -2080,9 +2081,11 @@ export class ControlPlane {
           ? "Image"
           : kind === "video"
             ? "Video"
-            : kind === "playlist"
-              ? "Playlist"
-              : "Page";
+            : kind === "stream"
+              ? "Live stream"
+              : kind === "playlist"
+                ? "Playlist"
+                : "Page";
   }
 
   /** A human content name for an activity line: the library source's name, else the ad-hoc URL's host. */
@@ -2161,6 +2164,11 @@ export class ControlPlane {
         });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
+      case "stream":
+        // POL-108 — a LIVE source. No loop (it never ends) and no zoom (there is no page to zoom);
+        // the player mounts its own stream engine on it. `protocol` is the vendor-neutral seam: hls
+        // today, whep declared. An RTSP camera is restreamed to HLS OUTSIDE the control plane.
+        return StreamSurface.parse({ ...base, type: "stream", url: spec.url, protocol: "hls" });
       case "video": {
         // POL-109 — the ingest's poster frame rides along, so the panel paints the video's own first
         // frame while it buffers instead of a black rectangle. Absent for a linked/unprobed video.
@@ -2630,7 +2638,11 @@ export class ControlPlane {
     const entries: PlaylistEntry[] = [];
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
-      if (!step || step.kind === "playlist" || step.kind === "page" || !step.url) continue;
+      // POL-108 — a `stream` is not a playlist step: rotating a live feed away and back re-negotiates
+      // the stream every cycle for no operator value, and a live source has no meaningful "duration".
+      // Skipped here (as `page` already is) so a drifted authoring never ships an unrenderable entry.
+      if (!step || step.kind === "playlist" || step.kind === "page" || step.kind === "stream" || !step.url)
+        continue;
       // POL-109 — a video step carries its ingest poster, so each step of a rotation pre-paints its
       // own first frame rather than flashing black on every advance.
       const poster = step.kind === "video" ? this.mediaFor(step.url)?.posterUrl : undefined;
@@ -3396,7 +3408,9 @@ export class ControlPlane {
    * Authoring-time validation of a playlist's items (POL-34): every step must reference an EXISTING,
    * NON-PLAYLIST source (playlists cannot nest — the player would otherwise need a rotation stack and
    * the console a cycle detector, for no operator value), and any step whose content never ends by
-   * itself (everything but video) must say how long it holds the screen.
+   * itself (everything but video) must say how long it holds the screen. POL-108: a LIVE stream is
+   * rejected outright rather than silently dropped — an operator who put a camera in a carousel has
+   * misunderstood the kind, and a wall that quietly skips a step teaches them nothing.
    */
   private validatePlaylistItems(
     items: PlaylistItem[],
@@ -3404,7 +3418,7 @@ export class ControlPlane {
     | { ok: true }
     | {
         ok: false;
-        error: "unknown-item-source" | "nested-playlist" | "item-needs-duration";
+        error: "unknown-item-source" | "nested-playlist" | "live-stream-step" | "item-needs-duration";
         itemSourceId: string;
       } {
     for (const item of items) {
@@ -3412,6 +3426,8 @@ export class ControlPlane {
       if (!step) return { ok: false, error: "unknown-item-source", itemSourceId: item.sourceId };
       if (step.kind === "playlist")
         return { ok: false, error: "nested-playlist", itemSourceId: item.sourceId };
+      if (step.kind === "stream")
+        return { ok: false, error: "live-stream-step", itemSourceId: item.sourceId };
       if (step.kind !== "video" && item.durationSeconds === undefined)
         return { ok: false, error: "item-needs-duration", itemSourceId: item.sourceId };
     }
@@ -3426,7 +3442,12 @@ export class ControlPlane {
     | { ok: true; source: ContentSource }
     | {
         ok: false;
-        error: "unknown-profile" | "unknown-item-source" | "nested-playlist" | "item-needs-duration";
+        error:
+          | "unknown-profile"
+          | "unknown-item-source"
+          | "nested-playlist"
+          | "live-stream-step"
+          | "item-needs-duration";
         itemSourceId?: string;
       }
   > {
@@ -3525,6 +3546,7 @@ export class ControlPlane {
           | "invalid-shape"
           | "unknown-item-source"
           | "nested-playlist"
+          | "live-stream-step"
           | "item-needs-duration";
         itemSourceId?: string;
       }
@@ -4168,7 +4190,17 @@ export class ControlPlane {
   ): PageEmbedResolution | undefined {
     if (sourceId) {
       const source = this.contentSources.get(sourceId);
-      if (!source || source.kind === "page" || source.kind === "playlist" || !source.url) return undefined;
+      // POL-108 — a `stream` source cannot be embedded in a page either: the page's embed element is
+      // an iframe/media tag, and a live HLS feed needs the player's stream engine (MSE), which only a
+      // top-level `stream` surface mounts. A stream-referencing embed renders its placeholder.
+      if (
+        !source ||
+        source.kind === "page" ||
+        source.kind === "playlist" ||
+        source.kind === "stream" ||
+        !source.url
+      )
+        return undefined;
       let url = source.url;
       if (source.credentialProfileId && this.tokenProvider) {
         const profile = this.credentialProfiles.get(source.credentialProfileId);
@@ -4226,6 +4258,7 @@ export class ControlPlane {
     switch (surface.type) {
       case "web":
       case "dashboard":
+      case "stream":
         return surface.url;
       case "image":
       case "video":

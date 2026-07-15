@@ -18,8 +18,12 @@ const store = useConsoleStore();
 
 const playlists = computed(() => store.sources.filter((s) => s.kind === "playlist"));
 
-/** What a playlist may contain: every library source except playlists themselves (no nesting). */
-const stepSources = computed(() => store.sources.filter((s) => s.kind !== "playlist"));
+/** What a playlist may contain: every library source except playlists themselves (no nesting) and
+ *  except live streams (POL-108) — a rotation over a never-ending feed re-negotiates the stream every
+ *  cycle and has no natural duration; the server rejects such a step, so we never offer it. */
+const stepSources = computed(() =>
+  store.sources.filter((s) => s.kind !== "playlist" && s.kind !== "stream"),
+);
 
 /** The row's sub-line: step count plus the running order by name, e.g. "3 steps · A → B → C". */
 function rowSub(p: ContentSource): string {
