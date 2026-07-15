@@ -24,6 +24,9 @@ import { DevtoolsRelay } from "../src/devtools-relay";
 import { Enrollment } from "../src/enroll";
 import { AgentHub, PlayerHub } from "../src/hub";
 import { AgentMtls } from "../src/mtls";
+import { PanelPowerScheduler } from "../src/panel-power";
+import { PlayerAuth } from "../src/player-auth";
+import { SourceHealthTracker } from "../src/source-health";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 import { attachWebSockets } from "../src/ws";
@@ -234,12 +237,16 @@ async function buildStack(require_: boolean): Promise<Stack> {
   };
 
   const devtoolsRelay = new DevtoolsRelay(agentHub, control, presence, activity, noopLog);
+  const playerAuth = await PlayerAuth.init(store, false, noopLog);
+  const health = new SourceHealthTracker();
+  const panelPower = new PanelPowerScheduler({ control, agentHub, presence, activity, broadcaster, log: noopLog });
 
   attachWebSockets({
     server: plainServer,
     control,
     enrollment,
     auth,
+    playerAuth,
     hub,
     agentHub,
     adminHub,
@@ -247,7 +254,9 @@ async function buildStack(require_: boolean): Promise<Stack> {
     broadcaster,
     activity,
     capture,
+    health,
     devtoolsRelay,
+    panelPower,
     log: noopLog,
     allowedOrigins: [],
     agentMtls,
