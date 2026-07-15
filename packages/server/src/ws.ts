@@ -44,9 +44,9 @@ import {
   ServerToPlayerSettings,
   parseMessage,
 } from "@polyptic/protocol";
-import type { MtlsBundle } from "@polyptic/protocol";
+import type { MtlsBundle, OperatorRole, ServerToAdminShellMessage } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import type { Server as HttpsServer } from "node:https";
 import type { RawData } from "ws";
 
@@ -62,6 +62,9 @@ import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
+import type { SourceHealthTracker } from "./source-health";
+import { powerAckLine } from "./panel-power";
+import type { PanelPowerScheduler } from "./panel-power";
 
 interface WsDeps {
   /** The main listener the three channels' upgrades hang off — plain HTTP, or the native-TLS
@@ -82,8 +85,12 @@ interface WsDeps {
   activity: ActivityLog;
   /** Live-preview capture (Phase 5) — ingests inbound `agent/thumbnail` frames. */
   capture: CaptureCoordinator;
+  /** POL-94 — per-source content health, fed by the players' `player/surface-health` reports. */
+  health: SourceHealthTracker;
   /** Remote-DevTools relay (POL-67) — bridges an operator's DevTools frontend to a wall's Chrome. */
   devtoolsRelay: DevtoolsRelay;
+  /** POL-101 — panel-hours scheduler; reconciles a box's panels to their window when it says hello. */
+  panelPower: PanelPowerScheduler;
   log: FastifyBaseLogger;
   /** Allowed browser origins for the /admin WS upgrade (anti-CSWSH); from CORS_ORIGIN. */
   allowedOrigins: string[];
@@ -142,8 +149,21 @@ export function parseDevtoolsUpgradePath(pathname: string): { screenId: string; 
   return { screenId, path: m[2] };
 }
 
+/**
+ * POL-104 — where an agent is dialling FROM, for the pending card. A forwarded-for header wins when
+ * present (behind an ingress the socket's peer is the ingress, which tells an operator nothing about
+ * which box is on the other end); otherwise the socket's own peer address. Best-effort: some runtimes
+ * do not populate `remoteAddress` on an upgrade at all, and an absent IP is simply omitted from the
+ * card — a fact we cannot establish is never invented.
+ */
+function peerAddress(req: IncomingMessage): string | undefined {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
+  return first && first.length > 0 ? first : (req.socket?.remoteAddress ?? undefined);
+}
+
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, log, allowedOrigins, agentMtls } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -166,7 +186,10 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
 
     if (pathname === "/agent") {
       // Device channel — authenticated via enrollment credentials on agent/hello, NOT a user session.
-      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, "plain"));
+      // POL-104: the peer address rides along so a pending card can say where the box is dialling from.
+      agentWss.handleUpgrade(req, socket, head, (ws) =>
+        agentWss.emit("connection", ws, "plain", peerAddress(req)),
+      );
     } else if (pathname === "/player") {
       // Device channel — players carry no user session, but they are NOT anonymous: the agent
       // launched them at a server-minted URL carrying a per-screen bearer token, echoed back in
@@ -185,8 +208,13 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
       }
       // Operator channel — gate on a valid signed session cookie (Phase 3f). When auth is disabled the
       // check is skipped (mirrors the REST gate). Reject the upgrade outright if there is no session.
+      //
+      // POL-107: the socket carries the operator's ROLE from here on. EVERY role may open it (it is how
+      // a viewer receives state at all — read access), but the frames that DO something (the POL-59
+      // remote shell) are re-checked against that role in `handleAdmin`. With auth disabled there is no
+      // session and nothing is enforced anywhere, so the socket runs as `admin` — same as /auth/me.
       if (!auth.enabled) {
-        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, req));
+        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, "admin"));
         return;
       }
       void auth
@@ -198,7 +226,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
-          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, req));
+          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, user.role));
         })
         .catch((err) => {
           log.warn({ event: "admin.ws.error", err: String(err) }, "error gating /admin upgrade");
@@ -240,6 +268,18 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
+          // POL-107 — a live remote debugger inside a wall's browser is an ADMIN capability, and the
+          // CDP socket is a second door to it: the REST `/screens/:id/devtools*` routes are admin-only
+          // by the gate's deny-by-default, and this upgrade must match them or the door is unlocked.
+          if (user.role !== "admin") {
+            log.warn(
+              { event: "devtools.ws.forbidden", userId: user.id, role: user.role },
+              "rejected devtools upgrade — role is not admin",
+            );
+            socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+            socket.destroy();
+            return;
+          }
           admit();
         })
         .catch((err) => {
@@ -251,8 +291,8 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
     }
   });
 
-  agentWss.on("connection", (ws: WebSocket, channel: AgentChannel) =>
-    handleAgent(ws, channel ?? "plain", agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, log),
+  agentWss.on("connection", (ws: WebSocket, channel: AgentChannel, remoteAddress?: string) =>
+    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, log),
   );
 
   // POL-25 — the mTLS agent channel: a second listener whose TLS handshake already rejected any
@@ -271,14 +311,16 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
         socket.destroy();
         return;
       }
-      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, "mtls"));
+      agentWss.handleUpgrade(req, socket, head, (ws) =>
+        agentWss.emit("connection", ws, "mtls", peerAddress(req)),
+      );
     });
   }
   playerWss.on("connection", (ws: WebSocket) =>
-    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, log),
+    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, health, log),
   );
-  adminWss.on("connection", (ws: WebSocket) =>
-    handleAdmin(ws, adminHub, broadcaster, control, shellRelay, log),
+  adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
+    handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, log),
   );
 
   return shellRelay;
@@ -287,6 +329,9 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
 function handleAgent(
   ws: WebSocket,
   channel: AgentChannel,
+  /** POL-104 — the peer address this agent is dialling from (live-only: it is recorded in Presence,
+   *  never persisted, because a stale IP on an offline box is a lie). */
+  remoteAddress: string | undefined,
   agentMtls: AgentMtlsChannel | undefined,
   control: ControlPlane,
   enrollment: Enrollment,
@@ -298,6 +343,7 @@ function handleAgent(
   capture: CaptureCoordinator,
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
+  panelPower: PanelPowerScheduler,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected", channel }, "agent socket opened");
@@ -365,7 +411,14 @@ function handleAgent(
       const reason = decision.reason ?? "enrollment rejected";
       sendRejected(reason);
       log.info(
-        { event: "agent.rejected", machineId: msg.machineId, reason },
+        {
+          event: "agent.rejected",
+          machineId: msg.machineId,
+          reason,
+          // POL-104 — when the token was RECOGNISED but refused (revoked/expired/used up), name it:
+          // "invalid token" sends an operator hunting for a typo that isn't there.
+          ...(decision.tokenId ? { tokenId: decision.tokenId, tokenName: decision.tokenName } : {}),
+        },
         "agent enrollment rejected — closing socket",
       );
       ws.close();
@@ -416,13 +469,27 @@ function handleAgent(
       presenceMarked = true;
     }
 
+    // POL-104 — the box's address, recorded live (never persisted) so a pending card can say where it
+    // is dialling from. An operator commissioning a rack matches a card to a box by its IP as often as
+    // by anything else.
+    if (!issueOnly && remoteAddress) presence.noteMachineAddress(machineId, remoteAddress);
+
     const input: RegisterMachineInput = {
       machineId: msg.machineId,
       agentVersion: msg.agentVersion,
       backend: msg.backend,
       browser: msg.browser,
+      // POL-101 — what this box can do about panel power, as IT reports it (dpms / cec). Re-read on
+      // every hello, so a box that grows a CEC adapter (or loses one) tells the truth after a restart.
+      power: msg.power,
       outputs: msg.outputs,
       hostname: msg.hostname,
+      // POL-105 — the image the box BOOTED, on its very first frame: an operator watching a canary
+      // reboot sees the new id land the moment the box is back, not a heartbeat later.
+      imageId: msg.imageId,
+      hardware: msg.hardware,
+      enrolledTokenId: decision.tokenId,
+      enrolledTokenName: decision.tokenName,
     };
 
     try {
@@ -453,6 +520,10 @@ function handleAgent(
             break;
           }
           sendApply(msg.machineId, assignments);
+          // POL-101 — the box is back and its panels are LIT (the compositor asserts `dpms on` at
+          // startup). If a screen is outside its panel hours right now, sleep it again; in hours,
+          // this does nothing at all — a wall that should be showing content is never blanked.
+          panelPower.reconcileMachine(msg.machineId);
           log.info(
             {
               event: "agent.hello",
@@ -479,7 +550,43 @@ function handleAgent(
           // hash, hand the agent its durable credential, then park it pending. No screens, no apply.
           const credential = decision.credential ?? "";
           await control.enrollPending(input, hashCredential(credential));
+          // POL-104 — this box consumed one of the token's enrolments (the cap counts NEW machines; a
+          // re-enrol of a box that already counted does not consume a second slot).
+          if (decision.tokenId) await enrollment.recordUse(decision.tokenId);
           sendEnrolled(msg.machineId, credential, "pending", mtlsBundle);
+
+          // POL-104 — did an operator declare this box before it ever booted? Pre-registration is
+          // consulted ONLY here, AFTER the token gate: it is not a credential and admits nothing on
+          // its own. It names the box, and — when the record says so — approves it, which is the
+          // zero-click commissioning path (no blind pending card, no click).
+          const preReg = await control.applyPreRegistration(msg.machineId, msg.hardware);
+          const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+          if (preReg?.record.autoApprove && !issueOnly) {
+            const approved = await control.approveMachine(msg.machineId);
+            if (approved) {
+              sendApply(msg.machineId, approved.assignments);
+              activity.push(
+                "good",
+                `${label} enrolled and auto-approved (pre-registered, matched on ${preReg.matchedOn})`,
+              );
+              log.info(
+                {
+                  event: "agent.enrolled",
+                  machineId: msg.machineId,
+                  outputs: msg.outputs.length,
+                  issuedCert: Boolean(mtlsBundle),
+                  status: "approved",
+                  preRegistrationId: preReg.record.id,
+                  matchedOn: preReg.matchedOn,
+                  tokenId: decision.tokenId,
+                  screens: approved.assignments.map((a) => a.screenId),
+                },
+                "new machine enrolled — pre-registered, auto-approved",
+              );
+              break;
+            }
+          }
+
           sendPending(decision.reason, msg.machineId);
           log.info(
             {
@@ -488,6 +595,10 @@ function handleAgent(
               outputs: msg.outputs.length,
               issuedCert: Boolean(mtlsBundle),
               status: "pending",
+              tokenId: decision.tokenId,
+              tokenName: decision.tokenName,
+              preRegistered: Boolean(preReg),
+              ...(preReg ? { matchedOn: preReg.matchedOn } : {}),
             },
             "new machine enrolled — awaiting operator approval",
           );
@@ -617,6 +728,26 @@ function handleAgent(
       // has a last-seen for `polyptic_machine_last_seen_seconds` either way.
       const hadVitals = presence.machineVitals(msg.machineId) !== undefined;
       presence.noteHeartbeat(msg.machineId, msg.vitals);
+      // POL-105 — the heartbeat also carries the box's booted image id. Persist it (and announce a
+      // CHANGE) so the version distribution survives the box going offline. `hello` already reported
+      // it; this keeps a long-lived session honest and covers an agent that heartbeats but never
+      // re-hellos. Unchanged ids are silent — this arrives every few seconds.
+      // Fire-and-forget like the hello path: a heartbeat is not a request/response, and a store blip
+      // must never take the status frame (or the socket) down.
+      if (msg.vitals?.imageId) {
+        const reported = msg.vitals.imageId;
+        void control
+          .noteMachineImage(msg.machineId, reported)
+          .then((changed) => {
+            if (changed) broadcaster.broadcast();
+          })
+          .catch((err: unknown) => {
+            log.warn(
+              { event: "image.report.error", machineId: msg.machineId, err: String(err) },
+              "could not record the image id this box reported",
+            );
+          });
+      }
       // Coalesced downstream; the first sample matters most (it fills an empty strip).
       if (msg.vitals || hadVitals) broadcaster.broadcast();
       log.info(
@@ -664,6 +795,42 @@ function handleAgent(
       devtoolsRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
     } else if (msg.t === "agent/devtools-closed") {
       devtoolsRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
+    } else if (msg.t === "agent/power-ack") {
+      // POL-101 — the box's answer to `server/display-power`, and the ONLY writer of `asleep`. The
+      // operator's click is a request; only the box knows whether the compositor took the DPMS command
+      // and whether the CEC bus answered. A refusal therefore leaves the screen AWAKE in the console:
+      // never show a wall as dark when it might still be lit.
+      const screen = control
+        .getScreens()
+        .find((s) => s.machineId === msg.machineId && s.connector === msg.connector);
+      if (screen) {
+        presence.setScreenAsleep(screen.id, msg.ok && !msg.on, msg.methods);
+        presence.setScreenPowerError(screen.id, msg.ok ? null : (msg.reason ?? "the box did not say why"));
+        if (!msg.ok) {
+          activity.push(
+            "bad",
+            `Could not ${msg.on ? "wake" : "sleep"} ${screen.friendlyName}: ${msg.reason ?? "no reason given"}`,
+          );
+        } else {
+          // "info", not "warn": a sleeping panel is a HEALTHY panel doing what it was told. The feed
+          // must not train an operator to read a scheduled sleep as a fault.
+          activity.push("info", powerAckLine(screen.friendlyName, msg.on, msg.methods));
+        }
+        broadcaster.broadcast();
+      }
+      log.info(
+        {
+          event: "agent.power_ack",
+          machineId: msg.machineId,
+          connector: msg.connector,
+          screenId: screen?.id,
+          on: msg.on,
+          ok: msg.ok,
+          methods: msg.methods,
+          reason: msg.reason,
+        },
+        msg.ok ? "agent applied panel power" : "agent could not apply panel power",
+      );
     } else if (msg.t === "agent/inspect-ack") {
       // POL-50 — the box's answer to `server/inspect`, and the ONLY writer of the `inspecting` flag:
       // the operator's click is a request, but only the wall knows whether surf relaunched and took
@@ -740,7 +907,12 @@ function handleAgent(
             playerHub.send(s.id, ServerToPlayerCastPin.parse({ t: "server/cast-pin", pin: null }));
           }
         }
-        presence.clearScreensInspecting(droppedScreens.map((s) => s.id));
+        const screenIds = droppedScreens.map((s) => s.id);
+        presence.clearScreensInspecting(screenIds);
+        // POL-101 — likewise the power state: a box that comes back comes back LIT, so a remembered
+        // "asleep" would strand the console showing a dark wall that is actually showing content. The
+        // scheduler re-sleeps it on hello if it is still outside its hours.
+        presence.clearScreensPower(screenIds);
       }
       broadcaster.broadcast();
     }
@@ -765,6 +937,7 @@ function handlePlayer(
   presence: Presence,
   broadcaster: AdminBroadcaster,
   activity: ActivityLog,
+  health: SourceHealthTracker,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "player.connected" }, "player socket opened");
@@ -868,6 +1041,35 @@ function handlePlayer(
         { event: "player.diag", screenId, playerAt: msg.at },
         `player diag: ${msg.msg}`,
       );
+    } else if (msg.t === "player/surface-health") {
+      // POL-94: the box's verdict on a surface's URL — the POL-86 prober's knowledge, addressed by
+      // library source instead of buried in the diag trail. Sent only on a state CHANGE (and re-sent
+      // on reconnect, since a dropped screen is forgotten below), so this path is cheap by design.
+      // An ad-hoc URL carries no sourceId: there is no library entry to attribute it to, so we log
+      // it and stop — the console's badge is a LIBRARY badge.
+      log.info(
+        {
+          event: "player.surface-health",
+          screenId,
+          surfaceId: msg.surfaceId,
+          sourceId: msg.sourceId,
+          state: msg.state,
+          url: msg.url, // redacted player-side (origin + path) — never a stamped token
+          playerAt: msg.at,
+        },
+        `player surface health: ${msg.sourceId ?? "ad-hoc"} is ${msg.state}${msg.detail ? ` (${msg.detail})` : ""}`,
+      );
+      if (msg.sourceId && control.getContentSource(msg.sourceId)) {
+        health.record({
+          screenId,
+          surfaceId: msg.surfaceId,
+          sourceId: msg.sourceId,
+          state: msg.state,
+          at: msg.at,
+          ...(msg.detail ? { detail: msg.detail } : {}),
+        });
+        broadcaster.broadcast();
+      }
     } else {
       // player/ack — record the revision this screen has observed.
       presence.setScreenObservedRevision(screenId, msg.revision);
@@ -886,6 +1088,9 @@ function handlePlayer(
       hub.remove(screenId, ws);
       if (hub.count(screenId) === 0) {
         activity.push("bad", `${name} went unreachable`);
+        // POL-94 — an offline screen knows nothing about a URL's reachability. Forget what it told
+        // us, or a source stays red forever on the word of a box that has been unplugged for a week.
+        health.forgetScreen(screenId);
       }
       // Screen may have gone offline (no sockets left) — refresh the admin view.
       broadcaster.broadcast();
@@ -899,6 +1104,8 @@ function handlePlayer(
 
 function handleAdmin(
   ws: WebSocket,
+  /** The role of the operator who opened this socket (POL-107) — fixed for its lifetime. */
+  role: OperatorRole,
   adminHub: AdminHub,
   broadcaster: AdminBroadcaster,
   control: ControlPlane,
@@ -906,7 +1113,7 @@ function handleAdmin(
   log: FastifyBaseLogger,
 ): void {
   adminHub.add(ws);
-  log.info({ event: "admin.connected", admins: adminHub.count() }, "admin socket opened");
+  log.info({ event: "admin.connected", role, admins: adminHub.count() }, "admin socket opened");
 
   // On connect: push the current registry snapshot straight away.
   if (ws.readyState === WebSocket.OPEN) {
@@ -928,7 +1135,33 @@ function handleAdmin(
         ws.send(JSON.stringify(broadcaster.snapshot()));
       }
       log.info({ event: "admin.hello" }, "admin registered");
-    } else if (msg.t === "admin/shell-open") {
+      return;
+    }
+
+    // POL-107 — every remaining frame is a SHELL frame: a root PTY on a wall box. That is the single
+    // most powerful thing this socket can do, so it is ADMIN-only, enforced here rather than in the
+    // console. A non-admin that forges the frame is told the session was refused (the same shape the
+    // relay uses when a box isn't armed) and nothing is relayed to the machine.
+    if (role !== "admin") {
+      log.warn(
+        { event: "admin.shell.forbidden", role, frame: msg.t },
+        "refused a shell frame — role is not admin",
+      );
+      if (msg.t === "admin/shell-open" && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            t: "server/shell-opened",
+            machineId: msg.machineId,
+            sessionId: "refused",
+            ok: false,
+            reason: "your role may not open a console on a machine",
+          } satisfies ServerToAdminShellMessage),
+        );
+      }
+      return;
+    }
+
+    if (msg.t === "admin/shell-open") {
       // POL-59: the operator opened a terminal on a box. The relay enforces armed + approved + online.
       shellRelay.openFromAdmin(ws, msg.machineId, msg.cols, msg.rows);
     } else if (msg.t === "admin/shell-data") {

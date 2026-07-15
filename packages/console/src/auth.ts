@@ -12,7 +12,10 @@
  */
 import {
   AuthUser,
+  BootOrderPolicy,
   ChangePasswordBody,
+  CreateEnrollmentTokenBody,
+  CreateOperatorBody,
   DisplaySettings,
   EnrollmentInfo,
   AgentSecurityInfo,
@@ -20,18 +23,30 @@ import {
   LoginBody,
   ImageUpdateInfo,
   NetbootInfo,
+  PromoteImageRingBody,
+  SetImageRingsBody,
+  RotateEnrollmentTokenBody,
+  Operator,
   UpdateImageSettingsBody,
+  UpdateOperatorBody,
 } from "@polyptic/protocol";
 import type {
+  BootOrderPolicy as BootOrderPolicyT,
   ChangePasswordBody as ChangePasswordBodyT,
+  CreateEnrollmentTokenBody as CreateEnrollmentTokenBodyT,
+  CreateOperatorBody as CreateOperatorBodyT,
   DisplaySettings as DisplaySettingsT,
+  ImageRing,
   LoginBody as LoginBodyT,
+  UpdateOperatorBody as UpdateOperatorBodyT,
 } from "@polyptic/protocol";
+import { z } from "zod";
 
 import { ApiError, apiUrl, send } from "./api";
 
 const BASE_AUTH = "/auth";
 const BASE_SETTINGS = "/settings";
+const BASE_OPERATORS = "/operators";
 
 /** The server may return the user bare or wrapped as `{ user }`; accept either, then validate. */
 function unwrapUser(raw: unknown): AuthUser {
@@ -40,6 +55,15 @@ function unwrapUser(raw: unknown): AuthUser {
       ? (raw as Record<string, unknown>).user
       : raw;
   return AuthUser.parse(candidate);
+}
+
+/** Likewise tolerate `{ operator }` wrapping on the create/update responses. */
+function unwrapOperator(raw: unknown): Operator {
+  const candidate =
+    raw && typeof raw === "object" && "operator" in (raw as Record<string, unknown>)
+      ? (raw as Record<string, unknown>).operator
+      : raw;
+  return Operator.parse(candidate);
 }
 
 /** Likewise tolerate `{ enrollment }` wrapping for the enrollment-info routes. */
@@ -87,15 +111,97 @@ export async function changePassword(body: ChangePasswordBodyT): Promise<void> {
   await send<unknown>("POST", `${BASE_AUTH}/change-password`, ChangePasswordBody.parse(body));
 }
 
+// ── Operator accounts (POL-107) — admin-only; every call 403s for an operator/viewer. ───────────
+
+/** GET /api/v1/operators → every account (id, email, role, createdAt). Never a hash. */
+export async function listOperators(): Promise<Operator[]> {
+  const raw = await send<unknown>("GET", BASE_OPERATORS);
+  const candidate =
+    raw && typeof raw === "object" && "operators" in (raw as Record<string, unknown>)
+      ? (raw as Record<string, unknown>).operators
+      : raw;
+  return z.array(Operator).parse(candidate);
+}
+
+/** POST /api/v1/operators { email, password, role } → the created account. 409 if the email exists. */
+export async function createOperator(body: CreateOperatorBodyT): Promise<Operator> {
+  const raw = await send<unknown>("POST", BASE_OPERATORS, CreateOperatorBody.parse(body));
+  return unwrapOperator(raw);
+}
+
+/** PATCH /api/v1/operators/:id { role?, password? } → the updated account. */
+export async function updateOperator(id: string, body: UpdateOperatorBodyT): Promise<Operator> {
+  const raw = await send<unknown>(
+    "PATCH",
+    `${BASE_OPERATORS}/${encodeURIComponent(id)}`,
+    UpdateOperatorBody.parse(body),
+  );
+  return unwrapOperator(raw);
+}
+
+/** DELETE /api/v1/operators/:id — remove the account and every session it holds. */
+export async function deleteOperator(id: string): Promise<void> {
+  await send<unknown>("DELETE", `${BASE_OPERATORS}/${encodeURIComponent(id)}`);
+}
+
 /** GET /api/v1/settings/enrollment → open-mode note or the gated bootstrap token (operator-only). */
 export async function getEnrollment(): Promise<EnrollmentInfo> {
   const raw = await send<unknown>("GET", `${BASE_SETTINGS}/enrollment`);
   return unwrapEnrollment(raw);
 }
 
-/** POST /api/v1/settings/enrollment/regenerate → mint a fresh gated token, returning the new info. */
+/** POST /api/v1/settings/enrollment/regenerate → rotate the baked token (24 h grace on the old one). */
 export async function regenerateEnrollment(): Promise<EnrollmentInfo> {
   const raw = await send<unknown>("POST", `${BASE_SETTINGS}/enrollment/regenerate`);
+  return unwrapEnrollment(raw);
+}
+
+// ── Enrolment tokens (POL-104) ───────────────────────────────────────────────
+
+/** POST /api/v1/settings/enrollment/tokens — cut a batch token (optionally expiring and/or capped). */
+export async function createEnrollmentToken(body: CreateEnrollmentTokenBodyT): Promise<EnrollmentInfo> {
+  const raw = await send<unknown>(
+    "POST",
+    `${BASE_SETTINGS}/enrollment/tokens`,
+    CreateEnrollmentTokenBody.parse(body),
+  );
+  return unwrapEnrollment(raw);
+}
+
+/** POST …/tokens/:id/rotate — cut a successor; the OLD secret keeps enrolling for `graceHours`. */
+export async function rotateEnrollmentToken(id: string, graceHours: number): Promise<EnrollmentInfo> {
+  const raw = await send<unknown>(
+    "POST",
+    `${BASE_SETTINGS}/enrollment/tokens/${encodeURIComponent(id)}/rotate`,
+    RotateEnrollmentTokenBody.parse({ graceHours }),
+  );
+  return unwrapEnrollment(raw);
+}
+
+/** POST …/tokens/:id/revoke — block NEW enrolments. Machines already enrolled on it keep running. */
+export async function revokeEnrollmentToken(id: string): Promise<EnrollmentInfo> {
+  const raw = await send<unknown>(
+    "POST",
+    `${BASE_SETTINGS}/enrollment/tokens/${encodeURIComponent(id)}/revoke`,
+  );
+  return unwrapEnrollment(raw);
+}
+
+/** POST …/tokens/:id/bake — make this the token that new boot media carry. */
+export async function bakeEnrollmentToken(id: string): Promise<EnrollmentInfo> {
+  const raw = await send<unknown>(
+    "POST",
+    `${BASE_SETTINGS}/enrollment/tokens/${encodeURIComponent(id)}/bake`,
+  );
+  return unwrapEnrollment(raw);
+}
+
+/** DELETE …/tokens/:id — forget it entirely (machines enrolled on it are untouched). */
+export async function deleteEnrollmentToken(id: string): Promise<EnrollmentInfo> {
+  const raw = await send<unknown>(
+    "DELETE",
+    `${BASE_SETTINGS}/enrollment/tokens/${encodeURIComponent(id)}`,
+  );
   return unwrapEnrollment(raw);
 }
 
@@ -164,6 +270,26 @@ export async function activateImage(arch: "arm64" | "amd64", imageId: string): P
   return ImageUpdateInfo.parse(raw);
 }
 
+/** PUT /api/v1/settings/image/rings → replace the whole staged-rollout ring list (POL-105). The
+ *  server rejects a ring whose selector does not parse or whose build the depot no longer retains. */
+export async function setImageRings(rings: ImageRing[]): Promise<ImageUpdateInfo> {
+  const body = SetImageRingsBody.parse({ rings });
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/image/rings`, body);
+  return ImageUpdateInfo.parse(raw);
+}
+
+/** POST /api/v1/settings/image/promote → activate a ring's build fleet-wide AND drop the ring, so
+ *  the canary machines and the rest of the fleet converge on one build (POL-105). */
+export async function promoteImageRing(
+  arch: "arm64" | "amd64",
+  selector: string,
+  urgent: boolean,
+): Promise<ImageUpdateInfo> {
+  const body = PromoteImageRingBody.parse({ arch, selector, urgent });
+  const raw = await send<unknown>("POST", `${BASE_SETTINGS}/image/promote`, body);
+  return ImageUpdateInfo.parse(raw);
+}
+
 /** GET /api/v1/settings/display → the current fleet-wide display settings (badge toggle) (POL-6). */
 export async function getDisplaySettings(): Promise<DisplaySettingsT> {
   const raw = await send<unknown>("GET", `${BASE_SETTINGS}/display`);
@@ -174,4 +300,16 @@ export async function getDisplaySettings(): Promise<DisplaySettingsT> {
 export async function updateDisplaySettings(showBadges: boolean): Promise<DisplaySettingsT> {
   const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/display`, { showBadges });
   return DisplaySettings.parse(raw);
+}
+
+/** GET /api/v1/settings/boot-order → the fleet's UEFI boot-order policy (POL-115). */
+export async function getBootOrderPolicy(): Promise<BootOrderPolicyT> {
+  const raw = await send<unknown>("GET", `${BASE_SETTINGS}/boot-order`);
+  return BootOrderPolicy.parse(raw);
+}
+
+/** PUT /api/v1/settings/boot-order { reassert } → the applied policy (POL-115). */
+export async function updateBootOrderPolicy(reassert: boolean): Promise<BootOrderPolicyT> {
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/boot-order`, { reassert });
+  return BootOrderPolicy.parse(raw);
 }

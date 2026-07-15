@@ -19,6 +19,7 @@ import type {
   ContentKind,
   ContentSource,
   CredentialProfileView,
+  PlacementMode,
   UpdateCredentialProfileBody,
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
@@ -50,6 +51,113 @@ function pageSubtitle(s: ContentSource): string {
 const sources = computed(() => store.sources.filter((s) => s.kind !== "playlist"));
 const profiles = computed(() => store.profiles);
 
+// ── search / filter / sort (POL-94) ───────────────────────────────────────────
+// The library grew into a pile: a flat, unsorted list with no way to find anything. All three are
+// CLIENT-side — a library is tens of rows, not thousands, and a round trip to filter a list you are
+// already holding is a worse experience than typing into it.
+
+const query = ref("");
+const kindFilter = ref<ContentKind | "all">("all");
+const sortBy = ref<"name" | "kind" | "usage">("name");
+
+/** The kinds actually present in the library — never offer a filter that can only return nothing. */
+const availableKinds = computed<ContentKind[]>(() =>
+  CONTENT_KINDS.filter((k) => sources.value.some((s) => s.kind === k)),
+);
+
+/** Total references (screens + walls + playlists + pages) — the "recently/most used" sort key. */
+function usageCount(s: ContentSource): number {
+  const u = store.statusForSource(s.id)?.usage;
+  if (!u) return 0;
+  return u.screenIds.length + u.wallIds.length + u.playlistIds.length + u.pageIds.length;
+}
+
+/** Name + address + kind, matched case-insensitively on every whitespace-separated term. */
+function matches(s: ContentSource, terms: string[]): boolean {
+  const hay = `${s.name} ${s.url ?? ""} ${kindLabel(s.kind)}`.toLowerCase();
+  return terms.every((t) => hay.includes(t));
+}
+
+const visibleSources = computed(() => {
+  const terms = query.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const filtered = sources.value.filter(
+    (s) => (kindFilter.value === "all" || s.kind === kindFilter.value) && matches(s, terms),
+  );
+  const sorted = [...filtered];
+  if (sortBy.value === "name") {
+    sorted.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sortBy.value === "kind") {
+    sorted.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+  } else {
+    // Most-used first — the sources an operator actually lives with float to the top.
+    sorted.sort((a, b) => usageCount(b) - usageCount(a) || a.name.localeCompare(b.name));
+  }
+  return sorted;
+});
+
+// ── usage + health (POL-94) ───────────────────────────────────────────────────
+
+/** "Used on 2 screens · 1 video wall" — or "Not used yet", which is itself the useful answer. */
+function usageLine(s: ContentSource): string {
+  return store.usageSummary(s.id) || "Not used yet";
+}
+
+/** The screens (by friendly name) currently reporting this source as unreachable. */
+function brokenOn(s: ContentSource): string[] {
+  const ids = store.statusForSource(s.id)?.unreachableScreenIds ?? [];
+  return ids.map((id) => store.screenById(id)?.friendlyName ?? id);
+}
+
+function healthLabel(s: ContentSource): string {
+  const health = store.healthForSource(s.id);
+  if (health === "reachable") return "loading";
+  if (health === "unreachable") return "not loading";
+  return "not checked";
+}
+
+/**
+ * What the badge means, spelled out — because a health badge that overclaims is worse than none.
+ * The player PROVES a URL fetchable before it paints it (POL-86); that is all this knows. It cannot
+ * see inside a cross-origin frame (same-origin policy), so a 500, an expired session's login page
+ * and an empty dashboard all read as "loading". Say so, in the tooltip, every time.
+ */
+function healthTitle(s: ContentSource): string {
+  const status = store.statusForSource(s.id);
+  const health = status?.health ?? "unknown";
+  const seen = status?.lastSeenAt ? ` Last reported ${timeAgo(status.lastSeenAt)}.` : "";
+  if (health === "reachable") {
+    return (
+      `The screens showing this fetched it successfully — it is loading on the glass.${seen} ` +
+      `This does not mean the page rendered what you want: a browser cannot see inside someone ` +
+      `else's page, so an error page or a signed-out dashboard also counts as "loading".`
+    );
+  }
+  if (health === "unreachable") {
+    const where = brokenOn(s);
+    const detail = status?.detail ? ` (${status.detail})` : "";
+    return (
+      `A screen showing this could not fetch it at all${detail} — ` +
+      `${where.length ? where.join(", ") : "the screen"} is showing a placeholder and retrying.${seen}`
+    );
+  }
+  return (
+    "Nobody is showing this right now, so nothing has checked it. Polyptic never probes a source " +
+    "no screen is displaying — a library of 200 links would become 200 requests an hour."
+  );
+}
+
+/** "2 min ago" / "3 h ago" — the badge's "when was this last seen" half, in the operator's terms. */
+function timeAgo(at: string): string {
+  const ms = Date.now() - Date.parse(at);
+  if (!Number.isFinite(ms) || ms < 0) return "just now";
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
 // ── modal state ──────────────────────────────────────────────────────────────
 const modalOpen = ref(false);
 const editingId = ref<string | null>(null); // null = creating
@@ -57,11 +165,20 @@ const draftName = ref("");
 const draftKind = ref<ContentKind>("web");
 const draftUrl = ref("");
 const draftProfileId = ref(""); // "" = no authentication (POL-24)
+const draftPlacement = ref<PlacementMode>("auto"); // POL-18 — display override (web/dashboard)
 const errorMsg = ref<string | null>(null);
 const saving = ref(false);
 
 /** Auth applies to browser-loaded sources; images/videos are fetched directly by the player. */
 const authPickable = computed(() => draftKind.value === "web" || draftKind.value === "dashboard");
+
+/** POL-108 — a live stream is addressed by its HLS playlist. The placeholder says so, and the hint
+ *  below the field names the RTSP seam explicitly (a restreamer sits OUTSIDE Polyptic, by design)
+ *  without naming any product: the operator picks their own. */
+const urlPlaceholder = computed(() =>
+  draftKind.value === "stream" ? "https://…/stream.m3u8" : "https://…",
+);
+const isStream = computed(() => draftKind.value === "stream");
 
 const modalTitle = computed(() => (editingId.value ? "Edit source" : "Add content source"));
 const saveLabel = computed(() => (editingId.value ? "Save changes" : "Add source"));
@@ -72,6 +189,7 @@ function openAdd() {
   draftKind.value = "web";
   draftUrl.value = "";
   draftProfileId.value = "";
+  draftPlacement.value = "auto";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -82,6 +200,7 @@ function openEdit(s: ContentSource) {
   draftKind.value = s.kind;
   draftUrl.value = s.url ?? "";
   draftProfileId.value = s.credentialProfileId ?? "";
+  draftPlacement.value = s.placementMode ?? "auto";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -100,6 +219,9 @@ async function save() {
     url: draftUrl.value.trim(),
     // Auth only rides on browser-loaded kinds; "" (None) and a non-authable kind both mean detach.
     credentialProfileId: authPickable.value && draftProfileId.value ? draftProfileId.value : null,
+    // POL-18 — the display override, web/dashboard only. "auto" travels explicitly so an edit back
+    // to auto actually clears a previously forced mode.
+    ...(authPickable.value ? { placementMode: draftPlacement.value } : {}),
   });
   if (!parsed.success) {
     errorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
@@ -118,11 +240,48 @@ async function save() {
   }
 }
 
+/**
+ * POL-94 — what deleting this source will actually break, named. The old copy said "any screen or
+ * video wall currently showing it will be cleared", which is true and useless: it never told you
+ * WHICH, and it never mentioned the playlist step or the page embed that would silently vanish.
+ * Plain text on purpose, so a dialog component can adopt it verbatim.
+ */
+function deleteConsequences(s: ContentSource): string {
+  const usage = store.statusForSource(s.id)?.usage;
+  if (!usage) return `Delete "${s.name}"?`;
+  const clauses: string[] = [];
+  const named = (ids: string[], resolve: (id: string) => string): string =>
+    ids.map(resolve).join(", ");
+  if (usage.screenIds.length) {
+    clauses.push(
+      `clear ${usage.screenIds.length === 1 ? "1 screen" : `${usage.screenIds.length} screens`} ` +
+        `(${named(usage.screenIds, (id) => store.screenById(id)?.friendlyName ?? id)})`,
+    );
+  }
+  if (usage.wallIds.length) {
+    clauses.push(
+      `clear ${usage.wallIds.length === 1 ? "1 video wall" : `${usage.wallIds.length} video walls`} ` +
+        `(${named(usage.wallIds, (id) => store.wallName(id))})`,
+    );
+  }
+  if (usage.playlistIds.length) {
+    clauses.push(
+      `remove a step from ${usage.playlistIds.length === 1 ? "1 playlist" : `${usage.playlistIds.length} playlists`} ` +
+        `(${named(usage.playlistIds, (id) => store.sourceById(id)?.name ?? id)})`,
+    );
+  }
+  if (usage.pageIds.length) {
+    clauses.push(
+      `blank an element on ${usage.pageIds.length === 1 ? "1 page" : `${usage.pageIds.length} pages`} ` +
+        `(${named(usage.pageIds, (id) => store.sourceById(id)?.name ?? id)})`,
+    );
+  }
+  if (clauses.length === 0) return `Delete "${s.name}"? It isn't used anywhere.`;
+  return `Delete "${s.name}"? This will ${clauses.join(", and ")}.`;
+}
+
 async function remove(s: ContentSource) {
-  const yes = window.confirm(
-    `Delete "${s.name}"? Any screen or video wall currently showing it will be cleared.`,
-  );
-  if (yes) await store.deleteSource(s.id);
+  if (window.confirm(deleteConsequences(s))) await store.deleteSource(s.id);
 }
 
 /** A compact, scheme-stripped address for the list row (matches the design's "address" read-out). */
@@ -130,9 +289,23 @@ function pretty(url: string | undefined): string {
   return (url ?? "").replace(/^https?:\/\//, "");
 }
 
-/** The library row's sub-line: the kind plus the compact address. */
+/** The library row's sub-line: the kind, the probed facts (POL-109), then the compact address. */
 function rowSub(s: ContentSource): string {
-  return `${kindLabel(s.kind)} · ${pretty(s.url ?? "")}`;
+  const facts = mediaFacts(s);
+  return facts
+    ? `${kindLabel(s.kind)} · ${facts} · ${pretty(s.url ?? "")}`
+    : `${kindLabel(s.kind)} · ${pretty(s.url ?? "")}`;
+}
+
+/** POL-18 — the row's framing/display read-out, or null when there is nothing worth saying. A
+ *  source that frames fine in auto mode stays quiet — the badge is for the exceptions. */
+function placementNote(s: ContentSource): string | null {
+  if (s.kind !== "web" && s.kind !== "dashboard") return null;
+  const mode = s.placementMode ?? "auto";
+  if (mode === "window") return "windowed (forced)";
+  if (mode === "iframe") return s.framing === "blocked" ? "framed (forced — blocks framing)" : null;
+  if (s.framing === "blocked") return "blocks framing → windowed";
+  return null;
 }
 
 /** The profile a source references, for the library row's auth read-out. */
@@ -357,20 +530,45 @@ async function doUpload() {
   });
   uploading.value = false;
   if (res.ok) {
+    // POL-109 — an accepted-with-a-caveat upload (nothing could be checked) says so ONCE, above the
+    // library; a REJECTED one never gets here — its message is the server's, shown in the modal.
+    notice.value = res.warning ?? null;
     uploadOpen.value = false; // the new source appears in the library via admin/state
   } else {
     uploadError.value = res.error ?? "Upload failed. Please try again.";
   }
 }
 
-/** Whether a source's `url` resolves to a directly-renderable picture (for a list thumbnail). */
-function isImage(s: ContentSource): boolean {
-  return s.kind === "image" && !!s.url;
+// ── ingest read-outs (POL-109) ────────────────────────────────────────────────
+// The library now shows what the server PROBED at upload: a real thumbnail/poster for every image and
+// video, and the facts (duration · dimensions · codec) on the row. A source with no `media` was never
+// probed (a linked URL, or a server with no toolchain) — it falls back to the kind glyph, as before.
+const notice = ref<string | null>(null);
+
+/** The picture for a row: the ingest poster/thumbnail, or (for a linked image) the image itself. */
+function thumbSrc(s: ContentSource): string | null {
+  const poster = s.media?.posterUrl;
+  if (poster) return poster;
+  return s.kind === "image" && s.url ? s.url : null;
 }
 
-/** The thumbnail address for an image row (guarded by `isImage`; typed for the template). */
-function thumbSrc(s: ContentSource): string {
-  return s.url ?? "";
+/** mm:ss for a probed duration (a 90-minute video reads 90:00, not 1:30:00 — wall content is short). */
+function fmtDuration(seconds: number): string {
+  const total = Math.round(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+/** The probed facts for a row's sub-line — only what we actually know. */
+function mediaFacts(s: ContentSource): string {
+  const m = s.media;
+  if (!m) return "";
+  const bits: string[] = [];
+  if (m.durationSeconds !== undefined) bits.push(fmtDuration(m.durationSeconds));
+  if (m.width && m.height) bits.push(`${m.width}×${m.height}`);
+  if (m.videoCodec) bits.push(m.videoCodec.toUpperCase());
+  return bits.join(" · ");
 }
 </script>
 
@@ -386,7 +584,9 @@ function thumbSrc(s: ContentSource): string {
             video wall.
           </p>
         </div>
-        <div class="head-actions">
+        <!-- POL-107: authoring the library is an OPERATOR verb. A viewer reads it and sees no
+             Upload / New page / Add / Edit / Delete — and every one of those routes 403s for it. -->
+        <div v-if="store.canAuthor" class="head-actions">
           <button class="add-btn ghost compact" @click="openUpload">⤓ Upload</button>
           <button
             class="add-btn ghost compact"
@@ -399,10 +599,61 @@ function thumbSrc(s: ContentSource): string {
         </div>
       </header>
 
+      <!-- POL-109 — an accepted-but-unchecked upload says so once, here. -->
+      <div v-if="notice" class="notice">
+        <span>⚠ {{ notice }}</span>
+        <button class="notice-x" title="Dismiss" @click="notice = null">✕</button>
+      </div>
+
+      <!-- ── search · filter · sort (POL-94) ────────────────────────────────── -->
+      <div v-if="sources.length" class="toolbar">
+        <div class="search-wrap">
+          <span class="search-glyph">⌕</span>
+          <input
+            v-model="query"
+            class="search"
+            type="search"
+            placeholder="Search by name or address…"
+            aria-label="Search content sources"
+          />
+        </div>
+        <div class="filter-row">
+          <button
+            class="filter-btn"
+            :class="{ active: kindFilter === 'all' }"
+            @click="kindFilter = 'all'"
+          >
+            All
+          </button>
+          <button
+            v-for="k in availableKinds"
+            :key="k"
+            class="filter-btn"
+            :class="{ active: kindFilter === k }"
+            @click="kindFilter = k"
+          >
+            <span :style="{ color: `var(${kindColorVar(k)})` }">{{ kindGlyph(k) }}</span>
+            {{ kindLabel(k) }}
+          </button>
+        </div>
+        <select v-model="sortBy" class="sort" aria-label="Sort content sources">
+          <option value="name">Sort: name</option>
+          <option value="kind">Sort: type</option>
+          <option value="usage">Sort: most used</option>
+        </select>
+      </div>
+
       <!-- list -->
-      <div v-if="sources.length" class="list">
-        <div v-for="c in sources" :key="c.id" class="row">
-          <img v-if="isImage(c)" class="thumb" :src="thumbSrc(c)" :alt="c.name" loading="lazy" />
+      <div v-if="visibleSources.length" class="list">
+        <div v-for="c in visibleSources" :key="c.id" class="row">
+          <img
+            v-if="thumbSrc(c)"
+            class="thumb"
+            :class="{ 'is-video': c.kind === 'video' }"
+            :src="thumbSrc(c) ?? ''"
+            :alt="c.name"
+            loading="lazy"
+          />
           <span v-else class="glyph" :style="{ color: `var(${kindColorVar(c.kind)})` }">
             {{ kindGlyph(c.kind) }}
           </span>
@@ -416,13 +667,46 @@ function thumbSrc(s: ContentSource): string {
               <template v-else>
                 {{ rowSub(c) }}
                 <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
+                <template v-if="placementNote(c)"> · ▣ {{ placementNote(c) }}</template>
               </template>
             </div>
+            <!-- POL-94 — where this source is used: an inventory, not a pile. -->
+            <div class="row-usage">{{ usageLine(c) }}</div>
           </div>
+          <!-- POL-94 — the live health badge. What it can and cannot know is in its tooltip. -->
+          <span
+            class="health-pill"
+            :class="store.healthForSource(c.id)"
+            :title="healthTitle(c)"
+          >
+            {{
+              store.healthForSource(c.id) === "reachable"
+                ? "●"
+                : store.healthForSource(c.id) === "unreachable"
+                  ? "⚠"
+                  : "○"
+            }}
+            {{ healthLabel(c) }}
+          </span>
           <span class="kind-badge">{{ kindLabel(c.kind) }}</span>
-          <button v-if="c.kind === 'page'" class="edit-btn" @click="openStudio(c)">Edit in Studio</button>
-          <button v-else class="edit-btn" @click="openEdit(c)">Edit</button>
-          <button class="del-btn" title="Delete source" @click="remove(c)">✕</button>
+          <template v-if="store.canAuthor">
+            <button v-if="c.kind === 'page'" class="edit-btn" @click="openStudio(c)">Edit in Studio</button>
+            <button v-else class="edit-btn" @click="openEdit(c)">Edit</button>
+            <button class="del-btn" title="Delete source" @click="remove(c)">✕</button>
+          </template>
+        </div>
+      </div>
+
+      <!-- nothing matched the search / filter (the library itself is not empty) -->
+      <div v-else-if="sources.length" class="empty">
+        <span class="empty-glyph">⌕</span>
+        <span class="empty-title">No sources match</span>
+        <span class="empty-sub">
+          Nothing in the library matches that search or filter. Clear them to see all
+          {{ sources.length }}.
+        </span>
+        <div class="empty-actions">
+          <button class="add-btn ghost" @click="query = ''; kindFilter = 'all'">Clear filters</button>
         </div>
       </div>
 
@@ -449,7 +733,9 @@ function thumbSrc(s: ContentSource): string {
             profile loads already authenticated.
           </p>
         </div>
-        <div class="head-actions">
+        <!-- Credential profiles hold content secrets: creating/editing/testing/deleting one is
+             ADMIN-only (the server refuses the mutations for anyone else); the redacted list is not. -->
+        <div v-if="store.isAdmin" class="head-actions">
           <button class="add-btn ghost compact" @click="openAddProfile">+ Add profile</button>
         </div>
       </header>
@@ -474,11 +760,13 @@ function thumbSrc(s: ContentSource): string {
             {{ p.tokenStatus === "ok" ? "●" : p.tokenStatus === "pending" ? "○" : "⚠" }}
             {{ statusLabel(p) }}
           </span>
-          <button class="edit-btn" :disabled="testState[p.id] === 'running'" @click="runTest(p)">
-            {{ testState[p.id] === "running" ? "Testing…" : "Test" }}
-          </button>
-          <button class="edit-btn" @click="openEditProfile(p)">Edit</button>
-          <button class="del-btn" title="Delete profile" @click="removeProfile(p)">✕</button>
+          <template v-if="store.isAdmin">
+            <button class="edit-btn" :disabled="testState[p.id] === 'running'" @click="runTest(p)">
+              {{ testState[p.id] === "running" ? "Testing…" : "Test" }}
+            </button>
+            <button class="edit-btn" @click="openEditProfile(p)">Edit</button>
+            <button class="del-btn" title="Delete profile" @click="removeProfile(p)">✕</button>
+          </template>
         </div>
       </div>
 
@@ -489,7 +777,7 @@ function thumbSrc(s: ContentSource): string {
           Showing dashboards that need a sign-in? Register a client at your identity provider, add
           its details here once, and any number of screens share the session.
         </span>
-        <div class="empty-actions">
+        <div v-if="store.isAdmin" class="empty-actions">
           <button class="add-btn ghost" @click="openAddProfile">+ Add credential profile</button>
         </div>
       </div>
@@ -526,9 +814,17 @@ function thumbSrc(s: ContentSource): string {
         <input
           v-model="draftUrl"
           class="field mono"
-          placeholder="https://…"
+          :placeholder="urlPlaceholder"
           @keyup.enter="save"
         />
+
+        <!-- POL-108 — the live-stream seam, stated plainly to the operator: HLS in, RTSP restreamed
+             outside Polyptic. No product is named; any restreamer works. -->
+        <p v-if="isStream" class="field-hint">
+          A live feed: point at an HLS playlist (<code>.m3u8</code>). The player reconnects by itself
+          if the source drops. RTSP cameras need an RTSP-to-HLS restreamer in front — Polyptic plays
+          what the restreamer publishes.
+        </p>
 
         <!-- POL-24 — the design's deferred "Authentication" picker. Web/dashboard only: images and
              videos are fetched directly by the player, not loaded as an authenticated page. -->
@@ -542,6 +838,16 @@ function thumbSrc(s: ContentSource): string {
             Protected content? Add a credential profile under Access credentials below, then pick it
             here.
           </p>
+
+          <!-- POL-18 — the display override. Auto probes the address's framing headers and falls
+               back to an agent-placed window when the site refuses to be framed; the forced modes
+               exist because header detection can never be perfect. -->
+          <label class="field-label">Display</label>
+          <select v-model="draftPlacement" class="field select">
+            <option value="auto">Auto — windowed only if the site blocks framing</option>
+            <option value="iframe">Always framed (embed in the player)</option>
+            <option value="window">Always windowed (placed by the box)</option>
+          </select>
         </template>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>
@@ -1001,7 +1307,7 @@ function thumbSrc(s: ContentSource): string {
   padding: 9px 13px;
 }
 
-/* image thumbnail in a list row (replaces the glyph badge for uploaded/linked images) */
+/* image thumbnail / video poster in a list row (replaces the glyph badge — POL-109) */
 .thumb {
   width: 34px;
   height: 34px;
@@ -1010,6 +1316,36 @@ function thumbSrc(s: ContentSource): string {
   object-fit: cover;
   background: var(--muted-bg);
   border: 1px solid var(--line);
+}
+/* a video's poster reads as film, not as a photo */
+.thumb.is-video {
+  border-color: var(--accent-line, var(--line));
+}
+
+/* POL-109 — the accepted-with-a-caveat note above the library */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--fg2);
+  background: var(--muted-bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.notice span {
+  flex: 1;
+}
+.notice-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
 }
 
 /* empty-state action pair */
@@ -1121,6 +1457,107 @@ function thumbSrc(s: ContentSource): string {
   background: var(--muted-bg);
   padding: 1px 4px;
   border-radius: 4px;
+}
+
+/* ── search · filter · sort (POL-94) ─────────────────────────────────────────── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.search-wrap {
+  position: relative;
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+.search-glyph {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 13px;
+  color: var(--muted2);
+  pointer-events: none;
+}
+.search {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 12px 8px 30px;
+  font-size: 13px;
+  color: var(--fg);
+  outline: none;
+  font-family: inherit;
+}
+.search:focus {
+  border-color: var(--accent);
+}
+.filter-row {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.filter-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.filter-btn:hover {
+  background: var(--muted-bg);
+}
+.filter-btn.active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.sort {
+  appearance: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 12px;
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* ── usage + health (POL-94) ─────────────────────────────────────────────────── */
+.row-usage {
+  font-size: 11px;
+  color: var(--muted2);
+  margin-top: 2px;
+}
+.health-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+  cursor: help;
+  color: var(--muted);
+  background: var(--muted-bg);
+}
+.health-pill.reachable {
+  color: var(--ok, #1d8a4e);
+  background: var(--ok-soft, var(--muted-bg));
+}
+.health-pill.unreachable {
+  color: var(--bad);
+  background: var(--bad-soft);
 }
 
 /* upload progress */

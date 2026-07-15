@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import type { AgentSecurityInfo, HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import { imageDistribution, OperatorRole } from "@polyptic/protocol";
+import type { AgentSecurityInfo, EnrollmentTokenView, HttpsInfo, ImageBuild, ImageRing, Operator } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
+import { ApiError } from "../api";
 import * as auth from "../auth";
 import Toggle from "../components/Toggle.vue";
 import { useConsoleStore } from "../stores/console";
@@ -19,8 +21,10 @@ onMounted(() => {
   void store.fetchEnrollment();
   void store.fetchNetboot();
   void store.fetchDisplaySettings();
+  void store.fetchBootOrderPolicy();
   void store.fetchImageUpdates();
   void loadHttps();
+  void loadOperators();
   void loadAgentSecurity();
   document.addEventListener("keydown", onKeydown);
 });
@@ -72,18 +76,145 @@ async function setBadges(show: boolean): Promise<void> {
   }
 }
 
-// ── Enrolment token ────────────────────────────────────────────────────────────
-const regenerating = ref(false);
+// ── UEFI boot order (POL-115) ──────────────────────────────────────────────────
+// Opt-in, and deliberately worded as one: the box writes a firmware boot variable. Off means a box
+// that finds its entry displaced REPORTS the drift and writes nothing.
+const bootOrderSaving = ref(false);
 
-async function regenerate(): Promise<void> {
-  if (regenerating.value) return;
-  if (!window.confirm("Regenerate the enrolment token? Machines still using the old token can no longer dial in.")) {
+async function setBootOrderReassert(reassert: boolean): Promise<void> {
+  if (bootOrderSaving.value || store.bootOrder?.reassert === reassert) return;
+  bootOrderSaving.value = true;
+  try {
+    await store.setBootOrderReassert(reassert);
+    showToast(
+      reassert
+        ? "Boxes may now re-assert their own boot order"
+        : "Boxes will only report boot-order drift",
+    );
+  } catch {
+    /* the store already reverted the optimistic value; the switch reflects the true state */
+  } finally {
+    bootOrderSaving.value = false;
+  }
+}
+
+// ── Enrolment tokens (POL-104) ─────────────────────────────────────────────────
+//
+// One flat token baked into every stick is a fleet credential: a stick that walks out compromises
+// enrolment for the whole estate, and rotating it meant re-flashing every medium. The card is now a
+// TABLE of named, scoped, individually revocable tokens. Exactly one is BAKED into new boot media.
+const busyToken = ref<string | null>(null);
+const showNewToken = ref(false);
+const newTokenName = ref("");
+const newTokenExpiryDays = ref<string>("");
+const newTokenMax = ref<string>("");
+const newTokenBake = ref(false);
+
+/** A token's state, in the operator's language. `live` is the only one that enrols anything. */
+type TokenState = "live" | "expired" | "revoked" | "used-up";
+
+function tokenState(token: EnrollmentTokenView): TokenState {
+  if (token.revokedAt) return "revoked";
+  if (token.expiresAt && Date.parse(token.expiresAt) <= Date.now()) return "expired";
+  if (token.maxEnrollments !== null && token.uses >= token.maxEnrollments) return "used-up";
+  return "live";
+}
+
+function tokenScope(token: EnrollmentTokenView): string {
+  const parts: string[] = [];
+  parts.push(
+    token.maxEnrollments === null
+      ? `${token.uses} enrolled · no limit`
+      : `${token.uses} / ${token.maxEnrollments} enrolled`,
+  );
+  if (token.expiresAt) {
+    const when = new Date(token.expiresAt);
+    parts.push(
+      when.getTime() <= Date.now()
+        ? `expired ${when.toLocaleDateString()}`
+        : `expires ${when.toLocaleDateString()}`,
+    );
+  } else {
+    parts.push("never expires");
+  }
+  return parts.join(" · ");
+}
+
+async function createToken(): Promise<void> {
+  const name = newTokenName.value.trim();
+  if (!name || busyToken.value) return;
+  busyToken.value = "new";
+  const days = Number.parseInt(newTokenExpiryDays.value, 10);
+  const max = Number.parseInt(newTokenMax.value, 10);
+  const ok = await store.createEnrollmentToken({
+    name,
+    ...(Number.isFinite(days) && days > 0 ? { expiresInDays: days } : {}),
+    ...(Number.isFinite(max) && max > 0 ? { maxEnrollments: max } : {}),
+    bake: newTokenBake.value,
+  });
+  busyToken.value = null;
+  if (!ok) {
+    showToast("Could not create the token");
     return;
   }
-  regenerating.value = true;
-  await store.regenerateEnrollment();
-  regenerating.value = false;
-  showToast("New enrolment token generated");
+  showNewToken.value = false;
+  newTokenName.value = "";
+  newTokenExpiryDays.value = "";
+  newTokenMax.value = "";
+  newTokenBake.value = false;
+  showToast(`Token "${name}" created`);
+}
+
+async function rotateToken(token: EnrollmentTokenView): Promise<void> {
+  if (busyToken.value) return;
+  const yes = window.confirm(
+    `Rotate "${token.name}"?\n\nA new secret is cut and baked into future boot media. The OLD secret keeps ` +
+      `enrolling for 24 more hours (the grace window), so boots in flight and media not yet re-flashed are ` +
+      `not stranded. Re-bake your boot media before the window closes.`,
+  );
+  if (!yes) return;
+  busyToken.value = token.id;
+  const ok = await store.rotateEnrollmentToken(token.id, 24);
+  busyToken.value = null;
+  showToast(ok ? "Token rotated — old secret valid for 24 h" : "Could not rotate the token");
+}
+
+async function revokeToken(token: EnrollmentTokenView): Promise<void> {
+  if (busyToken.value) return;
+  const yes = window.confirm(
+    `Revoke "${token.name}"?\n\nNo NEW machine can enrol with it — including a box booting from a stick that ` +
+      `carries it. The ${token.uses} machine(s) already enrolled on it hold their own per-machine credential ` +
+      `and KEEP RUNNING; to take one of those off the wall, reject it in Machines.`,
+  );
+  if (!yes) return;
+  busyToken.value = token.id;
+  const ok = await store.revokeEnrollmentToken(token.id);
+  busyToken.value = null;
+  showToast(ok ? `"${token.name}" revoked — running machines untouched` : "Could not revoke the token");
+}
+
+async function bakeToken(token: EnrollmentTokenView): Promise<void> {
+  if (busyToken.value) return;
+  busyToken.value = token.id;
+  const ok = await store.bakeEnrollmentToken(token.id);
+  busyToken.value = null;
+  showToast(ok ? `New boot media will carry "${token.name}"` : "Could not select the token");
+}
+
+async function deleteToken(token: EnrollmentTokenView): Promise<void> {
+  if (busyToken.value) return;
+  const last = store.enrollmentTokens.length === 1;
+  const yes = window.confirm(
+    last
+      ? `Delete the LAST enrolment token?\n\nEnrolment goes back to OPEN mode: every agent that connects is ` +
+          `auto-registered and auto-approved, with no token at all.`
+      : `Delete "${token.name}"? Machines already enrolled on it keep running.`,
+  );
+  if (!yes) return;
+  busyToken.value = token.id;
+  const ok = await store.deleteEnrollmentToken(token.id);
+  busyToken.value = null;
+  showToast(ok ? "Token deleted" : "Could not delete the token");
 }
 
 // ── HTTPS (POL-70/D89) ─────────────────────────────────────────────────────────
@@ -321,6 +452,102 @@ async function activate(build: ImageBuild): Promise<void> {
   }
 }
 
+// ── Staged roll-outs + the version distribution (POL-105) ──────────────────────
+//
+// The distribution is computed from the LIVE admin state (`store.machines`, pushed over the WS on
+// every change) joined against the depot's retained builds — so "which boxes are on which build"
+// updates itself as boxes come back on a new image, with no polling and no second source of truth.
+// `imageDistribution` is the shared protocol function; the server's tests pin the same one.
+
+const distribution = computed(() =>
+  imageDistribution(store.machines, store.imageUpdates?.builds ?? []),
+);
+
+/** The roll-out rings, indexed by the build they pin — the build rows render their own canary state. */
+const ringsByBuild = computed(() => {
+  const map = new Map<string, ImageRing[]>();
+  for (const ring of store.imageUpdates?.rings ?? []) {
+    const key = `${ring.arch}-${ring.imageId}`;
+    map.set(key, [...(map.get(key) ?? []), ring]);
+  }
+  return map;
+});
+
+const ringBusy = ref(false);
+
+async function saveRings(rings: ImageRing[], message: string): Promise<void> {
+  if (ringBusy.value) return;
+  ringBusy.value = true;
+  try {
+    store.imageUpdates = await auth.setImageRings(rings);
+    showToast(message);
+  } catch (err) {
+    console.error("[console] rings update failed", err);
+    showToast(err instanceof Error ? err.message : "Could not save the roll-out rings");
+  } finally {
+    ringBusy.value = false;
+  }
+}
+
+/** Pin a build to a tag: every machine carrying that tag boots THIS build, the rest of the fleet
+ *  stays on the active one. The tag is POL-103's — the same chips the Machines view edits. */
+async function canary(build: ImageBuild): Promise<void> {
+  rowMenu.value = null;
+  const raw = window.prompt(
+    `Which tag should boot ${formatImageId(build.imageId)} (${build.arch})?\n\nMachines carrying this tag boot this build; every other machine stays on the fleet build. Tag machines in the Machines view.`,
+    "canary",
+  );
+  if (raw === null) return;
+  const tag = raw.trim().toLowerCase();
+  if (!tag) return;
+
+  const selector = `tag=${tag}`;
+  const urgent = window.confirm(
+    `Reboot the ${selector} machines into this build within minutes?\n\nOK = now (splayed). Cancel = they take it in the nightly window.`,
+  );
+  const rings = (store.imageUpdates?.rings ?? []).filter(
+    (r) => !(r.arch === build.arch && r.selector === selector),
+  );
+  await saveRings(
+    [...rings, { selector, arch: build.arch, imageId: build.imageId, urgent }],
+    `${selector} → ${build.arch} · ${build.imageId.split("-").pop()}`,
+  );
+}
+
+/** Drop a ring: its machines rejoin the fleet build on their next poll. */
+async function dropRing(ring: ImageRing): Promise<void> {
+  rowMenu.value = null;
+  if (!window.confirm(`Stop pinning ${ring.selector} to this build? Those machines rejoin the fleet build.`)) return;
+  await saveRings(
+    (store.imageUpdates?.rings ?? []).filter((r) => r !== ring),
+    `${ring.selector} rejoins the fleet build`,
+  );
+}
+
+/** Promote a canary to the whole fleet: activate its build AND drop the ring, in one action. */
+async function promote(ring: ImageRing): Promise<void> {
+  rowMenu.value = null;
+  if (ringBusy.value) return;
+  if (
+    !window.confirm(
+      `Promote ${formatImageId(ring.imageId)} (${ring.arch}) from ${ring.selector} to the WHOLE fleet?\n\nEvery box on another image reboots into it, and ${ring.selector} stops being a canary.`,
+    )
+  ) {
+    return;
+  }
+  const urgent = window.confirm("Roll it out within minutes?\n\nOK = now (splayed). Cancel = the nightly window.");
+  ringBusy.value = true;
+  try {
+    store.imageUpdates = await auth.promoteImageRing(ring.arch, ring.selector, urgent);
+    showToast(`Promoted ${ring.arch} · ${ring.imageId.split("-").pop()} to the fleet`);
+  } catch (err) {
+    console.error("[console] promote failed", err);
+    showToast("Could not promote that build");
+  } finally {
+    ringBusy.value = false;
+  }
+}
+
 // ── Update schedule (POL-41 nightly refresh + POL-43 weekly full rebuild) ───────
 const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
@@ -352,6 +579,97 @@ function saveTime(value: string, field: "scheduleTime" | "fullScheduleTime"): vo
 
 function goToOnboard(): void {
   document.getElementById("sec-netboot")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// ── Operators (POL-107) ────────────────────────────────────────────────────────
+// Admin-only. The card is hidden for other roles, and the SERVER refuses every one of these calls
+// with a 403 for them anyway — the hiding is a courtesy, the 403 is the permission system.
+const operators = ref<Operator[]>([]);
+const opsError = ref<string | null>(null);
+const opsBusy = ref<string | null>(null);
+const opsCreating = ref(false);
+const newOp = reactive<{ email: string; password: string; role: OperatorRole }>({
+  email: "",
+  password: "",
+  role: "operator",
+});
+
+async function loadOperators(): Promise<void> {
+  if (!store.isAdmin) return;
+  try {
+    operators.value = await auth.listOperators();
+  } catch {
+    // A non-admin never gets here (the card is hidden); a transport failure just leaves the list empty.
+    operators.value = [];
+  }
+}
+
+async function onCreateOperator(): Promise<void> {
+  if (opsCreating.value) return;
+  opsError.value = null;
+  if (!newOp.email.includes("@")) {
+    opsError.value = "Enter a valid email address.";
+    return;
+  }
+  if (newOp.password.length < 8) {
+    opsError.value = "The password must be at least 8 characters.";
+    return;
+  }
+  opsCreating.value = true;
+  try {
+    await auth.createOperator({ email: newOp.email, password: newOp.password, role: newOp.role });
+    newOp.email = "";
+    newOp.password = "";
+    newOp.role = "operator";
+    await loadOperators();
+    showToast("Operator added");
+  } catch (err) {
+    opsError.value =
+      err instanceof ApiError && err.status === 409
+        ? "An operator with that email already exists."
+        : "Could not add that operator.";
+  } finally {
+    opsCreating.value = false;
+  }
+}
+
+async function onRoleChange(op: Operator, raw: string): Promise<void> {
+  const parsed = OperatorRole.safeParse(raw);
+  if (!parsed.success || parsed.data === op.role) return;
+  opsError.value = null;
+  opsBusy.value = op.id;
+  try {
+    await auth.updateOperator(op.id, { role: parsed.data });
+    await loadOperators();
+    showToast(`${op.email} is now ${parsed.data}`);
+  } catch (err) {
+    // 409 = the last-admin guard. Reload so the <select> snaps back to the truth on the server.
+    opsError.value =
+      err instanceof ApiError && err.status === 409
+        ? "That change would leave the deployment with no admin."
+        : "Could not change that role.";
+    await loadOperators();
+  } finally {
+    opsBusy.value = null;
+  }
+}
+
+async function onRemoveOperator(op: Operator): Promise<void> {
+  if (!window.confirm(`Remove ${op.email}? Their sessions end immediately.`)) return;
+  opsError.value = null;
+  opsBusy.value = op.id;
+  try {
+    await auth.deleteOperator(op.id);
+    await loadOperators();
+    showToast("Operator removed");
+  } catch (err) {
+    opsError.value =
+      err instanceof ApiError && err.status === 409
+        ? "The last admin cannot be removed."
+        : "Could not remove that operator.";
+  } finally {
+    opsBusy.value = null;
+  }
 }
 
 // ── Change password ────────────────────────────────────────────────────────────
@@ -391,6 +709,9 @@ async function onChangePassword(): Promise<void> {
   }
 }
 
+/** The signed-in operator's role, title-cased for the Account card ("Admin" / "Operator" / "Viewer"). */
+const roleLabel = computed(() => store.role.charAt(0).toUpperCase() + store.role.slice(1));
+
 // ── Logout ─────────────────────────────────────────────────────────────────────
 const loggingOut = ref(false);
 async function onSignOut(): Promise<void> {
@@ -424,7 +745,9 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- Onboard Screens (POL-33 netboot + POL-45 builds) --------------------- -->
-      <section id="sec-netboot" class="card pad-lg">
+      <!-- POL-107: the fleet cards below are ADMIN-only. The server 403s every route behind them
+           (deny-by-default in roles.ts), so hiding them is honesty, not security. -->
+      <section v-if="store.isAdmin" id="sec-netboot" class="card pad-lg">
         <div class="title-row">
           <h2 class="card-title">Onboard Screens</h2>
           <div class="spacer" />
@@ -621,6 +944,17 @@ async function onSignOut(): Promise<void> {
               <span class="tag tag-muted">Superseded</span>
             </template>
 
+            <!-- POL-105 — the roll-out rings pinned to this build: `tag=canary` boots THIS build
+                 while the fleet stays on the active one. -->
+            <span
+              v-for="ring in ringsByBuild.get(rowKey(b)) ?? []"
+              :key="ring.selector"
+              class="tag tag-ring"
+              :title="`Machines matching ${ring.selector} boot this build${ring.urgent ? ' — within minutes' : ' — in the nightly window'}`"
+            >
+              {{ ring.selector }}{{ ring.urgent ? " · now" : "" }}
+            </span>
+
             <!-- The active build has nothing to activate, so its single action stays a plain icon.
                  Every other row folds Download + Activate into an overflow menu. -->
             <template v-if="b.active">
@@ -691,6 +1025,43 @@ async function onSignOut(): Promise<void> {
                       <span class="menu-sub">Serve this build to the fleet.</span>
                     </span>
                   </button>
+
+                  <!-- POL-105 — the staged roll-out. A ring pins this build to the machines a tag
+                       matches; promoting it makes it the fleet's build and retires the ring. -->
+                  <div class="menu-sep"></div>
+                  <button type="button" class="menu-item" :disabled="ringBusy" @click="canary(b)">
+                    <svg
+                      width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                      stroke-linecap="round" stroke-linejoin="round" class="menu-icon"
+                    >
+                      <path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82Z" />
+                      <circle cx="7" cy="7" r="1.2" fill="currentColor" />
+                    </svg>
+                    <span class="menu-text">
+                      <span class="menu-title">Canary this build to a tag…</span>
+                      <span class="menu-sub">Only tagged machines boot it. The fleet stays put.</span>
+                    </span>
+                  </button>
+                  <template v-for="ring in ringsByBuild.get(rowKey(b)) ?? []" :key="ring.selector">
+                    <button type="button" class="menu-item" :disabled="ringBusy" @click="promote(ring)">
+                      <svg
+                        width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                        stroke-linecap="round" stroke-linejoin="round" class="menu-icon"
+                      >
+                        <path d="M12 19V5" /><path d="m5 12 7-7 7 7" />
+                      </svg>
+                      <span class="menu-text">
+                        <span class="menu-title">Promote {{ ring.selector }} to the whole fleet</span>
+                        <span class="menu-sub">Serve it to everyone and retire the canary.</span>
+                      </span>
+                    </button>
+                    <button type="button" class="menu-item danger" :disabled="ringBusy" @click="dropRing(ring)">
+                      <span class="menu-text">
+                        <span class="menu-title">Stop the {{ ring.selector }} canary</span>
+                        <span class="menu-sub">Those machines rejoin the fleet build.</span>
+                      </span>
+                    </button>
+                  </template>
                 </div>
               </template>
             </div>
@@ -699,6 +1070,57 @@ async function onSignOut(): Promise<void> {
         <p v-else class="hint">
           No builds retained yet — the depot fills as images are built. Run a build from the ⋯ menu, or with
           <code class="code">deploy/build-live-image.sh</code>.
+        </p>
+
+        <!-- What the fleet is ACTUALLY running (POL-105) ------------------------ -->
+        <!-- Live: every box reports the image id it booted on hello + every heartbeat, and the
+             control plane persists it — so an OFFLINE box still shows the build it is stuck on,
+             which is exactly the box a roll-out has stranded. -->
+        <div class="field-label field-label-spaced">Fleet versions</div>
+        <div v-if="distribution.length > 0" class="versions">
+          <div
+            v-for="bucket in distribution"
+            :key="bucket.imageId ?? 'unknown'"
+            class="version-row"
+            :class="{ active: bucket.active, stale: bucket.imageId !== null && !bucket.active, unknown: bucket.imageId === null }"
+          >
+            <div class="version-head">
+              <span class="build-id">
+                {{ bucket.imageId ? formatImageId(bucket.imageId) : "Not reported" }}
+              </span>
+              <span v-if="bucket.arch" class="arch">{{ bucket.arch }}</span>
+              <span v-if="bucket.active" class="tag tag-accent">Fleet build</span>
+              <span
+                v-else-if="bucket.imageId && !bucket.retained"
+                class="tag tag-muted"
+                title="The depot no longer has this build — these boxes are running something it cannot re-serve."
+              >
+                Pruned
+              </span>
+              <span v-else-if="bucket.imageId" class="tag tag-muted">Superseded</span>
+              <span class="version-count">
+                {{ bucket.machines.length }} {{ bucket.machines.length === 1 ? "machine" : "machines" }}
+              </span>
+            </div>
+            <div class="version-machines">
+              <span
+                v-for="m in bucket.machines"
+                :key="m.id"
+                class="chip-machine"
+                :class="{ offline: !m.online }"
+                :title="
+                  m.online
+                    ? `${m.label} — online${m.tags.length ? `, tagged ${m.tags.join(', ')}` : ''}`
+                    : `${m.label} — offline; this is the last build it reported`
+                "
+              >
+                {{ m.label }}<span v-if="m.tags.length" class="chip-machine-tags">{{ m.tags.join(" · ") }}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+        <p v-else class="hint">
+          No machines have reported an image yet — a box reports the build it booted when its agent connects.
         </p>
         <!-- Boot without a USB stick (secondary) -------------------------------- -->
         <button type="button" class="disclosure" :class="{ open: advOpen }" @click="advOpen = !advOpen">
@@ -733,7 +1155,7 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- On-screen badges ----------------------------------------------------- -->
-      <section class="card">
+      <section v-if="store.isAdmin" class="card">
         <div class="card-head">
           <div class="min-w-0">
             <h2 class="card-title">On-screen badges</h2>
@@ -756,39 +1178,157 @@ async function onSignOut(): Promise<void> {
         </div>
       </section>
 
-      <!-- Enrolment token ------------------------------------------------------ -->
+      <!-- UEFI boot order (POL-115) --------------------------------------------- -->
       <section class="card">
-        <h2 class="card-title">Enrolment token</h2>
-        <p class="card-sub gap">The shared secret new machines present when they dial in.</p>
+        <div class="card-head">
+          <div class="min-w-0">
+            <h2 class="card-title">Boot order</h2>
+            <p class="card-sub wrap">
+              Firmware re-prepends its own OS after updates and reflashes, and the box quietly boots the
+              wrong thing on its next power-on. Every box watches its own UEFI boot order and reports
+              drift here. It only puts itself back at the front if you let it.
+            </p>
+          </div>
+          <Toggle
+            label="Re-assert boot order"
+            :model-value="store.bootOrder?.reassert ?? false"
+            :disabled="bootOrderSaving || store.bootOrder === null"
+            @update:model-value="setBootOrderReassert"
+          />
+        </div>
+        <p class="hint">
+          {{
+            store.bootOrder?.reassert
+              ? "Boxes put their own UEFI entry back at the head of the boot order, keep every other entry, and report what the firmware accepted."
+              : "Report only — no box writes a firmware boot variable. Drift shows up in Live Activity."
+          }}
+        </p>
+      </section>
+
+      <!-- Enrolment tokens (POL-104) — admin-only (POL-107) ---------------------- -->
+      <section v-if="store.isAdmin" class="card">
+        <h2 class="card-title">Enrolment tokens</h2>
+        <p class="card-sub gap">
+          The secrets a new machine presents when it first dials in. Cut one per batch or site, scope it with an
+          expiry and a cap, and revoke it on its own — a lost stick then costs you one batch, not the estate.
+        </p>
 
         <div v-if="store.enrollment === null" class="hint">Loading…</div>
 
-        <div v-else-if="store.enrollmentOpen" class="open-note">
-          <span class="badge-ok">Open mode</span>
-          <span>
-            Any agent that connects is auto-registered — no token required. Set an enrolment secret on the server to
-            gate access.
-          </span>
-        </div>
+        <template v-else-if="store.enrollmentOpen">
+          <div class="open-note">
+            <span class="badge-ok">Open mode</span>
+            <span>
+              Any agent that connects is auto-registered <em>and auto-approved</em> — no token, no approval. Fine on a
+              dev box, never on a real fleet.
+            </span>
+          </div>
+          <button type="button" class="btn-ghost-sm gap-sm" :disabled="busyToken === 'new'" @click="showNewToken = true">
+            Gate enrolment — create a token
+          </button>
+        </template>
 
         <template v-else>
-          <div class="field-row">
-            <code class="mono-field">{{ store.enrollmentToken }}</code>
-            <button type="button" class="btn-ghost-sm" @click="copy(store.enrollmentToken ?? '', 'Enrolment token copied')">
-              Copy
-            </button>
-            <button type="button" class="btn-ghost-sm" :disabled="regenerating" @click="regenerate">
-              {{ regenerating ? "Regenerating…" : "Regenerate" }}
-            </button>
-          </div>
-          <p class="hint gap-sm">Regenerating revokes access for machines that haven't dialled in yet.</p>
+          <ul class="token-list">
+            <li v-for="token in store.enrollmentTokens" :key="token.id" class="token" :class="tokenState(token)">
+              <div class="token-head">
+                <span class="token-name">{{ token.name }}</span>
+                <span v-if="token.bake" class="chip chip-bake" title="Baked into /boot/grub.cfg and the next boot medium">
+                  On new media
+                </span>
+                <span v-if="token.legacy" class="chip" title="The original bootstrap token, carried by every medium already flashed">
+                  Original
+                </span>
+                <span class="chip" :class="`chip-${tokenState(token)}`">
+                  {{
+                    tokenState(token) === "live"
+                      ? "Live"
+                      : tokenState(token) === "revoked"
+                        ? "Revoked"
+                        : tokenState(token) === "expired"
+                          ? "Expired"
+                          : "Used up"
+                  }}
+                </span>
+              </div>
+              <div class="token-secret">
+                <code class="mono-field">{{ token.secret }}</code>
+                <button type="button" class="btn-ghost-sm" @click="copy(token.secret, 'Token copied')">Copy</button>
+              </div>
+              <p class="hint">{{ tokenScope(token) }}</p>
+              <div class="token-actions">
+                <button
+                  v-if="!token.bake && tokenState(token) === 'live'"
+                  type="button"
+                  class="btn-ghost-sm"
+                  :disabled="busyToken !== null"
+                  @click="bakeToken(token)"
+                >
+                  Bake into new media
+                </button>
+                <button
+                  v-if="tokenState(token) !== 'revoked'"
+                  type="button"
+                  class="btn-ghost-sm"
+                  :disabled="busyToken !== null"
+                  @click="rotateToken(token)"
+                >
+                  Rotate
+                </button>
+                <button
+                  v-if="tokenState(token) !== 'revoked'"
+                  type="button"
+                  class="btn-ghost-sm danger"
+                  :disabled="busyToken !== null"
+                  @click="revokeToken(token)"
+                >
+                  Revoke
+                </button>
+                <button type="button" class="btn-ghost-sm danger" :disabled="busyToken !== null" @click="deleteToken(token)">
+                  Delete
+                </button>
+              </div>
+            </li>
+          </ul>
+
+          <p class="hint gap-sm">
+            Revoking blocks NEW enrolments only — a machine that already enrolled holds its own per-machine credential
+            and keeps running. Rotating leaves the old secret alive for 24 hours, so media already flashed (and boots in
+            flight) still land; re-bake your boot medium inside that window.
+          </p>
+
+          <button type="button" class="btn-ghost-sm gap-sm" @click="showNewToken = !showNewToken">
+            {{ showNewToken ? "Cancel" : "New token" }}
+          </button>
         </template>
+
+        <form v-if="showNewToken" class="token-form" @submit.prevent="createToken">
+          <label class="token-field">
+            <span>Name</span>
+            <input v-model="newTokenName" type="text" placeholder="Floor 3 rollout" required />
+          </label>
+          <label class="token-field">
+            <span>Expires in (days)</span>
+            <input v-model="newTokenExpiryDays" type="number" min="1" placeholder="never" />
+          </label>
+          <label class="token-field">
+            <span>Max machines</span>
+            <input v-model="newTokenMax" type="number" min="1" placeholder="unlimited" />
+          </label>
+          <label class="token-check">
+            <input v-model="newTokenBake" type="checkbox" />
+            <span>Bake into new boot media</span>
+          </label>
+          <button type="submit" class="btn-ghost-sm" :disabled="busyToken === 'new' || !newTokenName.trim()">
+            {{ busyToken === "new" ? "Creating…" : "Create token" }}
+          </button>
+        </form>
       </section>
 
       <!-- HTTPS (POL-70/D89) ----------------------------------------------------- -->
       <!-- Rendered only when THIS listener terminates TLS; behind a TLS-terminating ingress the
            server sees plain HTTP and the certificate story belongs to the ingress/cert-manager. -->
-      <section v-if="https && https.mode !== 'off'" class="card">
+      <section v-if="store.isAdmin && https && https.mode !== 'off'" class="card">
         <h2 class="card-title">HTTPS</h2>
 
         <template v-if="https.mode === 'provided'">
@@ -901,7 +1441,7 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- Update schedule ------------------------------------------------------ -->
-      <section id="sec-image" class="card pad-lg">
+      <section v-if="store.isAdmin" id="sec-image" class="card pad-lg">
         <h2 class="card-title">Update schedule</h2>
         <p class="card-sub wrap gap">
           When the live image is refreshed. A nightly in-place refresh picks up userspace fixes; a weekly full rebuild
@@ -996,6 +1536,84 @@ async function onSignOut(): Promise<void> {
         </template>
       </section>
 
+      <!-- Operators (POL-107) --------------------------------------------------- -->
+      <!-- ADMIN-only, and the server agrees: /api/v1/operators** is admin-by-deny-default. -->
+      <section v-if="store.isAdmin" id="sec-operators" class="card">
+        <h2 class="card-title">Operators</h2>
+        <p class="card-sub gap">
+          Who can sign in, and what they may do.
+          <strong>Admin</strong> runs the fleet (machines, enrolment, image builds, settings).
+          <strong>Operator</strong> authors content and layout. <strong>Viewer</strong> reads the
+          console and can recall a saved scene — nothing else.
+        </p>
+
+        <div v-if="opsError" class="callout callout-bad"><span class="callout-icon">⚠</span>{{ opsError }}</div>
+
+        <table class="ops-table">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Role</th>
+              <th class="right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="op in operators" :key="op.id">
+              <td class="ops-email">
+                {{ op.email }}
+                <span v-if="op.id === store.currentUser?.id" class="ops-you">you</span>
+              </td>
+              <td>
+                <select
+                  class="input ops-role"
+                  :value="op.role"
+                  :disabled="opsBusy === op.id || op.id === store.currentUser?.id"
+                  :title="op.id === store.currentUser?.id ? 'You cannot change your own role' : ''"
+                  @change="onRoleChange(op, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="admin">Admin</option>
+                  <option value="operator">Operator</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+              </td>
+              <td class="right">
+                <button
+                  type="button"
+                  class="btn-ghost-sm"
+                  :disabled="opsBusy === op.id || op.id === store.currentUser?.id"
+                  :title="op.id === store.currentUser?.id ? 'You cannot remove your own account' : ''"
+                  @click="onRemoveOperator(op)"
+                >
+                  Remove
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="ops-new">
+          <div>
+            <label class="field-label" for="op-email">Email</label>
+            <input id="op-email" v-model="newOp.email" class="input" type="email" autocomplete="off" :disabled="opsCreating" />
+          </div>
+          <div>
+            <label class="field-label" for="op-password">Password</label>
+            <input id="op-password" v-model="newOp.password" class="input" type="password" autocomplete="new-password" :disabled="opsCreating" />
+          </div>
+          <div>
+            <label class="field-label" for="op-role">Role</label>
+            <select id="op-role" v-model="newOp.role" class="input" :disabled="opsCreating">
+              <option value="admin">Admin</option>
+              <option value="operator">Operator</option>
+              <option value="viewer">Viewer</option>
+            </select>
+          </div>
+          <button type="button" class="btn btn-primary" :disabled="opsCreating" @click="onCreateOperator">
+            {{ opsCreating ? "Adding…" : "Add operator" }}
+          </button>
+        </div>
+      </section>
+
       <!-- Change password ------------------------------------------------------ -->
       <section id="sec-security" class="card">
         <h2 class="card-title">Change password</h2>
@@ -1039,7 +1657,7 @@ async function onSignOut(): Promise<void> {
         <div class="account">
           <div class="avatar">{{ store.accountInitials }}</div>
           <div class="min-w-0 who">
-            <div class="who-name">Operator</div>
+            <div class="who-name">{{ roleLabel }}</div>
             <div class="who-email">{{ store.currentEmail || "—" }}</div>
           </div>
           <button type="button" class="btn-ghost-sm" :disabled="loggingOut" @click="onSignOut">
@@ -1562,6 +2180,71 @@ async function onSignOut(): Promise<void> {
   color: var(--muted);
   background: var(--muted-bg);
 }
+.tag-accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ── POL-105: roll-out rings + the fleet's version distribution ───────────────── */
+.tag-ring {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--line);
+}
+.versions {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  overflow: hidden;
+}
+.version-row {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 14px;
+}
+.version-row + .version-row {
+  border-top: 1px solid var(--line);
+}
+.version-row.active {
+  background: var(--accent-soft);
+}
+.version-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.version-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted2);
+}
+.version-machines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip-machine {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: var(--muted-bg);
+  color: var(--fg2);
+}
+/* An offline box is the point of this view, not a footnote: it is the box a roll-out stranded. */
+.chip-machine.offline {
+  color: var(--muted2);
+  border-style: dashed;
+}
+.chip-machine-tags {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--muted);
+}
 .row-btn {
   display: flex;
   align-items: center;
@@ -1666,6 +2349,11 @@ async function onSignOut(): Promise<void> {
   color: var(--muted);
   margin-bottom: 10px;
 }
+/* A label that follows a bordered list (POL-105's Fleet versions, under Recent builds) needs the
+   breathing room the card's own stack does not give it. */
+.field-label-spaced {
+  margin-top: 20px;
+}
 .mono-field {
   flex: 1;
   min-width: 0;
@@ -1760,6 +2448,104 @@ async function onSignOut(): Promise<void> {
   font-size: 12.5px;
   color: var(--muted);
   line-height: 1.5;
+}
+
+/* ── Enrolment tokens (POL-104) ────────────────────────────────────────────── */
+.token-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.token {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 12px 14px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.token.revoked,
+.token.expired,
+.token.used-up {
+  opacity: 0.72;
+}
+.token-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.token-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.token-secret {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.token-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.btn-ghost-sm.danger {
+  color: var(--bad);
+}
+.chip-live {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+.chip-revoked,
+.chip-expired,
+.chip-used-up {
+  color: var(--bad);
+  background: var(--bad-soft);
+}
+.chip-bake {
+  color: var(--accent-fg);
+  background: var(--accent-soft);
+}
+.token-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.token-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.token-field input {
+  font: inherit;
+  font-weight: 400;
+  font-size: 12.5px;
+  color: var(--fg2);
+  background: var(--muted-bg);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 10px;
+  min-width: 130px;
+}
+.token-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  padding-bottom: 9px;
 }
 
 /* ── Badges ────────────────────────────────────────────────────────────────── */
@@ -1963,6 +2749,64 @@ async function onSignOut(): Promise<void> {
 .pw-grid .field-label {
   color: var(--fg2);
   margin-bottom: 6px;
+}
+
+/* ── Operators (POL-107) ───────────────────────────────────────────────────── */
+.ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 18px;
+}
+.ops-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+.ops-table td {
+  padding: 10px 10px 10px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+  font-size: 13px;
+}
+.ops-table th.right,
+.ops-table td.right {
+  text-align: right;
+  padding-right: 0;
+}
+.ops-email {
+  font-weight: 500;
+}
+.ops-you {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.ops-role {
+  min-width: 130px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.ops-new {
+  display: grid;
+  grid-template-columns: 1.6fr 1.2fr 1fr auto;
+  gap: 12px;
+  align-items: end;
+}
+@media (max-width: 720px) {
+  .ops-new {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ── Account ───────────────────────────────────────────────────────────────── */

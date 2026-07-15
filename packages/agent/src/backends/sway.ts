@@ -24,20 +24,25 @@
  */
 import type { ChildProcess } from "node:child_process";
 import { hostname as osHostname } from "node:os";
-import type { KioskBrowser } from "@polyptic/protocol";
+import type { KioskBrowser, PanelPowerMethod, PowerCapabilities, WindowPlacement } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
+import { PanelPower, swayDpmsArgs } from "./power";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
 import { buildSurfArgs, matchesSurfWindow, prelaunchSurf, resolveSurf } from "./surf";
 import {
   DEVTOOLS_PORT_BASE,
   buildChromeArgs,
+  buildChromeWindowArgs,
   matchesChromeWindow,
   prelaunchChrome,
+  prelaunchChromeWindow,
   resolveChrome,
   selectKioskBrowser,
 } from "./chrome";
 import { browserProbesFrom, SupervisedBrowser, SupervisedProcess, killStaleByToken } from "./supervise";
 import type { LaunchTarget } from "./supervise";
+import { regionToOutputRect } from "../windows";
+import type { OutputRect } from "../windows";
 import {
   CAST_PORT_BASE,
   CAST_PORT_STRIDE,
@@ -253,6 +258,18 @@ export class SwayBackend implements DisplayBackend {
   /** connector → supervised kiosk browser. */
   private readonly browsers = new Map<string, SupervisedBrowser>();
 
+  /** POL-18 — window id → its supervised second browser (the placed web-window). */
+  private readonly windows = new Map<string, SupervisedBrowser>();
+  /** POL-18 — window id → the LATEST placement spec; the launch fn reads it so a respawn after a
+   *  crash comes back at the current geometry, not the one it was first launched with. */
+  private readonly windowSpecs = new Map<
+    string,
+    { connector: string; window: WindowPlacement }
+  >();
+  /** POL-18 — window id → the sway container id its window was placed as (re-position without a
+   *  relaunch when only geometry changed). Cleared on relaunch. */
+  private readonly windowConIds = new Map<string, number>();
+
   /** Latched once `grim` is found missing, so we log the remediation hint once and then skip. */
   private captureUnavailable = false;
   /** Which browser this box drives (chrome | surf), resolved once via selectKioskBrowser. */
@@ -277,6 +294,21 @@ export class SwayBackend implements DisplayBackend {
   private castSession: ((connector: string, active: boolean) => void) | null = null;
   /** POL-136 — the agent's PIN listener: told the PIN a pairing sender must type (null = clear). */
   private castPin: ((connector: string, pin: string | null) => void) | null = null;
+
+  /** POL-101 — DPMS via sway IPC, plus CEC if this box has an adapter. The browser is NOT torn down
+   *  when a panel sleeps, which is what makes the wake instant and content-preserving. */
+  private readonly power = new PanelPower(async (connector, on) => {
+    await requireSwaymsg();
+    const output = await this.resolveConnector(connector);
+    const res = await run("swaymsg", swayDpmsArgs(output, on));
+    if (res.code !== 0) {
+      throw new Error(
+        `swaymsg output ${output} dpms ${on ? "on" : "off"} failed: ` +
+          `${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
+    this.log(`panel ${on ? "woken" : "slept"} on ${output} (dpms ${on ? "on" : "off"})`);
+  });
 
   private log(msg: string): void {
     console.log(`[${ts()}] [sway] ${msg}`);
@@ -559,6 +591,162 @@ export class SwayBackend implements DisplayBackend {
     this.log(`hideScreen(${connector}): torn down`);
   }
 
+  // ── Web-windows (POL-18) ─────────────────────────────────────────────────────
+  //
+  // A `placement: "window"` surface is a SECOND, supervised kiosk browser window floated over the
+  // player at the surface's region. Same launch/supervise machinery as the per-output player
+  // browser (SupervisedBrowser + the pre-spawn sway window subscription); the only new mechanics
+  // are the floating placement (`floating enable` + `resize set` + `move absolute position` —
+  // Wayland clients cannot self-position, so sway does it, exactly like the player's own
+  // move-to-output) and the canvas → output pixel scale (../windows.ts).
+
+  /** Output name → its mode + position in sway's global coordinate space (POL-18 placement). */
+  private async getOutputRects(): Promise<Map<string, OutputRect>> {
+    const res = await run("swaymsg", ["-r", "-t", "get_outputs"]);
+    if (res.code !== 0) {
+      throw new Error(`swaymsg -t get_outputs failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(res.stdout);
+    } catch {
+      throw new Error("could not parse swaymsg get_outputs JSON");
+    }
+    const rects = new Map<string, OutputRect>();
+    if (!Array.isArray(parsed)) return rects;
+    for (const o of parsed) {
+      if (!o || typeof o !== "object") continue;
+      const name = (o as { name?: unknown }).name;
+      const rect = (o as { rect?: { x?: unknown; y?: unknown; width?: unknown; height?: unknown } })
+        .rect;
+      if (
+        typeof name === "string" &&
+        rect &&
+        typeof rect.x === "number" &&
+        typeof rect.y === "number" &&
+        typeof rect.width === "number" &&
+        typeof rect.height === "number"
+      ) {
+        rects.set(name, { x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+      }
+    }
+    return rects;
+  }
+
+  /** Float + size + move a placed web-window's container to its region on `connector` (POL-18). */
+  private async positionWindow(
+    id: string,
+    conId: number,
+    connector: string,
+    win: WindowPlacement,
+  ): Promise<void> {
+    const output = await this.resolveConnector(connector);
+    const rect = (await this.getOutputRects()).get(output);
+    if (!rect) throw new Error(`no output rect for ${output}`);
+    const r = regionToOutputRect(win.region, win.canvas, rect);
+    const cmd =
+      `[con_id=${conId}] floating enable, border none, ` +
+      `resize set width ${r.w} px height ${r.h} px, ` +
+      `move absolute position ${r.x} ${r.y}`;
+    const res = await run("swaymsg", [cmd]);
+    if (res.code !== 0) {
+      throw new Error(`swaymsg window placement failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+    }
+  }
+
+  /** Launch + float one web-window (POL-18). Placement is best-effort like the player's own: a
+   *  window on the wrong spot beats no window, so a positioning failure logs but never kills the
+   *  supervised child. */
+  private async launchAndPlaceWindow(
+    id: string,
+    bin: string,
+    target: LaunchTarget,
+  ): Promise<ChildProcess> {
+    const spec = this.windowSpecs.get(id);
+    if (!spec) throw new Error(`no placement spec for web-window ${id}`);
+    const browser = await this.ensureBrowserKind();
+    if (browser === "chrome") await prelaunchChromeWindow(id, (m) => this.log(m));
+    else await prelaunchSurf(target.url, (m) => this.log(m));
+
+    // Subscribe BEFORE spawning so we never miss the window's `new` event (same as the player's).
+    const matches = browser === "chrome" ? matchesChromeWindow : matchesSurfWindow;
+    const sub = startSwayWindowSubscription(matches, (m) => this.log(m));
+    let child: ChildProcess;
+    try {
+      const args =
+        browser === "chrome"
+          ? buildChromeWindowArgs({
+              url: target.url,
+              windowId: id,
+              devtoolsPort: this.devtoolsPortFor(`win:${id}`),
+            })
+          : buildSurfArgs({ url: target.url, inspector: false });
+      child = spawnChild(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.pipeBrowserOutput(child, browser, `win:${id}`);
+      this.log(`spawned ${browser} web-window pid=${child.pid ?? "?"} (${id}) → ${target.url}`);
+    } catch (err) {
+      sub.close();
+      throw err;
+    }
+
+    this.windowConIds.delete(id);
+    try {
+      const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
+      await this.positionWindow(id, conId, spec.connector, spec.window);
+      this.windowConIds.set(id, conId);
+      this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connector}`);
+    } catch (err) {
+      this.log(`web-window ${id} placement failed: ${(err as Error).message}`);
+    } finally {
+      sub.close();
+    }
+    return child;
+  }
+
+  async showWindow(connector: string, win: WindowPlacement): Promise<void> {
+    const bin = await this.ensureBin();
+    await requireSwaymsg();
+    this.windowSpecs.set(win.id, { connector, window: win });
+
+    let supervised = this.windows.get(win.id);
+    if (!supervised) {
+      supervised = new SupervisedBrowser(
+        `web-window ${win.id}`,
+        (target) => this.launchAndPlaceWindow(win.id, bin, target),
+        (m) => this.log(m),
+      );
+      this.windows.set(win.id, supervised);
+    }
+
+    // Geometry-only change on a live window: re-position the existing container in place — no
+    // relaunch, no flash (the agent-channel echo of D5). A URL change relaunches via setTarget.
+    const conId = this.windowConIds.get(win.id);
+    if (supervised.running && supervised.url === win.url) {
+      if (conId !== undefined) {
+        await this.positionWindow(win.id, conId, connector, win);
+        this.log(`web-window ${win.id}: repositioned over ${connector}`);
+        return;
+      }
+      // Same target but we never learned its container id (an earlier placement failure) —
+      // setTarget would no-op, so force a clean relaunch to get a placeable window back.
+      await supervised.stop();
+    }
+    await supervised.setTarget({ url: win.url, inspector: false });
+  }
+
+  async hideWindow(id: string): Promise<void> {
+    const supervised = this.windows.get(id);
+    this.windowSpecs.delete(id);
+    this.windowConIds.delete(id);
+    if (!supervised) {
+      this.log(`hideWindow(${id}): nothing placed`);
+      return;
+    }
+    await supervised.stop();
+    this.windows.delete(id);
+    this.log(`hideWindow(${id}): torn down`);
+  }
+
   /**
    * Agent-side ident is best-effort and secondary: the VISIBLE "which panel is this?" overlay is
    * server → player. We only log here (a future enhancement could flash a sway color/border).
@@ -622,6 +810,16 @@ export class SwayBackend implements DisplayBackend {
     if (!this.browsers.get(connector)?.running) return null;
     const port = this.devtoolsPorts.get(connector);
     return port === undefined ? null : { port };
+  }
+
+  /** POL-101 — DPMS is always available under sway; CEC only if the box has an adapter (probed once). */
+  powerCapabilities(): Promise<PowerCapabilities> {
+    return this.power.capabilities();
+  }
+
+  /** POL-101 — sleep/wake this output's panel. See ./power.ts for why DPMS and CEC are two rungs. */
+  setPower(connector: string, on: boolean): Promise<PanelPowerMethod[]> {
+    return this.power.apply(connector, on);
   }
 
   // ── casting (POL-119) ─────────────────────────────────────────────────────────

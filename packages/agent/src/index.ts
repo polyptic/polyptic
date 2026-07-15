@@ -65,7 +65,7 @@ import {
   parseMessage,
   PROTOCOL_VERSION,
 } from "@polyptic/protocol";
-import type { KioskBrowser, MachineVitals, Output } from "@polyptic/protocol";
+import type { KioskBrowser, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { applyCastPinEvent } from "./backends/cast";
@@ -73,6 +73,7 @@ import { selectKioskBrowser } from "./backends/chrome";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import { readHostIdentity } from "./hardware";
 import { DevtoolsManager } from "./devtools";
 import {
   certNeedsRenewal,
@@ -85,6 +86,8 @@ import {
 import type { MtlsBundleFile } from "./mtls";
 import { rebootHost } from "./host";
 import { ShellManager } from "./shell";
+import { diffWindows } from "./windows";
+import type { PlacedWindow } from "./windows";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
@@ -152,6 +155,7 @@ type IdentMsg = Extract<ServerToAgentMessage, { t: "server/ident" }>;
 type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
 type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
 type InspectMsg = Extract<ServerToAgentMessage, { t: "server/inspect" }>;
+type DisplayPowerMsg = Extract<ServerToAgentMessage, { t: "server/display-power" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
 type PendingMsg = Extract<ServerToAgentMessage, { t: "server/pending" }>;
 type RejectedMsg = Extract<ServerToAgentMessage, { t: "server/rejected" }>;
@@ -203,6 +207,9 @@ class Agent {
   private lastAppliedRevision = 0;
   /** connector → player URL currently placed (dedupes repeat opens on reconnect/re-apply). */
   private readonly placed = new Map<string, string>();
+  /** POL-18 — window id → what is placed (connector + spec signature); diffed on every apply so an
+   *  unchanged window is never relaunched and a vanished one is torn down. */
+  private readonly placedWindows = new Map<string, PlacedWindow>();
   /** connector → last placement outcome, reported in heartbeats. */
   private readonly status = new Map<string, { ok: boolean; note?: string }>();
   /** POL-119 — connector → is a cast session live NOW (receiver window on the glass)? Entries exist
@@ -227,6 +234,8 @@ class Agent {
     credential: string | null,
     /** Which kiosk browser this box drives (POL-67); undefined on dev-open (no kiosk browser). */
     private readonly browser: KioskBrowser | undefined,
+    /** POL-101 — what this box can do about panel power (DPMS / CEC), probed once at startup. */
+    private readonly power: PowerCapabilities,
     mtls: MtlsBundleFile | null = null,
   ) {
     this.credential = credential;
@@ -400,6 +409,9 @@ class Agent {
       case "server/inspect":
         await this.onInspect(msg);
         break;
+      case "server/display-power":
+        await this.onDisplayPower(msg);
+        break;
       case "server/enrolled":
         this.onEnrolled(msg);
         break;
@@ -482,6 +494,40 @@ class Agent {
       this.status.delete(connector);
       this.casting.delete(connector);
       this.castPins.delete(connector);
+    }
+
+    // POL-18 — reconcile the placed WEB-WINDOWS: place what's new/changed, retire what vanished.
+    // Retire first so a window moving between outputs never briefly exists twice. A placement
+    // failure is reported on the connector's status note (console-visible) but never fails the
+    // apply — the player underneath keeps rendering everything else.
+    const { toPlace, toRemove } = diffWindows(
+      this.placedWindows,
+      msg.screens.map((s) => ({ connector: s.connector, windows: s.windows ?? [] })),
+    );
+    for (const id of toRemove) {
+      try {
+        await this.backend.hideWindow(id);
+      } catch (err) {
+        log(`hideWindow(${id}) failed: ${(err as Error).message}`);
+      }
+      this.placedWindows.delete(id);
+    }
+    for (const place of toPlace) {
+      try {
+        await this.backend.showWindow(place.connector, place.window);
+        this.placedWindows.set(place.window.id, {
+          connector: place.connector,
+          signature: place.signature,
+        });
+        log(`placed web-window ${place.window.id} on ${place.connector}`);
+      } catch (err) {
+        const note = `web-window ${place.window.id}: ${(err as Error).message}`;
+        // Keep the screen's ok flag (the player itself placed fine); surface the window's failure
+        // on that connector's note so the console can show why the region is empty.
+        const st = this.status.get(place.connector);
+        this.status.set(place.connector, { ok: st?.ok ?? true, note });
+        log(`FAILED to place web-window ${place.window.id} on ${place.connector}: ${note}`);
+      }
     }
 
     // Ack the new state immediately rather than waiting for the next heartbeat tick.
@@ -687,6 +733,52 @@ class Agent {
   }
 
   /**
+   * `server/display-power` — sleep or wake ONE panel (POL-101).
+   *
+   * This is the ONLY thing in the agent that darkens a wall, and it fires only when the control plane
+   * says so — an operator's click, or a panel-hours boundary an operator set. Nothing here is driven
+   * by idleness; the compositor's no-blank discipline (`output * dpms on`, no swayidle) is untouched.
+   *
+   * The browser is deliberately NOT torn down: the player keeps its socket and its slice, so waking is
+   * a DPMS/CEC command rather than a reload, and the wall lights up already showing its content (D5).
+   *
+   * The ack carries the state we actually reached and WHICH rungs got us there — DPMS alone means the
+   * output is dark but the panel may still be lit; DPMS+CEC means the display itself was told to power
+   * down. A failure acks `ok: false` and leaves the console reading the screen as awake, which is the
+   * safe direction: never claim a wall is dark when it might not be.
+   */
+  private async onDisplayPower(msg: DisplayPowerMsg): Promise<void> {
+    log(
+      `server/display-power received (connector=${msg.connector} on=${msg.on})` +
+        (msg.reason ? ` — ${msg.reason}` : ""),
+    );
+    try {
+      const methods = await this.backend.setPower(msg.connector, msg.on);
+      this.send({
+        t: "agent/power-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: msg.on,
+        ok: true,
+        methods,
+      });
+      log(`panel ${msg.on ? "awake" : "asleep"} on ${msg.connector} via ${methods.join("+")}`);
+    } catch (err) {
+      const reason = (err as Error).message;
+      this.send({
+        t: "agent/power-ack",
+        machineId: this.machineId,
+        connector: msg.connector,
+        on: msg.on,
+        ok: false,
+        methods: [],
+        reason,
+      });
+      logError(`display-power(${msg.connector}, ${msg.on}) failed: ${reason}`);
+    }
+  }
+
+  /**
    * `server/enrolled` — the server issued (or re-issued) this machine's durable credential and/or
    * its mTLS client-cert bundle (POL-25). Persist the RAW credential locally so future reconnects
    * authenticate without the bootstrap token. A cert bundle is paired with the private key whose
@@ -806,8 +898,16 @@ class Agent {
       agentVersion: this.agentVersion,
       backend: this.backend.id,
       browser: this.browser,
+      power: this.power,
       outputs: this.outputs,
       hostname: osHostname(),
+      // POL-105 — the OS image this box actually BOOTED (`/etc/polyptic/image-id`). Undefined on a
+      // dev box with no live image, and dropped by JSON.stringify, so an old server ignores it.
+      imageId: await this.vitals.bootedImageId().catch(() => undefined),
+      // POL-104 — what this box IS (MACs / DMI serial / arch). Descriptive, never a credential: the
+      // server uses it to match a pre-registration (after the token gate) and to make a pending
+      // approval card readable. Sampled per hello so a re-cabled box re-reports honestly.
+      hardware: readHostIdentity(),
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,
@@ -916,11 +1016,16 @@ async function main(): Promise<void> {
   const browser: KioskBrowser | undefined =
     backend.id === "wayland-sway" ? await selectKioskBrowser() : backend.id === "x11-i3" ? "surf" : undefined;
   const mtlsBundle = loadMtlsBundle(machineId);
+  // POL-101 — probe panel power ONCE at startup (is there a CEC adapter this user can open?) and
+  // report it on hello, so the console can be honest about whether "sleep" darkens the output or
+  // actually powers the display down. A box with no CEC is a normal box, not a broken one.
+  const power = await backend.powerCapabilities();
 
   log(
     `polyptic-agent v${agentVersion} · machineId=${machineId} · outputs=${outputs
       .map((o) => o.connector)
-      .join(",")} · backend=${backend.id}${browser ? ` · browser=${browser}` : ""}`,
+      .join(",")} · backend=${backend.id}${browser ? ` · browser=${browser}` : ""}` +
+      ` · panel power: ${power.dpms ? (power.cec ? "dpms+cec" : "dpms only") : "none"}`,
   );
   log(
     `enrollment: ${credential ? "stored credential found" : "no stored credential"}${
@@ -937,6 +1042,7 @@ async function main(): Promise<void> {
     bootstrapToken,
     credential,
     browser,
+    power,
     mtlsBundle,
   );
   agent.start();
