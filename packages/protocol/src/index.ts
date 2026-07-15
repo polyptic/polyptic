@@ -10,6 +10,48 @@
  */
 import { z } from "zod";
 
+/** Canvas geometry both the server and the console reason about: contact/adjacency + auto-pack
+ *  (POL-96/POL-100). Pure functions — the wall-validity rules live in exactly one place. */
+export * from "./geometry.js";
+
+import { ImageRings } from "./image-rollout";
+import { MachineTags } from "./selector";
+import { Daypart, Schedule, SchedulerSettings } from "./schedule";
+
+/** POL-105 — staged (canary) image roll-outs targeted by a POL-103 selector, and the fleet's
+ *  version distribution (who is actually running which build). */
+export {
+  ImageArch,
+  ImageDistributionBucket,
+  ImageDistributionMachine,
+  ImageRing,
+  ImageRings,
+  imageDistribution,
+  resolveRolloutImage,
+} from "./image-rollout";
+export type {
+  DistributableBuild,
+  DistributableMachine,
+  RolloutResolution,
+} from "./image-rollout";
+
+/** POL-103 — machine tags + the selector grammar that targets bulk operations. */
+export {
+  MACHINE_TAG_PATTERN,
+  MachineTag,
+  MachineTags,
+  distinctTags,
+  matchesSelector,
+  normalizeTag,
+  parseSelector,
+  selectByTags,
+} from "./selector";
+export type { MachineSelector, ParseSelectorResult } from "./selector";
+
+// The scene scheduler (POL-89/D93): dayparts, schedules, settings AND the shared resolver — the
+// server's ticker and the console's week strip answer "what plays when" with the same function.
+export * from "./schedule";
+
 export const PROTOCOL_VERSION = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +216,16 @@ export const Machine = z.object({
   power: PowerCapabilities.optional(),
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
+  /** POL-103 — free-form operator tags ("atrium", "floor:2", "canary"). Flat and opaque: a selector
+   *  matches them by set membership, never by parsing them. They are what bulk operations target. */
+  tags: MachineTags.default([]),
+  /** POL-105 — the OS image this box last told us it BOOTED (`/etc/polyptic/image-id`, carried on
+   *  `agent/hello` and in every heartbeat's vitals). PERSISTED, unlike the live vitals ring, because
+   *  the box a roll-out has stranded is precisely the box that is offline: "which machines are still
+   *  on 20260711T…?" has to be answerable about a box that is not currently talking to us. */
+  imageId: z.string().optional(),
+  /** When that image id was last reported (ISO). */
+  imageIdAt: z.string().datetime().optional(),
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
    *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
@@ -661,6 +713,11 @@ export const AgentHello = z.object({
   outputs: z.array(Output),
   /** The box's os.hostname(), used as the human machine label (additive-safe; optional). */
   hostname: z.string().optional(),
+  /** POL-105 — the OS image this box BOOTED (`/etc/polyptic/image-id`). Sent on the very first frame
+   *  of a session, so the control plane learns a box's build the moment it comes back rather than one
+   *  heartbeat later — a reboot into a canary build is exactly the moment an operator is watching.
+   *  Optional: a dev box (no live image) and any pre-POL-105 agent simply omit it. */
+  imageId: z.string().optional(),
   /** POL-104 — the box's physical identity (MACs / DMI serial / arch). Optional: a pre-POL-104 agent
    *  sends none, and a pending card then simply says less. */
   hardware: HostIdentity.optional(),
@@ -1355,6 +1412,12 @@ export const MachineView = z.object({
   browser: KioskBrowser.optional(),
   online: z.boolean(), // is the agent's WS currently connected?
   status: EnrollmentStatus, // pending machines await operator approval
+  /** POL-103 — the machine's operator tags; the console renders them as chips and filters on them. */
+  tags: MachineTags.default([]),
+  /** POL-105 — the build this box last reported BOOTING. Persisted, so it survives the box going
+   *  dark: the version-distribution view in Settings is built from this. */
+  imageId: z.string().optional(),
+  imageIdAt: z.string().datetime().optional(),
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
@@ -1568,7 +1631,8 @@ export const Scene = z.object({
   placements: z.array(ScenePlacement), // layout
   walls: z.array(SceneWall), // grouping + each wall's content
   screens: z.array(SceneScreen), // content for placed, non-walled screens
-  scheduleAt: z.string().optional(), // "HH:MM" — illustrative; stored, not fired
+  // A scene carries NO time of its own (POL-89/D93 dropped D24's illustrative `scheduleAt`): WHEN a
+  // scene plays is a `Schedule` — a scene bound to a daypart on a recurrence, at a priority.
 });
 export type Scene = z.infer<typeof Scene>;
 
@@ -1716,6 +1780,11 @@ export const ServerToAdminState = z.object({
   panelPower: PanelPowerConfig.optional(), // POL-101 — the deployment's panel-hours timezone
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  // POL-89 — the scene scheduler. The console feeds these three straight into the shared resolver to
+  // paint its "what plays when" week strip, so the strip cannot disagree with the server's ticker.
+  dayparts: z.array(Daypart).optional(), // optional = back-compat
+  schedules: z.array(Schedule).optional(),
+  scheduler: SchedulerSettings.optional(),
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -1767,6 +1836,95 @@ export type PanelHoursBody = z.infer<typeof PanelHoursBody>;
 export const UpdatePanelPowerBody = PanelPowerConfig;
 export type UpdatePanelPowerBody = z.infer<typeof UpdatePanelPowerBody>;
 
+// ── Tags + selector-targeted bulk operations (POL-103) ───────────────────────
+//
+// PUT /api/v1/machines/:id/tags replaces a machine's whole tag set — add and remove are the same
+// call, so the console never has to reconcile two half-applied mutations.
+//
+// The bulk routes take a TARGET, which is either a `selector` (the tag grammar in selector.ts) or an
+// explicit `machineIds` list (the console's checkboxes). Never both-optional-and-absent: a bulk verb
+// with no target is a 400, never a fleet-wide fan-out. Each answers a per-machine RESULT list —
+// partial success is the normal case, and three offline boxes must not fail the other nine.
+
+export const SetMachineTagsBody = z.object({ tags: MachineTags });
+export type SetMachineTagsBody = z.infer<typeof SetMachineTagsBody>;
+
+const bulkTargetShape = {
+  /** A tag selector, e.g. `tag=atrium` or `tag=floor:2,tag=canary` (AND). */
+  selector: z.string().max(200).optional(),
+  /** Or an explicit set of machines — what the console's checkboxes send. */
+  machineIds: z.array(z.string().min(1)).max(500).optional(),
+};
+
+/** Exactly-one-target: a bulk verb that names nothing must never mean "everything". */
+function requireTarget(
+  value: { selector?: string; machineIds?: string[] },
+  ctx: z.RefinementCtx,
+): void {
+  const hasSelector = typeof value.selector === "string" && value.selector.trim() !== "";
+  const hasIds = Array.isArray(value.machineIds) && value.machineIds.length > 0;
+  if (!hasSelector && !hasIds) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "name a target: a tag selector (e.g. tag=atrium) or a non-empty machineIds list",
+    });
+  }
+  if (hasSelector && hasIds) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "name ONE target: a selector or a machineIds list, not both",
+    });
+  }
+}
+
+export const BulkRebootBody = z
+  .object({ ...bulkTargetShape, reason: z.string().max(200).optional() })
+  .superRefine(requireTarget);
+export type BulkRebootBody = z.infer<typeof BulkRebootBody>;
+
+export const BulkIdentBody = z
+  .object({ ...bulkTargetShape, on: z.boolean(), ttlMs: z.number().int().positive().optional() })
+  .superRefine(requireTarget);
+export type BulkIdentBody = z.infer<typeof BulkIdentBody>;
+
+export const BulkShellBody = z
+  .object({ ...bulkTargetShape, enabled: z.boolean() })
+  .superRefine(requireTarget);
+export type BulkShellBody = z.infer<typeof BulkShellBody>;
+
+export const BulkApproveBody = z.object({ ...bulkTargetShape }).superRefine(requireTarget);
+export type BulkApproveBody = z.infer<typeof BulkApproveBody>;
+
+/**
+ * What happened to ONE machine in a bulk fan-out:
+ *   applied — the verb reached the box (or changed persisted state, for approve/tag)
+ *   offline — matched, but its agent socket is down: reported, never fatal
+ *   skipped — matched, but the verb does not apply (rebooting a pending box, approving an approved one)
+ *   failed  — the control plane tried and errored (the sentence says how)
+ */
+export const BulkOutcome = z.enum(["applied", "offline", "skipped", "failed"]);
+export type BulkOutcome = z.infer<typeof BulkOutcome>;
+
+export const BulkMachineResult = z.object({
+  machineId: z.string(),
+  label: z.string(),
+  outcome: BulkOutcome,
+  /** A plain sentence when the outcome is not `applied` — shown to the operator verbatim. */
+  detail: z.string().optional(),
+});
+export type BulkMachineResult = z.infer<typeof BulkMachineResult>;
+
+export const BulkOpResponse = z.object({
+  ok: z.literal(true),
+  action: z.string(),
+  /** How the target was named, echoed back (the selector text, or "N machines"). */
+  target: z.string(),
+  matched: z.number().int().nonnegative(),
+  applied: z.number().int().nonnegative(),
+  results: z.array(BulkMachineResult),
+});
+export type BulkOpResponse = z.infer<typeof BulkOpResponse>;
+
 /** POST /api/v1/screens/:id/cast — enable or disable casting (AirPlay receiver) on one screen
  *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
 export const CastArmBody = z.object({ enabled: z.boolean() });
@@ -1789,11 +1947,34 @@ export const PlaceScreenBody = z.object({
 });
 export type PlaceScreenBody = z.infer<typeof PlaceScreenBody>;
 
+/** Translate a canvas selection — screens and/or whole combined surfaces — by a delta, atomically
+ *  (POL-100). One call, one broadcast: this is how a wall is dragged (its members move together), how
+ *  the keyboard nudges a selection, and how a multi-screen drag lands. Every wall the move touches is
+ *  re-checked for adjacency, so a move can never leave an invalid wall behind. */
+export const MoveTargetsBody = z
+  .object({
+    screenIds: z.array(z.string()).default([]),
+    wallIds: z.array(z.string()).default([]),
+    dx: z.number(),
+    dy: z.number(),
+  })
+  .refine((b) => b.screenIds.length + b.wallIds.length > 0, {
+    message: "name at least one screen or wall to move",
+  });
+export type MoveTargetsBody = z.infer<typeof MoveTargetsBody>;
+
+/** Return several screens to the unplaced tray in one call (POL-96). */
+export const UnplaceScreensBody = z.object({ screenIds: z.array(z.string()).min(1) });
+export type UnplaceScreensBody = z.infer<typeof UnplaceScreensBody>;
+
 // REST bodies — combined surfaces (Phase 3b)
 export const CombineScreensBody = z.object({
   muralId: z.string(),
   memberScreenIds: z.array(z.string()).min(2),
   name: z.string().min(1).max(80).optional(), // optional name at creation; else a default is derived
+  /** POL-100 — close the gaps first: pack the members into a bezel-tight grid, then combine. Without
+   *  it a non-adjacent selection is REFUSED (a wall with a hole in it renders content nobody shows). */
+  pack: z.boolean().optional(),
 });
 export type CombineScreensBody = z.infer<typeof CombineScreensBody>;
 
@@ -1812,6 +1993,22 @@ export const SetContentBody = z
     message: "provide exactly one of sourceId or url",
   });
 export type SetContentBody = z.infer<typeof SetContentBody>;
+
+/**
+ * Assign content to — or CLEAR it from — many screens and walls at once (POL-96). `content: null` is
+ * the explicit unset: the named targets stop showing anything and fall back to the idle splash (D39).
+ * One call, one fan-out, one activity line, whatever the size of the selection.
+ */
+export const BulkContentBody = z
+  .object({
+    screenIds: z.array(z.string()).default([]),
+    wallIds: z.array(z.string()).default([]),
+    content: SetContentBody.nullable(),
+  })
+  .refine((b) => b.screenIds.length + b.wallIds.length > 0, {
+    message: "name at least one screen or wall",
+  });
+export type BulkContentBody = z.infer<typeof BulkContentBody>;
 
 /** Set the page zoom on a single screen's OR a video wall's framed content (POL-57). The server
  *  remembers the value against the (target, content) pair, so re-assigning the same page to the same
@@ -1921,10 +2118,9 @@ export const CreateSceneBody = z.object({
 });
 export type CreateSceneBody = z.infer<typeof CreateSceneBody>;
 
-/** Rename a scene and/or set its illustrative schedule time (null clears it). */
+/** Rename a scene. (Scheduling is NOT here — a scene's time of day is a `Schedule`, POL-89/D93.) */
 export const UpdateSceneBody = z.object({
   name: z.string().min(1).max(120).optional(),
-  scheduleAt: z.string().nullable().optional(),
 });
 export type UpdateSceneBody = z.infer<typeof UpdateSceneBody>;
 
@@ -2332,6 +2528,10 @@ export const ImageUpdateInfo = z.object({
   builds: z.array(ImageBuild).default([]),
   /** How many builds per arch the depot keeps before pruning (IMAGE_RETAIN_BUILDS, default 3). */
   retainBuilds: z.number().int().min(1).default(3),
+  /** POL-105 — the roll-out RINGS: ordered, first match wins, each pinning one build for the
+   *  machines a POL-103 selector matches (`tag=canary` → build X). Everything else follows the
+   *  arch's active build. Empty = today's behaviour, one image for the whole fleet. */
+  rings: ImageRings.default([]),
 });
 export type ImageUpdateInfo = z.infer<typeof ImageUpdateInfo>;
 
@@ -2359,6 +2559,31 @@ export const ActivateImageBody = z.object({
   imageId: z.string().min(1),
 });
 export type ActivateImageBody = z.infer<typeof ActivateImageBody>;
+
+/**
+ * POL-105 — replace the whole ordered ring list (`PUT /api/v1/settings/image/rings`). Whole-list, like
+ * a machine's tag set: add/remove/reorder are one call, so the console never has to reconcile two
+ * half-applied mutations. The server REJECTS a ring whose selector does not parse (POL-103's grammar)
+ * or whose build the depot does not retain — a ring you cannot serve is a boot the box cannot make.
+ */
+export const SetImageRingsBody = z.object({ rings: ImageRings });
+export type SetImageRingsBody = z.infer<typeof SetImageRingsBody>;
+
+/**
+ * POL-105 — PROMOTE a ring's build to the whole fleet in one action (`POST .../image/promote`):
+ * activate that build for its arch (the D54 relink) and DROP the ring, so the canary machines and
+ * everyone else converge on the same id. One activity line names what happened. This is the "one
+ * action with evidence" the ticket's DoD asks for; a promotion that left the ring in place would
+ * leave a canary pinned to what is now merely the fleet build.
+ */
+export const PromoteImageRingBody = z.object({
+  arch: z.enum(["arm64", "amd64"]),
+  /** The ring to promote, named by its selector — the same string the operator typed. */
+  selector: z.string().min(1).max(200),
+  /** Roll it out to the rest of the fleet immediately rather than in the nightly window. */
+  urgent: z.boolean().default(false),
+});
+export type PromoteImageRingBody = z.infer<typeof PromoteImageRingBody>;
 
 /** Update the fleet-wide display settings from the console (POL-6). Currently just the badge toggle. */
 export const UpdateDisplaySettingsBody = z.object({

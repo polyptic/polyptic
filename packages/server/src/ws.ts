@@ -481,6 +481,9 @@ function handleAgent(
       power: msg.power,
       outputs: msg.outputs,
       hostname: msg.hostname,
+      // POL-105 — the image the box BOOTED, on its very first frame: an operator watching a canary
+      // reboot sees the new id land the moment the box is back, not a heartbeat later.
+      imageId: msg.imageId,
       hardware: msg.hardware,
       enrolledTokenId: decision.tokenId,
       enrolledTokenName: decision.tokenName,
@@ -722,6 +725,26 @@ function handleAgent(
       // has a last-seen for `polyptic_machine_last_seen_seconds` either way.
       const hadVitals = presence.machineVitals(msg.machineId) !== undefined;
       presence.noteHeartbeat(msg.machineId, msg.vitals);
+      // POL-105 — the heartbeat also carries the box's booted image id. Persist it (and announce a
+      // CHANGE) so the version distribution survives the box going offline. `hello` already reported
+      // it; this keeps a long-lived session honest and covers an agent that heartbeats but never
+      // re-hellos. Unchanged ids are silent — this arrives every few seconds.
+      // Fire-and-forget like the hello path: a heartbeat is not a request/response, and a store blip
+      // must never take the status frame (or the socket) down.
+      if (msg.vitals?.imageId) {
+        const reported = msg.vitals.imageId;
+        void control
+          .noteMachineImage(msg.machineId, reported)
+          .then((changed) => {
+            if (changed) broadcaster.broadcast();
+          })
+          .catch((err: unknown) => {
+            log.warn(
+              { event: "image.report.error", machineId: msg.machineId, err: String(err) },
+              "could not record the image id this box reported",
+            );
+          });
+      }
       // Coalesced downstream; the first sample matters most (it fills an empty strip).
       if (msg.vitals || hadVitals) broadcaster.broadcast();
       log.info(

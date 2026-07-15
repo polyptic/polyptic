@@ -26,18 +26,32 @@ import { randomUUID } from "node:crypto";
 import {
   ContentSource,
   DashboardSurface,
+  Daypart,
   ImageSurface,
+  normalizeTag,
   PlaylistSurface,
   PageSurface,
   Scene,
+  Schedule,
+  SchedulerSettings,
   VideoSurface,
   VideoWall,
   WebSurface,
   Zoom,
+  isValidTimeZone,
   meaningfulHostname,
+  packRects,
+  rectsAreAdjacent,
 } from "@polyptic/protocol";
+import type { Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
+  CreateDaypartBody,
+  CreateScheduleBody,
+  ScheduleSet,
+  UpdateDaypartBody,
+  UpdateScheduleBody,
+  UpdateSchedulerSettingsBody,
   CreateContentSourceBody,
   PlaylistEntry,
   PlaylistItem,
@@ -76,6 +90,7 @@ import type {
   PersistedCredentialProfile,
   PersistedMachine,
   PersistedScene,
+  PersistedSchedulerSettings,
   Store,
 } from "./store/types";
 import type { TokenService } from "./tokens";
@@ -112,6 +127,21 @@ function defaultTimezone(): string {
   } catch {
     return "UTC";
   }
+}
+
+/**
+ * POL-89 — the scheduler's defaults until the operator first touches Settings. The TIMEZONE defaults
+ * to the SERVER's own zone (a deployment has exactly one — a wall lives in one building) but is
+ * stored explicitly the moment anything is saved, so "what plays when" never silently depends on the
+ * host's `TZ` changing under it. `TZ`/the runtime's resolved zone is only ever the seed.
+ */
+export function defaultSchedulerSettings(): SchedulerSettings {
+  const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return {
+    enabled: true,
+    timezone: hostZone && isValidTimeZone(hostZone) ? hostZone : "UTC",
+    defaultSceneId: null,
+  };
 }
 
 /** The two surface kinds that frame a page, and so are the only ones that can be zoomed. */
@@ -191,6 +221,9 @@ export interface RegisterMachineInput {
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
+  /** POL-105 — the OS image the box BOOTED (`/etc/polyptic/image-id`). Absent on a dev box (no live
+   *  image) and on any pre-POL-105 agent; an absent value never ERASES the id we already knew. */
+  imageId?: string;
   /** POL-104 — what the box IS (MACs / DMI serial / arch). Persisted, so a pending card is informative
    *  even while the box is offline. A hello that carries none NEVER blanks what we already know. */
   hardware?: HostIdentity;
@@ -221,10 +254,44 @@ export type CombineScreensResult =
         | "unknown-screen"
         | "not-placed"
         | "wrong-mural"
-        | "already-combined";
+        | "already-combined"
+        // POL-100 — the members don't form one contiguous region (a gap, or a corner-only join). The
+        // caller may retry with `pack: true`, which closes the gaps first.
+        | "not-adjacent";
       screenId?: string;
       wallId?: string;
     };
+
+/** Result of the atomic canvas move (POL-100): the placements that shifted, or why nothing did.
+ *  `breaks-wall` = the move would tear a combined surface apart; NOTHING is written in that case. */
+export type MoveTargetsResult =
+  | { ok: true; placements: Placement[] }
+  | {
+      ok: false;
+      error: "unknown-mural" | "unknown-screen" | "unknown-wall" | "wrong-mural" | "not-placed" | "breaks-wall";
+      screenId?: string;
+      wallId?: string;
+    };
+
+/** Result of an explicit CLEAR (POL-96): the emptied slices to push, or why nothing was cleared. */
+export type ClearContentResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | { ok: false; error: "unknown-screen" | "unknown-wall" | "wall-member"; wallId?: string };
+
+/**
+ * Result of a bulk content apply/clear (POL-96). `slices` is the whole fan-out (one per affected
+ * screen, deduped); `applied` counts the targets that took the change and `skipped` names the ones
+ * that could not (an unknown id, or a screen that is really a wall member) — a partial selection
+ * still does the useful work rather than refusing the lot.
+ */
+export type BulkContentResult =
+  | {
+      ok: true;
+      slices: ScreenSlice[];
+      applied: { screens: number; walls: number };
+      skipped: Array<{ id: string; reason: string }>;
+    }
+  | { ok: false; error: "unknown-source" };
 
 /** Result of `setWallContent`: the per-member slices to render, or why it could not be computed. */
 export type SetWallContentResult =
@@ -358,6 +425,15 @@ export class ControlPlane {
   private readonly scenes = new Map<string, Scene>();
   private sceneCounter = 0;
 
+  /** POL-89 — the scene scheduler: the daypart library, the schedules bound to it, and the one
+   *  deployment-wide settings row. The server's ticker and the console's week strip both resolve
+   *  from exactly this set (it rides `admin/state`), so they can never disagree. */
+  private readonly dayparts = new Map<string, Daypart>();
+  private daypartCounter = 0;
+  private readonly schedules = new Map<string, Schedule>();
+  private scheduleCounter = 0;
+  private schedulerSettings: SchedulerSettings = defaultSchedulerSettings();
+
   /** POL-24 — credential profiles keyed by id. Held as the FULL persisted row (incl. the client
    *  secret) because the control plane is where the secret is written through; every outward-facing
    *  read goes via `getCredentialProfileViews`, which never carries it. */
@@ -420,7 +496,6 @@ export class ControlPlane {
         walls: scene.walls,
         screens: scene.screens,
       },
-      scheduleAt: scene.scheduleAt ?? null,
     };
   }
 
@@ -437,6 +512,9 @@ export class ControlPlane {
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
+      tags: machine.tags ?? [],
+      imageId: machine.imageId,
+      imageIdAt: machine.imageIdAt,
       hardware: machine.hardware,
       enrolledTokenId: machine.enrolledTokenId,
       enrolledTokenName: machine.enrolledTokenName,
@@ -467,6 +545,11 @@ export class ControlPlane {
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
         shellArmedAt: m.shellArmedAt,
+        // POL-103 — legacy rows have no tags column value; they load untagged.
+        tags: m.tags ?? [],
+        // POL-105 — the last build this box reported booting (absent until it reports one).
+        imageId: m.imageId,
+        imageIdAt: m.imageIdAt,
         hardware: m.hardware,
         enrolledTokenId: m.enrolledTokenId,
         enrolledTokenName: m.enrolledTokenName,
@@ -630,7 +713,6 @@ export class ControlPlane {
         placements: ps.snapshot.placements ?? [],
         walls: ps.snapshot.walls ?? [],
         screens: ps.snapshot.screens ?? [],
-        ...(ps.scheduleAt ? { scheduleAt: ps.scheduleAt } : {}),
       });
       if (parsed.success) this.scenes.set(parsed.data.id, parsed.data);
     }
@@ -644,6 +726,47 @@ export class ControlPlane {
       }
     }
     this.sceneCounter = maxScene;
+
+    // ── Scene scheduler (POL-89) ──────────────────────────────────────────────
+    for (const pd of persisted.dayparts) {
+      const parsed = Daypart.safeParse(pd);
+      if (parsed.success) this.dayparts.set(parsed.data.id, parsed.data);
+    }
+    let maxDaypart = 0;
+    for (const d of this.dayparts.values()) {
+      const match = /^daypart-(\d+)$/.exec(d.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxDaypart = Math.max(maxDaypart, n);
+      }
+    }
+    this.daypartCounter = maxDaypart;
+
+    for (const psch of persisted.schedules) {
+      const parsed = Schedule.safeParse(psch);
+      if (parsed.success) this.schedules.set(parsed.data.id, parsed.data);
+    }
+    let maxSchedule = 0;
+    for (const s of this.schedules.values()) {
+      const match = /^schedule-(\d+)$/.exec(s.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxSchedule = Math.max(maxSchedule, n);
+      }
+    }
+    this.scheduleCounter = maxSchedule;
+
+    const persistedScheduler = await this.store.getSchedulerSettings();
+    if (persistedScheduler) {
+      const parsed = SchedulerSettings.safeParse(persistedScheduler);
+      // A stored zone the runtime does not know (an ICU/tzdata downgrade) must not silently become
+      // UTC on a live wall — keep it loud and fall back to the host's zone.
+      if (parsed.success && isValidTimeZone(parsed.data.timezone)) {
+        this.schedulerSettings = parsed.data;
+      } else {
+        this.emit("warn", `Scheduler timezone "${persistedScheduler.timezone}" is unknown here — using ${this.schedulerSettings.timezone}`);
+      }
+    }
 
     // ── Credential profiles (POL-24) ──────────────────────────────────────────
     for (const cp of persisted.credentialProfiles) {
@@ -917,6 +1040,13 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
+      // anything the box reports about itself.
+      tags: existing?.tags ?? [],
+      // POL-105 — the box's own report of the image it BOOTED. A hello that carries none (dev box,
+      // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
+      imageId: input.imageId ?? existing?.imageId,
+      imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
       // POL-104: never blank what we already know. An agent too old to report hardware (or one that
       // could not read its own DMI this boot) must not erase the card an operator relies on. And a
       // machine's enrolment provenance is written ONCE, at first enrolment — a later token re-enrol
@@ -962,6 +1092,13 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
+      // anything the box reports about itself.
+      tags: existing?.tags ?? [],
+      // POL-105 — the box's own report of the image it BOOTED. A hello that carries none (dev box,
+      // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
+      imageId: input.imageId ?? existing?.imageId,
+      imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
       hardware: input.hardware ?? existing?.hardware,
       enrolledTokenId: existing?.enrolledTokenId ?? input.enrolledTokenId,
       enrolledTokenName: existing?.enrolledTokenName ?? input.enrolledTokenName,
@@ -1127,6 +1264,71 @@ export class ControlPlane {
     machine.status = "rejected";
     await this.store.setMachineStatus(machineId, "rejected");
     this.emit("bad", `${machine.label} rejected`);
+    return true;
+  }
+
+  /**
+   * POL-103 — replace a machine's whole tag set. Registry state, like a rename: it changes nothing a
+   * player or an agent renders, so it does NOT bump the revision (a tag edit must not restate the
+   * fleet's desired state). Tags are normalized (trimmed + lowercased) and de-duplicated, so
+   * "Atrium " and "atrium" are the same tag and a selector can never miss a box on casing.
+   * Returns the machine, or null if it is unknown.
+   */
+  async setMachineTags(machineId: string, tags: string[]): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+
+    const next: string[] = [];
+    for (const raw of tags) {
+      const tag = normalizeTag(raw);
+      if (tag !== "" && !next.includes(tag)) next.push(tag);
+    }
+    machine.tags = next;
+    await this.store.setMachineTags(machineId, next);
+
+    this.emit(
+      "info",
+      next.length > 0
+        ? `${machine.label} tagged ${next.join(", ")}`
+        : `${machine.label} untagged`,
+    );
+    return machine;
+  }
+
+  /** POL-105 — the tags a machine carries, for the depot's per-machine manifest (an unknown machine
+   *  carries none, so it can match no ring and simply follows the fleet's active build). */
+  machineTags(machineId: string): string[] {
+    return this.machines.get(machineId)?.tags ?? [];
+  }
+
+  /**
+   * POL-105 — record the OS image a box reports BOOTING (`agent/hello`, and every heartbeat's vitals
+   * so a long-lived session still tells the truth). Persisted, because the box a roll-out stranded is
+   * the box that has gone dark, and "which machines are still on 20260711T…?" has to be answerable
+   * about exactly that box.
+   *
+   * A CHANGE is announced: the id a box comes back on is the only evidence that a roll-out — or a
+   * canary, or a rollback — actually reached it. An unchanged id is silent (it arrives every 5s).
+   * Returns true when the value changed.
+   */
+  async noteMachineImage(machineId: string, imageId: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine || imageId.trim() === "") return false;
+    const next = imageId.trim();
+    if (machine.imageId === next) return false;
+
+    const previous = machine.imageId;
+    const at = new Date().toISOString();
+    machine.imageId = next;
+    machine.imageIdAt = at;
+    await this.store.setMachineImage(machineId, next, at);
+
+    this.emit(
+      "good",
+      previous
+        ? `${machine.label} booted image ${next} (was ${previous})`
+        : `${machine.label} is running image ${next}`,
+    );
     return true;
   }
 
@@ -2211,6 +2413,7 @@ export class ControlPlane {
     muralId: string,
     memberScreenIds: string[],
     name?: string,
+    pack = false,
   ): Promise<CombineScreensResult> {
     if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
 
@@ -2228,6 +2431,21 @@ export class ControlPlane {
       const existing = this.getWallForScreen(screenId);
       if (existing) {
         return { ok: false, error: "already-combined", screenId, wallId: existing.id };
+      }
+    }
+
+    // POL-100 — a wall must be ONE contiguous region (see the adjacency rule in protocol/geometry).
+    // A gappy selection is either packed bezel-tight first (the operator asked) or refused outright:
+    // combining it would span content across canvas that no screen is showing.
+    const rects = ids.map((sid) => this.placements.get(sid)!);
+    if (!rectsAreAdjacent(rects)) {
+      if (!pack) return { ok: false, error: "not-adjacent" };
+      const packed = packRects(rects);
+      if (!rectsAreAdjacent(packed)) return { ok: false, error: "not-adjacent" };
+      for (let i = 0; i < ids.length; i++) {
+        const next: Placement = { ...rects[i]!, x: packed[i]!.x, y: packed[i]!.y };
+        this.placements.set(next.screenId, next);
+        await this.store.upsertPlacement(next);
       }
     }
 
@@ -2423,6 +2641,262 @@ export class ControlPlane {
       `${screen.friendlyName} → ${this.resolvedContentName(resolved.spec, resolved.sourceId)}`,
     );
     return { ok: true, slice: next };
+  }
+
+  // ── Clearing content + bulk canvas operations (POL-96) ──────────────────────
+  //
+  // Until now content could only be REPLACED, never removed: "show nothing" had no API path at all.
+  // Clearing is the same mutation combine/split already make internally (empty the slice, drop the
+  // library-source assignment, push) — it just becomes something the operator can ask for. A cleared
+  // screen falls back to the player's idle splash (D39). Bulk is the same primitives run under one
+  // emit, so a 20-screen selection is one REST call, one broadcast and one activity line.
+
+  /** Clear a single screen's content (it falls back to the idle splash). A wall member is refused —
+   *  its content belongs to the combined surface, so the WALL is what gets cleared. */
+  async clearScreenContent(screenId: string): Promise<ClearContentResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slices = this.clearSlices([screenId]);
+    if (slices.length === 0) return { ok: false, error: "unknown-screen" };
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("info", `${screen.friendlyName} cleared`);
+    return { ok: true, slices };
+  }
+
+  /** Clear a combined surface's spanning content — every member goes blank (idle splash), and the
+   *  wall keeps existing (it is a grouping, not a piece of content). */
+  async clearWallContent(wallId: string): Promise<ClearContentResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices = this.clearSlices(wall.memberScreenIds);
+    await this.setWallSourceAssignment(wall, null);
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("info", `${wall.name ?? wall.id} cleared`);
+    return { ok: true, slices };
+  }
+
+  /**
+   * Assign content to — or clear it from — many screens and walls in ONE mutation (POL-96). Runs the
+   * per-target primitives with their activity lines suppressed and emits a single summary instead;
+   * the caller pushes the returned slices (deduped) and broadcasts once. Targets that cannot take the
+   * change (an unknown id; a screen that is a member of a wall) are SKIPPED and named back, so a
+   * selection that includes one awkward screen still does the operator's work.
+   */
+  async applyBulkContent(
+    targets: { screenIds: readonly string[]; wallIds: readonly string[] },
+    content: ContentAssignment | null,
+  ): Promise<BulkContentResult> {
+    // Fail fast on a bad source: a bulk assign that can't resolve should change nothing at all.
+    if (content) {
+      const resolved = this.resolveSpec(content);
+      if ("error" in resolved) return { ok: false, error: "unknown-source" };
+    }
+
+    const touched = new Map<string, ScreenSlice>();
+    const skipped: Array<{ id: string; reason: string }> = [];
+    let screens = 0;
+    let walls = 0;
+    let name = "";
+
+    this.suppressEmit = true;
+    try {
+      for (const wallId of targets.wallIds) {
+        const result = content
+          ? await this.setWallContent(wallId, content)
+          : await this.clearWallContent(wallId);
+        if (!result.ok) {
+          skipped.push({ id: wallId, reason: result.error });
+          continue;
+        }
+        for (const slice of result.slices) touched.set(slice.screenId, slice);
+        walls += 1;
+        name ||= this.videoWalls.get(wallId)?.name ?? wallId;
+      }
+
+      for (const screenId of targets.screenIds) {
+        if (content) {
+          const result = await this.setScreenContent(screenId, content);
+          if (!result.ok) {
+            skipped.push({ id: screenId, reason: result.error });
+            continue;
+          }
+          touched.set(result.slice.screenId, result.slice);
+        } else {
+          const result = await this.clearScreenContent(screenId);
+          if (!result.ok) {
+            skipped.push({ id: screenId, reason: result.error });
+            continue;
+          }
+          for (const slice of result.slices) touched.set(slice.screenId, slice);
+        }
+        screens += 1;
+        name ||= this.getScreen(screenId)?.friendlyName ?? screenId;
+      }
+    } finally {
+      this.suppressEmit = false;
+    }
+
+    const applied = screens + walls;
+    if (applied > 0) {
+      const what = applied === 1 ? name : `${applied} targets`;
+      if (content) {
+        const resolved = this.resolveSpec(content);
+        const contentName =
+          "error" in resolved ? "content" : this.resolvedContentName(resolved.spec, resolved.sourceId);
+        this.emit("good", `${what} → ${contentName}`);
+      } else {
+        this.emit("info", `${what} cleared`);
+      }
+    }
+
+    return { ok: true, slices: [...touched.values()], applied: { screens, walls }, skipped };
+  }
+
+  /**
+   * Return several screens to the unplaced tray in one mutation (POL-96). Unplacing a wall member
+   * dissolves that wall exactly as the single-screen path does — the returned slices are every screen
+   * that must be re-rendered. One activity line for the lot.
+   */
+  async unplaceScreens(screenIds: readonly string[]): Promise<{ slices: ScreenSlice[]; unplaced: string[] }> {
+    const touched = new Map<string, ScreenSlice>();
+    const unplaced: string[] = [];
+    let name = "";
+
+    this.suppressEmit = true;
+    try {
+      for (const screenId of screenIds) {
+        const result = await this.unplaceScreen(screenId);
+        if (result === false) continue;
+        for (const slice of result.slices) touched.set(slice.screenId, slice);
+        unplaced.push(screenId);
+        name ||= this.getScreen(screenId)?.friendlyName ?? screenId;
+      }
+    } finally {
+      this.suppressEmit = false;
+    }
+
+    if (unplaced.length === 1) this.emit("info", `${name} unplaced`);
+    else if (unplaced.length > 1) this.emit("info", `${unplaced.length} screens unplaced`);
+
+    return { slices: [...touched.values()], unplaced };
+  }
+
+  // ── The atomic canvas move (POL-100) ────────────────────────────────────────
+  //
+  // Dragging a WALL moves every member together; a keyboard nudge moves a whole selection. Both are
+  // ONE intent, so both are one mutation: every named screen and every member of every named wall is
+  // translated by the same (dx, dy), and the result is written through only if EVERY wall the move
+  // touches is still adjacent afterwards. A rigid translation preserves adjacency by construction —
+  // the re-check is what makes that a guarantee rather than an assumption, and it also catches the
+  // case where a loose screen in the same move happens to be a member of another wall.
+
+  /**
+   * Translate placements by (dx, dy), atomically. All targets must live on `muralId`. Returns the new
+   * placements, or an error result — and on ANY error nothing at all is written (the check runs on a
+   * projection of the move before a single row is touched), so a move can never leave a broken wall.
+   */
+  async moveTargets(
+    muralId: string,
+    targets: { screenIds: readonly string[]; wallIds: readonly string[] },
+    dx: number,
+    dy: number,
+  ): Promise<MoveTargetsResult> {
+    if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
+
+    // Collect the screens to move: the named ones plus every member of every named wall.
+    const moving = new Set<string>();
+    for (const wallId of targets.wallIds) {
+      const wall = this.videoWalls.get(wallId);
+      if (!wall) return { ok: false, error: "unknown-wall", wallId };
+      if (wall.muralId !== muralId) return { ok: false, error: "wrong-mural", wallId };
+      for (const sid of wall.memberScreenIds) moving.add(sid);
+    }
+    for (const screenId of targets.screenIds) {
+      if (!this.getScreen(screenId)) return { ok: false, error: "unknown-screen", screenId };
+      moving.add(screenId);
+    }
+
+    for (const screenId of moving) {
+      const placement = this.placements.get(screenId);
+      if (!placement) return { ok: false, error: "not-placed", screenId };
+      if (placement.muralId !== muralId) return { ok: false, error: "wrong-mural", screenId };
+    }
+
+    // Project the move, then re-check every wall it touches BEFORE writing anything.
+    const next = new Map<string, Placement>();
+    for (const screenId of moving) {
+      const p = this.placements.get(screenId)!;
+      next.set(screenId, { ...p, x: p.x + dx, y: p.y + dy });
+    }
+    const projected = (screenId: string): Placement | undefined =>
+      next.get(screenId) ?? this.placements.get(screenId);
+
+    for (const wall of this.videoWalls.values()) {
+      if (!wall.memberScreenIds.some((sid) => moving.has(sid))) continue;
+      const rects: Rect[] = [];
+      for (const sid of wall.memberScreenIds) {
+        const p = projected(sid);
+        if (p) rects.push(p);
+      }
+      if (!rectsAreAdjacent(rects)) return { ok: false, error: "breaks-wall", wallId: wall.id };
+    }
+
+    for (const [screenId, placement] of next) {
+      this.placements.set(screenId, placement);
+      await this.store.upsertPlacement(placement);
+    }
+
+    // Placements are not part of any render slice (the span offsets are union-RELATIVE, so a rigid
+    // translation leaves every member's slice byte-identical) — no revision bump, no push. The
+    // console repaints from the admin/state broadcast the REST layer sends.
+    return { ok: true, placements: [...next.values()] };
+  }
+
+  /**
+   * Would placing `screenId` at `rect` tear apart the wall it belongs to? Returns that wall, or null
+   * when the screen is wall-free or the wall survives the move. The REST placement edge calls this so
+   * a single-screen drag can never leave a wall with a hole in it (POL-100).
+   */
+  wallBrokenByPlacement(screenId: string, rect: Rect): VideoWall | null {
+    const wall = this.getWallForScreen(screenId);
+    if (!wall) return null;
+    const rects: Rect[] = [];
+    for (const sid of wall.memberScreenIds) {
+      if (sid === screenId) {
+        rects.push(rect);
+        continue;
+      }
+      const p = this.placements.get(sid);
+      if (p) rects.push(p);
+    }
+    return rectsAreAdjacent(rects) ? null : wall;
   }
 
   // ── Content library (Phase 3c) ──────────────────────────────────────────────
@@ -3141,8 +3615,9 @@ export class ControlPlane {
   // placement / combine / content primitives, so the INSTANT property (stable-id render paths, D5) is
   // preserved on apply. Content is captured as the ASSIGNMENT (a library `sourceId` or an ad-hoc
   // `url`), never the resolved surface — so applying a scene re-resolves each source to its CURRENT
-  // url. `scheduleAt` ("HH:MM") is ILLUSTRATIVE: it is stored, NOT fired (D24) — nothing here activates
-  // a scene at that time.
+  // url. WHEN a scene plays is NOT here: that is a `Schedule` (POL-89/D93), resolved by the ticker in
+  // `scheduler.ts`, which fires this very `applyScene` — so a scheduled switch is the operator's own
+  // Apply, minus the operator.
 
   getScenes(): Scene[] {
     return [...this.scenes.values()];
@@ -3365,9 +3840,8 @@ export class ControlPlane {
   }
 
   /**
-   * Update a saved scene: rename it and/or set its ILLUSTRATIVE schedule time (`scheduleAt` is "HH:MM";
-   * null clears it — STORED, NOT FIRED, D24). Write-through. Does NOT bump the revision (registry
-   * metadata). Returns the updated scene, or null if unknown.
+   * Rename a saved scene. Write-through. Does NOT bump the revision (registry metadata). Returns the
+   * updated scene, or null if unknown. (WHEN a scene plays is a `Schedule` — POL-89/D93.)
    */
   async updateScene(id: string, patch: UpdateSceneBody): Promise<Scene | null> {
     const existing = this.scenes.get(id);
@@ -3375,10 +3849,6 @@ export class ControlPlane {
 
     const next: Scene = { ...existing };
     if (patch.name !== undefined) next.name = patch.name;
-    if (patch.scheduleAt !== undefined) {
-      if (patch.scheduleAt === null) delete next.scheduleAt;
-      else next.scheduleAt = patch.scheduleAt;
-    }
 
     const scene = Scene.parse(next);
     this.scenes.set(id, scene);
@@ -3387,14 +3857,172 @@ export class ControlPlane {
   }
 
   /**
-   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId. Write-through.
-   * Does NOT touch the live wall (a scene is just a saved snapshot). Returns false if unknown.
+   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId; any SCHEDULE
+   * bound to it (and its standing as the default scene) goes with it — a schedule pointing at a scene
+   * that no longer exists would resolve to nothing every tick. Write-through. Does NOT touch the live
+   * wall (a scene is just a saved snapshot). Returns false if unknown.
    */
   async deleteScene(id: string): Promise<boolean> {
     if (!this.scenes.has(id)) return false;
     this.scenes.delete(id);
     if (this.state.activeSceneId === id) this.state.activeSceneId = null;
     await this.store.deleteScene(id);
+
+    for (const schedule of [...this.schedules.values()].filter((s) => s.sceneId === id)) {
+      this.schedules.delete(schedule.id);
+      await this.store.deleteSchedule(schedule.id);
+    }
+    if (this.schedulerSettings.defaultSceneId === id) {
+      this.schedulerSettings = { ...this.schedulerSettings, defaultSceneId: null };
+      await this.store.setSchedulerSettings(this.toPersistedSchedulerSettings());
+    }
     return true;
+  }
+
+  // ── The scene scheduler (POL-89) ──────────────────────────────────────────────
+  //
+  // Dayparts + schedules + one settings row. This layer only STORES and validates; the ticker
+  // (`scheduler.ts`) resolves them against the clock and calls the existing applyScene path, so the
+  // fan-out is the ordinary instant WS push and nothing on a box or in a player changes.
+
+  private toPersistedSchedulerSettings(): PersistedSchedulerSettings {
+    return { ...this.schedulerSettings };
+  }
+
+  getDayparts(): Daypart[] {
+    return [...this.dayparts.values()];
+  }
+
+  getSchedules(): Schedule[] {
+    return [...this.schedules.values()];
+  }
+
+  getSchedulerSettings(): SchedulerSettings {
+    return { ...this.schedulerSettings };
+  }
+
+  /** Everything the shared resolver needs — the same set the console gets in `admin/state`. */
+  getScheduleSet(): ScheduleSet {
+    return {
+      dayparts: this.getDayparts(),
+      schedules: this.getSchedules(),
+      settings: this.getSchedulerSettings(),
+    };
+  }
+
+  async createDaypart(body: CreateDaypartBody): Promise<Daypart> {
+    this.daypartCounter += 1;
+    const daypart = Daypart.parse({
+      id: `daypart-${this.daypartCounter}`,
+      name: body.name,
+      start: body.start,
+      end: body.end,
+    });
+    this.dayparts.set(daypart.id, daypart);
+    await this.store.upsertDaypart(daypart);
+    this.emit("info", `Added daypart ${daypart.name} (${daypart.start}–${daypart.end})`);
+    return daypart;
+  }
+
+  async updateDaypart(id: string, patch: UpdateDaypartBody): Promise<Daypart | null> {
+    const existing = this.dayparts.get(id);
+    if (existing === undefined) return null;
+    const daypart = Daypart.parse({ ...existing, ...patch });
+    this.dayparts.set(id, daypart);
+    await this.store.upsertDaypart(daypart);
+    this.emit("info", `Daypart ${daypart.name} is now ${daypart.start}–${daypart.end}`);
+    return daypart;
+  }
+
+  /**
+   * Delete a daypart. Refuses while any schedule is bound to it (returns the binding count) — an
+   * operator must not be able to silently unschedule a wall by tidying up the library.
+   */
+  async deleteDaypart(id: string): Promise<{ ok: true } | { ok: false; error: "unknown" | "in-use"; schedules: number }> {
+    const existing = this.dayparts.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown", schedules: 0 };
+    const bound = [...this.schedules.values()].filter((s) => s.daypartId === id);
+    if (bound.length > 0) return { ok: false, error: "in-use", schedules: bound.length };
+    this.dayparts.delete(id);
+    await this.store.deleteDaypart(id);
+    this.emit("info", `Deleted daypart ${existing.name}`);
+    return { ok: true };
+  }
+
+  async createSchedule(
+    body: CreateScheduleBody,
+  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown-scene" | "unknown-daypart" }> {
+    if (!this.scenes.has(body.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (!this.dayparts.has(body.daypartId)) return { ok: false, error: "unknown-daypart" };
+    this.scheduleCounter += 1;
+    const schedule = Schedule.parse({
+      id: `schedule-${this.scheduleCounter}`,
+      sceneId: body.sceneId,
+      daypartId: body.daypartId,
+      days: [...new Set(body.days)].sort((a, b) => a - b),
+      priority: body.priority,
+      enabled: body.enabled,
+      from: body.from,
+      until: body.until,
+      createdAt: new Date().toISOString(),
+    });
+    this.schedules.set(schedule.id, schedule);
+    await this.store.upsertSchedule(schedule);
+    this.emit(
+      "info",
+      `Scheduled ${this.scenes.get(schedule.sceneId)?.name ?? schedule.sceneId} in ${this.dayparts.get(schedule.daypartId)?.name ?? schedule.daypartId}`,
+    );
+    return { ok: true, schedule };
+  }
+
+  async updateSchedule(
+    id: string,
+    patch: UpdateScheduleBody,
+  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown" | "unknown-scene" | "unknown-daypart" }> {
+    const existing = this.schedules.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown" };
+    if (patch.sceneId !== undefined && !this.scenes.has(patch.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (patch.daypartId !== undefined && !this.dayparts.has(patch.daypartId)) {
+      return { ok: false, error: "unknown-daypart" };
+    }
+    const schedule = Schedule.parse({
+      ...existing,
+      ...patch,
+      ...(patch.days ? { days: [...new Set(patch.days)].sort((a, b) => a - b) } : {}),
+    });
+    this.schedules.set(id, schedule);
+    await this.store.upsertSchedule(schedule);
+    return { ok: true, schedule };
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    if (!this.schedules.has(id)) return false;
+    this.schedules.delete(id);
+    await this.store.deleteSchedule(id);
+    return true;
+  }
+
+  /**
+   * Patch the deployment's scheduler settings. An unknown timezone or an unknown default scene is
+   * REFUSED, not coerced: a wall's whole daily rhythm hangs off this row, so a typo must fail loudly
+   * at the edge rather than quietly move every window an hour.
+   */
+  async updateSchedulerSettings(
+    patch: UpdateSchedulerSettingsBody,
+  ): Promise<{ ok: true; settings: SchedulerSettings } | { ok: false; error: "unknown-timezone" | "unknown-scene" }> {
+    if (patch.timezone !== undefined && !isValidTimeZone(patch.timezone)) {
+      return { ok: false, error: "unknown-timezone" };
+    }
+    if (patch.defaultSceneId != null && !this.scenes.has(patch.defaultSceneId)) {
+      return { ok: false, error: "unknown-scene" };
+    }
+    const settings = SchedulerSettings.parse({ ...this.schedulerSettings, ...patch });
+    this.schedulerSettings = settings;
+    await this.store.setSchedulerSettings(this.toPersistedSchedulerSettings());
+    if (patch.enabled !== undefined) {
+      this.emit(patch.enabled ? "good" : "warn", patch.enabled ? "Scene scheduler ON" : "Scene scheduler OFF");
+    }
+    if (patch.timezone !== undefined) this.emit("info", `Scheduler timezone set to ${settings.timezone}`);
+    return { ok: true, settings };
   }
 }

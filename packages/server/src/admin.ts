@@ -405,6 +405,13 @@ export function buildAdminState(
       browser: machine.browser,
       online: presence.isMachineOnline(machine.id),
       status: machine.status,
+      tags: machine.tags ?? [], // POL-103 — the chips + what a selector matches
+      // POL-105 — the build this box last reported BOOTING. Unlike vitals this is NOT gated on the
+      // box being online: the machine a roll-out stranded is exactly the machine that is now dark,
+      // and the version-distribution view exists to find it.
+      imageId: machine.imageId,
+      imageIdAt: machine.imageIdAt,
+
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,
       lastSeen: machine.lastSeen,
@@ -454,6 +461,11 @@ export function buildAdminState(
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     panelPower: control.getPanelPowerConfig(), // POL-101 — the panel-hours timezone
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
+    // POL-89 — the scene scheduler. The console feeds these three into the SHARED resolver to paint
+    // its week strip, so "what plays when" cannot drift from what the server's ticker will do.
+    dayparts: control.getDayparts(),
+    schedules: control.getSchedules(),
+    scheduler: control.getSchedulerSettings(),
   });
 }
 

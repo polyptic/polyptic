@@ -24,6 +24,8 @@ import {
   EnrollmentStatus,
   Geometry,
   HostIdentity,
+  ImageRings,
+  MachineTags,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -36,11 +38,14 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedDaypart,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
   PersistedPanelPower,
   PersistedImageRollout,
   PersistedMachine,
+  PersistedSchedule,
+  PersistedSchedulerSettings,
   PersistedAgentMtlsPosture,
   PersistedMtlsCa,
   PersistedPreRegistration,
@@ -70,6 +75,9 @@ interface MachineRow {
   last_seen: Date | null;
   shell_enabled: boolean | null;
   shell_armed_at: Date | null;
+  tags: unknown;
+  image_id: string | null;
+  image_id_at: Date | null;
   hardware: unknown;
   enrolled_token_id: string | null;
   enrolled_token_name: string | null;
@@ -203,7 +211,31 @@ interface SceneRow {
   name: string;
   mural_id: string;
   snapshot: unknown;
-  schedule_at: string | null;
+}
+
+interface DaypartRow {
+  id: string;
+  name: string;
+  start_time: string;
+  end_time: string;
+}
+
+interface ScheduleRow {
+  id: string;
+  scene_id: string;
+  daypart_id: string;
+  days: unknown;
+  priority: number;
+  enabled: boolean;
+  from_date: string | null;
+  until_date: string | null;
+  created_at: Date;
+}
+
+interface SchedulerSettingsRow {
+  enabled: boolean;
+  timezone: string;
+  default_scene_id: string | null;
 }
 
 interface UserRow {
@@ -272,6 +304,14 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS credential_hash text`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_enabled boolean NOT NULL DEFAULT false`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_armed_at timestamptz`;
+    // POL-103 — operator tags. jsonb, not a join table: a tag set is small, always read whole, and
+    // only ever replaced whole; a `machine_tags` table would buy nothing but a second write path.
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS tags jsonb NOT NULL DEFAULT '[]'::jsonb`;
+    // POL-105 — the OS image the box last reported BOOTING. Persisted, not live-only: "which boxes
+    // are still on 20260711T…?" must be answerable about a box that is currently offline — which is
+    // precisely the box a roll-out has stranded.
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS image_id text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS image_id_at timestamptz`;
     // POL-104: what the box IS (MACs / DMI serial / arch), which token it enrolled on, and whether it
     // matched a pre-registration. All NULL on rows that pre-date POL-104 — a machine enrolled before
     // this change simply says less on its card; it is never re-gated or re-approved because of it.
@@ -390,14 +430,54 @@ export class PostgresStore implements Store {
       )
     `;
     // Scenes (Phase 3d). A named SNAPSHOT of a mural's whole wall — layout + grouping + content live
-    // in the `snapshot` jsonb. `schedule_at` is the illustrative "HH:MM" time (stored, NOT fired).
+    // in the `snapshot` jsonb.
     await sql`
       CREATE TABLE IF NOT EXISTS scenes (
         id          text PRIMARY KEY,
         name        text NOT NULL,
         mural_id    text NOT NULL,
-        snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb,
-        schedule_at text
+        snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb
+      )
+    `;
+    // POL-89/D93: D24's `schedule_at` was an illustrative "HH:MM" that was STORED and NEVER FIRED.
+    // Real scheduling is the `schedules` table below, so the decoy column is DROPPED rather than
+    // migrated: an existing value is not a schedule (no recurrence, no window, no priority), and
+    // inventing one from it would make a live wall start flipping scenes nobody asked it to.
+    await sql`ALTER TABLE scenes DROP COLUMN IF EXISTS schedule_at`;
+    // The scene scheduler (POL-89). A DAYPART is a named window of the day; `end_time <= start_time`
+    // wraps past midnight; `start_time = end_time` is the all-day window.
+    await sql`
+      CREATE TABLE IF NOT EXISTS dayparts (
+        id         text PRIMARY KEY,
+        name       text NOT NULL,
+        start_time text NOT NULL,
+        end_time   text NOT NULL
+      )
+    `;
+    // A SCHEDULE binds a scene to a daypart on a recurrence (weekdays + optional inclusive date
+    // range), at an integer priority. `days` is a jsonb array of 0=Sun…6=Sat.
+    await sql`
+      CREATE TABLE IF NOT EXISTS schedules (
+        id          text PRIMARY KEY,
+        scene_id    text NOT NULL,
+        daypart_id  text NOT NULL,
+        days        jsonb NOT NULL DEFAULT '[]'::jsonb,
+        priority    int NOT NULL DEFAULT 0,
+        enabled     boolean NOT NULL DEFAULT true,
+        from_date   text,
+        until_date  text,
+        created_at  timestamptz NOT NULL DEFAULT now()
+      )
+    `;
+    // Deployment-wide scheduler settings (one row): master switch, the ONE timezone every window is
+    // evaluated in, and the default scene (the always-on floor). Absent until first changed — the
+    // control plane defaults to the server's own zone.
+    await sql`
+      CREATE TABLE IF NOT EXISTS scheduler_settings (
+        id               int PRIMARY KEY DEFAULT 1,
+        enabled          boolean NOT NULL,
+        timezone         text NOT NULL,
+        default_scene_id text
       )
     `;
     // Local operator accounts (Phase 3f / D29). Passwords are stored ONLY as argon2id hashes; the
@@ -539,6 +619,9 @@ export class PostgresStore implements Store {
     // POL-121: the first-image latch. The server that finds an EMPTY depot on a fresh install stamps
     // this before it spawns the one-shot full build, so pod churn cannot re-trigger it.
     await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS first_build_at timestamptz`;
+    // POL-105: the staged roll-out rings (selector → build). jsonb for the same reason as machine
+    // tags: a small ordered list, always read whole, only ever replaced whole.
+    await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS rings jsonb NOT NULL DEFAULT '[]'::jsonb`;
     // Display settings (POL-6): a single row holding the fleet-wide on-screen badge toggle. Absent
     // until an operator first changes it — the control plane falls back to its env default (prod off,
     // dev on) until then, so the row is written on the first mutation, not on migrate.
@@ -573,10 +656,12 @@ export class PostgresStore implements Store {
       videoWallRows,
       contentSourceRows,
       sceneRows,
+      daypartRows,
+      scheduleRows,
       credentialProfileRows,
       zoomPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
@@ -584,7 +669,9 @@ export class PostgresStore implements Store {
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
       sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition FROM content_sources`,
-      sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
+      sql<SceneRow[]>`SELECT id, name, mural_id, snapshot FROM scenes`,
+      sql<DaypartRow[]>`SELECT id, name, start_time, end_time FROM dayparts`,
+      sql<ScheduleRow[]>`SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
     ]);
@@ -608,6 +695,11 @@ export class PostgresStore implements Store {
         lastSeen: row.last_seen ? row.last_seen.toISOString() : undefined,
         shellEnabled: row.shell_enabled ?? false,
         shellArmedAt: row.shell_armed_at ? row.shell_armed_at.toISOString() : undefined,
+        // POL-103 — legacy rows (NULL) and anything unrecognised load as untagged.
+        tags: MachineTags.safeParse(row.tags).data ?? [],
+        // POL-105 — the last image id the box reported booting (NULL until it reports one).
+        imageId: row.image_id ?? undefined,
+        imageIdAt: row.image_id_at ? row.image_id_at.toISOString() : undefined,
         hardware: hardware?.success ? hardware.data : undefined,
         enrolledTokenId: row.enrolled_token_id ?? undefined,
         enrolledTokenName: row.enrolled_token_name ?? undefined,
@@ -696,9 +788,28 @@ export class PostgresStore implements Store {
           walls: Array.isArray(raw.walls) ? (raw.walls as PersistedScene["snapshot"]["walls"]) : [],
           screens: Array.isArray(raw.screens) ? (raw.screens as PersistedScene["snapshot"]["screens"]) : [],
         },
-        scheduleAt: row.schedule_at ?? null,
       };
     });
+
+    const dayparts: PersistedDaypart[] = daypartRows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      start: row.start_time,
+      end: row.end_time,
+    }));
+
+    const schedules: PersistedSchedule[] = scheduleRows.map((row) => ({
+      id: row.id,
+      sceneId: row.scene_id,
+      daypartId: row.daypart_id,
+      // jsonb comes back parsed; keep only the weekday numbers (the control plane re-validates).
+      days: Array.isArray(row.days) ? (row.days as unknown[]).map(Number).filter(Number.isInteger) : [],
+      priority: Number(row.priority),
+      enabled: row.enabled,
+      from: row.from_date ?? null,
+      until: row.until_date ?? null,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
 
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
 
@@ -712,6 +823,8 @@ export class PostgresStore implements Store {
       videoWalls,
       contentSources,
       scenes,
+      dayparts,
+      schedules,
       credentialProfiles,
       zoomPreferences,
     };
@@ -720,7 +833,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -732,6 +845,9 @@ export class PostgresStore implements Store {
         ${machine.lastSeen ? new Date(machine.lastSeen) : null},
         ${machine.shellEnabled ?? false},
         ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null},
+        ${sql.json(machine.tags ?? [])},
+        ${machine.imageId ?? null},
+        ${machine.imageIdAt ? new Date(machine.imageIdAt) : null},
         ${machine.hardware ? sql.json(machine.hardware) : null},
         ${machine.enrolledTokenId ?? null},
         ${machine.enrolledTokenName ?? null},
@@ -749,6 +865,11 @@ export class PostgresStore implements Store {
         last_seen       = EXCLUDED.last_seen,
         shell_enabled   = EXCLUDED.shell_enabled,
         shell_armed_at  = EXCLUDED.shell_armed_at,
+        tags            = EXCLUDED.tags,
+        -- POL-105 — never let a re-hello that carries no image id ERASE the one we already know: an
+        -- older agent (or a dev box with no live image) must not blank a real box's reported build.
+        image_id        = COALESCE(EXCLUDED.image_id, machines.image_id),
+        image_id_at     = COALESCE(EXCLUDED.image_id_at, machines.image_id_at),
         -- POL-104: never blank out what we already know. A pre-POL-104 agent (or an agent that could
         -- not read its own DMI) sends no hardware; a row that HAS hardware must not lose it because
         -- one hello arrived without any, and the token a machine enrolled on is written ONCE, at
@@ -760,6 +881,16 @@ export class PostgresStore implements Store {
         mtls_cert_issued_at = EXCLUDED.mtls_cert_issued_at,
         mtls_seen_at    = EXCLUDED.mtls_seen_at
     `;
+  }
+
+  async setMachineImage(id: string, imageId: string, at: string): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET image_id = ${imageId}, image_id_at = ${new Date(at)} WHERE id = ${id}`;
+  }
+
+  async setMachineTags(id: string, tags: string[]): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET tags = ${sql.json(tags)} WHERE id = ${id}`;
   }
 
   async setMachineStatus(id: string, status: EnrollmentStatus): Promise<void> {
@@ -1052,19 +1183,17 @@ export class PostgresStore implements Store {
   async upsertScene(scene: PersistedScene): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO scenes (id, name, mural_id, snapshot, schedule_at)
+      INSERT INTO scenes (id, name, mural_id, snapshot)
       VALUES (
         ${scene.id},
         ${scene.name},
         ${scene.muralId},
-        ${sql.json(scene.snapshot)},
-        ${scene.scheduleAt ?? null}
+        ${sql.json(scene.snapshot)}
       )
       ON CONFLICT (id) DO UPDATE SET
         name        = EXCLUDED.name,
         mural_id    = EXCLUDED.mural_id,
-        snapshot    = EXCLUDED.snapshot,
-        schedule_at = EXCLUDED.schedule_at
+        snapshot    = EXCLUDED.snapshot
     `;
   }
 
@@ -1075,7 +1204,7 @@ export class PostgresStore implements Store {
 
   async listScenes(): Promise<PersistedScene[]> {
     const sql = this.sql;
-    const rows = await sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`;
+    const rows = await sql<SceneRow[]>`SELECT id, name, mural_id, snapshot FROM scenes`;
     return rows.map((row) => {
       const raw =
         row.snapshot && typeof row.snapshot === "object" ? (row.snapshot as Record<string, unknown>) : {};
@@ -1088,9 +1217,104 @@ export class PostgresStore implements Store {
           walls: Array.isArray(raw.walls) ? (raw.walls as PersistedScene["snapshot"]["walls"]) : [],
           screens: Array.isArray(raw.screens) ? (raw.screens as PersistedScene["snapshot"]["screens"]) : [],
         },
-        scheduleAt: row.schedule_at ?? null,
       };
     });
+  }
+
+  // ── Scene scheduler (POL-89) ────────────────────────────────────────────────
+
+  async upsertDaypart(daypart: PersistedDaypart): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO dayparts (id, name, start_time, end_time)
+      VALUES (${daypart.id}, ${daypart.name}, ${daypart.start}, ${daypart.end})
+      ON CONFLICT (id) DO UPDATE SET
+        name       = EXCLUDED.name,
+        start_time = EXCLUDED.start_time,
+        end_time   = EXCLUDED.end_time
+    `;
+  }
+
+  async deleteDaypart(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM dayparts WHERE id = ${id}`;
+  }
+
+  async listDayparts(): Promise<PersistedDaypart[]> {
+    const sql = this.sql;
+    const rows = await sql<DaypartRow[]>`SELECT id, name, start_time, end_time FROM dayparts`;
+    return rows.map((row) => ({ id: row.id, name: row.name, start: row.start_time, end: row.end_time }));
+  }
+
+  async upsertSchedule(schedule: PersistedSchedule): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO schedules (id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at)
+      VALUES (
+        ${schedule.id},
+        ${schedule.sceneId},
+        ${schedule.daypartId},
+        ${sql.json(schedule.days)},
+        ${schedule.priority},
+        ${schedule.enabled},
+        ${schedule.from},
+        ${schedule.until},
+        ${schedule.createdAt}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        scene_id   = EXCLUDED.scene_id,
+        daypart_id = EXCLUDED.daypart_id,
+        days       = EXCLUDED.days,
+        priority   = EXCLUDED.priority,
+        enabled    = EXCLUDED.enabled,
+        from_date  = EXCLUDED.from_date,
+        until_date = EXCLUDED.until_date
+    `;
+  }
+
+  async deleteSchedule(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM schedules WHERE id = ${id}`;
+  }
+
+  async listSchedules(): Promise<PersistedSchedule[]> {
+    const sql = this.sql;
+    const rows = await sql<ScheduleRow[]>`
+      SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      sceneId: row.scene_id,
+      daypartId: row.daypart_id,
+      days: Array.isArray(row.days) ? (row.days as unknown[]).map(Number).filter(Number.isInteger) : [],
+      priority: Number(row.priority),
+      enabled: row.enabled,
+      from: row.from_date ?? null,
+      until: row.until_date ?? null,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+  }
+
+  async getSchedulerSettings(): Promise<PersistedSchedulerSettings | undefined> {
+    const sql = this.sql;
+    const rows = await sql<SchedulerSettingsRow[]>`
+      SELECT enabled, timezone, default_scene_id FROM scheduler_settings WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return { enabled: row.enabled, timezone: row.timezone, defaultSceneId: row.default_scene_id ?? null };
+  }
+
+  async setSchedulerSettings(settings: PersistedSchedulerSettings): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO scheduler_settings (id, enabled, timezone, default_scene_id)
+      VALUES (1, ${settings.enabled}, ${settings.timezone}, ${settings.defaultSceneId})
+      ON CONFLICT (id) DO UPDATE SET
+        enabled          = EXCLUDED.enabled,
+        timezone         = EXCLUDED.timezone,
+        default_scene_id = EXCLUDED.default_scene_id
+    `;
   }
 
   // ── Local operator accounts + sessions (Phase 3f) ────────────────────────────
@@ -1467,13 +1691,14 @@ export class PostgresStore implements Store {
         full_schedule_time: string;
         urgent: boolean;
         first_build_at: Date | null;
+        rings: unknown;
         last_build_started_at: Date | null;
         last_build_finished_at: Date | null;
         last_build_status: string | null;
         last_build_log: string | null;
         last_build_kind: string | null;
       }[]
-    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
+    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
     const row = rows[0];
     if (!row) return undefined;
     const status = row.last_build_status;
@@ -1485,6 +1710,9 @@ export class PostgresStore implements Store {
       fullScheduleDay: row.full_schedule_day,
       fullScheduleTime: row.full_schedule_time,
       urgent: row.urgent,
+      // POL-105 — a corrupt/legacy rings value degrades to NO rings, i.e. one image for the whole
+      // fleet. Parse at the edge: an unreadable ring must never point a box at a build we invented.
+      rings: ImageRings.safeParse(row.rings).data ?? [],
       firstBuildAt: row.first_build_at?.toISOString() ?? null,
       lastBuildStartedAt: row.last_build_started_at?.toISOString() ?? null,
       lastBuildFinishedAt: row.last_build_finished_at?.toISOString() ?? null,
@@ -1497,8 +1725,8 @@ export class PostgresStore implements Store {
   async setImageRollout(rollout: PersistedImageRollout): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
-      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
+      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
+      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${sql.json(rollout.rings ?? [])}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
       ON CONFLICT (id) DO UPDATE SET
         schedule_enabled = EXCLUDED.schedule_enabled,
         schedule_time = EXCLUDED.schedule_time,
@@ -1509,6 +1737,7 @@ export class PostgresStore implements Store {
         -- The first-image latch (POL-121) is claimed ONCE and never cleared: COALESCE keeps the
         -- original stamp even if a later write carries a null, so no code path can un-latch it.
         first_build_at = COALESCE(image_rollout.first_build_at, EXCLUDED.first_build_at),
+        rings = EXCLUDED.rings,
         last_build_started_at = EXCLUDED.last_build_started_at,
         last_build_finished_at = EXCLUDED.last_build_finished_at,
         last_build_status = EXCLUDED.last_build_status,
