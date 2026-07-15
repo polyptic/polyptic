@@ -14,7 +14,9 @@ import type { ChildProcess } from "node:child_process";
 import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PanelPowerMethod, PowerCapabilities } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
+import { PanelPower, x11DpmsCommands } from "./power";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
 import { buildSurfArgs, prelaunchSurf, resolveSurf } from "./surf";
 import { browserProbesFrom, sanitizeConnector, SupervisedBrowser } from "./supervise";
@@ -89,6 +91,37 @@ export class X11Backend implements DisplayBackend {
   /** connector → why the last inspector-opening attempt failed (null = it worked). Read by `inspect`
    *  so the operator's ack carries the real reason, since the opening happens inside the launch. */
   private readonly inspectErrors = new Map<string, string | null>();
+
+  /**
+   * POL-101 — panel power on the X11 fallback.
+   *
+   * CAVEAT, and it is a real one: `xset` drives DPMS for the whole X DISPLAY, not per connector — X
+   * has no per-output DPMS (`xrandr --output … --off` would disable the output, rearranging the
+   * layout and moving the kiosk windows, which is a cure worse than the disease). So on a MULTI-output
+   * x11-i3 box, sleeping one screen sleeps every panel that box drives. Single-output boxes — the
+   * common case for the fallback — behave exactly as intended. Wayland/sway (the default backend,
+   * D9/D77) has genuine per-output DPMS and is where a mixed-hours wall belongs.
+   */
+  private readonly power = new PanelPower(async (connector, on) => {
+    if (!(await which("xset"))) {
+      throw new Error(
+        "xset not found — the x11-i3 backend needs it to power panels (it ships with xserver-xorg)",
+      );
+    }
+    for (const { cmd, args } of x11DpmsCommands(on)) {
+      const res = await run(cmd, args);
+      if (res.code !== 0) {
+        throw new Error(
+          `${cmd} ${args.join(" ")} failed: ${res.stderr.trim() || `exit ${res.code}`} ` +
+            `(is DISPLAY set for this process?)`,
+        );
+      }
+    }
+    this.log(
+      `panel ${on ? "woken" : "slept"} for ${connector} via xset — NB: X11 DPMS is per-DISPLAY, so ` +
+        `every output this box drives is now ${on ? "awake" : "asleep"}`,
+    );
+  });
 
   private log(msg: string): void {
     console.log(`[${ts()}] [x11] ${msg}`);
@@ -295,6 +328,19 @@ export class X11Backend implements DisplayBackend {
     this.log(`hideScreen(${connector}): torn down`);
   }
 
+  /** POL-18 — not implemented on the i3 fallback yet (the server capability-gates on wayland-sway
+   *  and degrades such content to the iframe there, with a console note). Defence in depth: an
+   *  unexpected window placement is refused loudly, never silently dropped. */
+  async showWindow(connector: string): Promise<void> {
+    throw new Error(
+      `web-window placement is not implemented by the x11-i3 backend (connector ${connector})`,
+    );
+  }
+
+  async hideWindow(id: string): Promise<void> {
+    this.log(`hideWindow(${id}): nothing placed (x11-i3 places no windows)`);
+  }
+
   async ident(on: boolean): Promise<void> {
     this.log(`ident ${on ? "on" : "off"} — visible ident is server→player; agent no-op`);
   }
@@ -329,6 +375,16 @@ export class X11Backend implements DisplayBackend {
   /** x11-i3 drives surf, which has no tunnel-able remote inspector (D63) — never a DevTools port. */
   devtoolsEndpoint(): { port: number } | null {
     return null;
+  }
+
+  /** POL-101 — DPMS via xset (per-display, see the caveat on `power`); CEC if the box has an adapter. */
+  powerCapabilities(): Promise<PowerCapabilities> {
+    return this.power.capabilities();
+  }
+
+  /** POL-101 — sleep/wake the panel(s). See the `power` field for the per-display X11 caveat. */
+  setPower(connector: string, on: boolean): Promise<PanelPowerMethod[]> {
+    return this.power.apply(connector, on);
   }
 
   /** POL-119 — casting is sway-only for now: the receiver renders via waylandsink natively, and

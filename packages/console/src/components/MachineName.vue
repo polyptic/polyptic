@@ -9,15 +9,18 @@
   a name — and simply typing into it is the naming affordance.
 
   Works on any card — naming a still-PENDING box is the point, since boxes are indistinguishable
-  exactly while several queue for approval.
+  exactly while several queue for approval. The pending card passes `boxed` (POL-139): a visible
+  always-boxed input with a "Name this box" call-to-action placeholder, per the v2 mock — the id
+  tail lives beside it on that card, so the honest-placeholder duty is already covered.
 -->
+
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { MachineView } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { machineDisplayName, machineHasName } from "../machine-name";
 
-const props = defineProps<{ machine: MachineView }>();
+const props = defineProps<{ machine: MachineView; boxed?: boolean }>();
 
 const store = useConsoleStore();
 
@@ -37,7 +40,9 @@ watch(
   },
 );
 
-const placeholder = computed(() => machineDisplayName(props.machine));
+const placeholder = computed(() =>
+  props.boxed ? "Name this box" : machineDisplayName(props.machine),
+);
 
 const trimmed = computed(() => draft.value.trim());
 const canRename = computed(() => {
@@ -59,11 +64,11 @@ function revert(): void {
   <input
     v-model="draft"
     class="machine-rename"
-    :class="{ unnamed: !machineHasName(machine) && !focused }"
+    :class="{ unnamed: !machineHasName(machine) && !focused && !boxed, boxed }"
     spellcheck="false"
     autocomplete="off"
     :placeholder="placeholder"
-    :aria-label="`Rename ${placeholder}`"
+    :aria-label="`Rename ${machineDisplayName(machine)}`"
     :title="machineHasName(machine) ? 'Rename this machine' : 'Name this machine so you can tell it apart'"
     @focus="focused = true"
     @blur="focused = false; commit()"
@@ -103,5 +108,21 @@ function revert(): void {
   border-color: var(--accent, var(--primary));
   background: var(--surface);
   font-style: normal;
+}
+
+/* POL-139 — the pending card's variant: always visibly a box ("fill me in"), per the v2 mock. */
+.machine-rename.boxed {
+  width: 180px;
+  background: var(--surface);
+  border-color: var(--line);
+  padding: 6px 10px;
+  margin-left: 0;
+  font-size: 13px;
+}
+.machine-rename.boxed:hover {
+  border-color: var(--line2);
+}
+.machine-rename.boxed:focus {
+  border-color: var(--accent, var(--primary));
 }
 </style>

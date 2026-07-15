@@ -16,13 +16,14 @@ import type { Logger } from "./log";
 import type { RenderMode, SetupOptions } from "./args";
 import type { SetupState } from "./state";
 import { hostname as osHostname } from "node:os";
-import { detectDistro, corePackages, installCmd, refreshCmd } from "./distro";
+import { detectDistro, corePackages, installCmd, optionalPackages, refreshCmd } from "./distro";
 import { installBrowser } from "./browser";
 import { loadState, saveState } from "./state";
 import { renderAgentToml } from "./config";
 import { agentVersion } from "../version";
 import {
   AGENT_SERVICE,
+  CEC_UDEV_RULES_PATH,
   COMPOSITOR_LAUNCHER,
   REBOOT_PATH_UNIT,
   REBOOT_REQUEST_DIR,
@@ -31,6 +32,7 @@ import {
   SESSION_TARGET,
   SYSTEM_UNIT_DIR,
   agentServiceUnit,
+  cecUdevRules,
   compositorLauncher,
   greetdConfig,
   i3Config,
@@ -142,6 +144,9 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   // has none, and this image ships neither sudo nor polkit. See templates.ts for why a path unit.
   writeRebootHelper(sys, opts, log, assumptions);
 
+  // 5c ─ HDMI-CEC device access (POL-101): the second rung of panel power, if this box has an adapter.
+  writeCecUdevRule(sys, log, assumptions);
+
   // 6 ─ /etc/polyptic/agent.toml
   writeAgentConfig(sys, opts, log, needsVerification);
 
@@ -202,6 +207,26 @@ function installDeps(
   const pkgs = corePackages(distro.pm, opts.backend, opts.splash);
   const inst = installCmd(distro.pm, pkgs);
   sys.exec(inst.cmd, inst.args, { desc: `install ${pkgs.join(" ")}`, env });
+
+  // POL-101 — the HDMI-CEC tool-chain, in its OWN transaction and explicitly ALLOWED TO FAIL. CEC is
+  // the second rung of panel power (it powers the display itself down, where DPMS only stops driving
+  // the output); a box without it degrades to DPMS-only, loudly in the log and silently on the glass.
+  // An optional package that can't resolve on this suite/arch must never break the image build.
+  const optional = optionalPackages(distro.pm, opts.backend);
+  if (optional.length > 0) {
+    const optInst = installCmd(distro.pm, optional);
+    const res = sys.exec(optInst.cmd, optInst.args, {
+      desc: `install ${optional.join(" ")} (optional — HDMI-CEC panel power)`,
+      allowFail: true,
+      env,
+    });
+    if (res.code !== 0) {
+      log.info(
+        `HDMI-CEC tools (${optional.join(", ")}) did not install — panel sleep will use DPMS only ` +
+          `(the output goes dark; a display that ignores a dead signal may stay lit). Not fatal.`,
+      );
+    }
+  }
 
   installBrowser(sys, distro, opts, log, needsVerification);
 
@@ -325,6 +350,32 @@ function writeRebootHelper(sys: Sys, opts: SetupOptions, log: Logger, assumption
   assumptions.push(
     `the agent reboots the box by creating ${REBOOT_REQUEST_DIR}/reboot, which ${REBOOT_PATH_UNIT} ` +
       `turns into a root \`systemctl reboot\` — no sudo, no polkit, and no command the agent can choose.`,
+  );
+}
+
+/**
+ * POL-101 — let the unprivileged agent open /dev/cec* (a udev rule handing the node to the `video`
+ * group the kiosk user is already in). Written unconditionally: a box with no CEC adapter has no
+ * device for the rule to match, so it costs nothing, and a box that GROWS an adapter later (a new
+ * panel, a USB-CEC dongle) then works without a re-provision.
+ */
+function writeCecUdevRule(sys: Sys, log: Logger, assumptions: string[]): void {
+  log.step("write the HDMI-CEC udev rule");
+  sys.writeFile(CEC_UDEV_RULES_PATH, cecUdevRules(), {
+    mode: 0o644,
+    desc: "HDMI-CEC device access for the kiosk user",
+  });
+  // Best-effort: the rule takes effect on the next boot (or hot-plug) regardless, and a chroot build
+  // host has no udev running at all — so a failure here is never fatal.
+  sys.exec("udevadm", ["control", "--reload-rules"], { desc: "reload udev rules", allowFail: true });
+  sys.exec("udevadm", ["trigger", "--subsystem-match=cec"], {
+    desc: "apply the rule to any CEC device already present",
+    allowFail: true,
+  });
+  assumptions.push(
+    `HDMI-CEC (panel standby/wake on the display itself) is available only if this box HAS a CEC ` +
+      `adapter; ${CEC_UDEV_RULES_PATH} grants the kiosk user access to it via the 'video' group. ` +
+      `Without an adapter, panels still sleep via DPMS — the agent probes and reports which it has.`,
   );
 }
 

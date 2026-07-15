@@ -90,6 +90,94 @@ body {
   animation: badge-blink 1.6s steps(1, end) infinite;
 }
 
+/* POL-108 — live streams.
+
+   The <video> is fed by MSE (hls.js), so it has no src to speak of; it is sized like any other media
+   (span/zoom inline styles override the 100% box for a video-wall slice). */
+.surface-stream {
+  background: #05070a;
+}
+
+/* The board a live surface shows whenever frames are NOT arriving — connecting, reconnecting, dead.
+   It sits over the (frozen or empty) element when the surface is painted, and IS the region when the
+   prober has cleared it. Static by construction: the wall-chrome motion rules (D66) forbid animating
+   opacity/transform/filter and forbid continuous repaints — the only motion is the dot's discrete
+   visibility blink (two repaints a second, no layer promotion). */
+.stream-board {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 4%;
+  text-align: center;
+  background: #0b0f14;
+  color: #cdd7e2;
+}
+
+/* Painted-but-unhealthy: a veil over the last frame, so the frame is still legible underneath (a
+   frozen camera image is evidence) while the words say it is not live. */
+.stream-board--overlay {
+  background: rgba(8, 12, 18, 0.82);
+}
+
+.stream-board-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stream-board-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #8a93a0;
+  flex: none;
+}
+
+.stream-board-dot--connecting,
+.stream-board-dot--recovering {
+  background: #f2c14e;
+  animation: badge-blink 1s steps(1, end) infinite;
+}
+
+.stream-board-dot--down {
+  background: #e0533d;
+}
+
+.stream-board-title {
+  font-size: clamp(14px, 2.2vw, 30px);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: #e8eef5;
+}
+
+.stream-board-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: clamp(11px, 1.2vw, 16px);
+  color: #9fb0c0;
+  word-break: break-all;
+}
+
+.stream-board-detail {
+  max-width: 90%;
+  font-size: clamp(11px, 1.1vw, 15px);
+  line-height: 1.4;
+  color: #7f8b99;
+}
+
+/* POL-18 — an agent-placed WINDOW surface: the region under a top-level browser window the agent
+   floats over the player. A plain dark rectangle, no dot, no motion — the window ABOVE is the
+   content, and anything animated here would peek out during the window's launch/respawn. */
+.surface-window-hole {
+  width: 100%;
+  height: 100%;
+  background: #0b0f14;
+}
+
 /* Playlist (POL-34): the NEXT entry pre-warming invisibly behind the current one, so a rotation
    swaps without flashing a blank region. Same box as the content, just never seen or clicked. */
 .playlist-preload {

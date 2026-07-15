@@ -53,6 +53,18 @@ export interface SurfaceTarget {
   url: string;
 }
 
+/** What the prober currently believes about a surface's URL (POL-94). `unknown` = never concluded
+ *  anything yet (first probe still in flight) — it is never REPORTED, only an initial value. */
+export type SurfaceHealth = "unknown" | "reachable" | "unreachable";
+
+/** One health conclusion, emitted only when a surface's state CHANGES (POL-94). */
+export interface SurfaceHealthChange {
+  id: string;
+  url: string;
+  state: "reachable" | "unreachable";
+  detail?: string;
+}
+
 export interface SurfaceProberOptions {
   /** Point the element at a proven URL (mount it if this surface was dark). */
   paint: (id: string, url: string) => void;
@@ -62,6 +74,16 @@ export interface SurfaceProberOptions {
   reload: (id: string) => void;
   /** Reachability oracle; resolves = reachable. Injected for tests. */
   probe?: (url: string) => Promise<void>;
+  /** POL-108 — a probe FAILED (with how many in a row, and why). The prober itself needs no such
+   *  hook: it just keeps trying, calmly, forever. A LIVE surface does — a wall whose camera was
+   *  already unreachable when the box booted would otherwise sit on "Connecting…" for ever, which is
+   *  true but useless. The player turns a repeated failure into "No signal · cannot reach the source"
+   *  on the glass. Optional; nothing else listens. */
+  onProbeFail?: (id: string, attempts: number, error: string) => void;
+  /** POL-94 — the probe's verdict CHANGED for a surface. Fired on transitions only (never per probe,
+   *  never per retry), so reporting a fleet's content health to the control plane is a handful of
+   *  frames rather than a poll. The player forwards these as `player/surface-health`. */
+  onHealth?: (change: SurfaceHealthChange) => void;
   log?: (msg: string) => void;
   probeTimeoutMs?: number;
   probeBackoffMinMs?: number;
@@ -95,6 +117,8 @@ interface SurfaceState {
   errorStreak: number;
   /** Bumped to invalidate in-flight probe results when the surface is retargeted or dropped. */
   seq: number;
+  /** POL-94 — the last verdict REPORTED for this surface (so we only report changes). */
+  health: SurfaceHealth;
   /** Pending probe retry or scheduled verify. */
   timer: ReturnType<typeof setTimeout> | null;
   verifyIdx: number;
@@ -131,6 +155,8 @@ export class SurfaceProber {
   private readonly clearEl: (id: string) => void;
   private readonly reloadEl: (id: string) => void;
   private readonly probe: (url: string) => Promise<void>;
+  private readonly onProbeFail: (id: string, attempts: number, error: string) => void;
+  private readonly onHealth: (change: SurfaceHealthChange) => void;
   private readonly log: (msg: string) => void;
   private readonly backoffMinMs: number;
   private readonly backoffMaxMs: number;
@@ -145,6 +171,8 @@ export class SurfaceProber {
     this.clearEl = opts.clear;
     this.reloadEl = opts.reload;
     this.probe = opts.probe ?? defaultProbe(opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
+    this.onProbeFail = opts.onProbeFail ?? ((): void => {});
+    this.onHealth = opts.onHealth ?? ((): void => {});
     this.log = opts.log ?? ((): void => {});
     this.backoffMinMs = opts.probeBackoffMinMs ?? PROBE_BACKOFF_MIN_MS;
     this.backoffMaxMs = opts.probeBackoffMaxMs ?? PROBE_BACKOFF_MAX_MS;
@@ -173,6 +201,7 @@ export class SurfaceProber {
           attempts: 0,
           errorStreak: 0,
           seq: 0,
+          health: "unknown",
           timer: null,
           verifyIdx: 0,
           lastReloadAt: Number.NEGATIVE_INFINITY,
@@ -186,6 +215,9 @@ export class SurfaceProber {
         state.phase = "proving";
         state.attempts = 0;
         state.errorStreak = 0;
+        // A new URL is a new question: whatever we knew about the old one says nothing about this
+        // one, and the console must not keep showing the old verdict against the new address.
+        state.health = "unknown";
         this.log(`${id}: url changed — proving ${redactUrl(url)} (previous content stays up meanwhile)`);
         void this.prove(id, "url change");
       }
@@ -208,6 +240,7 @@ export class SurfaceProber {
     state.attempts = 0;
     const delay = Math.min(this.backoffMaxMs, this.errorRetryMinMs * 2 ** (state.errorStreak - 1));
     this.log(`${id}: element failed to load (streak ${state.errorStreak}) — re-proving in ${delay}ms`);
+    this.setHealth(id, state, "unreachable", "element failed to load");
     state.timer = setTimeout(() => {
       state.timer = null;
       void this.prove(id, "element error");
@@ -217,7 +250,11 @@ export class SurfaceProber {
   /** The element finished a real load — media only calls this on genuine success. */
   elementLoaded(id: string): void {
     const state = this.surfaces.get(id);
-    if (state) state.errorStreak = 0;
+    if (!state) return;
+    state.errorStreak = 0;
+    // The element that was failing has now loaded for real — the surface is healthy again, and this
+    // is the ONLY signal that can say so (the probe never disproved the URL; the element did).
+    if (state.paintedUrl !== null) this.setHealth(id, state, "reachable");
   }
 
   /**
@@ -252,6 +289,21 @@ export class SurfaceProber {
     }, this.recheckDebounceMs);
   }
 
+  /**
+   * POL-94 — every surface's CURRENT verdict (skipping those with none yet). The player re-sends
+   * this whenever its socket (re)opens: the server forgets a screen's health the moment it drops, so
+   * without a replay a reconnected wall showing a dead dashboard would read "unknown" in the console
+   * until the URL happened to change state again — which, for a URL that is simply dead, is never.
+   */
+  snapshot(): SurfaceHealthChange[] {
+    const out: SurfaceHealthChange[] = [];
+    for (const [id, state] of this.surfaces) {
+      if (state.health === "unknown") continue;
+      out.push({ id, url: state.url, state: state.health });
+    }
+    return out;
+  }
+
   stop(): void {
     this.stopped = true;
     if (this.recheckTimer) clearTimeout(this.recheckTimer);
@@ -260,6 +312,19 @@ export class SurfaceProber {
   }
 
   // ── internals ───────────────────────────────────────────────────────────────
+
+  /** Report a verdict — but only when it CHANGES. A URL that has been dead for a week costs one
+   *  frame, not one per retry; a healthy wall costs none at all. */
+  private setHealth(
+    id: string,
+    state: SurfaceState,
+    next: "reachable" | "unreachable",
+    detail?: string,
+  ): void {
+    if (state.health === next) return;
+    state.health = next;
+    this.onHealth({ id, url: state.url, state: next, ...(detail ? { detail } : {}) });
+  }
 
   private drop(id: string): void {
     const state = this.surfaces.get(id);
@@ -301,6 +366,8 @@ export class SurfaceProber {
       this.log(
         `${id}: probe of ${redactUrl(url)} failed (${describeError(error)}) — retry ${current.attempts} in ${delay}ms [${why}]`,
       );
+      this.onProbeFail(id, current.attempts, describeError(error));
+      this.setHealth(id, current, "unreachable", describeError(error).slice(0, 200));
       current.timer = setTimeout(() => {
         current.timer = null;
         void this.prove(id, why);
@@ -310,6 +377,11 @@ export class SurfaceProber {
 
     const attempts = current.attempts;
     current.attempts = 0;
+    // "The URL is fetchable" is only good news if the ELEMENT isn't currently failing on it: a 404
+    // image or an undecodable video probes perfectly and still shows a broken icon on the wall. While
+    // an error streak is open, the element's own verdict outranks the probe's — `elementLoaded`
+    // (a real, successful load) is what clears it.
+    if (current.errorStreak === 0) this.setHealth(id, current, "reachable");
     if (current.paintedUrl === url) {
       // The element already shows this URL; reachable again ≠ the element survived the outage.
       current.phase = "verifying";
@@ -357,11 +429,13 @@ export class SurfaceProber {
       this.log(
         `${id}: verify probe failed (${describeError(error)}) — the network moved after paint; re-proving`,
       );
+      this.setHealth(id, current, "unreachable", describeError(error).slice(0, 200));
       current.phase = "proving";
       current.attempts = 0;
       void this.prove(id, "verify failed");
       return;
     }
+    this.setHealth(id, current, "reachable");
     current.verifyIdx += 1;
     this.scheduleVerify(id, current);
   }

@@ -46,7 +46,13 @@
 #   POLYPTIC_BASE=http://10.0.0.5:8080 POLYPTIC_TOKEN=fleet-token deploy/build-boot-medium.sh
 #     env: POLYPTIC_BASE   (required) PLAIN http; baked into stage 1 AND the local menu
 #          POLYPTIC_TOKEN  (recommended) enrolment token for the LOCAL menu; without it the local
-#                          path only enrols on an OPEN-enrolment control plane (loud warning)
+#                          path only enrols on an OPEN-enrolment control plane (loud warning).
+#                          POL-104: a deployment now holds SEVERAL named tokens and exactly one is
+#                          flagged "On new media" in Console ▸ Settings ▸ Enrolment tokens — that is
+#                          the one `/boot/grub.cfg` bakes, and the helm bake Job lifts it straight out
+#                          of that menu, so the medium picks up the operator's choice with no change
+#                          here. Pass POLYPTIC_TOKEN explicitly to bake a DIFFERENT token (e.g. a
+#                          short-lived, capped batch token cut for one site's sticks).
 #          LEAN=1          ESCAPE HATCH, opt-in only (POL-122): the old v1 medium — tiny, tokenless,
 #                          WIRED-ONLY (no payload, no Wi-Fi). Nothing selects it automatically any
 #                          more (the helm Job used to, on a fresh install, and quietly shipped every

@@ -30,7 +30,7 @@ describe("kiosk video decode", () => {
 });
 
 /**
- * Cast hardware-decode packages (POL-144/D120 regression).
+ * Cast hardware-decode packages (POL-144/D135 regression).
  *
  * A real iPhone mirror came through torn and banded on an Intel wall box: the image shipped the
  * GStreamer `va` decode plugin (in plugins-bad) but no VA DRIVER, so UxPlay's decodebin fell back to

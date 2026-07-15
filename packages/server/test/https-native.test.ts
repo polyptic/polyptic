@@ -28,6 +28,9 @@ import { CaptureCoordinator, ThumbnailStore } from "../src/capture";
 import { DevtoolsRelay } from "../src/devtools-relay";
 import { Enrollment } from "../src/enroll";
 import { AgentHub, PlayerHub } from "../src/hub";
+import { PanelPowerScheduler } from "../src/panel-power";
+import { PlayerAuth } from "../src/player-auth";
+import { SourceHealthTracker } from "../src/source-health";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 import { attachWebSockets } from "../src/ws";
@@ -103,6 +106,7 @@ describe("native TLS on the main listener (POL-70/D89)", () => {
       control,
       enrollment: new Enrollment(undefined), // open mode: hello → auto-approved, no token needed
       auth: { enabled: false } as unknown as AuthService,
+      playerAuth: await PlayerAuth.init(store, false, noopLog),
       hub,
       agentHub,
       adminHub,
@@ -110,7 +114,9 @@ describe("native TLS on the main listener (POL-70/D89)", () => {
       broadcaster,
       activity,
       capture,
+      health: new SourceHealthTracker(),
       devtoolsRelay: new DevtoolsRelay(agentHub, control, presence, activity, noopLog),
+      panelPower: new PanelPowerScheduler({ control, agentHub, presence, activity, broadcaster, log: noopLog }),
       log: noopLog,
       allowedOrigins: [],
     });

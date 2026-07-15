@@ -6,7 +6,8 @@
 # every input path (the cmdline, the DMI uuid, the console) is an env-overridable fixture.
 #
 # What this pins is the bug the file exists for: a box whose medium pins a build the depot has pruned
-# must BOOT (on the active image, loudly) — while a box whose pin is fine must be affected in no way
+# must BOOT (on the active image, loud on the console and off-box but quiet on the splash, POL-140)
+# — while a box whose pin is fine must be affected in no way
 # at all, and a box whose depot is simply unreachable must keep the old retry-the-pin behaviour rather
 # than be told a lie about pruning. Also wrapped by a bun test (packages/e2e/netboot-pinned-fallback.test.ts)
 # so it runs in `bun test` / CI.
@@ -30,7 +31,7 @@ mkdir -p "$BIN"
 # $STUB/manifest: the body of manifest.json (absent → the depot 404s it)
 # $STUB/down    : present → every request fails like a dead network (curl exit 7), NOT a 404
 # $STUB/probes  : every probed URL, in order        $STUB/reports: every POSTed body + headers
-# $STUB/plymouth: every splash message raised
+# $STUB/plymouth: every splash message raised (must stay empty — POL-140 keeps the glass quiet)
 
 cat > "$BIN/curl" << 'EOF'
 #!/bin/sh
@@ -145,8 +146,8 @@ serve "$ACTIVE_URL" "$ROOT_URL" # the pin is gone; everything else is there
 manifest "$ACTIVE_ID"
 out="$(resolve "livenet:$PIN_URL")"
 eq "pruned pin → livenet is re-pointed at the active build" "livenet:$ACTIVE_URL" "$out"
-has "pruned pin → the splash says so, in plain English" \
-  "The OS image this screen was set up with is gone" "$(file "$STUB/plymouth")"
+eq "pruned pin → nothing on the splash (POL-140: a standard startup, as far as the room knows)" \
+  "" "$(file "$STUB/plymouth")"
 has "pruned pin → the console names BOTH build ids" "$PINNED_ID" "$(file "$STUB/console")"
 has "pruned pin → the console names the image it booted instead" "$ACTIVE_ID" "$(file "$STUB/console")"
 has "pruned pin → reported off-box under the POL-116 code" \
@@ -165,8 +166,7 @@ setup
 serve "$ROOT_URL" # no manifest fixture → the depot 404s manifest.json
 out="$(resolve "livenet:$PIN_URL")"
 eq "no manifest → livenet falls back to the unpinned arch root" "livenet:$ROOT_URL" "$out"
-has "no manifest → still loud on the splash" \
-  "starting the newest one" "$(file "$STUB/plymouth")"
+eq "no manifest → still nothing on the splash (POL-140)" "" "$(file "$STUB/plymouth")"
 has "no manifest → still reported off-box" '"code":"pinned-build-missing"' "$(file "$STUB/reports")"
 
 # ─── 4) The manifest names a build whose mirror is ALSO gone → the arch root ────────────────────────

@@ -6,17 +6,24 @@
  * deep-cloned on the way in and out so callers can never mutate the store's copy by reference —
  * mirroring the isolation a real database gives you.
  */
-import type { EnrollmentStatus } from "@polyptic/protocol";
+import type { EnrollmentStatus, OperatorRole } from "@polyptic/protocol";
 import type {
   PersistedBootstrap,
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedBootOrderPolicy,
+  PersistedDaypart,
   PersistedDisplaySettings,
+  PersistedPanelPower,
+  PersistedSchedule,
+  PersistedSchedulerSettings,
   PersistedImageRollout,
+  PersistedEnrollmentToken,
   PersistedMachine,
   PersistedAgentMtlsPosture,
   PersistedMtlsCa,
+  PersistedPreRegistration,
   PersistedServerTls,
   PersistedMural,
   PersistedPlacement,
@@ -26,6 +33,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedAudioPreference,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -34,8 +42,8 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-/** Composite key for a zoom preference — the pair (target, content) it is remembered against. The
- *  separator can't appear in an id, so no pair can collide with another. */
+/** Composite key for a zoom / audio preference — the pair (target, content) it is remembered against.
+ *  The separator can't appear in an id, so no pair can collide with another. */
 function zoomKey(targetId: string, sourceKey: string): string {
   return `${targetId}\u0000${sourceKey}`;
 }
@@ -53,16 +61,28 @@ export class MemoryStore implements Store {
   private readonly contentSources = new Map<string, PersistedContentSource>();
   /** Keyed by scene id — saved wall snapshots (Phase 3d). */
   private readonly scenes = new Map<string, PersistedScene>();
+  /** Keyed by daypart id — the named windows of the day (POL-89). */
+  private readonly dayparts = new Map<string, PersistedDaypart>();
+  /** Keyed by schedule id — scene ⇄ daypart bindings (POL-89). */
+  private readonly schedules = new Map<string, PersistedSchedule>();
+  /** Deployment-wide scheduler settings (POL-89), undefined until first changed. */
+  private schedulerSettings: PersistedSchedulerSettings | undefined;
   /** Keyed by profile id — credential profiles for content auth (POL-24). */
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
   private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
+  /** Keyed by `<targetId>\0<sourceKey>` — remembered audio intent per pair (POL-112). */
+  private readonly audioPreferences = new Map<string, PersistedAudioPreference>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
   private readonly sessions = new Map<string, PersistedSession>();
   /** The enrollment bootstrap (mode + token), seeded on first boot. */
   private bootstrap: PersistedBootstrap | undefined;
+  /** Keyed by token id — the POL-104 enrolment tokens (insertion-ordered). */
+  private readonly enrollmentTokens = new Map<string, PersistedEnrollmentToken>();
+  /** Keyed by record id — the POL-104 pre-registrations (insertion-ordered). */
+  private readonly preRegistrations = new Map<string, PersistedPreRegistration>();
   /** The mTLS agent CA (POL-25), generated on the first boot with AGENT_MTLS_PORT set. */
   private mtlsCa: PersistedMtlsCa | undefined;
   /** The require-mTLS posture (POL-134), written by auto-promotion or a pinned env. */
@@ -71,7 +91,10 @@ export class MemoryStore implements Store {
   private playerTokenSecret: string | undefined;
   /** Fleet-wide display settings (POL-6), undefined until first changed. */
   private displaySettings: PersistedDisplaySettings | undefined;
+  private bootOrderPolicy: PersistedBootOrderPolicy | undefined;
   private revision = 0;
+  /** POL-95 — the scene the wall is on (null = none / diverged). */
+  private activeSceneId: string | null = null;
 
   async migrate(): Promise<void> {
     // Nothing to set up for the in-memory store.
@@ -80,6 +103,7 @@ export class MemoryStore implements Store {
   async load(): Promise<PersistedState> {
     return {
       revision: this.revision,
+      activeSceneId: this.activeSceneId,
       machines: [...this.machines.values()].map(clone),
       screens: [...this.screens.values()].map(clone),
       content: [...this.content.values()].map(clone),
@@ -88,8 +112,11 @@ export class MemoryStore implements Store {
       videoWalls: [...this.videoWalls.values()].map(clone),
       contentSources: [...this.contentSources.values()].map(clone),
       scenes: [...this.scenes.values()].map(clone),
+      dayparts: [...this.dayparts.values()].map(clone),
+      schedules: [...this.schedules.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
       zoomPreferences: [...this.zoomPreferences.values()].map(clone),
+      audioPreferences: [...this.audioPreferences.values()].map(clone),
     };
   }
 
@@ -110,6 +137,19 @@ export class MemoryStore implements Store {
     }
   }
 
+  async setMachineTags(id: string, tags: string[]): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) machine.tags = [...tags];
+  }
+
+  async setMachineImage(id: string, imageId: string, at: string): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) {
+      machine.imageId = imageId;
+      machine.imageIdAt = at;
+    }
+  }
+
   async deleteMachine(id: string): Promise<void> {
     this.machines.delete(id);
     // Cascade the machine's screens + their content + placements (defensive — the control plane also
@@ -120,6 +160,7 @@ export class MemoryStore implements Store {
       this.content.delete(screenId);
       this.placements.delete(screenId);
       this.dropZoomPreferences(screenId);
+      this.dropAudioPreferences(screenId);
     }
   }
 
@@ -141,6 +182,10 @@ export class MemoryStore implements Store {
 
   async setRevision(revision: number): Promise<void> {
     this.revision = revision;
+  }
+
+  async setActiveSceneId(sceneId: string | null): Promise<void> {
+    this.activeSceneId = sceneId;
   }
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────
@@ -233,6 +278,26 @@ export class MemoryStore implements Store {
     }
   }
 
+  // ── Audio preferences (POL-112) ──────────────────────────────────────────────
+
+  async upsertAudioPreference(pref: PersistedAudioPreference): Promise<void> {
+    this.audioPreferences.set(zoomKey(pref.targetId, pref.sourceKey), clone(pref));
+  }
+
+  async deleteAudioPreferencesForTarget(targetId: string): Promise<void> {
+    this.dropAudioPreferences(targetId);
+  }
+
+  async listAudioPreferences(): Promise<PersistedAudioPreference[]> {
+    return [...this.audioPreferences.values()].map(clone);
+  }
+
+  private dropAudioPreferences(targetId: string): void {
+    for (const [key, pref] of this.audioPreferences) {
+      if (pref.targetId === targetId) this.audioPreferences.delete(key);
+    }
+  }
+
   // ── Credential profiles (POL-24) ─────────────────────────────────────────────
 
   async upsertCredentialProfile(profile: PersistedCredentialProfile): Promise<void> {
@@ -266,6 +331,40 @@ export class MemoryStore implements Store {
     return [...this.scenes.values()].map(clone);
   }
 
+  // ── Scene scheduler (POL-89) ────────────────────────────────────────────────
+
+  async upsertDaypart(daypart: PersistedDaypart): Promise<void> {
+    this.dayparts.set(daypart.id, clone(daypart));
+  }
+
+  async deleteDaypart(id: string): Promise<void> {
+    this.dayparts.delete(id);
+  }
+
+  async listDayparts(): Promise<PersistedDaypart[]> {
+    return [...this.dayparts.values()].map(clone);
+  }
+
+  async upsertSchedule(schedule: PersistedSchedule): Promise<void> {
+    this.schedules.set(schedule.id, clone(schedule));
+  }
+
+  async deleteSchedule(id: string): Promise<void> {
+    this.schedules.delete(id);
+  }
+
+  async listSchedules(): Promise<PersistedSchedule[]> {
+    return [...this.schedules.values()].map(clone);
+  }
+
+  async getSchedulerSettings(): Promise<PersistedSchedulerSettings | undefined> {
+    return this.schedulerSettings ? clone(this.schedulerSettings) : undefined;
+  }
+
+  async setSchedulerSettings(settings: PersistedSchedulerSettings): Promise<void> {
+    this.schedulerSettings = clone(settings);
+  }
+
   // ── Local operator accounts + sessions (Phase 3f) ────────────────────────────
 
   async getUserByEmail(email: string): Promise<PersistedUser | undefined> {
@@ -291,6 +390,28 @@ export class MemoryStore implements Store {
   async updateUserPassword(id: string, passwordHash: string): Promise<void> {
     const user = this.users.get(id);
     if (user) user.passwordHash = passwordHash;
+  }
+
+  async listUsers(): Promise<PersistedUser[]> {
+    return [...this.users.values()]
+      .map(clone)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  }
+
+  async updateUserRole(id: string, role: OperatorRole): Promise<void> {
+    const user = this.users.get(id);
+    if (user) user.role = role;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    this.users.delete(id);
+    await this.deleteSessionsForUser(id);
+  }
+
+  async countAdmins(): Promise<number> {
+    let n = 0;
+    for (const user of this.users.values()) if (user.role === "admin") n += 1;
+    return n;
   }
 
   async createSession(session: PersistedSession): Promise<void> {
@@ -327,6 +448,32 @@ export class MemoryStore implements Store {
 
   async setBootstrap(bootstrap: PersistedBootstrap): Promise<void> {
     this.bootstrap = clone(bootstrap);
+  }
+
+  // ── Enrolment tokens + pre-registration (POL-104) ────────────────────────────
+
+  async listEnrollmentTokens(): Promise<PersistedEnrollmentToken[]> {
+    return [...this.enrollmentTokens.values()].map(clone);
+  }
+
+  async upsertEnrollmentToken(token: PersistedEnrollmentToken): Promise<void> {
+    this.enrollmentTokens.set(token.id, clone(token));
+  }
+
+  async deleteEnrollmentToken(id: string): Promise<void> {
+    this.enrollmentTokens.delete(id);
+  }
+
+  async listPreRegistrations(): Promise<PersistedPreRegistration[]> {
+    return [...this.preRegistrations.values()].map(clone);
+  }
+
+  async upsertPreRegistration(record: PersistedPreRegistration): Promise<void> {
+    this.preRegistrations.set(record.id, clone(record));
+  }
+
+  async deletePreRegistration(id: string): Promise<void> {
+    this.preRegistrations.delete(id);
   }
 
   // ── mTLS agent CA (POL-25) ───────────────────────────────────────────────────
@@ -391,6 +538,26 @@ export class MemoryStore implements Store {
 
   async setDisplaySettings(settings: PersistedDisplaySettings): Promise<void> {
     this.displaySettings = clone(settings);
+  }
+
+  async getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined> {
+    return this.bootOrderPolicy ? clone(this.bootOrderPolicy) : undefined;
+  }
+
+  async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
+    this.bootOrderPolicy = clone(policy);
+  }
+
+  // ── Panel power (POL-101) ────────────────────────────────────────────────────
+
+  private panelPower: PersistedPanelPower | undefined;
+
+  async getPanelPower(): Promise<PersistedPanelPower | undefined> {
+    return this.panelPower ? clone(this.panelPower) : undefined;
+  }
+
+  async setPanelPower(power: PersistedPanelPower): Promise<void> {
+    this.panelPower = clone(power);
   }
 
   async close(): Promise<void> {

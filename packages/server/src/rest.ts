@@ -21,6 +21,13 @@
  *   POST /api/v1/machines/:machineId/reboot   -> server/reboot to a connected, approved agent;
  *                                                404 unknown; 409 not-approved or offline
  *
+ * POL-103 tags + selector-targeted bulk operations:
+ *   PUT  /api/v1/machines/:machineId/tags     -> replace a machine's whole tag set; 404 unknown
+ *   POST /api/v1/machines/bulk/reboot         -> each takes {selector} (e.g. "tag=atrium") or
+ *   POST /api/v1/machines/bulk/shell             {machineIds}, fans out, and answers a per-machine
+ *   POST /api/v1/machines/bulk/ident             result list. Offline boxes are an OUTCOME, not a
+ *   POST /api/v1/machines/bulk/approve           failed call. 400 if no target is named.
+ *
  * POL-50 operator route:
  *   POST /api/v1/screens/:screenId/inspect    -> server/inspect: pop the kiosk browser's Web Inspector
  *                                                ON that panel; 202 delivered (the agent's ack decides
@@ -30,44 +37,67 @@ import { z } from "zod";
 
 import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
+import { probeFraming } from "./framing";
+import type { PanelPowerScheduler } from "./panel-power";
 
 import {
+  BulkApproveBody,
+  BulkContentBody,
+  BulkIdentBody,
+  BulkOpResponse,
+  BulkRebootBody,
+  BulkShellBody,
   CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
   CreateMuralBody,
+  CreatePreRegistrationBody,
   CreateSceneBody,
   IdentBody,
+  ImportPreRegistrationsBody,
   InspectBody,
+  MoveTargetsBody,
+  PanelHoursBody,
+  PanelPowerBody,
   PlaceScreenBody,
+  UnplaceScreensBody,
+  PreRegistration,
   RebootBody,
   ShellArmBody,
   RenameMachineBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
+  ScreenVariablesBody,
   ServerToAgentApply,
   ServerToAgentInspect,
   ServerToAgentPending,
+  UpdatePanelPowerBody,
   ServerToAgentReboot,
   ServerToAgentRejected,
   ServerToPlayerIdent,
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetAudioBody,
+  SetMachineTagsBody,
   SetZoomBody,
   SetPlaylistEntryZoomBody,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateBootOrderPolicyBody,
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
-import type { Screen, ScreenSlice } from "@polyptic/protocol";
+import type { BulkMachineResult, Screen, ScreenSlice } from "@polyptic/protocol";
 
-import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
+import { appliedCount, fanOut, resolveTarget, unknownIdResults } from "./bulk";
+
+import { MediaTooLargeError, ingestUpload, isFileTooLargeError, kindForMime, readField } from "./media";
+import { parsePreRegistrationCsv } from "./preregistration";
 
 import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
@@ -75,8 +105,10 @@ import type { ControlPlane } from "./state";
 import { pendingUrlFor } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, Presence } from "./admin";
+import type { MediaProber } from "./media-probe";
 import type { MediaStore } from "./media";
 import type { TokenService } from "./tokens";
+import type { SourceHealthTracker } from "./source-health";
 
 /** Phase 7 — where uploaded media lands + how its serve URL is built. Wired from env in index.ts. */
 export interface MediaConfig {
@@ -84,10 +116,15 @@ export interface MediaConfig {
   publicBase: string;
   /** Byte cap enforced on an upload (mirrors the multipart fileSize limit). */
   maxBytes: number;
+  /** POL-109 — the ingest prober (metadata + poster frames + codec validation). Behind the adapter
+   *  seam: this route knows only the interface, and a server with no toolchain still accepts uploads. */
+  prober: MediaProber;
 }
 
 const ScreenParams = z.object({ screenId: z.string().min(1) });
 const MachineParams = z.object({ machineId: z.string().min(1) });
+/** POL-104 — a pre-registration record id. */
+const PreRegistrationParams = z.object({ id: z.string().min(1) });
 const MuralParams = z.object({ id: z.string().min(1) });
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
@@ -95,7 +132,7 @@ const ContentSourceParams = z.object({ id: z.string().min(1) });
 
 /** A plain sentence for each playlist authoring error (POL-34), shown to the operator verbatim. */
 function playlistItemErrorDetail(
-  error: "unknown-item-source" | "nested-playlist" | "item-needs-duration",
+  error: "unknown-item-source" | "nested-playlist" | "live-stream-step" | "item-needs-duration",
   itemSourceId?: string,
 ): string {
   switch (error) {
@@ -103,10 +140,17 @@ function playlistItemErrorDetail(
       return `playlist item references an unknown source: ${itemSourceId}`;
     case "nested-playlist":
       return `a playlist cannot contain another playlist (${itemSourceId})`;
+    case "live-stream-step":
+      return `a playlist cannot contain a live stream — assign it to a screen directly (${itemSourceId})`;
     case "item-needs-duration":
       return `playlist items that are not videos need a duration (${itemSourceId})`;
   }
 }
+/** "1 machine" / "12 machines" — a bulk op leaves ONE activity line, and it counts the blast radius. */
+function countMachines(n: number): string {
+  return `${n} ${n === 1 ? "machine" : "machines"}`;
+}
+
 const CredentialProfileParams = z.object({ id: z.string().min(1) });
 const SceneParams = z.object({ id: z.string().min(1) });
 const SurfacesBody = z.object({ surfaces: z.array(Surface) });
@@ -127,7 +171,60 @@ export function registerRestRoutes(
   presence: Presence,
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
+  /** POL-94 — per-source content health; a deleted source's reports are dropped with it. */
+  health: SourceHealthTracker,
+  panelPower: PanelPowerScheduler,
 ): void {
+  // POL-18 — machines whose placed windows the agent may still be holding. A content change on such
+  // a machine must push a fresh apply even when the new state has none (so the agent tears the
+  // window down); a machine that never had windows skips the extra frame entirely.
+  //
+  // Seeded from REAL placed-window state (not left empty), so a server restart cannot strand a
+  // floating window: control.init() has already hydrated the persisted slices by the time routes
+  // register, so a screen that still holds a `placement: "window"` surface is recorded here up
+  // front — and a later clear/reassign of that screen fires the teardown apply instead of
+  // short-circuiting on an empty Set and leaving the window over empty content.
+  const machinesWithWindows = new Set<string>();
+  for (const machine of control.getMachines()) {
+    const hasWindows = control
+      .assignmentsForMachine(machine.id)
+      .some((a) => (a.windows?.length ?? 0) > 0);
+    if (hasWindows) machinesWithWindows.add(machine.id);
+  }
+
+  /**
+   * POL-18 — keep a machine's agent in step with its screens' WINDOW placements. Content changes
+   * ride the player channel (instant, D5) — but a `placement: "window"` surface is rendered by the
+   * AGENT, so whenever a render might have changed a window set we push a full `server/apply` for
+   * that machine (always the complete per-output list: the agent retires unlisted connectors).
+   * No-op for machines that neither have nor had windows, so the common path costs nothing.
+   */
+  function syncWindowsToAgent(screenId: string): void {
+    const screen = control.getScreen(screenId);
+    if (!screen) return;
+    const assignments = control.assignmentsForMachine(screen.machineId);
+    const hasWindows = assignments.some((a) => (a.windows?.length ?? 0) > 0);
+    if (!hasWindows && !machinesWithWindows.has(screen.machineId)) return;
+    if (hasWindows) machinesWithWindows.add(screen.machineId);
+    else machinesWithWindows.delete(screen.machineId);
+    const apply = ServerToAgentApply.parse({
+      t: "server/apply",
+      revision: control.state.revision,
+      machineId: screen.machineId,
+      screens: assignments,
+    });
+    const delivered = agentHub.send(screen.machineId, apply);
+    fastify.log.info(
+      {
+        event: "apply.windows",
+        machineId: screen.machineId,
+        windows: assignments.flatMap((a) => (a.windows ?? []).map((w) => `${a.connector}:${w.id}`)),
+        delivered,
+      },
+      "pushed window placements to agent",
+    );
+  }
+
   function pushRender(screenId: string, slice: ScreenSlice): number {
     const message = ServerToPlayerRender.parse({
       t: "server/render",
@@ -141,6 +238,8 @@ export function registerRestRoutes(
       slice: control.decorateSliceForSend(slice),
     });
     const delivered = hub.send(screenId, message);
+    // POL-18 — a render change may have added/removed/moved a placed window; tell the agent too.
+    syncWindowsToAgent(screenId);
     fastify.log.info(
       {
         event: "render.push",
@@ -152,6 +251,25 @@ export function registerRestRoutes(
       "pushed render to player(s)",
     );
     return delivered;
+  }
+
+  /**
+   * POL-18 — probe a web/dashboard source's framing headers and store the verdict. When the verdict
+   * changes how the source renders (auto mode), the returned slices are pushed live — the automatic
+   * web → web-window fallback — and the agents of the affected machines get fresh window placements
+   * through pushRender's sync. Fire-and-forget from create/update (a slow target site must never
+   * hold an operator's save hostage); awaited by the explicit re-probe route.
+   */
+  async function probeSourceFraming(sourceId: string, url: string): Promise<void> {
+    const verdict = await probeFraming(url);
+    const result = await control.setSourceFraming(sourceId, verdict);
+    if (!result.changed) return;
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "content-source.framing", sourceId, verdict, screens: result.slices.map((s) => s.screenId) },
+      "framing verdict stored",
+    );
+    broadcaster.broadcast();
   }
 
   /** Fan the current fleet-wide display settings out to EVERY connected player (POL-6). */
@@ -564,6 +682,221 @@ export function registerRestRoutes(
     return { ok: true, machineId: machine.id, shellEnabled: machine.shellEnabled ?? false };
   });
 
+  // ── Tags + selector-targeted bulk operations (POL-103) ──────────────────────
+  //
+  // At fifty boxes every fleet action is fifty clicks. Tags group them ("atrium", "floor:2",
+  // "canary"); a selector (`tag=atrium`, or an AND: `tag=floor:2,tag=canary`) targets a whole group;
+  // the bulk verbs below fan out over it and answer a RESULT PER MACHINE. Three offline boxes are a
+  // reported outcome, not a failed call — partial success is the normal case at this scale.
+  //
+  // Every bulk body must NAME its target (a selector, or an explicit machineIds list). A bulk verb
+  // with no target is a 400 and never means "the whole fleet"; likewise a selector that parses but
+  // matches nothing is an honest `matched: 0`, not a fan-out over everything.
+
+  // PUT /api/v1/machines/:machineId/tags  { tags }  -> replace the machine's whole tag set
+  fastify.put("/api/v1/machines/:machineId/tags", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetMachineTagsBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = await control.setMachineTags(params.data.machineId, body.data.tags);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.tags", machineId: machine.id, tags: machine.tags },
+      "machine tags set",
+    );
+    return { ok: true, machineId: machine.id, tags: machine.tags };
+  });
+
+  /** The one shape every bulk verb answers with (+ its single summarized activity line). */
+  function bulkReply(
+    action: string,
+    target: string,
+    results: BulkMachineResult[],
+    summary: (applied: number) => string,
+  ): unknown {
+    const applied = appliedCount(results);
+    if (applied > 0) activity.push("accent", summary(applied));
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: `machines.bulk.${action}`, target, matched: results.length, applied },
+      "bulk operation fanned out",
+    );
+    return BulkOpResponse.parse({
+      ok: true,
+      action,
+      target,
+      matched: results.length,
+      applied,
+      results,
+    });
+  }
+
+  // POST /api/v1/machines/bulk/reboot  { selector | machineIds, reason? }
+  fastify.post("/api/v1/machines/bulk/reboot", async (request, reply) => {
+    const body = BulkRebootBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const reason = body.data.reason?.trim() || "requested by an operator from the console";
+    const results = await fanOut(resolved.machines, (machine) => {
+      if (machine.status !== "approved") {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "skipped" as const,
+          detail: `${machine.status}, not approved — cannot reboot it`,
+        };
+      }
+      const delivered = agentHub.send(
+        machine.id,
+        ServerToAgentReboot.parse({ t: "server/reboot", reason }),
+      );
+      return delivered === 0
+        ? {
+            machineId: machine.id,
+            label: machine.label,
+            outcome: "offline" as const,
+            detail: "offline — nothing to reboot",
+          }
+        : { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply("reboot", resolved.target, results, (n) => `Rebooting ${countMachines(n)}`);
+  });
+
+  // POST /api/v1/machines/bulk/shell  { selector | machineIds, enabled }  -> arm/disarm a group
+  fastify.post("/api/v1/machines/bulk/shell", async (request, reply) => {
+    const body = BulkShellBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const enabled = body.data.enabled;
+    const results = await fanOut(resolved.machines, async (machine) => {
+      const updated = await control.setShellEnabled(machine.id, enabled);
+      if (!updated) {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "failed" as const,
+          detail: "unknown machine — it may have been removed",
+        };
+      }
+      // Disarming must not leave a terminal open on a box the operator just locked down.
+      if (!enabled) shellRelay.closeMachineSessions(machine.id, "console disabled");
+      return { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply(
+      "shell",
+      resolved.target,
+      results,
+      (n) => `Console ${enabled ? "enabled" : "disabled"} on ${countMachines(n)}`,
+    );
+  });
+
+  // POST /api/v1/machines/bulk/ident  { selector | machineIds, on, ttlMs? }  -> ident a whole group
+  fastify.post("/api/v1/machines/bulk/ident", async (request, reply) => {
+    const body = BulkIdentBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const { on, ttlMs } = body.data;
+    const results = await fanOut(resolved.machines, (machine) => {
+      const screens = control.getScreens().filter((s) => s.machineId === machine.id);
+      if (screens.length === 0) {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "skipped" as const,
+          detail: "no screens yet — nothing to flash",
+        };
+      }
+      let delivered = 0;
+      for (const screen of screens) {
+        delivered += sendIdentPulse(screen, on);
+        if (on && ttlMs) scheduleIdentOff(screen.id, ttlMs);
+      }
+      return delivered === 0
+        ? {
+            machineId: machine.id,
+            label: machine.label,
+            outcome: "offline" as const,
+            detail: "no player connected — nothing to flash",
+          }
+        : { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply("ident", resolved.target, results, (n) => `Ident pulsed on ${countMachines(n)}`);
+  });
+
+  // POST /api/v1/machines/bulk/approve  { selector | machineIds }  -> admit a batch of pending boxes
+  fastify.post("/api/v1/machines/bulk/approve", async (request, reply) => {
+    const body = BulkApproveBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const resolved = resolveTarget(control.getMachines(), body.data);
+    if (!resolved.ok) return reply.code(400).send({ error: resolved.error });
+
+    const results = await fanOut(resolved.machines, async (machine) => {
+      if (machine.status === "approved") {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "skipped" as const,
+          detail: "already approved",
+        };
+      }
+      const result = await control.approveMachine(machine.id);
+      if (!result) {
+        return {
+          machineId: machine.id,
+          label: machine.label,
+          outcome: "failed" as const,
+          detail: "unknown machine — it may have been removed",
+        };
+      }
+      // Live admit: if the agent is connected NOW, push it server/apply for its (new) screens. An
+      // offline box is still APPROVED — it collects its state on its next hello, so this is not an
+      // `offline` outcome, unlike a reboot that was never delivered.
+      agentHub.send(
+        machine.id,
+        ServerToAgentApply.parse({
+          t: "server/apply",
+          revision: control.state.revision,
+          machineId: machine.id,
+          screens: result.assignments,
+        }),
+      );
+      return { machineId: machine.id, label: machine.label, outcome: "applied" as const };
+    });
+    results.push(...unknownIdResults(resolved.unknownIds));
+
+    return bulkReply("approve", resolved.target, results, (n) => `Approved ${countMachines(n)}`);
+  });
+
   // POST /api/v1/screens/:screenId/inspect  { on }  -> pop the Web Inspector ON that panel (POL-50)
   //
   // Not a remote dev-tools tunnel, because there is nothing to tunnel: surf (WebKitGTK, D63) exposes
@@ -632,6 +965,181 @@ export function registerRestRoutes(
     return reply.code(202).send({ ok: true, screenId: screen.id, on: body.data.on, delivered });
   });
 
+  // ── Panel power (POL-101) ─────────────────────────────────────────────────────
+  //
+  // Manual wake/sleep (per screen, and per machine for a whole box's panels) + the daily panel-hours
+  // window. The non-negotiable, restated where it can be violated: a screen that SHOULD be showing
+  // content is never blanked. Nothing below runs on a timer over the wall's state, nothing infers
+  // idleness — a panel goes dark only because an operator said so, or because a window an operator
+  // set says the day is over.
+  //
+  // 202, not 200, for the power routes: the request is DELIVERED, not applied. The agent's
+  // `agent/power-ack` (ws.ts) is what marks a screen asleep, because only the box knows whether the
+  // compositor took the DPMS command and whether the CEC bus answered.
+
+  /**
+   * Deliver one operator power frame for a screen. Note what it does NOT do: it never touches the
+   * scheduler's memory. That is what makes a manual action hold until the next boundary — the
+   * schedule's opinion hasn't changed, so no edge exists and the next tick says nothing (see
+   * panel-power.ts). An operator who wakes a wall for an evening visit gets their evening.
+   */
+  function pushScreenPower(screenId: string, on: boolean): number {
+    const delivered = panelPower.send(screenId, on, "requested by an operator from the console");
+    // Drop any previous refusal so the console shows THIS attempt's outcome, not the last one.
+    if (delivered > 0) presence.setScreenPowerError(screenId, null);
+    return delivered;
+  }
+
+  // POST /api/v1/screens/:screenId/power  { on }  -> wake/sleep ONE panel
+  fastify.post("/api/v1/screens/:screenId/power", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = PanelPowerBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = control.getScreen(params.data.screenId);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+    const machine = control.getMachine(screen.machineId);
+    if (!machine || machine.status !== "approved") {
+      return reply.code(409).send({
+        error: `screen ${screen.id} belongs to a machine that is not approved — cannot power it`,
+      });
+    }
+
+    const delivered = pushScreenPower(screen.id, body.data.on);
+    if (delivered === 0) {
+      return reply
+        .code(409)
+        .send({ error: `${machine.label} is offline — nothing to ${body.data.on ? "wake" : "sleep"}` });
+    }
+    broadcaster.broadcast();
+    return reply.code(202).send({ ok: true, screenId: screen.id, on: body.data.on, delivered });
+  });
+
+  // POST /api/v1/machines/:machineId/power  { on }  -> wake/sleep EVERY panel a box drives (bulk)
+  fastify.post("/api/v1/machines/:machineId/power", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = PanelPowerBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = control.getMachine(params.data.machineId);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+    if (machine.status !== "approved") {
+      return reply
+        .code(409)
+        .send({ error: `machine ${machine.id} is ${machine.status}, not approved — cannot power its panels` });
+    }
+
+    const screens = control.getScreens().filter((s) => s.machineId === machine.id);
+    if (screens.length === 0) {
+      return reply.code(409).send({ error: `${machine.label} drives no screens` });
+    }
+    // One frame per connector — the machine is plumbing, the screens are the subject (D4).
+    let delivered = 0;
+    for (const screen of screens) delivered += pushScreenPower(screen.id, body.data.on);
+    if (delivered === 0) {
+      return reply
+        .code(409)
+        .send({ error: `${machine.label} is offline — nothing to ${body.data.on ? "wake" : "sleep"}` });
+    }
+
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.power", machineId: machine.id, on: body.data.on, screens: screens.length, delivered },
+      body.data.on ? "pushed panel wake to every screen" : "pushed panel sleep to every screen",
+    );
+    return reply.code(202).send({ ok: true, machineId: machine.id, on: body.data.on, delivered });
+  });
+
+  // PUT /api/v1/screens/:screenId/panel-hours  { hours | null }  -> set/clear a screen's daily window
+  //
+  // 200, not 202: this one IS applied here — it changes stored config, not the glass. The window takes
+  // effect at its next boundary, and a screen with NO window (the default, and what every existing
+  // deployment has) is never touched by the scheduler at all.
+  fastify.put("/api/v1/screens/:screenId/panel-hours", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = PanelHoursBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const screen = control.getScreen(params.data.screenId);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    await control.setPanelHours(screen.id, body.data.hours);
+    const hours = body.data.hours;
+    activity.push(
+      "info",
+      hours && hours.enabled
+        ? `Panel hours for ${screen.friendlyName}: ${hours.on}–${hours.off} (${control.getPanelPowerConfig().timezone})`
+        : `Panel hours cleared for ${screen.friendlyName} — it runs 24/7`,
+    );
+    // Bring the screen to where its NEW window says it should be, now, rather than making the operator
+    // wait until tonight to discover whether they typed what they meant. Only when the two disagree:
+    // `desired === asleep` is exactly the mismatch (want-awake-but-asleep, or want-asleep-but-awake).
+    const desired = panelPower.desiredFor(screen.id);
+    if (desired !== null) {
+      if (desired === presence.isScreenAsleep(screen.id)) {
+        panelPower.send(screen.id, desired, "panel hours updated");
+      }
+      // Record the schedule's opinion either way, so the next tick doesn't mistake a stale value for
+      // a boundary and send a redundant frame.
+      panelPower.noteScheduleApplied(screen.id, desired);
+    }
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "screen.panel_hours", screenId: screen.id, hours },
+      "panel hours updated",
+    );
+    return { ok: true, screenId: screen.id, hours: control.getPanelHours(screen.id) ?? null };
+  });
+
+  // GET /api/v1/settings/panel-power -> PanelPowerConfig { timezone }
+  fastify.get("/api/v1/settings/panel-power", async () => control.getPanelPowerConfig());
+
+  // PUT /api/v1/settings/panel-power  { timezone }  -> PanelPowerConfig
+  //
+  // The zone is EXPLICIT by design: the server's own TZ is an accident of where it is hosted, and the
+  // operator's browser is an accident of where they are standing. A wall keeps ITS building's hours.
+  fastify.put("/api/v1/settings/panel-power", async (request, reply) => {
+    const body = UpdatePanelPowerBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    // Validate the zone against the runtime's own tz database — a typo must fail HERE, loudly, not
+    // silently degrade the scheduler to UTC at 19:00 six weeks from now.
+    try {
+      new Intl.DateTimeFormat("en-GB", { timeZone: body.data.timezone });
+    } catch {
+      return reply
+        .code(400)
+        .send({ error: `unknown timezone: ${body.data.timezone} (expected an IANA zone, e.g. Europe/London)` });
+    }
+
+    const config = await control.setPanelTimezone(body.data.timezone);
+    activity.push("info", `Panel-hours timezone set to ${config.timezone}`);
+    broadcaster.broadcast();
+    fastify.log.info({ event: "settings.panel_power.set", timezone: config.timezone }, "panel-power timezone updated");
+    return config;
+  });
+
   // POST /api/v1/screens/:screenId/cast  { enabled }  -> enable/disable casting (POL-119)
   //
   // The persistent per-screen AirPlay-receiver toggle. Persisted first (desired state — an offline
@@ -648,7 +1156,6 @@ export function registerRestRoutes(
     if (!body.success) {
       return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
     }
-
     const screen = await control.setScreenCastEnabled(params.data.screenId, body.data.enabled);
     if (!screen) {
       return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
@@ -682,6 +1189,43 @@ export function registerRestRoutes(
       body.data.enabled ? "casting enabled" : "casting disabled",
     );
     return { ok: true, screen, delivered };
+  });
+
+  // POST /api/v1/screens/:screenId/variables  { variables }  -> per-screen template variables (POL-111)
+  //
+  // The whole map, replaced. Registry metadata (like a rename), so no revision bump — but the screen's
+  // render IS re-pushed at the SAME revision, because what the player should now show HAS changed:
+  // `decorateSliceForSend` re-substitutes the clean, stored templates against the new scope and the
+  // player DOM-diffs the new URL/text in place. No reload, no duplicated source, nothing substituted
+  // written to the DB.
+  fastify.post("/api/v1/screens/:screenId/variables", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = ScreenVariablesBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = await control.setScreenVariables(params.data.screenId, body.data.variables);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    pushRender(screen.id, control.sliceForPlayer(screen.id));
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.variables",
+        screenId: screen.id,
+        // Keys only — a value is operator content and has no business in the logs.
+        keys: Object.keys(screen.variables),
+      },
+      "screen variables set",
+    );
+    return { ok: true, screen };
   });
 
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────
@@ -764,6 +1308,87 @@ export function registerRestRoutes(
       delivered,
       closed,
     };
+  });
+
+  // ── Pre-registration (POL-104) ───────────────────────────────────────────────
+  //
+  // Boxes an operator declares BEFORE they ever boot, so commissioning a rack is a paste rather than
+  // N blind approvals. A record is NOT a credential and admits nothing: it is consulted only after a
+  // hello has already authenticated against a valid enrolment token, and all it decides is the box's
+  // name, its tags, and whether a human has to click Approve.
+
+  // GET /api/v1/pre-registrations -> { records }
+  fastify.get("/api/v1/pre-registrations", async () => ({
+    records: control.listPreRegistrations().map((r) => PreRegistration.parse(r)),
+  }));
+
+  // POST /api/v1/pre-registrations  CreatePreRegistrationBody -> the new record
+  fastify.post("/api/v1/pre-registrations", async (request, reply) => {
+    const body = CreatePreRegistrationBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    if (!body.data.machineId && !body.data.dmiSerial && !body.data.mac) {
+      // A record with no key can never match anything — refuse it rather than let an operator believe
+      // a box is pre-registered when nothing will ever claim it.
+      return reply.code(400).send({ error: "a pre-registration needs a MAC, a DMI serial or a machine id" });
+    }
+    const record = await control.addPreRegistration(body.data);
+    fastify.log.info(
+      { event: "prereg.create", id: record.id, label: record.label, autoApprove: record.autoApprove },
+      "pre-registration created",
+    );
+    broadcaster.broadcast();
+    return { ok: true, record: PreRegistration.parse(record) };
+  });
+
+  // POST /api/v1/pre-registrations/import  { csv, autoApprove } -> { created, errors }
+  //
+  // A CSV paste, because the operator's source of truth is a delivery note or a spreadsheet of MAC
+  // labels. Bad lines are REPORTED with their line number, never silently dropped: a row that vanishes
+  // in a 50-box paste is a box that never auto-approves and nobody knows why.
+  fastify.post("/api/v1/pre-registrations/import", async (request, reply) => {
+    const body = ImportPreRegistrationsBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const parsed = parsePreRegistrationCsv(body.data.csv);
+    const created: PreRegistration[] = [];
+    for (const line of parsed.records) {
+      created.push(
+        await control.addPreRegistration({
+          ...(line.label ? { label: line.label } : {}),
+          tags: line.tags,
+          autoApprove: body.data.autoApprove,
+          ...(line.machineId ? { machineId: line.machineId } : {}),
+          ...(line.dmiSerial ? { dmiSerial: line.dmiSerial } : {}),
+          ...(line.mac ? { mac: line.mac } : {}),
+        }),
+      );
+    }
+    fastify.log.info(
+      { event: "prereg.import", created: created.length, errors: parsed.errors.length },
+      "pre-registrations imported",
+    );
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      created: created.map((r) => PreRegistration.parse(r)),
+      errors: parsed.errors,
+    };
+  });
+
+  // DELETE /api/v1/pre-registrations/:id
+  fastify.delete("/api/v1/pre-registrations/:id", async (request, reply) => {
+    const params = PreRegistrationParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const ok = await control.removePreRegistration(params.data.id);
+    if (!ok) return reply.code(404).send({ error: `unknown pre-registration: ${params.data.id}` });
+    fastify.log.info({ event: "prereg.delete", id: params.data.id }, "pre-registration deleted");
+    broadcaster.broadcast();
+    return { ok: true };
   });
 
   // ── Removal (POL-14) — permanently forget a machine or a single screen ────────
@@ -863,6 +1488,28 @@ export function registerRestRoutes(
     return settings;
   });
 
+  // ── UEFI boot-order policy (POL-115) ──────────────────────────────────────────
+  //
+  // One fleet-wide boolean: may a running box put its own UEFI boot entry back at the head of
+  // BootOrder when the firmware displaces it? Default OFF — a box reports the drift and writes
+  // nothing. Nothing is pushed to boxes here: they read the policy on their own poll (GET
+  // /boot/policy) right before they would act on it, so this route only records the operator's intent.
+
+  // GET /api/v1/settings/boot-order -> BootOrderPolicy { reassert }
+  fastify.get("/api/v1/settings/boot-order", async () => control.getBootOrderPolicy());
+
+  // PUT /api/v1/settings/boot-order  { reassert }  -> BootOrderPolicy
+  fastify.put("/api/v1/settings/boot-order", async (request, reply) => {
+    const body = UpdateBootOrderPolicyBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const policy = await control.setBootOrderPolicy({ reassert: body.data.reassert });
+    fastify.log.info({ event: "settings.boot-order.set", reassert: policy.reassert }, "boot-order policy updated");
+    broadcaster.broadcast();
+    return policy;
+  });
+
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────
   //
   // Murals + placement are spatial layout metadata for the console, not part of any player's render
@@ -942,6 +1589,23 @@ export function registerRestRoutes(
     }
     if (!control.getMural(body.data.muralId)) {
       return reply.code(404).send({ error: `unknown mural: ${body.data.muralId}` });
+    }
+
+    // POL-100 — a member of a combined surface may be nudged around, but never OUT of its wall: a
+    // wall whose members stop forming one contiguous region would span content across canvas nobody
+    // is showing. Refuse the move (nothing is written); the operator splits the wall first.
+    const existing = control.getPlacement(params.data.screenId);
+    const broken = control.wallBrokenByPlacement(params.data.screenId, {
+      x: body.data.x,
+      y: body.data.y,
+      w: body.data.w ?? existing?.w ?? 0,
+      h: body.data.h ?? existing?.h ?? 0,
+    });
+    if (broken) {
+      return reply.code(409).send({
+        error: `moving ${params.data.screenId} there would break up ${broken.name ?? broken.id} — split the surface first, or drag the whole surface`,
+        wallId: broken.id,
+      });
     }
 
     const placement = await control.placeScreen(
@@ -1026,6 +1690,7 @@ export function registerRestRoutes(
       params.data.muralId,
       body.data.memberScreenIds,
       body.data.name,
+      body.data.pack === true,
     );
     if (!result.ok) {
       const status =
@@ -1034,7 +1699,14 @@ export function registerRestRoutes(
           : result.error === "already-combined"
             ? 409
             : 400;
-      return reply.code(status).send({ error: result.error, screenId: result.screenId, wallId: result.wallId });
+      // POL-100 — a gappy selection is refused with a reason the console can act on (offer to pack).
+      const message =
+        result.error === "not-adjacent"
+          ? "those screens don't sit next to each other — close the gaps (pack) or move them together"
+          : result.error;
+      return reply
+        .code(status)
+        .send({ error: result.error, message, screenId: result.screenId, wallId: result.wallId });
     }
 
     // Combining clears the members' previous content — push the (now empty) slice to each player.
@@ -1185,6 +1857,167 @@ export function registerRestRoutes(
     return { ok: true, revision: control.state.revision, slice: result.slice };
   });
 
+  // ── Clearing content + bulk canvas operations (POL-96) ───────────────────────
+  //
+  // "Show nothing" is an intent in its own right: DELETE the content and the screen falls back to the
+  // idle splash (D39) instead of being handed some other page to display. The bulk route is the same
+  // thing across a whole selection — one call, one fan-out, one broadcast, one activity line, so a
+  // 20-screen assign costs the operator one interaction and the control plane one push per player.
+
+  // DELETE /api/v1/screens/:screenId/content  -> clear one screen (409 if it's a wall member)
+  fastify.delete("/api/v1/screens/:screenId/content", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.clearScreenContent(params.data.screenId);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; clear the wall`,
+          wallId: result.wallId,
+        });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "screen.content.clear", screenId: params.data.screenId, revision: control.state.revision },
+      "screen content cleared",
+    );
+    broadcaster.broadcast(); // surfaceCount changed
+    return { ok: true, revision: control.state.revision };
+  });
+
+  // DELETE /api/v1/walls/:wallId/content  -> clear a combined surface (the wall itself survives)
+  fastify.delete("/api/v1/walls/:wallId/content", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const result = await control.clearWallContent(params.data.wallId);
+    if (!result.ok) {
+      return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "wall.content.clear", wallId: params.data.wallId, revision: control.state.revision },
+      "video wall content cleared",
+    );
+    broadcaster.broadcast();
+    return { ok: true, revision: control.state.revision };
+  });
+
+  // POST /api/v1/content/assign  { screenIds, wallIds, content|null }  -> bulk assign OR bulk clear
+  fastify.post("/api/v1/content/assign", async (request, reply) => {
+    const body = BulkContentBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.applyBulkContent(
+      { screenIds: body.data.screenIds, wallIds: body.data.wallIds },
+      body.data.content,
+    );
+    if (!result.ok) {
+      return reply.code(404).send({ error: `unknown content source: ${body.data.content?.sourceId}` });
+    }
+
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      {
+        event: body.data.content ? "content.bulk-assign" : "content.bulk-clear",
+        screens: result.applied.screens,
+        walls: result.applied.walls,
+        skipped: result.skipped.length,
+        revision: control.state.revision,
+      },
+      body.data.content ? "content assigned in bulk" : "content cleared in bulk",
+    );
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      revision: control.state.revision,
+      applied: result.applied,
+      skipped: result.skipped,
+    };
+  });
+
+  // POST /api/v1/screens/unplace  { screenIds }  -> return several screens to the tray in one call
+  fastify.post("/api/v1/screens/unplace", async (request, reply) => {
+    const body = UnplaceScreensBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.unplaceScreens(body.data.screenIds);
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    fastify.log.info(
+      { event: "screen.bulk-unplace", screenIds: result.unplaced },
+      "screens unplaced in bulk",
+    );
+    broadcaster.broadcast();
+    return { ok: true, unplaced: result.unplaced };
+  });
+
+  // POST /api/v1/murals/:muralId/move  { screenIds, wallIds, dx, dy }  -> atomic translate (POL-100)
+  //
+  // A whole combined surface drags as ONE unit (all members shift together) and a keyboard nudge
+  // moves a whole selection — both land here, so the wall's adjacency is re-checked once, against the
+  // finished geometry, and refused before a single row is written if it would break.
+  fastify.post("/api/v1/murals/:muralId/move", async (request, reply) => {
+    const params = MuralIdParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = MoveTargetsBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.moveTargets(
+      params.data.muralId,
+      { screenIds: body.data.screenIds, wallIds: body.data.wallIds },
+      body.data.dx,
+      body.data.dy,
+    );
+    if (!result.ok) {
+      const status =
+        result.error === "unknown-mural" ||
+        result.error === "unknown-screen" ||
+        result.error === "unknown-wall"
+          ? 404
+          : 409;
+      return reply.code(status).send({
+        error:
+          result.error === "breaks-wall"
+            ? `that move would break up the combined surface ${result.wallId} — split it first`
+            : result.error,
+        screenId: result.screenId,
+        wallId: result.wallId,
+      });
+    }
+
+    fastify.log.info(
+      {
+        event: "canvas.move",
+        muralId: params.data.muralId,
+        screens: body.data.screenIds,
+        walls: body.data.wallIds,
+        dx: body.data.dx,
+        dy: body.data.dy,
+      },
+      "canvas selection moved",
+    );
+    // A rigid translation changes no slice (span offsets are union-relative) — no render push needed.
+    broadcaster.broadcast();
+    return { ok: true, placements: result.placements };
+  });
+
   // ── Page zoom (POL-57) ───────────────────────────────────────────────────────
   //
   // Zoom the framed page on a screen or a combined surface. The server remembers the value against
@@ -1267,6 +2100,95 @@ export function registerRestRoutes(
       wallId: params.data.wallId,
       revision: control.state.revision,
       zoom: body.data.zoom,
+      screens: result.slices.map((s) => s.screenId),
+    };
+  });
+
+  // ── Audio (POL-112) ──────────────────────────────────────────────────────────
+  //
+  // Turn the sound on (and set its level) for the audible content on a screen or a combined surface.
+  // Same in-place discipline as zoom: the surface keeps its id, so the player re-applies muted/volume
+  // to the video element it already has — the clip does not restart. The one-unmuted-panel guard for
+  // a wall is enforced in the control plane, not here, so no client can route around it.
+
+  // PUT /api/v1/screens/:screenId/audio  { muted, volume }  (409 if wall member / not audible)
+  fastify.put("/api/v1/screens/:screenId/audio", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetAudioBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenAudio(params.data.screenId, body.data);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; set the wall's audio`,
+          wallId: result.wallId,
+        });
+      }
+      // no-content / not-audible are conflicts with the screen's current state, not bad requests.
+      if (result.error === "no-content" || result.error === "not-audible") {
+        return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.audio",
+        screenId: params.data.screenId,
+        muted: body.data.muted,
+        volume: body.data.volume,
+        revision: control.state.revision,
+      },
+      "screen audio set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's content read-out carries the live audio
+    return { ok: true, revision: control.state.revision, ...body.data };
+  });
+
+  // PUT /api/v1/walls/:wallId/audio  { muted, volume }  -> anchor panel sounds, the rest stay muted
+  fastify.put("/api/v1/walls/:wallId/audio", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetAudioBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallAudio(params.data.wallId, body.data);
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.audio",
+        wallId: params.data.wallId,
+        muted: body.data.muted,
+        volume: body.data.volume,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall audio set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      revision: control.state.revision,
+      ...body.data,
       screens: result.slices.map((s) => s.screenId),
     };
   });
@@ -1424,6 +2346,11 @@ export function registerRestRoutes(
       { event: "content-source.create", sourceId: source.id, kind: source.kind, name: source.name },
       "content source created",
     );
+    // POL-18 — probe the new source's framing in the background; a "blocked" verdict flips its
+    // (auto) placement to a window when it is later assigned. Never blocks the operator's save.
+    if ((source.kind === "web" || source.kind === "dashboard") && source.url) {
+      void probeSourceFraming(source.id, source.url);
+    }
     broadcaster.broadcast();
     return reply.code(201).send({ ok: true, source });
   });
@@ -1464,6 +2391,16 @@ export function registerRestRoutes(
     // Re-resolved every screen/wall showing this source — push the new render to each affected player.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
 
+    // POL-18 — a URL change dropped the stored framing verdict (it described the old address);
+    // re-probe the new one in the background.
+    if (
+      (result.source.kind === "web" || result.source.kind === "dashboard") &&
+      result.source.url &&
+      result.source.framing === undefined
+    ) {
+      void probeSourceFraming(result.source.id, result.source.url);
+    }
+
     fastify.log.info(
       {
         event: "content-source.update",
@@ -1476,6 +2413,26 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return { ok: true, source: result.source, screens: result.slices.map((s) => s.screenId) };
+  });
+
+  // POST /api/v1/content-sources/:id/probe-framing  -> re-run the framing probe NOW (POL-18) and
+  // return the verdict. Awaited on purpose: the console's "re-check" and the e2e suite both want a
+  // deterministic answer, and a single header fetch is cheap.
+  fastify.post("/api/v1/content-sources/:id/probe-framing", async (request, reply) => {
+    const params = ContentSourceParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const source = control.getContentSource(params.data.id);
+    if (!source) {
+      return reply.code(404).send({ error: `unknown content source: ${params.data.id}` });
+    }
+    if ((source.kind !== "web" && source.kind !== "dashboard") || !source.url) {
+      return reply.code(400).send({ error: "only web/dashboard sources have framing to probe" });
+    }
+    await probeSourceFraming(source.id, source.url);
+    const probed = control.getContentSource(params.data.id);
+    return { ok: true, framing: probed?.framing ?? "unknown" };
   });
 
   // DELETE /api/v1/content-sources/:id  -> clear in-use assignments (empty render) + push
@@ -1493,6 +2450,9 @@ export function registerRestRoutes(
     // Phase 7 lifecycle: if this source was backed by an uploaded file, unlink it from the disk volume
     // (a linked / non-uploaded source has nothing on disk → this is a no-op for it).
     const unlinked = await media.deleteBySourceId(params.data.id);
+
+    // POL-94 — the source is gone; so is anything the players ever said about it.
+    health.forgetSource(params.data.id);
 
     // Cleared every screen/wall that was showing this source — push the (now empty) slice to each.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
@@ -1656,6 +2616,27 @@ export function registerRestRoutes(
       throw err;
     }
 
+    // POL-109 — INGEST, before the file is allowed to become a library source: probe it, make its
+    // poster, and refuse a codec/container the wall browser provably cannot decode. A rejected upload
+    // is unlinked and never appears in the library — the whole point is that "it's in your library"
+    // means "it will show on a wall". A server with no toolchain accepts and warns (D129).
+    const ingest = await ingestUpload(mediaConfig.prober, media, record, mediaConfig.publicBase);
+    if (!ingest.ok) {
+      await media.deleteById(record.id);
+      fastify.log.info(
+        {
+          event: "media.rejected",
+          reason: ingest.reason,
+          mime: record.mime,
+          size: record.size,
+          name: originalName,
+        },
+        "media upload rejected by ingest",
+      );
+      activity.push("warn", `Upload rejected: ${name} — ${ingest.message}`);
+      return reply.code(415).send({ error: ingest.message, reason: ingest.reason });
+    }
+
     const url = `${mediaConfig.publicBase}/media/${record.id}`;
     const created = await control.createContentSource({ name, kind, url });
     if (!created.ok) {
@@ -1674,19 +2655,31 @@ export function registerRestRoutes(
         mime: record.mime,
         size: record.size,
         name: source.name,
+        probed: ingest.metadata.probed,
+        ...(ingest.metadata.durationSeconds !== undefined
+          ? { durationSeconds: ingest.metadata.durationSeconds }
+          : {}),
+        ...(ingest.metadata.videoCodec !== undefined ? { videoCodec: ingest.metadata.videoCodec } : {}),
       },
       "media uploaded",
     );
     broadcaster.broadcast();
-    return reply.code(201).send({ ok: true, source });
+    // The created source is re-read so it carries the ingest decoration (`media`) the console renders.
+    const decorated = control.getContentSource(source.id) ?? source;
+    return reply.code(201).send({
+      ok: true,
+      source: decorated,
+      ...(ingest.metadata.warning ? { warning: ingest.metadata.warning } : {}),
+    });
   });
 
   // ── Phase 3d routes (scenes) ──────────────────────────────────────────────────
   //
-  // A scene is a named SNAPSHOT of a mural's whole wall. Saving/renaming/scheduling/deleting a scene is
-  // registry metadata → those routes broadcast a fresh admin/state (which now carries scenes[]). APPLY
-  // re-lays the wall (split/place/move + combine + content), so it ALSO pushes `server/render` to every
-  // affected member's player (the instant path). The schedule time is illustrative — STORED, NOT FIRED.
+  // A scene is a named SNAPSHOT of a mural's whole wall. Saving/renaming/deleting a scene is registry
+  // metadata → those routes broadcast a fresh admin/state (which now carries scenes[]). APPLY re-lays
+  // the wall (split/place/move + combine + content), so it ALSO pushes `server/render` to every
+  // affected member's player (the instant path). WHEN a scene plays lives in `schedule-routes.ts`
+  // (POL-89): dayparts + schedules, resolved by a ticker that calls this same apply path.
 
   // GET /api/v1/scenes -> Scene[]
   fastify.get("/api/v1/scenes", async () => control.getScenes());
@@ -1717,6 +2710,22 @@ export function registerRestRoutes(
     broadcaster.broadcast();
     // Convention: { ok, <resource> } (like murals/walls/sources). api.createScene reads body.scene.
     return reply.code(201).send({ ok: true, scene });
+  });
+
+  // GET /api/v1/scenes/:id/diff  -> the APPLY PREVIEW (POL-95): what applying this scene would change
+  // on its mural (content / placement / combine / split / cleared), computed server-side against the
+  // LIVE wall. Read-only — it changes nothing, and it never gates the apply (which stays one click).
+  fastify.get("/api/v1/scenes/:id/diff", async (request, reply) => {
+    const params = SceneParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+
+    const diff = control.diffScene(params.data.id);
+    if (!diff) {
+      return reply.code(404).send({ error: `unknown scene: ${params.data.id}` });
+    }
+    return reply.send({ ok: true, diff });
   });
 
   // POST /api/v1/scenes/:id/apply  -> re-apply the scene to its mural; push render to every member
@@ -1753,7 +2762,7 @@ export function registerRestRoutes(
     };
   });
 
-  // PATCH /api/v1/scenes/:id  { name?, scheduleAt? }  -> rename and/or set illustrative schedule time
+  // PATCH /api/v1/scenes/:id  { name? }  -> rename a saved scene
   fastify.patch("/api/v1/scenes/:id", async (request, reply) => {
     const params = SceneParams.safeParse(request.params);
     if (!params.success) {
@@ -1770,7 +2779,7 @@ export function registerRestRoutes(
     }
 
     fastify.log.info(
-      { event: "scene.update", sceneId: scene.id, name: scene.name, scheduleAt: scene.scheduleAt ?? null },
+      { event: "scene.update", sceneId: scene.id, name: scene.name },
       "scene updated",
     );
     broadcaster.broadcast();

@@ -39,7 +39,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from "@polyptic/protocol";
-import type { BootReportBody as BootReport } from "@polyptic/protocol";
+import type { BootOrderPolicy, BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
@@ -378,6 +378,33 @@ export function bootReportLine(report: BootReport): { severity: "good" | "warn" 
       }`,
     };
   }
+  // POL-115: boot-order drift. These are NOT install outcomes — they come from a box that is up and
+  // running, watching its own boot path, so they get their own sentences. The wording is the point:
+  // an operator who reads "will boot something else next time" knows a truck roll is coming and can
+  // stop it; "could not install the Polyptic bootloader (boot-order-drift)" would have told them
+  // nothing true.
+  if (report.code === "boot-order-drift") {
+    return {
+      severity: "warn",
+      text: `${who} found its UEFI boot order changed and would boot something else next time${
+        detail ? `: ${detail}` : ""
+      }. Nothing was written — turn on Settings ▸ Boot order ▸ "Re-assert" to let boxes fix this themselves`,
+    };
+  }
+  if (report.code === "boot-order-reasserted") {
+    return {
+      severity: "good",
+      text: `${who} put itself back at the head of its UEFI boot order${detail ? `: ${detail}` : ""}`,
+    };
+  }
+  if (report.code === "boot-order-reassert-failed") {
+    return {
+      severity: "bad",
+      text: `${who} could not put itself back at the head of its UEFI boot order — its firmware keeps winning${
+        detail ? `: ${detail}` : ""
+      }. The boot order is unchanged; fix it in firmware setup`,
+    };
+  }
   const severity = report.code === "ambiguous-esp" || report.code === "not-uefi" ? "warn" : "bad";
   return {
     severity,
@@ -612,6 +639,15 @@ export interface ImageManifestSource {
   manifest(arch: string): Promise<{ arch: string; imageId: string; builtAt: string; sha256: string | null } | null>;
   state(): Promise<{ urgent: boolean }>;
   /**
+   * POL-105 — the manifest for ONE machine, given its tags: the first roll-out ring whose selector
+   * matches wins, everyone else gets the arch's active build. This is what makes `tag=canary` boot a
+   * different build than the rest of the fleet *from the same depot*.
+   */
+  resolveFor(
+    arch: string,
+    tags: readonly string[],
+  ): Promise<{ arch: string; imageId: string; builtAt: string; sha256: string | null; urgent: boolean } | null>;
+  /**
    * Heal the ACTIVE build's `builds/<imageId>/` mirror if the depot lacks it (POL-79). The netboot
    * medium pins `root=live:…/builds/<active-id>/rootfs.squashfs`, so the serve path calls this on a
    * miss to hardlink the mirror from the arch root — no server restart needed. Best-effort and
@@ -628,6 +664,11 @@ export function registerProvisionRoutes(
   onBootReport?: ActivitySink,
   /** POL-92 — called for every depot artifact actually served, for the `/metrics` fetch counter. */
   onDepotFetch?: (arch: string, file: string) => void,
+  /** POL-115 — the fleet's UEFI boot-order policy, served to booted boxes at `GET /boot/policy`. */
+  bootOrderPolicy?: () => BootOrderPolicy | Promise<BootOrderPolicy>,
+  /** POL-105 — the tags a machine carries, for the per-machine manifest. Absent (or an unknown
+   *  machineId) → no tags → no ring can match → the box follows the fleet's active build. */
+  machineTags?: (machineId: string) => readonly string[],
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
 
@@ -728,12 +769,38 @@ export function registerProvisionRoutes(
   //    can only ever produce ONE bounded activity line: the code is a closed enum, `detail` is capped
   //    at 200 chars by the contract, and the bucket below stops a hostile boot network from flooding
   //    the feed. Nothing here mutates the registry. ──
-  const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
-  fastify.post("/boot/report", async (request, reply) => {
+  // ── GET /boot/policy — what a running box may do about its own UEFI boot order (POL-115).
+  //    A box polls this before it touches NVRAM. It is a READ, it carries no secret (one boolean the
+  //    operator set in the console), and it is gated exactly like `/boot/report` — the fleet token in
+  //    GATED mode, ungated in OPEN (dev) mode — because the reporter is the same box, on the same boot
+  //    depot, before any agent session exists.
+  //
+  //    FAIL-SAFE BY CONSTRUCTION: a box that cannot reach this endpoint, or gets a 401, falls back to
+  //    report-only and writes nothing. There is no reachable state in which a control plane going away
+  //    makes a box start editing firmware variables. ──
+  fastify.get("/boot/policy", async (request, reply) => {
     if (!enrollment.open) {
       const provided = bearerToken(request);
       const expected = enrollment.currentToken;
       if (expected === undefined || provided === undefined || !constantTimeEqual(provided, expected)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+    }
+    reply.header("Cache-Control", "no-store");
+    const policy = (await bootOrderPolicy?.()) ?? { reassert: false };
+    return { reassert: policy.reassert };
+  });
+
+  const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
+  fastify.post("/boot/report", async (request, reply) => {
+    if (!enrollment.open) {
+      // POL-104 — ANY token this deployment RECOGNISES passes, including one we have since revoked or
+      // expired. Deliberate: a box booting on a stick whose token was just cut is exactly the box whose
+      // boot report an operator most needs to read, and this route grants no authority — it is a
+      // rate-limited telemetry line that mutates no registry state. Gating it on the CURRENT bake token
+      // (the pre-POL-104 behaviour) would have gone silent on every medium in the field the moment an
+      // operator rotated.
+      if (!enrollment.knowsSecret(bearerToken(request))) {
         return reply.code(401).send({ error: "unauthorized" });
       }
     }
@@ -765,15 +832,25 @@ export function registerProvisionRoutes(
   //    boxes reboot into the image this same depot serves. Netbooted boxes poll this every 5
   //    minutes and reboot when their /etc/polyptic/image-id no longer matches (urgent → now,
   //    else the nightly window). 404 until a POL-41 build publishes an image-id.txt.
+  //
+  //    POL-105 — the box appends `?machineId=<its stable id>` and the answer is resolved FOR THAT
+  //    MACHINE: the first roll-out ring whose POL-103 selector matches its tags wins (`tag=canary` →
+  //    build X), and every other box — including one whose id we do not know, and every pre-POL-105
+  //    box that sends no machineId at all — gets the arch's ACTIVE build, i.e. exactly the previous
+  //    behaviour. Still ungated and still secret-free: a machine id is not a secret (it is derived
+  //    from the box's own DMI/MAC and already rides the boot cmdline), and the worst an attacker can
+  //    learn by guessing one is which build the operator pointed that box at — from a depot that will
+  //    serve them that build anyway. Nothing here mutates the registry.
   fastify.get("/dist/image/:arch/manifest.json", async (request, reply) => {
     if (!imageUpdates) return reply.code(404).send({ error: "image updates not wired" });
     const { arch } = request.params as { arch?: string };
     if (!arch || !ARCH_RE.test(arch)) return reply.code(404).send({ error: "unknown architecture" });
-    const m = await imageUpdates.manifest(arch);
+    const { machineId } = request.query as { machineId?: string };
+    const tags = machineId ? (machineTags?.(machineId) ?? []) : [];
+    const m = await imageUpdates.resolveFor(arch, tags);
     if (!m) return reply.code(404).send({ error: "no published image for this arch" });
-    const { urgent } = await imageUpdates.state();
     reply.header("Cache-Control", "no-store");
-    return { ...m, urgent };
+    return m;
   });
 
   // ── GET /dist/image/:arch/builds/:imageId/:file — one RETAINED build's artifacts (POL-45).
