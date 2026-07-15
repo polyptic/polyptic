@@ -32,6 +32,7 @@ import {
   VideoWall,
   WebSurface,
   Zoom,
+  meaningfulHostname,
 } from "@polyptic/protocol";
 import type {
   ContentKind,
@@ -126,6 +127,21 @@ export type PlayerTokenMinter = (screenId: string) => string;
  *  player app, same base URL; no screen id, because a pending machine has no screens yet. */
 export function pendingUrlFor(machineId: string): string {
   return `${PLAYER_BASE_URL}/?pending=${encodeURIComponent(machineId)}`;
+}
+
+/**
+ * POL-117 — which label a (re)registering machine keeps. An operator's name always wins; a label
+ * that merely equals the machineId (the unnamed sentinel) or a meaningless live-image hostname
+ * adopted before this fix ("localhost.localdomain" on every netbooted box) is NOT an operator name
+ * and never wins. Otherwise adopt the box's hostname when it actually means something, else keep
+ * the machineId sentinel — the console renders that honestly as "Unnamed box", never as a hostname
+ * pretending to identify a panel.
+ */
+function labelForHello(existing: Machine | undefined, input: RegisterMachineInput): string {
+  if (existing && existing.label !== existing.id && meaningfulHostname(existing.label) !== null) {
+    return existing.label;
+  }
+  return meaningfulHostname(input.hostname) ?? input.machineId;
 }
 
 /** One entry of the `server/apply` payload: which screen an output is, and where to point its player. */
@@ -773,9 +789,9 @@ export class ControlPlane {
     const existing = this.machines.get(input.machineId);
     const machine: Machine = {
       id: input.machineId,
-      // An operator rename wins (label diverged from the machineId default); otherwise adopt the box
-      // hostname, so an already-registered machine still UUID-labelled relabels on its next hello.
-      label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
+      // An operator rename wins; a MEANINGFUL box hostname is adopted otherwise (POL-117 — see
+      // labelForHello: `localhost.localdomain` from the shared live image is never a name).
+      label: labelForHello(existing, input),
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
@@ -809,9 +825,9 @@ export class ControlPlane {
     const existing = this.machines.get(input.machineId);
     const machine: Machine = {
       id: input.machineId,
-      // An operator rename wins (label diverged from the machineId default); otherwise adopt the box
-      // hostname, so an already-registered machine still UUID-labelled relabels on its next hello.
-      label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
+      // An operator rename wins; a MEANINGFUL box hostname is adopted otherwise (POL-117 — see
+      // labelForHello: `localhost.localdomain` from the shared live image is never a name).
+      label: labelForHello(existing, input),
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
@@ -1176,6 +1192,28 @@ export class ControlPlane {
     });
     if (previousName !== friendlyName) this.emit("info", `${previousName} renamed`);
     return screen;
+  }
+
+  /**
+   * POL-117 — rename a machine (any machine, any status: naming a still-PENDING box is the point,
+   * because several identical netbooted boxes are indistinguishable exactly while they queue for
+   * approval). Writes `Machine.label` — the same field the hostname used to default into — so the
+   * operator's name simply wins from here on (labelForHello never overwrites a real name).
+   * Registry metadata like renameScreen: write-through, NO revision bump; the caller broadcasts
+   * admin/state so every open console relabels live. Returns the machine, or null if unknown.
+   */
+  async renameMachine(machineId: string, label: string): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+    const previous = machine.label;
+    machine.label = label;
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+    if (previous !== label) {
+      // The previous label may be the unnamed sentinel (= machineId) — say so honestly.
+      const from = previous === machine.id ? "Unnamed box" : previous;
+      this.emit("info", `${from} renamed to ${label}`);
+    }
+    return machine;
   }
 
   /**

@@ -26,6 +26,7 @@ import { ref, computed, watch, onUnmounted } from "vue";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
+import { machineDisplayName } from "../../machine-name";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
 import Toggle from "../Toggle.vue";
@@ -243,7 +244,8 @@ const machineName = computed(() => {
   const s = single.value;
   if (!s) return "";
   const m = store.machineForScreen(s.id);
-  return m ? m.label : s.machineId;
+  // POL-117 — the operator's name, or an honest "Unnamed box · <tail>"; never a live-image hostname.
+  return m ? machineDisplayName(m) : s.machineId;
 });
 
 // ── dev-tools quick-launch (POL-85 — the ⋯ overflow in the single-screen header) ──

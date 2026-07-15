@@ -151,6 +151,13 @@ body {
   text-shadow: 0 2px 40px rgba(255, 255, 255, 0.35);
 }
 
+/* POL-117 — the pre-approval ident flashes the MACHINE ID (a pending box's only identity), which is
+   far longer than a screen's friendly name: smaller type, breakable anywhere, so `dmi-…` ids fit. */
+.pending-ident-name {
+  font-size: 7vw;
+  word-break: break-all;
+}
+
 @keyframes ident-blink {
   0%,
   49.9% {

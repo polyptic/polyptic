@@ -14,6 +14,7 @@ import {
   CreateMuralBody,
   CreateSceneBody,
   IdentBody,
+  RenameMachineBody,
   InspectBody,
   PlaceScreenBody,
   RenameMuralBody,
@@ -222,9 +223,21 @@ export function rejectMachine(machineId: string, reason?: string): Promise<unkno
   );
 }
 
-/** POST /api/v1/machines/:machineId/ident { on, ttlMs? } — flash every screen the machine drives. */
+/** POST /api/v1/machines/:machineId/ident { on, ttlMs? } — flash every screen the machine drives.
+ *  POL-117: also works on a still-PENDING machine — the server re-points its holding board at the
+ *  flashing variant over the agent channel, so the operator can tell which panel they're approving. */
 export function identMachine(machineId: string, body: IdentBody): Promise<unknown> {
   return send("POST", `/machines/${encodeURIComponent(machineId)}/ident`, IdentBody.parse(body));
+}
+
+/** POST /api/v1/machines/:machineId/rename { label } — name a machine (POL-117). Any status, any
+ *  time; the operator's name replaces the meaningless live-image hostname as the box's identity. */
+export function renameMachine(machineId: string, label: string): Promise<unknown> {
+  return send(
+    "POST",
+    `/machines/${encodeURIComponent(machineId)}/rename`,
+    RenameMachineBody.parse({ label }),
+  );
 }
 
 /**

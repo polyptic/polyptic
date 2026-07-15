@@ -43,11 +43,13 @@ import {
   PlaceScreenBody,
   RebootBody,
   ShellArmBody,
+  RenameMachineBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
   ServerToAgentApply,
   ServerToAgentInspect,
+  ServerToAgentPending,
   ServerToAgentReboot,
   ServerToAgentRejected,
   ServerToPlayerIdent,
@@ -70,6 +72,7 @@ import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from 
 import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
+import { pendingUrlFor } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, Presence } from "./admin";
 import type { MediaStore } from "./media";
@@ -380,7 +383,43 @@ export function registerRestRoutes(
     return { ok: true, screenId: screen.id, on: body.data.on, delivered };
   });
 
+  // POST /api/v1/machines/:machineId/rename  { label }  (POL-117)
+  //
+  // Any machine, any status, any time — naming a still-PENDING box is the point: several identical
+  // netbooted boxes (all hostnamed `localhost.localdomain`) are indistinguishable exactly while they
+  // queue for approval. Registry metadata like a screen rename: no revision bump, no player push —
+  // the admin/state broadcast relabels every open console live.
+  fastify.post("/api/v1/machines/:machineId/rename", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = RenameMachineBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = await control.renameMachine(params.data.machineId, body.data.label);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    fastify.log.info(
+      { event: "machine.rename", machineId: machine.id, label: machine.label },
+      "machine renamed",
+    );
+    broadcaster.broadcast();
+    return { ok: true, machine };
+  });
+
   // POST /api/v1/machines/:machineId/ident  { on, ttlMs? }  -> ident every screen on the machine
+  //
+  // POL-117 — a PENDING machine can ident too, so the operator knows which physical panel they are
+  // approving. It has no screens (no player WS to pulse), so the pulse rides the one channel a
+  // pending box already holds: the agent WS. The server re-sends `server/pending` with `&ident=1`
+  // appended to the holding board's URL; the agent's existing URL-diff handling re-places the board,
+  // which comes up flashing. Deliberately NOT a new pre-approval capability — the box could already
+  // be told to show the pending board, this just varies which face of it.
   fastify.post("/api/v1/machines/:machineId/ident", async (request, reply) => {
     const params = MachineParams.safeParse(request.params);
     if (!params.success) {
@@ -394,6 +433,31 @@ export function registerRestRoutes(
     const machine = control.getMachine(params.data.machineId);
     if (!machine) {
       return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    if (machine.status === "pending") {
+      const sendPendingBoard = (ident: boolean): number =>
+        agentHub.send(
+          machine.id,
+          ServerToAgentPending.parse({
+            t: "server/pending",
+            machineId: machine.id,
+            pendingUrl: pendingUrlFor(machine.id) + (ident ? "&ident=1" : ""),
+          }),
+        );
+      const delivered = sendPendingBoard(body.data.on);
+      if (body.data.on && body.data.ttlMs) {
+        setTimeout(() => {
+          // Re-check the status at fire time: an approve inside the TTL window means the box now
+          // shows real content — a stale pending frame must not drag it back to the holding board.
+          if (control.getMachine(machine.id)?.status === "pending") sendPendingBoard(false);
+        }, body.data.ttlMs);
+      }
+      fastify.log.info(
+        { event: "ident.pending", machineId: machine.id, on: body.data.on, delivered },
+        "pushed pending-board ident to agent",
+      );
+      return { ok: true, machineId: machine.id, on: body.data.on, screens: [], delivered };
     }
 
     const screens = control.getScreens().filter((s) => s.machineId === machine.id);
@@ -474,6 +538,17 @@ export function registerRestRoutes(
     if (!params.success) return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
     const body = ShellArmBody.safeParse(request.body ?? {});
     if (!body.success) return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+
+    // POL-117 — pre-approval, the ONLY thing reachable on a box is its own holding board (the
+    // pending ident). An unapproved box must not be armable for a shell: approval is the trust
+    // boundary, and arming would let a console session reach a terminal on hardware nobody admitted.
+    // (Disarming is always allowed — locking down never needs approval.)
+    const target = control.getMachine(params.data.machineId);
+    if (target && target.status !== "approved" && body.data.enabled) {
+      return reply.code(409).send({
+        error: `machine ${target.id} is ${target.status}, not approved — cannot enable its console`,
+      });
+    }
 
     const machine = await control.setShellEnabled(params.data.machineId, body.data.enabled);
     if (!machine) return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });

@@ -800,12 +800,33 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box. */
+    /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box.
+     *  POL-117: works pre-approval too — the server flips the box's holding board to its flashing
+     *  face over the agent channel. That path re-places the kiosk browser (seconds, not millis), so
+     *  a pending box gets a longer TTL or the flash would be over before the board came back up. */
     async identMachine(id: string): Promise<void> {
+      const pending = this.machines.find((m) => m.id === id)?.status === "pending";
       try {
-        await api.identMachine(id, { on: true, ttlMs: 3000 });
+        await api.identMachine(id, { on: true, ttlMs: pending ? 12000 : 3000 });
       } catch (err) {
         console.error("[console] identMachine failed", err);
+      }
+    },
+
+    /**
+     * Name a machine (POL-117) — any machine, any status. Optimistic like renameScreen; the
+     * authoritative admin/state broadcast (<150ms) then relabels every open console, including the
+     * box's own pending card while it queues for approval.
+     */
+    async renameMachine(id: string, label: string): Promise<void> {
+      const trimmed = label.trim();
+      if (!trimmed) return;
+      const machine = this.machines.find((m) => m.id === id);
+      if (machine) machine.label = trimmed; // optimistic
+      try {
+        await api.renameMachine(id, trimmed);
+      } catch (err) {
+        console.error("[console] renameMachine failed", err);
       }
     },
 

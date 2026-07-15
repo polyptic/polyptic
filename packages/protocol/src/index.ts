@@ -55,9 +55,28 @@ export type KioskBrowser = z.infer<typeof KioskBrowser>;
 export const EnrollmentStatus = z.enum(["pending", "approved", "rejected"]);
 export type EnrollmentStatus = z.infer<typeof EnrollmentStatus>;
 
+/**
+ * POL-117 — is this hostname worth showing a human? Every netbooted box boots the same live image,
+ * so every box reports `localhost.localdomain` — a wall of identical "names" that identify nothing.
+ * Shared by the server (which refuses to ADOPT such a hostname as the machine label) and the console
+ * (which refuses to DISPLAY one that predates the fix), so the two ends can never disagree about
+ * what counts as meaningless. Returns the trimmed hostname when it carries information, else null.
+ */
+export function meaningfulHostname(hostname: string | undefined | null): string | null {
+  const h = hostname?.trim();
+  if (!h) return null;
+  const lower = h.toLowerCase();
+  if (lower === "localhost" || lower === "localhost.localdomain") return null;
+  if (lower.endsWith(".localdomain")) return null;
+  return h;
+}
+
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
+  /** The human name shown in the console. Defaults from the box's reported hostname when that
+   *  hostname means something (see `meaningfulHostname`), else stays = `id` — the "unnamed" sentinel
+   *  the console renders honestly ("Unnamed box"). An operator rename (POL-117) always wins. */
   label: z.string(),
   agentVersion: z.string().optional(),
   backend: DisplayBackend.optional(),
@@ -903,7 +922,13 @@ export const ServerToAgentPending = z.object({
   machineId: z.string().optional(),
   /** POL-46 — a player page to show fullscreen on every output WHILE pending, instead of leaving the
    *  wall black. Optional: an older agent simply ignores it, and a server that cannot resolve a
-   *  player base omits it. */
+   *  player base omits it.
+   *
+   *  POL-117 — pre-approval ident rides THIS frame, deliberately: a pending box holds no screens, so
+   *  there is no player WS to pulse, and the trust model wants nothing new reachable pre-approval.
+   *  The server re-sends `server/pending` with `&ident=1` appended to the URL (and again without it
+   *  to clear); the agent's existing "re-place when the URL changed" handling swaps the board, and
+   *  the pending page renders its flash overlay. No new frame, no new agent code, old agents included. */
   pendingUrl: z.string().optional(),
 });
 
@@ -1513,6 +1538,13 @@ export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
 // REST bodies — admin actions
 export const RenameScreenBody = z.object({ friendlyName: z.string().min(1).max(64) });
 export type RenameScreenBody = z.infer<typeof RenameScreenBody>;
+
+/** POST /api/v1/machines/:id/rename — POL-117. Writes `Machine.label`, the same field the hostname
+ *  used to default into, so an operator name simply WINS over whatever the box reported. Any machine,
+ *  any status, any time — naming is how an operator tells identical netbooted boxes apart, so it must
+ *  work on a still-pending machine too. */
+export const RenameMachineBody = z.object({ label: z.string().trim().min(1).max(64) });
+export type RenameMachineBody = z.infer<typeof RenameMachineBody>;
 
 /** Ident pulse request: flash a screen's friendly name so an operator can map physical panels. */
 export const IdentBody = z.object({

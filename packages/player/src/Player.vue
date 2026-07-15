@@ -103,6 +103,14 @@ function readPendingMachineId(): string {
 }
 
 const pendingMachineId = readPendingMachineId();
+
+/** POL-117 — `&ident=1` alongside `?pending=`: the operator asked this still-pending box to flash so
+ *  they know which physical panel they're approving. The server re-points the holding board at this
+ *  variant over the AGENT channel (a pending box has no player WS), so "ident on" is simply this
+ *  page with the overlay up, and "ident off" is the plain board again. */
+const pendingIdent =
+  pendingMachineId !== "" && new URLSearchParams(window.location.search).get("ident") === "1";
+
 const screenId = readScreenId();
 const playerToken = readPlayerToken();
 
@@ -574,14 +582,20 @@ function connLabel(state: ConnState): string {
     rather than dead, and tells the operator exactly what to do. No WS: a pending machine has no
     screen to subscribe to. The amber dot says "waiting", not "broken".
   -->
-  <IdleSplash
-    v-if="pendingMachineId"
-    :name="pendingMachineId"
-    conn-state="connecting"
-    :version="APP_VERSION"
-    sub="Pending Approval"
-    caption="Approve this machine in Console ▸ Machines"
-  />
+  <template v-if="pendingMachineId">
+    <IdleSplash
+      :name="pendingMachineId"
+      conn-state="connecting"
+      :version="APP_VERSION"
+      sub="Pending Approval"
+      caption="Approve this machine in Console ▸ Machines"
+    />
+    <!-- POL-117 — pre-approval ident: the same flash overlay approved screens get, labelled with the
+         machine id (the one identity a pending box has), so the operator can match panel to card. -->
+    <div v-if="pendingIdent" class="ident" style="background-color: #00c2ff">
+      <span class="ident-name pending-ident-name">{{ pendingMachineId }}</span>
+    </div>
+  </template>
 
   <div v-else-if="!screenId" class="notice">
     <p>

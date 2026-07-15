@@ -25,8 +25,15 @@
   A "Connect a machine" button (and a first-run empty state) opens the cold-start wizard. Screens are
   first-class and named; machines are plumbing — so the rich, per-screen affordances live here.
 
-  Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine, and via
-  ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints, no direct fetch.
+  POL-117 — machines are NAMED here. Every netbooted box reports the hostname
+  `localhost.localdomain`, so the hostname is never the identity: the card shows the operator's name
+  (editable in place via MachineName.vue, on pending and approved cards alike) or an honest
+  "Unnamed box · <id tail>". Pending cards also get an Ident button — the box flashes its holding
+  board so the operator knows which physical panel they're approving.
+
+  Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine /
+  renameMachine, and via ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints,
+  no direct fetch.
 -->
 <script setup lang="ts">
 import { ref, computed, reactive, onMounted, onUnmounted } from "vue";
@@ -35,8 +42,10 @@ import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
 import ScreenRow from "../components/ScreenRow.vue";
 import ColdStartWizard from "../components/ColdStartWizard.vue";
+import MachineName from "../components/MachineName.vue";
 import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
+import { machineDisplayName } from "../machine-name";
 
 const store = useConsoleStore();
 
@@ -70,7 +79,7 @@ function approve(m: MachineView): void {
 }
 
 function reject(m: MachineView): void {
-  const reason = window.prompt(`Reject "${m.label}"? Optionally add a reason (sent to the agent):`);
+  const reason = window.prompt(`Reject "${machineDisplayName(m)}"? Optionally add a reason (sent to the agent):`);
   // Cancel (null) aborts; an empty string rejects without a reason.
   if (reason === null) return;
   void store.rejectMachine(m.id, reason);
@@ -79,7 +88,7 @@ function reject(m: MachineView): void {
 function revoke(m: MachineView): void {
   menuFor.value = null;
   const yes = window.confirm(
-    `Revoke "${m.label}"? Its screens go dark until it is approved again.`,
+    `Revoke "${machineDisplayName(m)}"? Its screens go dark until it is approved again.`,
   );
   if (yes) void store.rejectMachine(m.id);
 }
@@ -97,7 +106,7 @@ function remove(m: MachineView): void {
   const n = m.screens.length;
   const what = n > 0 ? `its ${countLabel(n, "screen")} plus their layout and content` : "it";
   const yes = window.confirm(
-    `Remove "${m.label}"? This permanently forgets the machine and deletes ${what} from the console. ` +
+    `Remove "${machineDisplayName(m)}"? This permanently forgets the machine and deletes ${what} from the console. ` +
       `If it reconnects it will have to be set up again.`,
   );
   if (yes) void store.removeMachine(m.id);
@@ -117,11 +126,11 @@ async function reboot(m: MachineView): Promise<void> {
   const n = m.screens.length;
   const what = n > 0 ? `Its ${countLabel(n, "screen")} go dark` : "It goes dark";
   const yes = window.confirm(
-    `Reboot "${m.label}"? ${what} until it boots back up and reconnects — about a minute.`,
+    `Reboot "${machineDisplayName(m)}"? ${what} until it boots back up and reconnects — about a minute.`,
   );
   if (!yes) return;
   const error = await store.rebootMachine(m.id);
-  showToast(error ?? `Rebooting ${m.label}…`);
+  showToast(error ?? `Rebooting ${machineDisplayName(m)}…`);
 }
 
 // ── Console lifecycle (POL-59 arm/disarm, POL-68 UI) ─────────────────────────
@@ -134,7 +143,7 @@ const enabling = reactive(new Set<string>());
 async function enableConsole(m: MachineView): Promise<void> {
   if (enabling.has(m.id)) return;
   const yes = window.confirm(
-    `Enable the console on "${m.label}"? While enabled, an operator can open an unprivileged ` +
+    `Enable the console on "${machineDisplayName(m)}"? While enabled, an operator can open an unprivileged ` +
       `terminal on this box. It cannot change what the screen displays. Sessions are logged to the ` +
       `activity feed. Disable it when you're done.`,
   );
@@ -245,7 +254,9 @@ function showToast(message: string): void {
                 <div class="machine-id">
                   <div class="machine-id-line">
                     <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
-                    <span class="machine-label">{{ m.label }}</span>
+                    <!-- POL-117 — name it while it queues: pending boxes are exactly when several
+                         identical `localhost.localdomain` machines need telling apart. -->
+                    <MachineName :machine="m" />
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                   <div class="machine-meta">
@@ -253,6 +264,20 @@ function showToast(message: string): void {
                     {{ countLabel(m.outputCount, "screen") }} · {{ lastSeen(m) }}
                   </div>
                 </div>
+                <!-- POL-117 — flash the box's holding board so the operator knows WHICH physical
+                     panel they are approving. Rides the agent channel; needs the box online. -->
+                <button
+                  class="btn-ghost-sm"
+                  :disabled="!m.online"
+                  :title="
+                    m.online
+                      ? 'Flash this box\'s screens so you can tell which panel it is'
+                      : `${machineDisplayName(m)} is offline — nothing to flash`
+                  "
+                  @click="identAll(m)"
+                >
+                  <span class="ident-dot"></span>Ident
+                </button>
                 <button class="btn-remove" @click="remove(m)">Remove</button>
                 <button class="btn-reject" @click="reject(m)">Reject</button>
                 <button class="btn-approve" @click="approve(m)">Approve</button>
@@ -276,7 +301,8 @@ function showToast(message: string): void {
                 <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
                 <div class="machine-id">
                   <div class="machine-id-line">
-                    <span class="machine-label">{{ m.label }}</span>
+                    <!-- POL-117 — the operator's name is the identity; edit in place. -->
+                    <MachineName :machine="m" />
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                 </div>
@@ -302,7 +328,7 @@ function showToast(message: string): void {
                   :title="
                     m.online
                       ? 'Enables an unprivileged debug shell on this box — sessions are logged to the activity feed'
-                      : `${m.label} is offline — the console rides its agent connection`
+                      : `${machineDisplayName(m)} is offline — the console rides its agent connection`
                   "
                   @click="enableConsole(m)"
                 >
@@ -318,7 +344,7 @@ function showToast(message: string): void {
                     :title="
                       m.online
                         ? 'Open a terminal on this machine'
-                        : `${m.label} is offline — the console rides its agent connection`
+                        : `${machineDisplayName(m)} is offline — the console rides its agent connection`
                     "
                     @click="openTerminal(m)"
                   >
@@ -368,7 +394,7 @@ function showToast(message: string): void {
                       <button
                         class="menu-item"
                         :disabled="!m.online"
-                        :title="m.online ? 'Power-cycle this machine' : `${m.label} is offline — nothing to reboot`"
+                        :title="m.online ? 'Power-cycle this machine' : `${machineDisplayName(m)} is offline — nothing to reboot`"
                         @click="reboot(m)"
                       >
                         Reboot
@@ -390,7 +416,7 @@ function showToast(message: string): void {
                   v-for="s in m.screens"
                   :key="s.id"
                   :screen="s"
-                  :machine-label="m.label"
+                  :machine-label="machineDisplayName(m)"
                   :machine-online="m.online"
                   :browser="m.browser"
                   @notify="showToast"
@@ -415,7 +441,8 @@ function showToast(message: string): void {
                 <span class="dot dot-off"></span>
                 <div class="machine-id">
                   <div class="machine-id-line">
-                    <span class="machine-label">{{ m.label }}</span>
+                    <!-- POL-117 — honest fallback; never `localhost.localdomain` posing as a name. -->
+                    <span class="machine-label">{{ machineDisplayName(m) }}</span>
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                   <div class="machine-meta">
@@ -439,7 +466,7 @@ function showToast(message: string): void {
       v-if="terminalFor"
       :key="terminalFor.id"
       :machine-id="terminalFor.id"
-      :machine-label="terminalFor.label"
+      :machine-label="machineDisplayName(terminalFor)"
       @close="terminalFor = null"
     />
 
