@@ -411,6 +411,12 @@ onMounted(() => {
     {
       onMessage: handleMessage,
       onState: (state) => {
+        // Update the reactive state FIRST: everything below (and everything IT calls) must see the
+        // socket's true state. shellServerContact()'s safe-swap gate once read a stale "connecting"
+        // here and deferred a shell update at every contact, forever (caught in review) — the gate
+        // no longer depends on this ordering (serverContact() IS the safe moment), but stale-state
+        // callbacks are a bug class, not a one-off.
+        connState.value = state;
         diag(`player socket ${state}`);
         if (state === "open") {
           // A RECONNECT (not the first connect) means the socket dropped — itself evidence the network
@@ -422,7 +428,6 @@ onMounted(() => {
           // newer build already finished installing, swap into it now (logged in the trail).
           shellServerContact();
         }
-        connState.value = state;
       },
     },
     playerToken,

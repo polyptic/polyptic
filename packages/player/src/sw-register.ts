@@ -71,12 +71,18 @@ export class ShellUpdater {
     this.trySwap();
   }
 
-  /** The server answered (player WS open): revalidate the shell and swap if a newer build waits. */
+  /** The server answered (player WS open): revalidate the shell and swap if a newer build waits.
+   *  Being called IS the safe moment — the swap must not additionally consult `safeToSwap()`,
+   *  which polls reactive state that may not have caught up with the very event that triggered
+   *  this call (the WS open handler once updated its state AFTER calling us: every contact then
+   *  read a stale "connecting" and deferred the swap forever — caught in review; the ordering
+   *  test below pins it). `safeToSwap()` remains the gate for swaps triggered by anything that
+   *  is NOT itself a server contact (e.g. an install completing mid-connection). */
   serverContact(): void {
     void this.registration?.update().catch(() => {
       /* offline / server gone again — the next contact revalidates */
     });
-    this.trySwap();
+    this.trySwap(true);
   }
 
   /**
@@ -90,22 +96,38 @@ export class ShellUpdater {
     this.deps.reload();
   }
 
+  /** The most recent installing worker we wired (guards against double-watching: `attach` and the
+   *  `updatefound` event can both see the same worker object). */
+  private watched: WorkerLike | null = null;
+
   private watchInstalling(): void {
     const installing = this.registration?.installing;
-    if (!installing?.addEventListener) return;
+    if (!installing?.addEventListener || installing === this.watched) return;
+    this.watched = installing;
+    let installed = false;
     installing.addEventListener("statechange", () => {
-      if (installing.state === "installed") this.trySwap();
+      if (installing.state === "installed") {
+        installed = true;
+        this.trySwap();
+      } else if (installing.state === "redundant" && !installed) {
+        // An install that died BEFORE reaching `installed` (a precache fetch failed mid-addAll,
+        // the server vanished, quota). register() resolved long ago, so without this line the
+        // failure is silent — and the wall's next reload-mid-outage is unprotected with no trace.
+        this.deps.log(
+          "shell service worker install FAILED (precache aborted?) — a reload during an outage is not shielded yet; retries on the next update check",
+        );
+      }
     });
   }
 
-  private trySwap(): void {
+  private trySwap(contactNow = false): void {
     if (this.swapRequested) return;
     const waiting = this.registration?.waiting ?? null;
     if (!waiting) return;
     // No controller → nothing is being replaced (cannot happen with a *waiting* worker in a normal
     // life, but guard it: reloading an uncontrolled page buys nothing).
     if (!this.deps.hasController()) return;
-    if (!this.deps.safeToSwap()) {
+    if (!contactNow && !this.deps.safeToSwap()) {
       if (!this.announcedWaiting) {
         this.announcedWaiting = true;
         this.deps.log("shell update installed — waiting for server contact to swap builds");

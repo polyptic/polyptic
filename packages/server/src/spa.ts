@@ -126,11 +126,13 @@ export async function registerSpaHosting(
   const setHeaders = (res: { setHeader(name: string, value: string): void }, filePath: string): void => {
     if (filePath.endsWith(".html")) {
       res.setHeader("Cache-Control", "no-cache");
-    } else if (/[\\/]sw\.js$/.test(filePath)) {
-      // POL-132 — the player's shell service worker. `no-cache` so the browser's update check always
-      // sees the deployed copy (a heuristically-cached sw.js would pin walls to an old build), and
-      // `Service-Worker-Allowed: /player` so it may claim the no-trailing-slash "/player" scope —
-      // wider than its /player/ directory, covering a bare `/player?screen=…` navigation too.
+    } else if (playerDir && /[\\/]sw\.js$/.test(filePath) && filePath.startsWith(playerDir)) {
+      // POL-132 — the PLAYER's shell service worker, matched against the player dist specifically:
+      // a future console sw.js must not silently inherit a "/player" scope grant. `no-cache` so
+      // the browser's update check always sees the deployed copy (a heuristically-cached sw.js
+      // would pin walls to an old build), and `Service-Worker-Allowed: /player` so it may claim
+      // the no-trailing-slash "/player" scope — wider than its /player/ directory, covering a
+      // bare `/player?screen=…` navigation too.
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Service-Worker-Allowed", "/player");
     } else if (/[\\/]assets[\\/]/.test(filePath)) {

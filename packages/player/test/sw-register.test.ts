@@ -2,8 +2,10 @@
  * POL-132 — the page-side update discipline (ShellUpdater), pinned against fakes.
  *
  * The invariants that keep a fleet healthy:
- *   - a newer build NEVER swaps in mid-outage or mid-anything: only at a safe moment (player WS
- *     open — the reload it costs repaints instantly from the last-good slice and reconnects);
+ *   - a newer build NEVER swaps in mid-outage or mid-anything: only at a safe moment — a server
+ *     CONTACT (proof of reachability in itself; it must not re-consult a polled gate that may lag
+ *     the very event that fired it — the review-caught bug), or an install completing while the
+ *     gate reads open (the reload either way repaints instantly from the last-good slice);
  *   - every server contact revalidates (registration.update()), so a wall is never pinned to an
  *     old shell past the next successful contact (D107 version discipline);
  *   - the swap is written to player.diag ("shell from cache (vX) → updating to vY") — D78: the
@@ -75,11 +77,21 @@ describe("ShellUpdater", () => {
     expect(w.posted).toEqual([{ t: "polyptic/skip-waiting" }]);
   });
 
-  test("NOT safe → announces once, waits; the swap happens on the next server contact", async () => {
+  test("install completes with NO contact and the gate closed → announces once, waits", async () => {
     const w = makeWorld({ safe: false });
-    w.registration.waiting = w.waiting;
+    // A background install finishing is not a server contact — it must respect the gate.
     w.updater.attach(w.registration);
-    w.updater.serverContact(); // still offline — no swap, no repeat announcement
+    const listeners: Array<() => void> = [];
+    w.registration.installing = {
+      state: "installing",
+      postMessage: () => {},
+      addEventListener: (_t: string, fn: () => void) => listeners.push(fn),
+    };
+    w.fireUpdatefound();
+    (w.registration.installing as { state?: string }).state = "installed";
+    w.registration.waiting = w.waiting;
+    listeners.forEach((f) => f());
+    listeners.forEach((f) => f()); // a repeat statechange must not repeat the announcement
     await flush();
     expect(w.posted).toHaveLength(0);
     expect(w.log.filter((l) => l.includes("waiting for server contact"))).toHaveLength(1);
@@ -88,7 +100,25 @@ describe("ShellUpdater", () => {
     w.updater.serverContact(); // the safe moment
     await flush();
     expect(w.posted).toEqual([{ t: "polyptic/skip-waiting" }]);
-    expect(w.updateCalls()).toBe(2); // every contact revalidated the registration too
+    expect(w.updateCalls()).toBe(1); // the contact revalidated the registration too
+  });
+
+  // THE REGRESSION PIN (found in review): the WS open handler once called serverContact() BEFORE
+  // updating the reactive state safeToSwap() polls — so at every contact the gate read a stale
+  // "connecting" and the swap deferred forever, while the trail kept claiming it was "waiting for
+  // server contact". A server contact IS the safe moment by definition: it must swap even when the
+  // polled gate hasn't caught up with the event that triggered it.
+  test("a server contact arriving AFTER the worker installed swaps even if the polled gate reads stale", async () => {
+    const w = makeWorld({ safe: false }); // the gate NEVER reads open — the stale-callback world
+    w.registration.waiting = w.waiting; // the new build already finished installing
+    w.updater.attach(w.registration);
+    await flush();
+    expect(w.posted).toHaveLength(0); // attach alone is not a contact — still gated
+
+    w.updater.serverContact(); // WS open: the contact itself is the proof of reachability
+    await flush();
+    expect(w.posted).toEqual([{ t: "polyptic/skip-waiting" }]);
+    expect(w.log.some((l) => l.includes("updating to v2.0.0"))).toBe(true);
   });
 
   test("an unknown next version still swaps, honestly labelled", async () => {
@@ -122,6 +152,41 @@ describe("ShellUpdater", () => {
     w.updater.attach(w.registration);
     await flush();
     expect(w.posted).toHaveLength(0);
+  });
+
+  test("an install that dies before `installed` (precache failed) writes a diag line — never silent", () => {
+    const w = makeWorld();
+    w.updater.attach(w.registration);
+    const listeners: Array<() => void> = [];
+    w.registration.installing = {
+      state: "installing",
+      postMessage: () => {},
+      addEventListener: (_t: string, fn: () => void) => listeners.push(fn),
+    };
+    w.fireUpdatefound();
+    // addAll() rejected mid-outage: the worker goes straight to redundant, register() already
+    // resolved — without the diag line the wall's next reload is unprotected with no trace.
+    (w.registration.installing as { state?: string }).state = "redundant";
+    listeners.forEach((f) => f());
+    expect(w.log.some((l) => l.includes("install FAILED"))).toBe(true);
+  });
+
+  test("a worker that DID install and is later superseded is not misreported as an install failure", () => {
+    const w = makeWorld({ safe: false });
+    w.updater.attach(w.registration);
+    const listeners: Array<() => void> = [];
+    w.registration.installing = {
+      state: "installing",
+      postMessage: () => {},
+      addEventListener: (_t: string, fn: () => void) => listeners.push(fn),
+    };
+    w.fireUpdatefound();
+    (w.registration.installing as { state?: string }).state = "installed";
+    listeners.forEach((f) => f());
+    // …and later an even newer build replaces it while it still waits.
+    (w.registration.installing as { state?: string }).state = "redundant";
+    listeners.forEach((f) => f());
+    expect(w.log.some((l) => l.includes("install FAILED"))).toBe(false);
   });
 
   test("a background install completing (updatefound → installed) triggers the same safe-swap path", async () => {

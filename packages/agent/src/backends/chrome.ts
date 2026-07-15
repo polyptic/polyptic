@@ -93,10 +93,13 @@ export function buildChromeArgs(
   ];
   // POL-132 — the player's shell service worker (what lets a wall RELOAD while the control plane is
   // down and still paint) requires a SECURE CONTEXT, and netboot boxes reach the control plane over
-  // plain HTTP by design (D47/D52). This flag makes Chrome treat exactly the player's own origin as
-  // secure — nothing else changes; an https deploy needs (and gets) no flag. Storage stays in the
-  // per-connector profile above, so the registration survives an agent browser respawn (a REBOOT
-  // wipes XDG_RUNTIME_DIR, which is fine: reboot survival is explicitly out of POL-132's scope).
+  // plain HTTP by design (D47/D52). This flag grants the player's origin the FULL secure-context
+  // treatment — not just service workers but everything gated on it (WebCrypto subtle, geolocation,
+  // getUserMedia, …). Acceptable on a kiosk whose one origin IS the control plane we already trust
+  // with the whole wall; NOT a general browsing flag — which is why it is scoped to exactly this
+  // origin, and only for http (an https deploy needs — and gets — no carve-out). Storage stays in
+  // the per-connector profile above, so the registration survives an agent browser respawn (a
+  // REBOOT wipes XDG_RUNTIME_DIR, which is fine: reboot survival is out of POL-132's scope).
   const playerOrigin = insecurePlayerOrigin(spec.url);
   if (playerOrigin) args.push(`--unsafely-treat-insecure-origin-as-secure=${playerOrigin}`);
   if (spec.extra && spec.extra.length > 0) args.push(...spec.extra);

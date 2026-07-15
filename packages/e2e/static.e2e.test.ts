@@ -55,8 +55,10 @@ const PLAYER_INDEX_HTML = "<!doctype html><html><head><title>polyptic-player</ti
 const CONSOLE_FAVICON_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><!-- CONSOLE_FAVICON_MARKER --></svg>";
 const PLAYER_FAVICON_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><!-- PLAYER_FAVICON_MARKER --></svg>";
 // POL-132 — the player's shell service worker lives at the dist root; its response headers are
-// load-bearing (see the test below).
+// load-bearing (see the tests below). The console copy exists to pin the NEGATIVE: only the
+// player's sw.js may carry the /player scope grant.
 const PLAYER_SW_JS = "/* PLAYER_SW_MARKER */\n";
+const CONSOLE_SW_JS = "/* CONSOLE_SW_MARKER */\n";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -87,6 +89,7 @@ function fabricateSpaRoots(): void {
   writeFileSync(join(consoleDir, "index.html"), CONSOLE_INDEX_HTML, "utf8");
   writeFileSync(join(consoleDir, "assets", "app.js"), CONSOLE_APP_JS, "utf8");
   writeFileSync(join(consoleDir, "favicon.svg"), CONSOLE_FAVICON_SVG, "utf8");
+  writeFileSync(join(consoleDir, "sw.js"), CONSOLE_SW_JS, "utf8");
 
   mkdirSync(playerDir, { recursive: true });
   writeFileSync(join(playerDir, "index.html"), PLAYER_INDEX_HTML, "utf8");
@@ -239,6 +242,19 @@ describe("phase 8 static SPA serving", () => {
       // Allows the worker to claim the no-trailing-slash "/player" scope (wider than its
       // /player/ directory), so a bare `/player?screen=…` navigation is controlled too.
       expect(res.headers.get("service-worker-allowed")).toBe("/player");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a sw.js in the CONSOLE dist does NOT inherit the /player scope grant",
+    async () => {
+      const res = await fetch(`${BASE}/sw.js`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("CONSOLE_SW_MARKER");
+      // The grant is matched against the player dist specifically — a future console worker must
+      // make its own (deliberate) header decision, not silently gain power over /player.
+      expect(res.headers.get("service-worker-allowed")).toBeNull();
     },
     TEST_TIMEOUT,
   );
