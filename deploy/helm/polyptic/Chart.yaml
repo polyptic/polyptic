@@ -26,10 +26,11 @@ maintainers:
   - name: Polyptic Maintainers
     email: maintainers@polyptic.example
 
-# Database: bring your own Postgres via externalDatabase.url / a DATABASE_URL secret (the
-# production norm) — this chart deploys ONLY the server and renders standalone. In-cluster
-# Postgres is OPT-IN: add the Bitnami `postgresql` chart under a `dependencies:` block here,
-# run `helm dependency build`, then set `postgresql.enabled=true`.
+# Database (POL-123/D108): the chart brings its OWN Postgres — a first-party StatefulSet in
+# templates/postgres.yaml, on by default (postgresql.enabled), NOT a subchart. There is
+# deliberately no `postgresql` dependency here: a bundled 60-line StatefulSet has no vendored
+# tarball to keep in step (cf. cert-manager below) and no upgrade path we don't control.
+# Bring-your-own Postgres stays first-class: postgresql.enabled=false + externalDatabase.url.
 #
 # cert-manager (POL-70/D89): condition-gated on letsEncrypt.enabled, so deployments that
 # don't opt in pull nothing extra. The chart tarball is VENDORED under charts/ (and the

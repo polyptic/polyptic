@@ -33,23 +33,29 @@ import type { DevtoolsRelay } from "./devtools-relay";
 import type { PanelPowerScheduler } from "./panel-power";
 
 import {
+  CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
   CreateMuralBody,
+  CreatePreRegistrationBody,
   CreateSceneBody,
   IdentBody,
+  ImportPreRegistrationsBody,
   InspectBody,
   PanelHoursBody,
   PanelPowerBody,
   PlaceScreenBody,
+  PreRegistration,
   RebootBody,
   ShellArmBody,
+  RenameMachineBody,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
   ServerToAgentApply,
   ServerToAgentInspect,
+  ServerToAgentPending,
   UpdatePanelPowerBody,
   ServerToAgentReboot,
   ServerToAgentRejected,
@@ -58,6 +64,7 @@ import {
   ServerToPlayerSettings,
   SetContentBody,
   SetZoomBody,
+  SetPlaylistEntryZoomBody,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -68,10 +75,12 @@ import type { FastifyInstance } from "fastify";
 import type { Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { MediaTooLargeError, isFileTooLargeError, kindForMime, readField } from "./media";
+import { parsePreRegistrationCsv } from "./preregistration";
 
 import type { ActivityLog } from "./activity";
 import type { CaptureCoordinator } from "./capture";
 import type { ControlPlane } from "./state";
+import { pendingUrlFor } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, Presence } from "./admin";
 import type { MediaStore } from "./media";
@@ -87,6 +96,8 @@ export interface MediaConfig {
 
 const ScreenParams = z.object({ screenId: z.string().min(1) });
 const MachineParams = z.object({ machineId: z.string().min(1) });
+/** POL-104 — a pre-registration record id. */
+const PreRegistrationParams = z.object({ id: z.string().min(1) });
 const MuralParams = z.object({ id: z.string().min(1) });
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
@@ -134,6 +145,8 @@ export function registerRestRoutes(
       revision: control.state.revision,
       // Stamp the screen's current friendly name so the player labels itself with it, not the raw id.
       friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
+      // POL-119: stamp the cast toggle the same way — the badge's cast glyph, not render data.
+      castEnabled: control.getScreen(screenId)?.castEnabled ?? false,
       // POL-24: stamp the current auth token into web/dashboard URLs at SEND time (stored slices keep
       // the clean url, so the DB never holds a token and every load gets a live one).
       slice: control.decorateSliceForSend(slice),
@@ -335,6 +348,21 @@ export function registerRestRoutes(
     // re-sends the SAME revision with the new name — an instant relabel, no reload, no "behind" ack.
     pushRender(screen.id, control.sliceForPlayer(screen.id));
 
+    // POL-119 — a cast-enabled screen advertises its friendly name on mDNS, so a rename must reach
+    // the box too: a same-revision apply re-push restarts that receiver under the new name (a brief
+    // advertisement blip, accepted in the pitch). Not sent for uncast screens — nothing to relabel.
+    if (screen.castEnabled) {
+      agentHub.send(
+        screen.machineId,
+        ServerToAgentApply.parse({
+          t: "server/apply",
+          revision: control.state.revision,
+          machineId: screen.machineId,
+          screens: control.assignmentsFor(screen.machineId),
+        }),
+      );
+    }
+
     fastify.log.info(
       { event: "screen.rename", screenId: screen.id, friendlyName: screen.friendlyName },
       "screen renamed",
@@ -366,7 +394,43 @@ export function registerRestRoutes(
     return { ok: true, screenId: screen.id, on: body.data.on, delivered };
   });
 
+  // POST /api/v1/machines/:machineId/rename  { label }  (POL-117)
+  //
+  // Any machine, any status, any time — naming a still-PENDING box is the point: several identical
+  // netbooted boxes (all hostnamed `localhost.localdomain`) are indistinguishable exactly while they
+  // queue for approval. Registry metadata like a screen rename: no revision bump, no player push —
+  // the admin/state broadcast relabels every open console live.
+  fastify.post("/api/v1/machines/:machineId/rename", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = RenameMachineBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = await control.renameMachine(params.data.machineId, body.data.label);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    fastify.log.info(
+      { event: "machine.rename", machineId: machine.id, label: machine.label },
+      "machine renamed",
+    );
+    broadcaster.broadcast();
+    return { ok: true, machine };
+  });
+
   // POST /api/v1/machines/:machineId/ident  { on, ttlMs? }  -> ident every screen on the machine
+  //
+  // POL-117 — a PENDING machine can ident too, so the operator knows which physical panel they are
+  // approving. It has no screens (no player WS to pulse), so the pulse rides the one channel a
+  // pending box already holds: the agent WS. The server re-sends `server/pending` with `&ident=1`
+  // appended to the holding board's URL; the agent's existing URL-diff handling re-places the board,
+  // which comes up flashing. Deliberately NOT a new pre-approval capability — the box could already
+  // be told to show the pending board, this just varies which face of it.
   fastify.post("/api/v1/machines/:machineId/ident", async (request, reply) => {
     const params = MachineParams.safeParse(request.params);
     if (!params.success) {
@@ -380,6 +444,31 @@ export function registerRestRoutes(
     const machine = control.getMachine(params.data.machineId);
     if (!machine) {
       return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+
+    if (machine.status === "pending") {
+      const sendPendingBoard = (ident: boolean): number =>
+        agentHub.send(
+          machine.id,
+          ServerToAgentPending.parse({
+            t: "server/pending",
+            machineId: machine.id,
+            pendingUrl: pendingUrlFor(machine.id) + (ident ? "&ident=1" : ""),
+          }),
+        );
+      const delivered = sendPendingBoard(body.data.on);
+      if (body.data.on && body.data.ttlMs) {
+        setTimeout(() => {
+          // Re-check the status at fire time: an approve inside the TTL window means the box now
+          // shows real content — a stale pending frame must not drag it back to the holding board.
+          if (control.getMachine(machine.id)?.status === "pending") sendPendingBoard(false);
+        }, body.data.ttlMs);
+      }
+      fastify.log.info(
+        { event: "ident.pending", machineId: machine.id, on: body.data.on, delivered },
+        "pushed pending-board ident to agent",
+      );
+      return { ok: true, machineId: machine.id, on: body.data.on, screens: [], delivered };
     }
 
     const screens = control.getScreens().filter((s) => s.machineId === machine.id);
@@ -460,6 +549,17 @@ export function registerRestRoutes(
     if (!params.success) return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
     const body = ShellArmBody.safeParse(request.body ?? {});
     if (!body.success) return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+
+    // POL-117 — pre-approval, the ONLY thing reachable on a box is its own holding board (the
+    // pending ident). An unapproved box must not be armable for a shell: approval is the trust
+    // boundary, and arming would let a console session reach a terminal on hardware nobody admitted.
+    // (Disarming is always allowed — locking down never needs approval.)
+    const target = control.getMachine(params.data.machineId);
+    if (target && target.status !== "approved" && body.data.enabled) {
+      return reply.code(409).send({
+        error: `machine ${target.id} is ${target.status}, not approved — cannot enable its console`,
+      });
+    }
 
     const machine = await control.setShellEnabled(params.data.machineId, body.data.enabled);
     if (!machine) return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
@@ -718,6 +818,57 @@ export function registerRestRoutes(
     return config;
   });
 
+  // POST /api/v1/screens/:screenId/cast  { enabled }  -> enable/disable casting (POL-119)
+  //
+  // The persistent per-screen AirPlay-receiver toggle. Persisted first (desired state — an offline
+  // box reconciles it from the apply it gets on its next hello), then, when the agent is connected
+  // NOW, a same-revision `server/apply` re-push makes it start/stop the receiver immediately, and a
+  // same-revision `server/render` re-push flips the player badge's cast glyph (the rename trick —
+  // neither mutation is render data, so the revision must not move).
+  fastify.post("/api/v1/screens/:screenId/cast", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = CastArmBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const screen = await control.setScreenCastEnabled(params.data.screenId, body.data.enabled);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    const delivered = agentHub.send(
+      screen.machineId,
+      ServerToAgentApply.parse({
+        t: "server/apply",
+        revision: control.state.revision,
+        machineId: screen.machineId,
+        screens: control.assignmentsFor(screen.machineId),
+      }),
+    );
+    pushRender(screen.id, control.sliceForPlayer(screen.id));
+
+    // Disabling kills the receiver (and with it any live session) on the box; don't leave the
+    // console saying "casting" until the agent's next status lands — the operator's intent is now.
+    if (!body.data.enabled) presence.setScreenCasting(screen.id, false);
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.cast",
+        screenId: screen.id,
+        machineId: screen.machineId,
+        connector: screen.connector,
+        enabled: body.data.enabled,
+        delivered,
+      },
+      body.data.enabled ? "casting enabled" : "casting disabled",
+    );
+    return { ok: true, screen, delivered };
+  });
+
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────
 
   // POST /api/v1/machines/:machineId/approve  -> pending → approved; create screens; live apply.
@@ -800,6 +951,87 @@ export function registerRestRoutes(
     };
   });
 
+  // ── Pre-registration (POL-104) ───────────────────────────────────────────────
+  //
+  // Boxes an operator declares BEFORE they ever boot, so commissioning a rack is a paste rather than
+  // N blind approvals. A record is NOT a credential and admits nothing: it is consulted only after a
+  // hello has already authenticated against a valid enrolment token, and all it decides is the box's
+  // name, its tags, and whether a human has to click Approve.
+
+  // GET /api/v1/pre-registrations -> { records }
+  fastify.get("/api/v1/pre-registrations", async () => ({
+    records: control.listPreRegistrations().map((r) => PreRegistration.parse(r)),
+  }));
+
+  // POST /api/v1/pre-registrations  CreatePreRegistrationBody -> the new record
+  fastify.post("/api/v1/pre-registrations", async (request, reply) => {
+    const body = CreatePreRegistrationBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    if (!body.data.machineId && !body.data.dmiSerial && !body.data.mac) {
+      // A record with no key can never match anything — refuse it rather than let an operator believe
+      // a box is pre-registered when nothing will ever claim it.
+      return reply.code(400).send({ error: "a pre-registration needs a MAC, a DMI serial or a machine id" });
+    }
+    const record = await control.addPreRegistration(body.data);
+    fastify.log.info(
+      { event: "prereg.create", id: record.id, label: record.label, autoApprove: record.autoApprove },
+      "pre-registration created",
+    );
+    broadcaster.broadcast();
+    return { ok: true, record: PreRegistration.parse(record) };
+  });
+
+  // POST /api/v1/pre-registrations/import  { csv, autoApprove } -> { created, errors }
+  //
+  // A CSV paste, because the operator's source of truth is a delivery note or a spreadsheet of MAC
+  // labels. Bad lines are REPORTED with their line number, never silently dropped: a row that vanishes
+  // in a 50-box paste is a box that never auto-approves and nobody knows why.
+  fastify.post("/api/v1/pre-registrations/import", async (request, reply) => {
+    const body = ImportPreRegistrationsBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const parsed = parsePreRegistrationCsv(body.data.csv);
+    const created: PreRegistration[] = [];
+    for (const line of parsed.records) {
+      created.push(
+        await control.addPreRegistration({
+          ...(line.label ? { label: line.label } : {}),
+          tags: line.tags,
+          autoApprove: body.data.autoApprove,
+          ...(line.machineId ? { machineId: line.machineId } : {}),
+          ...(line.dmiSerial ? { dmiSerial: line.dmiSerial } : {}),
+          ...(line.mac ? { mac: line.mac } : {}),
+        }),
+      );
+    }
+    fastify.log.info(
+      { event: "prereg.import", created: created.length, errors: parsed.errors.length },
+      "pre-registrations imported",
+    );
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      created: created.map((r) => PreRegistration.parse(r)),
+      errors: parsed.errors,
+    };
+  });
+
+  // DELETE /api/v1/pre-registrations/:id
+  fastify.delete("/api/v1/pre-registrations/:id", async (request, reply) => {
+    const params = PreRegistrationParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const ok = await control.removePreRegistration(params.data.id);
+    if (!ok) return reply.code(404).send({ error: `unknown pre-registration: ${params.data.id}` });
+    fastify.log.info({ event: "prereg.delete", id: params.data.id }, "pre-registration deleted");
+    broadcaster.broadcast();
+    return { ok: true };
+  });
+
   // ── Removal (POL-14) — permanently forget a machine or a single screen ────────
   //
   // Unlike reject/revoke (a remembered "rejected" state) or unplace (return-to-tray), these DELETEs
@@ -822,6 +1054,9 @@ export function registerRestRoutes(
     // If the agent is connected NOW, close its socket — the machine is gone, so it must re-enrol to
     // return (a lingering socket would otherwise sit idle until its next reconnect).
     const closed = agentHub.close(params.data.machineId);
+    // POL-92 — and forget its live state (vitals ring, last heartbeat), so a re-enrolling box with
+    // the same machine id never inherits the dead one's readings.
+    presence.forgetMachine(params.data.machineId);
 
     // Dissolving its screens' walls cleared surviving members' slices — push the (now empty) renders.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
@@ -1300,6 +1535,97 @@ export function registerRestRoutes(
       zoom: body.data.zoom,
       screens: result.slices.map((s) => s.screenId),
     };
+  });
+
+  // ── Playlist step zoom (POL-133) ─────────────────────────────────────────────
+  //
+  // Zoom ONE framed step of the playlist a screen/wall is showing, identified by the step's library
+  // source. Same D62 model as page zoom — remembered against the (target, step source) pair — and the
+  // same instant path: the push re-stamps the entry inside the SAME playlist surface (same id, same
+  // startedAt), so the rotation keeps its position and a live step rescales without a reload.
+
+  // PUT /api/v1/screens/:screenId/playlist-zoom  { sourceId, zoom }
+  fastify.put("/api/v1/screens/:screenId/playlist-zoom", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetPlaylistEntryZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenPlaylistEntryZoom(
+      params.data.screenId,
+      body.data.sourceId,
+      body.data.zoom,
+    );
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; zoom the wall's step`,
+          wallId: result.wallId,
+        });
+      }
+      if (result.error === "unknown-screen") {
+        return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+      }
+      // no-content / not-zoomable / unknown-entry conflict with the screen's current state.
+      return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.playlist-zoom",
+        screenId: params.data.screenId,
+        sourceId: body.data.sourceId,
+        zoom: body.data.zoom,
+        revision: control.state.revision,
+      },
+      "playlist step zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's step read-out carries the live zoom
+    return { ok: true, revision: control.state.revision, zoom: body.data.zoom };
+  });
+
+  // PUT /api/v1/walls/:wallId/playlist-zoom  { sourceId, zoom }  -> re-stamp on every member
+  fastify.put("/api/v1/walls/:wallId/playlist-zoom", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetPlaylistEntryZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallPlaylistEntryZoom(
+      params.data.wallId,
+      body.data.sourceId,
+      body.data.zoom,
+    );
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.playlist-zoom",
+        wallId: params.data.wallId,
+        sourceId: body.data.sourceId,
+        zoom: body.data.zoom,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall playlist step zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return { ok: true, wallId: params.data.wallId, revision: control.state.revision, zoom: body.data.zoom };
   });
 
   // POST /api/v1/walls/:wallId/ident  { on, ttlMs? }  -> ident-pulse to every member

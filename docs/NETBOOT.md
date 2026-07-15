@@ -76,7 +76,7 @@ Boot medium (USB dongle)   or   offloaded ESP entry   or   UEFI HTTP Boot / site
         │  firmware db (Microsoft UEFI CA 2011) verifies + runs…
         ▼
 shim (Microsoft-signed) → verifies + loads → network GRUB "grubnet" (Canonical-signed)
-        │  DHCP on all NICs, then fetches
+        │  DHCP on each NIC IN TURN, first lease wins (POL-118), then fetches
         ▼
 GET /boot/grub.cfg   (control plane = BOOT DEPOT, ungated)
         │  GRUB menu: control-plane base + (gated) enrolment token baked in from THIS request
@@ -284,6 +284,39 @@ dark against Plymouth's, and the committed PNG against the size the theme asks G
 
 ---
 
+## The wired wait: one card at a time, and it talks (POL-118)
+
+Stage 1 used to run `net_dhcp` with no argument. That runs DHCP on **every** card GRUB enumerates,
+sharing one retransmit loop, and it does not stop when a card gets an address — it stops when the
+**last** card gives up. On a dual-NIC box with one cable in, the empty port therefore held the boot
+long after the live port was already online: minutes of `Starting Polyptic ...` on the glass, with the
+box looking dead. It is the same failure [D71](DECISIONS.md) fixed one stage later, in the initramfs.
+
+So stage 1 now walks the cards itself and **takes the first lease**:
+
+```
+net_dhcp efinet0 ; set nic_rc="$?"     # 0 = leased; 36 = GRUB_ERR_NET_NO_CARD, i.e. no such port
+```
+
+EFI names network cards `efinet0..N` in enumeration order, `net_dhcp` takes a card name, and after a
+lease GRUB registers the address in `net_<card>_dhcp_ip` — which is where the screen's
+`Got an address (…)` line comes from. **What GRUB cannot do is see carrier**, and it cannot enumerate
+its own cards from script (`net_ls_cards` only *prints* them, and GRUB script has no command
+substitution). So an unplugged port can no longer outlive a working one, but if the unplugged port is
+enumerated **first**, its own DHCP schedule is still paid before the live one is tried. Fixing *that*
+means changing the loop inside `grub_cmd_bootp` — a **signed binary we neither build nor touch**
+([D47](DECISIONS.md)). The bare all-cards sweep stays on the failure menu's **Try again**, which is the
+escape hatch for a box with more than four ports.
+
+**Watching a boot.** Both menus carry a verbose entry — **Watch this screen boot (verbose)** on the
+served menu, **Try again, and show the network conversation** on the medium's fallback menu. It sets
+`debug=net,efinet,http` and `pager=1`, so GRUB prints every card, every DHCP packet and every HTTP
+request it makes, and (on the served menu) boots the kernel **without** `quiet splash`, so the
+transcript carries on into the initramfs instead of disappearing behind the Plymouth splash. It is
+never the default: an unattended wall boots the same silent-and-branded path it always did.
+
+---
+
 ## The boot medium: dongle or offload
 
 Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloader** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box beyond, optionally, [dropping the site's Wi-Fi credentials](#wi-fi-boxes-with-no-wire) onto the FAT partition. Besides the signed loaders the medium carries a **local boot payload** — kernel + `initrd-wifi` per built arch, in A/B slots the booted box refreshes itself — which is only touched when the wired chain is unreachable; a wired box reads the stick for a few seconds at power-on, exactly as before.
@@ -349,8 +382,19 @@ Everything netboot buys survives on Wi-Fi: the OS still streams from the control
 every boot, the box stays diskless and generic, and updates stay automatic — the 5-minute poll
 **refreshes the medium itself** (new build's kernel + initrd-wifi into the inactive A/B slot,
 verified against the depot's `SHA256SUMS`, menu rewritten last so power loss mid-update leaves the
-old slot bootable) before rebooting. A box offline longer than the depot's retention boots the
-menu's recovery entry (newest image, possibly mismatched kernel) and heals itself on the next poll.
+old slot bootable) before rebooting.
+
+A box offline **longer than the depot's retention** comes back to a pin that has been pruned — a 404
+it cannot boot past, and it can never boot to earn the refresh that would re-pin it. So it heals
+itself **in the initramfs**, where it still has the network it just joined (POL-116): when the pinned
+image cannot be fetched, it asks `manifest.json` which build is active, boots THAT one (or the
+unpinned arch root), and says so — on the splash, and off-box as a `pinned-build-missing` boot report,
+because the wall is now running a rootfs its on-stick kernel did not ship with. The update poll then
+re-pins the medium as it always has, so the fallback fires exactly once. If the kernel and the image
+genuinely disagree, the existing recovery path owns it: the running kernel has no `/lib/modules` in
+that rootfs, the poll sees the tell, refreshes the medium and reboots into a matched pair. (The
+menu's manual **"newest image"** entry survives for an operator standing at a box with a keyboard —
+but a wall screen has neither, which is why the fallback is automatic.)
 
 The offline menu also **paints the branded boot splash** (POL-47), even with no server to fetch the
 theme from: `deploy/build-boot-medium.sh` bakes `theme.txt` + `logo.png` onto the medium (fetched
@@ -411,7 +455,13 @@ either behaviour.
 
 - **The medium grows** from ~64 MiB to a few hundred MB per built arch (the wlan firmware is most
   of it — the fleet's chipsets are unknown, so Intel/Realtek/MediaTek/Qualcomm-Atheros/Broadcom/
-  Marvell all ride along). `LEAN=1` still builds the old tiny, tokenless, wired-only dongle.
+  Marvell all ride along). `LEAN=1` still builds the old tiny, tokenless, wired-only dongle — but it
+  is an **opt-in escape hatch only** (POL-122/D110): nothing selects it for you, because a lean and a
+  full medium share a filename and a URL, so a stick that silently cannot boot a Wi-Fi screen is
+  worse than no stick at all. A deployment with no live image yet publishes **no medium**, and the
+  console says so ("Building the first OS image …") rather than offering a download that lies. Every
+  medium now ships a sidecar `polyptic-boot.json` saying what it is (`lean`, arches, image ids,
+  whether a token is baked), which is what lets the console tell you.
 - **Two initrds per build.** The lean `initrd` keeps the wired GRUB-HTTP fetch fast (that fetch runs
   at a few MB/s and is on every wired power-on's critical path); `initrd-wifi` only ever loads from
   fast local media. Both come from the same dracut run against the same kernel.

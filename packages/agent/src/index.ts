@@ -65,13 +65,15 @@ import {
   parseMessage,
   PROTOCOL_VERSION,
 } from "@polyptic/protocol";
-import type { KioskBrowser, Output, PowerCapabilities } from "@polyptic/protocol";
+import type { KioskBrowser, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
+import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
+import { readHostIdentity } from "./hardware";
 import { DevtoolsManager } from "./devtools";
 import {
   certNeedsRenewal,
@@ -87,6 +89,7 @@ import { ShellManager } from "./shell";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
+import { VitalsSampler } from "./vitals";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -204,6 +207,17 @@ class Agent {
   private readonly placed = new Map<string, string>();
   /** connector → last placement outcome, reported in heartbeats. */
   private readonly status = new Map<string, { ok: boolean; note?: string }>();
+  /** POL-119 — connector → is a cast session live NOW (receiver window on the glass)? Entries exist
+   *  only for cast-enabled connectors; reported in every status frame + immediately on change. */
+  private readonly casting = new Map<string, boolean>();
+  /** POL-136 — connector → the PIN a pairing sender must type right now. Entries exist only while a
+   *  pairing is in progress; level-reported like `casting` (heartbeat + immediate on change) so the
+   *  overlay self-heals across reconnects. */
+  private readonly castPins = new Map<string, string>();
+
+  /** POL-92 — host vitals, sampled from /proc on each heartbeat. Holds the previous CPU jiffy totals
+   *  between samples (busy% is a delta), so it lives for the life of the agent, not the socket. */
+  private readonly vitals = new VitalsSampler();
 
   constructor(
     private readonly url: string,
@@ -224,6 +238,30 @@ class Agent {
   }
 
   start(): void {
+    // POL-119 — the backend's account of window presence IS the cast-session signal: push it up
+    // the moment it changes (the console's "casting now"), on top of the level in every heartbeat.
+    this.backend.onCastSession((connector, active) => {
+      if (this.casting.get(connector) === active) return;
+      if (!this.casting.has(connector)) return; // receiver already retired — stale event
+      this.casting.set(connector, active);
+      log(`cast session on ${connector}: ${active ? "started" : "ended"}`);
+      this.sendStatus();
+    });
+    // POL-136 — the PIN a pairing sender must type: learned by the backend from the receiver's
+    // stdout (the receiver never draws it), pushed up IMMEDIATELY so the panel shows it while the
+    // phone is still asking, and level-reported in every heartbeat until the pairing ends.
+    this.backend.onCastPin((connector, pin) => {
+      // The ledger rules live in applyCastPinEvent (cast.ts, pinned by tests) — notably that a
+      // null CLEAR applies even after the `casting` entry is gone, or a receiver-death ordering
+      // could strand a stale PIN in every heartbeat.
+      if (!applyCastPinEvent(this.castPins, (c) => this.casting.has(c), connector, pin)) return;
+      log(
+        pin === null
+          ? `cast pairing PIN on ${connector} cleared`
+          : `cast pairing PIN on ${connector}: ${pin} — reporting for the panel overlay`,
+      );
+      this.sendStatus();
+    });
     this.connect();
   }
 
@@ -419,18 +457,19 @@ class Agent {
       if (this.placed.get(screen.connector) === screen.playerUrl) {
         // already pointed at this URL — nothing to do (content updates over the player channel)
         this.status.set(screen.connector, { ok: true });
-        continue;
+      } else {
+        try {
+          await this.backend.showScreen(screen.connector, screen.playerUrl);
+          this.placed.set(screen.connector, screen.playerUrl);
+          this.status.set(screen.connector, { ok: true });
+          log(`placed ${screen.screenId} on ${screen.connector}`);
+        } catch (err) {
+          const note = (err as Error).message;
+          this.status.set(screen.connector, { ok: false, note });
+          log(`FAILED to place ${screen.screenId} on ${screen.connector}: ${note}`);
+        }
       }
-      try {
-        await this.backend.showScreen(screen.connector, screen.playerUrl);
-        this.placed.set(screen.connector, screen.playerUrl);
-        this.status.set(screen.connector, { ok: true });
-        log(`placed ${screen.screenId} on ${screen.connector}`);
-      } catch (err) {
-        const note = (err as Error).message;
-        this.status.set(screen.connector, { ok: false, note });
-        log(`FAILED to place ${screen.screenId} on ${screen.connector}: ${note}`);
-      }
+      await this.reconcileCast(screen);
     }
 
     // Retire any output no longer in the desired set.
@@ -441,12 +480,49 @@ class Agent {
       } catch (err) {
         log(`hideScreen(${connector}) failed: ${(err as Error).message}`);
       }
+      try {
+        await this.backend.setCast(connector, null); // a retired output keeps no receiver either
+      } catch (err) {
+        log(`setCast(${connector}, off) failed: ${(err as Error).message}`);
+      }
       this.placed.delete(connector);
       this.status.delete(connector);
+      this.casting.delete(connector);
+      this.castPins.delete(connector);
     }
 
     // Ack the new state immediately rather than waiting for the next heartbeat tick.
     this.sendStatus();
+  }
+
+  /**
+   * POL-119 — reconcile one connector's cast receiver to the apply's desired state. A cast failure
+   * must never fail the SCREEN (the wall renders fine without a receiver): it rides the status note
+   * instead, so the console can say why casting isn't up without painting the panel red.
+   */
+  private async reconcileCast(screen: ApplyMsg["screens"][number]): Promise<void> {
+    const enabled = screen.castEnabled === true;
+    try {
+      await this.backend.setCast(
+        screen.connector,
+        enabled ? { name: screen.friendlyName ?? screen.screenId } : null,
+      );
+      if (enabled && !this.casting.has(screen.connector)) this.casting.set(screen.connector, false);
+      if (!enabled) {
+        this.casting.delete(screen.connector);
+        this.castPins.delete(screen.connector); // a torn-down receiver strands no PIN (POL-136)
+      }
+    } catch (err) {
+      const reason = (err as Error).message;
+      log(`setCast(${screen.connector}, ${enabled ? "on" : "off"}) failed: ${reason}`);
+      this.casting.delete(screen.connector);
+      this.castPins.delete(screen.connector);
+      const st = this.status.get(screen.connector);
+      this.status.set(screen.connector, {
+        ok: st?.ok ?? true,
+        note: st?.note ? `${st.note}; cast: ${reason}` : `cast: ${reason}`,
+      });
+    }
   }
 
   /**
@@ -786,6 +862,10 @@ class Agent {
       power: this.power,
       outputs: this.outputs,
       hostname: osHostname(),
+      // POL-104 — what this box IS (MACs / DMI serial / arch). Descriptive, never a credential: the
+      // server uses it to match a pre-registration (after the token gate) and to make a pending
+      // approval card readable. Sampled per hello so a re-cabled box re-reports honestly.
+      hardware: readHostIdentity(),
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,
@@ -793,20 +873,42 @@ class Agent {
     this.send(hello);
   }
 
-  private sendStatus(): void {
+  /**
+   * The heartbeat. Carries the observed revision + per-connector placement outcome, and — POL-92 —
+   * a cheap /proc sample of the box's own health (CPU/mem/disk/temp, per-browser RSS + respawns, and
+   * the `/dev/dri` GPU tell that catches a software-rendering browser before it cooks the box).
+   *
+   * The sample is best-effort and NEVER blocks the heartbeat: a host with no /proc (a dev laptop)
+   * samples nothing and the frame goes out without `vitals` — exactly what a pre-POL-92 agent sends.
+   */
+  private async sendStatus(): Promise<void> {
     const screens = [...this.status.entries()].map(([connector, st]) => {
-      const entry: { connector: string; ok: boolean; note?: string } = {
+      const entry: { connector: string; ok: boolean; note?: string; casting?: boolean; castPin?: string } = {
         connector,
         ok: st.ok,
       };
       if (st.note !== undefined) entry.note = st.note;
+      // POL-119 — level-report the live session per cast-enabled connector (absent = not castable).
+      const casting = this.casting.get(connector);
+      if (casting !== undefined) entry.casting = casting;
+      // POL-136 — level-report the pairing PIN while a sender is pairing (absent = no pairing).
+      const castPin = this.castPins.get(connector);
+      if (castPin !== undefined) entry.castPin = castPin;
       return entry;
     });
+    let vitals: MachineVitals | undefined;
+    try {
+      vitals = await this.vitals.sample(this.backend.browserProbes?.() ?? []);
+    } catch (err) {
+      // Telemetry must never cost a heartbeat: a machine that stops heartbeating reads as OFFLINE.
+      log(`vitals sample failed (heartbeat continues without them): ${(err as Error).message}`);
+    }
     this.send({
       t: "agent/status",
       machineId: this.machineId,
       observedRevision: this.lastAppliedRevision,
       screens,
+      vitals,
     });
   }
 
@@ -825,8 +927,8 @@ class Agent {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
-    this.sendStatus();
-    this.heartbeatTimer = setInterval(() => this.sendStatus(), HEARTBEAT_MS);
+    void this.sendStatus();
+    this.heartbeatTimer = setInterval(() => void this.sendStatus(), HEARTBEAT_MS);
   }
 
   private stopHeartbeat(): void {

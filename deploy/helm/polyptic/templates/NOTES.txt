@@ -93,15 +93,32 @@ Store:     {{ .Values.config.store }}
         pod restart. Enable persistence for any real deployment.
 {{- end }}
 
-6. Database:
-{{- if .Values.postgresql.enabled }}
-     In-cluster Postgres subchart enabled. DATABASE_URL is derived automatically
-     and points at {{ include "polyptic.postgresql.host" . }}:5432.
+6. Database (POL-123/D108):
+{{- if include "polyptic.postgresql.deployed" . }}
+     BUNDLED Postgres — the chart deploys it (StatefulSet {{ include "polyptic.postgresql.fullname" . }},
+     {{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}) and wires DATABASE_URL at
+     {{ include "polyptic.postgresql.host" . }}:{{ .Values.postgresql.service.port }} automatically. Nothing else to apply.
+
+     kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "polyptic.postgresql.fullname" . }}
+  {{- if .Values.postgresql.persistence.enabled }}
+    {{- if .Values.postgresql.persistence.existingClaim }}
+     Data lives on your existing PVC "{{ .Values.postgresql.persistence.existingClaim }}" (adopted).
+    {{- else }}
+     Data lives on PVC data-{{ include "polyptic.postgresql.fullname" . }}-0 ({{ .Values.postgresql.persistence.size }}) — kept on `helm uninstall`;
+     delete it explicitly to destroy the registry.
+    {{- end }}
+  {{- else }}
+     ⚠️  postgresql.persistence.enabled=false — the database is an emptyDir and the
+        WHOLE REGISTRY is lost on pod restart. Dev only.
+  {{- end }}
+  {{- if not (or .Values.postgresql.auth.password .Values.postgresql.auth.existingSecret) }}
+     The password was generated and stored in Secret {{ include "polyptic.secretName" . }} (key
+     POSTGRES_PASSWORD); `helm upgrade` preserves it.
+  {{- end }}
 {{- else if .Values.externalDatabase.url }}
-     External Postgres in use (externalDatabase.url).
+     EXTERNAL Postgres in use (externalDatabase.url); the bundled database is off.
 {{- else if eq .Values.config.store "memory" }}
      STORE=memory — ephemeral; registry state is lost on pod restart. Dev only.
 {{- else }}
-     ⚠️  STORE={{ .Values.config.store }} but no database configured. Set
-        postgresql.enabled=true or externalDatabase.url.
+     Database supplied out-of-band (secrets.existingSecret / extraEnv DATABASE_URL).
 {{- end }}

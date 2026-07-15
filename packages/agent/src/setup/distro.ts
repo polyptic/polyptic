@@ -130,6 +130,7 @@ interface PkgSet {
   codecs: string[];
   /** POL-101 — HDMI-CEC tools. OPTIONAL by construction (see `optionalPackages`). */
   cec: string[];
+  cast: string[];
 }
 
 // POL-7 (D43): our theme uses the `script` plugin and draws text via `Image.Text` (the live status
@@ -162,6 +163,12 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // `v4l-utils` carries `cec-ctl` (the KERNEL CEC API — preferred, no daemon); `cec-utils` carries
     // libcec's `cec-client` as the fallback stack.
     cec: ["v4l-utils", "cec-utils"],
+    // CAST (POL-119): the AirPlay receiver the agent supervises per cast-enabled screen. `uxplay`
+    // is in Ubuntu universe and arm64-safe (works in the lab VMs, unlike Chrome); `avahi-daemon`
+    // does the mDNS advertisement (shipped rather than relying on UxPlay 1.74's experimental
+    // built-in responder); `plugins-bad` carries `waylandsink`, the ONLY sink we allow — POL-67
+    // established that Xwayland software paths peg the CPU on real amdgpu boxes.
+    cast: ["uxplay", "avahi-daemon", "gstreamer1.0-plugins-bad"],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -174,6 +181,9 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // Fedora ships the ffmpeg-backed decoders in `gstreamer1-libav` (RPMFusion on stock Fedora).
     codecs: ["gstreamer1-libav", "gstreamer1-plugins-good"],
     cec: ["v4l-utils", "libcec"],
+    // Fedora has no packaged uxplay — casting stays best-effort there (the agent refuses with a
+    // clear reason when the binary is absent), but avahi + waylandsink are installable.
+    cast: ["avahi", "gstreamer1-plugins-bad-free"],
   },
   pacman: {
     base: ["greetd", "ca-certificates", "curl"],
@@ -184,6 +194,8 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     splash: ["plymouth", "librsvg"],
     codecs: ["gst-libav", "gst-plugins-good"],
     cec: ["v4l-utils", "libcec"],
+    // Arch ships uxplay in the AUR only — casting stays best-effort (see the Fedora note).
+    cast: ["avahi", "gst-plugins-bad"],
   },
 };
 
@@ -215,7 +227,11 @@ export function corePackages(pm: PkgManager, backend: Backend, splash = true): s
   const splashPkgs = splash ? set.splash : [];
   // Codecs ride with the real kiosk backends: a wall shows video, and without the ffmpeg-backed
   // GStreamer decoders an uploaded MP4 renders as nothing at all (POL-46, found on real hardware).
-  if (backend === "wayland-sway") return [...set.base, ...set.wayland, ...set.fonts, ...splashPkgs, ...set.codecs];
+  // Cast (POL-119) rides ONLY with wayland-sway: the receiver renders via waylandsink natively,
+  // and POL-67 rules out the Xwayland/X11 software sinks — the x11-i3 backend refuses `setCast`.
+  if (backend === "wayland-sway") {
+    return [...set.base, ...set.wayland, ...set.fonts, ...splashPkgs, ...set.codecs, ...set.cast];
+  }
   if (backend === "x11-i3") return [...set.base, ...set.x11, ...set.fonts, ...splashPkgs, ...set.codecs];
   return [...set.base]; // dev-open
 }

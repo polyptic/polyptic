@@ -210,6 +210,15 @@ function remove(): void {
         <span v-if="hoursSummary" class="chip chip-hours" :title="`Panel hours — this screen sleeps and wakes on a daily schedule`">
           {{ hoursSummary }}
         </span>
+        <!-- POL-119 — cast-enabled indicator (the toggle itself lives in the canvas Inspector) -->
+        <span
+          v-if="screen.castEnabled"
+          class="chip cast-chip"
+          :class="{ live: screen.castActive }"
+          :title="screen.castActive ? 'A device is casting to this screen now' : 'Casting enabled — discoverable via Screen Mirroring'"
+        >
+          {{ screen.castActive ? "Casting now" : "Cast on" }}
+        </span>
         <span class="driven">
           Driven by {{ machineLabel }} ·
           {{ screen.surfaceCount }} {{ screen.surfaceCount === 1 ? "surface" : "surfaces" }}
@@ -217,7 +226,10 @@ function remove(): void {
       </div>
     </div>
 
-    <button class="ident-btn" :class="{ active: identing }" @click="ident">
+    <!-- POL-107 — Ident is an OPERATOR verb (flash a panel to find it); a viewer gets neither it nor
+         the two below. Inspect opens a live debugger inside the wall's browser and removing a screen
+         forgets a device: both are ADMIN. Every one of these routes 403s for a lesser role. -->
+    <button v-if="store.canAuthor" class="ident-btn" :class="{ active: identing }" @click="ident">
       <span class="ident-dot"></span>{{ identing ? "Flashing…" : "Ident" }}
     </button>
 
@@ -234,6 +246,7 @@ function remove(): void {
     </button>
 
     <button
+      v-if="store.isAdmin"
       class="inspect-btn"
       :class="{ active: inspecting, pending: inspectPending }"
       :disabled="!machineOnline || inspectPending"
@@ -244,7 +257,7 @@ function remove(): void {
       <span class="inspect-glyph" aria-hidden="true">&lt;/&gt;</span>{{ inspectLabel }}
     </button>
 
-    <button class="remove-btn" title="Remove screen" aria-label="Remove screen" @click="remove">
+    <button v-if="store.isAdmin" class="remove-btn" title="Remove screen" aria-label="Remove screen" @click="remove">
       ✕
     </button>
   </div>
@@ -339,6 +352,15 @@ function remove(): void {
   font-weight: 500;
   padding: 2px 7px;
   border-radius: 6px;
+}
+/* POL-119 — casting indicator: calm when merely enabled, accent while a session is live. */
+.cast-chip {
+  color: var(--muted);
+}
+.cast-chip.live {
+  background: var(--accent-bg, var(--muted-bg));
+  color: var(--accent-fg);
+  font-weight: 600;
 }
 .driven {
   color: var(--muted);

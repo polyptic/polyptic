@@ -18,7 +18,7 @@
  *   GET /grub/grub.cfg (+ per-arch aliases)       → the SAME menu where an HTTP-booted grubnet looks:
  *                                                   its baked prefix resolves to (http,host:port)/grub
  *                                                   at the server root, not next to the shim URL.
- *   GET /boot/theme.txt, GET /boot/logo.png       → the GRUB theme that makes that menu the Polyptic
+ *   GET /boot/{theme.txt,logo.png,bg.png}         → the GRUB theme that makes that menu the Polyptic
  *                                                   splash rather than a text console (POL-47).
  *   GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
@@ -38,11 +38,11 @@ import { open, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { BootReportBody, NetbootInfo } from "@polyptic/protocol";
+import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from "@polyptic/protocol";
 import type { BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
+import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
 import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
 
@@ -100,9 +100,11 @@ const IMAGE_FILE_RE = /^(vmlinuz|initrd|initrd-wifi|rootfs\.squashfs|polyptic-li
 const IMAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** The boot-depot files (POL-33/D47): `polyptic-boot.img` is the universal `dd`-able FAT32 dongle (both
  *  arches on one stick); the four `.efi` files are the SIGNED loaders (shim + network GRUB per arch) for
- *  UEFI HTTP Boot and the offload flow. All TOKENLESS (they only chain `/boot/grub.cfg`), so this route
- *  is ungated like `/dist/agent`. */
-const BOOT_FILE_RE = /^(polyptic-boot\.img|shimx64\.efi|shimaa64\.efi|grubx64\.efi|grubaa64\.efi)$/;
+ *  UEFI HTTP Boot and the offload flow; `polyptic-boot.json` is the medium's self-description (POL-122,
+ *  secret-free: it says WHETHER a token is baked, never what it is). All TOKENLESS (they only chain
+ *  `/boot/grub.cfg`), so this route is ungated like `/dist/agent`. */
+const BOOT_FILE_RE =
+  /^(polyptic-boot\.img|polyptic-boot\.json|shimx64\.efi|shimaa64\.efi|grubx64\.efi|grubaa64\.efi)$/;
 /** The four signed loaders the depot serves and the offload flow installs (for the boot summary). */
 const SIGNED_LOADER_FILES = ["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grubaa64.efi"] as const;
 /** `POST /boot/report` throttle (POL-58): a rack being offloaded posts a handful of lines a minute, so
@@ -208,7 +210,11 @@ export function toWsAgentUrl(httpBase: string): string {
  * the boot depot is plain http by contract) and the token (when gated) is a baked literal. The caller
  * appends `polyptic.offload=1` on the offload entry only.
  */
-function bootKernelCmdline(httpBase: string, token: string | undefined): string {
+function bootKernelCmdline(
+  httpBase: string,
+  token: string | undefined,
+  opts: { watch?: boolean } = {},
+): string {
   const parts = [
     `root=live:${httpBase}/dist/image/$arch/rootfs.squashfs`,
     "rd.overlay=1",
@@ -227,7 +233,13 @@ function bootKernelCmdline(httpBase: string, token: string | undefined): string 
   // plymouth assume a headless server and never paint the local display (verified live with
   // plymouthd --debug in the POL-38 UTM boot). A wall renders on its panel by definition.
   // `multipath=off` is a dracut cmdline gate; the image also omits the module outright.
-  parts.push("multipath=off", "quiet", "splash", "plymouth.ignore-serial-consoles");
+  parts.push("multipath=off");
+  // `watch` is the verbose entry (POL-118): the operator deliberately chose to SEE the boot, so the
+  // splash that normally hides it is exactly what they do not want. Dropping `quiet splash` leaves
+  // the kernel and systemd printing to the console, which is where GRUB's own `debug=net,efinet,http`
+  // narration has just been going — one continuous transcript from the first DHCP packet onwards.
+  if (!opts.watch) parts.push("quiet", "splash");
+  parts.push("plymouth.ignore-serial-consoles");
   return parts.join(" ");
 }
 
@@ -265,6 +277,7 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
   const httpBase = `http://${hostPort}`;
   const cmdline = bootKernelCmdline(httpBase, token);
+  const watchCmdline = bootKernelCmdline(httpBase, token, { watch: true });
   const lines = [
     "# Polyptic netboot (POL-33/D47), generated for THIS control plane from the request Host.",
     "# Ownership is by KEY: the box belongs to the server whose enrolment token it carries.",
@@ -290,8 +303,12 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
     ...bootGfxPreamble("$net/boot/theme.txt"),
     "set timeout=5",
     "set default=live",
+    // The echo names the next few seconds (POL-118). What follows it is a multi-megabyte kernel +
+    // initrd fetch that GRUB makes in silence, and on a slow LAN that silence is long enough to read
+    // as a dead box. Narrating it is progress, not diagnostics — the thing D65 moved off this screen
+    // was the technical detail (RAM, arch, "image"), and none of that comes back here.
     'menuentry "Polyptic" --id live {',
-    '  echo "Starting Polyptic ..."',
+    '  echo "Starting Polyptic - downloading the operating system ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
@@ -305,6 +322,19 @@ export function buildBootGrubCfg(base: string, token: string | undefined): strin
     'menuentry "Debug console" --id debug {',
     '  echo "Starting Polyptic with a root shell on tty9 (Ctrl+Alt+F9) ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} systemd.debug-shell=1`,
+    "  initrd $net/dist/image/$arch/initrd",
+    "}",
+    // The operator's window into the boot (POL-118). A wired box that is slow has, until now, been
+    // impossible to WATCH: GRUB's network conversation happens behind the splash. This entry turns it
+    // on — `debug=net,efinet,http` narrates every card, DHCP packet and HTTP request, `pager=1` stops
+    // it scrolling past — and then boots the same kernel WITHOUT `quiet splash`, so the transcript
+    // continues into the initramfs instead of hitting a curtain. Same exemption as the debug entry:
+    // nobody sees any of it unless they deliberately chose it, so D65's happy path is untouched.
+    'menuentry "Watch this screen boot (verbose)" --id verbose {',
+    '  echo "Showing everything this screen does. Press a key each time it pauses ..."',
+    "  set debug=net,efinet,http",
+    "  set pager=1",
+    `  linux  $net/dist/image/$arch/vmlinuz ${watchCmdline}`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
   );
@@ -327,14 +357,26 @@ function reporterName(machineId: string): string {
  * composed about its own firmware and disks; the server never parses it, only quotes it — the codes
  * are the machine-readable half of the contract, and they are what tests pin.
  *
- * `installed` is `good`. Everything else is `bad` except the two "the operator has to decide" cases —
- * an ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human.
+ * `installed` is `good`. Everything else is `bad` except the "the operator has to decide" cases — an
+ * ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human — and
+ * POL-116's `pinned-build-missing`, which is not a bootloader outcome at all.
  */
 export function bootReportLine(report: BootReport): { severity: "good" | "warn" | "bad"; text: string } {
   const who = reporterName(report.machineId);
   const detail = report.detail.trim();
   if (report.ok && report.code === "installed") {
     return { severity: "good", text: `${who} installed the Polyptic bootloader${detail ? `: ${detail}` : ""}` };
+  }
+  // POL-116: the box IS up — it just healed a pin retention had pruned and streamed the ACTIVE image
+  // instead of the one its medium named. `warn`, not `bad`: nothing is broken, but the operator must
+  // know the wall is running a rootfs its on-stick kernel did not ship with until the medium re-pins.
+  if (report.code === "pinned-build-missing") {
+    return {
+      severity: "warn",
+      text: `${who} could not find the OS image its boot medium was pinned to and started the current one instead${
+        detail ? `: ${detail}` : ""
+      }`,
+    };
   }
   const severity = report.code === "ambiguous-esp" || report.code === "not-uefi" ? "warn" : "bad";
   return {
@@ -474,21 +516,87 @@ async function sendBootAsset(
   return reply.send(createReadStream(abs));
 }
 
+/** The manifest `build-boot-medium.sh` drops beside the image so the medium describes itself. */
+const BOOT_MEDIUM_MANIFEST = "polyptic-boot.json";
+
+/** Below this, a manifest-less medium can only be the LEAN one (POL-122). The lean medium is a flat
+ *  64 MiB; a payload medium is >= 384 MiB by construction (build-boot-medium.sh sizes it to hold every
+ *  arch's kernel+initrd plus a spare A/B slot). 256 MiB sits in the empty middle of that gap, so the
+ *  inference cannot flip either way. Only used for media baked BEFORE POL-122, which carry no manifest. */
+const LEAN_MEDIUM_MAX_BYTES = 256 * 1024 * 1024;
+
+/** The published boot medium, resolved off disk: where it is, and WHAT it is. */
+export interface ResolvedBootMedium {
+  /** Absolute path of the `.img` on disk. */
+  path: string;
+  bytes: number;
+  /** Wired-only (no local payload, no Wi-Fi): from the manifest, else inferred from the size. */
+  lean: boolean;
+  arches: Array<"arm64" | "amd64">;
+  imageIds: Record<string, string>;
+  mediumId: string | null;
+  builtAt: string | null;
+  /** `null` when the medium carries no manifest — we cannot know, so we do not claim. */
+  tokenBaked: boolean | null;
+  /** Whether a manifest was found (false → `lean` is inferred and the rest is empty/unknown). */
+  selfDescribed: boolean;
+}
+
 /**
  * Resolve the downloadable boot medium under `bootDistDir`, traversal-safe: the universal `dd`-able
- * `polyptic-boot.img` dongle (one stick boots amd64 AND arm64, no per-arch media). Returns its absolute
- * path when it is a regular file, else `null` (the medium is optional, the UI falls back to pointing
+ * `polyptic-boot.img` dongle (one stick boots amd64 AND arm64, no per-arch media). Returns its shape
+ * when it is a regular file, else `null` (the medium is optional, the UI falls back to pointing
  * DHCP option-67 / UEFI HTTP Boot at the shim URL when it's absent).
+ *
+ * POL-122: it also reads the sidecar manifest, because "a file exists" was never enough to answer the
+ * only question that matters to an operator — can a Wi-Fi screen boot from this? A LEAN medium can't,
+ * and it wears the same filename. A medium with no manifest predates POL-122; its lean-ness is then
+ * inferred from the file size (see {@link LEAN_MEDIUM_MAX_BYTES}) and nothing else is claimed.
  */
-export async function resolveBootMedium(bootDistDir: string): Promise<string | null> {
+export async function resolveBootMedium(bootDistDir: string): Promise<ResolvedBootMedium | null> {
   const abs = safeResolve(bootDistDir, "polyptic-boot.img");
   if (!abs) return null;
+  let bytes: number;
   try {
-    if ((await stat(abs)).isFile()) return abs;
+    const st = await stat(abs);
+    if (!st.isFile()) return null;
+    bytes = st.size;
   } catch {
-    // medium not bundled
+    return null; // medium not bundled
   }
-  return null;
+
+  const manifestPath = safeResolve(bootDistDir, BOOT_MEDIUM_MANIFEST);
+  if (manifestPath) {
+    try {
+      // Parse at the edge: a corrupt/partial manifest degrades to the inferred shape below, it never
+      // takes the route down (the medium itself is still perfectly downloadable).
+      const m = BootMediumManifest.parse(JSON.parse(await readFile(manifestPath, "utf8")));
+      return {
+        path: abs,
+        bytes,
+        lean: m.lean,
+        arches: m.arches,
+        imageIds: m.imageIds,
+        mediumId: m.mediumId,
+        builtAt: m.builtAt,
+        tokenBaked: m.tokenBaked,
+        selfDescribed: true,
+      };
+    } catch {
+      // no manifest, or an unreadable one — fall through to inference
+    }
+  }
+  return {
+    path: abs,
+    bytes,
+    lean: bytes <= LEAN_MEDIUM_MAX_BYTES,
+    arches: [],
+    imageIds: {},
+    mediumId: null,
+    builtAt: null,
+    tokenBaked: null,
+    selfDescribed: false,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,6 +626,8 @@ export function registerProvisionRoutes(
   enrollment: Enrollment,
   imageUpdates?: ImageManifestSource,
   onBootReport?: ActivitySink,
+  /** POL-92 — called for every depot artifact actually served, for the `/metrics` fetch counter. */
+  onDepotFetch?: (arch: string, file: string) => void,
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
 
@@ -596,6 +706,20 @@ export function registerProvisionRoutes(
     return reply.send(png);
   });
 
+  // The theme's desktop-image (POL-130): a tiny solid-dark PNG GRUB stretches over the panel. It is
+  // LOAD-BEARING — GRUB 2.12's gfxmenu scales the desktop image on every view draw, and a theme with
+  // only desktop-color hands the scaler a NULL bitmap whose stashed error paints
+  // "error: null src bitmap ... Press any key to continue" the moment a menu entry boots.
+  fastify.get("/boot/bg.png", async (_request, reply) => {
+    const png = Buffer.from(bootBgPng());
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    // A complete Buffer (not a stream) is the only way Bun emits Content-Length; GRUB requires it.
+    reply.header("Content-Length", String(png.length));
+    reply.type("image/png");
+    return reply.send(png);
+  });
+
   // ── POST /boot/report — the box tells the control plane how its bootloader install went (POL-58).
   //    The reporter is a diskless box mid-boot, before any agent session exists, so this lives beside
   //    the boot depot rather than under /api/v1. In GATED mode it must present the fleet enrolment
@@ -607,9 +731,13 @@ export function registerProvisionRoutes(
   const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
   fastify.post("/boot/report", async (request, reply) => {
     if (!enrollment.open) {
-      const provided = bearerToken(request);
-      const expected = enrollment.currentToken;
-      if (expected === undefined || provided === undefined || !constantTimeEqual(provided, expected)) {
+      // POL-104 — ANY token this deployment RECOGNISES passes, including one we have since revoked or
+      // expired. Deliberate: a box booting on a stick whose token was just cut is exactly the box whose
+      // boot report an operator most needs to read, and this route grants no authority — it is a
+      // rate-limited telemetry line that mutates no registry state. Gating it on the CURRENT bake token
+      // (the pre-POL-104 behaviour) would have gone silent on every medium in the field the moment an
+      // operator rotated.
+      if (!enrollment.knowsSecret(bearerToken(request))) {
         return reply.code(401).send({ error: "unauthorized" });
       }
     }
@@ -677,6 +805,7 @@ export function registerProvisionRoutes(
       st = await statFileOrNull(abs);
     }
     if (!st) return reply.code(404).send({ error: "build artifact not retained" });
+    onDepotFetch?.(arch, file);
     return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 
@@ -698,6 +827,7 @@ export function registerProvisionRoutes(
     // vmlinuz + initrd are fetched (and vmlinuz shim_lock-verified) by GRUB, which needs Content-Length;
     // sendBootAsset buffers those two. The root image + live ISO stream (curl/browser fetch them,
     // and buffering a ~500 MB body OOM-killed the pod in the field). Range-aware (206/416).
+    onDepotFetch?.(arch, file);
     return sendBootAsset(reply, abs, st.size, request.headers.range, GRUB_FETCHED_IMAGE_FILES.has(file));
   });
 
@@ -741,11 +871,27 @@ export function registerProvisionRoutes(
         // not bundled for this arch — omit the entry
       }
     }
+    const mediumUrl = medium ? `${base}/dist/boot/polyptic-boot.img` : null;
     return NetbootInfo.parse({
       baseUrl: base,
       mode: enrollment.open ? "open" : "gated",
       bootConfigUrl: `${base}/boot/grub.cfg`,
-      bootMediumUrl: medium ? `${base}/dist/boot/polyptic-boot.img` : null,
+      bootMediumUrl: mediumUrl,
+      // POL-122: say WHAT the download is, not just that a file exists. A lean (wired-only) medium
+      // is surfaced as lean so the console can warn instead of implying Wi-Fi screens will boot.
+      bootMedium:
+        medium && mediumUrl
+          ? BootMediumInfo.parse({
+              url: mediumUrl,
+              lean: medium.lean,
+              arches: medium.arches,
+              imageIds: medium.imageIds,
+              mediumId: medium.mediumId,
+              builtAt: medium.builtAt,
+              tokenBaked: medium.tokenBaked,
+              selfDescribed: medium.selfDescribed,
+            })
+          : null,
       liveIsos,
     });
   });
@@ -780,7 +926,8 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
   agentAmd64: boolean;
   imageDistDir: boolean;
   imageAmd64: boolean;
-  bootMedium: boolean;
+  /** POL-122: the boot banner distinguishes the two media — a `lean` line is a warning, not an OK. */
+  bootMedium: "none" | "lean" | "full";
   signedLoaders: boolean;
 }> {
   const [agentDir, arm64, amd64, imageDir, imageAmd64, medium, loaders] =
@@ -790,7 +937,9 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
       isFile(resolve(config.agentDistDir, "polyptic-agent-amd64")),
       isDir(config.imageDistDir),
       isFile(resolve(config.imageDistDir, "amd64", "rootfs.squashfs")),
-      resolveBootMedium(config.bootDistDir).then((p) => p !== null),
+      resolveBootMedium(config.bootDistDir).then((m): "none" | "lean" | "full" =>
+        m === null ? "none" : m.lean ? "lean" : "full",
+      ),
       // Serving UEFI HTTP Boot / offload needs ALL FOUR loaders (shim + network GRUB, both arches).
       Promise.all(
         SIGNED_LOADER_FILES.map((f) => isFile(resolve(config.bootDistDir, f))),

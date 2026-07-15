@@ -39,13 +39,14 @@ import {
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
+  ServerToPlayerCastPin,
   ServerToPlayerRender,
   ServerToPlayerSettings,
   parseMessage,
 } from "@polyptic/protocol";
-import type { MtlsBundle } from "@polyptic/protocol";
+import type { MtlsBundle, OperatorRole, ServerToAdminShellMessage } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import type { Server as HttpsServer } from "node:https";
 import type { RawData } from "ws";
 
@@ -115,8 +116,17 @@ export interface AgentMtlsChannel {
    * When true the PLAIN /agent channel never admits a machine: it authenticates, issues the cert
    * bundle, answers, and CLOSES — every live agent session must ride the mTLS listener. When false
    * (roll-out mode) the plain channel keeps admitting while the fleet picks its certs up.
+   *
+   * POL-134 — a FUNCTION, not a flag: the posture promotes itself to required at runtime (once
+   * every known machine has been seen on the mTLS listener), so the channel policy must read the
+   * live value on every hello.
    */
-  require: boolean;
+  required(): boolean;
+  /** POL-134 — called whenever a CSR is signed, so the machine's cert state is persisted. */
+  noteCertIssued?(machineId: string): void;
+  /** POL-134 — called on every authenticated hello that arrived OVER the mTLS listener: records
+   *  first-seen (the "wall1 now on mTLS" feed line) and re-evaluates the require promotion. */
+  noteMtlsHello?(machineId: string): void;
 }
 
 /** Which listener an agent socket arrived on (POL-25). */
@@ -134,6 +144,19 @@ export function parseDevtoolsUpgradePath(pathname: string): { screenId: string; 
     return null;
   }
   return { screenId, path: m[2] };
+}
+
+/**
+ * POL-104 — where an agent is dialling FROM, for the pending card. A forwarded-for header wins when
+ * present (behind an ingress the socket's peer is the ingress, which tells an operator nothing about
+ * which box is on the other end); otherwise the socket's own peer address. Best-effort: some runtimes
+ * do not populate `remoteAddress` on an upgrade at all, and an absent IP is simply omitted from the
+ * card — a fact we cannot establish is never invented.
+ */
+function peerAddress(req: IncomingMessage): string | undefined {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
+  return first && first.length > 0 ? first : (req.socket?.remoteAddress ?? undefined);
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
@@ -160,7 +183,10 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
 
     if (pathname === "/agent") {
       // Device channel — authenticated via enrollment credentials on agent/hello, NOT a user session.
-      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, "plain"));
+      // POL-104: the peer address rides along so a pending card can say where the box is dialling from.
+      agentWss.handleUpgrade(req, socket, head, (ws) =>
+        agentWss.emit("connection", ws, "plain", peerAddress(req)),
+      );
     } else if (pathname === "/player") {
       // Device channel — players carry no user session, but they are NOT anonymous: the agent
       // launched them at a server-minted URL carrying a per-screen bearer token, echoed back in
@@ -179,8 +205,13 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
       }
       // Operator channel — gate on a valid signed session cookie (Phase 3f). When auth is disabled the
       // check is skipped (mirrors the REST gate). Reject the upgrade outright if there is no session.
+      //
+      // POL-107: the socket carries the operator's ROLE from here on. EVERY role may open it (it is how
+      // a viewer receives state at all — read access), but the frames that DO something (the POL-59
+      // remote shell) are re-checked against that role in `handleAdmin`. With auth disabled there is no
+      // session and nothing is enforced anywhere, so the socket runs as `admin` — same as /auth/me.
       if (!auth.enabled) {
-        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, req));
+        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, "admin"));
         return;
       }
       void auth
@@ -192,7 +223,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
-          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, req));
+          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, user.role));
         })
         .catch((err) => {
           log.warn({ event: "admin.ws.error", err: String(err) }, "error gating /admin upgrade");
@@ -234,6 +265,18 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
+          // POL-107 — a live remote debugger inside a wall's browser is an ADMIN capability, and the
+          // CDP socket is a second door to it: the REST `/screens/:id/devtools*` routes are admin-only
+          // by the gate's deny-by-default, and this upgrade must match them or the door is unlocked.
+          if (user.role !== "admin") {
+            log.warn(
+              { event: "devtools.ws.forbidden", userId: user.id, role: user.role },
+              "rejected devtools upgrade — role is not admin",
+            );
+            socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+            socket.destroy();
+            return;
+          }
           admit();
         })
         .catch((err) => {
@@ -245,8 +288,8 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
     }
   });
 
-  agentWss.on("connection", (ws: WebSocket, channel: AgentChannel) =>
-    handleAgent(ws, channel ?? "plain", agentMtls, control, enrollment, agentHub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, log),
+  agentWss.on("connection", (ws: WebSocket, channel: AgentChannel, remoteAddress?: string) =>
+    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, log),
   );
 
   // POL-25 — the mTLS agent channel: a second listener whose TLS handshake already rejected any
@@ -265,14 +308,16 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
         socket.destroy();
         return;
       }
-      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, "mtls"));
+      agentWss.handleUpgrade(req, socket, head, (ws) =>
+        agentWss.emit("connection", ws, "mtls", peerAddress(req)),
+      );
     });
   }
   playerWss.on("connection", (ws: WebSocket) =>
     handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, log),
   );
-  adminWss.on("connection", (ws: WebSocket) =>
-    handleAdmin(ws, adminHub, broadcaster, control, shellRelay, log),
+  adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
+    handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, log),
   );
 
   return shellRelay;
@@ -281,10 +326,14 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
 function handleAgent(
   ws: WebSocket,
   channel: AgentChannel,
+  /** POL-104 — the peer address this agent is dialling from (live-only: it is recorded in Presence,
+   *  never persisted, because a stale IP on an offline box is a lie). */
+  remoteAddress: string | undefined,
   agentMtls: AgentMtlsChannel | undefined,
   control: ControlPlane,
   enrollment: Enrollment,
   agentHub: AgentHub,
+  playerHub: PlayerHub,
   presence: Presence,
   broadcaster: AdminBroadcaster,
   activity: ActivityLog,
@@ -359,7 +408,14 @@ function handleAgent(
       const reason = decision.reason ?? "enrollment rejected";
       sendRejected(reason);
       log.info(
-        { event: "agent.rejected", machineId: msg.machineId, reason },
+        {
+          event: "agent.rejected",
+          machineId: msg.machineId,
+          reason,
+          // POL-104 — when the token was RECOGNISED but refused (revoked/expired/used up), name it:
+          // "invalid token" sends an operator hunting for a typo that isn't there.
+          ...(decision.tokenId ? { tokenId: decision.tokenId, tokenName: decision.tokenName } : {}),
+        },
         "agent enrollment rejected — closing socket",
       );
       ws.close();
@@ -393,7 +449,7 @@ function handleAgent(
     // POL-25 require mode: the PLAIN channel exists only to authenticate + hand out cert bundles.
     // Nothing on it is admitted, marked online, or kept open past this hello's answer — every live
     // agent session must arrive through the mTLS listener.
-    const issueOnly = channel === "plain" && agentMtls?.require === true;
+    const issueOnly = channel === "plain" && agentMtls?.required() === true;
 
     // From here the connection is kept: mark presence + register the socket by machineId.
     machineId = msg.machineId;
@@ -406,9 +462,14 @@ function handleAgent(
     let cameOnline = false;
     if (!issueOnly && !presenceMarked) {
       cameOnline = !presence.isMachineOnline(machineId);
-      presence.agentConnected(machineId);
+      presence.agentConnected(machineId, channel);
       presenceMarked = true;
     }
+
+    // POL-104 — the box's address, recorded live (never persisted) so a pending card can say where it
+    // is dialling from. An operator commissioning a rack matches a card to a box by its IP as often as
+    // by anything else.
+    if (!issueOnly && remoteAddress) presence.noteMachineAddress(machineId, remoteAddress);
 
     const input: RegisterMachineInput = {
       machineId: msg.machineId,
@@ -420,6 +481,9 @@ function handleAgent(
       power: msg.power,
       outputs: msg.outputs,
       hostname: msg.hostname,
+      hardware: msg.hardware,
+      enrolledTokenId: decision.tokenId,
+      enrolledTokenName: decision.tokenName,
     };
 
     try {
@@ -480,7 +544,43 @@ function handleAgent(
           // hash, hand the agent its durable credential, then park it pending. No screens, no apply.
           const credential = decision.credential ?? "";
           await control.enrollPending(input, hashCredential(credential));
+          // POL-104 — this box consumed one of the token's enrolments (the cap counts NEW machines; a
+          // re-enrol of a box that already counted does not consume a second slot).
+          if (decision.tokenId) await enrollment.recordUse(decision.tokenId);
           sendEnrolled(msg.machineId, credential, "pending", mtlsBundle);
+
+          // POL-104 — did an operator declare this box before it ever booted? Pre-registration is
+          // consulted ONLY here, AFTER the token gate: it is not a credential and admits nothing on
+          // its own. It names the box, and — when the record says so — approves it, which is the
+          // zero-click commissioning path (no blind pending card, no click).
+          const preReg = await control.applyPreRegistration(msg.machineId, msg.hardware);
+          const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+          if (preReg?.record.autoApprove && !issueOnly) {
+            const approved = await control.approveMachine(msg.machineId);
+            if (approved) {
+              sendApply(msg.machineId, approved.assignments);
+              activity.push(
+                "good",
+                `${label} enrolled and auto-approved (pre-registered, matched on ${preReg.matchedOn})`,
+              );
+              log.info(
+                {
+                  event: "agent.enrolled",
+                  machineId: msg.machineId,
+                  outputs: msg.outputs.length,
+                  issuedCert: Boolean(mtlsBundle),
+                  status: "approved",
+                  preRegistrationId: preReg.record.id,
+                  matchedOn: preReg.matchedOn,
+                  tokenId: decision.tokenId,
+                  screens: approved.assignments.map((a) => a.screenId),
+                },
+                "new machine enrolled — pre-registered, auto-approved",
+              );
+              break;
+            }
+          }
+
           sendPending(decision.reason, msg.machineId);
           log.info(
             {
@@ -489,6 +589,10 @@ function handleAgent(
               outputs: msg.outputs.length,
               issuedCert: Boolean(mtlsBundle),
               status: "pending",
+              tokenId: decision.tokenId,
+              tokenName: decision.tokenName,
+              preRegistered: Boolean(preReg),
+              ...(preReg ? { matchedOn: preReg.matchedOn } : {}),
             },
             "new machine enrolled — awaiting operator approval",
           );
@@ -527,6 +631,14 @@ function handleAgent(
         }
       }
 
+      // POL-134 — persist the cert-issued timestamp AFTER the switch registered the machine, or a
+      // first contact (machine row not yet created at signing time) would never record it.
+      if (mtlsBundle) agentMtls?.noteCertIssued?.(msg.machineId);
+      // POL-134 — an authenticated hello that arrived OVER the mTLS listener is proof this box
+      // presents a working cert: record it (the first time narrates "now on mTLS" in the feed) and
+      // let the posture re-evaluate its promotion to require.
+      if (channel === "mtls") agentMtls?.noteMtlsHello?.(msg.machineId);
+
       // A machine came online (and possibly new screens / a status change) — refresh the admin view.
       if (cameOnline) {
         const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
@@ -555,8 +667,72 @@ function handleAgent(
     if (msg.t === "agent/hello") {
       void onHello(msg);
     } else if (msg.t === "agent/status") {
+      // POL-119 — the status report doubles as the cast-session signal: `casting` is the box's own
+      // account of whether its receiver owns a visible window (mirror or PIN prompt) on each
+      // connector. Level-reported on every heartbeat AND immediately on change, so ingest is
+      // idempotent; broadcast only on a real edge, or every heartbeat would fan out an admin/state.
+      let castChanged = false;
+      const screens = control.getScreens().filter((s) => s.machineId === msg.machineId);
+      for (const entry of msg.screens) {
+        // Pre-cast agents (no `casting`, no `castPin`) leave presence alone entirely.
+        if (entry.casting === undefined && entry.castPin === undefined) continue;
+        const screen = screens.find((s) => s.connector === entry.connector);
+        if (!screen) continue;
+        if (entry.casting !== undefined && presence.setScreenCasting(screen.id, entry.casting)) {
+          castChanged = true;
+          activity.push(
+            "info",
+            entry.casting
+              ? `Casting to ${screen.friendlyName} started`
+              : `Casting to ${screen.friendlyName} ended`,
+          );
+        }
+        // POL-136 — the pairing PIN rides the same level report: on a real edge, paint (or clear)
+        // the player's PIN overlay. The receiver prints the PIN to stdout only — the player overlay
+        // is the ONLY thing that puts it on the glass, so an undeliverable overlay is feed-worthy:
+        // the phone is asking for a code nobody can read.
+        const pin = entry.castPin ?? null;
+        if (presence.setScreenCastPin(screen.id, pin)) {
+          castChanged = true;
+          const overlay = ServerToPlayerCastPin.parse({ t: "server/cast-pin", pin });
+          const delivered = playerHub.send(screen.id, overlay);
+          // The PIN itself NEVER enters the feed: activity rides every admin/state snapshot (and
+          // lingers in the ring long after pairing), so a code there would leak proof-of-physical-
+          // presence to anyone who can see the console. The feed says what an operator can act on;
+          // the PIN travels only the gated per-screen player channel and the box's own journal.
+          if (pin !== null) {
+            activity.push(
+              delivered > 0 ? "info" : "bad",
+              delivered > 0
+                ? `AirPlay pairing on ${screen.friendlyName} — the PIN is on the panel`
+                : `AirPlay pairing on ${screen.friendlyName} — NO player is connected to display the PIN (read it in the box's agent journal)`,
+            );
+          }
+          log.info(
+            { event: "cast.pin", screenId: screen.id, pairing: pin !== null, delivered },
+            pin !== null ? "cast pairing PIN pushed to player" : "cast pairing PIN cleared",
+          );
+        }
+      }
+      if (castChanged) broadcaster.broadcast();
+
+      // POL-92 — the heartbeat now carries the box's own vitals. Ring them in Presence (live-only,
+      // never persisted) and broadcast, so the Machines view's stats strip is as live as the
+      // heartbeat. A pre-POL-92 agent sends no `vitals`; the heartbeat is still recorded, so the box
+      // has a last-seen for `polyptic_machine_last_seen_seconds` either way.
+      const hadVitals = presence.machineVitals(msg.machineId) !== undefined;
+      presence.noteHeartbeat(msg.machineId, msg.vitals);
+      // Coalesced downstream; the first sample matters most (it fills an empty strip).
+      if (msg.vitals || hadVitals) broadcaster.broadcast();
       log.info(
-        { event: "agent.status", machineId: msg.machineId, observedRevision: msg.observedRevision },
+        {
+          event: "agent.status",
+          machineId: msg.machineId,
+          observedRevision: msg.observedRevision,
+          cpu: msg.vitals?.cpuPercent,
+          mem: msg.vitals?.memPercent,
+          gpuAccel: msg.vitals?.browsers?.some((b) => b.gpuAccel === true),
+        },
         "agent status",
       );
     } else if (msg.t === "agent/reboot-ack") {
@@ -697,10 +873,15 @@ function handleAgent(
         }
         // POL-50 — the box is gone, so its panels are no longer showing an inspector. Drop the flag,
         // or a reboot-while-inspecting leaves the console badging a wall that came back sealed.
-        const screenIds = control
-          .getScreens()
-          .filter((s) => s.machineId === machineId)
-          .map((s) => s.id);
+        const droppedScreens = control.getScreens().filter((s) => s.machineId === machineId);
+        // POL-136 — a pairing died with the box's receiver: clear any PIN overlay its players still
+        // show (the player has its own timeout backstop, but there is no reason to wait for it).
+        for (const s of droppedScreens) {
+          if (presence.screenCastPin(s.id) !== null) {
+            playerHub.send(s.id, ServerToPlayerCastPin.parse({ t: "server/cast-pin", pin: null }));
+          }
+        }
+        const screenIds = droppedScreens.map((s) => s.id);
         presence.clearScreensInspecting(screenIds);
         // POL-101 — likewise the power state: a box that comes back comes back LIT, so a remembered
         // "asleep" would strand the console showing a dark wall that is actually showing content. The
@@ -785,6 +966,8 @@ function handlePlayer(
         revision: control.state.revision,
         // Stamp the current friendly name so the player labels itself with it, not the raw id (POL-29).
         friendlyName: control.getScreen(screenId)?.friendlyName ?? screenId,
+        // POL-119: stamp the cast toggle the same way, for the badge's cast glyph.
+        castEnabled: control.getScreen(screenId)?.castEnabled ?? false,
         slice,
       });
       ws.send(JSON.stringify(render));
@@ -796,6 +979,13 @@ function handlePlayer(
         settings: control.getDisplaySettings(),
       });
       ws.send(JSON.stringify(settings));
+      // POL-136 — replay an in-flight pairing PIN: a player that (re)connects mid-pairing (cold
+      // boot, network blip) must still show the code the phone is asking for. Level-held in
+      // Presence from the agent's status reports, so this needs no extra round trip.
+      const castPin = presence.screenCastPin(screenId);
+      if (castPin !== null) {
+        ws.send(JSON.stringify(ServerToPlayerCastPin.parse({ t: "server/cast-pin", pin: castPin })));
+      }
       log.info(
         {
           event: "player.hello",
@@ -855,6 +1045,8 @@ function handlePlayer(
 
 function handleAdmin(
   ws: WebSocket,
+  /** The role of the operator who opened this socket (POL-107) — fixed for its lifetime. */
+  role: OperatorRole,
   adminHub: AdminHub,
   broadcaster: AdminBroadcaster,
   control: ControlPlane,
@@ -862,7 +1054,7 @@ function handleAdmin(
   log: FastifyBaseLogger,
 ): void {
   adminHub.add(ws);
-  log.info({ event: "admin.connected", admins: adminHub.count() }, "admin socket opened");
+  log.info({ event: "admin.connected", role, admins: adminHub.count() }, "admin socket opened");
 
   // On connect: push the current registry snapshot straight away.
   if (ws.readyState === WebSocket.OPEN) {
@@ -884,7 +1076,33 @@ function handleAdmin(
         ws.send(JSON.stringify(broadcaster.snapshot()));
       }
       log.info({ event: "admin.hello" }, "admin registered");
-    } else if (msg.t === "admin/shell-open") {
+      return;
+    }
+
+    // POL-107 — every remaining frame is a SHELL frame: a root PTY on a wall box. That is the single
+    // most powerful thing this socket can do, so it is ADMIN-only, enforced here rather than in the
+    // console. A non-admin that forges the frame is told the session was refused (the same shape the
+    // relay uses when a box isn't armed) and nothing is relayed to the machine.
+    if (role !== "admin") {
+      log.warn(
+        { event: "admin.shell.forbidden", role, frame: msg.t },
+        "refused a shell frame — role is not admin",
+      );
+      if (msg.t === "admin/shell-open" && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            t: "server/shell-opened",
+            machineId: msg.machineId,
+            sessionId: "refused",
+            ok: false,
+            reason: "your role may not open a console on a machine",
+          } satisfies ServerToAdminShellMessage),
+        );
+      }
+      return;
+    }
+
+    if (msg.t === "admin/shell-open") {
       // POL-59: the operator opened a terminal on a box. The relay enforces armed + approved + online.
       shellRelay.openFromAdmin(ws, msg.machineId, msg.cols, msg.rows);
     } else if (msg.t === "admin/shell-data") {

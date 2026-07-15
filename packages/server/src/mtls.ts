@@ -29,9 +29,13 @@ import { connect } from "node:tls";
 import { isIP } from "node:net";
 import { hostname } from "node:os";
 
-import type { FastifyBaseLogger } from "fastify";
+import { AgentSecurityInfo } from "@polyptic/protocol";
+import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { Server } from "node:https";
+import type { ActivityLog } from "./activity";
+import type { Presence } from "./admin";
 import type { PersistedMtlsCa, Store } from "./store";
+import type { ControlPlane } from "./state";
 
 const x509 = await import("@peculiar/x509");
 x509.cryptoProvider.set(globalThis.crypto);
@@ -325,4 +329,230 @@ export class AgentMtls {
     }
     return { safe: true };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POL-134 — mTLS is ON BY DEFAULT: env resolution + the require-posture state machine.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The default agent-mTLS listener port when nothing is configured (mirrors the chart). */
+export const DEFAULT_AGENT_MTLS_PORT = 8443;
+
+/**
+ * The resolved agent-mTLS configuration. `explicit` distinguishes "the operator asked for this"
+ * from "the shipped default": an explicitly-requested listener that cannot come up is FATAL (never
+ * serve a fake gate the operator believes in), while the zero-config default degrades loudly to
+ * off — a laptop dev run with port 8443 occupied, or a Bun ≤ 1.2 runtime that cannot verify client
+ * certs, must not brick a server nobody configured.
+ */
+export interface AgentMtlsEnv {
+  enabled: boolean;
+  port: number;
+  /** True when any AGENT_MTLS* env was set — failures are then fatal instead of degrading. */
+  explicit: boolean;
+  /**
+   * The AGENT_MTLS_REQUIRE pin: `true`/`false` when the env is set (no auto-promotion either way),
+   * `undefined` when unset — the posture then starts from the store and promotes itself.
+   */
+  requirePin?: boolean;
+  publicUrl?: string;
+  sans: string[];
+}
+
+/**
+ * Resolve the agent-mTLS envs into one config (POL-134 flipped the default to ON):
+ *   - `AGENT_MTLS=off` (or `0`/`false`/`no`) disables the listener entirely — the escape hatch.
+ *   - `AGENT_MTLS_PORT` picks the port (0 also disables, the pre-POL-134 spelling of off);
+ *     unset → 8443. An unparseable value THROWS: it is explicit configuration, and silently
+ *     treating a typo as "off" would bypass the explicit-failures-are-fatal rule with a lie.
+ *   - `AGENT_MTLS_REQUIRE` set pins the require posture (truthy → required now, falsy → never
+ *     auto-promote); unset → the posture manages itself (see {@link MtlsPosture}).
+ */
+export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): AgentMtlsEnv {
+  const modeRaw = env.AGENT_MTLS?.trim();
+  const portRaw = env.AGENT_MTLS_PORT?.trim();
+  const requireRaw = env.AGENT_MTLS_REQUIRE?.trim();
+
+  const explicit = modeRaw !== undefined || (portRaw !== undefined && portRaw !== "");
+  const modeOff = modeRaw !== undefined && /^(off|0|false|no)$/i.test(modeRaw);
+  const port = portRaw !== undefined && portRaw !== "" ? Number(portRaw) : DEFAULT_AGENT_MTLS_PORT;
+  if (!Number.isFinite(port) || !Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(
+      `AGENT_MTLS_PORT is not a valid port: ${JSON.stringify(env.AGENT_MTLS_PORT)} — ` +
+        "set a port (1–65535), 0 to disable, or unset it for the default (8443)",
+    );
+  }
+
+  const requirePin =
+    requireRaw === undefined || requireRaw === ""
+      ? undefined
+      : /^(1|true|yes|on)$/i.test(requireRaw);
+
+  return {
+    enabled: !modeOff && port > 0,
+    port,
+    explicit,
+    ...(requirePin !== undefined ? { requirePin } : {}),
+    publicUrl: env.AGENT_MTLS_PUBLIC_URL?.trim() || undefined,
+    sans: (env.AGENT_MTLS_SANS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  };
+}
+
+/**
+ * Whether an agent-mTLS STARTUP failure (bind error, self-test failure) must be FATAL rather than
+ * degrade to off. Fatal when:
+ *   - the operator configured mTLS explicitly (never serve a fake gate they asked for), or
+ *   - the posture is pinned required (`AGENT_MTLS_REQUIRE=1`), or
+ *   - the PERSISTED posture says the deployment already graduated to required and no pin overrides
+ *     it — a zero-config deployment that promised its fleet "every session is mutually
+ *     authenticated" must not quietly re-open plaintext sessions because :8443 was busy for one
+ *     boot. Degrading here would be operationally invisible (agents self-heal onto the plain
+ *     channel after a few failed dials); a crash-looping server is loud, a plaintext fleet is not.
+ * `AGENT_MTLS_REQUIRE=0` is the operator's explicit "plain admission is acceptable" — with that
+ * pin, the zero-config degrade stays available.
+ */
+export function mtlsStartupFailureIsFatal(
+  env: AgentMtlsEnv,
+  persisted: { required: boolean } | undefined,
+): boolean {
+  if (env.explicit) return true;
+  if (env.requirePin !== undefined) return env.requirePin;
+  return persisted?.required === true;
+}
+
+/**
+ * The require-mTLS posture (POL-134): starts in MIGRATING (the plain channel still admits sessions
+ * while agents pick up certs) and GRADUATES to REQUIRED by itself, with notice, once every known
+ * machine has actually connected over the mTLS listener — proof the whole fleet presents working
+ * certs, so requiring strands nobody. The promotion is:
+ *
+ *   - automatic, because an explicit click is exactly the ceremony POL-134 exists to delete, and a
+ *     click every deployment must eventually click is a default in denial;
+ *   - safe, because even under REQUIRE the plain channel still authenticates first contact and
+ *     issues certs (it just never carries a session) — a new box, a re-imaged box, or a diskless
+ *     netbooter all still walk in through the same door; the only strandable client would be an
+ *     agent too old to send a CSR, and the promotion condition (every machine SEEN on mTLS) proves
+ *     no such agent exists in this fleet;
+ *   - one-way and persisted: a promotion survives restarts and never silently regresses. The only
+ *     ways back are the explicit pins (`AGENT_MTLS_REQUIRE=0`) or disabling mTLS outright.
+ *
+ * An empty fleet does NOT promote (vacuous truth would flip brand-new deployments into require
+ * before the operator's dev tooling — fake agents, smoke tests — ever connected once); the first
+ * machine to complete the plain→cert→mTLS arc is what proves the path works, and promotes.
+ */
+export class MtlsPosture {
+  private required_: boolean;
+  private promotedAt?: string;
+
+  private constructor(
+    private readonly store: Store,
+    private readonly pin: boolean | undefined,
+    initial: { required: boolean; promotedAt?: string },
+  ) {
+    this.required_ = initial.required;
+    this.promotedAt = initial.promotedAt;
+  }
+
+  /**
+   * Load the persisted posture and apply the env pin (a pin always wins, both directions, for the
+   * RUNTIME value). A `pin=true` also PERSISTS `required=true` — the pin is a promotion, and like
+   * every promotion it is one-way: unpinning later must leave the fleet required, not regress it to
+   * migrating on a fleet whose machines were never individually SEEN on the listener. A `pin=false`
+   * deliberately writes NOTHING: it suppresses requirement for this runtime without erasing a
+   * graduation the store already recorded.
+   */
+  static async load(store: Store, pin: boolean | undefined): Promise<MtlsPosture> {
+    const persisted = await store.getAgentMtlsPosture();
+    if (pin !== undefined) {
+      const promotedAt = pin ? (persisted?.promotedAt ?? new Date().toISOString()) : undefined;
+      if (pin && persisted?.required !== true) {
+        await store.setAgentMtlsPosture({ required: true, promotedAt });
+      }
+      return new MtlsPosture(store, pin, { required: pin, promotedAt });
+    }
+    return new MtlsPosture(store, undefined, {
+      required: persisted?.required ?? false,
+      promotedAt: persisted?.promotedAt,
+    });
+  }
+
+  get required(): boolean {
+    return this.required_;
+  }
+
+  get pinned(): boolean {
+    return this.pin !== undefined;
+  }
+
+  get requiredSince(): string | undefined {
+    return this.required_ ? this.promotedAt : undefined;
+  }
+
+  /**
+   * Evaluate the promotion condition against the live registry and promote when it holds:
+   * at least one machine is known, and EVERY known machine has been seen on the mTLS listener.
+   * Announces once in the activity feed; persists so the graduation survives restarts.
+   */
+  async evaluate(control: ControlPlane, activity: ActivityLog, log?: FastifyBaseLogger): Promise<void> {
+    if (this.pin !== undefined || this.required_) return;
+    const machines = control.getMachines();
+    if (machines.length === 0) return;
+    if (!machines.every((m) => Boolean(m.mtlsSeenAt))) return;
+
+    this.required_ = true;
+    this.promotedAt = new Date().toISOString();
+    await this.store.setAgentMtlsPosture({ required: true, promotedAt: this.promotedAt });
+    activity.push(
+      "good",
+      `Agent mTLS is now required — every machine holds a certificate. New machines still enrol over the plain channel and are handed one.`,
+    );
+    log?.info(
+      { event: "mtls.require.promoted", machines: machines.length },
+      "agent mTLS promoted to REQUIRED — every known machine has connected over the mTLS listener",
+    );
+  }
+}
+
+/** Everything the agent-security settings surface needs about the live mTLS runtime. */
+export interface AgentSecurityRuntime {
+  /** Present when the listener is up. */
+  posture?: MtlsPosture;
+  port?: number;
+  /** Why the listener is off, when it is ("AGENT_MTLS=off", "port 8443 in use", …). */
+  offDetail?: string;
+}
+
+/**
+ * POL-134 — `GET /api/v1/settings/agent-security` (auth-gated like every settings surface): the
+ * posture + per-machine cert state the Settings card renders. The GET also re-evaluates the
+ * promotion lazily, so a fleet whose last certless machine was REMOVED graduates the next time an
+ * operator looks — not only on the next agent hello.
+ */
+export function registerAgentSecurityRoutes(
+  fastify: FastifyInstance,
+  deps: { control: ControlPlane; presence: Presence; activity: ActivityLog; runtime: AgentSecurityRuntime },
+): void {
+  const { control, presence, activity, runtime } = deps;
+  fastify.get("/api/v1/settings/agent-security", async () => {
+    if (runtime.posture) await runtime.posture.evaluate(control, activity, fastify.log);
+    const machines = control.getMachines().map((m) => ({
+      id: m.id,
+      label: m.label,
+      online: presence.isMachineOnline(m.id),
+      ...(presence.machineChannel(m.id) ? { agentChannel: presence.machineChannel(m.id) } : {}),
+      ...(m.mtlsCertIssuedAt ? { mtlsCertIssuedAt: m.mtlsCertIssuedAt } : {}),
+      ...(m.mtlsSeenAt ? { mtlsSeenAt: m.mtlsSeenAt } : {}),
+    }));
+    return AgentSecurityInfo.parse({
+      mode: !runtime.posture ? "off" : runtime.posture.required ? "required" : "migrating",
+      ...(runtime.port ? { port: runtime.port } : {}),
+      ...(runtime.posture?.requiredSince ? { requiredSince: runtime.posture.requiredSince } : {}),
+      pinned: runtime.posture?.pinned ?? false,
+      ...(runtime.offDetail ? { detail: runtime.offDetail } : {}),
+      machines,
+    });
+  });
 }
