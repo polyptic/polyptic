@@ -23,6 +23,8 @@ import {
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
+  HostIdentity,
+  OperatorRole,
   Output,
   PlaylistItem,
   Surface,
@@ -36,9 +38,12 @@ import type {
   PersistedCredentialProfile,
   PersistedBootOrderPolicy,
   PersistedDisplaySettings,
+  PersistedEnrollmentToken,
   PersistedImageRollout,
   PersistedMachine,
+  PersistedAgentMtlsPosture,
   PersistedMtlsCa,
+  PersistedPreRegistration,
   PersistedServerTls,
   PersistedMural,
   PersistedPlacement,
@@ -65,6 +70,43 @@ interface MachineRow {
   last_seen: Date | null;
   shell_enabled: boolean | null;
   shell_armed_at: Date | null;
+  hardware: unknown;
+  enrolled_token_id: string | null;
+  enrolled_token_name: string | null;
+  pre_registered: boolean | null;
+  mtls_cert_issued_at: Date | null;
+  mtls_seen_at: Date | null;
+}
+
+/** POL-104 — one enrolment token row. */
+interface EnrollmentTokenRow {
+  id: string;
+  name: string;
+  secret: string;
+  created_at: Date;
+  expires_at: Date | null;
+  max_enrollments: number | null;
+  uses: number;
+  revoked_at: Date | null;
+  last_used_at: Date | null;
+  bake: boolean;
+  legacy: boolean;
+}
+
+/** POL-104 — one pre-registration row. */
+interface PreRegistrationRow {
+  id: string;
+  label: string | null;
+  tags: unknown;
+  auto_approve: boolean;
+  machine_id: string | null;
+  dmi_serial: string | null;
+  mac: string | null;
+  note: string | null;
+  created_at: Date;
+  matched_machine_id: string | null;
+  matched_at: Date | null;
+  matched_on: string | null;
 }
 
 interface ScreenRow {
@@ -169,6 +211,8 @@ interface UserRow {
   email: string;
   password_hash: string;
   created_at: Date;
+  /** POL-107. Nullable in the type on purpose: a pre-POL-107 row read by a mid-migration replica. */
+  role: string | null;
 }
 
 interface SessionRow {
@@ -226,6 +270,16 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS credential_hash text`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_enabled boolean NOT NULL DEFAULT false`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_armed_at timestamptz`;
+    // POL-104: what the box IS (MACs / DMI serial / arch), which token it enrolled on, and whether it
+    // matched a pre-registration. All NULL on rows that pre-date POL-104 — a machine enrolled before
+    // this change simply says less on its card; it is never re-gated or re-approved because of it.
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS hardware jsonb`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS enrolled_token_id text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS enrolled_token_name text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS pre_registered boolean NOT NULL DEFAULT false`;
+    // POL-134: per-machine mTLS cert state (issued / actually seen on the mTLS listener).
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS mtls_cert_issued_at timestamptz`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS mtls_seen_at timestamptz`;
     await sql`
       CREATE TABLE IF NOT EXISTS screens (
         id            text PRIMARY KEY,
@@ -354,6 +408,11 @@ export class PostgresStore implements Store {
         created_at    timestamptz NOT NULL DEFAULT now()
       )
     `;
+    // POL-107 — roles. THE UPGRADE PATH: an existing single-admin deployment has exactly one row in
+    // `users`, and that account IS the deployment's admin. The DEFAULT back-fills every pre-POL-107
+    // row with 'admin', so the configured admin keeps every capability it had — an upgrade is never a
+    // lockout, and it needs no operator action. New rows are written with an explicit role.
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'admin'`;
     // Server-side sessions (Phase 3f). `id` is sha256(cookieToken) so a DB read never yields a usable
     // token. Sessions are revocable (delete the row) and expire at expires_at.
     await sql`
@@ -375,6 +434,42 @@ export class PostgresStore implements Store {
         token text
       )
     `;
+    // POL-104: the enrolment tokens. The `bootstrap` row above survives as the seed (its token is
+    // LIFTED into this table on the first boot after the upgrade — every already-flashed medium
+    // carries it) and is kept mirroring whichever token is currently `bake`.
+    await sql`
+      CREATE TABLE IF NOT EXISTS enrollment_tokens (
+        id              text PRIMARY KEY,
+        name            text NOT NULL,
+        secret          text NOT NULL,
+        created_at      timestamptz NOT NULL DEFAULT now(),
+        expires_at      timestamptz,
+        max_enrollments int,
+        uses            int NOT NULL DEFAULT 0,
+        revoked_at      timestamptz,
+        last_used_at    timestamptz,
+        bake            boolean NOT NULL DEFAULT false,
+        legacy          boolean NOT NULL DEFAULT false
+      )
+    `;
+    // POL-104: boxes declared before they ever booted. Consulted AFTER a hello authenticates — this
+    // table is not a credential and never admits anything on its own.
+    await sql`
+      CREATE TABLE IF NOT EXISTS pre_registrations (
+        id                 text PRIMARY KEY,
+        label              text,
+        tags               jsonb NOT NULL DEFAULT '[]'::jsonb,
+        auto_approve       boolean NOT NULL DEFAULT true,
+        machine_id         text,
+        dmi_serial         text,
+        mac                text,
+        note               text,
+        created_at         timestamptz NOT NULL DEFAULT now(),
+        matched_machine_id text,
+        matched_at         timestamptz,
+        matched_on         text
+      )
+    `;
     // mTLS agent CA (POL-25): a single row holding the deployment's own agent-CA cert + private key,
     // generated once on the first boot with AGENT_MTLS_PORT set and reused forever (every client cert
     // in the fleet chains to this key).
@@ -384,6 +479,16 @@ export class PostgresStore implements Store {
         cert_pem   text NOT NULL,
         key_pem    text NOT NULL,
         created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `;
+    // Agent-mTLS posture (POL-134): a single row recording whether this deployment has graduated to
+    // REQUIRING the mTLS agent channel. Written by the auto-promotion (every known machine seen on
+    // mTLS) or a pinned AGENT_MTLS_REQUIRE; read on boot so the posture never silently regresses.
+    await sql`
+      CREATE TABLE IF NOT EXISTS agent_mtls_posture (
+        id          int PRIMARY KEY DEFAULT 1,
+        required    boolean NOT NULL DEFAULT false,
+        promoted_at timestamptz
       )
     `;
     // Player-token secret (POL-54): a single row holding the deployment's HMAC secret behind the
@@ -467,7 +572,7 @@ export class PostgresStore implements Store {
       credentialProfileRows,
       zoomPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
@@ -484,6 +589,9 @@ export class PostgresStore implements Store {
       const outputs = Output.array().safeParse(row.outputs);
       const backend = DisplayBackend.safeParse(row.backend);
       const status = EnrollmentStatus.safeParse(row.status);
+      // POL-104: a hardware blob that no longer parses (an older/newer agent, a hand-edited row) is
+      // DROPPED, never fatal — it is descriptive metadata on a card, not a credential.
+      const hardware = row.hardware ? HostIdentity.safeParse(row.hardware) : undefined;
       return {
         id: row.id,
         label: row.label,
@@ -496,6 +604,12 @@ export class PostgresStore implements Store {
         lastSeen: row.last_seen ? row.last_seen.toISOString() : undefined,
         shellEnabled: row.shell_enabled ?? false,
         shellArmedAt: row.shell_armed_at ? row.shell_armed_at.toISOString() : undefined,
+        hardware: hardware?.success ? hardware.data : undefined,
+        enrolledTokenId: row.enrolled_token_id ?? undefined,
+        enrolledTokenName: row.enrolled_token_name ?? undefined,
+        preRegistered: row.pre_registered ?? false,
+        mtlsCertIssuedAt: row.mtls_cert_issued_at ? row.mtls_cert_issued_at.toISOString() : undefined,
+        mtlsSeenAt: row.mtls_seen_at ? row.mtls_seen_at.toISOString() : undefined,
       };
     });
 
@@ -602,7 +716,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -613,7 +727,13 @@ export class PostgresStore implements Store {
         ${machine.credentialHash ?? null},
         ${machine.lastSeen ? new Date(machine.lastSeen) : null},
         ${machine.shellEnabled ?? false},
-        ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null}
+        ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null},
+        ${machine.hardware ? sql.json(machine.hardware) : null},
+        ${machine.enrolledTokenId ?? null},
+        ${machine.enrolledTokenName ?? null},
+        ${machine.preRegistered ?? false},
+        ${machine.mtlsCertIssuedAt ? new Date(machine.mtlsCertIssuedAt) : null},
+        ${machine.mtlsSeenAt ? new Date(machine.mtlsSeenAt) : null}
       )
       ON CONFLICT (id) DO UPDATE SET
         label           = EXCLUDED.label,
@@ -624,7 +744,17 @@ export class PostgresStore implements Store {
         credential_hash = EXCLUDED.credential_hash,
         last_seen       = EXCLUDED.last_seen,
         shell_enabled   = EXCLUDED.shell_enabled,
-        shell_armed_at  = EXCLUDED.shell_armed_at
+        shell_armed_at  = EXCLUDED.shell_armed_at,
+        -- POL-104: never blank out what we already know. A pre-POL-104 agent (or an agent that could
+        -- not read its own DMI) sends no hardware; a row that HAS hardware must not lose it because
+        -- one hello arrived without any, and the token a machine enrolled on is written ONCE, at
+        -- enrolment — a later hello must never rewrite its provenance.
+        hardware            = COALESCE(EXCLUDED.hardware, machines.hardware),
+        enrolled_token_id   = COALESCE(EXCLUDED.enrolled_token_id, machines.enrolled_token_id),
+        enrolled_token_name = COALESCE(EXCLUDED.enrolled_token_name, machines.enrolled_token_name),
+        pre_registered      = machines.pre_registered OR EXCLUDED.pre_registered,
+        mtls_cert_issued_at = EXCLUDED.mtls_cert_issued_at,
+        mtls_seen_at    = EXCLUDED.mtls_seen_at
     `;
   }
 
@@ -964,7 +1094,7 @@ export class PostgresStore implements Store {
   async getUserByEmail(email: string): Promise<PersistedUser | undefined> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at FROM users WHERE email = ${email} LIMIT 1
+      SELECT id, email, password_hash, created_at, role FROM users WHERE email = ${email} LIMIT 1
     `;
     const row = rows[0];
     return row ? this.toUser(row) : undefined;
@@ -973,7 +1103,7 @@ export class PostgresStore implements Store {
   async getUserById(id: string): Promise<PersistedUser | undefined> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at FROM users WHERE id = ${id} LIMIT 1
+      SELECT id, email, password_hash, created_at, role FROM users WHERE id = ${id} LIMIT 1
     `;
     const row = rows[0];
     return row ? this.toUser(row) : undefined;
@@ -988,14 +1118,42 @@ export class PostgresStore implements Store {
   async createUser(user: PersistedUser): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO users (id, email, password_hash, created_at)
-      VALUES (${user.id}, ${user.email}, ${user.passwordHash}, ${new Date(user.createdAt)})
+      INSERT INTO users (id, email, password_hash, created_at, role)
+      VALUES (${user.id}, ${user.email}, ${user.passwordHash}, ${new Date(user.createdAt)}, ${user.role})
     `;
   }
 
   async updateUserPassword(id: string, passwordHash: string): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE users SET password_hash = ${passwordHash} WHERE id = ${id}`;
+  }
+
+  async listUsers(): Promise<PersistedUser[]> {
+    const sql = this.sql;
+    const rows = await sql<UserRow[]>`
+      SELECT id, email, password_hash, created_at, role FROM users ORDER BY created_at ASC, id ASC
+    `;
+    return rows.map((row) => this.toUser(row));
+  }
+
+  async updateUserRole(id: string, role: OperatorRole): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE users SET role = ${role} WHERE id = ${id}`;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    const sql = this.sql;
+    // Sessions first: a deleted account must not keep a live cookie for the length of its TTL.
+    await sql`DELETE FROM sessions WHERE user_id = ${id}`;
+    await sql`DELETE FROM users WHERE id = ${id}`;
+  }
+
+  async countAdmins(): Promise<number> {
+    const sql = this.sql;
+    const rows = await sql<CountRow[]>`
+      SELECT count(*)::text AS count FROM users WHERE role = 'admin'
+    `;
+    return rows[0] ? Number(rows[0].count) : 0;
   }
 
   async createSession(session: PersistedSession): Promise<void> {
@@ -1043,11 +1201,15 @@ export class PostgresStore implements Store {
   }
 
   private toUser(row: UserRow): PersistedUser {
+    // An absent/unknown role reads as `admin` — see the migration note: a row that predates POL-107
+    // belonged to the deployment's ONLY account, which was an admin in all but name.
+    const parsed = OperatorRole.safeParse(row.role);
     return {
       id: row.id,
       email: row.email,
       passwordHash: row.password_hash,
       createdAt: row.created_at.toISOString(),
+      role: parsed.success ? parsed.data : "admin",
     };
   }
 
@@ -1070,6 +1232,127 @@ export class PostgresStore implements Store {
     `;
   }
 
+  // ── Enrolment tokens + pre-registration (POL-104) ────────────────────────────
+
+  async listEnrollmentTokens(): Promise<PersistedEnrollmentToken[]> {
+    const sql = this.sql;
+    const rows = await sql<EnrollmentTokenRow[]>`
+      SELECT id, name, secret, created_at, expires_at, max_enrollments, uses, revoked_at, last_used_at, bake, legacy
+      FROM enrollment_tokens ORDER BY created_at ASC, id ASC
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      secret: row.secret,
+      createdAt: row.created_at.toISOString(),
+      expiresAt: row.expires_at ? row.expires_at.toISOString() : null,
+      maxEnrollments: row.max_enrollments ?? null,
+      uses: row.uses,
+      revokedAt: row.revoked_at ? row.revoked_at.toISOString() : null,
+      lastUsedAt: row.last_used_at ? row.last_used_at.toISOString() : null,
+      bake: row.bake,
+      legacy: row.legacy,
+    }));
+  }
+
+  async upsertEnrollmentToken(token: PersistedEnrollmentToken): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO enrollment_tokens (id, name, secret, created_at, expires_at, max_enrollments, uses, revoked_at, last_used_at, bake, legacy)
+      VALUES (
+        ${token.id},
+        ${token.name},
+        ${token.secret},
+        ${new Date(token.createdAt)},
+        ${token.expiresAt ? new Date(token.expiresAt) : null},
+        ${token.maxEnrollments ?? null},
+        ${token.uses},
+        ${token.revokedAt ? new Date(token.revokedAt) : null},
+        ${token.lastUsedAt ? new Date(token.lastUsedAt) : null},
+        ${token.bake},
+        ${token.legacy}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        name            = EXCLUDED.name,
+        secret          = EXCLUDED.secret,
+        expires_at      = EXCLUDED.expires_at,
+        max_enrollments = EXCLUDED.max_enrollments,
+        uses            = EXCLUDED.uses,
+        revoked_at      = EXCLUDED.revoked_at,
+        last_used_at    = EXCLUDED.last_used_at,
+        bake            = EXCLUDED.bake,
+        legacy          = EXCLUDED.legacy
+    `;
+  }
+
+  async deleteEnrollmentToken(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM enrollment_tokens WHERE id = ${id}`;
+  }
+
+  async listPreRegistrations(): Promise<PersistedPreRegistration[]> {
+    const sql = this.sql;
+    const rows = await sql<PreRegistrationRow[]>`
+      SELECT id, label, tags, auto_approve, machine_id, dmi_serial, mac, note, created_at, matched_machine_id, matched_at, matched_on
+      FROM pre_registrations ORDER BY created_at ASC, id ASC
+    `;
+    return rows.map((row) => {
+      const tags = z.array(z.string()).safeParse(row.tags);
+      const matchedOn = z.enum(["machineId", "dmiSerial", "mac"]).safeParse(row.matched_on);
+      return {
+        id: row.id,
+        label: row.label ?? undefined,
+        tags: tags.success ? tags.data : [],
+        autoApprove: row.auto_approve,
+        machineId: row.machine_id ?? undefined,
+        dmiSerial: row.dmi_serial ?? undefined,
+        mac: row.mac ?? undefined,
+        note: row.note ?? undefined,
+        createdAt: row.created_at.toISOString(),
+        matchedMachineId: row.matched_machine_id ?? undefined,
+        matchedAt: row.matched_at ? row.matched_at.toISOString() : undefined,
+        matchedOn: matchedOn.success ? matchedOn.data : undefined,
+      };
+    });
+  }
+
+  async upsertPreRegistration(record: PersistedPreRegistration): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO pre_registrations (id, label, tags, auto_approve, machine_id, dmi_serial, mac, note, created_at, matched_machine_id, matched_at, matched_on)
+      VALUES (
+        ${record.id},
+        ${record.label ?? null},
+        ${sql.json(record.tags)},
+        ${record.autoApprove},
+        ${record.machineId ?? null},
+        ${record.dmiSerial ?? null},
+        ${record.mac ?? null},
+        ${record.note ?? null},
+        ${new Date(record.createdAt)},
+        ${record.matchedMachineId ?? null},
+        ${record.matchedAt ? new Date(record.matchedAt) : null},
+        ${record.matchedOn ?? null}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        label              = EXCLUDED.label,
+        tags               = EXCLUDED.tags,
+        auto_approve       = EXCLUDED.auto_approve,
+        machine_id         = EXCLUDED.machine_id,
+        dmi_serial         = EXCLUDED.dmi_serial,
+        mac                = EXCLUDED.mac,
+        note               = EXCLUDED.note,
+        matched_machine_id = EXCLUDED.matched_machine_id,
+        matched_at         = EXCLUDED.matched_at,
+        matched_on         = EXCLUDED.matched_on
+    `;
+  }
+
+  async deletePreRegistration(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM pre_registrations WHERE id = ${id}`;
+  }
+
   // ── mTLS agent CA (POL-25) ───────────────────────────────────────────────────
 
   async getMtlsCa(): Promise<PersistedMtlsCa | undefined> {
@@ -1088,6 +1371,27 @@ export class PostgresStore implements Store {
       INSERT INTO mtls_ca (id, cert_pem, key_pem, created_at)
       VALUES (1, ${ca.certPem}, ${ca.keyPem}, ${ca.createdAt})
       ON CONFLICT (id) DO UPDATE SET cert_pem = EXCLUDED.cert_pem, key_pem = EXCLUDED.key_pem
+    `;
+  }
+
+  // ── Agent-mTLS posture (POL-134) ─────────────────────────────────────────────
+
+  async getAgentMtlsPosture(): Promise<PersistedAgentMtlsPosture | undefined> {
+    const sql = this.sql;
+    const rows = await sql<{ required: boolean; promoted_at: Date | null }[]>`
+      SELECT required, promoted_at FROM agent_mtls_posture WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return { required: row.required, promotedAt: row.promoted_at ? row.promoted_at.toISOString() : undefined };
+  }
+
+  async setAgentMtlsPosture(posture: PersistedAgentMtlsPosture): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO agent_mtls_posture (id, required, promoted_at)
+      VALUES (1, ${posture.required}, ${posture.promotedAt ? new Date(posture.promotedAt) : null})
+      ON CONFLICT (id) DO UPDATE SET required = EXCLUDED.required, promoted_at = EXCLUDED.promoted_at
     `;
   }
 

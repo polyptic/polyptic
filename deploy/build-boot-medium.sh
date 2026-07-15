@@ -46,7 +46,13 @@
 #   POLYPTIC_BASE=http://10.0.0.5:8080 POLYPTIC_TOKEN=fleet-token deploy/build-boot-medium.sh
 #     env: POLYPTIC_BASE   (required) PLAIN http; baked into stage 1 AND the local menu
 #          POLYPTIC_TOKEN  (recommended) enrolment token for the LOCAL menu; without it the local
-#                          path only enrols on an OPEN-enrolment control plane (loud warning)
+#                          path only enrols on an OPEN-enrolment control plane (loud warning).
+#                          POL-104: a deployment now holds SEVERAL named tokens and exactly one is
+#                          flagged "On new media" in Console ▸ Settings ▸ Enrolment tokens — that is
+#                          the one `/boot/grub.cfg` bakes, and the helm bake Job lifts it straight out
+#                          of that menu, so the medium picks up the operator's choice with no change
+#                          here. Pass POLYPTIC_TOKEN explicitly to bake a DIFFERENT token (e.g. a
+#                          short-lived, capped batch token cut for one site's sticks).
 #          LEAN=1          ESCAPE HATCH, opt-in only (POL-122): the old v1 medium — tiny, tokenless,
 #                          WIRED-ONLY (no payload, no Wi-Fi). Nothing selects it automatically any
 #                          more (the helm Job used to, on a fresh install, and quietly shipped every
@@ -237,6 +243,8 @@ LOCALCFG
   HAVE_THEME=0
   THEME_SRC="$REPO_ROOT/packages/server/assets/boot-theme.txt"
   LOGO_SRC="$REPO_ROOT/packages/server/assets/boot-logo.png"
+  BG_SRC="$REPO_ROOT/packages/server/assets/boot-bg.png"
+  PNG_CHECK="$REPO_ROOT/deploy/live/usr/local/lib/polyptic/grub-png-check.sh"
   mkdir -p "$WORK/theme"
   if [ ! -f "$THEME_SRC" ]; then
     rm -rf "$WORK/theme"
@@ -244,10 +252,25 @@ LOCALCFG
   elif [ ! -f "$LOGO_SRC" ]; then
     rm -rf "$WORK/theme"
     echo "==> Boot theme: missing $LOGO_SRC (run 'bun deploy/render-boot-logo.ts') — offline menu will be plain (still boots)" >&2
+  elif [ ! -f "$BG_SRC" ]; then
+    rm -rf "$WORK/theme"
+    echo "==> Boot theme: missing $BG_SRC (run 'bun deploy/render-boot-theme.ts') — offline menu will be plain (still boots)" >&2
   else
-    # Logo first, theme.txt last (POL-87 discipline shared by every theme writer): theme.txt is the
-    # file the GRUB guard keys on, so its bitmap must exist before it at every instant.
+    # A PNG that EXISTS but that GRUB 2.12's decoder cannot LOAD (interlaced, greyscale, palette,
+    # torn) passes every file-exists guard and still paints "error: null src bitmap ... Press any
+    # key to continue" on the wall (POL-130). That is a repo/asset bug, so it FAILS the build with
+    # a message naming the file — a medium that errors on the glass must be unbuildable, and a
+    # silently-plain medium would hide the defect (POL-121's lesson about quiet degradation).
+    for png in "$LOGO_SRC" "$BG_SRC"; do
+      if ! sh "$PNG_CHECK" "$png"; then
+        echo "build-boot-medium: $png is not a PNG GRUB can decode (needs 8/16-bit truecolour, non-interlaced — see deploy/live/usr/local/lib/polyptic/grub-png-check.sh). Regenerate it: bun deploy/render-boot-logo.ts && bun deploy/render-boot-theme.ts" >&2
+        exit 1
+      fi
+    done
+    # Bitmaps first, theme.txt last (POL-87 discipline shared by every theme writer): theme.txt is
+    # the file the GRUB guard keys on, so everything it references must exist before it, always.
     cp "$LOGO_SRC"  "$WORK/theme/logo.png"
+    cp "$BG_SRC"    "$WORK/theme/bg.png"
     cp "$THEME_SRC" "$WORK/theme/theme.txt"
     HAVE_THEME=1
     echo "==> Boot theme: baked from committed repo assets (offline menu shows the branded splash)"
@@ -308,10 +331,12 @@ if [ "$LEAN" != "1" ]; then
     mcopy -i "$IMG" "$ird" "::/polyptic/boot/$arch/a/initrd"
   done
   # The offline splash theme (POL-74), at the path render-local-grub.sh points `set theme=` at.
+  # Bitmaps before theme.txt, same POL-87 ordering as every other writer.
   if [ "${HAVE_THEME:-0}" = 1 ]; then
     mmd   -i "$IMG" ::/polyptic/boot/theme
-    mcopy -i "$IMG" "$WORK/theme/theme.txt" ::/polyptic/boot/theme/theme.txt
     mcopy -i "$IMG" "$WORK/theme/logo.png"  ::/polyptic/boot/theme/logo.png
+    mcopy -i "$IMG" "$WORK/theme/bg.png"    ::/polyptic/boot/theme/bg.png
+    mcopy -i "$IMG" "$WORK/theme/theme.txt" ::/polyptic/boot/theme/theme.txt
   fi
 fi
 

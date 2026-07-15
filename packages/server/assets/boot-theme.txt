@@ -1,6 +1,12 @@
 # Polyptic boot theme (POL-47), served by the control plane at /boot/theme.txt.
 # GRUB draws this while it fetches the kernel; the Plymouth splash takes over from the same dark.
+# desktop-image is LOAD-BEARING, not decoration (POL-130): GRUB 2.12's gfxmenu scales the desktop
+# image on EVERY view draw, and a theme with only desktop-color hands the scaler a NULL bitmap —
+# the stashed error then paints "error: null src bitmap ... Press any key to continue" on the wall
+# the moment the menu entry boots. bg.png is a tiny solid-colour PNG stretched over the panel;
+# visually identical to the desktop-color fill, which stays as the fallback.
 desktop-color: "#0b0b0d"
+desktop-image: "bg.png"
 title-text: ""
 terminal-font: "GNU Unifont Regular 16"
 

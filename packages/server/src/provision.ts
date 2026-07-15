@@ -18,7 +18,7 @@
  *   GET /grub/grub.cfg (+ per-arch aliases)       → the SAME menu where an HTTP-booted grubnet looks:
  *                                                   its baked prefix resolves to (http,host:port)/grub
  *                                                   at the server root, not next to the shim URL.
- *   GET /boot/theme.txt, GET /boot/logo.png       → the GRUB theme that makes that menu the Polyptic
+ *   GET /boot/{theme.txt,logo.png,bg.png}         → the GRUB theme that makes that menu the Polyptic
  *                                                   splash rather than a text console (POL-47).
  *   GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
@@ -42,7 +42,7 @@ import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from 
 import type { BootOrderPolicy, BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
+import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
 import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
 
@@ -735,6 +735,20 @@ export function registerProvisionRoutes(
     return reply.send(png);
   });
 
+  // The theme's desktop-image (POL-130): a tiny solid-dark PNG GRUB stretches over the panel. It is
+  // LOAD-BEARING — GRUB 2.12's gfxmenu scales the desktop image on every view draw, and a theme with
+  // only desktop-color hands the scaler a NULL bitmap whose stashed error paints
+  // "error: null src bitmap ... Press any key to continue" the moment a menu entry boots.
+  fastify.get("/boot/bg.png", async (_request, reply) => {
+    const png = Buffer.from(bootBgPng());
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    // A complete Buffer (not a stream) is the only way Bun emits Content-Length; GRUB requires it.
+    reply.header("Content-Length", String(png.length));
+    reply.type("image/png");
+    return reply.send(png);
+  });
+
   // ── POST /boot/report — the box tells the control plane how its bootloader install went (POL-58).
   //    The reporter is a diskless box mid-boot, before any agent session exists, so this lives beside
   //    the boot depot rather than under /api/v1. In GATED mode it must present the fleet enrolment
@@ -768,9 +782,13 @@ export function registerProvisionRoutes(
   const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
   fastify.post("/boot/report", async (request, reply) => {
     if (!enrollment.open) {
-      const provided = bearerToken(request);
-      const expected = enrollment.currentToken;
-      if (expected === undefined || provided === undefined || !constantTimeEqual(provided, expected)) {
+      // POL-104 — ANY token this deployment RECOGNISES passes, including one we have since revoked or
+      // expired. Deliberate: a box booting on a stick whose token was just cut is exactly the box whose
+      // boot report an operator most needs to read, and this route grants no authority — it is a
+      // rate-limited telemetry line that mutates no registry state. Gating it on the CURRENT bake token
+      // (the pre-POL-104 behaviour) would have gone silent on every medium in the field the moment an
+      // operator rotated.
+      if (!enrollment.knowsSecret(bearerToken(request))) {
         return reply.code(401).send({ error: "unauthorized" });
       }
     }

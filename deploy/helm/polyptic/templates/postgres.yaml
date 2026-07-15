@@ -156,11 +156,18 @@ spec:
   # by the StatefulSet, is NEVER deleted by Kubernetes or by `helm uninstall`, and is re-bound to
   # the pod on every reschedule. The data outlives the release by default — deleting a wall's
   # database should take an explicit `kubectl delete pvc`.
+  #
+  # STABLE LABELS ONLY (POL-127). `volumeClaimTemplates` is one of the IMMUTABLE fields of a
+  # StatefulSet spec, so anything rendered here that changes between chart versions makes the next
+  # `helm upgrade` a forbidden patch — permanently. `polyptic.labels` carries `helm.sh/chart` and
+  # `app.kubernetes.io/version`, which change on EVERY release, so it must never appear below this
+  # line. `polyptic.selectorLabels` (name + instance) is the stable set. The StatefulSet's own
+  # metadata and its pod `template` keep the full labels: both are mutable.
   volumeClaimTemplates:
     - metadata:
         name: data
         labels:
-          {{- include "polyptic.labels" . | nindent 10 }}
+          {{- include "polyptic.selectorLabels" . | nindent 10 }}
           app.kubernetes.io/component: database
       spec:
         accessModes:

@@ -15,11 +15,13 @@ import type { MachineVitals } from "@polyptic/protocol";
 import {
   cpuTooltip,
   diskTooltip,
+  factsFor,
   formatBytes,
   formatPercent,
   formatUptime,
   memoryTooltip,
   meterLevel,
+  metersFor,
   nextOverloaded,
   overloadPeak,
   softwareRenderingConnectors,
@@ -146,5 +148,56 @@ describe("tooltips (the design's detail strings)", () => {
     expect(cpuTooltip(undefined)).toBe("CPU busy across all cores");
     expect(memoryTooltip({})).toBe("Memory in use");
     expect(diskTooltip({})).toBe("Root filesystem in use");
+  });
+});
+
+// ── POL-137: the redesigned band's view-model ────────────────────────────────
+//
+// The two-row band (labelled bars over an icon'd facts row) is built as DATA so the D112 rule —
+// a vital the box didn't report renders NOTHING — is pinned here, not left to a template.
+
+describe("metersFor — the bar row", () => {
+  test("only reported meters get a bar; a partial box reflows, it never draws a dead track", () => {
+    const partial: MachineVitals = { cpuPercent: 34, memPercent: 41 }; // no diskPercent
+    expect(metersFor(partial).map((m) => m.key)).toEqual(["cpu", "memory"]);
+    expect(metersFor({ diskPercent: 22 }).map((m) => m.key)).toEqual(["disk"]);
+  });
+
+  test("a pre-POL-92 agent (no vitals) and an empty sample both yield no bars at all", () => {
+    expect(metersFor(undefined)).toEqual([]);
+    expect(metersFor({})).toEqual([]);
+  });
+
+  test("design order is fixed: CPU · MEMORY · DISK, labels verbatim", () => {
+    const full: MachineVitals = { cpuPercent: 1, memPercent: 2, diskPercent: 3 };
+    expect(metersFor(full).map((m) => m.label)).toEqual(["CPU", "MEMORY", "DISK"]);
+  });
+});
+
+describe("factsFor — the facts row", () => {
+  test("each fact appears only when the heartbeat carried it, in the design's order", () => {
+    const full: MachineVitals = {
+      uptimeSec: 2 * 86400 + 3600, // "up 2d 1h" — the design's example, verbatim
+      loadavg: [1.2, 0.9, 0.7],
+      tempC: 61.2,
+      browsers: [{ connector: "DP-1", running: true, rssBytes: 412 * 1024 ** 2 }],
+    };
+    const facts = factsFor(full);
+    expect(facts.map((f) => f.key)).toEqual(["up", "load", "temp", "rss"]);
+    expect(facts.map((f) => f.icon)).toEqual(["clock", "gauge", "thermometer", "browser"]);
+    expect(facts[0]?.text).toBe("up 2d 1h");
+    expect(facts[1]?.text).toBe("load 1.20");
+    expect(facts[2]?.text).toBe("61°C");
+    expect(facts[3]?.text).toBe("browser 412 MB");
+  });
+
+  test("an omitted vital contributes nothing — no empty icon slot", () => {
+    expect(factsFor({ tempC: 48 }).map((f) => f.key)).toEqual(["temp"]);
+    expect(factsFor({})).toEqual([]);
+    expect(factsFor(undefined)).toEqual([]);
+  });
+
+  test("a browser with no RSS reading is not a zero-byte fact", () => {
+    expect(factsFor({ browsers: [{ connector: "DP-1", running: true }] })).toEqual([]);
   });
 });

@@ -18,6 +18,7 @@ import { ref, reactive, computed, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
+import { machineDisplayName } from "../machine-name";
 
 const props = defineProps<{ open: boolean; now: number }>();
 const emit = defineEmits<{ (e: "close"): void }>();
@@ -267,7 +268,8 @@ function close(): void {
             <div v-for="m in pending" :key="m.id" class="pend">
               <div class="pend-head">
                 <span class="dot dot-on"></span>
-                <span class="pend-label">{{ m.label }}</span>
+                <!-- POL-117 — honest name; never `localhost.localdomain` posing as one. -->
+                <span class="pend-label">{{ machineDisplayName(m) }}</span>
                 <span class="pend-id">requesting access</span>
               </div>
               <div class="pend-meta">
@@ -292,7 +294,7 @@ function close(): void {
 
           <div v-if="screens.length === 0" class="waiting">
             <span class="spinner"></span>
-            <span class="waiting-text">Registering screens for {{ enrollingMachine?.label }}…</span>
+            <span class="waiting-text">Registering screens for {{ enrollingMachine ? machineDisplayName(enrollingMachine) : "the machine" }}…</span>
           </div>
 
           <div v-else class="map-list">
