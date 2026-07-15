@@ -19,6 +19,7 @@ import type {
   EnrollmentStatus,
   Geometry,
   HostIdentity,
+  OperatorRole,
   Output,
   PlaylistItem,
   PreRegistration,
@@ -56,6 +57,11 @@ export interface PersistedMachine {
   enrolledTokenName?: string;
   /** POL-104 — this machine matched a pre-registration record. */
   preRegistered?: boolean;
+  /** POL-134 — ISO time the server last signed this machine's CSR into an mTLS client cert. */
+  mtlsCertIssuedAt?: string;
+  /** POL-134 — ISO time this machine FIRST connected over the mTLS listener (proof it presents a
+   *  working cert). Undefined on legacy rows and on machines still on the plain channel. */
+  mtlsSeenAt?: string;
 }
 
 /** A screen row: the first-class, named entity, stable per (machineId, connector). */
@@ -208,6 +214,12 @@ export interface PersistedUser {
   passwordHash: string;
   /** ISO-8601 creation timestamp. */
   createdAt: string;
+  /**
+   * POL-107 — what this account may do (`admin` | `operator` | `viewer`). A row written before
+   * POL-107 has no role column value; the Postgres migration back-fills `admin` (that single account
+   * WAS the admin) and every read normalizes an unknown/absent value to `admin` for the same reason.
+   */
+  role: OperatorRole;
 }
 
 /**
@@ -268,6 +280,18 @@ export interface PersistedEnrollmentToken {
 
 /** POL-104 — a box declared before it ever booted (see the protocol's `PreRegistration`). */
 export type PersistedPreRegistration = PreRegistration;
+
+/**
+ * POL-134 — the persisted agent-mTLS posture: whether the deployment has graduated to REQUIRING the
+ * mTLS channel for every live agent session. Written exactly once by the auto-promotion (when every
+ * known machine has been seen on the mTLS listener) or by a pinned `AGENT_MTLS_REQUIRE`; read on
+ * boot so a promotion survives restarts and never silently regresses.
+ */
+export interface PersistedAgentMtlsPosture {
+  required: boolean;
+  /** ISO-8601 time of the promotion (or the first boot that saw the pin). */
+  promotedAt?: string;
+}
 
 /**
  * POL-25 — the deployment's own agent CA for mTLS client certificates. Generated once on the first
@@ -467,10 +491,18 @@ export interface Store {
   getUserById(id: string): Promise<PersistedUser | undefined>;
   /** How many users exist — drives "seed an admin on first boot if none exist". */
   countUsers(): Promise<number>;
-  /** Insert a new user row (id + email + argon2id hash + created_at). */
+  /** Insert a new user row (id + email + argon2id hash + created_at + role). */
   createUser(user: PersistedUser): Promise<void>;
   /** Replace a user's password hash (after verifying the current password). No-op if absent. */
   updateUserPassword(id: string, passwordHash: string): Promise<void>;
+  /** Every operator account, oldest first (POL-107 — Settings ▸ Operators). Hashes stay in the row. */
+  listUsers(): Promise<PersistedUser[]>;
+  /** Change an account's role (POL-107). No-op if absent. */
+  updateUserRole(id: string, role: OperatorRole): Promise<void>;
+  /** Delete an account and every session it holds (POL-107). No-op if absent. */
+  deleteUser(id: string): Promise<void>;
+  /** How many accounts hold `admin` — the last-admin guard reads this before a demote/delete. */
+  countAdmins(): Promise<number>;
 
   /** Insert a session row (its id is sha256(token); the raw token only ever lives in the cookie). */
   createSession(session: PersistedSession): Promise<void>;
@@ -509,6 +541,12 @@ export interface Store {
   getMtlsCa(): Promise<PersistedMtlsCa | undefined>;
   /** Persist the agent CA (single row, written once on first mTLS boot). */
   setMtlsCa(ca: PersistedMtlsCa): Promise<void>;
+
+  // ── Agent-mTLS posture (POL-134) ───────────────────────────────────────────
+  /** The persisted require-mTLS posture. Undefined until first promoted/pinned. */
+  getAgentMtlsPosture(): Promise<PersistedAgentMtlsPosture | undefined>;
+  /** Persist the require-mTLS posture (single row). */
+  setAgentMtlsPosture(posture: PersistedAgentMtlsPosture): Promise<void>;
 
   // ── Player-token secret (POL-54) ───────────────────────────────────────────
   /** The persisted HMAC secret behind the per-screen player tokens (hex). Undefined until the first

@@ -9,11 +9,11 @@
  *
  * The fix heals the box where it still has a network: an initramfs `netroot` hook that probes the pin
  * and, when the depot really has pruned it, re-points livenet at the ACTIVE build (or the unpinned
- * arch root) — loudly, on the splash and via `POST /boot/report`. The decision tree is exercised by
- * the shell suite below (stub curl/plymouth, no dracut, no boot); this file runs it and pins the
- * halves the server and docs depend on: the hook is wired into the dracut module as a `netroot` hook,
- * it never `exit`s (it is SOURCED into /sbin/netroot), and its splash line is one the pre-pivot hook
- * knows how to take back down.
+ * arch root) — loud on the console and via `POST /boot/report`, but silent on the splash (POL-140:
+ * the wall is public signage, and to the room this is a standard startup). The decision tree is
+ * exercised by the shell suite below (stub curl/plymouth, no dracut, no boot); this file runs it and
+ * pins the halves the server and docs depend on: the hook is wired into the dracut module as a
+ * `netroot` hook, it never `exit`s (it is SOURCED into /sbin/netroot), and it never paints the glass.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -60,15 +60,13 @@ describe("netboot pinned-build fallback: the dracut wiring", () => {
     expect(hook).not.toMatch(/^\s*set -[eu]/m);
   });
 
-  test("the splash line it raises is one the pre-pivot hook takes back down (POL-53)", () => {
-    const splash = /POLYPTIC_PIN_SPLASH="([^"]+)"/.exec(hook)?.[1];
-    expect(splash).toBeTruthy();
-    expect(done).toContain(`hide-message --text="${splash}"`);
+  test("it never paints the glass — the swap is console+report only (POL-140)", () => {
+    expect(hook).not.toContain("plymouth");
+    expect(hook).not.toContain("display-message");
   });
 
-  test("the splash names no host and no build id — a wall screen is public signage", () => {
-    const splash = /POLYPTIC_PIN_SPLASH="([^"]+)"/.exec(hook)?.[1] ?? "";
-    expect(splash).not.toMatch(/http|\/dist\/|\d{8}T\d{6}Z/);
+  test("the pre-pivot hook no longer hides a splash line nobody raises (POL-140)", () => {
+    expect(done).not.toContain("was set up with is gone");
   });
 
   test("only a PINNED builds/ path is ever second-guessed (the wired, unpinned menu is untouched)", () => {

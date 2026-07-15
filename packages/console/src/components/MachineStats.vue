@@ -1,47 +1,45 @@
 <!--
-  MachineStats.vue — the per-machine system-stats strip (POL-92; the design deferred from POL-68 §1).
+  MachineStats.vue — the per-machine vitals band (POL-92 data, POL-137 design).
 
-  A full-width muted strip under each approved machine card, per the "Polyptych Console v2" mock,
-  verbatim: three equal meters (CPU · MEMORY · DISK), each a full-width 4px bar with the value at the
-  end, inside a rounded --muted-bg container. Values are ALWAYS coloured by level (green when ok —
-  the mock colours the healthy state, it doesn't mute it). Thresholds: < 70 ok · 70–89 warn ·
-  >= 90 bad. Bar widths animate between samples, so a heartbeat reads as movement, not a jump.
-  Per-meter tooltips carry the detail ("4 cores", "3.3 / 8 GB", "92 GB free").
+  The redesign from "Polyptych Console v2": under the machine card's header row the vitals are a
+  TWO-ROW band inside one rounded --muted-bg container —
 
-  Below the strip, one quiet meta line surfaces the rest of the heartbeat's vitals when they exist
-  (up · load · temp · browser RSS · running image) — facts, not judgements, so they stay muted.
+   1. Bar row.   CPU · MEMORY · DISK as labelled horizontal progress bars, the percentage at the
+                 end of each bar. Healthy fill is green (--ok); the D112 thresholds still recolour
+                 a stressed bar (< 70 ok · 70–89 warn · >= 90 bad) and widths animate between
+                 samples so a heartbeat reads as movement, not a jump.
+   2. Facts row. Uptime ("up 2d 1h"), load average, temperature and browser memory, each with a
+                 small icon — and the running image id right-aligned in mono (how an operator
+                 learns a box never took a roll-out). New facts join by appending to `factsFor`;
+                 the row flex-wraps, so nothing else moves.
 
-  Three things this surface says that no other can:
+  Omitted-field discipline (D112): a vital the box didn't report renders NOTHING — no zeroed bar,
+  no empty icon slot. Both rows are built as data in ../vitals.ts (metersFor / factsFor) so that
+  rule is unit-tested; a row with no entries never renders, and a box with no vitals at all gets
+  the quiet "unavailable" line instead of an empty band.
 
-   • OVERLOAD (amber banner, CPU or memory >= 90%): this box may drop frames on animated content —
-     including the Ident flash an operator is about to rely on. The banner is HYSTERETIC (arms at 90,
-     clears at 85) because the mock's version flickered on a box hovering at the threshold.
-   • SOFTWARE RENDERING (red banner): the box's kiosk browser holds no `/dev/dri` handle — it is
-     painting the wall on the CPU. This is the D77 failure that cost a field-debugging session with a
-     remote shell and `top`; now it is a banner an operator sees without touching the box.
-   • RESPAWNS: the agent has restarted this output's browser N times. The wall can look perfectly
-     fine between crashes.
+  Below the band, the two banners this surface exists for (unchanged from POL-92):
 
-  OFFLINE machines get no meters at all — just the mock's grey "System stats unavailable while
-  offline." box. Vitals describe a running box; a reading from a box that has gone dark is an
-  epitaph, not health data.
+   • SOFTWARE RENDERING (red): the kiosk browser holds no /dev/dri handle — the D77 failure,
+     called out in words. Outranks the overload banner, because it is the cause.
+   • OVERLOAD (amber, hysteretic — arms at 90, clears at 85): this box may drop frames on
+     animated content, including the Ident flash an operator is about to rely on.
+
+  OFFLINE machines get no meters at all — vitals describe a running box; a reading from a box
+  that has gone dark is an epitaph, not health data.
 -->
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { MachineView } from "@polyptic/protocol";
 
 import {
-  cpuTooltip,
-  diskTooltip,
-  formatBytes,
+  factsFor,
   formatPercent,
-  formatUptime,
-  memoryTooltip,
+  metersFor,
   meterLevel,
   nextOverloaded,
   overloadPeak,
   softwareRenderingConnectors,
-  totalBrowserRss,
   totalRespawns,
 } from "../vitals";
 
@@ -49,64 +47,36 @@ const props = defineProps<{ machine: MachineView }>();
 
 const vitals = computed(() => (props.machine.online ? props.machine.vitals : undefined));
 /** Online, but the box reports nothing: an older agent, or a backend that samples no host (dev-open). */
-const noReadings = computed(
-  () => props.machine.online && vitals.value === undefined,
+const noReadings = computed(() => props.machine.online && vitals.value === undefined);
+
+const meters = computed(() => metersFor(vitals.value));
+const facts = computed(() => factsFor(vitals.value));
+const imageId = computed(() => vitals.value?.imageId);
+
+const softwareRendering = computed(() => softwareRenderingConnectors(vitals.value));
+const respawns = computed(() => totalRespawns(vitals.value));
+
+/** The facts row renders only when something is in it — an empty row is not a design element. */
+const factsRowShown = computed(
+  () =>
+    facts.value.length > 0 ||
+    imageId.value !== undefined ||
+    respawns.value > 0 ||
+    softwareRendering.value.length > 0,
 );
+/** …and the band itself collapses when a box reported vitals but nothing we can draw. */
+const bandShown = computed(() => meters.value.length > 0 || factsRowShown.value);
 
-const meters = computed(() => [
-  {
-    key: "cpu",
-    label: "CPU",
-    percent: vitals.value?.cpuPercent,
-    tooltip: cpuTooltip(vitals.value),
-  },
-  {
-    key: "memory",
-    label: "MEMORY",
-    percent: vitals.value?.memPercent,
-    tooltip: memoryTooltip(vitals.value),
-  },
-  {
-    key: "disk",
-    label: "DISK",
-    percent: vitals.value?.diskPercent,
-    tooltip: diskTooltip(vitals.value),
-  },
-]);
-
-/** The rest of the heartbeat's vitals, as quiet "label value" facts — only what actually exists. */
-const meta = computed(() => {
-  const v = vitals.value;
-  if (!v) return [];
-  const parts: { key: string; text: string; title?: string }[] = [];
-  if (v.uptimeSec !== undefined) parts.push({ key: "up", text: `up ${formatUptime(v.uptimeSec)}` });
-  const load1 = v.loadavg?.[0];
-  if (v.loadavg && load1 !== undefined) {
-    parts.push({
-      key: "load",
-      text: `load ${load1.toFixed(2)}`,
-      title: `1/5/15 min load: ${v.loadavg.map((n) => n.toFixed(2)).join(", ")}`,
-    });
-  }
-  if (v.tempC !== undefined) {
-    parts.push({ key: "temp", text: `${Math.round(v.tempC)}°C`, title: "Hottest thermal zone" });
-  }
-  const rss = totalBrowserRss(v);
-  if (rss !== undefined) {
-    parts.push({
-      key: "rss",
-      text: `browser ${formatBytes(rss)}`,
-      title: (v.browsers ?? [])
-        .filter((b) => b.rssBytes !== undefined)
-        .map((b) => `${b.connector}: ${formatBytes(b.rssBytes)}`)
-        .join(" · "),
-    });
-  }
-  if (v.imageId) {
-    parts.push({ key: "image", text: `image ${v.imageId}`, title: "The OS image this box is running" });
-  }
-  return parts;
-});
+// The small icons for the facts row: inline strokes on currentColor — accent-coloured per the
+// chosen design's facts row. Feather-style geometry on a 24-unit grid, drawn at 12px.
+const ICON_PATHS: Record<string, string[]> = {
+  clock: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", "M12 7v5l3 2"],
+  gauge: ["M3 12h4l3-8 4 16 3-8h4"],
+  thermometer: ["M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"],
+  browser: ["M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z", "M3 9h18"],
+  // The image id's glyph — the design marks the running build with a stack of layers.
+  layers: ["M12 2 2 7l10 5 10-5-10-5z", "M2 17l10 5 10-5", "M2 12l10 5 10-5"],
+};
 
 // The overload banner's state is HELD, not derived: hysteresis needs to know what it said last time
 // (arm at 90, clear at 85). One component instance per machine card, so this is per machine.
@@ -118,9 +88,6 @@ watch(
   },
   { immediate: true },
 );
-
-const softwareRendering = computed(() => softwareRenderingConnectors(vitals.value));
-const respawns = computed(() => totalRespawns(vitals.value));
 </script>
 
 <template>
@@ -132,37 +99,73 @@ const respawns = computed(() => totalRespawns(vitals.value));
     </div>
 
     <template v-else>
-      <div class="strip">
-        <div v-for="m in meters" :key="m.key" class="meter" :title="m.tooltip">
-          <span class="meter-label">{{ m.label }}</span>
-          <span class="bar">
-            <span
-              class="fill"
-              :class="meterLevel(m.percent)"
-              :style="{ width: `${m.percent ?? 0}%` }"
-            ></span>
-          </span>
-          <span class="value" :class="meterLevel(m.percent)">{{ formatPercent(m.percent) }}</span>
+      <div v-if="bandShown" class="band">
+        <!-- Row 1 — the labelled progress bars. Only meters the box reported: an absent reading
+             is absent, never a dead track at 0%. -->
+        <div v-if="meters.length" class="bars">
+          <div v-for="m in meters" :key="m.key" class="meter" :title="m.tooltip">
+            <span class="meter-label">{{ m.label }}</span>
+            <span class="bar">
+              <span
+                class="fill"
+                :class="meterLevel(m.percent)"
+                :style="{ width: `${m.percent}%` }"
+              ></span>
+            </span>
+            <span class="value" :class="meterLevel(m.percent)">{{ formatPercent(m.percent) }}</span>
+          </div>
         </div>
-      </div>
 
-      <div v-if="meta.length || respawns > 0 || softwareRendering.length" class="meta">
-        <span v-for="p in meta" :key="p.key" class="meta-item" :title="p.title">{{ p.text }}</span>
+        <!-- Row 2 — the facts: icon + reading, and the running image id pinned to the right in
+             mono. Wraps when a card gets narrow or facts multiply. -->
+        <div v-if="factsRowShown" class="facts">
+          <span v-for="f in facts" :key="f.key" class="fact" :title="f.title">
+            <svg
+              class="fact-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path v-for="(d, i) in ICON_PATHS[f.icon]" :key="i" :d="d" />
+            </svg>
+            {{ f.text }}
+          </span>
 
-        <span
-          v-if="respawns > 0"
-          class="chip warn"
-          :title="`The agent has respawned this machine's kiosk browser ${respawns} time(s) since it started. A climbing count is a crash loop — the wall can look fine between respawns.`"
-        >
-          {{ respawns }} browser respawn{{ respawns === 1 ? "" : "s" }}
-        </span>
-        <span
-          v-if="softwareRendering.length"
-          class="chip bad"
-          :title="`No /dev/dri handle on ${softwareRendering.join(', ')} — the browser is rendering on the CPU.`"
-        >
-          Software rendering
-        </span>
+          <span
+            v-if="respawns > 0"
+            class="chip warn"
+            :title="`The agent has respawned this machine's kiosk browser ${respawns} time(s) since it started. A climbing count is a crash loop — the wall can look fine between respawns.`"
+          >
+            {{ respawns }} browser respawn{{ respawns === 1 ? "" : "s" }}
+          </span>
+          <span
+            v-if="softwareRendering.length"
+            class="chip bad"
+            :title="`No /dev/dri handle on ${softwareRendering.join(', ')} — the browser is rendering on the CPU.`"
+          >
+            Software rendering
+          </span>
+
+          <span v-if="imageId !== undefined" class="image-id" title="The OS image this box is running">
+            <svg
+              class="fact-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path v-for="(d, i) in ICON_PATHS.layers" :key="i" :d="d" />
+            </svg>
+            <span class="image-id-text">{{ imageId }}</span>
+          </span>
+        </div>
       </div>
 
       <!-- The D77 tell, in words. It OUTRANKS the overload banner (v-else-if below) on purpose: a
@@ -186,7 +189,7 @@ const respawns = computed(() => totalRespawns(vitals.value));
 </template>
 
 <style scoped>
-/* The strip sits directly under the machine row — the design draws no divider above it; the
+/* The band sits directly under the machine row — the design draws no divider above it; the
    --muted-bg container IS the separation. */
 
 .unavailable {
@@ -198,16 +201,22 @@ const respawns = computed(() => totalRespawns(vitals.value));
   color: var(--muted2);
 }
 
-.strip {
+.band {
   display: flex;
-  align-items: center;
-  gap: 24px;
+  flex-direction: column;
+  gap: 9px;
   margin-top: 11px;
   padding: 8px 13px;
   background: var(--muted-bg);
   border-radius: 8px;
 }
 
+/* Row 1 — the labelled progress bars. */
+.bars {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
 .meter {
   flex: 1;
   display: flex;
@@ -266,21 +275,42 @@ const respawns = computed(() => totalRespawns(vitals.value));
   color: var(--bad);
 }
 
-/* The quiet facts row — POL-92's extra vitals, muted so the meters keep the eye. */
-.meta {
+/* Row 2 — the icon'd facts, image id pinned right. */
+.facts {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px 14px;
-  margin-top: 8px;
-  padding: 0 2px;
+  gap: 5px 16px;
+  min-height: 16px;
 }
-.meta-item {
+.fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
   color: var(--muted2);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   cursor: default;
+}
+.fact-icon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+.image-id {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  cursor: default;
+}
+.image-id-text {
+  font-size: 10.5px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  color: var(--muted);
 }
 
 .chip {

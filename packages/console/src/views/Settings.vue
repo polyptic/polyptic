@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import type { EnrollmentTokenView, HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import { OperatorRole } from "@polyptic/protocol";
+import type { AgentSecurityInfo, EnrollmentTokenView, HttpsInfo, ImageBuild, Operator } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
+import { ApiError } from "../api";
 import * as auth from "../auth";
 import Toggle from "../components/Toggle.vue";
 import { useConsoleStore } from "../stores/console";
@@ -21,6 +23,8 @@ onMounted(() => {
   void store.fetchDisplaySettings();
   void store.fetchImageUpdates();
   void loadHttps();
+  void loadOperators();
+  void loadAgentSecurity();
   document.addEventListener("keydown", onKeydown);
 });
 onBeforeUnmount(() => document.removeEventListener("keydown", onKeydown));
@@ -225,6 +229,30 @@ async function downloadCa(): Promise<void> {
   } finally {
     caDownloading.value = false;
   }
+}
+
+// ── Agent security (POL-134) ───────────────────────────────────────────────────
+// The mTLS posture of the agent channel, in operator words. Loaded non-throwing like the HTTPS
+// card: a failed fetch leaves the card in its loading state rather than breaking Settings.
+const agentSec = ref<AgentSecurityInfo | null>(null);
+
+async function loadAgentSecurity(): Promise<void> {
+  try {
+    agentSec.value = await auth.getAgentSecurity();
+  } catch (err) {
+    console.error("[console] loadAgentSecurity failed", err);
+  }
+}
+
+/** How many machines have proven they hold a working cert (connected over mTLS at least once). */
+const mtlsMigrated = computed(() => (agentSec.value?.machines ?? []).filter((m) => m.mtlsSeenAt).length);
+
+/** One plain-words state per machine, for the card's list. */
+function machineCertState(m: AgentSecurityInfo["machines"][number]): { label: string; cls: string } {
+  if (m.online && m.agentChannel === "mtls") return { label: "Secure channel", cls: "asec-ok" };
+  if (m.mtlsSeenAt) return { label: "Has certificate", cls: "asec-ok" };
+  if (m.mtlsCertIssuedAt) return { label: "Certificate issued — moves over on next connection", cls: "asec-warn" };
+  return { label: "No certificate yet", cls: "asec-warn" };
 }
 
 // ── Onboard Screens: the ⋯ build menu ──────────────────────────────────────────
@@ -434,6 +462,97 @@ function goToOnboard(): void {
   document.getElementById("sec-netboot")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// ── Operators (POL-107) ────────────────────────────────────────────────────────
+// Admin-only. The card is hidden for other roles, and the SERVER refuses every one of these calls
+// with a 403 for them anyway — the hiding is a courtesy, the 403 is the permission system.
+const operators = ref<Operator[]>([]);
+const opsError = ref<string | null>(null);
+const opsBusy = ref<string | null>(null);
+const opsCreating = ref(false);
+const newOp = reactive<{ email: string; password: string; role: OperatorRole }>({
+  email: "",
+  password: "",
+  role: "operator",
+});
+
+async function loadOperators(): Promise<void> {
+  if (!store.isAdmin) return;
+  try {
+    operators.value = await auth.listOperators();
+  } catch {
+    // A non-admin never gets here (the card is hidden); a transport failure just leaves the list empty.
+    operators.value = [];
+  }
+}
+
+async function onCreateOperator(): Promise<void> {
+  if (opsCreating.value) return;
+  opsError.value = null;
+  if (!newOp.email.includes("@")) {
+    opsError.value = "Enter a valid email address.";
+    return;
+  }
+  if (newOp.password.length < 8) {
+    opsError.value = "The password must be at least 8 characters.";
+    return;
+  }
+  opsCreating.value = true;
+  try {
+    await auth.createOperator({ email: newOp.email, password: newOp.password, role: newOp.role });
+    newOp.email = "";
+    newOp.password = "";
+    newOp.role = "operator";
+    await loadOperators();
+    showToast("Operator added");
+  } catch (err) {
+    opsError.value =
+      err instanceof ApiError && err.status === 409
+        ? "An operator with that email already exists."
+        : "Could not add that operator.";
+  } finally {
+    opsCreating.value = false;
+  }
+}
+
+async function onRoleChange(op: Operator, raw: string): Promise<void> {
+  const parsed = OperatorRole.safeParse(raw);
+  if (!parsed.success || parsed.data === op.role) return;
+  opsError.value = null;
+  opsBusy.value = op.id;
+  try {
+    await auth.updateOperator(op.id, { role: parsed.data });
+    await loadOperators();
+    showToast(`${op.email} is now ${parsed.data}`);
+  } catch (err) {
+    // 409 = the last-admin guard. Reload so the <select> snaps back to the truth on the server.
+    opsError.value =
+      err instanceof ApiError && err.status === 409
+        ? "That change would leave the deployment with no admin."
+        : "Could not change that role.";
+    await loadOperators();
+  } finally {
+    opsBusy.value = null;
+  }
+}
+
+async function onRemoveOperator(op: Operator): Promise<void> {
+  if (!window.confirm(`Remove ${op.email}? Their sessions end immediately.`)) return;
+  opsError.value = null;
+  opsBusy.value = op.id;
+  try {
+    await auth.deleteOperator(op.id);
+    await loadOperators();
+    showToast("Operator removed");
+  } catch (err) {
+    opsError.value =
+      err instanceof ApiError && err.status === 409
+        ? "The last admin cannot be removed."
+        : "Could not remove that operator.";
+  } finally {
+    opsBusy.value = null;
+  }
+}
+
 // ── Change password ────────────────────────────────────────────────────────────
 const pw = reactive({ current: "", next: "", confirm: "" });
 const pwError = ref<string | null>(null);
@@ -471,6 +590,9 @@ async function onChangePassword(): Promise<void> {
   }
 }
 
+/** The signed-in operator's role, title-cased for the Account card ("Admin" / "Operator" / "Viewer"). */
+const roleLabel = computed(() => store.role.charAt(0).toUpperCase() + store.role.slice(1));
+
 // ── Logout ─────────────────────────────────────────────────────────────────────
 const loggingOut = ref(false);
 async function onSignOut(): Promise<void> {
@@ -504,7 +626,9 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- Onboard Screens (POL-33 netboot + POL-45 builds) --------------------- -->
-      <section id="sec-netboot" class="card pad-lg">
+      <!-- POL-107: the fleet cards below are ADMIN-only. The server 403s every route behind them
+           (deny-by-default in roles.ts), so hiding them is honesty, not security. -->
+      <section v-if="store.isAdmin" id="sec-netboot" class="card pad-lg">
         <div class="title-row">
           <h2 class="card-title">Onboard Screens</h2>
           <div class="spacer" />
@@ -813,7 +937,7 @@ async function onSignOut(): Promise<void> {
       </section>
 
       <!-- On-screen badges ----------------------------------------------------- -->
-      <section class="card">
+      <section v-if="store.isAdmin" class="card">
         <div class="card-head">
           <div class="min-w-0">
             <h2 class="card-title">On-screen badges</h2>
@@ -836,8 +960,8 @@ async function onSignOut(): Promise<void> {
         </div>
       </section>
 
-      <!-- Enrolment tokens (POL-104) -------------------------------------------- -->
-      <section class="card">
+      <!-- Enrolment tokens (POL-104) — admin-only (POL-107) ---------------------- -->
+      <section v-if="store.isAdmin" class="card">
         <h2 class="card-title">Enrolment tokens</h2>
         <p class="card-sub gap">
           The secrets a new machine presents when it first dials in. Cut one per batch or site, scope it with an
@@ -959,7 +1083,7 @@ async function onSignOut(): Promise<void> {
       <!-- HTTPS (POL-70/D89) ----------------------------------------------------- -->
       <!-- Rendered only when THIS listener terminates TLS; behind a TLS-terminating ingress the
            server sees plain HTTP and the certificate story belongs to the ingress/cert-manager. -->
-      <section v-if="https && https.mode !== 'off'" class="card">
+      <section v-if="store.isAdmin && https && https.mode !== 'off'" class="card">
         <h2 class="card-title">HTTPS</h2>
 
         <template v-if="https.mode === 'provided'">
@@ -1015,8 +1139,64 @@ async function onSignOut(): Promise<void> {
         </template>
       </section>
 
+      <!-- Agent security (POL-134) ---------------------------------------------- -->
+      <section id="sec-agent-security" class="card">
+        <h2 class="card-title">Agent security</h2>
+        <p class="card-sub wrap gap">
+          Machines talk to the control plane over the <strong>agent channel</strong> — it carries the remote shell,
+          browser DevTools, screen previews and window placement. Each machine is issued its own certificate
+          automatically when it enrols, so only your machines can open that channel. Screens (players) and the boot
+          flow have their own separate gates and are not affected by this.
+        </p>
+
+        <div v-if="agentSec === null" class="hint">Loading…</div>
+
+        <template v-else>
+          <div v-if="agentSec.mode === 'off'" class="open-note">
+            <span class="asec-badge asec-warn">Off</span>
+            <span>
+              The certificate channel is not running{{ agentSec.detail ? ` — ${agentSec.detail}` : "" }}. Machines
+              still authenticate with their enrolment credentials, but the transport is not mutually authenticated.
+            </span>
+          </div>
+
+          <div v-else-if="agentSec.mode === 'required'" class="open-note">
+            <span class="asec-badge asec-ok">Secured</span>
+            <span>
+              Every live machine connection is certificate-authenticated{{ agentSec.requiredSince ? ` (since ${new Date(agentSec.requiredSince).toLocaleDateString()})` : "" }}.
+              New machines still enrol with the enrolment token and are handed a certificate on first contact —
+              nothing extra to do when you add a box.
+            </span>
+          </div>
+
+          <div v-else class="open-note">
+            <span class="asec-badge asec-warn">Migrating</span>
+            <span>
+              Certificates are being handed out: <strong>{{ mtlsMigrated }} of {{ agentSec.machines.length }}</strong>
+              machines are on the secure channel; the rest move over by themselves the next time they connect. Once
+              every machine is on it, the secure channel becomes <em>required</em> automatically — the activity feed
+              will say so.
+            </span>
+          </div>
+
+          <p v-if="agentSec.pinned && agentSec.mode !== 'off'" class="hint gap-sm">
+            This posture is pinned by the server's configuration (AGENT_MTLS_REQUIRE) — it will not change by itself.
+          </p>
+
+          <ul v-if="agentSec.mode !== 'off' && agentSec.machines.length > 0" class="asec-list">
+            <li v-for="m in agentSec.machines" :key="m.id" class="asec-row">
+              <span class="asec-name">{{ m.label }}</span>
+              <span class="asec-badge" :class="machineCertState(m).cls">{{ machineCertState(m).label }}</span>
+            </li>
+          </ul>
+          <p v-else-if="agentSec.mode !== 'off'" class="hint gap-sm">
+            No machines yet — the first box to enrol gets a certificate on its first hello.
+          </p>
+        </template>
+      </section>
+
       <!-- Update schedule ------------------------------------------------------ -->
-      <section id="sec-image" class="card pad-lg">
+      <section v-if="store.isAdmin" id="sec-image" class="card pad-lg">
         <h2 class="card-title">Update schedule</h2>
         <p class="card-sub wrap gap">
           When the live image is refreshed. A nightly in-place refresh picks up userspace fixes; a weekly full rebuild
@@ -1111,6 +1291,84 @@ async function onSignOut(): Promise<void> {
         </template>
       </section>
 
+      <!-- Operators (POL-107) --------------------------------------------------- -->
+      <!-- ADMIN-only, and the server agrees: /api/v1/operators** is admin-by-deny-default. -->
+      <section v-if="store.isAdmin" id="sec-operators" class="card">
+        <h2 class="card-title">Operators</h2>
+        <p class="card-sub gap">
+          Who can sign in, and what they may do.
+          <strong>Admin</strong> runs the fleet (machines, enrolment, image builds, settings).
+          <strong>Operator</strong> authors content and layout. <strong>Viewer</strong> reads the
+          console and can recall a saved scene — nothing else.
+        </p>
+
+        <div v-if="opsError" class="callout callout-bad"><span class="callout-icon">⚠</span>{{ opsError }}</div>
+
+        <table class="ops-table">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Role</th>
+              <th class="right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="op in operators" :key="op.id">
+              <td class="ops-email">
+                {{ op.email }}
+                <span v-if="op.id === store.currentUser?.id" class="ops-you">you</span>
+              </td>
+              <td>
+                <select
+                  class="input ops-role"
+                  :value="op.role"
+                  :disabled="opsBusy === op.id || op.id === store.currentUser?.id"
+                  :title="op.id === store.currentUser?.id ? 'You cannot change your own role' : ''"
+                  @change="onRoleChange(op, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="admin">Admin</option>
+                  <option value="operator">Operator</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+              </td>
+              <td class="right">
+                <button
+                  type="button"
+                  class="btn-ghost-sm"
+                  :disabled="opsBusy === op.id || op.id === store.currentUser?.id"
+                  :title="op.id === store.currentUser?.id ? 'You cannot remove your own account' : ''"
+                  @click="onRemoveOperator(op)"
+                >
+                  Remove
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="ops-new">
+          <div>
+            <label class="field-label" for="op-email">Email</label>
+            <input id="op-email" v-model="newOp.email" class="input" type="email" autocomplete="off" :disabled="opsCreating" />
+          </div>
+          <div>
+            <label class="field-label" for="op-password">Password</label>
+            <input id="op-password" v-model="newOp.password" class="input" type="password" autocomplete="new-password" :disabled="opsCreating" />
+          </div>
+          <div>
+            <label class="field-label" for="op-role">Role</label>
+            <select id="op-role" v-model="newOp.role" class="input" :disabled="opsCreating">
+              <option value="admin">Admin</option>
+              <option value="operator">Operator</option>
+              <option value="viewer">Viewer</option>
+            </select>
+          </div>
+          <button type="button" class="btn btn-primary" :disabled="opsCreating" @click="onCreateOperator">
+            {{ opsCreating ? "Adding…" : "Add operator" }}
+          </button>
+        </div>
+      </section>
+
       <!-- Change password ------------------------------------------------------ -->
       <section id="sec-security" class="card">
         <h2 class="card-title">Change password</h2>
@@ -1154,7 +1412,7 @@ async function onSignOut(): Promise<void> {
         <div class="account">
           <div class="avatar">{{ store.accountInitials }}</div>
           <div class="min-w-0 who">
-            <div class="who-name">Operator</div>
+            <div class="who-name">{{ roleLabel }}</div>
             <div class="who-email">{{ store.currentEmail || "—" }}</div>
           </div>
           <button type="button" class="btn-ghost-sm" :disabled="loggingOut" @click="onSignOut">
@@ -2000,6 +2258,48 @@ async function onSignOut(): Promise<void> {
   background: #22c55e;
 }
 
+/* ── Agent security (POL-134) ──────────────────────────────────────────────── */
+.asec-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.asec-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  font-size: 12.5px;
+}
+.asec-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asec-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.asec-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.asec-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 /* ── Update schedule ───────────────────────────────────────────────────────── */
 .sched {
   border: 1px solid var(--line);
@@ -2134,6 +2434,64 @@ async function onSignOut(): Promise<void> {
 .pw-grid .field-label {
   color: var(--fg2);
   margin-bottom: 6px;
+}
+
+/* ── Operators (POL-107) ───────────────────────────────────────────────────── */
+.ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 18px;
+}
+.ops-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+.ops-table td {
+  padding: 10px 10px 10px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+  font-size: 13px;
+}
+.ops-table th.right,
+.ops-table td.right {
+  text-align: right;
+  padding-right: 0;
+}
+.ops-email {
+  font-weight: 500;
+}
+.ops-you {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.ops-role {
+  min-width: 130px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.ops-new {
+  display: grid;
+  grid-template-columns: 1.6fr 1.2fr 1fr auto;
+  gap: 12px;
+  align-items: end;
+}
+@media (max-width: 720px) {
+  .ops-new {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ── Account ───────────────────────────────────────────────────────────────── */

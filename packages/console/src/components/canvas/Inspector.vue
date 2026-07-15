@@ -26,6 +26,7 @@ import { ref, computed, watch, onUnmounted } from "vue";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
+import { machineDisplayName } from "../../machine-name";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
 import Toggle from "../Toggle.vue";
@@ -94,6 +95,35 @@ function zoomScreen(zoom: number) {
 function zoomWall(zoom: number) {
   const w = wall.value;
   if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
+}
+
+// ── playlist step zoom (POL-133) ────────────────────────────────────────────
+// A playlist's read-out carries its steps; a step with a `zoom` is a framed page and gets the same
+// −/value/+ control a directly-assigned page does — the operator asked for "zoom controls in
+// playlist pages, just like normal screens", so it must READ as the same feature. Steps without a
+// zoom (images, videos) are listed but inert, and a step needs a sourceId to be addressed at all.
+// The same step appearing twice shares one remembered value, so it's collapsed to one control.
+type ZoomableStep = { sourceId: string; name: string; kind: string; zoom: number };
+function zoomableSteps(content: { entries?: { sourceId?: string; name: string; kind: string; zoom?: number }[] } | null): ZoomableStep[] {
+  const out: ZoomableStep[] = [];
+  const seen = new Set<string>();
+  for (const entry of content?.entries ?? []) {
+    if (entry.sourceId === undefined || entry.zoom === undefined || seen.has(entry.sourceId)) continue;
+    seen.add(entry.sourceId);
+    out.push({ sourceId: entry.sourceId, name: entry.name, kind: entry.kind, zoom: entry.zoom });
+  }
+  return out;
+}
+const singleSteps = computed(() => zoomableSteps(singleContent.value));
+const wallSteps = computed(() => zoomableSteps(wallContent.value));
+
+function zoomScreenStep(sourceId: string, zoom: number) {
+  const s = single.value;
+  if (s) store.setScreenPlaylistZoom(s.id, sourceId, zoom);
+}
+function zoomWallStep(sourceId: string, zoom: number) {
+  const w = wall.value;
+  if (w && !wallPending.value) store.setWallPlaylistZoom(w.id, sourceId, zoom);
 }
 
 const wallSourcePick = ref("");
@@ -214,7 +244,8 @@ const machineName = computed(() => {
   const s = single.value;
   if (!s) return "";
   const m = store.machineForScreen(s.id);
-  return m ? m.label : s.machineId;
+  // POL-117 — the operator's name, or an honest "Unnamed box · <tail>"; never a live-image hostname.
+  return m ? machineDisplayName(m) : s.machineId;
 });
 
 // ── dev-tools quick-launch (POL-85 — the ⋯ overflow in the single-screen header) ──
@@ -402,6 +433,21 @@ function selectOne(id: string) {
         />
       </template>
 
+      <!-- Playlist step zoom (POL-133): one control per framed step, applied across all panels. -->
+      <template v-if="wallSteps.length">
+        <div class="section-label gap-top">Step zoom</div>
+        <div v-for="step in wallSteps" :key="step.sourceId" class="step-zoom">
+          <div class="step-zoom-name" :title="step.name">{{ step.name }}</div>
+          <ZoomControl
+            :zoom="step.zoom"
+            :disabled="wallPending"
+            caption=""
+            @update="(z: number) => zoomWallStep(step.sourceId, z)"
+          />
+        </div>
+        <div class="hint">Remembered per step — the page zooms as one, across all panels.</div>
+      </template>
+
       <div class="panels-head">
         <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
         <span class="panels-res">{{ wallRes }}</span>
@@ -529,6 +575,20 @@ function selectOne(id: string) {
           caption="Remembered for this screen and this page."
           @update="zoomScreen"
         />
+      </template>
+
+      <!-- Playlist step zoom (POL-133): one control per framed step of the rotation. -->
+      <template v-if="singleSteps.length">
+        <div class="section-label gap-top">Step zoom</div>
+        <div v-for="step in singleSteps" :key="step.sourceId" class="step-zoom">
+          <div class="step-zoom-name" :title="step.name">{{ step.name }}</div>
+          <ZoomControl
+            :zoom="step.zoom"
+            caption=""
+            @update="(z: number) => zoomScreenStep(step.sourceId, z)"
+          />
+        </div>
+        <div class="hint">Remembered per step, for this screen — applies live when the step is showing.</div>
       </template>
 
       <div class="section-label gap-top">Layout</div>
@@ -978,6 +1038,20 @@ function selectOne(id: string) {
   font-size: 11px;
   color: var(--muted2);
   line-height: 1.55;
+}
+
+/* Playlist step zoom (POL-133): one row per framed step — name over the same −/value/+ control. */
+.step-zoom {
+  margin-top: 8px;
+}
+.step-zoom-name {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fg2);
+  margin-bottom: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .layout-grid {

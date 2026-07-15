@@ -68,6 +68,7 @@ import {
 import type { KioskBrowser, MachineVitals, Output } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
+import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
@@ -208,6 +209,10 @@ class Agent {
   /** POL-119 — connector → is a cast session live NOW (receiver window on the glass)? Entries exist
    *  only for cast-enabled connectors; reported in every status frame + immediately on change. */
   private readonly casting = new Map<string, boolean>();
+  /** POL-136 — connector → the PIN a pairing sender must type right now. Entries exist only while a
+   *  pairing is in progress; level-reported like `casting` (heartbeat + immediate on change) so the
+   *  overlay self-heals across reconnects. */
+  private readonly castPins = new Map<string, string>();
 
   /** POL-92 — host vitals, sampled from /proc on each heartbeat. Holds the previous CPU jiffy totals
    *  between samples (busy% is a delta), so it lives for the life of the agent, not the socket. */
@@ -237,6 +242,21 @@ class Agent {
       if (!this.casting.has(connector)) return; // receiver already retired — stale event
       this.casting.set(connector, active);
       log(`cast session on ${connector}: ${active ? "started" : "ended"}`);
+      this.sendStatus();
+    });
+    // POL-136 — the PIN a pairing sender must type: learned by the backend from the receiver's
+    // stdout (the receiver never draws it), pushed up IMMEDIATELY so the panel shows it while the
+    // phone is still asking, and level-reported in every heartbeat until the pairing ends.
+    this.backend.onCastPin((connector, pin) => {
+      // The ledger rules live in applyCastPinEvent (cast.ts, pinned by tests) — notably that a
+      // null CLEAR applies even after the `casting` entry is gone, or a receiver-death ordering
+      // could strand a stale PIN in every heartbeat.
+      if (!applyCastPinEvent(this.castPins, (c) => this.casting.has(c), connector, pin)) return;
+      log(
+        pin === null
+          ? `cast pairing PIN on ${connector} cleared`
+          : `cast pairing PIN on ${connector}: ${pin} — reporting for the panel overlay`,
+      );
       this.sendStatus();
     });
     this.connect();
@@ -462,6 +482,7 @@ class Agent {
       this.placed.delete(connector);
       this.status.delete(connector);
       this.casting.delete(connector);
+      this.castPins.delete(connector);
     }
 
     // Ack the new state immediately rather than waiting for the next heartbeat tick.
@@ -481,11 +502,15 @@ class Agent {
         enabled ? { name: screen.friendlyName ?? screen.screenId } : null,
       );
       if (enabled && !this.casting.has(screen.connector)) this.casting.set(screen.connector, false);
-      if (!enabled) this.casting.delete(screen.connector);
+      if (!enabled) {
+        this.casting.delete(screen.connector);
+        this.castPins.delete(screen.connector); // a torn-down receiver strands no PIN (POL-136)
+      }
     } catch (err) {
       const reason = (err as Error).message;
       log(`setCast(${screen.connector}, ${enabled ? "on" : "off"}) failed: ${reason}`);
       this.casting.delete(screen.connector);
+      this.castPins.delete(screen.connector);
       const st = this.status.get(screen.connector);
       this.status.set(screen.connector, {
         ok: st?.ok ?? true,
@@ -805,7 +830,7 @@ class Agent {
    */
   private async sendStatus(): Promise<void> {
     const screens = [...this.status.entries()].map(([connector, st]) => {
-      const entry: { connector: string; ok: boolean; note?: string; casting?: boolean } = {
+      const entry: { connector: string; ok: boolean; note?: string; casting?: boolean; castPin?: string } = {
         connector,
         ok: st.ok,
       };
@@ -813,6 +838,9 @@ class Agent {
       // POL-119 — level-report the live session per cast-enabled connector (absent = not castable).
       const casting = this.casting.get(connector);
       if (casting !== undefined) entry.casting = casting;
+      // POL-136 — level-report the pairing PIN while a sender is pairing (absent = no pairing).
+      const castPin = this.castPins.get(connector);
+      if (castPin !== undefined) entry.castPin = castPin;
       return entry;
     });
     let vitals: MachineVitals | undefined;

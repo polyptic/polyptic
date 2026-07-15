@@ -4,7 +4,9 @@
 
   Machines are grouped by enrollment status:
     • Pending  — newly dialed-in boxes awaiting a decision: Approve (admits their screens) or Reject
-                 (with an optional reason). Surfaced first, with a warning treatment.
+                 (with an optional reason). Surfaced first, with the v2 mock's full amber treatment
+                 (POL-139): a pulsing warn border, a boxed "Name this box" input, a short monospace
+                 id tail, ghost Reject → outlined Ident → primary Approve, and an amber note strip.
     • Approved — admitted machines, online first. Each card shows exactly three action clusters
                  (POL-68): [Ident all] · [console button] · [⋯ overflow]. The ⋯ menu holds Reboot and
                  the destructive actions (Revoke access / Remove machine); status chips (Online pill +
@@ -25,8 +27,15 @@
   A "Connect a machine" button (and a first-run empty state) opens the cold-start wizard. Screens are
   first-class and named; machines are plumbing — so the rich, per-screen affordances live here.
 
-  Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine, and via
-  ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints, no direct fetch.
+  POL-117 — machines are NAMED here. Every netbooted box reports the hostname
+  `localhost.localdomain`, so the hostname is never the identity: the card shows the operator's name
+  (editable in place via MachineName.vue, on pending and approved cards alike) or an honest
+  "Unnamed box · <id tail>". Pending cards also get an Ident button — the box flashes its holding
+  board so the operator knows which physical panel they're approving.
+
+  Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine /
+  renameMachine, and via ScreenRow: identScreen / renameScreen / inspectScreen). No new endpoints,
+  no direct fetch.
 -->
 <script setup lang="ts">
 import { ref, computed, reactive, onMounted, onUnmounted } from "vue";
@@ -35,8 +44,10 @@ import { useConsoleStore } from "../stores/console";
 import { formatLastSeen, countLabel } from "../time";
 import ScreenRow from "../components/ScreenRow.vue";
 import ColdStartWizard from "../components/ColdStartWizard.vue";
+import MachineName from "../components/MachineName.vue";
 import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
+import { machineDisplayName, machineIdTail } from "../machine-name";
 
 const store = useConsoleStore();
 
@@ -59,6 +70,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (clock) clearInterval(clock);
   window.clearTimeout(toastTimer);
+  for (const t of identTimers) window.clearTimeout(t);
 });
 
 /** "just now" while online, "rebooting…" while an operator reboot is in flight, else relative. */
@@ -145,7 +157,7 @@ function removePreReg(record: PreRegistration): void {
 }
 
 function reject(m: MachineView): void {
-  const reason = window.prompt(`Reject "${m.label}"? Optionally add a reason (sent to the agent):`);
+  const reason = window.prompt(`Reject "${machineDisplayName(m)}"? Optionally add a reason (sent to the agent):`);
   // Cancel (null) aborts; an empty string rejects without a reason.
   if (reason === null) return;
   void store.rejectMachine(m.id, reason);
@@ -154,7 +166,7 @@ function reject(m: MachineView): void {
 function revoke(m: MachineView): void {
   menuFor.value = null;
   const yes = window.confirm(
-    `Revoke "${m.label}"? Its screens go dark until it is approved again.`,
+    `Revoke "${machineDisplayName(m)}"? Its screens go dark until it is approved again.`,
   );
   if (yes) void store.rejectMachine(m.id);
 }
@@ -172,7 +184,7 @@ function remove(m: MachineView): void {
   const n = m.screens.length;
   const what = n > 0 ? `its ${countLabel(n, "screen")} plus their layout and content` : "it";
   const yes = window.confirm(
-    `Remove "${m.label}"? This permanently forgets the machine and deletes ${what} from the console. ` +
+    `Remove "${machineDisplayName(m)}"? This permanently forgets the machine and deletes ${what} from the console. ` +
       `If it reconnects it will have to be set up again.`,
   );
   if (yes) void store.removeMachine(m.id);
@@ -180,6 +192,30 @@ function remove(m: MachineView): void {
 
 function identAll(m: MachineView): void {
   void store.identMachine(m.id);
+}
+
+// While a pending box's holding board flashes, its Ident button reads "Identing…" and won't
+// re-fire. The store flashes a pending box for 12 s (identMachine's pending TTL) — mirror that.
+const PENDING_IDENT_MS = 12000;
+const identing = reactive(new Set<string>());
+const identTimers = new Set<number>();
+
+function identPending(m: MachineView): void {
+  if (identing.has(m.id)) return;
+  identing.add(m.id);
+  void store.identMachine(m.id);
+  const timer = window.setTimeout(() => {
+    identing.delete(m.id);
+    identTimers.delete(timer);
+  }, PENDING_IDENT_MS);
+  identTimers.add(timer);
+}
+
+/** The note strip's subject: "its screen" / "its 3 screens" / "its screens" (none reported yet). */
+function pendingScreensPhrase(m: MachineView): string {
+  if (m.outputCount === 1) return "its screen";
+  if (m.outputCount > 1) return `its ${m.outputCount} screens`;
+  return "its screens";
 }
 
 /**
@@ -192,11 +228,11 @@ async function reboot(m: MachineView): Promise<void> {
   const n = m.screens.length;
   const what = n > 0 ? `Its ${countLabel(n, "screen")} go dark` : "It goes dark";
   const yes = window.confirm(
-    `Reboot "${m.label}"? ${what} until it boots back up and reconnects — about a minute.`,
+    `Reboot "${machineDisplayName(m)}"? ${what} until it boots back up and reconnects — about a minute.`,
   );
   if (!yes) return;
   const error = await store.rebootMachine(m.id);
-  showToast(error ?? `Rebooting ${m.label}…`);
+  showToast(error ?? `Rebooting ${machineDisplayName(m)}…`);
 }
 
 // ── Console lifecycle (POL-59 arm/disarm, POL-68 UI) ─────────────────────────
@@ -209,7 +245,7 @@ const enabling = reactive(new Set<string>());
 async function enableConsole(m: MachineView): Promise<void> {
   if (enabling.has(m.id)) return;
   const yes = window.confirm(
-    `Enable the console on "${m.label}"? While enabled, an operator can open an unprivileged ` +
+    `Enable the console on "${machineDisplayName(m)}"? While enabled, an operator can open an unprivileged ` +
       `terminal on this box. It cannot change what the screen displays. Sessions are logged to the ` +
       `activity feed. Disable it when you're done.`,
   );
@@ -281,7 +317,8 @@ function showToast(message: string): void {
             anything.
           </p>
         </div>
-        <button class="connect-btn" @click="wizardOpen = true">Connect a machine</button>
+        <!-- Enrolling a box is an ADMIN flow (approve + the enrolment token are admin-only). -->
+        <button v-if="store.isAdmin" class="connect-btn" @click="wizardOpen = true">Connect a machine</button>
       </header>
 
       <!-- first-run empty state -->
@@ -305,7 +342,7 @@ function showToast(message: string): void {
               dials in and appears below as Pending. Approve it to admit its screens.
             </div>
           </div>
-          <button class="connect-btn ghost" @click="wizardOpen = true">Guided setup →</button>
+          <button v-if="store.isAdmin" class="connect-btn ghost" @click="wizardOpen = true">Guided setup →</button>
         </div>
 
         <!-- pending -->
@@ -321,24 +358,41 @@ function showToast(message: string): void {
           </div>
           <div class="stack">
             <div v-for="m in pending" :key="m.id" class="machine pending">
-              <div class="machine-row">
+              <div class="machine-row pending-row">
                 <div class="machine-id">
                   <div class="machine-id-line">
                     <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
-                    <span class="machine-label">{{ m.label }}</span>
-                    <span class="machine-uuid">{{ m.id }}</span>
+                    <!-- POL-117 — name it while it queues: pending boxes are exactly when several
+                         identical `localhost.localdomain` machines need telling apart. Boxed here
+                         (unlike the approved card's ghost input) — naming is part of approving. -->
+                    <MachineName :machine="m" boxed />
+                    <span class="machine-hex" :title="m.id">{{ machineIdTail(m.id) }}</span>
+                    <!-- POL-104 — a box that named/approved itself from a pre-registration. -->
                     <span v-if="m.preRegistered" class="chip chip-accent" title="Matched a pre-registration">
                       Pre-registered
                     </span>
                   </div>
-                  <div class="machine-meta">
-                    {{ m.online ? "Online" : "Offline" }} · reports
-                    {{ countLabel(m.outputCount, "screen") }} · {{ lastSeen(m) }}
-                  </div>
                 </div>
-                <button class="btn-remove" @click="remove(m)">Remove</button>
-                <button class="btn-reject" @click="reject(m)">Reject</button>
-                <button class="btn-approve" @click="approve(m)">Approve</button>
+                <!-- POL-107: enrolment is an ADMIN verb (the server 403s these routes for anyone
+                     else) — a non-admin sees the pending box, and no way to admit it. -->
+                <div v-if="store.isAdmin" class="pending-actions">
+                  <button class="btn-reject-ghost" @click="reject(m)">Reject</button>
+                  <!-- POL-117 — flash the box's holding board so the operator knows WHICH physical
+                       panel they are approving. Rides the agent channel; needs the box online. -->
+                  <button
+                    class="btn-ghost-sm"
+                    :disabled="!m.online || identing.has(m.id)"
+                    :title="
+                      m.online
+                        ? 'Flashes a badge on every screen this box drives'
+                        : `${machineDisplayName(m)} is offline — nothing to flash`
+                    "
+                    @click="identPending(m)"
+                  >
+                    <span class="ident-dot"></span>{{ identing.has(m.id) ? "Identing…" : "Ident" }}
+                  </button>
+                  <button class="btn-approve pending-approve" @click="approve(m)">Approve</button>
+                </div>
               </div>
 
               <!-- POL-104 — the facts an operator needs to tell THIS box from the 49 next to it.
@@ -351,9 +405,10 @@ function showToast(message: string): void {
               </dl>
 
               <div class="pending-note">
-                Not yet admitted — its screens show a holding board carrying this same id, so you can
-                walk the room and match a panel to a card. Approve and its
-                {{ countLabel(m.outputCount, "screen") }} land in the Unplaced tray.
+                Nothing plays on this box until you approve it. Its screens show a holding board
+                carrying this same id, so you can walk the room and match a panel to a card. Once you
+                do, {{ pendingScreensPhrase(m) }} will show up in the Unplaced tray, ready to place on
+                the wall.
               </div>
             </div>
           </div>
@@ -437,7 +492,8 @@ function showToast(message: string): void {
                 <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
                 <div class="machine-id">
                   <div class="machine-id-line">
-                    <span class="machine-label">{{ m.label }}</span>
+                    <!-- POL-117 — the operator's name is the identity; edit in place. -->
+                    <MachineName :machine="m" />
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                 </div>
@@ -450,20 +506,22 @@ function showToast(message: string): void {
                 </span>
                 <span class="last-seen">{{ lastSeen(m) }}</span>
 
-                <!-- cluster 1: Ident all -->
-                <button v-if="m.screens.length" class="btn-ghost-sm" @click="identAll(m)">
+                <!-- cluster 1: Ident all — an operator may flash panels; a viewer may not. -->
+                <button v-if="m.screens.length && store.canAuthor" class="btn-ghost-sm" @click="identAll(m)">
                   <span class="ident-dot"></span>Ident all
                 </button>
 
-                <!-- cluster 2: the stateful console button (POL-68 §3) -->
+                <!-- cluster 2: the stateful console button (POL-68 §3). ADMIN-only (POL-107): a root
+                     PTY on a wall box is the most powerful thing this console can do, and the /admin
+                     WS refuses the shell frames for any other role. -->
                 <button
-                  v-if="!m.shellEnabled"
+                  v-if="!m.shellEnabled && store.isAdmin"
                   class="btn-ghost-sm"
                   :disabled="!m.online || enabling.has(m.id)"
                   :title="
                     m.online
                       ? 'Enables an unprivileged debug shell on this box — sessions are logged to the activity feed'
-                      : `${m.label} is offline — the console rides its agent connection`
+                      : `${machineDisplayName(m)} is offline — the console rides its agent connection`
                   "
                   @click="enableConsole(m)"
                 >
@@ -472,14 +530,14 @@ function showToast(message: string): void {
                   </template>
                   <template v-else>Enable console</template>
                 </button>
-                <div v-else class="split">
+                <div v-else-if="store.isAdmin" class="split">
                   <button
                     class="split-main"
                     :disabled="!m.online"
                     :title="
                       m.online
                         ? 'Open a terminal on this machine'
-                        : `${m.label} is offline — the console rides its agent connection`
+                        : `${machineDisplayName(m)} is offline — the console rides its agent connection`
                     "
                     @click="openTerminal(m)"
                   >
@@ -512,7 +570,9 @@ function showToast(message: string): void {
                 </div>
 
                 <!-- cluster 3: ⋯ overflow (Reboot · Revoke access · Remove machine) -->
-                <div class="menu-wrap">
+                <!-- POL-107 — reboot / revoke / remove are ADMIN verbs. A marketing viewer cannot
+                     reboot a box: the button is gone here, and the route 403s regardless. -->
+                <div v-if="store.isAdmin" class="menu-wrap">
                   <button
                     class="kebab"
                     :class="{ open: menuFor === m.id }"
@@ -529,7 +589,7 @@ function showToast(message: string): void {
                       <button
                         class="menu-item"
                         :disabled="!m.online"
-                        :title="m.online ? 'Power-cycle this machine' : `${m.label} is offline — nothing to reboot`"
+                        :title="m.online ? 'Power-cycle this machine' : `${machineDisplayName(m)} is offline — nothing to reboot`"
                         @click="reboot(m)"
                       >
                         Reboot
@@ -551,7 +611,7 @@ function showToast(message: string): void {
                   v-for="s in m.screens"
                   :key="s.id"
                   :screen="s"
-                  :machine-label="m.label"
+                  :machine-label="machineDisplayName(m)"
                   :machine-online="m.online"
                   :browser="m.browser"
                   @notify="showToast"
@@ -576,15 +636,18 @@ function showToast(message: string): void {
                 <span class="dot dot-off"></span>
                 <div class="machine-id">
                   <div class="machine-id-line">
-                    <span class="machine-label">{{ m.label }}</span>
+                    <!-- POL-117 — honest fallback; never `localhost.localdomain` posing as a name. -->
+                    <span class="machine-label">{{ machineDisplayName(m) }}</span>
                     <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                   <div class="machine-meta">
                     Access denied · {{ formatLastSeen(m.lastSeen, now) }}
                   </div>
                 </div>
-                <button class="btn-remove" @click="remove(m)">Remove</button>
-                <button class="btn-approve" @click="reapprove(m)">Re-approve</button>
+                <template v-if="store.isAdmin">
+                  <button class="btn-remove" @click="remove(m)">Remove</button>
+                  <button class="btn-approve" @click="reapprove(m)">Re-approve</button>
+                </template>
               </div>
             </div>
           </div>
@@ -600,7 +663,7 @@ function showToast(message: string): void {
       v-if="terminalFor"
       :key="terminalFor.id"
       :machine-id="terminalFor.id"
-      :machine-label="terminalFor.label"
+      :machine-label="machineDisplayName(terminalFor)"
       @close="terminalFor = null"
     />
 
@@ -764,9 +827,57 @@ function showToast(message: string): void {
   background: var(--card);
   box-shadow: var(--shadow-sm);
 }
+/* POL-139 — the v2 mock's pending treatment: a full amber border whose colour and 3px soft glow
+   breathe on a 2s cycle. All the card's urgency comes from this pulse + the amber palette. */
 .machine.pending {
-  border-color: var(--warn-soft);
-  border-left: 3px solid var(--warn);
+  border-color: var(--warn);
+  padding: 16px 18px;
+  animation: pendingPulse 2s ease-in-out infinite;
+}
+@keyframes pendingPulse {
+  0%,
+  100% {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 3px var(--warn-soft);
+  }
+  50% {
+    border-color: var(--warn-soft);
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .machine.pending {
+    animation: none;
+  }
+}
+.pending-row {
+  gap: 14px;
+}
+.pending-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.machine-hex {
+  font-size: 11.5px;
+  color: var(--muted2);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  white-space: nowrap;
+}
+/* Boxed name input (MachineName's `boxed` variant) + the pending row's button weights: ghost
+   Reject → outlined Ident → primary Approve, escalating left to right per the mock. */
+.pending .btn-ghost-sm {
+  padding: 8px 13px;
+  font-size: 12.5px;
+  border-color: var(--line);
+  background: transparent;
+  box-shadow: none;
+}
+.pending-approve {
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 12.5px;
 }
 .machine.rejected {
   opacity: 0.7;
@@ -864,19 +975,21 @@ function showToast(message: string): void {
 .btn-approve:hover {
   opacity: 0.92;
 }
-.btn-reject {
-  padding: 9px 15px;
-  border-radius: 9px;
-  border: 1px solid var(--line2);
-  background: var(--surface);
-  font-size: 13px;
+/* Reject is a ghost button — quiet until hovered, when it turns destructive. */
+.btn-reject-ghost {
+  padding: 8px 13px;
+  border-radius: 8px;
+  border: none;
+  background: none;
+  font-size: 12.5px;
   font-weight: 500;
-  color: var(--bad);
+  color: var(--muted);
   cursor: pointer;
   font-family: inherit;
 }
-.btn-reject:hover {
+.btn-reject-ghost:hover {
   background: var(--bad-soft);
+  color: var(--bad);
 }
 .btn-ghost-sm {
   display: inline-flex;
@@ -1076,12 +1189,13 @@ function showToast(message: string): void {
 }
 
 .pending-note {
-  margin-top: 11px;
+  margin-top: 12px;
   font-size: 12px;
   color: var(--warn);
   background: var(--warn-soft);
   padding: 8px 11px;
   border-radius: 8px;
+  line-height: 1.5;
 }
 
 /* ── POL-104: pending hardware facts + pre-registration ─────────────────────── */

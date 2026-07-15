@@ -66,10 +66,19 @@ export interface DisplayBackend {
 
   /**
    * POL-119 — register the (single) cast-session listener: fired with `(connector, active)` when a
-   * receiver window appears (mirror or PIN prompt) or the last one closes. Window presence on the
+   * receiver window appears (the mirror) or the last one closes. Window presence on the
    * box — never the operator's toggle — is what the console shows as "casting now".
    */
   onCastSession(listener: (connector: string, active: boolean) => void): void;
+
+  /**
+   * POL-136 — register the (single) pairing-PIN listener: fired with the PIN a sender must type
+   * RIGHT NOW to pair with `connector`'s receiver, and with `null` when the pairing ends (paired,
+   * mirroring started, receiver died, or timed out). The receiver prints its PIN to stdout only —
+   * it never draws a window at pairing time — so the backend, which supervises that process, is the
+   * only thing that can learn it; the agent forwards it for the server to paint via the player.
+   */
+  onCastPin(listener: (connector: string, pin: string | null) => void): void;
 
   /**
    * POL-92 — the kiosk browsers this backend currently supervises (one per placed output): their

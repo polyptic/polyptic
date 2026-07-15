@@ -77,9 +77,28 @@ export const HostIdentity = z.object({
 });
 export type HostIdentity = z.infer<typeof HostIdentity>;
 
+/**
+ * POL-117 — is this hostname worth showing a human? Every netbooted box boots the same live image,
+ * so every box reports `localhost.localdomain` — a wall of identical "names" that identify nothing.
+ * Shared by the server (which refuses to ADOPT such a hostname as the machine label) and the console
+ * (which refuses to DISPLAY one that predates the fix), so the two ends can never disagree about
+ * what counts as meaningless. Returns the trimmed hostname when it carries information, else null.
+ */
+export function meaningfulHostname(hostname: string | undefined | null): string | null {
+  const h = hostname?.trim();
+  if (!h) return null;
+  const lower = h.toLowerCase();
+  if (lower === "localhost" || lower === "localhost.localdomain") return null;
+  if (lower.endsWith(".localdomain")) return null;
+  return h;
+}
+
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
+  /** The human name shown in the console. Defaults from the box's reported hostname when that
+   *  hostname means something (see `meaningfulHostname`), else stays = `id` — the "unnamed" sentinel
+   *  the console renders honestly ("Unnamed box"). An operator rename (POL-117) always wins. */
   label: z.string(),
   agentVersion: z.string().optional(),
   backend: DisplayBackend.optional(),
@@ -102,6 +121,13 @@ export const Machine = z.object({
   enrolledTokenName: z.string().optional(),
   /** POL-104 — this machine matched a pre-registration (named / tagged / approved from it). */
   preRegistered: z.boolean().optional(),
+  /** POL-134 — when the server last signed this machine's CSR into an mTLS client cert. Absent on
+   *  machines that never asked (pre-POL-25 agents, or an mTLS-off deployment). */
+  mtlsCertIssuedAt: z.string().datetime().optional(),
+  /** POL-134 — when this machine FIRST connected over the mTLS listener: proof the box actually
+   *  holds and presents a working cert, not just that one was issued. Drives the auto-promotion to
+   *  require-mTLS and the per-machine cert state in Settings. */
+  mtlsSeenAt: z.string().datetime().optional(),
 });
 export type Machine = z.infer<typeof Machine>;
 
@@ -197,6 +223,11 @@ export const PlaylistEntry = z.object({
   /** The library source this entry resolved from — how send-time auth stamping (POL-24) finds the
    *  entry's credential profile. Absent on an entry with nothing to stamp. */
   sourceId: z.string().optional(),
+  /** POL-133 — page zoom for THIS entry while it is on air, meaningful only for the framed kinds
+   *  (web/dashboard; media has no page to zoom). Same D62 model as a directly-assigned page: the
+   *  server remembers the operator's value per (target, entry source) pair and stamps it in at
+   *  resolution time. Default 1 so a pre-POL-133 payload parses to exactly the old behaviour. */
+  zoom: Zoom.default(1),
 });
 export type PlaylistEntry = z.infer<typeof PlaylistEntry>;
 
@@ -248,6 +279,13 @@ export const PageEmbedElement = PageElementBase.extend({
   props: z.object({
     sourceId: z.string().optional(),
     url: z.string().url().optional(),
+    /** POL-133 — page zoom for the framed page, AUTHORED in the Studio as a property of the element
+     *  (not per-screen like D62): a composition must render identically in the Studio preview and on
+     *  every wall showing it (the D74 one-renderer invariant), so anything that changes how the page
+     *  lays out is part of the composition itself. Same browser-zoom semantics as `WebSurface.zoom`
+     *  (the frame is laid out at 1/zoom and scaled back up); default 1 keeps old compositions
+     *  byte-identical. */
+    zoom: Zoom.default(1),
   }),
 });
 
@@ -271,6 +309,10 @@ export const PageFeedElement = PageElementBase.extend({
   props: z.object({
     url: z.string().max(500).default(""),
     items: z.number().int().min(2).max(8).default(4),
+    /** POL-133 — text size as a PERCENT of the feed's height-proportional default (100 = exactly the
+     *  pre-POL-133 sizing, so an old composition parses to an identical render). Scales the masthead,
+     *  headlines and ages together, keeping the card's own proportions. */
+    fontScale: z.number().min(50).max(200).default(100),
   }),
 });
 
@@ -324,12 +366,87 @@ export const PageWeatherElement = PageElementBase.extend({
   }),
 });
 
-/** Static QR code, encoded to SVG client-side in the shared elements package — no network. */
+// ── QR colours + scannability (POL-133) ──────────────────────────────────────
+// A QR that doesn't scan is worse than an ugly one, so the colour pair is validated AT THE CONTRACT
+// EDGE: the module/background contrast a camera needs is part of what makes the stored definition a
+// QR element at all. The helpers live here (not in the elements package) because the zod refine needs
+// them, and the console reuses them for its authoring-time warning.
+
+/** Parse `#rgb` / `#rrggbb` to sRGB relative luminance (0..1), or null for any other colour text.
+ *  Non-hex colours (named colours, gradients) can't be judged, so they're never refused. */
+export function hexLuminance(color: string): number | null {
+  const m = /^#(?:([0-9a-f]{3})|([0-9a-f]{6}))$/i.exec(color.trim());
+  if (!m) return null;
+  const hex = m[1] ? m[1].split("").map((c) => c + c).join("") : m[2]!;
+  const channel = (i: number) => {
+    const v = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16) / 255;
+    return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2);
+}
+
+/** WCAG-style contrast ratio (1..21) between two hex colours, or null when either isn't hex. */
+export function contrastRatio(a: string, b: string): number | null {
+  const la = hexLuminance(a);
+  const lb = hexLuminance(b);
+  if (la === null || lb === null) return null;
+  const [hi, lo] = la >= lb ? [la, lb] : [lb, la];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** The contrast a QR needs to scan reliably. Below this the pair is REFUSED at the contract edge. */
+export const QR_MIN_CONTRAST = 3;
+/** Below this (but ≥ the minimum) the pair is allowed with a loud authoring-time warning. */
+export const QR_SAFE_CONTRAST = 4.5;
+
+/**
+ * Why a QR colour pair is a problem, or null when it's fine. `refuse` fails the schema; `warn` is
+ * for the Studio to shout about (inverted codes and low-but-legal contrast scan on most, not all,
+ * cameras). Non-hex colours return null — unjudgeable, so never refused.
+ */
+export function qrContrastIssue(
+  fg: string,
+  bg: string,
+): { level: "refuse" | "warn"; message: string } | null {
+  const ratio = contrastRatio(fg, bg);
+  if (ratio === null) return null;
+  if (ratio < QR_MIN_CONTRAST) {
+    return {
+      level: "refuse",
+      message: `QR contrast ${ratio.toFixed(1)}:1 is below ${QR_MIN_CONTRAST}:1 — this code will not scan`,
+    };
+  }
+  const lfg = hexLuminance(fg)!;
+  const lbg = hexLuminance(bg)!;
+  if (lfg > lbg) {
+    return { level: "warn", message: "Light modules on a dark background — some cameras refuse inverted QR codes" };
+  }
+  if (ratio < QR_SAFE_CONTRAST) {
+    return {
+      level: "warn",
+      message: `QR contrast ${ratio.toFixed(1)}:1 is marginal — may not scan in poor light`,
+    };
+  }
+  return null;
+}
+
+/** Static QR code, encoded to SVG client-side in the shared elements package — no network.
+ *  POL-133 — module (`fg`) and background (`bg`) colours are authorable; the defaults are exactly
+ *  the pre-POL-133 hardcoded render, so an old composition parses to an identical code. A pair the
+ *  camera provably can't read (hex colours below the minimum contrast) is refused here, at the
+ *  contract edge — an unscannable QR is worse than an ugly one. */
 export const PageQrElement = PageElementBase.extend({
   kind: z.literal("qr"),
-  props: z.object({
-    url: z.string().max(500).default(""),
-  }),
+  props: z
+    .object({
+      url: z.string().max(500).default(""),
+      fg: z.string().max(32).default("#09090b"),
+      bg: z.string().max(32).default("#ffffff"),
+    })
+    .superRefine((p, ctx) => {
+      const issue = qrContrastIssue(p.fg, p.bg);
+      if (issue?.level === "refuse") ctx.addIssue({ code: "custom", message: issue.message });
+    }),
 });
 
 /** Time to a target time-of-day. Updates a text node per minute — no animation (D66). */
@@ -566,6 +683,13 @@ export const AgentStatus = z.object({
        *  instead of needing an edge-triggered ack that a dropped frame would strand. Optional =
        *  back-compat with agents that predate casting. */
       casting: z.boolean().optional(),
+      /** POL-136 — the PIN a sender must type RIGHT NOW to pair with this connector's receiver.
+       *  The receiver prints its per-pairing PIN to stdout only (it never draws a window at pairing
+       *  time — the D111 premise this corrects), so the agent, which owns that stdout, learns it and
+       *  level-reports it here for the server to surface on the panel via the player overlay.
+       *  Present only while a pairing is in progress; absent = no pairing (or a pre-POL-136 agent).
+       *  Digits only (UxPlay pins are 4-digit, zero-padded — "0000" is a valid pin). */
+      castPin: z.string().regex(/^\d{1,8}$/).optional(),
     }),
   ),
   /** POL-92 — host vitals, sampled each heartbeat. Optional: an older agent (or a backend with no
@@ -831,7 +955,13 @@ export const ServerToAgentPending = z.object({
   machineId: z.string().optional(),
   /** POL-46 — a player page to show fullscreen on every output WHILE pending, instead of leaving the
    *  wall black. Optional: an older agent simply ignores it, and a server that cannot resolve a
-   *  player base omits it. */
+   *  player base omits it.
+   *
+   *  POL-117 — pre-approval ident rides THIS frame, deliberately: a pending box holds no screens, so
+   *  there is no player WS to pulse, and the trust model wants nothing new reachable pre-approval.
+   *  The server re-sends `server/pending` with `&ident=1` appended to the URL (and again without it
+   *  to clear); the agent's existing "re-place when the URL changed" handling swaps the board, and
+   *  the pending page renders its flash overlay. No new frame, no new agent code, old agents included. */
   pendingUrl: z.string().optional(),
 });
 
@@ -1005,10 +1135,22 @@ export const ServerToPlayerSettings = z.object({
   settings: DisplaySettings,
 });
 
+/** POL-136 — AirPlay pairing PIN overlay: show (or clear, with null) the PIN a sender must type on
+ *  the phone right now. Ephemeral like `server/ident-pulse` — never part of the stored slice — and
+ *  replayed to a player that (re)connects mid-pairing, straight after its first render. The player
+ *  draws it fullscreen and big: at pairing time no receiver window exists on the box (the receiver
+ *  only opens one once mirroring starts), so the player IS what's on the glass. */
+export const ServerToPlayerCastPin = z.object({
+  t: z.literal("server/cast-pin"),
+  /** Digits only, zero-padding preserved ("0000" is a valid pin); null clears the overlay. */
+  pin: z.string().regex(/^\d{1,8}$/).nullable(),
+});
+
 export const ServerToPlayerMessage = z.discriminatedUnion("t", [
   ServerToPlayerRender,
   ServerToPlayerIdent,
   ServerToPlayerSettings,
+  ServerToPlayerCastPin,
 ]);
 export type ServerToPlayerMessage = z.infer<typeof ServerToPlayerMessage>;
 
@@ -1034,6 +1176,20 @@ export const ScreenView = Screen.extend({
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
+      /** POL-133 — present only for playlist content: the live rotation's steps, in order, each with
+       *  its display name and (for framed steps only) the zoom currently applied on THIS screen. The
+       *  console renders one per-step zoom control from exactly this — the same presence-is-the-
+       *  question pattern as `zoom` above. */
+      entries: z
+        .array(
+          z.object({
+            sourceId: z.string().optional(),
+            name: z.string(),
+            kind: PlaylistEntryKind,
+            zoom: Zoom.optional(),
+          }),
+        )
+        .optional(),
     })
     .nullable()
     .optional(),
@@ -1093,6 +1249,12 @@ export const MachineView = z.object({
     .optional(),
   /** POL-104 — this machine matched a pre-registration and was named/approved from it. */
   preRegistered: z.boolean().optional(),
+  /** POL-134 — which agent channel this machine's LIVE session arrived on. Present only while
+   *  online; `mtls` means the box completed the client-cert handshake for its current session. */
+  agentChannel: z.enum(["plain", "mtls"]).optional(),
+  /** POL-134 — per-machine cert state for the Settings card (mirrors `Machine`). */
+  mtlsCertIssuedAt: z.string().datetime().optional(),
+  mtlsSeenAt: z.string().datetime().optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;
@@ -1424,6 +1586,13 @@ export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
 export const RenameScreenBody = z.object({ friendlyName: z.string().min(1).max(64) });
 export type RenameScreenBody = z.infer<typeof RenameScreenBody>;
 
+/** POST /api/v1/machines/:id/rename — POL-117. Writes `Machine.label`, the same field the hostname
+ *  used to default into, so an operator name simply WINS over whatever the box reported. Any machine,
+ *  any status, any time — naming is how an operator tells identical netbooted boxes apart, so it must
+ *  work on a still-pending machine too. */
+export const RenameMachineBody = z.object({ label: z.string().trim().min(1).max(64) });
+export type RenameMachineBody = z.infer<typeof RenameMachineBody>;
+
 /** Ident pulse request: flash a screen's friendly name so an operator can map physical panels. */
 export const IdentBody = z.object({
   on: z.boolean(),
@@ -1494,6 +1663,18 @@ export type SetContentBody = z.infer<typeof SetContentBody>;
  *  screen later restores the zoom the operator last dialled in. */
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
+
+/** POL-133 — set the page zoom on ONE step of the playlist a screen/wall is showing, identified by
+ *  the step's library source. Same D62 model, same table: the value is remembered against the
+ *  (target, step source) pair, so it survives restarts, scene switches and re-assignment — and the
+ *  same source assigned DIRECTLY to that target shares the dialled-in zoom, which is D62's "zoom
+ *  belongs to the (target, content) pair" taken at its word. */
+export const SetPlaylistEntryZoomBody = z.object({
+  /** The step's library source id (`PlaylistEntry.sourceId`). */
+  sourceId: z.string().min(1),
+  zoom: Zoom,
+});
+export type SetPlaylistEntryZoomBody = z.infer<typeof SetPlaylistEntryZoomBody>;
 
 // REST bodies — content library (Phase 3c; playlists POL-34; pages POL-42)
 export const CreateContentSourceBody = z
@@ -1602,9 +1783,66 @@ export const LoginBody = z.object({
 });
 export type LoginBody = z.infer<typeof LoginBody>;
 
-/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). */
-export const AuthUser = z.object({ id: z.string(), email: z.string().email() });
+/**
+ * What an operator account is ALLOWED to do (POL-107). Three roles, ordered — each one strictly
+ * contains the one below it:
+ *
+ *   - `viewer`   — read the whole registry, and INVOKE a saved scene (`POST /scenes/:id/apply`).
+ *                  The "staff invoke" half of the author/invoke split: a receptionist can recall a
+ *                  layout the wall's owner authored, and can change nothing else.
+ *   - `operator` — everything a viewer can do, plus the CONTENT + LAYOUT verbs: the content library,
+ *                  murals/placements/walls, per-screen + per-wall content and zoom, scenes CRUD,
+ *                  ident, capture, casting, screen renames.
+ *   - `admin`    — everything, plus the FLEET + SECRETS verbs: machines (approve/reject/reboot/remove),
+ *                  the remote shell and the DevTools tunnel, every `/settings/**` route (enrolment
+ *                  token, image builds, display settings, HTTPS, credential profiles) and operator
+ *                  management itself.
+ *
+ * The ordering is the whole contract: a role may do anything its rank allows, and the SERVER decides
+ * (a console that hides a button is a nicety, not a permission system).
+ */
+export const OperatorRole = z.enum(["admin", "operator", "viewer"]);
+export type OperatorRole = z.infer<typeof OperatorRole>;
+
+/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). `role` is what
+ *  the console keys its affordances off; the server enforces the same role on every route. Defaulted
+ *  to `admin` so a pre-POL-107 payload (or an upgraded single-admin deployment) parses as the admin it
+ *  effectively was — never as a lockout. */
+export const AuthUser = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  role: OperatorRole.default("admin"),
+});
 export type AuthUser = z.infer<typeof AuthUser>;
+
+/** An operator account as listed in Settings ▸ Operators (admin-only). Never carries a hash. */
+export const Operator = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  role: OperatorRole,
+  createdAt: z.string(),
+});
+export type Operator = z.infer<typeof Operator>;
+
+/** Create an operator account (admin-only). The password is min-8, same as a self-service change. */
+export const CreateOperatorBody = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(200),
+  role: OperatorRole,
+});
+export type CreateOperatorBody = z.infer<typeof CreateOperatorBody>;
+
+/** Update an operator (admin-only): change the role and/or reset the password. At least one of the
+ *  two must be present — an empty patch is a client bug, not a no-op. */
+export const UpdateOperatorBody = z
+  .object({
+    role: OperatorRole.optional(),
+    password: z.string().min(8).max(200).optional(),
+  })
+  .refine((b) => b.role !== undefined || b.password !== undefined, {
+    message: "provide role and/or password",
+  });
+export type UpdateOperatorBody = z.infer<typeof UpdateOperatorBody>;
 
 /** Change the current operator's password. */
 export const ChangePasswordBody = z.object({
@@ -1834,6 +2072,41 @@ export const HttpsInfo = z.object({
     .nullable(),
 });
 export type HttpsInfo = z.infer<typeof HttpsInfo>;
+
+/**
+ * POL-134 — `GET /api/v1/settings/agent-security` (auth-gated): the agent-channel security posture
+ * in operator words, for the Settings card. `mode` is the whole story:
+ *   - "off"       the mTLS listener is not running (explicitly disabled, or the runtime/port could
+ *                 not offer it — `detail` says which).
+ *   - "migrating" certs are being issued and agents move over as they reconnect; the plain channel
+ *                 still admits sessions while the fleet catches up.
+ *   - "required"  every live agent session rides the mTLS listener; the plain channel only
+ *                 authenticates first contact and issues certs — it never carries a session.
+ */
+export const AgentSecurityInfo = z.object({
+  mode: z.enum(["off", "migrating", "required"]),
+  /** The mTLS listener's port (absent when mode is "off"). */
+  port: z.number().int().positive().optional(),
+  /** When the deployment graduated to require-mTLS (auto-promotion or a pinned env). */
+  requiredSince: z.string().optional(),
+  /** True when AGENT_MTLS_REQUIRE pins the posture (no auto-promotion either way). */
+  pinned: z.boolean(),
+  /** Why the listener is off, when it is ("AGENT_MTLS=off", "port 8443 in use", …). */
+  detail: z.string().optional(),
+  /** Per-machine cert state, one row per known machine. */
+  machines: z.array(
+    z.object({
+      id: z.string(),
+      label: z.string(),
+      online: z.boolean(),
+      /** The channel of the machine's live session (present only while online). */
+      agentChannel: z.enum(["plain", "mtls"]).optional(),
+      mtlsCertIssuedAt: z.string().optional(),
+      mtlsSeenAt: z.string().optional(),
+    }),
+  ),
+});
+export type AgentSecurityInfo = z.infer<typeof AgentSecurityInfo>;
 
 /** One arch's published live image, as served UNGATED at `/dist/image/<arch>/manifest.json` and
  *  compared by every netbooted box's 5-minute update poll (POL-41). `urgent` is the fleet-wide

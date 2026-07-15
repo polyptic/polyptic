@@ -58,7 +58,7 @@ const canIn = computed(() => !props.disabled && canZoomIn(props.zoom));
       +
     </button>
   </div>
-  <div class="hint">{{ props.caption }}</div>
+  <div v-if="props.caption" class="hint">{{ props.caption }}</div>
 </template>
 
 <style scoped>

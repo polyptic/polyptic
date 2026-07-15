@@ -30,6 +30,7 @@ import type {
   MachineView,
   Mural,
   NetbootInfo,
+  OperatorRole,
   Placement,
   PreRegistration,
   Scene,
@@ -209,6 +210,26 @@ export const useConsoleStore = defineStore("console", {
     /** The signed-in operator's email, or "" when not signed in. */
     currentEmail(state): string {
       return state.currentUser?.email ?? "";
+    },
+
+    // ── Roles (POL-107) ─────────────────────────────────────────────────────────
+    // These drive which affordances the console DRAWS. They are a courtesy, not a permission system:
+    // every one of them mirrors a policy the SERVER enforces on the route (and 403s on), so a hand-
+    // crafted fetch from a viewer's console gains nothing. Signed out ⇒ the most restrictive answer.
+
+    /** The signed-in operator's role (`viewer` until we know better — never assume power). */
+    role(state): OperatorRole {
+      return state.currentUser?.role ?? "viewer";
+    },
+
+    /** Machines, enrolment, image builds, settings, credential profiles, the shell, DevTools. */
+    isAdmin(state): boolean {
+      return state.currentUser?.role === "admin";
+    },
+
+    /** Content + layout mutations (an admin is also an operator). */
+    canAuthor(state): boolean {
+      return state.currentUser?.role === "admin" || state.currentUser?.role === "operator";
     },
 
     /** Two-letter avatar initials derived from the operator's email (e.g. "operator@…" → "OP"). */
@@ -914,12 +935,33 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box. */
+    /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box.
+     *  POL-117: works pre-approval too — the server flips the box's holding board to its flashing
+     *  face over the agent channel. That path re-places the kiosk browser (seconds, not millis), so
+     *  a pending box gets a longer TTL or the flash would be over before the board came back up. */
     async identMachine(id: string): Promise<void> {
+      const pending = this.machines.find((m) => m.id === id)?.status === "pending";
       try {
-        await api.identMachine(id, { on: true, ttlMs: 3000 });
+        await api.identMachine(id, { on: true, ttlMs: pending ? 12000 : 3000 });
       } catch (err) {
         console.error("[console] identMachine failed", err);
+      }
+    },
+
+    /**
+     * Name a machine (POL-117) — any machine, any status. Optimistic like renameScreen; the
+     * authoritative admin/state broadcast (<150ms) then relabels every open console, including the
+     * box's own pending card while it queues for approval.
+     */
+    async renameMachine(id: string, label: string): Promise<void> {
+      const trimmed = label.trim();
+      if (!trimmed) return;
+      const machine = this.machines.find((m) => m.id === id);
+      if (machine) machine.label = trimmed; // optimistic
+      try {
+        await api.renameMachine(id, trimmed);
+      } catch (err) {
+        console.error("[console] renameMachine failed", err);
       }
     },
 
@@ -1233,6 +1275,48 @@ export const useConsoleStore = defineStore("console", {
           if (!screenIds.includes(screen.id) || !screen.content) continue;
           if (screen.content.zoom === undefined) continue;
           screen.content = { ...screen.content, zoom };
+        }
+      }
+    },
+
+    /**
+     * Zoom one framed step of the playlist a single screen is showing (POL-133). Same shape as
+     * `setScreenZoom`: optimistic patch of the step's read-out so the − / + buttons step from the
+     * value the operator sees; the authoritative value returns on the next `admin/state`.
+     */
+    async setScreenPlaylistZoom(screenId: string, sourceId: string, zoom: number): Promise<void> {
+      this.patchPlaylistEntryZoom([screenId], sourceId, zoom);
+      try {
+        await api.setScreenPlaylistZoom(screenId, sourceId, zoom);
+      } catch (err) {
+        console.error("[console] setScreenPlaylistZoom failed", err);
+      }
+    },
+
+    /** Zoom one framed step of the playlist spanning a combined surface (POL-133). */
+    async setWallPlaylistZoom(wallId: string, sourceId: string, zoom: number): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchPlaylistEntryZoom(wall.memberScreenIds, sourceId, zoom);
+      try {
+        await api.setWallPlaylistZoom(wallId, sourceId, zoom);
+      } catch (err) {
+        console.error("[console] setWallPlaylistZoom failed", err);
+      }
+    },
+
+    /** Optimistically write a step zoom onto the given screens' playlist read-outs. Steps that are
+     *  not zoomable (media — no zoom in the read-out) are left alone, mirroring the server. */
+    patchPlaylistEntryZoom(screenIds: readonly string[], sourceId: string, zoom: number): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content?.entries) continue;
+          screen.content = {
+            ...screen.content,
+            entries: screen.content.entries.map((entry) =>
+              entry.sourceId === sourceId && entry.zoom !== undefined ? { ...entry, zoom } : entry,
+            ),
+          };
         }
       }
     },
