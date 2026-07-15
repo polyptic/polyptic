@@ -367,6 +367,114 @@ describe.skipIf(!runnable)("POL-134 — mTLS default-on, end to end over real so
   });
 });
 
+// ── Finding pin: a REQUIRED deployment whose listener cannot start must NOT admit plain sessions.
+// A zero-config fleet that graduated to require-mTLS, restarting while something holds :8443, must
+// refuse to boot (crash loops are loud) rather than silently re-open plaintext agent sessions that
+// self-healing agents would drift onto. Driven with the REAL server process: we occupy :8443
+// ourselves and assert the required boot dies while the merely-default boot degrades and lives.
+// (The persisted-row variant of the same decision — no pin, `agent_mtls_posture.required=true` —
+// is pinned at the seam by mtlsStartupFailureIsFatal's unit tests: a memory-store spawn cannot
+// carry a pre-persisted row across the process boundary.)
+describe.skipIf(!runnable)("POL-134 — required posture + failed listener refuses to serve plain sessions", () => {
+  let blocker: ReturnType<typeof createNetServer> | null = null;
+
+  beforeAll(async () => {
+    blocker = createNetServer();
+    await new Promise<void>((r, j) => {
+      blocker!.once("error", j);
+      blocker!.listen(MTLS_PORT, "0.0.0.0", () => r());
+    });
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((r) => (blocker ? blocker.close(() => r()) : r()));
+  });
+
+  async function bootWithBlockedPort(extraEnv: Record<string, string>, port: number): Promise<{
+    exitCode: number | null;
+    log: string;
+    reachable: boolean;
+    kill(): void;
+  }> {
+    const child = Bun.spawn([process.execPath, serverEntry], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        STORE: "memory",
+        PORT: String(port),
+        POLYPTIC_BOOTSTRAP_TOKEN: BOOTSTRAP_TOKEN,
+        LOG_LEVEL: "info",
+        AUTH_ENABLED: "false",
+        AGENT_MTLS: undefined as unknown as string,
+        AGENT_MTLS_PORT: undefined as unknown as string,
+        AGENT_MTLS_REQUIRE: undefined as unknown as string,
+        ...extraEnv,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let log = "";
+    const drain = async (stream: ReadableStream<Uint8Array>) => {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        log += decoder.decode(value);
+      }
+    };
+    void drain(child.stdout as ReadableStream<Uint8Array>);
+    void drain(child.stderr as ReadableStream<Uint8Array>);
+
+    // Wait until the process exits OR the API answers — whichever proves the outcome.
+    const deadline = Date.now() + 15_000;
+    let reachable = false;
+    let exitCode: number | null = null;
+    for (;;) {
+      if (Date.now() > deadline) break;
+      const exited = await Promise.race([child.exited.then((c) => c), sleep(200).then(() => null)]);
+      if (exited !== null) {
+        exitCode = exited;
+        break;
+      }
+      try {
+        const res = await fetch(`http://localhost:${port}/api/v1/state`);
+        if (res.ok) {
+          await res.body?.cancel();
+          reachable = true;
+          break;
+        }
+      } catch {
+        // not up yet (or never will be)
+      }
+    }
+    return { exitCode, log, reachable, kill: () => child.kill() };
+  }
+
+  test("required (pinned) + occupied :8443 → the server EXITS; no plain channel ever comes up", async () => {
+    const run = await bootWithBlockedPort({ AGENT_MTLS_REQUIRE: "1" }, 8142);
+    try {
+      expect(run.reachable).toBe(false);
+      expect(run.exitCode).toBe(1);
+      expect(run.log).toContain("REQUIRES mTLS");
+      expect(run.log).toContain("could not bind");
+    } finally {
+      run.kill();
+    }
+  }, 20_000);
+
+  test("the CONTRAST: merely-default (not required) + occupied :8443 → degrades loudly and serves", async () => {
+    const run = await bootWithBlockedPort({}, 8143);
+    try {
+      expect(run.reachable).toBe(true);
+      expect(run.exitCode).toBe(null);
+      expect(run.log).toContain("mtls.default.unavailable");
+    } finally {
+      run.kill();
+    }
+  }, 20_000);
+});
+
 // On a runtime that cannot verify client certs, or a host with :8443 occupied, say WHY we skipped.
 describe.skipIf(runnable)("POL-134 default-on e2e (skipped)", () => {
   test("skipped: runtime cannot verify client certs (Bun ≤ 1.2) or port 8443 is occupied", () => {

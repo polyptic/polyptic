@@ -12,7 +12,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { ActivityLog } from "../src/activity";
-import { MtlsPosture, resolveAgentMtlsEnv, DEFAULT_AGENT_MTLS_PORT } from "../src/mtls";
+import { MtlsPosture, mtlsStartupFailureIsFatal, resolveAgentMtlsEnv, DEFAULT_AGENT_MTLS_PORT } from "../src/mtls";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 
@@ -63,6 +63,14 @@ describe("resolveAgentMtlsEnv — default ON, explicit escape hatches", () => {
     expect(resolveAgentMtlsEnv({}).requirePin).toBeUndefined();
   });
 
+  test("an unparseable AGENT_MTLS_PORT is FATAL, not silently off — explicit config with a typo must not bypass the gate", () => {
+    for (const v of ["abc", "-1", "1.5", "99999", "8443x"]) {
+      expect(() => resolveAgentMtlsEnv({ AGENT_MTLS_PORT: v })).toThrow(/AGENT_MTLS_PORT is not a valid port/);
+    }
+    // 0 stays the legitimate pre-POL-134 spelling of off.
+    expect(resolveAgentMtlsEnv({ AGENT_MTLS_PORT: "0" }).enabled).toBe(false);
+  });
+
   test("publicUrl and SANs pass through", () => {
     const cfg = resolveAgentMtlsEnv({
       AGENT_MTLS_PUBLIC_URL: "wss://walls.example:8443",
@@ -70,6 +78,31 @@ describe("resolveAgentMtlsEnv — default ON, explicit escape hatches", () => {
     });
     expect(cfg.publicUrl).toBe("wss://walls.example:8443");
     expect(cfg.sans).toEqual(["walls.example", "10.0.0.5"]);
+  });
+});
+
+// ── mtlsStartupFailureIsFatal (finding: required must never silently degrade) ─
+
+describe("mtlsStartupFailureIsFatal — a REQUIRED deployment never degrades to plaintext sessions", () => {
+  const zeroConfig = resolveAgentMtlsEnv({});
+
+  test("explicit config → always fatal", () => {
+    expect(mtlsStartupFailureIsFatal(resolveAgentMtlsEnv({ AGENT_MTLS: "on" }), undefined)).toBe(true);
+    expect(mtlsStartupFailureIsFatal(resolveAgentMtlsEnv({ AGENT_MTLS_PORT: "9443" }), undefined)).toBe(true);
+  });
+
+  test("zero-config, no posture row → degrade allowed (the dev-laptop case)", () => {
+    expect(mtlsStartupFailureIsFatal(zeroConfig, undefined)).toBe(false);
+    expect(mtlsStartupFailureIsFatal(zeroConfig, { required: false })).toBe(false);
+  });
+
+  test("zero-config but the PERSISTED posture says required → fatal (the graduated fleet)", () => {
+    expect(mtlsStartupFailureIsFatal(zeroConfig, { required: true })).toBe(true);
+  });
+
+  test("AGENT_MTLS_REQUIRE=1 → fatal even with no row; =0 is the explicit consent to degrade, and overrides the row", () => {
+    expect(mtlsStartupFailureIsFatal(resolveAgentMtlsEnv({ AGENT_MTLS_REQUIRE: "1" }), undefined)).toBe(true);
+    expect(mtlsStartupFailureIsFatal(resolveAgentMtlsEnv({ AGENT_MTLS_REQUIRE: "0" }), { required: true })).toBe(false);
   });
 });
 
@@ -152,5 +185,24 @@ describe("MtlsPosture — automatic, announced, one-way graduation", () => {
     const posture = await MtlsPosture.load(store, true);
     expect(posture.required).toBe(true);
     expect(posture.pinned).toBe(true);
+  });
+
+  test("a pin=true PERSISTS the promotion — unpinning later must not regress a required fleet to migrating", async () => {
+    const { store } = await planeWith([{ id: "wall1", seen: false }]);
+    const pinned = await MtlsPosture.load(store, true);
+    expect(pinned.required).toBe(true);
+    // The row was written: a later boot WITHOUT the pin loads required=true (one-way, as ever) —
+    // even though wall1 was never individually SEEN on the listener.
+    expect((await store.getAgentMtlsPosture())?.required).toBe(true);
+    const unpinned = await MtlsPosture.load(store, undefined);
+    expect(unpinned.required).toBe(true);
+  });
+
+  test("a pin=false suppresses requirement for the runtime but never ERASES a recorded graduation", async () => {
+    const { store } = await planeWith([]);
+    await store.setAgentMtlsPosture({ required: true, promotedAt: new Date().toISOString() });
+    const pinnedOff = await MtlsPosture.load(store, false);
+    expect(pinnedOff.required).toBe(false);
+    expect((await store.getAgentMtlsPosture())?.required).toBe(true);
   });
 });

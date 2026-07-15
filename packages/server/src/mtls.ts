@@ -363,7 +363,8 @@ export interface AgentMtlsEnv {
  * Resolve the agent-mTLS envs into one config (POL-134 flipped the default to ON):
  *   - `AGENT_MTLS=off` (or `0`/`false`/`no`) disables the listener entirely — the escape hatch.
  *   - `AGENT_MTLS_PORT` picks the port (0 also disables, the pre-POL-134 spelling of off);
- *     unset → 8443.
+ *     unset → 8443. An unparseable value THROWS: it is explicit configuration, and silently
+ *     treating a typo as "off" would bypass the explicit-failures-are-fatal rule with a lie.
  *   - `AGENT_MTLS_REQUIRE` set pins the require posture (truthy → required now, falsy → never
  *     auto-promote); unset → the posture manages itself (see {@link MtlsPosture}).
  */
@@ -375,7 +376,12 @@ export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): Agent
   const explicit = modeRaw !== undefined || (portRaw !== undefined && portRaw !== "");
   const modeOff = modeRaw !== undefined && /^(off|0|false|no)$/i.test(modeRaw);
   const port = portRaw !== undefined && portRaw !== "" ? Number(portRaw) : DEFAULT_AGENT_MTLS_PORT;
-  const portValid = Number.isFinite(port) && port > 0;
+  if (!Number.isFinite(port) || !Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(
+      `AGENT_MTLS_PORT is not a valid port: ${JSON.stringify(env.AGENT_MTLS_PORT)} — ` +
+        "set a port (1–65535), 0 to disable, or unset it for the default (8443)",
+    );
+  }
 
   const requirePin =
     requireRaw === undefined || requireRaw === ""
@@ -383,8 +389,8 @@ export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): Agent
       : /^(1|true|yes|on)$/i.test(requireRaw);
 
   return {
-    enabled: !modeOff && portValid,
-    port: portValid ? port : 0,
+    enabled: !modeOff && port > 0,
+    port,
     explicit,
     ...(requirePin !== undefined ? { requirePin } : {}),
     publicUrl: env.AGENT_MTLS_PUBLIC_URL?.trim() || undefined,
@@ -393,6 +399,28 @@ export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): Agent
       .map((s) => s.trim())
       .filter((s) => s.length > 0),
   };
+}
+
+/**
+ * Whether an agent-mTLS STARTUP failure (bind error, self-test failure) must be FATAL rather than
+ * degrade to off. Fatal when:
+ *   - the operator configured mTLS explicitly (never serve a fake gate they asked for), or
+ *   - the posture is pinned required (`AGENT_MTLS_REQUIRE=1`), or
+ *   - the PERSISTED posture says the deployment already graduated to required and no pin overrides
+ *     it — a zero-config deployment that promised its fleet "every session is mutually
+ *     authenticated" must not quietly re-open plaintext sessions because :8443 was busy for one
+ *     boot. Degrading here would be operationally invisible (agents self-heal onto the plain
+ *     channel after a few failed dials); a crash-looping server is loud, a plaintext fleet is not.
+ * `AGENT_MTLS_REQUIRE=0` is the operator's explicit "plain admission is acceptable" — with that
+ * pin, the zero-config degrade stays available.
+ */
+export function mtlsStartupFailureIsFatal(
+  env: AgentMtlsEnv,
+  persisted: { required: boolean } | undefined,
+): boolean {
+  if (env.explicit) return true;
+  if (env.requirePin !== undefined) return env.requirePin;
+  return persisted?.required === true;
 }
 
 /**
@@ -428,15 +456,22 @@ export class MtlsPosture {
     this.promotedAt = initial.promotedAt;
   }
 
-  /** Load the persisted posture and apply the env pin (a pin always wins, both directions). */
+  /**
+   * Load the persisted posture and apply the env pin (a pin always wins, both directions, for the
+   * RUNTIME value). A `pin=true` also PERSISTS `required=true` — the pin is a promotion, and like
+   * every promotion it is one-way: unpinning later must leave the fleet required, not regress it to
+   * migrating on a fleet whose machines were never individually SEEN on the listener. A `pin=false`
+   * deliberately writes NOTHING: it suppresses requirement for this runtime without erasing a
+   * graduation the store already recorded.
+   */
   static async load(store: Store, pin: boolean | undefined): Promise<MtlsPosture> {
     const persisted = await store.getAgentMtlsPosture();
     if (pin !== undefined) {
-      const posture = new MtlsPosture(store, pin, {
-        required: pin,
-        promotedAt: pin ? (persisted?.promotedAt ?? new Date().toISOString()) : undefined,
-      });
-      return posture;
+      const promotedAt = pin ? (persisted?.promotedAt ?? new Date().toISOString()) : undefined;
+      if (pin && persisted?.required !== true) {
+        await store.setAgentMtlsPosture({ required: true, promotedAt });
+      }
+      return new MtlsPosture(store, pin, { required: pin, promotedAt });
     }
     return new MtlsPosture(store, undefined, {
       required: persisted?.required ?? false,

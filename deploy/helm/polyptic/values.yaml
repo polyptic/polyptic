@@ -87,6 +87,15 @@ agentMtls:
   # to require-mTLS once every known machine holds a working cert. true = pin
   # required NOW (AGENT_MTLS_REQUIRE=1). false = pin it off — never auto-promote
   # (AGENT_MTLS_REQUIRE=0), for fleets that must keep certless agents admitted.
+  # Two cases where the false pin is exactly what you want:
+  #   - dev/test tooling that dials the plain channel with fake agents: once a
+  #     real fleet fully migrates and the posture promotes, those fake agents
+  #     are answered-and-closed instead of admitted — pin false to keep them;
+  #   - rolling boxes back to a pre-mTLS agent image AFTER promotion: rebooted
+  #     (diskless) boxes come back certless and get no session until you pin
+  #     false or fix the image. Promotion is one-way on purpose — once required,
+  #     a failed mTLS listener at boot is FATAL rather than a silent fallback
+  #     to plaintext sessions.
   require: ""
   # Optional full wss:// URL agents should dial (AGENT_MTLS_PUBLIC_URL) when the
   # mTLS listener is exposed somewhere other than "same host, this port" — e.g. a

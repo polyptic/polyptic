@@ -23,7 +23,7 @@ import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
 import { CaptureCoordinator, ThumbnailStore } from "./capture";
 import { Enrollment } from "./enroll";
-import { AgentMtls, MtlsPosture, registerAgentSecurityRoutes, resolveAgentMtlsEnv } from "./mtls";
+import { AgentMtls, MtlsPosture, mtlsStartupFailureIsFatal, registerAgentSecurityRoutes, resolveAgentMtlsEnv } from "./mtls";
 import { AgentHub, PlayerHub } from "./hub";
 import { MediaStore, registerMediaServeRoute } from "./media";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
@@ -86,7 +86,15 @@ const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
 // once every known machine has been seen on the listener (see MtlsPosture). Escape hatches:
 // `AGENT_MTLS=off` (or AGENT_MTLS_PORT=0) disables the listener; AGENT_MTLS_REQUIRE=1/0 pins the
 // require posture in either direction (no auto-promotion).
-const agentMtlsEnv = resolveAgentMtlsEnv(process.env);
+// An unparseable AGENT_MTLS_PORT is explicit configuration with a typo — refuse to boot rather
+// than silently treat it as "off" (same posture as resolveTlsEnv's half-configured pair).
+let agentMtlsEnv: ReturnType<typeof resolveAgentMtlsEnv>;
+try {
+  agentMtlsEnv = resolveAgentMtlsEnv(process.env);
+} catch (err) {
+  console.error(`FATAL: ${(err as Error).message}`);
+  process.exit(1);
+}
 // Full wss:// URL override for deployments where the mTLS endpoint is not same-host:port from the
 // agent's point of view (e.g. a separate LoadBalancer in Kubernetes). Advertised verbatim.
 const AGENT_MTLS_PUBLIC_URL = agentMtlsEnv.publicUrl;
@@ -315,12 +323,28 @@ let agentMtlsChannel: import("./ws").AgentMtlsChannel | undefined;
 let agentMtlsPosture: MtlsPosture | undefined;
 let agentMtlsOffDetail: string | undefined = agentMtlsEnv.enabled ? undefined : "disabled (AGENT_MTLS=off)";
 if (agentMtlsEnv.enabled) {
+  // Consult the PERSISTED posture BEFORE deciding how a startup failure is handled: a zero-config
+  // deployment that already graduated to require-mTLS must never quietly re-open plaintext
+  // sessions because one boot couldn't bind :8443 — agents self-heal onto the plain channel after
+  // a few failed dials, so the regression would be invisible except for one log line. Required
+  // (persisted or pinned) ⇒ startup failure is FATAL; a crash loop is loud, a plaintext fleet
+  // is not. AGENT_MTLS_REQUIRE=0 is the explicit consent that makes the degrade acceptable again.
+  const persistedPosture = await store.getAgentMtlsPosture();
   const mtlsFailed = (reason: string): void => {
-    if (agentMtlsEnv.explicit) {
+    if (mtlsStartupFailureIsFatal(agentMtlsEnv, persistedPosture)) {
+      const why = agentMtlsEnv.explicit
+        ? "the explicitly configured mTLS agent channel could not start"
+        : "this deployment REQUIRES mTLS (graduated posture) and the mTLS agent channel could not start";
       fastify.log.error(
-        { event: "mtls.start.failed", reason },
-        `FATAL: the explicitly configured mTLS agent channel could not start — ${reason}. ` +
-          "Refusing to start rather than serve an agent channel that LOOKS mutually authenticated but is not.",
+        {
+          event: "mtls.start.failed",
+          reason,
+          explicit: agentMtlsEnv.explicit,
+          required: agentMtlsEnv.requirePin ?? persistedPosture?.required ?? false,
+        },
+        `FATAL: ${why} — ${reason}. Refusing to admit plaintext agent sessions instead of serving a ` +
+          "channel that LOOKS mutually authenticated but is not. Fix the cause, or pin AGENT_MTLS_REQUIRE=0 " +
+          "/ set AGENT_MTLS=off to explicitly accept plain admission.",
       );
       process.exit(1);
     }
