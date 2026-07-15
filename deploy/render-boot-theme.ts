@@ -22,11 +22,16 @@
 import { writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildBootThemeTxt } from "../packages/server/src/boot-theme.ts";
+import { bootBgPng, buildBootThemeTxt } from "../packages/server/src/boot-theme.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = resolve(REPO_ROOT, "packages/server/assets/boot-theme.txt");
+// The theme's desktop-image (POL-130): rendered together because the theme REQUIRES it — a theme
+// without a decodable desktop-image makes GRUB 2.12 error the moment a menu entry boots.
+const BG_OUT = resolve(REPO_ROOT, "packages/server/assets/boot-bg.png");
 
 await mkdir(dirname(OUT), { recursive: true });
 await writeFile(OUT, buildBootThemeTxt(), "utf8");
 console.log(`render-boot-theme: wrote ${OUT}`);
+await writeFile(BG_OUT, bootBgPng());
+console.log(`render-boot-theme: wrote ${BG_OUT}`);

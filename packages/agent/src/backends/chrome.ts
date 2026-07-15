@@ -91,10 +91,33 @@ export function buildChromeArgs(
     // A wall shows video with nobody there to click "play".
     "--autoplay-policy=no-user-gesture-required",
   ];
+  // POL-132 — the player's shell service worker (what lets a wall RELOAD while the control plane is
+  // down and still paint) requires a SECURE CONTEXT, and netboot boxes reach the control plane over
+  // plain HTTP by design (D47/D52). This flag grants the player's origin the FULL secure-context
+  // treatment — not just service workers but everything gated on it (WebCrypto subtle, geolocation,
+  // getUserMedia, …). Acceptable on a kiosk whose one origin IS the control plane we already trust
+  // with the whole wall; NOT a general browsing flag — which is why it is scoped to exactly this
+  // origin, and only for http (an https deploy needs — and gets — no carve-out). Storage stays in
+  // the per-connector profile above, so the registration survives an agent browser respawn (a
+  // REBOOT wipes XDG_RUNTIME_DIR, which is fine: reboot survival is out of POL-132's scope).
+  const playerOrigin = insecurePlayerOrigin(spec.url);
+  if (playerOrigin) args.push(`--unsafely-treat-insecure-origin-as-secure=${playerOrigin}`);
   if (spec.extra && spec.extra.length > 0) args.push(...spec.extra);
   const extra = env.POLYPTIC_BROWSER_ARGS?.trim();
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
   return args;
+}
+
+/** The player URL's origin when (and only when) it is plain `http:` — the one origin the kiosk may
+ *  treat as secure so service workers (POL-132) work on an HTTP control plane. `https:` origins are
+ *  already secure; an unparseable URL yields null (no flag — never guess a security exemption). */
+export function insecurePlayerOrigin(url: string): string | null {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" ? u.origin : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Does a compositor window's `app_id` / WM class look like our Chrome? Under native Wayland an

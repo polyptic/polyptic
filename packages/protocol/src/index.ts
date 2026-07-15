@@ -70,9 +70,50 @@ export type KioskBrowser = z.infer<typeof KioskBrowser>;
 export const EnrollmentStatus = z.enum(["pending", "approved", "rejected"]);
 export type EnrollmentStatus = z.infer<typeof EnrollmentStatus>;
 
+/**
+ * POL-104 — what a box IS, physically. Sent on every `agent/hello` and used for two things: to match a
+ * pre-registration (see {@link PreRegistration}), and to make a pending-approval card informative — an
+ * operator approving 50 boxes was previously staring at 50 identical UUIDs.
+ *
+ * Every field is optional and best-effort. A box in a VM has no chassis serial (or a placeholder one);
+ * an unprivileged agent may not be able to read `/sys/class/dmi/id/product_serial` at all; a
+ * Wi-Fi-bridged VM's MAC is rewritten by its host (POL-63/POL-78). NOTHING here is a credential and
+ * nothing here is trusted as proof — the enrolment token is the credential, this is a description.
+ */
+export const HostIdentity = z.object({
+  /** Non-loopback, non-virtual interface MACs, lower-case colon form, sorted. */
+  macs: z.array(z.string()).default([]),
+  /** DMI chassis/product serial, when readable and not an obvious placeholder. */
+  dmiSerial: z.string().optional(),
+  dmiProduct: z.string().optional(),
+  dmiVendor: z.string().optional(),
+  /** `x64` / `arm64` — the box's CPU architecture, as the agent's runtime reports it. */
+  arch: z.string().optional(),
+});
+export type HostIdentity = z.infer<typeof HostIdentity>;
+
+/**
+ * POL-117 — is this hostname worth showing a human? Every netbooted box boots the same live image,
+ * so every box reports `localhost.localdomain` — a wall of identical "names" that identify nothing.
+ * Shared by the server (which refuses to ADOPT such a hostname as the machine label) and the console
+ * (which refuses to DISPLAY one that predates the fix), so the two ends can never disagree about
+ * what counts as meaningless. Returns the trimmed hostname when it carries information, else null.
+ */
+export function meaningfulHostname(hostname: string | undefined | null): string | null {
+  const h = hostname?.trim();
+  if (!h) return null;
+  const lower = h.toLowerCase();
+  if (lower === "localhost" || lower === "localhost.localdomain") return null;
+  if (lower.endsWith(".localdomain")) return null;
+  return h;
+}
+
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
+  /** The human name shown in the console. Defaults from the box's reported hostname when that
+   *  hostname means something (see `meaningfulHostname`), else stays = `id` — the "unnamed" sentinel
+   *  the console renders honestly ("Unnamed box"). An operator rename (POL-117) always wins. */
   label: z.string(),
   agentVersion: z.string().optional(),
   backend: DisplayBackend.optional(),
@@ -90,6 +131,21 @@ export const Machine = z.object({
   /** POL-59 — when the shell was armed / last used. A sweep auto-disarms a box idle past the TTL
    *  (SHELL_ARM_TTL_MS) so a forgotten armed box is not a standing shell-openable target. */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-104 — what the box IS (MACs / DMI serial / arch), as it last reported. Descriptive, never a
+   *  credential; kept so a PENDING card is informative even while the box is offline. */
+  hardware: HostIdentity.optional(),
+  /** POL-104 — the enrolment token this machine FIRST enrolled on, and its name at that moment. */
+  enrolledTokenId: z.string().optional(),
+  enrolledTokenName: z.string().optional(),
+  /** POL-104 — this machine matched a pre-registration (named / tagged / approved from it). */
+  preRegistered: z.boolean().optional(),
+  /** POL-134 — when the server last signed this machine's CSR into an mTLS client cert. Absent on
+   *  machines that never asked (pre-POL-25 agents, or an mTLS-off deployment). */
+  mtlsCertIssuedAt: z.string().datetime().optional(),
+  /** POL-134 — when this machine FIRST connected over the mTLS listener: proof the box actually
+   *  holds and presents a working cert, not just that one was issued. Drives the auto-promotion to
+   *  require-mTLS and the per-machine cert state in Settings. */
+  mtlsSeenAt: z.string().datetime().optional(),
 });
 export type Machine = z.infer<typeof Machine>;
 
@@ -99,6 +155,12 @@ export const Screen = z.object({
   friendlyName: z.string(), // "Nessie", "Big-Bertha"
   machineId: z.string(),
   connector: z.string(), // which Output on that machine
+  /** POL-119 — operator has enabled ad-hoc casting (AirPlay receiver) to this screen. Persistent and
+   *  TTL-less by design (unlike the shell arm): a meeting-room panel stays castable until an operator
+   *  turns it off. Part of desired state — the agent runs one receiver per cast-enabled connector,
+   *  advertised under the screen's friendlyName, and a sender's PIN entry (always on, displayed on the
+   *  glass) is the per-session gate, so leaving this enabled is not an open door. */
+  castEnabled: z.boolean().default(false),
 });
 export type Screen = z.infer<typeof Screen>;
 
@@ -179,6 +241,11 @@ export const PlaylistEntry = z.object({
   /** The library source this entry resolved from — how send-time auth stamping (POL-24) finds the
    *  entry's credential profile. Absent on an entry with nothing to stamp. */
   sourceId: z.string().optional(),
+  /** POL-133 — page zoom for THIS entry while it is on air, meaningful only for the framed kinds
+   *  (web/dashboard; media has no page to zoom). Same D62 model as a directly-assigned page: the
+   *  server remembers the operator's value per (target, entry source) pair and stamps it in at
+   *  resolution time. Default 1 so a pre-POL-133 payload parses to exactly the old behaviour. */
+  zoom: Zoom.default(1),
 });
 export type PlaylistEntry = z.infer<typeof PlaylistEntry>;
 
@@ -230,6 +297,13 @@ export const PageEmbedElement = PageElementBase.extend({
   props: z.object({
     sourceId: z.string().optional(),
     url: z.string().url().optional(),
+    /** POL-133 — page zoom for the framed page, AUTHORED in the Studio as a property of the element
+     *  (not per-screen like D62): a composition must render identically in the Studio preview and on
+     *  every wall showing it (the D74 one-renderer invariant), so anything that changes how the page
+     *  lays out is part of the composition itself. Same browser-zoom semantics as `WebSurface.zoom`
+     *  (the frame is laid out at 1/zoom and scaled back up); default 1 keeps old compositions
+     *  byte-identical. */
+    zoom: Zoom.default(1),
   }),
 });
 
@@ -253,6 +327,10 @@ export const PageFeedElement = PageElementBase.extend({
   props: z.object({
     url: z.string().max(500).default(""),
     items: z.number().int().min(2).max(8).default(4),
+    /** POL-133 — text size as a PERCENT of the feed's height-proportional default (100 = exactly the
+     *  pre-POL-133 sizing, so an old composition parses to an identical render). Scales the masthead,
+     *  headlines and ages together, keeping the card's own proportions. */
+    fontScale: z.number().min(50).max(200).default(100),
   }),
 });
 
@@ -306,12 +384,87 @@ export const PageWeatherElement = PageElementBase.extend({
   }),
 });
 
-/** Static QR code, encoded to SVG client-side in the shared elements package — no network. */
+// ── QR colours + scannability (POL-133) ──────────────────────────────────────
+// A QR that doesn't scan is worse than an ugly one, so the colour pair is validated AT THE CONTRACT
+// EDGE: the module/background contrast a camera needs is part of what makes the stored definition a
+// QR element at all. The helpers live here (not in the elements package) because the zod refine needs
+// them, and the console reuses them for its authoring-time warning.
+
+/** Parse `#rgb` / `#rrggbb` to sRGB relative luminance (0..1), or null for any other colour text.
+ *  Non-hex colours (named colours, gradients) can't be judged, so they're never refused. */
+export function hexLuminance(color: string): number | null {
+  const m = /^#(?:([0-9a-f]{3})|([0-9a-f]{6}))$/i.exec(color.trim());
+  if (!m) return null;
+  const hex = m[1] ? m[1].split("").map((c) => c + c).join("") : m[2]!;
+  const channel = (i: number) => {
+    const v = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16) / 255;
+    return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2);
+}
+
+/** WCAG-style contrast ratio (1..21) between two hex colours, or null when either isn't hex. */
+export function contrastRatio(a: string, b: string): number | null {
+  const la = hexLuminance(a);
+  const lb = hexLuminance(b);
+  if (la === null || lb === null) return null;
+  const [hi, lo] = la >= lb ? [la, lb] : [lb, la];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** The contrast a QR needs to scan reliably. Below this the pair is REFUSED at the contract edge. */
+export const QR_MIN_CONTRAST = 3;
+/** Below this (but ≥ the minimum) the pair is allowed with a loud authoring-time warning. */
+export const QR_SAFE_CONTRAST = 4.5;
+
+/**
+ * Why a QR colour pair is a problem, or null when it's fine. `refuse` fails the schema; `warn` is
+ * for the Studio to shout about (inverted codes and low-but-legal contrast scan on most, not all,
+ * cameras). Non-hex colours return null — unjudgeable, so never refused.
+ */
+export function qrContrastIssue(
+  fg: string,
+  bg: string,
+): { level: "refuse" | "warn"; message: string } | null {
+  const ratio = contrastRatio(fg, bg);
+  if (ratio === null) return null;
+  if (ratio < QR_MIN_CONTRAST) {
+    return {
+      level: "refuse",
+      message: `QR contrast ${ratio.toFixed(1)}:1 is below ${QR_MIN_CONTRAST}:1 — this code will not scan`,
+    };
+  }
+  const lfg = hexLuminance(fg)!;
+  const lbg = hexLuminance(bg)!;
+  if (lfg > lbg) {
+    return { level: "warn", message: "Light modules on a dark background — some cameras refuse inverted QR codes" };
+  }
+  if (ratio < QR_SAFE_CONTRAST) {
+    return {
+      level: "warn",
+      message: `QR contrast ${ratio.toFixed(1)}:1 is marginal — may not scan in poor light`,
+    };
+  }
+  return null;
+}
+
+/** Static QR code, encoded to SVG client-side in the shared elements package — no network.
+ *  POL-133 — module (`fg`) and background (`bg`) colours are authorable; the defaults are exactly
+ *  the pre-POL-133 hardcoded render, so an old composition parses to an identical code. A pair the
+ *  camera provably can't read (hex colours below the minimum contrast) is refused here, at the
+ *  contract edge — an unscannable QR is worse than an ugly one. */
 export const PageQrElement = PageElementBase.extend({
   kind: z.literal("qr"),
-  props: z.object({
-    url: z.string().max(500).default(""),
-  }),
+  props: z
+    .object({
+      url: z.string().max(500).default(""),
+      fg: z.string().max(32).default("#09090b"),
+      bg: z.string().max(32).default("#ffffff"),
+    })
+    .superRefine((p, ctx) => {
+      const issue = qrContrastIssue(p.fg, p.bg);
+      if (issue?.level === "refuse") ctx.addIssue({ code: "custom", message: issue.message });
+    }),
 });
 
 /** Time to a target time-of-day. Updates a text node per minute — no animation (D66). */
@@ -454,6 +607,9 @@ export const AgentHello = z.object({
   outputs: z.array(Output),
   /** The box's os.hostname(), used as the human machine label (additive-safe; optional). */
   hostname: z.string().optional(),
+  /** POL-104 — the box's physical identity (MACs / DMI serial / arch). Optional: a pre-POL-104 agent
+   *  sends none, and a pending card then simply says less. */
+  hardware: HostIdentity.optional(),
   /** First contact only: the operator-configured enrollment secret. The server validates it,
    * creates the machine as `pending`, and replies `server/enrolled` with a durable credential. */
   bootstrapToken: z.string().optional(),
@@ -469,13 +625,94 @@ export const AgentHello = z.object({
   csrPem: z.string().optional(),
 });
 
+// ── Host vitals (POL-92) ─────────────────────────────────────────────────────
+//
+// What a box knows about ITSELF, sampled from /proc + /sys on every heartbeat and carried on
+// `agent/status`. The fleet's known failure modes are physical — a browser software-rendering on a
+// broken GPU path pegs the CPU (D77), a wedged page eats the RAM, a respawn loop churns — and until
+// now none of them were visible to an operator without a shell session on the box.
+//
+// EVERY field is optional. A pre-POL-92 agent sends no `vitals` at all; a NON-Linux agent (dev-open
+// on a laptop) sends none either; a box whose kernel exposes no thermal zone simply omits `tempC`.
+// The console and the metrics exporter therefore render what they have and say nothing about what
+// they don't — an absent number is never rendered as a zero.
+
+/** One supervised kiosk browser (one per output), as the agent sees it right now. */
+export const BrowserVitals = z.object({
+  connector: z.string(),
+  /** Is a browser child alive on this output at all? */
+  running: z.boolean(),
+  pid: z.number().int().positive().optional(),
+  /** Resident set of the browser process TREE (the parent + its renderer/GPU children). */
+  rssBytes: z.number().nonnegative().optional(),
+  /** How many times the agent has respawned this output's browser since it started supervising it.
+   *  A climbing number is a crash loop — the wall may look fine between respawns. */
+  respawns: z.number().int().nonnegative().optional(),
+  /**
+   * THE D77 TELL. True when some process in this browser's tree holds an open fd on `/dev/dri/*` —
+   * i.e. it is talking to the GPU. False means the browser is rendering the wall IN SOFTWARE, which
+   * on a real panel pegs the CPU (the surf/Xwayland DRI3 bug, POL-67) and cooks the box. Absent when
+   * the agent could not tell (no /proc, no browser running, fds unreadable).
+   */
+  gpuAccel: z.boolean().optional(),
+});
+export type BrowserVitals = z.infer<typeof BrowserVitals>;
+
+/** A single cheap sample of the host's health, taken by the agent at heartbeat time. */
+export const MachineVitals = z.object({
+  /** When the box took this sample (ISO, the box's own clock). */
+  at: z.string().optional(),
+  /** Whole-host CPU busy %, 0–100, averaged over the interval since the previous sample. */
+  cpuPercent: z.number().min(0).max(100).optional(),
+  cores: z.number().int().positive().optional(),
+  /** 1/5/15-minute load averages. */
+  loadavg: z.array(z.number().nonnegative()).length(3).optional(),
+  memUsedBytes: z.number().nonnegative().optional(),
+  memTotalBytes: z.number().nonnegative().optional(),
+  memPercent: z.number().min(0).max(100).optional(),
+  /** The root filesystem — on a netbooted box that is the RAM-backed image (tmpfs/overlay), so a
+   *  full "disk" means a full box. */
+  diskUsedBytes: z.number().nonnegative().optional(),
+  diskTotalBytes: z.number().nonnegative().optional(),
+  diskPercent: z.number().min(0).max(100).optional(),
+  /** Hottest thermal zone, °C. Absent on hosts that expose none (VMs, most laptops-as-servers). */
+  tempC: z.number().optional(),
+  uptimeSec: z.number().nonnegative().optional(),
+  /** The live image this box is RUNNING (`/etc/polyptic/image-id`), which is how an operator learns
+   *  a box never took the last roll-out. */
+  imageId: z.string().optional(),
+  /** Per-output browser health (RSS, respawns, and the GPU tell). */
+  browsers: z.array(BrowserVitals).optional(),
+});
+export type MachineVitals = z.infer<typeof MachineVitals>;
+
 export const AgentStatus = z.object({
   t: z.literal("agent/status"),
   machineId: z.string(),
   observedRevision: z.number().int().nonnegative(),
   screens: z.array(
-    z.object({ connector: z.string(), ok: z.boolean(), note: z.string().optional() }),
+    z.object({
+      connector: z.string(),
+      ok: z.boolean(),
+      note: z.string().optional(),
+      /** POL-119 — a cast (AirPlay) session is live on this connector right now: the supervised
+       *  receiver owns at least one visible window (the mirror itself, or its PIN prompt). Level-
+       *  reported here (heartbeat + immediate status on change) so it self-heals across reconnects
+       *  instead of needing an edge-triggered ack that a dropped frame would strand. Optional =
+       *  back-compat with agents that predate casting. */
+      casting: z.boolean().optional(),
+      /** POL-136 — the PIN a sender must type RIGHT NOW to pair with this connector's receiver.
+       *  The receiver prints its per-pairing PIN to stdout only (it never draws a window at pairing
+       *  time — the D111 premise this corrects), so the agent, which owns that stdout, learns it and
+       *  level-reports it here for the server to surface on the panel via the player overlay.
+       *  Present only while a pairing is in progress; absent = no pairing (or a pre-POL-136 agent).
+       *  Digits only (UxPlay pins are 4-digit, zero-padded — "0000" is a valid pin). */
+      castPin: z.string().regex(/^\d{1,8}$/).optional(),
+    }),
   ),
+  /** POL-92 — host vitals, sampled each heartbeat. Optional: an older agent (or a backend with no
+   *  /proc to read) sends a status frame without it, and it still parses. */
+  vitals: MachineVitals.optional(),
 });
 
 export const AgentThumbnail = z.object({
@@ -628,7 +865,19 @@ export const ServerToAgentApply = z.object({
   machineId: z.string(),
   /** For each output: which screen it is and the URL to point a player at. */
   screens: z.array(
-    z.object({ connector: z.string(), screenId: z.string(), playerUrl: z.string().url() }),
+    z.object({
+      connector: z.string(),
+      screenId: z.string(),
+      playerUrl: z.string().url(),
+      /** POL-119 — run a cast (AirPlay) receiver for this connector. Rides the apply payload — not a
+       *  session frame — because it is desired STATE: an agent that restarts or reconnects must
+       *  re-reach it from the next apply alone. Optional = back-compat with older servers. */
+      castEnabled: z.boolean().optional(),
+      /** POL-119 — the screen's friendly name, stamped at send time like the player render's: the
+       *  receiver advertises it on mDNS, so the Screen Mirroring menu shows "Boardroom Left", not a
+       *  connector id. A rename re-applies and restarts that receiver (brief advertisement blip). */
+      friendlyName: z.string().optional(),
+    }),
   ),
 });
 
@@ -724,7 +973,13 @@ export const ServerToAgentPending = z.object({
   machineId: z.string().optional(),
   /** POL-46 — a player page to show fullscreen on every output WHILE pending, instead of leaving the
    *  wall black. Optional: an older agent simply ignores it, and a server that cannot resolve a
-   *  player base omits it. */
+   *  player base omits it.
+   *
+   *  POL-117 — pre-approval ident rides THIS frame, deliberately: a pending box holds no screens, so
+   *  there is no player WS to pulse, and the trust model wants nothing new reachable pre-approval.
+   *  The server re-sends `server/pending` with `&ident=1` appended to the URL (and again without it
+   *  to clear); the agent's existing "re-place when the URL changed" handling swaps the board, and
+   *  the pending page renders its flash overlay. No new frame, no new agent code, old agents included. */
   pendingUrl: z.string().optional(),
 });
 
@@ -866,6 +1121,10 @@ export const ServerToPlayerRender = z.object({
    *  stored slice — see ControlPlane.renameScreen). The player labels its idle splash / dev badge
    *  with this so a console rename shows through live, instead of the raw `screen-N` id (POL-29). */
   friendlyName: z.string(),
+  /** POL-119 — this screen is cast-enabled (AirPlay receiver armed). Stamped at send time like
+   *  `friendlyName`; the player's status badge shows a cast glyph when badges are on, so someone at
+   *  the glass can tell which panels accept Screen Mirroring. Optional = back-compat. */
+  castEnabled: z.boolean().optional(),
   slice: ScreenSlice,
 });
 
@@ -894,10 +1153,22 @@ export const ServerToPlayerSettings = z.object({
   settings: DisplaySettings,
 });
 
+/** POL-136 — AirPlay pairing PIN overlay: show (or clear, with null) the PIN a sender must type on
+ *  the phone right now. Ephemeral like `server/ident-pulse` — never part of the stored slice — and
+ *  replayed to a player that (re)connects mid-pairing, straight after its first render. The player
+ *  draws it fullscreen and big: at pairing time no receiver window exists on the box (the receiver
+ *  only opens one once mirroring starts), so the player IS what's on the glass. */
+export const ServerToPlayerCastPin = z.object({
+  t: z.literal("server/cast-pin"),
+  /** Digits only, zero-padding preserved ("0000" is a valid pin); null clears the overlay. */
+  pin: z.string().regex(/^\d{1,8}$/).nullable(),
+});
+
 export const ServerToPlayerMessage = z.discriminatedUnion("t", [
   ServerToPlayerRender,
   ServerToPlayerIdent,
   ServerToPlayerSettings,
+  ServerToPlayerCastPin,
 ]);
 export type ServerToPlayerMessage = z.infer<typeof ServerToPlayerMessage>;
 
@@ -923,6 +1194,20 @@ export const ScreenView = Screen.extend({
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
+      /** POL-133 — present only for playlist content: the live rotation's steps, in order, each with
+       *  its display name and (for framed steps only) the zoom currently applied on THIS screen. The
+       *  console renders one per-step zoom control from exactly this — the same presence-is-the-
+       *  question pattern as `zoom` above. */
+      entries: z
+        .array(
+          z.object({
+            sourceId: z.string().optional(),
+            name: z.string(),
+            kind: PlaylistEntryKind,
+            zoom: Zoom.optional(),
+          }),
+        )
+        .optional(),
     })
     .nullable()
     .optional(),
@@ -935,6 +1220,11 @@ export const ScreenView = Screen.extend({
    *  success, and when the machine drops. A refusal leaves `inspecting` false, i.e. UNCHANGED, so
    *  without this the console cannot tell "the wall said no" from "the wall hasn't answered yet". */
   inspectError: z.string().optional(),
+  /** POL-119 — a cast (AirPlay) session is live on this panel NOW: the box's receiver owns a visible
+   *  window (mirror or PIN prompt). Ephemeral, agent-reported via `agent/status.screens[].casting`,
+   *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
+   *  toggle — is inherited from `Screen`.) */
+  castActive: z.boolean().optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -961,6 +1251,30 @@ export const MachineView = z.object({
   rebooting: z.boolean().optional(),
   /** POL-59 — when the arming was set / last refreshed (for the "auto-disarms in N min" hint). */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-92 — the machine's LATEST host vitals sample (the head of the server's per-machine ring).
+   *  Absent while the box is offline, before its first heartbeat, or when it runs an agent/backend
+   *  that samples nothing — the console then says so rather than drawing empty meters. */
+  vitals: MachineVitals.optional(),
+  /** POL-104 — what the box IS: MACs, chassis serial, arch. Persisted from `agent/hello`, so a card
+   *  still shows it while the box is OFFLINE (an operator commissioning a rack needs to tell one
+   *  pending UUID from another, and the boxes come and go). Absent for a pre-POL-104 agent. */
+  hardware: HostIdentity.optional(),
+  /** POL-104 — the address the agent's socket is coming from, RIGHT NOW. Live-only (a stale IP is a
+   *  lie), so it is present only while the machine is online. */
+  ip: z.string().optional(),
+  /** POL-104 — the enrolment token this machine first enrolled on: which stick/batch it came in on.
+   *  `name` is a snapshot taken at enrolment, so a deleted token still reads sensibly. */
+  enrolledVia: z
+    .object({ tokenId: z.string(), name: z.string(), revoked: z.boolean().default(false) })
+    .optional(),
+  /** POL-104 — this machine matched a pre-registration and was named/approved from it. */
+  preRegistered: z.boolean().optional(),
+  /** POL-134 — which agent channel this machine's LIVE session arrived on. Present only while
+   *  online; `mtls` means the box completed the client-cert handshake for its current session. */
+  agentChannel: z.enum(["plain", "mtls"]).optional(),
+  /** POL-134 — per-machine cert state for the Settings card (mirrors `Machine`). */
+  mtlsCertIssuedAt: z.string().datetime().optional(),
+  mtlsSeenAt: z.string().datetime().optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;
@@ -1252,6 +1566,11 @@ export const BootReportCode = z.enum([
   "boot-order-not-first", // the entry exists but the firmware still boots something else first
   "esp-too-small", // POL-63: the Wi-Fi local payload (kernel + initrd-wifi + spare slot) won't fit
   "no-local-payload", // POL-63: a Wi-Fi box's offload found no payload for its arch on the medium
+  // POL-116: not a bootloader outcome at all — an initramfs one. The box's boot medium pinned a build
+  // (D67's offline menu) that retention (D54) has since pruned from the depot, so it healed itself in
+  // the initramfs and streamed the ACTIVE image instead. It IS up, on a rootfs its on-stick kernel did
+  // not ship with, until update-poll re-pins the medium — hence a report rather than a silent swap.
+  "pinned-build-missing",
 ]);
 export type BootReportCode = z.infer<typeof BootReportCode>;
 
@@ -1286,6 +1605,13 @@ export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
 // REST bodies — admin actions
 export const RenameScreenBody = z.object({ friendlyName: z.string().min(1).max(64) });
 export type RenameScreenBody = z.infer<typeof RenameScreenBody>;
+
+/** POST /api/v1/machines/:id/rename — POL-117. Writes `Machine.label`, the same field the hostname
+ *  used to default into, so an operator name simply WINS over whatever the box reported. Any machine,
+ *  any status, any time — naming is how an operator tells identical netbooted boxes apart, so it must
+ *  work on a still-pending machine too. */
+export const RenameMachineBody = z.object({ label: z.string().trim().min(1).max(64) });
+export type RenameMachineBody = z.infer<typeof RenameMachineBody>;
 
 /** Ident pulse request: flash a screen's friendly name so an operator can map physical panels. */
 export const IdentBody = z.object({
@@ -1395,6 +1721,11 @@ export const BulkOpResponse = z.object({
 });
 export type BulkOpResponse = z.infer<typeof BulkOpResponse>;
 
+/** POST /api/v1/screens/:id/cast — enable or disable casting (AirPlay receiver) on one screen
+ *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
+export const CastArmBody = z.object({ enabled: z.boolean() });
+export type CastArmBody = z.infer<typeof CastArmBody>;
+
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });
 export type CreateMuralBody = z.infer<typeof CreateMuralBody>;
@@ -1441,6 +1772,18 @@ export type SetContentBody = z.infer<typeof SetContentBody>;
  *  screen later restores the zoom the operator last dialled in. */
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
+
+/** POL-133 — set the page zoom on ONE step of the playlist a screen/wall is showing, identified by
+ *  the step's library source. Same D62 model, same table: the value is remembered against the
+ *  (target, step source) pair, so it survives restarts, scene switches and re-assignment — and the
+ *  same source assigned DIRECTLY to that target shares the dialled-in zoom, which is D62's "zoom
+ *  belongs to the (target, content) pair" taken at its word. */
+export const SetPlaylistEntryZoomBody = z.object({
+  /** The step's library source id (`PlaylistEntry.sourceId`). */
+  sourceId: z.string().min(1),
+  zoom: Zoom,
+});
+export type SetPlaylistEntryZoomBody = z.infer<typeof SetPlaylistEntryZoomBody>;
 
 // REST bodies — content library (Phase 3c; playlists POL-34; pages POL-42)
 export const CreateContentSourceBody = z
@@ -1549,9 +1892,66 @@ export const LoginBody = z.object({
 });
 export type LoginBody = z.infer<typeof LoginBody>;
 
-/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). */
-export const AuthUser = z.object({ id: z.string(), email: z.string().email() });
+/**
+ * What an operator account is ALLOWED to do (POL-107). Three roles, ordered — each one strictly
+ * contains the one below it:
+ *
+ *   - `viewer`   — read the whole registry, and INVOKE a saved scene (`POST /scenes/:id/apply`).
+ *                  The "staff invoke" half of the author/invoke split: a receptionist can recall a
+ *                  layout the wall's owner authored, and can change nothing else.
+ *   - `operator` — everything a viewer can do, plus the CONTENT + LAYOUT verbs: the content library,
+ *                  murals/placements/walls, per-screen + per-wall content and zoom, scenes CRUD,
+ *                  ident, capture, casting, screen renames.
+ *   - `admin`    — everything, plus the FLEET + SECRETS verbs: machines (approve/reject/reboot/remove),
+ *                  the remote shell and the DevTools tunnel, every `/settings/**` route (enrolment
+ *                  token, image builds, display settings, HTTPS, credential profiles) and operator
+ *                  management itself.
+ *
+ * The ordering is the whole contract: a role may do anything its rank allows, and the SERVER decides
+ * (a console that hides a button is a nicety, not a permission system).
+ */
+export const OperatorRole = z.enum(["admin", "operator", "viewer"]);
+export type OperatorRole = z.infer<typeof OperatorRole>;
+
+/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). `role` is what
+ *  the console keys its affordances off; the server enforces the same role on every route. Defaulted
+ *  to `admin` so a pre-POL-107 payload (or an upgraded single-admin deployment) parses as the admin it
+ *  effectively was — never as a lockout. */
+export const AuthUser = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  role: OperatorRole.default("admin"),
+});
 export type AuthUser = z.infer<typeof AuthUser>;
+
+/** An operator account as listed in Settings ▸ Operators (admin-only). Never carries a hash. */
+export const Operator = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  role: OperatorRole,
+  createdAt: z.string(),
+});
+export type Operator = z.infer<typeof Operator>;
+
+/** Create an operator account (admin-only). The password is min-8, same as a self-service change. */
+export const CreateOperatorBody = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(200),
+  role: OperatorRole,
+});
+export type CreateOperatorBody = z.infer<typeof CreateOperatorBody>;
+
+/** Update an operator (admin-only): change the role and/or reset the password. At least one of the
+ *  two must be present — an empty patch is a client bug, not a no-op. */
+export const UpdateOperatorBody = z
+  .object({
+    role: OperatorRole.optional(),
+    password: z.string().min(8).max(200).optional(),
+  })
+  .refine((b) => b.role !== undefined || b.password !== undefined, {
+    message: "provide role and/or password",
+  });
+export type UpdateOperatorBody = z.infer<typeof UpdateOperatorBody>;
 
 /** Change the current operator's password. */
 export const ChangePasswordBody = z.object({
@@ -1560,24 +1960,194 @@ export const ChangePasswordBody = z.object({
 });
 export type ChangePasswordBody = z.infer<typeof ChangePasswordBody>;
 
-/** Enrollment-token visibility for Settings + the cold-start wizard. `open` mode auto-approves with
- *  no token; `gated` mode requires the bootstrap token (shown only to a signed-in operator). */
+// ── Enrolment tokens + pre-registration (POL-104) ────────────────────────────
+//
+// Before POL-104 a gated deployment had exactly ONE bootstrap token, baked into every boot medium
+// ever flashed. That is a flat fleet credential: one stick that walks out of the building
+// compromises enrolment for the whole estate, and rotating it means re-flashing every medium.
+//
+// A deployment now holds a SET of named tokens, each optionally scoped by an expiry and/or a cap on
+// how many NEW machines it may onboard, and each revocable on its own. Exactly one is the BAKE token
+// — the one `/boot/grub.cfg` (and therefore `build-boot-medium.sh`, which lifts it back out of that
+// very menu) writes into a medium's kernel cmdline.
+//
+// BACKWARD COMPATIBILITY IS THE WHOLE GAME HERE. Every already-flashed stick in the field carries the
+// old flat token. On first boot after the upgrade the server LIFTS that token into the token table as
+// a record named "Original bootstrap token" (`legacy: true`) with no expiry and no cap, and keeps it
+// as the bake token — so every medium that worked yesterday works today, and nothing changes until an
+// operator deliberately rotates or revokes it.
+
+export const EnrollmentTokenView = z.object({
+  id: z.string(),
+  /** Operator-chosen name — the batch/site this token was cut for ("Floor 3 rollout", "Site: Leeds"). */
+  name: z.string(),
+  /** The secret itself. Only ever served to a signed-in operator over the auth-gated settings route. */
+  secret: z.string(),
+  createdAt: z.string().datetime(),
+  /** Hard expiry. After this instant the token enrols nothing. Null = never expires. */
+  expiresAt: z.string().datetime().nullable(),
+  /** Cap on how many NEW machines this token may enrol. Null = uncapped. A re-enrol of a machine that
+   *  ALREADY counted against the cap (a box that lost its credential) does not consume a second slot. */
+  maxEnrollments: z.number().int().positive().nullable(),
+  /** How many machines have first-enrolled on this token. */
+  uses: z.number().int().nonnegative(),
+  /** Revoked = blocks NEW enrolments and token re-enrols. Machines ALREADY enrolled on it keep their
+   *  durable per-machine credential and keep running — revoking a token never darkens a working wall. */
+  revokedAt: z.string().datetime().nullable(),
+  lastUsedAt: z.string().datetime().nullable(),
+  /** The token baked into `/boot/grub.cfg` and therefore into the next boot medium. Exactly one. */
+  bake: z.boolean(),
+  /** The pre-POL-104 flat bootstrap token, lifted into the table on upgrade. Never expires, never
+   *  capped — the media already in the field depend on it. */
+  legacy: z.boolean(),
+});
+export type EnrollmentTokenView = z.infer<typeof EnrollmentTokenView>;
+
+/** Enrollment visibility for Settings + the cold-start wizard. `open` mode auto-approves with
+ *  no token; `gated` mode requires one of the enrolment tokens (shown only to a signed-in operator).
+ *  `token` is the BAKE token's secret — kept as a scalar for the pre-POL-104 console/wizard. */
 export const EnrollmentInfo = z.object({
   mode: z.enum(["open", "gated"]),
   token: z.string().nullable(),
+  /** POL-104 — every live token. Absent on a pre-POL-104 server (the console degrades to the scalar). */
+  tokens: z.array(EnrollmentTokenView).default([]),
 });
 export type EnrollmentInfo = z.infer<typeof EnrollmentInfo>;
+
+/** POST /api/v1/settings/enrollment/tokens — cut a new batch token. */
+export const CreateEnrollmentTokenBody = z.object({
+  name: z.string().min(1).max(120),
+  /** Days from now until it expires. Omit for a token that never expires. */
+  expiresInDays: z.number().int().positive().max(3650).optional(),
+  /** Cap on NEW machines. Omit for uncapped. */
+  maxEnrollments: z.number().int().positive().max(100000).optional(),
+  /** Make this the token baked into new boot media. */
+  bake: z.boolean().default(false),
+});
+export type CreateEnrollmentTokenBody = z.infer<typeof CreateEnrollmentTokenBody>;
+
+/** POST /api/v1/settings/enrollment/tokens/:id/rotate — cut a successor and put the old one on a
+ *  GRACE window rather than killing it, so boots in flight (and media not yet re-flashed) still land. */
+export const RotateEnrollmentTokenBody = z.object({
+  /** Hours the OLD secret keeps working. 0 = revoke immediately (an emergency: a stick is gone). */
+  graceHours: z.number().int().nonnegative().max(8760).default(24),
+});
+export type RotateEnrollmentTokenBody = z.infer<typeof RotateEnrollmentTokenBody>;
+
+/**
+ * A box the operator declared BEFORE it ever booted. Matched on the first `agent/hello` that
+ * authenticates, and only then: pre-registration is not a credential and grants no access on its own
+ * — the box must still present a valid enrolment token. It decides what happens to a box that has
+ * ALREADY proved it belongs: what it is called, which tags it carries, and whether an operator has to
+ * click Approve at all.
+ *
+ * Keys, in match order (first hit wins; an AMBIGUOUS match — two records at the same tier — matches
+ * NOTHING, because auto-naming the wrong box is worse than one manual approval):
+ *   machineId  — the box's own stable netboot identity (`dmi-…`/`mac-…`). Strongest.
+ *   dmiSerial  — the chassis serial off the sticker. Strong on real hardware, absent/garbage in VMs.
+ *   mac        — weakest, and DELIBERATELY so: a Wi-Fi-bridged VM's MAC is rewritten by its host
+ *                (POL-63/POL-78 homelab lesson), and a MAC is trivially spoofable by anyone who could
+ *                already have got this far. It is a convenience for the common case, never a proof.
+ */
+export const PreRegistration = z.object({
+  id: z.string(),
+  /** The friendly name to give the box on enrolment ("Lobby left"). */
+  label: z.string().min(1).max(200).optional(),
+  /** Tags to apply on enrolment (composes with POL-103 machine tags; stored + shown today). */
+  tags: z.array(z.string().min(1).max(60)).default([]),
+  /** Approve the box the moment it enrols — the zero-click commissioning path. */
+  autoApprove: z.boolean().default(true),
+  machineId: z.string().min(1).optional(),
+  dmiSerial: z.string().min(1).optional(),
+  /** Normalized lower-case colon form (`aa:bb:cc:dd:ee:ff`). */
+  mac: z.string().min(1).optional(),
+  note: z.string().max(500).optional(),
+  createdAt: z.string().datetime(),
+  /** The machine this record matched, once it has been claimed. A record claims at most one box. */
+  matchedMachineId: z.string().optional(),
+  matchedAt: z.string().datetime().optional(),
+  /** Which key actually matched — shown to the operator, because a MAC match is a weaker claim. */
+  matchedOn: z.enum(["machineId", "dmiSerial", "mac"]).optional(),
+});
+export type PreRegistration = z.infer<typeof PreRegistration>;
+
+/** POST /api/v1/pre-registrations — one record, or a CSV paste of many. */
+export const CreatePreRegistrationBody = z.object({
+  label: z.string().min(1).max(200).optional(),
+  tags: z.array(z.string().min(1).max(60)).default([]),
+  autoApprove: z.boolean().default(true),
+  machineId: z.string().min(1).optional(),
+  dmiSerial: z.string().min(1).optional(),
+  mac: z.string().min(1).optional(),
+  note: z.string().max(500).optional(),
+});
+export type CreatePreRegistrationBody = z.infer<typeof CreatePreRegistrationBody>;
+
+/** POST /api/v1/pre-registrations/import — `label,mac-or-serial-or-machineId,tags…` per line. */
+export const ImportPreRegistrationsBody = z.object({
+  csv: z.string().max(200_000),
+  autoApprove: z.boolean().default(true),
+});
+export type ImportPreRegistrationsBody = z.infer<typeof ImportPreRegistrationsBody>;
 
 /** Netboot (POL-33/D47) surface for Settings: where a bare box's signed shim+GRUB chain fetches its
  *  boot menu from, and whether a prebuilt boot medium is bundled for download. Deliberately SECRET-FREE,
  *  the enrolment token that the boot flow bakes in lives only in {@link EnrollmentInfo}; this just
  *  surfaces the URLs an operator needs (control-plane base, the `/boot/grub.cfg` config URL, and the
  *  boot-medium download when present). */
+/** What the published boot medium ACTUALLY is (POL-122/D110). Two media wear the same filename:
+ *  the FULL universal medium (local payload per arch + Wi-Fi config — boots a Wi-Fi-only screen)
+ *  and the LEAN one (`LEAN=1`: wired netboot only, no payload, no Wi-Fi). They used to be
+ *  indistinguishable from outside — same name, same URL, no metadata — so an operator downloading
+ *  a lean stick had no way to know their Wi-Fi screens could never boot from it. The build script
+ *  now writes a sidecar manifest (`polyptic-boot.json`) beside the image and the server surfaces
+ *  it here, so the console can tell the truth. `selfDescribed: false` = a medium baked before
+ *  POL-122 (no manifest); its shape is then INFERRED from the image size (the lean medium is
+ *  64 MiB, a payload medium is >= 384 MiB by construction) and the finer facts are unknown. */
+export const BootMediumInfo = z.object({
+  /** Where to download it (the same ungated `/dist/boot/polyptic-boot.img` route). */
+  url: z.string(),
+  /** Wired-netboot-only: no local payload, no Wi-Fi. A Wi-Fi-only screen cannot boot from it. */
+  lean: z.boolean(),
+  /** Arches whose local boot payload rides on the medium (empty on a lean medium). */
+  arches: z.array(z.enum(["arm64", "amd64"])).default([]),
+  /** The live-image id baked per arch, so the console can say how stale the stick is. */
+  imageIds: z.record(z.string(), z.string()).default({}),
+  /** The medium's own identity marker (`polyptic/medium-id` on the stick), when it has one. */
+  mediumId: z.string().nullable().default(null),
+  builtAt: z.string().nullable().default(null),
+  /** Whether an enrolment token is baked into the LOCAL menu — which makes the file a credential.
+   *  `null` when unknown (a pre-POL-122 medium with no manifest). */
+  tokenBaked: z.boolean().nullable().default(null),
+  /** Whether the medium shipped its own manifest (false → the fields above are inferred). */
+  selfDescribed: z.boolean().default(false),
+});
+export type BootMediumInfo = z.infer<typeof BootMediumInfo>;
+
+/** The sidecar manifest `deploy/build-boot-medium.sh` writes beside the image (`polyptic-boot.json`,
+ *  emitted by `deploy/write-boot-manifest.sh`) and the server parses at the edge. This is a
+ *  cross-process contract like any other: the shell writes it, the server reads it, so it lives
+ *  here. Unknown/extra keys are ignored — an older or newer manifest degrades, it never 500s. */
+export const BootMediumManifest = z.object({
+  mediumId: z.string().nullable().default(null),
+  builtAt: z.string().nullable().default(null),
+  lean: z.boolean(),
+  arches: z.array(z.enum(["arm64", "amd64"])).default([]),
+  imageIds: z.record(z.string(), z.string()).default({}),
+  tokenBaked: z.boolean().default(false),
+  /** The image's size in bytes, as the builder saw it (informational). */
+  bytes: z.number().int().nonnegative().nullable().default(null),
+});
+export type BootMediumManifest = z.infer<typeof BootMediumManifest>;
+
 export const NetbootInfo = z.object({
   baseUrl: z.string(),
   mode: z.enum(["open", "gated"]),
   bootConfigUrl: z.string(),
   bootMediumUrl: z.string().nullable(),
+  /** The published medium's real shape, `null` when none is published (POL-122). `bootMediumUrl`
+   *  stays the download URL; this says WHAT that download is. */
+  bootMedium: BootMediumInfo.nullable().default(null),
   /** Self-contained bootable Polyptic live ISOs in the image depot (POL-38/D49): write to a USB
    *  stick (or attach to a UEFI VM) and the box boots straight into Polyptic and enrols — the
    *  manual-provisioning alternative to netboot. One entry per arch whose artifact exists on
@@ -1611,6 +2181,41 @@ export const HttpsInfo = z.object({
     .nullable(),
 });
 export type HttpsInfo = z.infer<typeof HttpsInfo>;
+
+/**
+ * POL-134 — `GET /api/v1/settings/agent-security` (auth-gated): the agent-channel security posture
+ * in operator words, for the Settings card. `mode` is the whole story:
+ *   - "off"       the mTLS listener is not running (explicitly disabled, or the runtime/port could
+ *                 not offer it — `detail` says which).
+ *   - "migrating" certs are being issued and agents move over as they reconnect; the plain channel
+ *                 still admits sessions while the fleet catches up.
+ *   - "required"  every live agent session rides the mTLS listener; the plain channel only
+ *                 authenticates first contact and issues certs — it never carries a session.
+ */
+export const AgentSecurityInfo = z.object({
+  mode: z.enum(["off", "migrating", "required"]),
+  /** The mTLS listener's port (absent when mode is "off"). */
+  port: z.number().int().positive().optional(),
+  /** When the deployment graduated to require-mTLS (auto-promotion or a pinned env). */
+  requiredSince: z.string().optional(),
+  /** True when AGENT_MTLS_REQUIRE pins the posture (no auto-promotion either way). */
+  pinned: z.boolean(),
+  /** Why the listener is off, when it is ("AGENT_MTLS=off", "port 8443 in use", …). */
+  detail: z.string().optional(),
+  /** Per-machine cert state, one row per known machine. */
+  machines: z.array(
+    z.object({
+      id: z.string(),
+      label: z.string(),
+      online: z.boolean(),
+      /** The channel of the machine's live session (present only while online). */
+      agentChannel: z.enum(["plain", "mtls"]).optional(),
+      mtlsCertIssuedAt: z.string().optional(),
+      mtlsSeenAt: z.string().optional(),
+    }),
+  ),
+});
+export type AgentSecurityInfo = z.infer<typeof AgentSecurityInfo>;
 
 /** One arch's published live image, as served UNGATED at `/dist/image/<arch>/manifest.json` and
  *  compared by every netbooted box's 5-minute update poll (POL-41). `urgent` is the fleet-wide

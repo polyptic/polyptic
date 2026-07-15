@@ -770,6 +770,15 @@ function enableServices(sys: Sys, log: Logger, state: SetupState): void {
 
   sys.exec("systemctl", ["enable", "greetd"], { desc: "enable greetd", allowFail: true });
 
+  // POL-119 — mDNS advertisement for the cast receiver(s). The daemon is a stock system service
+  // from the avahi package (installed with the wayland/cast set); the receiver itself needs no
+  // unit — the agent supervises it in-process, like the browsers. allowFail: a backend without
+  // the cast packages (x11/dev) simply has no unit to enable.
+  sys.exec("systemctl", ["enable", "avahi-daemon"], {
+    desc: "enable avahi-daemon (mDNS for casting, POL-119)",
+    allowFail: true,
+  });
+
   // POL-55 — arm the reboot watcher. It must be enabled (not started): systemd starts .path units at
   // boot, and a chroot install (the live-image build) has no manager to start anything anyway.
   sys.exec("systemctl", ["enable", REBOOT_PATH_UNIT], {

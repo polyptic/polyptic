@@ -212,6 +212,7 @@ describe("netboot: GET /boot/grub.cfg", () => {
       expect(body).toContain("--id live");
       expect(body).toContain("--id offload");
       expect(body).toContain("--id debug");
+      expect(body).toContain("--id verbose");
       expect(body).toContain(`root=live:http://${OPEN_HOST}/dist/image/$arch/rootfs.squashfs`);
       // The writable layer is an overlayfs in RAM. `rd.live.ram=1` must NEVER appear: it dd's a
       // SECOND full copy of the image into RAM on top of the one livenet already downloaded.
@@ -253,12 +254,15 @@ describe("netboot: GET /boot/grub.cfg", () => {
     async () => {
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
       const echoes = body.split("\n").filter((l) => l.trim().startsWith("echo "));
-      expect(echoes.length).toBe(3);
+      expect(echoes.length).toBe(4);
       expect(echoes[0]).toContain("Starting Polyptic");
+      // …and it says what the silent minute after it IS (POL-118): the kernel + initrd fetch. Progress
+      // in plain English is not the diagnostics D65 threw off this screen.
+      expect(echoes[0]).toContain("downloading the operating system");
       expect(echoes[1]).toContain("Setting up this screen");
       // The POL-47 complaint, verbatim: no RAM, no arch, no "offload", no "image" on a public panel.
-      // The debug entry is exempt: nobody sees its line unless they deliberately chose it, and by
-      // then `tty9` is the fact they walked to the box for.
+      // The debug and verbose entries are exempt: nobody sees their lines unless they deliberately
+      // chose them, and by then `tty9` is the fact they walked to the box for.
       for (const line of echoes.slice(0, 2)) {
         expect(line).not.toContain("RAM");
         expect(line).not.toContain("$arch");
@@ -315,7 +319,7 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
-    "the menu is three flat entries, addressed by --id, and no submenu",
+    "the menu is four flat entries, addressed by --id, and no submenu",
     async () => {
       // The names are POL-47's (D65 supersedes D61's on the signage argument); the `--id`s are the
       // stable handle, and the flatness is D61's — a submenu opens a fresh GRUB environment context,
@@ -324,7 +328,31 @@ describe("netboot: GET /boot/grub.cfg", () => {
       expect(body).toContain('menuentry "Polyptic" --id live');
       expect(body).toContain('menuentry "Set up this screen to start without the USB stick" --id offload');
       expect(body).toContain('menuentry "Debug console" --id debug');
+      expect(body).toContain('menuentry "Watch this screen boot (verbose)" --id verbose');
       expect(body).not.toContain("submenu ");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the verbose entry turns GRUB's own network narration on, and lifts the splash (POL-118)",
+    async () => {
+      // The operator's window into a slow boot: `debug=net,efinet,http` makes GRUB print every card,
+      // DHCP packet and HTTP request (verified under OVMF against the pinned signed grubnet — 78
+      // debug lines on one boot), `pager=1` stops it scrolling past, and dropping `quiet splash`
+      // keeps the transcript running into the kernel instead of hitting the Plymouth curtain.
+      const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
+      const verbose = body.slice(body.indexOf("--id verbose"));
+      expect(verbose).toContain("set debug=net,efinet,http");
+      expect(verbose).toContain("set pager=1");
+      expect(verbose).not.toContain("quiet");
+      expect(verbose).not.toContain("splash "); // `plymouth.ignore-serial-consoles` may stay
+      // …and NONE of that may leak onto a wall's unattended boot: the entries above it are untouched.
+      const beforeVerbose = body.slice(0, body.indexOf("--id verbose"));
+      expect(beforeVerbose).not.toContain("set debug=");
+      expect(beforeVerbose).not.toContain("set pager=");
+      expect(beforeVerbose).toContain("quiet splash");
+      expect(body).toContain("set default=live"); // it is a CHOICE, never the default
     },
     TEST_TIMEOUT,
   );
@@ -498,6 +526,37 @@ describe("netboot: POST /boot/report", () => {
   );
 
   test(
+    "POL-116: a box that healed a pruned pin reports `warn` — it is UP, on an image its kernel did not ship with",
+    async () => {
+      const res = await fetch(`${OPEN_BASE}/boot/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ok: false,
+          code: "pinned-build-missing",
+          detail:
+            "the OS image this screen was pinned to (20260713T140345Z-fe8ca57b) is gone from the depot; booting the current image (20260714T045032Z-5724b929) instead",
+          machineId: "dmi-4c4c4544-0037",
+        }),
+      });
+      expect(res.status).toBe(204);
+
+      const activity = await readAdminActivity(OPEN_BASE);
+      const line = activity.find((e) => e.text.includes("was pinned to"));
+      expect(line).toBeDefined();
+      // `warn`, not `bad`: the wall is showing content. A red line for a healthy wall trains the
+      // operator to ignore the feed — but a silent swap is exactly what POL-116 forbids.
+      expect(line?.severity).toBe("warn");
+      expect(line?.text).toContain("dmi-4c4c4544-0037");
+      expect(line?.text).toContain("started the current one instead");
+      expect(line?.text).toContain("20260714T045032Z-5724b929");
+      // It must NOT be laundered into the bootloader-install vocabulary: nothing was installed.
+      expect(line?.text).not.toContain("bootloader");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "an unknown code or an oversized detail is a 400, never an activity line",
     async () => {
       const bad = await fetch(`${OPEN_BASE}/boot/report`, {
@@ -585,20 +644,25 @@ describe("netboot: the GRUB boot theme", () => {
         expect(res.headers.get("content-length")).toBe(String(Buffer.byteLength(body)));
         expect(body).toContain("desktop-color:");
         expect(body).toContain('file = "logo.png"');
+        // POL-130: the desktop-image is load-bearing — without it GRUB 2.12's gfxmenu scales a
+        // NULL bitmap on every draw and errors onto the wall the moment a menu entry boots.
+        expect(body).toContain('desktop-image: "bg.png"');
       }
     },
     TEST_TIMEOUT,
   );
 
   test(
-    "serves the logo GRUB resolves relative to the theme, as a real PNG with a Content-Length",
+    "serves the bitmaps GRUB resolves relative to the theme, as real PNGs with a Content-Length",
     async () => {
-      const res = await fetch(`${OPEN_BASE}/boot/logo.png`);
-      expect(res.status).toBe(200);
-      expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/png");
-      const png = Buffer.from(await res.arrayBuffer());
-      expect(res.headers.get("content-length")).toBe(String(png.length));
-      expect(png.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      for (const file of ["logo.png", "bg.png"]) {
+        const res = await fetch(`${OPEN_BASE}/boot/${file}`);
+        expect(res.status).toBe(200);
+        expect((res.headers.get("content-type") ?? "").toLowerCase()).toContain("image/png");
+        const png = Buffer.from(await res.arrayBuffer());
+        expect(res.headers.get("content-length")).toBe(String(png.length));
+        expect(png.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      }
     },
     TEST_TIMEOUT,
   );

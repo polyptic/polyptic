@@ -59,20 +59,20 @@ For a *released* image instead of a local build, set the `server.image` to `ghcr
 
 **3. Helm — on Kubernetes**
 
-The standalone chart in `deploy/helm/polyptic` deploys **only the server** (agents are not in the cluster — they live on the boxes). Bring your own Postgres via `externalDatabase.url`, or flip on the in-cluster Bitnami subchart:
+The chart in `deploy/helm/polyptic` deploys the **server and its database** — agents are not in the cluster, they live on the boxes. **One command, nothing to apply first** (POL-123/D108): `postgresql.enabled` defaults to true and the chart brings up its own Postgres (a first-party StatefulSet, not a subchart), generating the password and wiring `DATABASE_URL` for you.
 
 ```bash
 helm install polyptic deploy/helm/polyptic \
   --set image.repository=ghcr.io/<owner>/polyptic-server \
   --set image.tag=0.1.0 \
-  --set externalDatabase.url=postgres://polyptic:polyptic@my-pg:5432/polyptic \
   --set secrets.cookieSecret="$(openssl rand -hex 32)" \
-  --set config.corsOrigin=https://polyptic.example.com \
   --set ingress.enabled=true --set ingress.host=polyptic.example.com \
   --set ingress.tls.enabled=true
 ```
 
-If you leave `secrets.cookieSecret` empty the chart generates one on first install and preserves it across upgrades. Liveness/readiness hit the **ungated** `/healthz`; Prometheus scrape annotations target the ungated `/metrics`. See `deploy/helm/polyptic/README.md` for the full values reference.
+Point it at a managed Postgres instead with `--set postgresql.enabled=false --set externalDatabase.url=postgres://…`. Setting **both** is refused at template time, as is `config.store=postgres` with **neither** — the combination that used to install happily and then crash-loop the server on `getaddrinfo ENOTFOUND`.
+
+If you leave `secrets.cookieSecret` empty the chart generates one on first install and preserves it across upgrades (the bundled database's password works the same way). Liveness/readiness hit the **ungated** `/healthz`; Prometheus scrape annotations target the ungated `/metrics`. See `deploy/helm/polyptic/README.md` for the full values reference — including how to adopt an existing `polyptic-db` PVC.
 
 ### Server environment reference
 

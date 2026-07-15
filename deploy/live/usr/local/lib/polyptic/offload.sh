@@ -324,7 +324,42 @@ if loadfont (memdisk)/fonts/unicode.pf2 ; then
 fi
 set net=(http,@@POLYPTIC_BASE_HOSTPORT@@)
 echo "Starting Polyptic ..."
-net_dhcp
+echo "Looking for a wired network ..."
+# ONE CARD AT A TIME, FIRST LEASE WINS (POL-118) — the GRUB-stage twin of POL-76/D71.
+# `net_dhcp` with no argument runs DHCP on EVERY card GRUB enumerates and keeps polling until the
+# LAST of them gives up (GRUB 2.12 `grub_cmd_bootp`: one shared retransmit loop over all cards, and
+# it only breaks out when no card still needs a poll). So a dual-NIC box with one cable in kept the
+# boot waiting on the carrier-less port long AFTER the live port already had its address.
+# GRUB script cannot enumerate cards — `net_ls_cards` only PRINTS them, and the language has no
+# command substitution — but `net_dhcp [CARD]` takes a card name, and EFI's driver names them
+# efinet0, efinet1, ... in enumeration order. So we walk the names ourselves and stop at the first
+# port that answers: a dead port can no longer outlive a working one.
+# `$?` is GRUB's grub_err_t: 0 = leased, 36 = GRUB_ERR_NET_NO_CARD, i.e. no such port, so we have run
+# off the end of the box's real ones. (If that number ever shifted, the only cost is a few probes of
+# cards that do not exist, each of which returns instantly.) A box with MORE than four ports, or a
+# GRUB that names them some other way, still has the all-cards sweep on the "Try again" entry below.
+set nic_ip=
+set nic_next=1
+net_dhcp efinet0 ; set nic_rc="$?"
+if [ "$nic_rc" = 0 ]; then set nic_ip="$net_efinet0_dhcp_ip" ; set nic_next= ; fi
+if [ "$nic_rc" = 36 ]; then set nic_next= ; fi
+if [ -n "$nic_next" ]; then
+  net_dhcp efinet1 ; set nic_rc="$?"
+  if [ "$nic_rc" = 0 ]; then set nic_ip="$net_efinet1_dhcp_ip" ; set nic_next= ; fi
+  if [ "$nic_rc" = 36 ]; then set nic_next= ; fi
+fi
+if [ -n "$nic_next" ]; then
+  net_dhcp efinet2 ; set nic_rc="$?"
+  if [ "$nic_rc" = 0 ]; then set nic_ip="$net_efinet2_dhcp_ip" ; set nic_next= ; fi
+  if [ "$nic_rc" = 36 ]; then set nic_next= ; fi
+fi
+if [ -n "$nic_next" ]; then
+  net_dhcp efinet3 ; set nic_rc="$?"
+  if [ "$nic_rc" = 0 ]; then set nic_ip="$net_efinet3_dhcp_ip" ; fi
+fi
+# Plain English, on the happy path, because a wall that is slow but talking is not a wall that has
+# died (POL-118). This is progress, not diagnostics — D65 banned the second, not the first.
+if [ -n "$nic_ip" ]; then echo "Got an address ($nic_ip) - fetching the boot menu ..." ; fi
 configfile $net/boot/grub.cfg
 # Only reached when DHCP or the chain failed. A medium carrying the POL-63 local payload boots it
 # instead of complaining: local kernel + initrd-wifi, which joins Wi-Fi from polyptic/wifi.conf and
@@ -344,7 +379,19 @@ echo "Could not reach the Polyptic control plane at $net over the network."
 sleep -i 8
 set timeout=10
 set default=retry
+# `net_dhcp` with no card here is deliberate and is the escape hatch for the walk above: it sweeps
+# EVERY card GRUB can see, whatever it is called and however many there are. It is slow by
+# construction — that is the price of exhaustiveness, and this menu is already the failure path.
 menuentry "Try again" --id retry { net_dhcp ; configfile $net/boot/grub.cfg }
+# The operator's window into the boot (POL-118). `debug=net,efinet,http` makes GRUB narrate its own
+# network conversation — every card it finds, every DHCP packet, every HTTP request — and `pager=1`
+# stops it scrolling past. Chosen deliberately, never on the happy path, so D65 is not in play.
+menuentry "Try again, and show the network conversation" --id verbose {
+  set debug=net,efinet,http
+  set pager=1
+  net_dhcp
+  configfile $net/boot/grub.cfg
+}
 menuentry "Start from this drive (Wi-Fi screens)" --id local { configfile /grub/local.cfg }
 menuentry "Restart this screen" { reboot }
 menuentry "Firmware setup" { fwsetup }
@@ -429,13 +476,16 @@ if [ "$wifi_payload" = 1 ]; then
   fi
   # The offline splash theme (POL-74): carry it to the ESP so an offloaded Wi-Fi box paints the
   # branded menu too. render-local-grub's `set theme` guard means a medium without it still boots.
-  # Only a COMPLETE pair is copied, logo first and theme.txt last (POL-87): theme.txt is what the
-  # GRUB guard keys on, and a theme without its bitmap paints "error: null src bitmap ... Press any
+  # Only a COMPLETE set is copied, bitmaps first and theme.txt last (POL-87, extended by POL-130
+  # with bg.png — the desktop-image GRUB 2.12 insists on scaling): theme.txt is what the GRUB
+  # guard keys on, and a theme without its bitmaps paints "error: null src bitmap ... Press any
   # key" on a keyboard-less screen — an interrupted copy must degrade to a plain menu, and an
-  # orphaned theme on the source medium must not propagate to the ESP.
-  if [ -f "$mnt_medium/polyptic/boot/theme/theme.txt" ] && [ -s "$mnt_medium/polyptic/boot/theme/logo.png" ]; then
+  # orphaned/incomplete theme on the source medium must not propagate to the ESP.
+  if [ -f "$mnt_medium/polyptic/boot/theme/theme.txt" ] && [ -s "$mnt_medium/polyptic/boot/theme/logo.png" ] \
+     && [ -s "$mnt_medium/polyptic/boot/theme/bg.png" ]; then
     mkdir -p "$mnt/polyptic/boot/theme"
     cp "$mnt_medium/polyptic/boot/theme/logo.png"  "$mnt/polyptic/boot/theme/logo.png" \
+      && cp "$mnt_medium/polyptic/boot/theme/bg.png" "$mnt/polyptic/boot/theme/bg.png" \
       && cp "$mnt_medium/polyptic/boot/theme/theme.txt" "$mnt/polyptic/boot/theme/theme.txt"
   fi
   printf 'medium-esp-%s\n' "$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)" > "$mnt/polyptic/medium-id"
