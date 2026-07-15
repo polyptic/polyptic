@@ -79,6 +79,7 @@ import {
   ServerToPlayerRender,
   ServerToPlayerSettings,
   SetContentBody,
+  SetAudioBody,
   SetMachineTagsBody,
   SetZoomBody,
   SetPlaylistEntryZoomBody,
@@ -2029,6 +2030,95 @@ export function registerRestRoutes(
       wallId: params.data.wallId,
       revision: control.state.revision,
       zoom: body.data.zoom,
+      screens: result.slices.map((s) => s.screenId),
+    };
+  });
+
+  // ── Audio (POL-112) ──────────────────────────────────────────────────────────
+  //
+  // Turn the sound on (and set its level) for the audible content on a screen or a combined surface.
+  // Same in-place discipline as zoom: the surface keeps its id, so the player re-applies muted/volume
+  // to the video element it already has — the clip does not restart. The one-unmuted-panel guard for
+  // a wall is enforced in the control plane, not here, so no client can route around it.
+
+  // PUT /api/v1/screens/:screenId/audio  { muted, volume }  (409 if wall member / not audible)
+  fastify.put("/api/v1/screens/:screenId/audio", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetAudioBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenAudio(params.data.screenId, body.data);
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; set the wall's audio`,
+          wallId: result.wallId,
+        });
+      }
+      // no-content / not-audible are conflicts with the screen's current state, not bad requests.
+      if (result.error === "no-content" || result.error === "not-audible") {
+        return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+      }
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.audio",
+        screenId: params.data.screenId,
+        muted: body.data.muted,
+        volume: body.data.volume,
+        revision: control.state.revision,
+      },
+      "screen audio set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's content read-out carries the live audio
+    return { ok: true, revision: control.state.revision, ...body.data };
+  });
+
+  // PUT /api/v1/walls/:wallId/audio  { muted, volume }  -> anchor panel sounds, the rest stay muted
+  fastify.put("/api/v1/walls/:wallId/audio", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetAudioBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallAudio(params.data.wallId, body.data);
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.audio",
+        wallId: params.data.wallId,
+        muted: body.data.muted,
+        volume: body.data.volume,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall audio set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return {
+      ok: true,
+      wallId: params.data.wallId,
+      revision: control.state.revision,
+      ...body.data,
       screens: result.slices.map((s) => s.screenId),
     };
   });

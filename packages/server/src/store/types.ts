@@ -159,6 +159,18 @@ export interface PersistedZoomPreference {
   zoom: number;
 }
 
+/**
+ * POL-112 — a remembered audio intent for one (target, content) pair, keyed exactly like a zoom
+ * preference. Assigning that content to that target again restores the level the operator dialled in;
+ * NEW content on that target has no row and so arrives at the muted default.
+ */
+export interface PersistedAudioPreference {
+  targetId: string;
+  sourceKey: string;
+  muted: boolean;
+  volume: number;
+}
+
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
 export interface PersistedMural {
   id: string;
@@ -461,6 +473,8 @@ export interface PersistedState {
   credentialProfiles: PersistedCredentialProfile[];
   /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
   zoomPreferences: PersistedZoomPreference[];
+  /** POL-112 — remembered audio intent per (screen-or-wall, content) pair. */
+  audioPreferences: PersistedAudioPreference[];
 }
 
 /**
@@ -540,6 +554,14 @@ export interface Store {
   deleteZoomPreferencesForTarget(targetId: string): Promise<void>;
   /** All persisted zoom preferences. */
   listZoomPreferences(): Promise<PersistedZoomPreference[]>;
+
+  // ── Audio preferences (POL-112) ────────────────────────────────────────────
+  /** Insert-or-update the remembered audio intent for one (target, content) pair. */
+  upsertAudioPreference(pref: PersistedAudioPreference): Promise<void>;
+  /** Forget every remembered audio intent for a screen or wall that no longer exists. No-op if none. */
+  deleteAudioPreferencesForTarget(targetId: string): Promise<void>;
+  /** All persisted audio preferences. */
+  listAudioPreferences(): Promise<PersistedAudioPreference[]>;
 
   // ── Credential profiles (POL-24) ───────────────────────────────────────────
   /** Insert-or-update a credential-profile row (the only home of the client secret). */

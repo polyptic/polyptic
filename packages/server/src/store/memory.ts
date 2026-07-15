@@ -32,6 +32,7 @@ import type {
   PersistedState,
   PersistedUser,
   PersistedVideoWall,
+  PersistedAudioPreference,
   PersistedZoomPreference,
   Store,
 } from "./types";
@@ -40,8 +41,8 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-/** Composite key for a zoom preference — the pair (target, content) it is remembered against. The
- *  separator can't appear in an id, so no pair can collide with another. */
+/** Composite key for a zoom / audio preference — the pair (target, content) it is remembered against.
+ *  The separator can't appear in an id, so no pair can collide with another. */
 function zoomKey(targetId: string, sourceKey: string): string {
   return `${targetId}\u0000${sourceKey}`;
 }
@@ -69,6 +70,8 @@ export class MemoryStore implements Store {
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
   private readonly zoomPreferences = new Map<string, PersistedZoomPreference>();
+  /** Keyed by `<targetId>\0<sourceKey>` — remembered audio intent per pair (POL-112). */
+  private readonly audioPreferences = new Map<string, PersistedAudioPreference>();
   /** Keyed by user id — local operator accounts (Phase 3f). */
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
@@ -108,6 +111,7 @@ export class MemoryStore implements Store {
       schedules: [...this.schedules.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
       zoomPreferences: [...this.zoomPreferences.values()].map(clone),
+      audioPreferences: [...this.audioPreferences.values()].map(clone),
     };
   }
 
@@ -151,6 +155,7 @@ export class MemoryStore implements Store {
       this.content.delete(screenId);
       this.placements.delete(screenId);
       this.dropZoomPreferences(screenId);
+      this.dropAudioPreferences(screenId);
     }
   }
 
@@ -261,6 +266,26 @@ export class MemoryStore implements Store {
   private dropZoomPreferences(targetId: string): void {
     for (const [key, pref] of this.zoomPreferences) {
       if (pref.targetId === targetId) this.zoomPreferences.delete(key);
+    }
+  }
+
+  // ── Audio preferences (POL-112) ──────────────────────────────────────────────
+
+  async upsertAudioPreference(pref: PersistedAudioPreference): Promise<void> {
+    this.audioPreferences.set(zoomKey(pref.targetId, pref.sourceKey), clone(pref));
+  }
+
+  async deleteAudioPreferencesForTarget(targetId: string): Promise<void> {
+    this.dropAudioPreferences(targetId);
+  }
+
+  async listAudioPreferences(): Promise<PersistedAudioPreference[]> {
+    return [...this.audioPreferences.values()].map(clone);
+  }
+
+  private dropAudioPreferences(targetId: string): void {
+    for (const [key, pref] of this.audioPreferences) {
+      if (pref.targetId === targetId) this.audioPreferences.delete(key);
     }
   }
 

@@ -352,11 +352,31 @@ export const ImageSurface = SurfaceBase.extend({
   fit: z.enum(["cover", "contain"]).default("cover"),
 });
 
+/** POL-112 — playback volume for a surface that can make sound: 0 (silent) … 1 (full). Volume is
+ *  INDEPENDENT of `muted`, exactly like a media element's two properties: unmuting a screen restores
+ *  the level the operator last dialled in rather than jumping to full. */
+export const Volume = z.number().min(0).max(1);
+export type Volume = z.infer<typeof Volume>;
+
+/** POL-112 — the audio intent of one audible surface. `muted` DEFAULTS TRUE everywhere: a wall makes
+ *  no sound until an operator explicitly opts in (an unexpectedly loud lobby is a support call), and
+ *  a legacy/partial payload therefore decodes to silence, never to noise. */
+const AudibleFields = {
+  muted: z.boolean().default(true),
+  volume: Volume.default(1),
+};
+
+/** POL-112 — the audio intent an operator sets on a screen's OR a wall's audible content, and the
+ *  read-out the console renders its controls from. Both halves always travel together (the console
+ *  holds both), so a slider drag never has to guess the toggle's state and vice-versa. */
+export const AudioIntent = z.object({ muted: z.boolean(), volume: Volume });
+export type AudioIntent = z.infer<typeof AudioIntent>;
+
 export const VideoSurface = SurfaceBase.extend({
   type: z.literal("video"),
   src: z.string().url(),
   loop: z.boolean().default(true),
-  muted: z.boolean().default(true),
+  ...AudibleFields,
 });
 
 // ── Playlists (POL-34) ────────────────────────────────────────────────────────
@@ -397,6 +417,10 @@ export const PlaylistSurface = SurfaceBase.extend({
    *  and a rebooting box rejoins the rotation mid-cycle instead of restarting it. A playlist with any
    *  untimed video can't be derived from a clock and plays sequentially from the top. */
   startedAt: z.string(),
+  /** POL-112 — the audio intent for the whole rotation, applied to whichever VIDEO entry is on air
+   *  (the other kinds have nothing to sound). One setting per rotation, not per step: an operator
+   *  turns the sound on for "the lobby playlist", not for step 3 of it. */
+  ...AudibleFields,
 });
 export type PlaylistSurface = z.infer<typeof PlaylistSurface>;
 
@@ -1386,6 +1410,10 @@ export const ScreenView = Screen.extend({
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
+      /** POL-112 — the audio currently applied, present only for AUDIBLE content (video, playlist).
+       *  Absent for everything else, so — exactly like `zoom` — its presence is the question "can
+       *  this selection make sound?" and the console shows or hides the control accordingly. */
+      audio: AudioIntent.optional(),
       /** POL-18 — true when this content renders as a top-level window placed by the agent (not an
        *  iframe in the player). The inspector labels the selection so the operator knows why the
        *  player's own region is empty. Absent = framed as normal. */
@@ -2063,6 +2091,13 @@ export type BulkContentBody = z.infer<typeof BulkContentBody>;
  *  screen later restores the zoom the operator last dialled in. */
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
+
+/** Set the audio on a single screen's OR a video wall's audible content (POL-112). Like zoom, the
+ *  server remembers the value against the (target, content) pair — so the same clip returning to the
+ *  same lobby screen comes back at the level the operator dialled in, while NEW content always
+ *  arrives at the muted default. On a wall the server enforces the one-unmuted-panel guard. */
+export const SetAudioBody = AudioIntent;
+export type SetAudioBody = z.infer<typeof SetAudioBody>;
 
 /** POL-133 — set the page zoom on ONE step of the playlist a screen/wall is showing, identified by
  *  the step's library source. Same D62 model, same table: the value is remembered against the

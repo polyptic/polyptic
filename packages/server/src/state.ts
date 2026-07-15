@@ -24,6 +24,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  AudioIntent,
   ContentSource,
   DashboardSurface,
   Daypart,
@@ -174,6 +175,55 @@ function withZoomedFirstSurface(
   return { ...slice, surfaces: [{ ...surface, zoom }, ...slice.surfaces.slice(1)] };
 }
 
+// ── Audio (POL-112) ──────────────────────────────────────────────────────────
+
+/** The muted-by-default posture, in one place: a wall that nobody asked to make sound makes none. */
+const DEFAULT_AUDIO: AudioIntent = { muted: true, volume: 1 };
+
+/** The surface kinds that can make sound — the only ones the audio control applies to. A framed page
+ *  may well have its own audio, but that is the PAGE's business, not the control plane's. */
+type AudibleSurface = Extract<Surface, { type: "video" | "playlist" }>;
+
+function isAudible(surface: Surface): surface is AudibleSurface {
+  return surface.type === "video" || surface.type === "playlist";
+}
+
+/** The url half of an audible surface's pref key. Mirrors `specUrl`: a video is identified by its
+ *  src, a playlist has no url of its own (its sourceId always identifies it). */
+function audioSurfaceUrl(surface: AudibleSurface): string {
+  return surface.type === "video" ? surface.src : "";
+}
+
+/** "on · 60%" / "muted" — how an audio intent reads in the activity feed. */
+function audioLabel(audio: AudioIntent): string {
+  return audio.muted ? "muted" : `on · ${Math.round(audio.volume * 100)}%`;
+}
+
+/**
+ * THE ONE-UNMUTED-PANEL GUARD (POL-112), enforced server-side so no client can talk a wall into an
+ * echo. Every member of a combined surface renders the same spanning video — N panels means N decoded
+ * video elements — so if they all unmuted, the room would hear N slightly-out-of-phase copies. Only
+ * the ANCHOR member (index 0, deterministic across pushes) carries the operator's intent; every other
+ * member is forced muted, whatever the caller asked for.
+ */
+function wallMemberAudio(audio: AudioIntent, memberIndex: number): AudioIntent {
+  return memberIndex === 0 ? audio : { ...audio, muted: true };
+}
+
+/** A copy of `slice` whose FIRST surface carries `audio`. Same in-place discipline as the zoom patch:
+ *  the surface keeps its id and src, so the player re-applies volume to the element it already has —
+ *  it never remounts, i.e. a video does not restart when the sound comes on. */
+function withAudibleFirstSurface(
+  slice: ScreenSlice,
+  surface: AudibleSurface,
+  audio: AudioIntent,
+): ScreenSlice {
+  return {
+    ...slice,
+    surfaces: [{ ...surface, muted: audio.muted, volume: audio.volume }, ...slice.surfaces.slice(1)],
+  };
+}
+
 /** POL-54 — whoever can mint a screen's player token (the PlayerAuth service, wired after
  *  construction like the token provider; absent in unit tests → tokenless URLs). */
 export type PlayerTokenMinter = (screenId: string) => string;
@@ -318,6 +368,16 @@ export type SetZoomResult =
       wallId?: string;
     };
 
+/** Result of `setScreenAudio` / `setWallAudio` (POL-112): the re-sounded slices to push, or why not.
+ *  `not-audible` = the target shows content that cannot make sound (a page, a dashboard, an image). */
+export type SetAudioResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error: "unknown-screen" | "unknown-wall" | "wall-member" | "no-content" | "not-audible";
+      wallId?: string;
+    };
+
 /** Result of `setScreenPlaylistEntryZoom` / `setWallPlaylistEntryZoom` (POL-133).
  *  `not-zoomable` = the target isn't showing a playlist; `unknown-entry` = the rotation has no
  *  framed step resolved from that source (media steps have no page to zoom). */
@@ -433,6 +493,10 @@ export class ControlPlane {
   /** POL-57 — remembered page zoom, keyed by `zoomKey(targetId, sourceKey)`. A target is a screen or
    *  a wall; a sourceKey identifies the page. Assigning that page there again restores this zoom. */
   private readonly zoomPrefs = new Map<string, number>();
+
+  /** POL-112 — remembered audio intent, keyed by the SAME (target, content) pair as a zoom pref. A
+   *  pair with no entry is MUTED: new content is silent until an operator says otherwise. */
+  private readonly audioPrefs = new Map<string, AudioIntent>();
 
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
@@ -680,6 +744,14 @@ export class ControlPlane {
       // back to 100%) rather than pushed to a player as an unrenderable scale.
       const zoom = Zoom.safeParse(p.zoom);
       if (zoom.success) this.zoomPrefs.set(zoomKey(p.targetId, p.sourceKey), zoom.data);
+    }
+
+    // ── Audio preferences (POL-112) ───────────────────────────────────────────
+    for (const p of persisted.audioPreferences) {
+      // Re-validate at the edge; a row outside 0–1 (or otherwise malformed) is ignored, which leaves
+      // that pair at the muted default — the failure mode is silence, never a surprise noise.
+      const audio = AudioIntent.safeParse({ muted: p.muted, volume: p.volume });
+      if (audio.success) this.audioPrefs.set(zoomKey(p.targetId, p.sourceKey), audio.data);
     }
 
     // ── Content library (Phase 3c) ────────────────────────────────────────────
@@ -1903,6 +1975,7 @@ export class ControlPlane {
     name: string;
     kind: ContentKind;
     zoom?: number;
+    audio?: AudioIntent;
     windowed?: boolean;
     entries?: { sourceId?: string; name: string; kind: PlaylistEntry["kind"]; zoom?: number }[];
   } | null {
@@ -1928,15 +2001,28 @@ export class ControlPlane {
         : undefined;
 
     const wall = this.getWallForScreen(screenId);
+    // POL-112 — the live audio, present only for audible content (its absence hides the control). For
+    // a WALL member we report the wall's remembered INTENT rather than the panel's own surface: the
+    // one-unmuted-panel guard leaves every non-anchor member muted, and the console must show the
+    // operator what they asked the wall to do, not the guard's per-panel consequence.
+    const audio = !surface || !isAudible(surface)
+      ? undefined
+      : wall
+        ? this.audioFor(
+            wall.id,
+            this.sourceKeyFor(this.wallSourceIds.get(wall.id) ?? null, audioSurfaceUrl(surface)),
+          )
+        : { muted: surface.muted, volume: surface.volume };
+
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind, zoom, windowed, entries };
+      if (src) return { name: src.name, kind: src.kind, zoom, audio, windowed, entries };
     }
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, windowed, entries };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, audio, windowed, entries };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -2000,6 +2086,7 @@ export class ControlPlane {
    * makes the surface render only its slice of a larger spanning content (video walls). The surface id
    * is caller-supplied and STABLE so consecutive pushes reconcile to the same keyed tile (in-place swap,
    * the INSTANT property — D5). `zoom` (POL-57) rides on framed kinds only; media has no page to zoom.
+   * `audio` (POL-112) rides on AUDIBLE kinds only (video, playlist) and defaults to muted.
    */
   private buildSurface(
     spec: ResolvedSpec,
@@ -2007,6 +2094,7 @@ export class ControlPlane {
     region: Geometry,
     span?: Span,
     zoom: number = DEFAULT_ZOOM,
+    audio: AudioIntent = DEFAULT_AUDIO,
   ): Surface {
     const base = span ? { id, region, span } : { id, region };
     switch (spec.kind) {
@@ -2035,7 +2123,16 @@ export class ControlPlane {
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
       case "video":
-        return VideoSurface.parse({ ...base, type: "video", src: spec.url, loop: true, muted: true });
+        // POL-112 — `audio` is the operator's remembered intent for this (target, content) pair; a
+        // pair nobody has touched resolves to DEFAULT_AUDIO, i.e. muted. It is NOT hardcoded here.
+        return VideoSurface.parse({
+          ...base,
+          type: "video",
+          src: spec.url,
+          loop: true,
+          muted: audio.muted,
+          volume: audio.volume,
+        });
       case "playlist":
         // POL-34 — the whole resolved rotation ships in one surface; the player advances it locally.
         // `startedAt` came off the spec (resolved once per assignment), so every wall member anchors
@@ -2045,6 +2142,8 @@ export class ControlPlane {
           type: "playlist",
           items: spec.entries ?? [],
           startedAt: spec.startedAt ?? new Date().toISOString(),
+          muted: audio.muted,
+          volume: audio.volume,
         });
     }
   }
@@ -2076,6 +2175,11 @@ export class ControlPlane {
       if (key.startsWith(`${targetId}\u0000`)) this.zoomPrefs.delete(key);
     }
     await this.store.deleteZoomPreferencesForTarget(targetId);
+    // POL-112 — the audio prefs of a dead screen/wall are dead weight too (ids are never reused).
+    for (const key of [...this.audioPrefs.keys()]) {
+      if (key.startsWith(`${targetId}\u0000`)) this.audioPrefs.delete(key);
+    }
+    await this.store.deleteAudioPreferencesForTarget(targetId);
   }
 
   /** The page identity a zoom is remembered against: a library source by id, else the ad-hoc URL. */
@@ -2305,6 +2409,115 @@ export class ControlPlane {
     return { ok: true, slices };
   }
 
+  // ── Audio (POL-112) ─────────────────────────────────────────────────────────
+  //
+  // Audio is a property of the (target, content) PAIR — the same reasoning as zoom (POL-57), and for
+  // the same reason it is NOT a property of the screen: the lobby panel wants the showreel loud and
+  // the same panel wants the safety briefing silent, so a per-screen master volume would be a knob an
+  // operator has to remember to re-set on every content change. It is not a property of the library
+  // source either: one clip is the sound of the lobby and background wallpaper in the boardroom.
+  //
+  // The default for a pair nobody has touched is MUTED. That asymmetry with zoom is deliberate: an
+  // unexpectedly loud wall is a support call, so sound is opt-in, per placement, every time — a NEW
+  // assignment has no pref row and therefore arrives silent, and only the same content returning to
+  // the same target restores what the operator dialled in.
+
+  /** The remembered audio for a (target, content) pair — muted when the operator never set one. */
+  private audioFor(targetId: string, sourceKey: string): AudioIntent {
+    return this.audioPrefs.get(zoomKey(targetId, sourceKey)) ?? DEFAULT_AUDIO;
+  }
+
+  /** Remember the audio for a pair, write-through. An explicit re-mute is STORED, not dropped: the
+   *  operator turning the sound back off must survive a restart as firmly as turning it on. */
+  private async rememberAudio(targetId: string, sourceKey: string, audio: AudioIntent): Promise<void> {
+    this.audioPrefs.set(zoomKey(targetId, sourceKey), audio);
+    await this.store.upsertAudioPreference({ targetId, sourceKey, muted: audio.muted, volume: audio.volume });
+  }
+
+  /**
+   * Set the audio on a single screen's audible content. Patches the EXISTING surface (id and src
+   * untouched) so the player re-applies muted/volume to the element it already has: the sound comes on
+   * mid-clip, the video does not restart, no reload (D5). Rejected if the screen is a wall member
+   * (audio belongs to the combined surface — see the guard), shows nothing, or shows silent content.
+   */
+  async setScreenAudio(screenId: string, audio: AudioIntent): Promise<SetAudioResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slice = this.state.slices[screenId];
+    const surface = slice?.surfaces[0];
+    if (slice === undefined || surface === undefined) return { ok: false, error: "no-content" };
+    if (!isAudible(surface)) return { ok: false, error: "not-audible" };
+
+    const next: ScreenSlice = withAudibleFirstSurface(slice, surface, audio);
+    this.state.slices[screenId] = next;
+    this.bumpRevision();
+
+    const sourceId = this.screenSourceIds.get(screenId) ?? null;
+    await this.rememberAudio(screenId, this.sourceKeyFor(sourceId, audioSurfaceUrl(surface)), audio);
+    await this.store.upsertContent({
+      screenId,
+      canvas: next.canvas,
+      surfaces: next.surfaces,
+      sourceId,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${screen.friendlyName} sound ${audioLabel(audio)}`);
+    return { ok: true, slices: [next] };
+  }
+
+  /**
+   * Set the audio on a combined surface. Every member decodes its own copy of the spanning video, so
+   * unmuting them all would play the room N out-of-phase copies of the same soundtrack: the ANCHOR
+   * member takes the operator's intent and every other member is forced muted (`wallMemberAudio`).
+   * The guard lives HERE, server-side — a client cannot opt out of it.
+   */
+  async setWallAudio(wallId: string, audio: AudioIntent): Promise<SetAudioResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices: ScreenSlice[] = [];
+    let sourceKey: string | undefined;
+    let memberIndex = 0;
+    for (const screenId of wall.memberScreenIds) {
+      const slice = this.state.slices[screenId];
+      const surface = slice?.surfaces[0];
+      if (slice === undefined || surface === undefined) continue;
+      if (!isAudible(surface)) return { ok: false, error: "not-audible" };
+      sourceKey ??= this.sourceKeyFor(this.wallSourceIds.get(wallId) ?? null, audioSurfaceUrl(surface));
+      const next: ScreenSlice = withAudibleFirstSurface(
+        slice,
+        surface,
+        wallMemberAudio(audio, memberIndex),
+      );
+      this.state.slices[screenId] = next;
+      slices.push(next);
+      memberIndex += 1;
+    }
+    if (slices.length === 0 || sourceKey === undefined) return { ok: false, error: "no-content" };
+
+    this.bumpRevision();
+    // Remember the operator's INTENT against the wall (not the per-member guarded value): the guard is
+    // re-applied on every rebuild, so a member joining/leaving never resurrects a second sounding panel.
+    await this.rememberAudio(wallId, sourceKey, audio);
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: this.wallSourceIds.get(wallId) ?? null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${wall.name ?? wall.id} sound ${audioLabel(audio)}`);
+    return { ok: true, slices };
+  }
+
   /**
    * Resolve a library source to its renderable spec. A playlist (POL-34) resolves each authored item
    * to a concrete entry AT THIS MOMENT — an item whose source was deleted (or somehow became another
@@ -2432,8 +2645,16 @@ export class ControlPlane {
    * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
    *
    * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
+   * POL-112: `audio` is the wall's remembered audio intent — NOT applied uniformly. The one-unmuted-
+   * panel guard gives it to the anchor member only; every other member is forced muted, so a wall can
+   * never echo itself. Membership order is stable, so the same panel keeps the sound across pushes.
    */
-  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
+  private computeWallSlices(
+    wall: VideoWall,
+    spec: ResolvedSpec,
+    zoom = DEFAULT_ZOOM,
+    audio: AudioIntent = DEFAULT_AUDIO,
+  ): ScreenSlice[] {
     // POL-18 — a video wall never windows: a spanned surface is one CONTENT sliced across members,
     // and a top-level window can neither be sliced nor span outputs. A window-wanting source on a
     // wall degrades to the iframe (with a console-visible note) rather than leaving member holes.
@@ -2466,6 +2687,7 @@ export class ControlPlane {
     const contentH = unionMaxY - unionMinY;
 
     const slices: ScreenSlice[] = [];
+    let memberIndex = 0;
     for (const { screenId, placement } of members) {
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
@@ -2482,7 +2704,9 @@ export class ControlPlane {
           offsetY: placement.y - unionMinY,
         },
         zoom,
+        wallMemberAudio(audio, memberIndex),
       );
+      memberIndex += 1;
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
       slices.push(next);
@@ -2651,12 +2875,21 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
+    const sourceKey = this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec));
     // POL-57 — restore the zoom this wall last used FOR THIS PAGE (100% if it never has).
-    const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
+    const zoom = this.zoomFor(wallId, sourceKey);
+    // POL-112 — restore the audio this wall last used FOR THIS CONTENT. Content it has never sounded
+    // arrives MUTED: assigning something new to a wall never surprises the room.
+    const audio = this.audioFor(wallId, sourceKey);
 
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
     // POL-133 — a playlist's framed steps pick up this wall's remembered per-step zooms.
-    const slices = this.computeWallSlices(wall, this.specForTarget(wallId, resolved.spec), zoom);
+    const slices = this.computeWallSlices(
+      wall,
+      this.specForTarget(wallId, resolved.spec),
+      zoom,
+      audio,
+    );
     if (slices.length === 0) return { ok: false, error: "no-placements" };
 
     // Record which library source (if any) this wall now spans, persisting the wall row.
@@ -2699,9 +2932,12 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
+    const sourceKey = this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec));
     // POL-57 — restore the zoom this screen last used FOR THIS PAGE (100% if it never has), so the
     // operator dials a dashboard in once per screen and it comes back that way every time.
-    const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
+    const zoom = this.zoomFor(screenId, sourceKey);
+    // POL-112 — likewise the audio, which defaults to MUTED for content this screen has never sounded.
+    const audio = this.audioFor(screenId, sourceKey);
 
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
     // POL-133 — a playlist's framed steps pick up this screen's remembered per-step zooms.
@@ -2713,6 +2949,7 @@ export class ControlPlane {
       { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
       undefined,
       zoom,
+      audio,
     );
     const next: ScreenSlice = { ...slice, surfaces: [surface] };
     this.state.slices[screenId] = next;
@@ -3116,6 +3353,9 @@ export class ControlPlane {
         { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
         undefined,
         this.zoomFor(screenId, sourceKey),
+        // POL-112 — an edit to the source must not silently mute (or unmute) a screen that is already
+        // sounding it: the remembered intent for this pair rides through the re-resolve.
+        this.audioFor(screenId, sourceKey),
       );
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
@@ -3127,7 +3367,8 @@ export class ControlPlane {
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
       const zoom = this.zoomFor(wallId, sourceKey);
-      for (const next of this.computeWallSlices(wall, this.specForTarget(wallId, spec), zoom))
+      const audio = this.audioFor(wallId, sourceKey);
+      for (const next of this.computeWallSlices(wall, this.specForTarget(wallId, spec), zoom, audio))
         byScreen.set(next.screenId, next);
     }
 

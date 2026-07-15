@@ -88,7 +88,9 @@ export function buildChromeArgs(
     "--disable-session-crashed-bubble",
     "--noerrdialogs",
     "--disable-features=Translate",
-    // A wall shows video with nobody there to click "play".
+    // A wall shows video with nobody there to click "play" — and, since POL-112, with the sound ON if
+    // an operator asked for it. Without this flag Chrome refuses to autoplay UNMUTED media, and the
+    // player would have to fall back to muted playback (which it does, deliberately — see audio.ts).
     "--autoplay-policy=no-user-gesture-required",
   ];
   // POL-132 — the player's shell service worker (what lets a wall RELOAD while the control plane is

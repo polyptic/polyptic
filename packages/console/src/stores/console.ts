@@ -13,6 +13,7 @@ import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
   ActivityEvent,
+  AudioIntent,
   AuthUser,
   BulkOpResponse,
   ChangePasswordBody,
@@ -1559,6 +1560,31 @@ export const useConsoleStore = defineStore("console", {
     },
 
     /**
+     * Set the sound on a single screen's audible content (POL-112). Optimistic like zoom: the slider
+     * must track the operator's thumb, and the authoritative value arrives on the next `admin/state`.
+     */
+    async setScreenAudio(screenId: string, audio: AudioIntent): Promise<void> {
+      this.patchScreenAudio([screenId], audio);
+      try {
+        await api.setScreenAudio(screenId, audio);
+      } catch (err) {
+        console.error("[console] setScreenAudio failed", err);
+      }
+    },
+
+    /** Write an audio intent onto the given screens' content read-outs in place (optimistic; the
+     *  server's broadcast overwrites it moments later). Silent content is left alone. */
+    patchScreenAudio(screenIds: readonly string[], audio: AudioIntent): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content) continue;
+          if (screen.content.audio === undefined) continue;
+          screen.content = { ...screen.content, audio: { ...audio } };
+        }
+      }
+    },
+
+    /**
      * Zoom one framed step of the playlist a single screen is showing (POL-133). Same shape as
      * `setScreenZoom`: optimistic patch of the step's read-out so the − / + buttons step from the
      * value the operator sees; the authoritative value returns on the next `admin/state`.
@@ -1652,6 +1678,19 @@ export const useConsoleStore = defineStore("console", {
             : "failed";
         if (reason !== "not-adjacent") console.error("[console] combine failed", err);
         return reason;
+      }
+    },
+
+    /** Set the sound on a combined surface (POL-112). The server hands it to ONE panel (the anchor)
+     *  and keeps the others muted — N panels sounding the same clip would echo the room. */
+    async setWallAudio(wallId: string, audio: AudioIntent): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchScreenAudio(wall.memberScreenIds, audio);
+      try {
+        await api.setWallAudio(wallId, audio);
+      } catch (err) {
+        console.error("[console] setWallAudio failed", err);
       }
     },
 
