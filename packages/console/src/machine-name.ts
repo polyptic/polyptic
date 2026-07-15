@@ -35,3 +35,14 @@ export function machineDisplayName(machine: { id: string; label: string }): stri
   if (machineHasName(machine)) return machine.label.trim();
   return `Unnamed box · ${machineIdTail(machine.id)}`;
 }
+
+/**
+ * POL-141 — the name as shown ON A MACHINE CARD, where the id-tail badge sits beside the status
+ * pill. The badge is the tail's single home there, so the unnamed placeholder is a plain
+ * "Unnamed box" — printing the tail twice on one row would just be noise. Prose contexts
+ * (confirm dialogs, toasts, the terminal header) have no badge, so they keep using
+ * `machineDisplayName`, where the tail is what disambiguates "Reboot Unnamed box?".
+ */
+export function machineCardName(machine: { id: string; label: string }): string {
+  return machineHasName(machine) ? machine.label.trim() : "Unnamed box";
+}
