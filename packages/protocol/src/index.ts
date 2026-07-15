@@ -635,8 +635,9 @@ export const AgentStatus = z.object({
        *  The receiver prints its per-pairing PIN to stdout only (it never draws a window at pairing
        *  time — the D111 premise this corrects), so the agent, which owns that stdout, learns it and
        *  level-reports it here for the server to surface on the panel via the player overlay.
-       *  Present only while a pairing is in progress; absent = no pairing (or a pre-POL-136 agent). */
-      castPin: z.string().min(1).max(16).optional(),
+       *  Present only while a pairing is in progress; absent = no pairing (or a pre-POL-136 agent).
+       *  Digits only (UxPlay pins are 4-digit, zero-padded — "0000" is a valid pin). */
+      castPin: z.string().regex(/^\d{1,8}$/).optional(),
     }),
   ),
   /** POL-92 — host vitals, sampled each heartbeat. Optional: an older agent (or a backend with no
@@ -1083,7 +1084,8 @@ export const ServerToPlayerSettings = z.object({
  *  only opens one once mirroring starts), so the player IS what's on the glass. */
 export const ServerToPlayerCastPin = z.object({
   t: z.literal("server/cast-pin"),
-  pin: z.string().min(1).max(16).nullable(),
+  /** Digits only, zero-padding preserved ("0000" is a valid pin); null clears the overlay. */
+  pin: z.string().regex(/^\d{1,8}$/).nullable(),
 });
 
 export const ServerToPlayerMessage = z.discriminatedUnion("t", [

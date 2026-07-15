@@ -34,3 +34,32 @@ describe("Presence.setScreenCastPin — level-set from agent/status, edges out (
     expect(p.screenCastPin("s2")).toBe("1234"); // another box's pairing is untouched
   });
 });
+
+describe("Presence cast-PIN TTL — a lost clear can never replay a stale code (PR #118 finding 3)", () => {
+  const T0 = 1_000_000;
+  const TTL = 120_000; // mirrors Presence.CAST_PIN_TTL_MS and the agent's own backstop
+
+  test("a PIN nobody refreshed for the TTL reads as null (and is dropped)", () => {
+    const p = new Presence();
+    p.setScreenCastPin("s1", "0417", T0);
+    expect(p.screenCastPin("s1", T0 + TTL)).toBe("0417"); // at the boundary: still live
+    expect(p.screenCastPin("s1", T0 + TTL + 1)).toBeNull(); // past it: gone
+    expect(p.screenCastPin("s1", T0 + TTL)).toBeNull(); // and dropped, not just hidden
+  });
+
+  test("heartbeats repeating the level refresh the TTL — a live pairing never expires", () => {
+    const p = new Presence();
+    p.setScreenCastPin("s1", "0417", T0);
+    // Three 10s heartbeats later the level is re-set each time (no edge, but the clock moves).
+    p.setScreenCastPin("s1", "0417", T0 + 110_000);
+    expect(p.screenCastPin("s1", T0 + 110_000 + TTL)).toBe("0417");
+  });
+
+  test("setting over an expired PIN reads as a fresh edge, not a no-op", () => {
+    const p = new Presence();
+    p.setScreenCastPin("s1", "0417", T0);
+    // Same pin re-reported long after expiry: the stored value equals it, but the expired entry
+    // must read as null so this counts as a CHANGE and the overlay is re-pushed.
+    expect(p.setScreenCastPin("s1", "0417", T0 + TTL + 60_000)).toBe(true);
+  });
+});

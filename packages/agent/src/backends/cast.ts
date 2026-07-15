@@ -96,6 +96,50 @@ export function matchesUxplayWindow(appId: string): boolean {
   return /uxplay/i.test(appId);
 }
 
+/**
+ * Wrap the receiver's spawn so its stdout is LINE-buffered even into a pipe (POL-136 review
+ * finding 1). UxPlay's logger is bare `printf` with no `fflush`/`setvbuf` — the only `fflush(NULL)`
+ * in its codebase sits in the audio path our `-as 0` disables — so with stdout a pipe, libc
+ * block-buffers at ~4 KiB and the PIN lines (a few hundred bytes) can sit unread past the whole
+ * pairing window: wall blank AND journal silent, the original bug reproduced one layer down.
+ * `stdbuf -oL -eL` (coreutils — Essential on the ubuntu-base image, but VERIFIED at spawn; POL-78
+ * taught us to assume nothing) presets line buffering via LD_PRELOAD and then EXECS the receiver,
+ * so the spawned pid still IS uxplay: pid-matched window placement and the reg-file cmdline token
+ * both keep working. Pure — pinned by tests.
+ */
+export function wrapLineBuffered(
+  bin: string,
+  args: string[],
+  stdbufAvailable: boolean,
+): { cmd: string; argv: string[] } {
+  if (!stdbufAvailable) return { cmd: bin, argv: args };
+  return { cmd: "stdbuf", argv: ["-oL", "-eL", bin, ...args] };
+}
+
+/**
+ * Apply one backend PIN event to the agent's connector→PIN ledger (POL-136). Returns true when the
+ * ledger CHANGED (the caller sends an immediate status). The subtlety this encodes (review
+ * finding 4): a `null` CLEAR must apply even when the connector is no longer castable — teardown
+ * orderings can delete the `casting` entry before the receiver's exit event lands, and a swallowed
+ * clear would level-report a stale PIN in every heartbeat forever. Only NEW pins are gated on
+ * castability.
+ */
+export function applyCastPinEvent(
+  pins: Map<string, string>,
+  castable: (connector: string) => boolean,
+  connector: string,
+  pin: string | null,
+): boolean {
+  if ((pins.get(connector) ?? null) === pin) return false;
+  if (pin === null) {
+    pins.delete(connector);
+    return true;
+  }
+  if (!castable(connector)) return false; // receiver retired — never surface a stale pin
+  pins.set(connector, pin);
+  return true;
+}
+
 // ── PIN pairing (POL-136) ─────────────────────────────────────────────────────
 //
 // D111 assumed "the PIN prompt is a window too". It is not: UxPlay's `display_pin` callback renders

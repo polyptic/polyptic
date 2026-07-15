@@ -68,6 +68,7 @@ import {
 import type { KioskBrowser, MachineVitals, Output } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
+import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
 import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
@@ -246,10 +247,10 @@ class Agent {
     // stdout (the receiver never draws it), pushed up IMMEDIATELY so the panel shows it while the
     // phone is still asking, and level-reported in every heartbeat until the pairing ends.
     this.backend.onCastPin((connector, pin) => {
-      if ((this.castPins.get(connector) ?? null) === pin) return;
-      if (!this.casting.has(connector)) return; // receiver already retired — stale event
-      if (pin === null) this.castPins.delete(connector);
-      else this.castPins.set(connector, pin);
+      // The ledger rules live in applyCastPinEvent (cast.ts, pinned by tests) — notably that a
+      // null CLEAR applies even after the `casting` entry is gone, or a receiver-death ordering
+      // could strand a stale PIN in every heartbeat.
+      if (!applyCastPinEvent(this.castPins, (c) => this.casting.has(c), connector, pin)) return;
       log(
         pin === null
           ? `cast pairing PIN on ${connector} cleared`

@@ -322,16 +322,19 @@ describe("POL-136 cast pairing PIN: agent/status → server/cast-pin → player"
   );
 
   test(
-    "the activity feed carries the pairing line, PIN included, so an operator can relay it",
+    "the activity feed announces the pairing but NEVER carries the PIN itself",
     async () => {
+      // The feed rides every admin/state snapshot and lingers in the ring long after pairing —
+      // a PIN there would leak proof-of-physical-presence to anyone who can see the console
+      // (PR #118 finding 2). The code travels the gated player channel and the box journal only.
       const admin = await connectAdmin();
-      // A fresh admin's first snapshot reflects current state; the pairing line is already in the ring.
       const state = await (async () => {
         admin.send({ t: "admin/hello", protocol: PROTOCOL_VERSION });
         return admin.waitFor((m) => m.t === "admin/state", "admin/state with pairing line", 4_000);
       })();
       const texts = (state.activity ?? []).map((e: Frame) => String(e.text));
-      expect(texts.some((t: string) => t.includes("AirPlay pairing") && t.includes(PIN))).toBe(true);
+      expect(texts.some((t: string) => t.includes("AirPlay pairing"))).toBe(true);
+      expect(texts.some((t: string) => t.includes(PIN))).toBe(false);
       admin.close();
     },
     TEST_TIMEOUT,

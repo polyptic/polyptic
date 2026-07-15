@@ -49,6 +49,7 @@ import {
   matchesUxplayWindow,
   resolveUxplay,
   sameCastTarget,
+  wrapLineBuffered,
 } from "./cast";
 import type { CastTarget } from "./cast";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
@@ -744,7 +745,20 @@ export class SwayBackend implements DisplayBackend {
       regFile,
       mac: castDeviceMac(`${osHostname()}:${connector}`),
     });
-    const child = spawnChild(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    // POL-136 — the PIN only ever exists on the receiver's stdout, and UxPlay never flushes: into a
+    // pipe, libc block-buffers its printf output at ~4 KiB, which can hold the PIN lines back past
+    // the whole pairing window. `stdbuf -oL -eL` forces line buffering (and execs uxplay, so the
+    // pid and cmdline stay pid-match/reap compatible). coreutils is Essential on the image, but a
+    // box without stdbuf must still cast — just with the delayed-PIN risk called out LOUDLY.
+    const hasStdbuf = await which("stdbuf");
+    if (!hasStdbuf) {
+      this.log(
+        `cast(${connector}): *** stdbuf not found — the receiver's stdout will be block-buffered ` +
+          `and pairing PINs may reach neither the panel nor the journal in time (install coreutils)`,
+      );
+    }
+    const { cmd, argv } = wrapLineBuffered(bin, args, hasStdbuf);
+    const child = spawnChild(cmd, argv, { stdio: ["ignore", "pipe", "pipe"] });
     this.pipeBrowserOutput(child, "uxplay", connector);
     // POL-136 — the PIN pairing lifecycle lives in the receiver's output (see cast.ts): feed every
     // line to this connector's tracker. This is SEPARATE from pipeBrowserOutput above, whose
@@ -772,9 +786,10 @@ export class SwayBackend implements DisplayBackend {
           buf = buf.slice(nl + 1);
           this.casts.get(connector)?.tracker.onLine(line);
         }
-        // An unterminated tail longer than any real log line is noise (or binary) — drop it so a
-        // stream that never newlines cannot grow the buffer without bound.
-        if (buf.length > 8192) buf = "";
+        // An unterminated tail longer than any real log line is noise (or binary). Keep the TAIL
+        // rather than dropping wholesale, so a PIN line arriving right after a large newline-less
+        // burst isn't truncated with it; the classifier shrugs at the garbled joint line.
+        if (buf.length > 8192) buf = buf.slice(-4096);
       };
     };
     child.stdout?.on("data", sink());

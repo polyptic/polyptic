@@ -591,12 +591,16 @@ function handleAgent(
           castChanged = true;
           const overlay = ServerToPlayerCastPin.parse({ t: "server/cast-pin", pin });
           const delivered = playerHub.send(screen.id, overlay);
+          // The PIN itself NEVER enters the feed: activity rides every admin/state snapshot (and
+          // lingers in the ring long after pairing), so a code there would leak proof-of-physical-
+          // presence to anyone who can see the console. The feed says what an operator can act on;
+          // the PIN travels only the gated per-screen player channel and the box's own journal.
           if (pin !== null) {
             activity.push(
               delivered > 0 ? "info" : "bad",
               delivered > 0
-                ? `AirPlay pairing on ${screen.friendlyName} — PIN ${pin} is on the panel`
-                : `AirPlay pairing on ${screen.friendlyName} — PIN ${pin}, but NO player is connected to show it`,
+                ? `AirPlay pairing on ${screen.friendlyName} — the PIN is on the panel`
+                : `AirPlay pairing on ${screen.friendlyName} — NO player is connected to display the PIN (read it in the box's agent journal)`,
             );
           }
           log.info(

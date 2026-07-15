@@ -270,3 +270,57 @@ describe("CastPairingTracker — the PIN lifecycle, from stdout to panel and bac
     expect(changes).toEqual(["1111", "2222"]);
   });
 });
+
+// ── Review findings (PR #118) ────────────────────────────────────────────────
+
+import { applyCastPinEvent, wrapLineBuffered } from "../src/backends/cast";
+
+describe("wrapLineBuffered — the PIN cannot sit in a libc block buffer (finding 1)", () => {
+  const ARGS_IN = ["-n", "Boardroom Left", "-pin"];
+
+  test("spawns through stdbuf -oL -eL so the receiver's printf output is line-buffered into our pipe", () => {
+    const { cmd, argv } = wrapLineBuffered("uxplay", ARGS_IN, true);
+    expect(cmd).toBe("stdbuf");
+    // Order is load-bearing: buffering flags first, then the real command and its untouched argv.
+    expect(argv).toEqual(["-oL", "-eL", "uxplay", "-n", "Boardroom Left", "-pin"]);
+  });
+
+  test("a box without stdbuf still casts — the receiver runs unwrapped (with the loud log upstream)", () => {
+    const { cmd, argv } = wrapLineBuffered("uxplay", ARGS_IN, false);
+    expect(cmd).toBe("uxplay");
+    expect(argv).toEqual(ARGS_IN);
+  });
+});
+
+describe("applyCastPinEvent — the agent's connector→PIN ledger rules (finding 4)", () => {
+  test("a new PIN on a castable connector applies and reports a change", () => {
+    const pins = new Map<string, string>();
+    expect(applyCastPinEvent(pins, () => true, "HDMI-1", "0417")).toBe(true);
+    expect(pins.get("HDMI-1")).toBe("0417");
+  });
+
+  test("repeating the same PIN is not a change (no duplicate status frames)", () => {
+    const pins = new Map([["HDMI-1", "0417"]]);
+    expect(applyCastPinEvent(pins, () => true, "HDMI-1", "0417")).toBe(false);
+  });
+
+  test("a new PIN for a retired connector is refused — never surface a stale pin", () => {
+    const pins = new Map<string, string>();
+    expect(applyCastPinEvent(pins, () => false, "HDMI-1", "0417")).toBe(false);
+    expect(pins.size).toBe(0);
+  });
+
+  test("THE ordering bug: a null clear applies even after the casting entry is gone", () => {
+    // Receiver death ordering: reconcile deletes the casting entry FIRST, the receiver's exit
+    // event lands after. The clear must still take, or the stale PIN level-reports forever.
+    const pins = new Map([["HDMI-1", "0417"]]);
+    const castable = () => false; // the connector was already retired
+    expect(applyCastPinEvent(pins, castable, "HDMI-1", null)).toBe(true);
+    expect(pins.size).toBe(0);
+  });
+
+  test("a null clear with nothing held is a no-op", () => {
+    const pins = new Map<string, string>();
+    expect(applyCastPinEvent(pins, () => true, "HDMI-1", null)).toBe(false);
+  });
+});
