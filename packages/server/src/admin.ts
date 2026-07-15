@@ -17,7 +17,7 @@
  */
 import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
+import type { MachineVitals, MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
@@ -64,9 +64,20 @@ export class AdminHub {
  */
 export class Presence {
   private readonly agentConns = new Map<string, number>();
+  /** POL-134 — machineId → the channel its live agent session arrived on. Live-only. */
+  private readonly agentChannel = new Map<string, "plain" | "mtls">();
   private readonly screenRevision = new Map<string, number>();
   /** screenIds whose panel currently shows the browser's Web Inspector (POL-50). */
   private readonly inspecting = new Set<string>();
+  /** POL-119 — screenIds with a LIVE cast (AirPlay) session: the box's receiver owns a visible
+   *  window (the mirror). Level-set from `agent/status.screens[].casting`. */
+  private readonly casting = new Set<string>();
+  /** POL-136 — screenId → the PIN a pairing sender must type RIGHT NOW (plus when we learned it),
+   *  per the agent's status report (the receiver prints it to stdout; the agent learns it there).
+   *  Live-only, like the rest of Presence — and TTL-guarded on read: the value exists to be
+   *  REPLAYED to late-connecting players, so a lost agent-side clear must not replay a stale code
+   *  over live mirrored content. The TTL mirrors the agent's own 120s pin backstop. */
+  private readonly castPins = new Map<string, { pin: string; at: number }>();
   /** screenId → why the box last refused to show it (POL-50). */
   private readonly inspectErrors = new Map<string, string>();
   /** machineId → when the box ACCEPTED an operator reboot (POL-68). Live-only; cleared when the
@@ -74,21 +85,51 @@ export class Presence {
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
 
+  /** POL-92 — machineId → a small ring of host-vitals samples, newest LAST. Live-only, exactly like
+   *  the rest of Presence: vitals describe a running box, and a box that isn't running has none. The
+   *  ring (not just the latest sample) is what lets an operator surface, and a future feature graph,
+   *  a few minutes of history without touching the store or the <150ms path. */
+  private readonly vitals = new Map<string, MachineVitals[]>();
+  /** POL-104 — machineId → the peer address of its live agent socket. Live-only (see `machineAddress`). */
+  private readonly addresses = new Map<string, string>();
+  /** machineId → ms epoch of the last heartbeat we accepted (with or WITHOUT vitals — a pre-POL-92
+   *  agent still proves liveness). Drives `polyptic_machine_last_seen_seconds`. */
+  private readonly lastHeartbeat = new Map<string, number>();
+
   /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
   private static readonly REBOOTING_TTL_MS = 3 * 60_000;
 
-  agentConnected(machineId: string): void {
+  /** POL-136 — how long a stored pairing PIN stays replayable; mirrors the agent's pin TTL. */
+  private static readonly CAST_PIN_TTL_MS = 120_000;
+
+  /** Samples retained per machine — ~5 minutes at the agent's 10s heartbeat. Bounded on purpose:
+   *  this is a fleet-sized in-memory structure, not a time-series database. */
+  private static readonly VITALS_RING = 30;
+
+  agentConnected(machineId: string, channel?: "plain" | "mtls"): void {
     this.agentConns.set(machineId, (this.agentConns.get(machineId) ?? 0) + 1);
+    // POL-134 — remember which agent channel the live session rides (the newest admitted socket
+    // wins; overlapping reconnects converge on the surviving one within a heartbeat anyway).
+    if (channel) this.agentChannel.set(machineId, channel);
   }
 
   agentDisconnected(machineId: string): void {
     const n = (this.agentConns.get(machineId) ?? 0) - 1;
-    if (n <= 0) this.agentConns.delete(machineId);
-    else this.agentConns.set(machineId, n);
+    if (n <= 0) {
+      this.agentConns.delete(machineId);
+      // POL-104 — the box is gone, and so is the address it was dialling from.
+      this.addresses.delete(machineId);
+      this.agentChannel.delete(machineId);
+    } else this.agentConns.set(machineId, n);
   }
 
   isMachineOnline(machineId: string): boolean {
     return (this.agentConns.get(machineId) ?? 0) > 0;
+  }
+
+  /** POL-134 — the channel of the machine's live agent session (undefined while offline). */
+  machineChannel(machineId: string): "plain" | "mtls" | undefined {
+    return this.isMachineOnline(machineId) ? this.agentChannel.get(machineId) : undefined;
   }
 
   setScreenObservedRevision(screenId: string, revision: number): void {
@@ -110,6 +151,43 @@ export class Presence {
 
   isScreenInspecting(screenId: string): boolean {
     return this.inspecting.has(screenId);
+  }
+
+  /** POL-119 — record whether a cast session is live on a screen, per the agent's status report
+   *  (window presence on the box — never the operator's click — is the truth). Returns true when the
+   *  value CHANGED, so the caller broadcasts only on real edges, not every heartbeat. */
+  setScreenCasting(screenId: string, active: boolean): boolean {
+    const was = this.casting.has(screenId);
+    if (active) this.casting.add(screenId);
+    else this.casting.delete(screenId);
+    return was !== active;
+  }
+
+  isScreenCasting(screenId: string): boolean {
+    return this.casting.has(screenId);
+  }
+
+  /** POL-136 — record (or clear, with null) the PIN a sender must type to pair with this screen's
+   *  receiver, per the agent's level report. Returns true when the value CHANGED, so the caller
+   *  pushes the player overlay / feed line only on real edges, not every heartbeat. */
+  setScreenCastPin(screenId: string, pin: string | null, nowMs: number = Date.now()): boolean {
+    const was = this.screenCastPin(screenId, nowMs); // TTL-aware: an expired pin reads as null
+    if (pin === null) this.castPins.delete(screenId);
+    else this.castPins.set(screenId, { pin, at: nowMs });
+    return was !== pin;
+  }
+
+  /** The PIN currently pairing against this screen, or null — replayed to a player that (re)connects
+   *  mid-pairing, right after its first render. Expired entries read as null (and are dropped): a
+   *  PIN nobody refreshed for 2 minutes describes a pairing that no longer exists. */
+  screenCastPin(screenId: string, nowMs: number = Date.now()): string | null {
+    const held = this.castPins.get(screenId);
+    if (!held) return null;
+    if (nowMs - held.at > Presence.CAST_PIN_TTL_MS) {
+      this.castPins.delete(screenId);
+      return null;
+    }
+    return held.pin;
   }
 
   /**
@@ -159,7 +237,63 @@ export class Presence {
     for (const id of screenIds) {
       this.inspecting.delete(id);
       this.inspectErrors.delete(id);
+      // POL-119 — a dropped machine's receiver windows are gone with it; no session survives.
+      this.casting.delete(id);
+      // POL-136 — and neither does an in-flight pairing (its receiver died with the box).
+      this.castPins.delete(id);
     }
+  }
+
+  // ── Host vitals (POL-92) ───────────────────────────────────────────────────
+
+  /** Record one heartbeat's arrival, with or without vitals (an old agent proves liveness too). */
+  noteHeartbeat(machineId: string, vitals?: MachineVitals): void {
+    this.lastHeartbeat.set(machineId, Date.now());
+    if (!vitals) return;
+    const ring = this.vitals.get(machineId) ?? [];
+    ring.push(vitals);
+    if (ring.length > Presence.VITALS_RING) ring.splice(0, ring.length - Presence.VITALS_RING);
+    this.vitals.set(machineId, ring);
+  }
+
+  /** The newest sample, or undefined when this box has never reported any. */
+  machineVitals(machineId: string): MachineVitals | undefined {
+    const ring = this.vitals.get(machineId);
+    return ring && ring.length > 0 ? ring[ring.length - 1] : undefined;
+  }
+
+  /** The whole ring, oldest first (a few minutes of history). */
+  machineVitalsSeries(machineId: string): readonly MachineVitals[] {
+    return this.vitals.get(machineId) ?? [];
+  }
+
+  /** Ms epoch of the last heartbeat from this machine, or undefined if we've had none this boot. */
+  machineLastHeartbeat(machineId: string): number | undefined {
+    return this.lastHeartbeat.get(machineId);
+  }
+
+  // ── Peer address (POL-104) ─────────────────────────────────────────────────
+
+  /** The address the agent's socket is coming from, recorded on hello. LIVE-ONLY, exactly like the
+   *  rest of Presence: an IP is a fact about a connection, and a connection that is gone has none —
+   *  persisting it would leave an offline card asserting an address that may now belong elsewhere. */
+  noteMachineAddress(machineId: string, address: string): void {
+    // Normalize the IPv4-mapped IPv6 form node hands us for a plain v4 peer (`::ffff:10.0.0.7`).
+    this.addresses.set(machineId, address.replace(/^::ffff:/, ""));
+  }
+
+  machineAddress(machineId: string): string | undefined {
+    return this.addresses.get(machineId);
+  }
+
+  /** A machine was REMOVED (POL-14) — drop everything we hold about it, so an id that is reused
+   *  never inherits a dead box's vitals. */
+  forgetMachine(machineId: string): void {
+    this.vitals.delete(machineId);
+    this.lastHeartbeat.delete(machineId);
+    this.rebootingSince.delete(machineId);
+    this.agentConns.delete(machineId);
+    this.addresses.delete(machineId);
   }
 }
 
@@ -176,8 +310,14 @@ export function buildAdminState(
   /** POL-94 — live per-source health from the players' probes. Optional so the older call sites (and
    *  tests) that only care about machines keep working; absent = every source reads "unknown". */
   health?: SourceHealthTracker,
+  /** POL-104 — the enrolment policy, so a machine's card can say which token it came in on and whether
+   *  that token has since been revoked. Optional: unit tests that build a view need no policy. */
+  enrollment?: { list(): { id: string; revokedAt: string | null }[] },
 ): ServerToAdminMessage {
   const screens = control.getScreens();
+  const revokedTokenIds = new Set(
+    (enrollment?.list() ?? []).filter((t) => t.revokedAt !== null).map((t) => t.id),
+  );
 
   const machines: MachineView[] = control.getMachines().map((machine) => {
     const machineScreens: ScreenView[] = screens
@@ -195,6 +335,8 @@ export function buildAdminState(
           content: control.screenContentSummary(s.id),
           inspecting: presence.isScreenInspecting(s.id),
           inspectError: presence.screenInspectError(s.id),
+          castEnabled: s.castEnabled, // POL-119 — the persistent operator toggle
+          castActive: presence.isScreenCasting(s.id), // POL-119 — a session is live NOW
         } satisfies ScreenView;
       });
 
@@ -212,6 +354,31 @@ export function buildAdminState(
       shellEnabled: machine.shellEnabled ?? false,
       rebooting: presence.isMachineRebooting(machine.id),
       shellArmedAt: machine.shellArmedAt,
+      // POL-92 — the latest host-vitals sample, but ONLY while the box is online. A CPU reading from
+      // a machine that has since gone dark is not health data, it is an epitaph; the console says
+      // "System stats unavailable while offline" instead of drawing a stale meter.
+      vitals: presence.isMachineOnline(machine.id) ? presence.machineVitals(machine.id) : undefined,
+      // POL-104 — what the box IS. Persisted (so a PENDING card is informative even between boots)
+      // and shown on the card an operator has to make a decision about: 50 identical UUIDs was the
+      // whole reason mass commissioning was 50 blind approvals.
+      hardware: machine.hardware,
+      // Live-only: an IP describes a connection, so an offline box has none.
+      ip: presence.isMachineOnline(machine.id) ? presence.machineAddress(machine.id) : undefined,
+      enrolledVia: machine.enrolledTokenId
+        ? {
+            tokenId: machine.enrolledTokenId,
+            name: machine.enrolledTokenName ?? machine.enrolledTokenId,
+            // Revoked ≠ dead: this box holds a durable per-machine credential and keeps running. The
+            // chip is provenance ("came in on a stick we have since cut"), not a status.
+            revoked: revokedTokenIds.has(machine.enrolledTokenId),
+          }
+        : undefined,
+      preRegistered: machine.preRegistered ?? false,
+      // POL-134 — the agent channel of the live session + persisted cert state, for the Settings
+      // card and the Machines view ("is this box actually on mTLS?").
+      agentChannel: presence.machineChannel(machine.id),
+      mtlsCertIssuedAt: machine.mtlsCertIssuedAt,
+      mtlsSeenAt: machine.mtlsSeenAt,
       screens: machineScreens,
     } satisfies MachineView;
   });
@@ -250,6 +417,8 @@ interface BroadcasterDeps {
   /** POL-94 — per-source content health, as reported by the players' probes. */
   health?: SourceHealthTracker;
   log: FastifyBaseLogger;
+  /** POL-104 — the live enrolment policy (which token a machine came in on, and whether it is revoked). */
+  enrollment?: { list(): { id: string; revokedAt: string | null }[] };
 }
 
 /**
@@ -270,6 +439,7 @@ export class AdminBroadcaster {
       this.deps.presence,
       this.deps.activity,
       this.deps.health,
+      this.deps.enrollment,
     );
   }
 

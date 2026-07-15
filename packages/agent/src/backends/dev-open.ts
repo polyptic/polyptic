@@ -86,4 +86,19 @@ export class DevOpenBackend implements DisplayBackend {
     // No screenshot facility without a compositor (grim/grim-equivalent lands in Phase 5).
     return null;
   }
+
+  /** POL-119 — no compositor, no receiver window to place: refuse to enable (the console shows the
+   *  reason); disabling (`null`) is always a safe no-op. */
+  async setCast(connector: string, spec: { name: string } | null): Promise<void> {
+    if (spec === null) return;
+    throw new Error(`the dev-open backend cannot run a cast receiver on ${connector}`);
+  }
+
+  onCastSession(): void {
+    // Never fires: no receiver can run here.
+  }
+
+  onCastPin(): void {
+    // Never fires: no receiver can run here (POL-136).
+  }
 }

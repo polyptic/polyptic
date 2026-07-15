@@ -18,8 +18,11 @@ import type {
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
+  HostIdentity,
+  OperatorRole,
   Output,
   PlaylistItem,
+  PreRegistration,
   Scene,
   Surface,
 } from "@polyptic/protocol";
@@ -44,6 +47,21 @@ export interface PersistedMachine {
   shellEnabled?: boolean;
   /** POL-59 — ISO time the shell was armed / last used, for the auto-disarm TTL sweep. */
   shellArmedAt?: string;
+  /** POL-104 — the box's physical identity as it last reported it (MACs / DMI serial / arch). Kept on
+   *  the ROW, not just in presence, so a pending card is informative while the box is offline. */
+  hardware?: HostIdentity;
+  /** POL-104 — the id of the enrolment token this machine FIRST enrolled on (which batch/stick it came
+   *  in on). Undefined on rows that pre-date POL-104, or in open mode. */
+  enrolledTokenId?: string;
+  /** POL-104 — the token's name at the moment of enrolment (survives the token's deletion). */
+  enrolledTokenName?: string;
+  /** POL-104 — this machine matched a pre-registration record. */
+  preRegistered?: boolean;
+  /** POL-134 — ISO time the server last signed this machine's CSR into an mTLS client cert. */
+  mtlsCertIssuedAt?: string;
+  /** POL-134 — ISO time this machine FIRST connected over the mTLS listener (proof it presents a
+   *  working cert). Undefined on legacy rows and on machines still on the plain channel. */
+  mtlsSeenAt?: string;
 }
 
 /** A screen row: the first-class, named entity, stable per (machineId, connector). */
@@ -52,6 +70,9 @@ export interface PersistedScreen {
   friendlyName: string;
   machineId: string;
   connector: string;
+  /** POL-119 — operator enabled casting (AirPlay receiver) on this screen. Persistent, no TTL.
+   *  Undefined on legacy rows → false. */
+  castEnabled?: boolean;
 }
 
 /** A screen's renderable content: its canvas + the surfaces currently placed on it. */
@@ -193,6 +214,12 @@ export interface PersistedUser {
   passwordHash: string;
   /** ISO-8601 creation timestamp. */
   createdAt: string;
+  /**
+   * POL-107 — what this account may do (`admin` | `operator` | `viewer`). A row written before
+   * POL-107 has no role column value; the Postgres migration back-fills `admin` (that single account
+   * WAS the admin) and every read normalizes an unknown/absent value to `admin` for the same reason.
+   */
+  role: OperatorRole;
 }
 
 /**
@@ -220,6 +247,50 @@ export type EnrollmentMode = "open" | "gated";
 export interface PersistedBootstrap {
   mode: EnrollmentMode;
   token: string | null;
+}
+
+/**
+ * POL-104 — one enrolment token. The pre-POL-104 single `bootstrap` row still exists and is still the
+ * seed: on the first boot after the upgrade the server LIFTS its token into this table as a `legacy`
+ * record (no expiry, no cap, `bake: true`), because every boot medium already flashed carries exactly
+ * that secret. The `bootstrap` row is kept in step with whichever token is currently `bake`, so a
+ * downgrade to a pre-POL-104 server still finds a working token where it expects one.
+ *
+ * The secret is stored RAW, not hashed — deliberately, and unlike the per-machine credentials next
+ * door. `GET /boot/grub.cfg` has to be able to BAKE it into a kernel cmdline, and `build-boot-medium.sh`
+ * lifts it back out of that menu; a hash cannot be baked into anything. (This is also true of the
+ * pre-POL-104 `bootstrap.token` it replaces — POL-104 does not lower the bar, but it does not raise it
+ * either, and that is the honest limit of this change.)
+ */
+export interface PersistedEnrollmentToken {
+  id: string;
+  name: string;
+  secret: string;
+  createdAt: string;
+  expiresAt?: string | null;
+  maxEnrollments?: number | null;
+  uses: number;
+  revokedAt?: string | null;
+  lastUsedAt?: string | null;
+  /** The token `/boot/grub.cfg` bakes. Exactly one row carries this. */
+  bake: boolean;
+  /** Lifted from the pre-POL-104 `bootstrap` row: the secret already in the field. */
+  legacy: boolean;
+}
+
+/** POL-104 — a box declared before it ever booted (see the protocol's `PreRegistration`). */
+export type PersistedPreRegistration = PreRegistration;
+
+/**
+ * POL-134 — the persisted agent-mTLS posture: whether the deployment has graduated to REQUIRING the
+ * mTLS channel for every live agent session. Written exactly once by the auto-promotion (when every
+ * known machine has been seen on the mTLS listener) or by a pinned `AGENT_MTLS_REQUIRE`; read on
+ * boot so a promotion survives restarts and never silently regresses.
+ */
+export interface PersistedAgentMtlsPosture {
+  required: boolean;
+  /** ISO-8601 time of the promotion (or the first boot that saw the pin). */
+  promotedAt?: string;
 }
 
 /**
@@ -279,6 +350,12 @@ export interface PersistedImageRollout {
   /** Server-local `HH:MM` the full rebuild fires at. */
   fullScheduleTime: string;
   urgent: boolean;
+  /** POL-121 — the FIRST-IMAGE LATCH: when the server auto-triggered the one-shot full build that
+   *  fills an empty depot on a fresh install. Written BEFORE the hook is spawned and never cleared,
+   *  so a crash-looping or rescheduled pod cannot launch a build storm: the very first server that
+   *  sees an empty depot claims it, everyone after reads the claim and stands down. Null on a
+   *  deployment that never needed one (an image was already in the depot). */
+  firstBuildAt: string | null;
   lastBuildStartedAt: string | null;
   lastBuildFinishedAt: string | null;
   lastBuildStatus: "running" | "success" | "failure" | null;
@@ -414,10 +491,18 @@ export interface Store {
   getUserById(id: string): Promise<PersistedUser | undefined>;
   /** How many users exist — drives "seed an admin on first boot if none exist". */
   countUsers(): Promise<number>;
-  /** Insert a new user row (id + email + argon2id hash + created_at). */
+  /** Insert a new user row (id + email + argon2id hash + created_at + role). */
   createUser(user: PersistedUser): Promise<void>;
   /** Replace a user's password hash (after verifying the current password). No-op if absent. */
   updateUserPassword(id: string, passwordHash: string): Promise<void>;
+  /** Every operator account, oldest first (POL-107 — Settings ▸ Operators). Hashes stay in the row. */
+  listUsers(): Promise<PersistedUser[]>;
+  /** Change an account's role (POL-107). No-op if absent. */
+  updateUserRole(id: string, role: OperatorRole): Promise<void>;
+  /** Delete an account and every session it holds (POL-107). No-op if absent. */
+  deleteUser(id: string): Promise<void>;
+  /** How many accounts hold `admin` — the last-admin guard reads this before a demote/delete. */
+  countAdmins(): Promise<number>;
 
   /** Insert a session row (its id is sha256(token); the raw token only ever lives in the cookie). */
   createSession(session: PersistedSession): Promise<void>;
@@ -436,11 +521,32 @@ export interface Store {
   /** Persist the enrollment bootstrap (single row). */
   setBootstrap(bootstrap: PersistedBootstrap): Promise<void>;
 
+  // ── Enrolment tokens + pre-registration (POL-104) ──────────────────────────
+  /** Every enrolment token, newest last. Empty on a deployment that has never been gated. */
+  listEnrollmentTokens(): Promise<PersistedEnrollmentToken[]>;
+  /** Insert-or-update one token row (create, revoke, bake-flag flip, use-count bump). */
+  upsertEnrollmentToken(token: PersistedEnrollmentToken): Promise<void>;
+  /** Forget a token entirely. Machines that enrolled on it are untouched (they hold credentials). */
+  deleteEnrollmentToken(id: string): Promise<void>;
+
+  /** Every pre-registration record, newest last. */
+  listPreRegistrations(): Promise<PersistedPreRegistration[]>;
+  /** Insert-or-update one pre-registration record. */
+  upsertPreRegistration(record: PersistedPreRegistration): Promise<void>;
+  /** Forget a pre-registration record. */
+  deletePreRegistration(id: string): Promise<void>;
+
   // ── mTLS agent CA (POL-25) ─────────────────────────────────────────────────
   /** The persisted agent CA (cert + key). Undefined until first generated. */
   getMtlsCa(): Promise<PersistedMtlsCa | undefined>;
   /** Persist the agent CA (single row, written once on first mTLS boot). */
   setMtlsCa(ca: PersistedMtlsCa): Promise<void>;
+
+  // ── Agent-mTLS posture (POL-134) ───────────────────────────────────────────
+  /** The persisted require-mTLS posture. Undefined until first promoted/pinned. */
+  getAgentMtlsPosture(): Promise<PersistedAgentMtlsPosture | undefined>;
+  /** Persist the require-mTLS posture (single row). */
+  setAgentMtlsPosture(posture: PersistedAgentMtlsPosture): Promise<void>;
 
   // ── Player-token secret (POL-54) ───────────────────────────────────────────
   /** The persisted HMAC secret behind the per-screen player tokens (hex). Undefined until the first

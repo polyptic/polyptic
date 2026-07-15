@@ -23,10 +23,11 @@
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
-import type { AuthUser } from "@polyptic/protocol";
+import type { AuthUser, Operator, OperatorRole } from "@polyptic/protocol";
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import type { EnrollmentMode, PersistedBootstrap, Store } from "./store/types";
+import { requiredRoleFor, roleAllows } from "./roles";
+import type { EnrollmentMode, PersistedBootstrap, PersistedUser, Store } from "./store/types";
 
 /** Make the resolved operator available to handlers after the auth gate runs. */
 declare module "fastify" {
@@ -64,6 +65,17 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
     // A malformed/unknown hash never authenticates.
     return false;
   }
+}
+
+/** The public (secret-free) identity of a stored account, as handed to the console + the gate. */
+function toAuthUser(user: PersistedUser): AuthUser {
+  return { id: user.id, email: user.email, role: user.role };
+}
+
+/** The admin-facing listing of an account. Deliberately built field-by-field: it must be impossible
+ *  to leak `passwordHash` by spreading the row. */
+function toOperator(user: PersistedUser): Operator {
+  return { id: user.id, email: user.email, role: user.role, createdAt: user.createdAt };
 }
 
 /** Normalize an email for storage + lookup: trim + lower-case (so logins are case-insensitive). */
@@ -208,6 +220,12 @@ export class AuthService {
    * Seed an admin user on first boot if no users exist. Uses POLYPTIC_ADMIN_EMAIL +
    * POLYPTIC_ADMIN_PASSWORD when both are set, otherwise a dev default with a LOUD "change me" warning.
    * Never logs the password.
+   *
+   * POL-107 — THE UPGRADE PATH. This is a first-boot seed only, and it stays that way: an EXISTING
+   * single-admin deployment already has its one row, so nothing is seeded, and the store's migration
+   * back-fills that row's role with `admin`. The configured `secrets.adminEmail`/`adminPassword`
+   * account therefore becomes the deployment's FIRST ADMIN — it keeps every capability it had, and
+   * can then invite operators/viewers. An upgrade is never a lockout.
    */
   async seedAdmin(env: NodeJS.ProcessEnv = process.env): Promise<void> {
     const existing = await this.store.countUsers();
@@ -225,6 +243,7 @@ export class AuthService {
       email,
       passwordHash,
       createdAt: new Date().toISOString(),
+      role: "admin",
     });
 
     if (usingDefaults) {
@@ -286,7 +305,7 @@ export class AuthService {
     this.fails.delete(ipKey); // successful login clears both counters
     this.fails.delete(emailKey);
     const token = await this.issueSession(user.id);
-    return { ok: true, user: { id: user.id, email: user.email }, token };
+    return { ok: true, user: toAuthUser(user), token };
   }
 
   /** Mint + persist a fresh session for a user, returning the raw token for the cookie. */
@@ -313,7 +332,10 @@ export class AuthService {
     }
     const user = await this.store.getUserById(session.userId);
     if (!user) return null;
-    return { id: user.id, email: user.email };
+    // The ROLE is read from the account on EVERY request, never cached in the session/cookie: an admin
+    // who demotes an operator to viewer takes effect on that operator's very next call, without
+    // waiting for a re-login (their live cookie keeps working, with less power).
+    return toAuthUser(user);
   }
 
   /** Revoke the session carried by a raw token (logout). No-op if the token is unknown. */
@@ -368,8 +390,18 @@ export class AuthService {
    * Fastify preHandler used by the global API gate. When auth is enabled it requires a valid session on
    * every `/api/v1/**` route except the public auth endpoints; otherwise it replies 401. Stashes the
    * resolved operator on `request.authUser`.
+   *
+   * POL-107 — AUTHORIZATION, not just authentication. Having a session is no longer enough: the
+   * resolved operator's ROLE must satisfy the route's minimum role ({@link requiredRoleFor}, deny by
+   * default), or the request is refused **403** — the honest code, since the caller IS authenticated,
+   * it simply may not do this. `path` is the caller-supplied, slash-collapsed path so the role check
+   * sees exactly what the router routed (the same duplicate-slash trap the 401 gate closed).
    */
-  requireAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+  requireAuth = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    path?: string,
+  ): Promise<void> => {
     if (!this.config.enabled) return;
     const user = await this.verifyRequest(request);
     if (!user) {
@@ -377,7 +409,86 @@ export class AuthService {
       return;
     }
     request.authUser = user;
+
+    const needed = requiredRoleFor(request.method, path ?? request.url.split("?")[0] ?? "");
+    if (needed && !roleAllows(user.role, needed)) {
+      this.log.warn(
+        { event: "auth.forbidden", userId: user.id, role: user.role, needed, method: request.method },
+        "refused an operator action — role too low",
+      );
+      await reply.code(403).send({ error: "forbidden", requiredRole: needed, role: user.role });
+      return;
+    }
   };
+
+  // ── Operator management (POL-107, admin-only; the routes enforce the role) ─────
+
+  /** Every operator account (no hashes). */
+  async listOperators(): Promise<Operator[]> {
+    return (await this.store.listUsers()).map(toOperator);
+  }
+
+  /**
+   * Create an operator account. Returns `"duplicate"` if the email is already taken (the ONE place
+   * enumeration is acceptable: the caller is an admin, and a silent overwrite would be worse).
+   */
+  async createOperator(
+    emailRaw: string,
+    password: string,
+    role: OperatorRole,
+  ): Promise<Operator | "duplicate"> {
+    const email = normalizeEmail(emailRaw);
+    if (await this.store.getUserByEmail(email)) return "duplicate";
+    const user: PersistedUser = {
+      id: `user_${randomUUID()}`,
+      email,
+      passwordHash: await hashPassword(password),
+      createdAt: new Date().toISOString(),
+      role,
+    };
+    await this.store.createUser(user);
+    return toOperator(user);
+  }
+
+  /**
+   * Change an operator's role and/or reset their password (admin action — no current-password check;
+   * that is the point of a reset). Refuses to demote the LAST admin (`"last-admin"`): a deployment
+   * with no admin can never be administered again, so the guard is a hard one, not a warning.
+   * A password reset revokes that operator's sessions — a reset must actually lock them out.
+   */
+  async updateOperator(
+    id: string,
+    patch: { role?: OperatorRole; password?: string },
+  ): Promise<Operator | "not-found" | "last-admin"> {
+    const user = await this.store.getUserById(id);
+    if (!user) return "not-found";
+
+    if (patch.role && patch.role !== user.role && user.role === "admin") {
+      if ((await this.store.countAdmins()) <= 1) return "last-admin";
+    }
+    if (patch.role && patch.role !== user.role) {
+      await this.store.updateUserRole(id, patch.role);
+    }
+    if (patch.password) {
+      await this.store.updateUserPassword(id, await hashPassword(patch.password));
+      await this.store.deleteSessionsForUser(id);
+    }
+    const updated = await this.store.getUserById(id);
+    return updated ? toOperator(updated) : "not-found";
+  }
+
+  /**
+   * Delete an operator account (and every session it holds). Refuses to remove the last admin, for
+   * the same reason as a demote. Deleting YOURSELF is refused by the route (an admin locking itself
+   * out of its own console is never what it meant).
+   */
+  async deleteOperator(id: string): Promise<"ok" | "not-found" | "last-admin"> {
+    const user = await this.store.getUserById(id);
+    if (!user) return "not-found";
+    if (user.role === "admin" && (await this.store.countAdmins()) <= 1) return "last-admin";
+    await this.store.deleteUser(id);
+    return "ok";
+  }
 
   // ── Login rate-limiter (in-memory, per-process) ───────────────────────────────
 

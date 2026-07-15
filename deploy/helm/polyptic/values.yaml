@@ -58,21 +58,45 @@ service:
 # to match server.Dockerfile (EXPOSE 8080) and the Service default.
 containerPort: 8080
 
-# ── mTLS agent identity (POL-25) ──────────────────────────────────────────────
-# A second, TLS-terminating listener for the /agent channel only: enrolment issues
+# ── mTLS agent identity (POL-25, ON BY DEFAULT since POL-134) ─────────────────
+# The agent channel carries the remote shell, DevTools, screenshots and window
+# placement — so it is mutually authenticated OUT OF THE BOX, with nothing to
+# configure. A second, TLS-terminating listener serves /agent: enrolment issues
 # each machine a durable client certificate (signed by the deployment's own CA,
 # persisted in the store) and a box without a valid cert is rejected in the TLS
-# HANDSHAKE, before any app code. The port is added to the Service — but it must
-# reach the pod as raw TCP (LoadBalancer / NodePort / TCP passthrough): an HTTP(S)
-# Ingress would terminate TLS itself and strip the client certificate. Requires a
-# server image on Bun ≥ 1.3 (the boot self-test refuses to serve mTLS otherwise).
+# HANDSHAKE, before any app code. New boxes still enrol over the plain channel
+# with their token (zero-click netboot survives): they receive a cert on that
+# first hello and reconnect over mTLS by themselves; an upgraded fleet migrates
+# the same way, box by box, narrated in the activity feed. Once every known
+# machine has been seen on the mTLS listener the server promotes itself to
+# REQUIRE mode (announced first in the feed): the plain channel then only enrols
+# + issues certs, never carries a session. Console ▸ Settings ▸ Agent security
+# shows the posture and each machine's cert state.
+#
+# The port is added to the Service — but it must reach the pod as raw TCP
+# (LoadBalancer / NodePort / TCP passthrough): an HTTP(S) Ingress would terminate
+# TLS itself and strip the client certificate. Requires a server image on
+# Bun ≥ 1.3 (the boot self-test refuses to serve mTLS otherwise).
 agentMtls:
-  enabled: false
+  # The escape hatch for debugging: false renders AGENT_MTLS=off — the agent
+  # channel then runs unauthenticated at the transport (app credentials still gate).
+  enabled: true
   # Container + Service port for the TLS agent listener (AGENT_MTLS_PORT).
   port: 8443
-  # Once the fleet holds certs, set true (AGENT_MTLS_REQUIRE): the plain /agent
-  # channel then only authenticates + issues certs and never admits a session.
-  require: false
+  # The require posture. "" (default) = self-managing: the server auto-promotes
+  # to require-mTLS once every known machine holds a working cert. true = pin
+  # required NOW (AGENT_MTLS_REQUIRE=1). false = pin it off — never auto-promote
+  # (AGENT_MTLS_REQUIRE=0), for fleets that must keep certless agents admitted.
+  # Two cases where the false pin is exactly what you want:
+  #   - dev/test tooling that dials the plain channel with fake agents: once a
+  #     real fleet fully migrates and the posture promotes, those fake agents
+  #     are answered-and-closed instead of admitted — pin false to keep them;
+  #   - rolling boxes back to a pre-mTLS agent image AFTER promotion: rebooted
+  #     (diskless) boxes come back certless and get no session until you pin
+  #     false or fix the image. Promotion is one-way on purpose — once required,
+  #     a failed mTLS listener at boot is FATAL rather than a silent fallback
+  #     to plaintext sessions.
+  require: ""
   # Optional full wss:// URL agents should dial (AGENT_MTLS_PUBLIC_URL) when the
   # mTLS listener is exposed somewhere other than "same host, this port" — e.g. a
   # dedicated LoadBalancer. Empty = agents reuse the host they already dial.
@@ -355,16 +379,20 @@ netboot:
   # Mount path of the depot volume; IMAGE_DIST_DIR/BOOT_DIST_DIR derive from it
   # (<depotDir>/image and <depotDir>/boot).
   depotDir: /var/lib/polyptic/depot
-  # Build the downloadable boot medium (polyptic-boot.img + signed loaders) onto
-  # the depot via a per-revision Job, so the console's bootloader download works
-  # from minute one. Needs an address to bake (imageUpdates.bakeBase or
-  # ingressRoute.bootHost) and a persistent depot; without either the Job is
-  # skipped. POL-69: the Job also bakes the CURRENT enrolment token (lifted from
-  # the server's /boot/grub.cfg at build time) and the local Wi-Fi payload from
-  # the depot, so the downloaded stick boots Wi-Fi-only screens on gated fleets
-  # — which makes the .img a credential there, and a token rotation wants a
-  # `helm upgrade` re-bake + re-flash of Wi-Fi sticks. Before the first image
-  # build it falls back to the LEAN wired-only medium, loudly.
+  # Build the downloadable boot medium (polyptic-boot.img + its manifest + the
+  # signed loaders) onto the depot via a per-revision Job, so the console's
+  # bootloader download works as soon as there is an image to bake into it.
+  # Needs an address to bake (imageUpdates.bakeBase or ingressRoute.bootHost)
+  # and a persistent depot; without either the Job is skipped. POL-69: the Job
+  # also bakes the CURRENT enrolment token (lifted from the server's
+  # /boot/grub.cfg at build time) and the local Wi-Fi payload from the depot, so
+  # the downloaded stick boots Wi-Fi-only screens on gated fleets — which makes
+  # the .img a credential there, and a token rotation wants a `helm upgrade`
+  # re-bake + re-flash of Wi-Fi sticks. POL-122: with no live image in the depot
+  # (a fresh install) the Job publishes NOTHING and says why — it never falls
+  # back to the LEAN wired-only medium, which is indistinguishable from the real
+  # one once downloaded and boots no Wi-Fi screen. Build the first image and the
+  # next `helm upgrade` (or the full rebuild itself) bakes the real medium.
   autoBuildMedium: true
   persistence:
     # Back the depot with a PVC. The live image is rebuilt nightly/weekly and
@@ -489,27 +517,83 @@ secrets:
   existingSecret: ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Database wiring.
-#   * postgresql.enabled=true  → deploy the Bitnami Postgres subchart; the chart
-#     derives DATABASE_URL from these credentials automatically.
-#   * postgresql.enabled=false → supply externalDatabase.url (or set
-#     secrets.existingSecret with a DATABASE_URL key, or config-level env override).
+# Database wiring (POL-123/D108) — BATTERIES INCLUDED.
+#
+#   * postgresql.enabled=true (the DEFAULT) → the chart deploys Postgres itself:
+#     a first-party StatefulSet + Service (templates/postgres.yaml), no subchart,
+#     no vendored tarball. DATABASE_URL is wired automatically; the operator sets
+#     nothing. `helm install polyptic …` is the whole deployment.
+#   * postgresql.enabled=false → bring your own: externalDatabase.url, or
+#     secrets.existingSecret carrying a DATABASE_URL key.
+#
+# These two are MUTUALLY EXCLUSIVE and the chart refuses to render both (and
+# refuses config.store=postgres with neither — that combination used to install
+# happily and crash-loop on `getaddrinfo ENOTFOUND`).
 # ─────────────────────────────────────────────────────────────────────────────
 postgresql:
-  enabled: false
+  enabled: true
+
+  image:
+    repository: postgres
+    # Track a MAJOR line, not `latest` — a major bump needs pg_upgrade, not a pod roll.
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+
   auth:
     username: polyptic
-    password: polyptic
     database: polyptic
-    # Optional: use an existing secret for the Postgres password.
+    # Password for the bundled database. Empty (the default) → the chart generates
+    # a random 32-char password on first install and PRESERVES it across upgrades
+    # (same lookup pattern as secrets.cookieSecret). There is deliberately no
+    # literal default: a chart that ships `password: polyptic` ships it to every
+    # install that forgets to override. Keep any explicit password URL-safe
+    # (alphanumeric) — it goes into a postgres:// connection string.
+    password: ""
+    # Bring your own Secret for the password instead (GitOps). It must exist
+    # before install and hold the key below; the chart never reads its contents.
     existingSecret: ""
-  # Bitnami chart sub-values pass through here (primary.persistence, etc.).
-  primary:
-    persistence:
-      enabled: true
-      size: 8Gi
+    existingSecretPasswordKey: POSTGRES_PASSWORD
+
+  service:
+    port: 5432
+
+  persistence:
+    # Back the data directory with a PersistentVolumeClaim. FALSE means the
+    # registry is wiped on every pod restart — dev only.
+    enabled: true
+    # ADOPTION (POL-123): point at a PVC you already have — e.g. the `polyptic-db`
+    # claim from the hand-rolled companion manifest this chart replaces — and the
+    # StatefulSet mounts it instead of creating its own. Your data comes with you.
+    # When empty, the StatefulSet's volumeClaimTemplate creates (and keeps, even
+    # across `helm uninstall`) a claim named data-<release>-db-0.
+    existingClaim: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 8Gi
+    # "" uses the cluster default StorageClass; "-" disables dynamic provisioning.
+    storageClass: ""
+
+  # Modest by default: the control plane's registry is a small OLTP database
+  # (screens, murals, scenes, content), not a warehouse.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  # The postgres image's entrypoint starts as root and drops to the `postgres`
+  # user itself (it must chown PGDATA first), so no runAsNonRoot here — unlike
+  # the server pod, which never needs root.
+  podSecurityContext: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 externalDatabase:
-  # Full Postgres connection string, used when postgresql.enabled=false.
+  # Full Postgres connection string for YOUR database. Requires
+  # postgresql.enabled=false — setting both is refused at template time.
   # e.g. postgres://user:pass@my-pg.rds.amazonaws.com:5432/polyptic
   url: ""

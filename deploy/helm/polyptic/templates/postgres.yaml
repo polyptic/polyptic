@@ -1,0 +1,186 @@
+{{- /*
+The BUNDLED database (POL-123/D108).
+
+Until now `postgresql.*` was a LIE: values.yaml advertised a bundled Postgres, Chart.yaml carried
+no such dependency, and no template rendered one — so `postgresql.enabled=true` deployed nothing
+and a fresh `helm install` with the default STORE=postgres crash-looped on
+`getaddrinfo ENOTFOUND` until the operator hand-applied a companion manifest nobody had documented.
+A self-hostable product whose chart cannot bring up its own database in one command is not
+self-hostable.
+
+So the chart now ships Postgres itself: a first-party StatefulSet + Service, no subchart, no
+vendored tarball. It is ON by default; `helm install polyptic … -f values.yaml` is the whole
+deployment.
+
+The pre-flight guard runs on EVERY render (this file is not gated), so an incoherent database
+posture fails at template time with a legible message instead of at 03:00 in a CrashLoopBackOff.
+*/ -}}
+{{- include "polyptic.validateDatabase" . -}}
+{{- if include "polyptic.postgresql.deployed" . }}
+{{- $name := include "polyptic.postgresql.fullname" . }}
+{{- $port := int .Values.postgresql.service.port }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: {{ $port }}
+      targetPort: postgres
+      protocol: TCP
+  selector:
+    {{- include "polyptic.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  # Single writer, like the control plane it serves. Postgres replication is a different product.
+  replicas: 1
+  serviceName: {{ $name }}
+  selector:
+    matchLabels:
+      {{- include "polyptic.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        {{- include "polyptic.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: database
+      {{- with .Values.postgresql.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ printf "%s:%s" .Values.postgresql.image.repository (.Values.postgresql.image.tag | toString) | quote }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.auth.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.auth.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "polyptic.postgresql.secretName" . }}
+                  key: {{ include "polyptic.postgresql.passwordKey" . }}
+            # PGDATA in a SUBDIRECTORY of the mount, never the mount root: a PV handed over with a
+            # lost+found (or any other stray entry) is not an empty directory, and initdb refuses
+            # to initialise into one.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: {{ $port }}
+              protocol: TCP
+          # pg_isready, not a TCP probe: the port is listening long before the database will answer
+          # a query (and again during crash recovery), and a server let through early just
+          # crash-loops against it.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - exec pg_isready -U {{ .Values.postgresql.auth.username | quote }} -d {{ .Values.postgresql.auth.database | quote }} -h 127.0.0.1 -p {{ $port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - exec pg_isready -U {{ .Values.postgresql.auth.username | quote }} -d {{ .Values.postgresql.auth.database | quote }} -h 127.0.0.1 -p {{ $port }}
+            # Generous: a big database replaying WAL after an unclean node reboot must not be
+            # killed halfway through recovery by its own liveness probe.
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          {{- with .Values.postgresql.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      {{- with .Values.postgresql.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or (not .Values.postgresql.persistence.enabled) .Values.postgresql.persistence.existingClaim }}
+      volumes:
+        - name: data
+          {{- if .Values.postgresql.persistence.existingClaim }}
+          # ADOPTION path: an operator who already has a `polyptic-db` PVC (the hand-rolled
+          # companion manifest this chart replaces) points at it here and keeps their data.
+          persistentVolumeClaim:
+            claimName: {{ .Values.postgresql.persistence.existingClaim }}
+          {{- else }}
+          # persistence disabled: the database is EPHEMERAL — every pod restart is a fresh, empty
+          # registry. Dev only.
+          emptyDir: {}
+          {{- end }}
+      {{- end }}
+  {{- if and .Values.postgresql.persistence.enabled (not .Values.postgresql.persistence.existingClaim) }}
+  # A volumeClaimTemplate, not a standalone PVC: the claim it creates (data-{{ $name }}-0) is owned
+  # by the StatefulSet, is NEVER deleted by Kubernetes or by `helm uninstall`, and is re-bound to
+  # the pod on every reschedule. The data outlives the release by default — deleting a wall's
+  # database should take an explicit `kubectl delete pvc`.
+  #
+  # STABLE LABELS ONLY (POL-127). `volumeClaimTemplates` is one of the IMMUTABLE fields of a
+  # StatefulSet spec, so anything rendered here that changes between chart versions makes the next
+  # `helm upgrade` a forbidden patch — permanently. `polyptic.labels` carries `helm.sh/chart` and
+  # `app.kubernetes.io/version`, which change on EVERY release, so it must never appear below this
+  # line. `polyptic.selectorLabels` (name + instance) is the stable set. The StatefulSet's own
+  # metadata and its pod `template` keep the full labels: both are mutable.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "polyptic.selectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: database
+      spec:
+        accessModes:
+          {{- toYaml .Values.postgresql.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size | quote }}
+        {{- if .Values.postgresql.persistence.storageClass }}
+        {{- if eq "-" .Values.postgresql.persistence.storageClass }}
+        storageClassName: ""
+        {{- else }}
+        storageClassName: {{ .Values.postgresql.persistence.storageClass | quote }}
+        {{- end }}
+        {{- end }}
+  {{- end }}
+{{- end }}

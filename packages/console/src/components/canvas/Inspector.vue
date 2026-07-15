@@ -26,8 +26,10 @@ import { ref, computed, watch, onUnmounted } from "vue";
 import { useConsoleStore } from "../../stores/console";
 import { useIdent } from "./useIdent";
 import { kindLabel } from "../../content";
+import { machineDisplayName } from "../../machine-name";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
+import Toggle from "../Toggle.vue";
 import ZoomControl from "./ZoomControl.vue";
 
 const store = useConsoleStore();
@@ -93,6 +95,35 @@ function zoomScreen(zoom: number) {
 function zoomWall(zoom: number) {
   const w = wall.value;
   if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
+}
+
+// ── playlist step zoom (POL-133) ────────────────────────────────────────────
+// A playlist's read-out carries its steps; a step with a `zoom` is a framed page and gets the same
+// −/value/+ control a directly-assigned page does — the operator asked for "zoom controls in
+// playlist pages, just like normal screens", so it must READ as the same feature. Steps without a
+// zoom (images, videos) are listed but inert, and a step needs a sourceId to be addressed at all.
+// The same step appearing twice shares one remembered value, so it's collapsed to one control.
+type ZoomableStep = { sourceId: string; name: string; kind: string; zoom: number };
+function zoomableSteps(content: { entries?: { sourceId?: string; name: string; kind: string; zoom?: number }[] } | null): ZoomableStep[] {
+  const out: ZoomableStep[] = [];
+  const seen = new Set<string>();
+  for (const entry of content?.entries ?? []) {
+    if (entry.sourceId === undefined || entry.zoom === undefined || seen.has(entry.sourceId)) continue;
+    seen.add(entry.sourceId);
+    out.push({ sourceId: entry.sourceId, name: entry.name, kind: entry.kind, zoom: entry.zoom });
+  }
+  return out;
+}
+const singleSteps = computed(() => zoomableSteps(singleContent.value));
+const wallSteps = computed(() => zoomableSteps(wallContent.value));
+
+function zoomScreenStep(sourceId: string, zoom: number) {
+  const s = single.value;
+  if (s) store.setScreenPlaylistZoom(s.id, sourceId, zoom);
+}
+function zoomWallStep(sourceId: string, zoom: number) {
+  const w = wall.value;
+  if (w && !wallPending.value) store.setWallPlaylistZoom(w.id, sourceId, zoom);
 }
 
 const wallSourcePick = ref("");
@@ -182,18 +213,39 @@ const statusLabel = computed(() => {
   const s = single.value;
   if (!s) return "";
   if (identingSingle.value) return "Identing…";
+  if (castingSingle.value) return "Casting now";
   return s.online ? "Connected" : "Unreachable";
 });
 const statusColor = computed(() => {
   const s = single.value;
   if (!s) return "var(--ok)";
+  if (castingSingle.value) return "var(--accent)";
   return s.online ? "var(--ok)" : "var(--bad)";
 });
+
+// ── casting (POL-119) — the persistent per-screen AirPlay-receiver toggle ──
+// `castEnabled` is desired state (optimistic via the store, reconciled by admin/state);
+// `castActive` is the agent's own report of a receiver window on the glass — never set here.
+const castEnabledSingle = computed(() => single.value?.castEnabled === true);
+const castingSingle = computed(
+  () => castEnabledSingle.value && single.value?.castActive === true,
+);
+const castStateText = computed(() => {
+  const s = single.value;
+  if (!s || !castEnabledSingle.value) return "Off — screen is not discoverable";
+  if (castingSingle.value) return "Casting now — a device is mirroring to this screen";
+  return `Discoverable as “${s.friendlyName}” — new devices enter the PIN shown on the screen`;
+});
+function toggleCast(enabled: boolean): void {
+  const s = single.value;
+  if (s) void store.setScreenCast(s.id, enabled);
+}
 const machineName = computed(() => {
   const s = single.value;
   if (!s) return "";
   const m = store.machineForScreen(s.id);
-  return m ? m.label : s.machineId;
+  // POL-117 — the operator's name, or an honest "Unnamed box · <tail>"; never a live-image hostname.
+  return m ? machineDisplayName(m) : s.machineId;
 });
 
 // ── dev-tools quick-launch (POL-85 — the ⋯ overflow in the single-screen header) ──
@@ -381,6 +433,21 @@ function selectOne(id: string) {
         />
       </template>
 
+      <!-- Playlist step zoom (POL-133): one control per framed step, applied across all panels. -->
+      <template v-if="wallSteps.length">
+        <div class="section-label gap-top">Step zoom</div>
+        <div v-for="step in wallSteps" :key="step.sourceId" class="step-zoom">
+          <div class="step-zoom-name" :title="step.name">{{ step.name }}</div>
+          <ZoomControl
+            :zoom="step.zoom"
+            :disabled="wallPending"
+            caption=""
+            @update="(z: number) => zoomWallStep(step.sourceId, z)"
+          />
+        </div>
+        <div class="hint">Remembered per step — the page zooms as one, across all panels.</div>
+      </template>
+
       <div class="panels-head">
         <span class="section-label flush">{{ wall.memberScreenIds.length }} panels</span>
         <span class="panels-res">{{ wallRes }}</span>
@@ -460,7 +527,25 @@ function selectOne(id: string) {
         {{ identingSingle ? "Flashing on wall…" : "Ident — flash on wall" }}
       </button>
 
-      <div class="section-label">Content</div>
+      <!-- Casting (POL-119): persistent AirPlay-receiver toggle + live session state. -->
+      <div class="section-label gap-top">Casting</div>
+      <div class="cast-card" :class="{ live: castingSingle }">
+        <svg class="cast-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5 17a9 9 0 0 1 14 0" opacity="0.35" />
+          <path d="M12 15l4.5 6h-9z" fill="currentColor" stroke="none" />
+        </svg>
+        <span class="cast-meta">
+          <span class="cast-title">Cast (AirPlay)</span>
+          <span class="cast-state">{{ castStateText }}</span>
+        </span>
+        <Toggle
+          :model-value="castEnabledSingle"
+          label="Cast to this screen"
+          @update:model-value="toggleCast"
+        />
+      </div>
+
+      <div class="section-label gap-top">Content</div>
       <div v-if="hasContent" class="content-card">
         <span class="thumb"></span>
         <span class="content-meta">
@@ -490,6 +575,20 @@ function selectOne(id: string) {
           caption="Remembered for this screen and this page."
           @update="zoomScreen"
         />
+      </template>
+
+      <!-- Playlist step zoom (POL-133): one control per framed step of the rotation. -->
+      <template v-if="singleSteps.length">
+        <div class="section-label gap-top">Step zoom</div>
+        <div v-for="step in singleSteps" :key="step.sourceId" class="step-zoom">
+          <div class="step-zoom-name" :title="step.name">{{ step.name }}</div>
+          <ZoomControl
+            :zoom="step.zoom"
+            caption=""
+            @update="(z: number) => zoomScreenStep(step.sourceId, z)"
+          />
+        </div>
+        <div class="hint">Remembered per step, for this screen — applies live when the step is showing.</div>
       </template>
 
       <div class="section-label gap-top">Layout</div>
@@ -780,6 +879,48 @@ function selectOne(id: string) {
   padding: 2px 7px;
 }
 
+/* casting (POL-119) — receiver toggle + live session state */
+.cast-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+}
+.cast-card.live {
+  border-color: var(--accent-line);
+}
+.cast-glyph {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  color: var(--muted);
+}
+.cast-card.live .cast-glyph {
+  color: var(--accent-fg);
+}
+.cast-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.cast-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.cast-state {
+  font-size: 11px;
+  color: var(--muted2);
+  line-height: 1.35;
+}
+.cast-card.live .cast-state {
+  color: var(--accent-fg);
+}
+
 .ident-btn {
   display: flex;
   align-items: center;
@@ -897,6 +1038,20 @@ function selectOne(id: string) {
   font-size: 11px;
   color: var(--muted2);
   line-height: 1.55;
+}
+
+/* Playlist step zoom (POL-133): one row per framed step — name over the same −/value/+ control. */
+.step-zoom {
+  margin-top: 8px;
+}
+.step-zoom-name {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fg2);
+  margin-bottom: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .layout-grid {
