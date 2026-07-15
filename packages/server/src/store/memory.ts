@@ -15,6 +15,7 @@ import type {
   PersistedDisplaySettings,
   PersistedImageRollout,
   PersistedMachine,
+  PersistedAgentMtlsPosture,
   PersistedMtlsCa,
   PersistedServerTls,
   PersistedMural,
@@ -64,6 +65,8 @@ export class MemoryStore implements Store {
   private bootstrap: PersistedBootstrap | undefined;
   /** The mTLS agent CA (POL-25), generated on the first boot with AGENT_MTLS_PORT set. */
   private mtlsCa: PersistedMtlsCa | undefined;
+  /** The require-mTLS posture (POL-134), written by auto-promotion or a pinned env. */
+  private agentMtlsPosture: PersistedAgentMtlsPosture | undefined;
   /** The player-token HMAC secret (POL-54), generated on first boot. */
   private playerTokenSecret: string | undefined;
   /** Fleet-wide display settings (POL-6), undefined until first changed. */
@@ -356,6 +359,16 @@ export class MemoryStore implements Store {
 
   async setMtlsCa(ca: PersistedMtlsCa): Promise<void> {
     this.mtlsCa = clone(ca);
+  }
+
+  // ── Agent-mTLS posture (POL-134) ─────────────────────────────────────────────
+
+  async getAgentMtlsPosture(): Promise<PersistedAgentMtlsPosture | undefined> {
+    return this.agentMtlsPosture ? clone(this.agentMtlsPosture) : undefined;
+  }
+
+  async setAgentMtlsPosture(posture: PersistedAgentMtlsPosture): Promise<void> {
+    this.agentMtlsPosture = clone(posture);
   }
 
   // ── Player-token secret (POL-54) ─────────────────────────────────────────────

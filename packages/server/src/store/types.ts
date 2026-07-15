@@ -45,6 +45,11 @@ export interface PersistedMachine {
   shellEnabled?: boolean;
   /** POL-59 — ISO time the shell was armed / last used, for the auto-disarm TTL sweep. */
   shellArmedAt?: string;
+  /** POL-134 — ISO time the server last signed this machine's CSR into an mTLS client cert. */
+  mtlsCertIssuedAt?: string;
+  /** POL-134 — ISO time this machine FIRST connected over the mTLS listener (proof it presents a
+   *  working cert). Undefined on legacy rows and on machines still on the plain channel. */
+  mtlsSeenAt?: string;
 }
 
 /** A screen row: the first-class, named entity, stable per (machineId, connector). */
@@ -230,6 +235,18 @@ export type EnrollmentMode = "open" | "gated";
 export interface PersistedBootstrap {
   mode: EnrollmentMode;
   token: string | null;
+}
+
+/**
+ * POL-134 — the persisted agent-mTLS posture: whether the deployment has graduated to REQUIRING the
+ * mTLS channel for every live agent session. Written exactly once by the auto-promotion (when every
+ * known machine has been seen on the mTLS listener) or by a pinned `AGENT_MTLS_REQUIRE`; read on
+ * boot so a promotion survives restarts and never silently regresses.
+ */
+export interface PersistedAgentMtlsPosture {
+  required: boolean;
+  /** ISO-8601 time of the promotion (or the first boot that saw the pin). */
+  promotedAt?: string;
 }
 
 /**
@@ -465,6 +482,12 @@ export interface Store {
   getMtlsCa(): Promise<PersistedMtlsCa | undefined>;
   /** Persist the agent CA (single row, written once on first mTLS boot). */
   setMtlsCa(ca: PersistedMtlsCa): Promise<void>;
+
+  // ── Agent-mTLS posture (POL-134) ───────────────────────────────────────────
+  /** The persisted require-mTLS posture. Undefined until first promoted/pinned. */
+  getAgentMtlsPosture(): Promise<PersistedAgentMtlsPosture | undefined>;
+  /** Persist the require-mTLS posture (single row). */
+  setAgentMtlsPosture(posture: PersistedAgentMtlsPosture): Promise<void>;
 
   // ── Player-token secret (POL-54) ───────────────────────────────────────────
   /** The persisted HMAC secret behind the per-screen player tokens (hex). Undefined until the first

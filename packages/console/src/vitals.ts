@@ -128,6 +128,98 @@ export function totalBrowserRss(vitals: MachineVitals | undefined): number | und
   return readings.length > 0 ? readings.reduce((sum, n) => sum + n, 0) : undefined;
 }
 
+// ── The vitals band's view-model (POL-137) ──────────────────────────────────
+//
+// The redesigned strip is a two-row band: labelled progress bars (CPU · MEMORY · DISK) over a
+// facts row (uptime, load, temperature, browser memory — each with a small icon — and the running
+// image id right-aligned in mono). Both rows are built HERE, as data, so the omitted-field
+// discipline (D112) is a pure function with tests: a vital the box didn't report simply isn't in
+// the array — no zeroed bar, no empty icon slot, and a row with nothing in it never renders.
+
+export type Meter = {
+  key: "cpu" | "memory" | "disk";
+  label: string;
+  percent: number;
+  tooltip: string;
+};
+
+/**
+ * The bar row: only the meters the box actually reported. A pre-POL-92 agent yields [], a box that
+ * knows its CPU but not its disk yields two bars — the row reflows, it never draws a dead track.
+ */
+export function metersFor(vitals: MachineVitals | undefined): Meter[] {
+  if (!vitals) return [];
+  const all: (Meter | undefined)[] = [
+    vitals.cpuPercent === undefined
+      ? undefined
+      : { key: "cpu", label: "CPU", percent: vitals.cpuPercent, tooltip: cpuTooltip(vitals) },
+    vitals.memPercent === undefined
+      ? undefined
+      : {
+          key: "memory",
+          label: "MEMORY",
+          percent: vitals.memPercent,
+          tooltip: memoryTooltip(vitals),
+        },
+    vitals.diskPercent === undefined
+      ? undefined
+      : { key: "disk", label: "DISK", percent: vitals.diskPercent, tooltip: diskTooltip(vitals) },
+  ];
+  return all.filter((m): m is Meter => m !== undefined);
+}
+
+/** One entry in the facts row. `icon` names a glyph the component owns; text is the fact itself. */
+export type Fact = {
+  key: string;
+  icon: "clock" | "gauge" | "thermometer" | "browser";
+  text: string;
+  title?: string;
+};
+
+/**
+ * The facts row's left-hand group, in the design's order: uptime · load · temperature · browser
+ * memory. Only what the heartbeat carried — and the list is the extension point: a new vital joins
+ * the row by pushing another entry here (the layout flex-wraps; nothing else moves).
+ */
+export function factsFor(vitals: MachineVitals | undefined): Fact[] {
+  const v = vitals;
+  if (!v) return [];
+  const facts: Fact[] = [];
+  if (v.uptimeSec !== undefined) {
+    facts.push({ key: "up", icon: "clock", text: `up ${formatUptime(v.uptimeSec)}` });
+  }
+  const load1 = v.loadavg?.[0];
+  if (v.loadavg && load1 !== undefined) {
+    facts.push({
+      key: "load",
+      icon: "gauge",
+      text: `load ${load1.toFixed(2)}`,
+      title: `1/5/15 min load: ${v.loadavg.map((n) => n.toFixed(2)).join(", ")}`,
+    });
+  }
+  if (v.tempC !== undefined) {
+    facts.push({
+      key: "temp",
+      icon: "thermometer",
+      text: `${Math.round(v.tempC)}°C`,
+      title: "Hottest thermal zone",
+    });
+  }
+  const rss = totalBrowserRss(v);
+  if (rss !== undefined) {
+    facts.push({
+      key: "rss",
+      icon: "browser",
+      text: `browser ${formatBytes(rss)}`,
+      title: (v.browsers ?? [])
+        .filter((b) => b.rssBytes !== undefined)
+        .map((b) => `${b.connector}: ${formatBytes(b.rssBytes)}`)
+        .join(" · "),
+    });
+  }
+  return facts;
+}
+
 /** How stale is this sample? (The strip greys out if a box stops sampling but stays connected.) */
 export function sampleAgeSeconds(vitals: MachineVitals | undefined, now: number): number | null {
   if (!vitals?.at) return null;

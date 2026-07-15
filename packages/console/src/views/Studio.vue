@@ -30,9 +30,11 @@ import type {
   PageElement,
   PageElementKind,
 } from "@polyptic/protocol";
+import { qrContrastIssue } from "@polyptic/protocol";
 import { ELEMENT_LIBRARY, PageElementView, defaultElement, libraryEntry } from "@polyptic/elements";
 import { useConsoleStore } from "../stores/console";
 import { kindLabel } from "../content";
+import { canZoomIn, canZoomOut, zoomIn, zoomLabel, zoomOut } from "../zoom";
 
 const store = useConsoleStore();
 const route = useRoute();
@@ -472,7 +474,7 @@ function setProp(key: string, value: unknown) {
 interface PropSpec {
   key: string;
   label?: string;
-  control: "text" | "select" | "range" | "color" | "toggle" | "note";
+  control: "text" | "select" | "range" | "color" | "toggle" | "note" | "zoom" | "warn";
   value?: unknown;
   valueLabel?: string;
   options?: { v: string; t: string }[];
@@ -522,11 +524,22 @@ const propSpecs = computed<PropSpec[]>(() => {
     valueLabel: p[key] ? "On" : "Off",
   });
   const note = (n: string): PropSpec => ({ key: "note", control: "note", note: n });
+  // POL-133 — the browser-style −/value/+ page-zoom control (the same ladder as the screens
+  // Inspector, so it reads as the same feature). Authoring-time: part of the composition.
+  const zoom = (label: string, key: string): PropSpec => ({
+    key,
+    label,
+    control: "zoom",
+    value: typeof p[key] === "number" ? p[key] : 1,
+    numeric: true,
+  });
+  const warn = (n: string): PropSpec => ({ key: "warn", control: "warn", note: n });
 
   switch (el.kind) {
     case "embed":
       return [
         select("Content source", "sourceId", embeddableSourceOptions.value),
+        zoom("Page zoom", "zoom"),
         note(
           "The player fetches this source with stamped credentials — the page never carries secrets. Sources that refuse framing can't go on a page.",
         ),
@@ -535,6 +548,7 @@ const propSpecs = computed<PropSpec[]>(() => {
       return [
         text("Feed URL", "url"),
         range("Items shown", "items", 2, 8, ""),
+        range("Font size", "fontScale", 50, 200, "%"),
         note("Polled server-side every ~5 min; last-good items are served if the feed is down."),
       ];
     case "ticker":
@@ -584,8 +598,18 @@ const propSpecs = computed<PropSpec[]>(() => {
         ]),
         note("Fetched server-side from Open-Meteo (keyless), cached ~15 min."),
       ];
-    case "qr":
-      return [text("Link", "url"), note("Encoded to SVG on the client — static, no network.")];
+    case "qr": {
+      // POL-133 — colour pair scannability, judged as the operator edits: a hard fail here is the
+      // same check the contract refuses at save time, so the warning is never a surprise 400.
+      const issue = qrContrastIssue(String(p.fg ?? "#09090b"), String(p.bg ?? "#ffffff"));
+      return [
+        text("Link", "url"),
+        color("Modules", "fg"),
+        color("Background", "bg"),
+        ...(issue ? [warn(issue.level === "refuse" ? `${issue.message}. Saving is refused until the colours are fixed.` : issue.message)] : []),
+        note("Encoded to SVG on the client — static, no network."),
+      ];
+    }
     case "countdown":
       return [text("Label", "label"), text("Target (HH:MM)", "target"), color("Colour", "color")];
   }
@@ -889,7 +913,42 @@ function badgeText(el: PageElement): string {
                   :style="{ background: c }"
                   @click="setProp(spec.key, c)"
                 ></button>
+                <!-- Any colour (POL-133): brand walls want more than six swatches. -->
+                <input
+                  type="color"
+                  class="swatch swatch-pick"
+                  :value="/^#[0-9a-fA-F]{6}$/.test(String(spec.value ?? '')) ? String(spec.value) : '#888888'"
+                  title="Custom colour"
+                  @input="setProp(spec.key, ($event.target as HTMLInputElement).value)"
+                />
               </div>
+              <div v-else-if="spec.control === 'zoom'" class="zoom-ctl">
+                <button
+                  class="zoom-step"
+                  :disabled="!canZoomOut(Number(spec.value))"
+                  title="Zoom out"
+                  @click="setProp(spec.key, zoomOut(Number(spec.value)))"
+                >
+                  −
+                </button>
+                <button
+                  class="zoom-val"
+                  :disabled="Number(spec.value) === 1"
+                  :title="Number(spec.value) === 1 ? 'Already at 100%' : 'Reset to 100%'"
+                  @click="setProp(spec.key, 1)"
+                >
+                  {{ zoomLabel(Number(spec.value)) }}
+                </button>
+                <button
+                  class="zoom-step"
+                  :disabled="!canZoomIn(Number(spec.value))"
+                  title="Zoom in"
+                  @click="setProp(spec.key, zoomIn(Number(spec.value)))"
+                >
+                  +
+                </button>
+              </div>
+              <div v-else-if="spec.control === 'warn'" class="prop-warn">⚠ {{ spec.note }}</div>
               <button
                 v-else-if="spec.control === 'toggle'"
                 class="toggle"
@@ -1500,6 +1559,79 @@ function badgeText(el: PageElement): string {
   background: var(--muted-bg);
   border-radius: 8px;
   padding: 9px 11px;
+}
+
+/* POL-133: a LOUD authoring-time warning (QR scannability) — must not read like the quiet notes. */
+.prop-warn {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--bad);
+  line-height: 1.55;
+  background: var(--bad-soft);
+  border: 1px solid var(--scr-bad-line);
+  border-radius: 8px;
+  padding: 9px 11px;
+}
+
+/* POL-133: the −/value/+ page-zoom control, visually matching the screens Inspector's ZoomControl. */
+.zoom-ctl {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.zoom-step {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  font-family: inherit;
+}
+.zoom-step:not(:disabled):hover {
+  background: var(--muted-bg);
+}
+.zoom-step:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.zoom-val {
+  flex: 1;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--muted-bg);
+  color: var(--fg2);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  font-family: inherit;
+}
+.zoom-val:disabled {
+  cursor: default;
+}
+
+/* POL-133: the free colour picker at the end of a swatch row. */
+.swatch-pick {
+  appearance: none;
+  -webkit-appearance: none;
+  background: none;
+}
+.swatch-pick::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+.swatch-pick::-webkit-color-swatch {
+  border: none;
+  border-radius: 5px;
 }
 .geom-grid {
   display: grid;

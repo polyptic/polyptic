@@ -39,9 +39,12 @@ const nextUp = computed<PlaylistEntry | undefined>(() =>
   items.value.length > 1 ? items.value[(index.value + 1) % items.value.length] : undefined,
 );
 
-/** Span sizing of the playlist surface applies to every entry element (zoom does not — a playlist is
- *  not one page, POL-57 stays per-page content). */
-const entryStyle = computed<CSSProperties>(() => contentStyle(props.surface.span));
+/** Span sizing of the playlist surface applies to every entry element; a FRAMED entry additionally
+ *  composes its own per-step zoom (POL-133) — the same 1/zoom-layout-then-scale a directly-assigned
+ *  page gets (POL-57), so a dashboard reads the same whether it plays direct or in a rotation. */
+const entryStyle = computed<CSSProperties>(() =>
+  contentStyle(props.surface.span, current.value && isFrame(current.value) ? (current.value.zoom ?? 1) : 1),
+);
 
 function isFrame(entry: PlaylistEntry): boolean {
   return entry.kind === "web" || entry.kind === "dashboard";
@@ -154,6 +157,7 @@ onUnmounted(clearTimer);
     v-if="nextUp && isFrame(nextUp) && !(current && isFrame(current))"
     class="playlist-preload"
     :src="nextUp.url"
+    :style="contentStyle(surface.span, nextUp.zoom ?? 1)"
     aria-hidden="true"
     tabindex="-1"
   />
