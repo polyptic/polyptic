@@ -133,6 +133,28 @@ const showBadges = ref<boolean>(import.meta.env.DEV);
 // `friendlyName`; shown as a glyph in the status badge so someone at the glass can tell.
 const castEnabled = ref<boolean>(false);
 
+// POL-136 — the AirPlay pairing PIN to show fullscreen RIGHT NOW (null = no pairing). Server-pushed
+// (`server/cast-pin`) and server-cleared; the local timeout is a backstop so a lost clear frame or a
+// dead server can never strand a four-digit code on the wall. Matches the agent-side TTL.
+const castPin = ref<string | null>(null);
+const CAST_PIN_BACKSTOP_MS = 150_000;
+let castPinTimer: ReturnType<typeof setTimeout> | undefined;
+
+function setCastPin(pin: string | null): void {
+  if (castPinTimer !== undefined) {
+    clearTimeout(castPinTimer);
+    castPinTimer = undefined;
+  }
+  castPin.value = pin;
+  if (pin !== null) {
+    castPinTimer = setTimeout(() => {
+      castPin.value = null;
+      castPinTimer = undefined;
+      diag("cast PIN overlay cleared by local backstop timeout");
+    }, CAST_PIN_BACKSTOP_MS);
+  }
+}
+
 // Pre-first-render the revision is -1; show an em-dash until the first slice lands.
 const revLabel = computed(() => (revision.value < 0 ? "—" : String(revision.value)));
 
@@ -240,6 +262,13 @@ function handleMessage(msg: ServerToPlayerMessage): void {
     // POL-6 — fleet-wide display settings: show/hide the corner status badge on this screen live.
     showBadges.value = msg.settings.showBadges;
     persistSlice();
+  } else if (msg.t === "server/cast-pin") {
+    // POL-136 — someone is standing at this panel with a phone that is asking for this code: the
+    // receiver prints its pairing PIN to stdout only (it draws no window until mirroring starts),
+    // so THIS overlay is the only thing that puts the number on the glass. Ephemeral like ident —
+    // never persisted — with a local timeout backstop so a lost clear frame can't strand a code.
+    setCastPin(msg.pin);
+    diag(msg.pin === null ? "cast PIN overlay cleared" : "cast PIN overlay shown");
   } else {
     // server/ident-pulse → flash the friendly name so an operator can map physical panels.
     ident.value = msg.on ? { friendlyName: msg.friendlyName, color: msg.color } : null;
@@ -651,6 +680,17 @@ function connLabel(state: ConnState): string {
 
     <div v-if="ident" class="ident" :style="{ backgroundColor: ident.color }">
       <span class="ident-name">{{ ident.friendlyName }}</span>
+    </div>
+
+    <!-- POL-136 — the AirPlay pairing PIN, fullscreen and unmissable: at pairing time the receiver
+         draws nothing (its window only appears once mirroring starts), so this overlay is the only
+         way the person at the panel can read the code their phone is asking for. Static — no
+         animation at all (wall-chrome motion rules, D66). Above ident: a pairing in progress
+         outranks a mapping flash. -->
+    <div v-if="castPin" class="cast-pin">
+      <span class="cast-pin-title">Enter this code on your device</span>
+      <span class="cast-pin-code">{{ castPin }}</span>
+      <span class="cast-pin-hint">{{ screenName }} · Screen Mirroring</span>
     </div>
 
     <div v-if="showBadges" class="badge">

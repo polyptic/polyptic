@@ -162,6 +162,46 @@ body {
   }
 }
 
+/* POL-136 — AirPlay pairing PIN: fullscreen, opaque, enormous. Someone is standing at this panel
+   with a phone asking for this exact code, so it outranks everything (z above ident). Fully static
+   by design: the wall-chrome motion rules (D66) forbid animated opacity/transform/filter, and a
+   code being typed from across a room needs no motion — it needs size and contrast. */
+.cast-pin {
+  position: absolute;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2vh;
+  background: #0a0e14;
+  color: #f2f6fa;
+  text-align: center;
+}
+
+.cast-pin-title {
+  font-size: 3.4vw;
+  font-weight: 600;
+  color: #aab6c4;
+  letter-spacing: 0.01em;
+}
+
+.cast-pin-code {
+  font-size: 24vw;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+  color: #ffffff;
+}
+
+.cast-pin-hint {
+  font-size: 2.2vw;
+  font-weight: 500;
+  color: #6d7a89;
+}
+
 /* Dev-only corner badge — proves "instant" by showing live state + the current revision.
    No backdrop-filter, deliberately (POL-67): a blur sampling the surface BELOW must re-blur on
    every underlying iframe repaint — measured on fpd-ago as part of the player roughly DOUBLING a

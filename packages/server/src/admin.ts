@@ -69,8 +69,14 @@ export class Presence {
   /** screenIds whose panel currently shows the browser's Web Inspector (POL-50). */
   private readonly inspecting = new Set<string>();
   /** POL-119 — screenIds with a LIVE cast (AirPlay) session: the box's receiver owns a visible
-   *  window (mirror or PIN prompt). Level-set from `agent/status.screens[].casting`. */
+   *  window (the mirror). Level-set from `agent/status.screens[].casting`. */
   private readonly casting = new Set<string>();
+  /** POL-136 — screenId → the PIN a pairing sender must type RIGHT NOW (plus when we learned it),
+   *  per the agent's status report (the receiver prints it to stdout; the agent learns it there).
+   *  Live-only, like the rest of Presence — and TTL-guarded on read: the value exists to be
+   *  REPLAYED to late-connecting players, so a lost agent-side clear must not replay a stale code
+   *  over live mirrored content. The TTL mirrors the agent's own 120s pin backstop. */
+  private readonly castPins = new Map<string, { pin: string; at: number }>();
   /** screenId → why the box last refused to show it (POL-50). */
   private readonly inspectErrors = new Map<string, string>();
   /** machineId → when the box ACCEPTED an operator reboot (POL-68). Live-only; cleared when the
@@ -89,6 +95,9 @@ export class Presence {
 
   /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
   private static readonly REBOOTING_TTL_MS = 3 * 60_000;
+
+  /** POL-136 — how long a stored pairing PIN stays replayable; mirrors the agent's pin TTL. */
+  private static readonly CAST_PIN_TTL_MS = 120_000;
 
   /** Samples retained per machine — ~5 minutes at the agent's 10s heartbeat. Bounded on purpose:
    *  this is a fleet-sized in-memory structure, not a time-series database. */
@@ -153,6 +162,29 @@ export class Presence {
     return this.casting.has(screenId);
   }
 
+  /** POL-136 — record (or clear, with null) the PIN a sender must type to pair with this screen's
+   *  receiver, per the agent's level report. Returns true when the value CHANGED, so the caller
+   *  pushes the player overlay / feed line only on real edges, not every heartbeat. */
+  setScreenCastPin(screenId: string, pin: string | null, nowMs: number = Date.now()): boolean {
+    const was = this.screenCastPin(screenId, nowMs); // TTL-aware: an expired pin reads as null
+    if (pin === null) this.castPins.delete(screenId);
+    else this.castPins.set(screenId, { pin, at: nowMs });
+    return was !== pin;
+  }
+
+  /** The PIN currently pairing against this screen, or null — replayed to a player that (re)connects
+   *  mid-pairing, right after its first render. Expired entries read as null (and are dropped): a
+   *  PIN nobody refreshed for 2 minutes describes a pairing that no longer exists. */
+  screenCastPin(screenId: string, nowMs: number = Date.now()): string | null {
+    const held = this.castPins.get(screenId);
+    if (!held) return null;
+    if (nowMs - held.at > Presence.CAST_PIN_TTL_MS) {
+      this.castPins.delete(screenId);
+      return null;
+    }
+    return held.pin;
+  }
+
   /**
    * Record (or clear, with `null`) why the box refused to show its inspector. A refusal leaves
    * `inspecting` false — i.e. UNCHANGED — so this is the only thing that distinguishes "the wall said
@@ -202,6 +234,8 @@ export class Presence {
       this.inspectErrors.delete(id);
       // POL-119 — a dropped machine's receiver windows are gone with it; no session survives.
       this.casting.delete(id);
+      // POL-136 — and neither does an in-flight pairing (its receiver died with the box).
+      this.castPins.delete(id);
     }
   }
 
