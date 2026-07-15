@@ -398,6 +398,11 @@ export function buildAdminState(
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
+    // POL-89 — the scene scheduler. The console feeds these three into the SHARED resolver to paint
+    // its week strip, so "what plays when" cannot drift from what the server's ticker will do.
+    dayparts: control.getDayparts(),
+    schedules: control.getSchedules(),
+    scheduler: control.getSchedulerSettings(),
   });
 }
 

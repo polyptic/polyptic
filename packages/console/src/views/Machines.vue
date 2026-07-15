@@ -41,7 +41,7 @@
   board so the operator knows which physical panel they're approving.
 
   Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine /
-  setMachineTags / renameMachine / bulkAction, and via ScreenRow: identScreen / renameScreen /
+  setMachineTags / bulkAction / renameMachine, and via ScreenRow: identScreen / renameScreen /
   inspectScreen). No direct fetch.
 -->
 <script setup lang="ts">
@@ -799,10 +799,6 @@ function showToast(message: string): void {
                 </div>
               </div>
 
-              <!-- POL-92 — host vitals, live from the heartbeat (CPU/memory/disk, overload, and the
-                   software-render tell). Offline machines get the "unavailable" line instead. -->
-              <MachineStats :machine="m" />
-
               <!-- tags (POL-103): chips that double as a one-click filter into a selector -->
               <div v-if="m.tags.length" class="tags">
                 <button
@@ -815,6 +811,9 @@ function showToast(message: string): void {
                   {{ t }}
                 </button>
               </div>
+              <!-- POL-92 — host vitals, live from the heartbeat (CPU/memory/disk, overload, and the
+                   software-render tell). Offline machines get the "unavailable" line instead. -->
+              <MachineStats :machine="m" />
 
               <div v-if="m.screens.length" class="screens">
                 <ScreenRow

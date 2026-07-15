@@ -3,7 +3,7 @@
  *
  * A **Scene** is a named SNAPSHOT of a mural's whole wall — its LAYOUT (placements), GROUPING (video
  * walls) and CONTENT (per placed-non-walled screen + per wall) — that an operator re-applies in one
- * click (optionally with an illustrative schedule time that is stored but NOT fired). Content is
+ * click. (WHEN a scene plays is a `Schedule` — POL-89/D93 — proven by scheduler.e2e.test.ts.) Content is
  * captured as the ASSIGNMENT, so a library source resolves to its CURRENT url on apply:
  *   - a library source  → SceneContent {sourceId}
  *   - an ad-hoc link     → SceneContent {url}
@@ -27,7 +27,7 @@
  *            snapshot AND the affected players get a fresh `server/render` with the restored content
  *            (A,B → a SPAN surface at the source's url again; C → its single-screen surface, no span);
  *            DesiredState.activeSceneId becomes the applied scene;
- *   - PATCH  /api/v1/scenes/:id {name, scheduleAt}  stores both (surfaced in admin/state);
+ *   - PATCH  /api/v1/scenes/:id {name}  renames it (and a scene carries NO time of its own);
  *   - POST   /api/v1/scenes/:id/apply for an UNKNOWN scene → 404;
  *   - DELETE /api/v1/scenes/:id  removes it from admin/state.scenes.
  *
@@ -96,7 +96,6 @@ const MUT_C_URL = "https://example.com/mutation-c";
 
 const SCENE_NAME = "Opening";
 const SCENE_RENAME = "Morning Wall";
-const SCENE_SCHEDULE = "08:30";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -676,12 +675,9 @@ describe("phase 3d scenes (saved wall snapshots)", () => {
   );
 
   test(
-    "PATCH /scenes/:id sets name + scheduleAt (stored, surfaced in admin/state)",
+    "PATCH /scenes/:id renames the scene (and carries NO time of its own — POL-89)",
     async () => {
-      const res = await patchJson(`/api/v1/scenes/${sceneId}`, {
-        name: SCENE_RENAME,
-        scheduleAt: SCENE_SCHEDULE,
-      });
+      const res = await patchJson(`/api/v1/scenes/${sceneId}`, { name: SCENE_RENAME });
       expect(res.status).toBe(200);
       await drain(res);
 
@@ -689,8 +685,9 @@ describe("phase 3d scenes (saved wall snapshots)", () => {
       const scene = sceneById(state, sceneId);
       expect(scene).toBeDefined();
       expect(scene.name).toBe(SCENE_RENAME);
-      // Scheduling is ILLUSTRATIVE — stored, never fired — but it must be surfaced.
-      expect(scene.scheduleAt).toBe(SCENE_SCHEDULE);
+      // D24's illustrative `scheduleAt` is GONE (POL-89/D93): when a scene plays is a `Schedule`,
+      // resolved by the server's ticker — see scheduler.e2e.test.ts.
+      expect(scene.scheduleAt).toBeUndefined();
     },
     TEST_TIMEOUT,
   );

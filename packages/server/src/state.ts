@@ -26,19 +26,29 @@ import { randomUUID } from "node:crypto";
 import {
   ContentSource,
   DashboardSurface,
+  Daypart,
   ImageSurface,
   normalizeTag,
   PlaylistSurface,
   PageSurface,
   Scene,
+  Schedule,
+  SchedulerSettings,
   VideoSurface,
   VideoWall,
   WebSurface,
   Zoom,
+  isValidTimeZone,
   meaningfulHostname,
 } from "@polyptic/protocol";
 import type {
   ContentKind,
+  CreateDaypartBody,
+  CreateScheduleBody,
+  ScheduleSet,
+  UpdateDaypartBody,
+  UpdateScheduleBody,
+  UpdateSchedulerSettingsBody,
   CreateContentSourceBody,
   PlaylistEntry,
   PlaylistItem,
@@ -74,6 +84,7 @@ import type {
   PersistedCredentialProfile,
   PersistedMachine,
   PersistedScene,
+  PersistedSchedulerSettings,
   Store,
 } from "./store/types";
 import type { TokenService } from "./tokens";
@@ -97,6 +108,21 @@ const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
 
 /** POL-57 — an unzoomed page: 100%, the same scale a browser opens a tab at. */
 const DEFAULT_ZOOM = 1;
+
+/**
+ * POL-89 — the scheduler's defaults until the operator first touches Settings. The TIMEZONE defaults
+ * to the SERVER's own zone (a deployment has exactly one — a wall lives in one building) but is
+ * stored explicitly the moment anything is saved, so "what plays when" never silently depends on the
+ * host's `TZ` changing under it. `TZ`/the runtime's resolved zone is only ever the seed.
+ */
+export function defaultSchedulerSettings(): SchedulerSettings {
+  const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return {
+    enabled: true,
+    timezone: hostZone && isValidTimeZone(hostZone) ? hostZone : "UTC",
+    defaultSceneId: null,
+  };
+}
 
 /** The two surface kinds that frame a page, and so are the only ones that can be zoomed. */
 type FramedSurface = Extract<Surface, { type: "web" | "dashboard" }>;
@@ -341,6 +367,15 @@ export class ControlPlane {
   private readonly scenes = new Map<string, Scene>();
   private sceneCounter = 0;
 
+  /** POL-89 — the scene scheduler: the daypart library, the schedules bound to it, and the one
+   *  deployment-wide settings row. The server's ticker and the console's week strip both resolve
+   *  from exactly this set (it rides `admin/state`), so they can never disagree. */
+  private readonly dayparts = new Map<string, Daypart>();
+  private daypartCounter = 0;
+  private readonly schedules = new Map<string, Schedule>();
+  private scheduleCounter = 0;
+  private schedulerSettings: SchedulerSettings = defaultSchedulerSettings();
+
   /** POL-24 — credential profiles keyed by id. Held as the FULL persisted row (incl. the client
    *  secret) because the control plane is where the secret is written through; every outward-facing
    *  read goes via `getCredentialProfileViews`, which never carries it. */
@@ -396,7 +431,6 @@ export class ControlPlane {
         walls: scene.walls,
         screens: scene.screens,
       },
-      scheduleAt: scene.scheduleAt ?? null,
     };
   }
 
@@ -614,7 +648,6 @@ export class ControlPlane {
         placements: ps.snapshot.placements ?? [],
         walls: ps.snapshot.walls ?? [],
         screens: ps.snapshot.screens ?? [],
-        ...(ps.scheduleAt ? { scheduleAt: ps.scheduleAt } : {}),
       });
       if (parsed.success) this.scenes.set(parsed.data.id, parsed.data);
     }
@@ -628,6 +661,47 @@ export class ControlPlane {
       }
     }
     this.sceneCounter = maxScene;
+
+    // ── Scene scheduler (POL-89) ──────────────────────────────────────────────
+    for (const pd of persisted.dayparts) {
+      const parsed = Daypart.safeParse(pd);
+      if (parsed.success) this.dayparts.set(parsed.data.id, parsed.data);
+    }
+    let maxDaypart = 0;
+    for (const d of this.dayparts.values()) {
+      const match = /^daypart-(\d+)$/.exec(d.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxDaypart = Math.max(maxDaypart, n);
+      }
+    }
+    this.daypartCounter = maxDaypart;
+
+    for (const psch of persisted.schedules) {
+      const parsed = Schedule.safeParse(psch);
+      if (parsed.success) this.schedules.set(parsed.data.id, parsed.data);
+    }
+    let maxSchedule = 0;
+    for (const s of this.schedules.values()) {
+      const match = /^schedule-(\d+)$/.exec(s.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxSchedule = Math.max(maxSchedule, n);
+      }
+    }
+    this.scheduleCounter = maxSchedule;
+
+    const persistedScheduler = await this.store.getSchedulerSettings();
+    if (persistedScheduler) {
+      const parsed = SchedulerSettings.safeParse(persistedScheduler);
+      // A stored zone the runtime does not know (an ICU/tzdata downgrade) must not silently become
+      // UTC on a live wall — keep it loud and fall back to the host's zone.
+      if (parsed.success && isValidTimeZone(parsed.data.timezone)) {
+        this.schedulerSettings = parsed.data;
+      } else {
+        this.emit("warn", `Scheduler timezone "${persistedScheduler.timezone}" is unknown here — using ${this.schedulerSettings.timezone}`);
+      }
+    }
 
     // ── Credential profiles (POL-24) ──────────────────────────────────────────
     for (const cp of persisted.credentialProfiles) {
@@ -3140,8 +3214,9 @@ export class ControlPlane {
   // placement / combine / content primitives, so the INSTANT property (stable-id render paths, D5) is
   // preserved on apply. Content is captured as the ASSIGNMENT (a library `sourceId` or an ad-hoc
   // `url`), never the resolved surface — so applying a scene re-resolves each source to its CURRENT
-  // url. `scheduleAt` ("HH:MM") is ILLUSTRATIVE: it is stored, NOT fired (D24) — nothing here activates
-  // a scene at that time.
+  // url. WHEN a scene plays is NOT here: that is a `Schedule` (POL-89/D93), resolved by the ticker in
+  // `scheduler.ts`, which fires this very `applyScene` — so a scheduled switch is the operator's own
+  // Apply, minus the operator.
 
   getScenes(): Scene[] {
     return [...this.scenes.values()];
@@ -3364,9 +3439,8 @@ export class ControlPlane {
   }
 
   /**
-   * Update a saved scene: rename it and/or set its ILLUSTRATIVE schedule time (`scheduleAt` is "HH:MM";
-   * null clears it — STORED, NOT FIRED, D24). Write-through. Does NOT bump the revision (registry
-   * metadata). Returns the updated scene, or null if unknown.
+   * Rename a saved scene. Write-through. Does NOT bump the revision (registry metadata). Returns the
+   * updated scene, or null if unknown. (WHEN a scene plays is a `Schedule` — POL-89/D93.)
    */
   async updateScene(id: string, patch: UpdateSceneBody): Promise<Scene | null> {
     const existing = this.scenes.get(id);
@@ -3374,10 +3448,6 @@ export class ControlPlane {
 
     const next: Scene = { ...existing };
     if (patch.name !== undefined) next.name = patch.name;
-    if (patch.scheduleAt !== undefined) {
-      if (patch.scheduleAt === null) delete next.scheduleAt;
-      else next.scheduleAt = patch.scheduleAt;
-    }
 
     const scene = Scene.parse(next);
     this.scenes.set(id, scene);
@@ -3386,14 +3456,172 @@ export class ControlPlane {
   }
 
   /**
-   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId. Write-through.
-   * Does NOT touch the live wall (a scene is just a saved snapshot). Returns false if unknown.
+   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId; any SCHEDULE
+   * bound to it (and its standing as the default scene) goes with it — a schedule pointing at a scene
+   * that no longer exists would resolve to nothing every tick. Write-through. Does NOT touch the live
+   * wall (a scene is just a saved snapshot). Returns false if unknown.
    */
   async deleteScene(id: string): Promise<boolean> {
     if (!this.scenes.has(id)) return false;
     this.scenes.delete(id);
     if (this.state.activeSceneId === id) this.state.activeSceneId = null;
     await this.store.deleteScene(id);
+
+    for (const schedule of [...this.schedules.values()].filter((s) => s.sceneId === id)) {
+      this.schedules.delete(schedule.id);
+      await this.store.deleteSchedule(schedule.id);
+    }
+    if (this.schedulerSettings.defaultSceneId === id) {
+      this.schedulerSettings = { ...this.schedulerSettings, defaultSceneId: null };
+      await this.store.setSchedulerSettings(this.toPersistedSchedulerSettings());
+    }
     return true;
+  }
+
+  // ── The scene scheduler (POL-89) ──────────────────────────────────────────────
+  //
+  // Dayparts + schedules + one settings row. This layer only STORES and validates; the ticker
+  // (`scheduler.ts`) resolves them against the clock and calls the existing applyScene path, so the
+  // fan-out is the ordinary instant WS push and nothing on a box or in a player changes.
+
+  private toPersistedSchedulerSettings(): PersistedSchedulerSettings {
+    return { ...this.schedulerSettings };
+  }
+
+  getDayparts(): Daypart[] {
+    return [...this.dayparts.values()];
+  }
+
+  getSchedules(): Schedule[] {
+    return [...this.schedules.values()];
+  }
+
+  getSchedulerSettings(): SchedulerSettings {
+    return { ...this.schedulerSettings };
+  }
+
+  /** Everything the shared resolver needs — the same set the console gets in `admin/state`. */
+  getScheduleSet(): ScheduleSet {
+    return {
+      dayparts: this.getDayparts(),
+      schedules: this.getSchedules(),
+      settings: this.getSchedulerSettings(),
+    };
+  }
+
+  async createDaypart(body: CreateDaypartBody): Promise<Daypart> {
+    this.daypartCounter += 1;
+    const daypart = Daypart.parse({
+      id: `daypart-${this.daypartCounter}`,
+      name: body.name,
+      start: body.start,
+      end: body.end,
+    });
+    this.dayparts.set(daypart.id, daypart);
+    await this.store.upsertDaypart(daypart);
+    this.emit("info", `Added daypart ${daypart.name} (${daypart.start}–${daypart.end})`);
+    return daypart;
+  }
+
+  async updateDaypart(id: string, patch: UpdateDaypartBody): Promise<Daypart | null> {
+    const existing = this.dayparts.get(id);
+    if (existing === undefined) return null;
+    const daypart = Daypart.parse({ ...existing, ...patch });
+    this.dayparts.set(id, daypart);
+    await this.store.upsertDaypart(daypart);
+    this.emit("info", `Daypart ${daypart.name} is now ${daypart.start}–${daypart.end}`);
+    return daypart;
+  }
+
+  /**
+   * Delete a daypart. Refuses while any schedule is bound to it (returns the binding count) — an
+   * operator must not be able to silently unschedule a wall by tidying up the library.
+   */
+  async deleteDaypart(id: string): Promise<{ ok: true } | { ok: false; error: "unknown" | "in-use"; schedules: number }> {
+    const existing = this.dayparts.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown", schedules: 0 };
+    const bound = [...this.schedules.values()].filter((s) => s.daypartId === id);
+    if (bound.length > 0) return { ok: false, error: "in-use", schedules: bound.length };
+    this.dayparts.delete(id);
+    await this.store.deleteDaypart(id);
+    this.emit("info", `Deleted daypart ${existing.name}`);
+    return { ok: true };
+  }
+
+  async createSchedule(
+    body: CreateScheduleBody,
+  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown-scene" | "unknown-daypart" }> {
+    if (!this.scenes.has(body.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (!this.dayparts.has(body.daypartId)) return { ok: false, error: "unknown-daypart" };
+    this.scheduleCounter += 1;
+    const schedule = Schedule.parse({
+      id: `schedule-${this.scheduleCounter}`,
+      sceneId: body.sceneId,
+      daypartId: body.daypartId,
+      days: [...new Set(body.days)].sort((a, b) => a - b),
+      priority: body.priority,
+      enabled: body.enabled,
+      from: body.from,
+      until: body.until,
+      createdAt: new Date().toISOString(),
+    });
+    this.schedules.set(schedule.id, schedule);
+    await this.store.upsertSchedule(schedule);
+    this.emit(
+      "info",
+      `Scheduled ${this.scenes.get(schedule.sceneId)?.name ?? schedule.sceneId} in ${this.dayparts.get(schedule.daypartId)?.name ?? schedule.daypartId}`,
+    );
+    return { ok: true, schedule };
+  }
+
+  async updateSchedule(
+    id: string,
+    patch: UpdateScheduleBody,
+  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown" | "unknown-scene" | "unknown-daypart" }> {
+    const existing = this.schedules.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown" };
+    if (patch.sceneId !== undefined && !this.scenes.has(patch.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (patch.daypartId !== undefined && !this.dayparts.has(patch.daypartId)) {
+      return { ok: false, error: "unknown-daypart" };
+    }
+    const schedule = Schedule.parse({
+      ...existing,
+      ...patch,
+      ...(patch.days ? { days: [...new Set(patch.days)].sort((a, b) => a - b) } : {}),
+    });
+    this.schedules.set(id, schedule);
+    await this.store.upsertSchedule(schedule);
+    return { ok: true, schedule };
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    if (!this.schedules.has(id)) return false;
+    this.schedules.delete(id);
+    await this.store.deleteSchedule(id);
+    return true;
+  }
+
+  /**
+   * Patch the deployment's scheduler settings. An unknown timezone or an unknown default scene is
+   * REFUSED, not coerced: a wall's whole daily rhythm hangs off this row, so a typo must fail loudly
+   * at the edge rather than quietly move every window an hour.
+   */
+  async updateSchedulerSettings(
+    patch: UpdateSchedulerSettingsBody,
+  ): Promise<{ ok: true; settings: SchedulerSettings } | { ok: false; error: "unknown-timezone" | "unknown-scene" }> {
+    if (patch.timezone !== undefined && !isValidTimeZone(patch.timezone)) {
+      return { ok: false, error: "unknown-timezone" };
+    }
+    if (patch.defaultSceneId != null && !this.scenes.has(patch.defaultSceneId)) {
+      return { ok: false, error: "unknown-scene" };
+    }
+    const settings = SchedulerSettings.parse({ ...this.schedulerSettings, ...patch });
+    this.schedulerSettings = settings;
+    await this.store.setSchedulerSettings(this.toPersistedSchedulerSettings());
+    if (patch.enabled !== undefined) {
+      this.emit(patch.enabled ? "good" : "warn", patch.enabled ? "Scene scheduler ON" : "Scene scheduler OFF");
+    }
+    if (patch.timezone !== undefined) this.emit("info", `Scheduler timezone set to ${settings.timezone}`);
+    return { ok: true, settings };
   }
 }

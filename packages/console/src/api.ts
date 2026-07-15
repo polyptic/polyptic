@@ -15,9 +15,11 @@ import {
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateDaypartBody,
   CreateMuralBody,
   CreatePreRegistrationBody,
   CreateSceneBody,
+  CreateScheduleBody,
   IdentBody,
   ImportPreRegistrationsBody,
   RenameMachineBody,
@@ -33,7 +35,10 @@ import {
   SetPlaylistEntryZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateDaypartBody,
   UpdateSceneBody,
+  UpdateScheduleBody,
+  UpdateSchedulerSettingsBody,
 } from "@polyptic/protocol";
 import type {
   BulkOpResponse,
@@ -41,7 +46,10 @@ import type {
   CreatePreRegistrationBody as CreatePreRegistrationBodyT,
   CredentialProfileTestResult,
   CredentialProfileView,
+  Daypart,
   Scene,
+  Schedule,
+  SchedulerSettings,
   VideoWall,
 } from "@polyptic/protocol";
 
@@ -648,10 +656,7 @@ export function applyScene(sceneId: string): Promise<unknown> {
   return send("POST", `/scenes/${encodeURIComponent(sceneId)}/apply`);
 }
 
-/**
- * PATCH /api/v1/scenes/:sceneId { name?, scheduleAt? } — rename a scene and/or set its illustrative
- * schedule time (HH:MM, or null to clear). The time is stored, not fired (illustrative only).
- */
+/** PATCH /api/v1/scenes/:sceneId { name? } — rename a saved scene. */
 export async function updateScene(sceneId: string, body: UpdateSceneBody): Promise<Scene> {
   const res = await send<{ scene: Scene }>("PATCH", `/scenes/${encodeURIComponent(sceneId)}`, UpdateSceneBody.parse(body));
   return res.scene;
@@ -660,4 +665,62 @@ export async function updateScene(sceneId: string, body: UpdateSceneBody): Promi
 /** DELETE /api/v1/scenes/:sceneId — delete a saved scene. */
 export function deleteScene(sceneId: string): Promise<unknown> {
   return send("DELETE", `/scenes/${encodeURIComponent(sceneId)}`);
+}
+
+// ── The scene scheduler (POL-89) ──────────────────────────────────────────────
+//
+// Dayparts (named windows of the day), schedules (a scene in a daypart, on a recurrence, at a
+// priority) and the deployment's one settings row. The console never resolves these itself — it
+// feeds them to the SHARED resolver in @polyptic/protocol, the same one the server's ticker uses.
+
+/** POST /api/v1/dayparts — add a named window of the day ("Opening hours", 08:00–18:00). */
+export async function createDaypart(body: CreateDaypartBody): Promise<Daypart> {
+  const res = await send<{ daypart: Daypart }>("POST", "/dayparts", CreateDaypartBody.parse(body));
+  return res.daypart;
+}
+
+/** PATCH /api/v1/dayparts/:id — rename a daypart and/or move its window. */
+export async function updateDaypart(id: string, body: UpdateDaypartBody): Promise<Daypart> {
+  const res = await send<{ daypart: Daypart }>(
+    "PATCH",
+    `/dayparts/${encodeURIComponent(id)}`,
+    UpdateDaypartBody.parse(body),
+  );
+  return res.daypart;
+}
+
+/** DELETE /api/v1/dayparts/:id — 409 while any schedule is still bound to it. */
+export function deleteDaypart(id: string): Promise<unknown> {
+  return send("DELETE", `/dayparts/${encodeURIComponent(id)}`);
+}
+
+/** POST /api/v1/schedules — bind a scene to a daypart on a recurrence, at a priority. */
+export async function createSchedule(body: CreateScheduleBody): Promise<Schedule> {
+  const res = await send<{ schedule: Schedule }>("POST", "/schedules", CreateScheduleBody.parse(body));
+  return res.schedule;
+}
+
+/** PATCH /api/v1/schedules/:id — edit a schedule (days, priority, daypart, date range, on/off). */
+export async function updateSchedule(id: string, body: UpdateScheduleBody): Promise<Schedule> {
+  const res = await send<{ schedule: Schedule }>(
+    "PATCH",
+    `/schedules/${encodeURIComponent(id)}`,
+    UpdateScheduleBody.parse(body),
+  );
+  return res.schedule;
+}
+
+/** DELETE /api/v1/schedules/:id — unschedule a scene. */
+export function deleteSchedule(id: string): Promise<unknown> {
+  return send("DELETE", `/schedules/${encodeURIComponent(id)}`);
+}
+
+/** PUT /api/v1/settings/scheduler — the master switch, THE timezone, and the default scene. */
+export async function updateSchedulerSettings(body: UpdateSchedulerSettingsBody): Promise<SchedulerSettings> {
+  const res = await send<{ scheduler: SchedulerSettings }>(
+    "PUT",
+    "/settings/scheduler",
+    UpdateSchedulerSettingsBody.parse(body),
+  );
+  return res.scheduler;
 }
