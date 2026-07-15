@@ -19,6 +19,7 @@ import type {
   EnrollmentStatus,
   Geometry,
   HostIdentity,
+  ImageRing,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -47,6 +48,12 @@ export interface PersistedMachine {
   shellEnabled?: boolean;
   /** POL-59 — ISO time the shell was armed / last used, for the auto-disarm TTL sweep. */
   shellArmedAt?: string;
+  /** POL-103 — operator tags ("atrium", "floor:2"). Undefined on legacy rows → no tags. */
+  tags?: string[];
+  /** POL-105 — the OS image id this box last reported booting, and when. Persisted (not live-only
+   *  like the vitals ring) because the box a roll-out stranded is the box that is now offline. */
+  imageId?: string;
+  imageIdAt?: string;
   /** POL-104 — the box's physical identity as it last reported it (MACs / DMI serial / arch). Kept on
    *  the ROW, not just in presence, so a pending card is informative while the box is offline. */
   hardware?: HostIdentity;
@@ -116,6 +123,12 @@ export interface PersistedContentSource {
   /** POL-42 — the authored composition (a `PageDefinition` as JSON), present only for `page`
    *  sources. The control plane re-validates it against the contract on load. */
   definition?: unknown | null;
+  /** POL-18 — the framing-probe verdict ("ok" | "blocked" | "unknown") for web/dashboard sources.
+   *  `null`/undefined = never probed (also legacy rows persisted before the column). */
+  framing?: string | null;
+  /** POL-18 — the operator's placement override ("auto" | "iframe" | "window"). `null`/undefined =
+   *  auto (also legacy rows persisted before the column). */
+  placementMode?: string | null;
 }
 
 /**
@@ -148,6 +161,18 @@ export interface PersistedZoomPreference {
   targetId: string;
   sourceKey: string;
   zoom: number;
+}
+
+/**
+ * POL-112 — a remembered audio intent for one (target, content) pair, keyed exactly like a zoom
+ * preference. Assigning that content to that target again restores the level the operator dialled in;
+ * NEW content on that target has no row and so arrives at the muted default.
+ */
+export interface PersistedAudioPreference {
+  targetId: string;
+  sourceKey: string;
+  muted: boolean;
+  volume: number;
 }
 
 /** A mural row (Phase 3): a named, switchable spatial canvas. */
@@ -194,15 +219,45 @@ export interface PersistedVideoWall {
 /**
  * Phase 3d — a SCENE row: a named SNAPSHOT of a mural's whole wall. The layout (placements),
  * grouping (video walls) and content (per screen + per wall) live together in the `snapshot` jsonb,
- * mirroring the protocol `Scene`'s {placements, walls, screens}. `scheduleAt` is the illustrative
- * "HH:MM" time — STORED, NOT FIRED — and is null/undefined when unscheduled.
+ * mirroring the protocol `Scene`'s {placements, walls, screens}. WHEN a scene plays is not here:
+ * POL-89/D93 dropped D24's illustrative `schedule_at` in favour of real `schedules` rows.
  */
 export interface PersistedScene {
   id: string;
   name: string;
   muralId: string;
   snapshot: Pick<Scene, "placements" | "walls" | "screens">;
-  scheduleAt?: string | null;
+}
+
+/** POL-89 — a named window of the day ("Opening hours", 08:00–18:00). `end <= start` wraps midnight. */
+export interface PersistedDaypart {
+  id: string;
+  name: string;
+  start: string;
+  end: string;
+}
+
+/** POL-89 — a scene bound to a daypart on a recurrence, at a priority. The scheduler's unit. */
+export interface PersistedSchedule {
+  id: string;
+  sceneId: string;
+  daypartId: string;
+  /** Weekdays the window is armed on (0=Sun…6=Sat). */
+  days: number[];
+  priority: number;
+  enabled: boolean;
+  /** Inclusive date range (`YYYY-MM-DD`), tested against the window's START date. */
+  from: string | null;
+  until: string | null;
+  createdAt: string;
+}
+
+/** POL-89 — deployment-wide scheduler settings (one row): master switch, timezone, default scene. */
+export interface PersistedSchedulerSettings {
+  enabled: boolean;
+  /** IANA zone. Explicit and configurable — never implied by the browser or the process env. */
+  timezone: string;
+  defaultSceneId: string | null;
 }
 
 // ── Local operator accounts + sessions + enrollment bootstrap (Phase 3f / D29) ──
@@ -354,6 +409,13 @@ export interface PersistedImageRollout {
   /** Server-local `HH:MM` the full rebuild fires at. */
   fullScheduleTime: string;
   urgent: boolean;
+  /**
+   * POL-105 — the staged roll-out RINGS, ordered, first match wins. Each pins one build for the
+   * machines a POL-103 selector matches (`tag=canary` → build X); every machine matching no ring
+   * follows the arch's ACTIVE build, so an empty list is exactly the pre-POL-105 fleet-wide roll-out.
+   * Persisted as a whole (jsonb): small, always read whole, only ever replaced whole.
+   */
+  rings: ImageRing[];
   /** POL-121 — the FIRST-IMAGE LATCH: when the server auto-triggered the one-shot full build that
    *  fills an empty depot on a fresh install. Written BEFORE the hook is spawned and never cleared,
    *  so a crash-looping or rescheduled pod cannot launch a build storm: the very first server that
@@ -377,9 +439,29 @@ export interface PersistedDisplaySettings {
   showBadges: boolean;
 }
 
+/**
+ * Panel power (POL-101): the deployment's timezone plus each screen's daily on/off window. ONE row,
+ * because that is genuinely all this is — a per-screen window and the zone to read it in. Kept
+ * deliberately small: the full recurrence machinery belongs to the scene scheduler, and the two are
+ * meant to converge (D100), so this must not grow a private calendar in the meantime.
+ *
+ * Absent until an operator first sets panel hours; a deployment that never does keeps its walls on
+ * 24/7, exactly as before POL-101.
+ */
+export interface PersistedPanelPower {
+  /** IANA zone the windows are read in ("Europe/London"). Explicit — never the server's own TZ. */
+  timezone: string;
+  /** screenId → its daily window. A screen with no entry is never touched by the scheduler. */
+  hours: Record<string, { enabled: boolean; on: string; off: string }>;
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
+  /** POL-95 — the scene the wall is currently on (null = none / diverged). Persisted with the
+   *  revision in the single-row `meta` table: the active scene is desired state, not a UI hint, so a
+   *  server restart must not lose it. */
+  activeSceneId: string | null;
   machines: PersistedMachine[];
   screens: PersistedScreen[];
   content: PersistedContent[];
@@ -392,10 +474,15 @@ export interface PersistedState {
   contentSources: PersistedContentSource[];
   /** Phase 3d — saved wall snapshots (scenes). */
   scenes: PersistedScene[];
+  /** POL-89 — the scene scheduler: the daypart library and the schedules bound to it. */
+  dayparts: PersistedDaypart[];
+  schedules: PersistedSchedule[];
   /** POL-24 — credential profiles (content auth). */
   credentialProfiles: PersistedCredentialProfile[];
   /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
   zoomPreferences: PersistedZoomPreference[];
+  /** POL-112 — remembered audio intent per (screen-or-wall, content) pair. */
+  audioPreferences: PersistedAudioPreference[];
 }
 
 /**
@@ -413,6 +500,10 @@ export interface Store {
   setMachineStatus(id: string, status: EnrollmentStatus): Promise<void>;
   /** Arm/disarm a machine for the remote shell (POL-59), stamping the arm time. No-op if absent. */
   setMachineShellEnabled(id: string, enabled: boolean, armedAt: string | null): Promise<void>;
+  /** POL-103 — replace a machine's whole tag set (add + remove are the same call). No-op if absent. */
+  setMachineTags(id: string, tags: string[]): Promise<void>;
+  /** POL-105 — record the OS image id a box reported BOOTING, and when. No-op if absent. */
+  setMachineImage(id: string, imageId: string, at: string): Promise<void>;
   /**
    * Permanently forget a machine: delete its row AND cascade its screens, their content, and their
    * placements (defensive — the control plane also removes each in memory + dissolves walls first, so
@@ -433,6 +524,9 @@ export interface Store {
   deleteContent(screenId: string): Promise<void>;
   /** Persist the global revision counter. */
   setRevision(revision: number): Promise<void>;
+  /** POL-95 — persist the ACTIVE scene (null = none / the wall has diverged). Single-row, alongside
+   *  the revision: which scene the wall is on is desired state, and must survive a restart. */
+  setActiveSceneId(sceneId: string | null): Promise<void>;
 
   // ── Murals & placement (Phase 3) ──────────────────────────────────────────
   /** Insert-or-update a mural row (id + name). */
@@ -472,6 +566,14 @@ export interface Store {
   /** All persisted zoom preferences. */
   listZoomPreferences(): Promise<PersistedZoomPreference[]>;
 
+  // ── Audio preferences (POL-112) ────────────────────────────────────────────
+  /** Insert-or-update the remembered audio intent for one (target, content) pair. */
+  upsertAudioPreference(pref: PersistedAudioPreference): Promise<void>;
+  /** Forget every remembered audio intent for a screen or wall that no longer exists. No-op if none. */
+  deleteAudioPreferencesForTarget(targetId: string): Promise<void>;
+  /** All persisted audio preferences. */
+  listAudioPreferences(): Promise<PersistedAudioPreference[]>;
+
   // ── Credential profiles (POL-24) ───────────────────────────────────────────
   /** Insert-or-update a credential-profile row (the only home of the client secret). */
   upsertCredentialProfile(profile: PersistedCredentialProfile): Promise<void>;
@@ -481,12 +583,31 @@ export interface Store {
   listCredentialProfiles(): Promise<PersistedCredentialProfile[]>;
 
   // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
-  /** Insert-or-update a scene row (id + name + mural + snapshot jsonb + schedule_at). */
+  /** Insert-or-update a scene row (id + name + mural + snapshot jsonb). */
   upsertScene(scene: PersistedScene): Promise<void>;
   /** Delete a scene row. No-op if absent. */
   deleteScene(id: string): Promise<void>;
   /** All persisted scenes. */
   listScenes(): Promise<PersistedScene[]>;
+
+  // ── Scene scheduler (POL-89) ───────────────────────────────────────────────
+  /** Insert-or-update a daypart row. */
+  upsertDaypart(daypart: PersistedDaypart): Promise<void>;
+  /** Delete a daypart row (the control plane deletes the schedules bound to it first). No-op if absent. */
+  deleteDaypart(id: string): Promise<void>;
+  /** All persisted dayparts. */
+  listDayparts(): Promise<PersistedDaypart[]>;
+  /** Insert-or-update a schedule row. */
+  upsertSchedule(schedule: PersistedSchedule): Promise<void>;
+  /** Delete a schedule row. No-op if absent. */
+  deleteSchedule(id: string): Promise<void>;
+  /** All persisted schedules. */
+  listSchedules(): Promise<PersistedSchedule[]>;
+  /** The persisted scheduler settings (single row). Undefined until first set — the control plane
+   *  then falls back to its default (scheduler on, the server's own zone, no default scene). */
+  getSchedulerSettings(): Promise<PersistedSchedulerSettings | undefined>;
+  /** Replace the scheduler settings (single row). */
+  setSchedulerSettings(settings: PersistedSchedulerSettings): Promise<void>;
 
   // ── Local operator accounts + sessions (Phase 3f / D29) ────────────────────
   /** Look up a user by (normalized) email. Used by login + change-password. */
@@ -576,6 +697,12 @@ export interface Store {
   getDisplaySettings(): Promise<PersistedDisplaySettings | undefined>;
   /** Persist the fleet-wide display settings (single row). */
   setDisplaySettings(settings: PersistedDisplaySettings): Promise<void>;
+
+  // ── Panel power (POL-101) ──────────────────────────────────────────────────
+  /** The persisted panel-power config (timezone + per-screen hours). Undefined until first set. */
+  getPanelPower(): Promise<PersistedPanelPower | undefined>;
+  /** Replace the panel-power config (single row). */
+  setPanelPower(power: PersistedPanelPower): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

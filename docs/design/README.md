@@ -18,7 +18,7 @@ Locally this `.dc.html` won't run without its runtime, but the inline CSS + mark
 - **Wall** — the murals canvas: mural switcher, scene switcher + save, content library + unplaced-screens tray, zoomable canvas of screens & **combined surfaces**, floating select toolbar, context inspector (single / combined / multi / empty) + live activity feed.
 - **Machines** — fleet: enrolment token (copy/regenerate), Pending (approve/reject), Approved (revoke). UI for the Phase-2b enrollment engine.
 - **Content** — content-source library: list + add/edit (name, type, address, auth strategy).
-- **Scenes** — saved presets: save current wall, apply, schedule (illustrative), duplicate, delete.
+- **Scenes** — saved presets: save current wall, apply, delete, and REAL scheduling (POL-89/D93: named dayparts, weekday/date recurrence, priority, a default scene, and a "what plays when" week strip). The mock's illustrative `at HH:MM` box is gone.
 - **Settings** — appearance/theme, enrolment token, replay first-run, account/sign-out.
 - **Cold-start wizard** — first run: Step 1 connect (token + approve a dialing-in machine), Step 2 map screens (ident → name → place).
 - **Overlays** — toast, save-scene modal, add/edit content-source modal.

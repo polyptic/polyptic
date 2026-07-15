@@ -118,9 +118,14 @@ describe("ControlPlane credential profiles (POL-24)", () => {
     const assigned = await cp.setScreenContent(screenId, { sourceId: created.source.id });
     expect(assigned.ok).toBe(true);
 
-    // No provider wired → the slice goes out untouched (login page until the token-usable edge).
+    // No provider wired → NO token is stamped (login page until the token-usable edge). The slice
+    // still picks up POL-94's send-time `sourceId` stamp — that is what lets the player attribute a
+    // reachability report back to this library source — but the URL itself is untouched.
     const stored = cp.getSlice(screenId)!;
-    expect(cp.decorateSliceForSend(stored)).toBe(stored);
+    const undecorated = cp.decorateSliceForSend(stored);
+    expect((undecorated.surfaces[0] as { url: string }).url).toBe("https://grafana.example.test/d/abc?kiosk");
+    expect((undecorated.surfaces[0] as { sourceId?: string }).sourceId).toBe(created.source.id);
+    expect((stored.surfaces[0] as { sourceId?: string }).sourceId).toBeUndefined(); // stored stays clean
 
     cp.setTokenProvider({
       getToken: (id) => (id === profile.id ? "JWT-123" : undefined),
