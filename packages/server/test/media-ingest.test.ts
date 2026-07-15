@@ -15,7 +15,7 @@
  *
  * The no-toolchain path (a dev laptop, a minimal container) is covered WITHOUT skipping, via the null
  * prober: the upload is still accepted, `probed` is false, the operator is warned, and an image still
- * gets a picture in the library. That is D123, and CI must keep it true whether or not a runner happens
+ * gets a picture in the library. That is D129, and CI must keep it true whether or not a runner happens
  * to ship a media toolchain.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -127,7 +127,7 @@ describe("POL-109 playability policy", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Ingest with NO toolchain (D123) — always runs, and CI must keep it green.
+// 2. Ingest with NO toolchain (D129) — always runs, and CI must keep it green.
 // ─────────────────────────────────────────────────────────────────────────────
 
 let dir = "";
@@ -148,7 +148,7 @@ async function save(path: string, mime: string, name: string) {
   return store.save(createReadStream(path), mime, name, 50 * 1024 * 1024);
 }
 
-describe("POL-109 ingest degrades when no probing toolchain exists (D123)", () => {
+describe("POL-109 ingest degrades when no probing toolchain exists (D129)", () => {
   test("an unprobeable VIDEO is ACCEPTED, flagged unprobed, and the operator is told why", async () => {
     const record = await save(PLAYABLE_MP4, "video/mp4", "clip.mp4");
     const result = await ingestUpload(new NullMediaProber(), store, record, PUBLIC_BASE);

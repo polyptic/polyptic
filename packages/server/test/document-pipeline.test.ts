@@ -15,7 +15,7 @@
  *     page sort and progress polling execute, and the assertions are about the pages that landed.
  *
  *  3. THE NO-CONVERTER BRANCH (always runs, never skipped). A server with no toolchain REFUSES a
- *     document — D124, and the opposite of POL-109's accept-and-warn, because conversion is not an
+ *     document — D132, and the opposite of POL-109's accept-and-warn, because conversion is not an
  *     inspection: with no pages there is no deck, only a library row that cannot paint.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -105,7 +105,7 @@ async function saveDeckPdf(name = "All Hands.pdf") {
   return store.save(createReadStream(DECK_PDF), PDF_MIME, name, 10 * 1024 * 1024);
 }
 
-describe("POL-114 a server with NO converter (D124 — refuse, don't pretend)", () => {
+describe("POL-114 a server with NO converter (D132 — refuse, don't pretend)", () => {
   test("the null converter is unavailable and ingest REFUSES, with a sentence to act on", async () => {
     const converter = new NullDocumentConverter();
     expect(await converter.available()).toBe(false);
@@ -242,7 +242,7 @@ describe("POL-114 a REAL PDF converts to a REAL image deck", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The job feed — the console's ONLY window into a conversion (D124).
+// The job feed — the console's ONLY window into a conversion (D132).
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("POL-114 conversion jobs", () => {

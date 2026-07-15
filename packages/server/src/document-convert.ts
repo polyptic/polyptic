@@ -17,7 +17,7 @@
  * two methods. Every binary is configurable (`DOC_OFFICE_CMD`, `DOC_RASTER_CMD`) so an operator can
  * point us at their own build without touching code, and `DOC_CONVERT=off` is the kill switch.
  *
- * REFUSE, DON'T PRETEND (D124). POL-109's prober ACCEPTS an unprobeable upload, because a file it
+ * REFUSE, DON'T PRETEND (D132). POL-109's prober ACCEPTS an unprobeable upload, because a file it
  * could not inspect is still a file the browser can probably render — silence is not evidence of
  * guilt. A converter is the opposite case: conversion is not an inspection, it is the CONTENT. With no
  * converter there are no page images, and a "deck" with no pages is a library row that provably cannot
@@ -131,7 +131,7 @@ export class NullDocumentConverter implements DocumentConverter {
   }
 }
 
-/** The sentence an operator sees when this server cannot convert documents (D124 — refuse, because a
+/** The sentence an operator sees when this server cannot convert documents (D132 — refuse, because a
  *  deck with no pages is a black screen with a name). */
 export const NO_CONVERTER_MESSAGE =
   "This server can't convert documents — no document toolchain is installed. Export your slides to " +

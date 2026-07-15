@@ -7,7 +7,7 @@
  *    tens of seconds; holding an HTTP request open for it means meeting a reverse proxy's read
  *    timeout (nginx's default is 60 s) and answering an operator's "is it working?" with nothing.
  *    So the upload route answers **202 + a job**, and the job's progress is pushed on the `admin/state`
- *    broadcast the console is ALREADY listening to (D124). No new WS channel, no polling, no job
+ *    broadcast the console is ALREADY listening to (D132). No new WS channel, no polling, no job
  *    table: pages appear as they land. Jobs are in-memory and bounded — they describe an upload in
  *    flight, not a fact about the world; a server restart mid-conversion loses the job, and the
  *    half-converted file with it (the deck never existed, so nothing dangles in the library).

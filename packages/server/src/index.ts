@@ -14,10 +14,18 @@ import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
-import { ActivateImageBody, ImageUpdateInfo, RebuildImageBody, UpdateImageSettingsBody } from "@polyptic/protocol";
+import {
+  ActivateImageBody,
+  ImageUpdateInfo,
+  PromoteImageRingBody,
+  RebuildImageBody,
+  SetImageRingsBody,
+  UpdateImageSettingsBody,
+} from "@polyptic/protocol";
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import { SourceHealthTracker } from "./source-health";
 import { AuthService, authConfigFromEnv } from "./auth-local";
 import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
@@ -37,7 +45,10 @@ import { initSelfSignedTls, registerHttpsRoutes, requiredSans, resolveTlsEnv } f
 import type { ServerTlsRuntime, TlsEnvConfig } from "./server-tls";
 import { PageDataService } from "./page-data";
 import { registerRestRoutes } from "./rest";
+import { registerScheduleRoutes } from "./schedule-routes";
+import { DEFAULT_TICK_MS, SceneScheduler } from "./scheduler";
 import { DevtoolsRelay } from "./devtools-relay";
+import { PanelPowerScheduler } from "./panel-power";
 import { registerDevtoolsRoutes } from "./devtools-routes";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
@@ -71,6 +82,13 @@ const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS ?? 4000);
 const SHELL_ARM_TTL_MS = Number(process.env.SHELL_ARM_TTL_MS ?? 60 * 60 * 1000);
 // Max thumbnails held in memory at once (LRU cap).
 const THUMBNAIL_CAPACITY = Number(process.env.CAPTURE_THUMBNAIL_CAP ?? 300);
+// POL-89 — how often the scene scheduler re-resolves "what should be on the wall right now". A
+// scheduled scene therefore lands within this of its window boundary (default 10s).
+const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS ?? DEFAULT_TICK_MS);
+// POL-89 — a TEST SEAM, and nothing else: shifts the scheduler's clock so a suite can stand a few
+// seconds before a window boundary and watch it fire, instead of sleeping through a real one. Unset
+// (0) in every real deployment; the ticker then reads the plain wall clock.
+const SCHEDULER_CLOCK_OFFSET_MS = Number(process.env.SCHEDULER_CLOCK_OFFSET_MS ?? 0);
 const CORS_ORIGIN = (
   process.env.CORS_ORIGIN ??
   // 5173 player, 5175 Vue console.
@@ -228,12 +246,16 @@ const hub = new PlayerHub();
 const agentHub = new AgentHub();
 const adminHub = new AdminHub();
 const presence = new Presence();
-// ── Document pipeline (POL-114 / D124): conversions in flight + what this server can convert. The
+// ── Document pipeline (POL-114 / D132): conversions in flight + what this server can convert. The
 // jobs registry pushes every progress tick onto the admin/state broadcast the console already reads —
 // that IS the progress channel (no new socket, no polling). `capabilities.documents` is levelled once
 // the converter has answered `available()`, so the console never offers an upload we would refuse.
 const documentCapabilities = { documents: false };
 const documentJobs = new DocumentJobs(() => broadcaster.broadcast());
+// POL-94 — live per-source content health, folded from the players' own reachability probes
+// (POL-86's SurfaceProber). Live-only, like Presence: a restart starts blank and the players
+// re-report on reconnect.
+const sourceHealth = new SourceHealthTracker();
 const broadcaster = new AdminBroadcaster({
   control,
   playerHub: hub,
@@ -243,6 +265,7 @@ const broadcaster = new AdminBroadcaster({
   log: fastify.log,
   enrollment,
   documents: { jobs: documentJobs, capabilities: documentCapabilities },
+  health: sourceHealth,
 });
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
@@ -328,13 +351,13 @@ await fastify.register(multipart, {
 const media = new MediaStore(MEDIA_DIR);
 await media.init();
 
-// ── Media ingest (POL-109 / D123): probe → validate → poster, behind the `MediaProber` seam. The
+// ── Media ingest (POL-109 / D129): probe → validate → poster, behind the `MediaProber` seam. The
 // external toolchain is optional BY DESIGN: with none installed the prober reports itself unavailable,
 // uploads are still accepted (with a warning on the source) and the wall behaves as it always did.
 const mediaProber = createMediaProber();
 control.setMediaProvider(media);
 
-// ── Document conversion (POL-114 / D124): PDF/slides → page images, behind the `DocumentConverter`
+// ── Document conversion (POL-114 / D132): PDF/slides → page images, behind the `DocumentConverter`
 // seam. Unlike probing, conversion IS the content: with no toolchain there are no page images, so the
 // server advertises `documents: false` and REFUSES a document upload rather than storing a file no
 // wall could ever paint.
@@ -403,6 +426,21 @@ registerAuthRoutes(fastify, auth, enrollment);
 // the agent WS — the POL-59 shell pattern. Built before the WS channels (agent frames route into it)
 // and handed to REST so disarming a screen closes its live sessions instantly.
 const devtoolsRelay = new DevtoolsRelay(agentHub, control, presence, activity, fastify.log);
+
+// POL-101 — panel power. The scheduler owns the daily on/off windows and is the only thing in the
+// server that can darken a wall; the WS layer reconciles a box's panels to their window when it says
+// hello (a box that reboots at 3am comes back LIT and must be re-slept), and REST drives the manual
+// wake/sleep. In hours, the only command it ever sends is WAKE: a screen that should be showing
+// content is never blanked.
+const panelPower = new PanelPowerScheduler({
+  control,
+  agentHub,
+  presence,
+  activity,
+  broadcaster,
+  log: fastify.log,
+});
+panelPower.start();
 
 // ── mTLS agent channel (POL-25/POL-134): CA + dedicated TLS listener + the boot self-test. ──
 // The self-test is load-bearing, not paranoia: Bun ≤ 1.2 implemented `requestCert` as PRESENCE-only
@@ -531,7 +569,9 @@ const shellRelay = attachWebSockets({
   broadcaster,
   activity,
   capture,
+  health: sourceHealth,
   devtoolsRelay,
+  panelPower,
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
   agentMtls: agentMtlsChannel,
@@ -557,9 +597,44 @@ registerRestRoutes(
   presence,
   shellRelay,
   devtoolsRelay,
+  sourceHealth,
+  panelPower,
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);
+
+// ── The scene scheduler (POL-89/D93): dayparts + priorities, resolved on a ticker. ──
+// It applies scenes through the EXISTING applyScene path — the same code the operator's Apply button
+// runs — so a scheduled switch fans out over the ordinary `server/render` push, in the ordinary
+// <150ms, with no reload, and neither the agent nor the player knows a scheduler exists.
+const scheduler = new SceneScheduler({
+  control,
+  log: fastify.log,
+  activity,
+  tickMs: Number.isFinite(SCHEDULER_TICK_MS) && SCHEDULER_TICK_MS > 0 ? SCHEDULER_TICK_MS : DEFAULT_TICK_MS,
+  now: () => Date.now() + (Number.isFinite(SCHEDULER_CLOCK_OFFSET_MS) ? SCHEDULER_CLOCK_OFFSET_MS : 0),
+  apply: async (sceneId) => {
+    const result = await control.applyScene(sceneId);
+    if (!result) return false;
+    for (const slice of result.slices) {
+      const message = ServerToPlayerRender.parse({
+        t: "server/render",
+        revision: control.state.revision,
+        friendlyName: control.getScreen(slice.screenId)?.friendlyName ?? slice.screenId,
+        slice: control.decorateSliceForSend(slice),
+      });
+      const delivered = hub.send(slice.screenId, message);
+      fastify.log.info(
+        { event: "render.push.schedule", screenId: slice.screenId, sceneId, revision: control.state.revision, delivered },
+        "pushed render for a scheduled scene",
+      );
+    }
+    broadcaster.broadcast();
+    return true;
+  },
+});
+registerScheduleRoutes(fastify, control, scheduler, broadcaster);
+scheduler.start();
 // The HTTPS settings surface (POL-70/D89), GATED under /api/v1: the TLS posture + (in self-signed
 // mode) the CA download the console's trust instructions hang off.
 registerHttpsRoutes(fastify, serverTls);
@@ -632,6 +707,9 @@ registerProvisionRoutes(
       "Netboot depot artifacts served (kernel, initrd, root image, …).",
       { arch, file },
     ),
+  // POL-105 — the depot's manifest route resolves PER MACHINE: a box appends `?machineId=…`, and its
+  // tags decide which roll-out ring (if any) it matches. The registry is the only place tags live.
+  (machineId) => control.machineTags(machineId),
 );
 
 // TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.
@@ -684,6 +762,7 @@ const imageUpdateInfo = async (request: FastifyRequest) => {
       liveIsoUrl: b.hasLiveIso ? `${base}/dist/image/${b.arch}/builds/${b.imageId}/polyptic-live.iso` : null,
     })),
     retainBuilds: imageUpdates.retainBuilds,
+    rings: st.rings ?? [],
   });
 };
 fastify.get("/api/v1/settings/image", async (request) => imageUpdateInfo(request));
@@ -706,6 +785,34 @@ fastify.post("/api/v1/settings/image/activate", async (request, reply) => {
   } catch (err) {
     return reply.code(404).send({ error: (err as Error).message });
   }
+  return imageUpdateInfo(request);
+});
+
+// ── Staged roll-outs (POL-105) ──
+// The rings are the WHOLE list, replaced in one call (like a machine's tag set): add, remove and
+// reorder are the same mutation, so the console never reconciles two half-applied writes. A ring
+// whose selector does not parse, or whose build the depot no longer retains, is a 400 — you cannot
+// point a box at a boot it cannot make.
+fastify.put("/api/v1/settings/image/rings", async (request, reply) => {
+  const { rings } = SetImageRingsBody.parse(request.body ?? {});
+  try {
+    await imageUpdates.setRings(rings);
+  } catch (err) {
+    return reply.code(400).send({ error: (err as Error).message });
+  }
+  return imageUpdateInfo(request);
+});
+
+// Promote a ring's build to the whole fleet: activate it for that arch AND drop the ring, so the
+// canary boxes and everyone else converge on one id. One action, one activity line (the DoD).
+fastify.post("/api/v1/settings/image/promote", async (request, reply) => {
+  const { arch, selector, urgent } = PromoteImageRingBody.parse(request.body ?? {});
+  try {
+    await imageUpdates.promote(arch, selector, urgent);
+  } catch (err) {
+    return reply.code(404).send({ error: (err as Error).message });
+  }
+  broadcaster.broadcast();
   return imageUpdateInfo(request);
 });
 
@@ -852,6 +959,7 @@ async function shutdown(signal: string): Promise<void> {
   capture.stop();
   tokens.stop();
   pageData.stop();
+  scheduler.stop();
   agentMtlsChannel?.server.close();
   try {
     await fastify.close();

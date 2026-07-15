@@ -17,7 +17,7 @@
  *   · a format the server cannot convert → the job FAILS with a sentence naming the format, and
  *                                  nothing appears in the library.
  *   · a server with NO converter → 415 at upload with a reason, and `capabilities.documents: false`
- *                                  so the console never offers the affordance (D124).
+ *                                  so the console never offers the affordance (D132).
  *
  * TOOLCHAIN-FREE BY CONSTRUCTION. CI has no document toolchain, so the converting server is pointed
  * at the committed TEST DOUBLE (`packages/server/test/fixtures/fake-pdftoppm.sh`) via DOC_RASTER_CMD —
@@ -270,7 +270,7 @@ describe("POL-114 the document pipeline", () => {
   );
 
   test(
-    "a server with NO converter REFUSES a document at upload, with a reason (D124)",
+    "a server with NO converter REFUSES a document at upload, with a reason (D132)",
     async () => {
       const res = await upload(OFF_BASE, "deck.pdf", PDF_MIME, "All Hands");
       expect(res.status).toBe(415);

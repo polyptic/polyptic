@@ -11,6 +11,12 @@
  * The rotation's identity is its structural signature (see rotationSignature): a send-time token
  * re-stamp keeps the current position, while any authored change — or a re-assignment's fresh
  * `startedAt` — restarts it.
+ *
+ * POL-112 — audio. This component used to hardcode `muted` on its video element, which made the
+ * playlist surface's flag (which the protocol has always carried) a lie. It now applies the
+ * surface's audio intent: one setting for the whole rotation, applied to whichever video entry is on
+ * air. An unmuted autoplay the browser refuses degrades to MUTED playback (see ./audio.ts) — the wall
+ * keeps its picture even where it cannot have sound.
  */
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
@@ -18,6 +24,8 @@ import type { PlaylistEntry, Surface } from "@polyptic/protocol";
 import { allTimed, entryHoldMs, rotationSignature, timedPosition } from "./playlist";
 import { contentStyle } from "./surface-style";
 import { resolveMediaSrc } from "./media-url";
+import { applyAudio, ensurePlaying, surfaceAudio } from "./audio";
+import { diag } from "./diag";
 
 type PlaylistSurfaceT = Extract<Surface, { type: "playlist" }>;
 
@@ -57,6 +65,26 @@ function mediaSrc(entry: PlaylistEntry): string {
  *  the step buffers, so an advance never shows black before the first decoded frame. */
 function posterSrc(entry: PlaylistEntry): string | undefined {
   return entry.poster ? resolveMediaSrc(entry.poster, props.serverHttpBase) : undefined;
+}
+
+/** The rotation's audio intent (POL-112): the flag the server sent, never a hardcode. It is applied
+ *  to the video element that is on air; the image/frame entries have nothing to sound. */
+const audio = computed(() => surfaceAudio(props.surface));
+
+/** Apply the intent to the entry's video element, then make sure it is actually PLAYING — an unmuted
+ *  autoplay a browser refuses falls back to muted rather than stalling the rotation on a dead frame. */
+async function onVideoReady(event: Event): Promise<void> {
+  const el = event.target;
+  if (!(el instanceof HTMLVideoElement)) return;
+  const intent = audio.value;
+  applyAudio(el, intent);
+  if (intent.muted) return;
+  const outcome = await ensurePlaying(el);
+  if (outcome === "muted-fallback") {
+    diag(`${props.surface.id}: playlist unmuted autoplay was BLOCKED — playing muted instead`);
+  } else if (outcome === "blocked") {
+    diag(`${props.surface.id}: playlist playback was blocked by the browser even muted`);
+  }
 }
 
 /** Loop policy for a video entry: a TIMED video replays until its slot ends; an untimed video that is
@@ -151,8 +179,10 @@ onUnmounted(clearTimer);
       :style="entryStyle"
       autoplay
       playsinline
-      muted
+      :muted="audio.muted"
+      :volume="audio.volume"
       :loop="videoLoop(current)"
+      @loadeddata="onVideoReady"
       @ended="onEnded"
     />
   </template>

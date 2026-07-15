@@ -9,6 +9,11 @@
 #   not urgent → reboot only inside the nightly window (03:00–04:59 local), also splayed. A 01:00
 #       scheduled refresh therefore rolls across the fleet the same night, invisibly.
 #
+# The manifest is fetched PER MACHINE (POL-105: `?machineId=<this box>`), so `imageId` and `urgent`
+# are this box's answer, not the fleet's: a box the operator tagged `canary` is told to boot the
+# canary build (and may be told to do it urgently while the rest of the fleet waits for the night).
+# Everything below is unchanged by that — the box still just compares two ids and reboots.
+#
 # NETBOOT BOXES ONLY: a box booted from the live ISO re-boots the SAME stale medium, so rebooting it
 # is at best pointless and at worst a loop. `root=live:http…` is exactly and only what a netboot
 # cmdline carries (dracut streams the squashfs from that URL); an ISO boot carries
@@ -46,7 +51,16 @@ hostport="${base#http://}"; hostport="${hostport%%/*}"
 
 case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) exit 0 ;; esac
 
-MANIFEST="$(curl -fsS --max-time 10 "$base/dist/image/$arch/manifest.json" 2>/dev/null || true)"
+# The box's stable machine id (POL-105): the manifest is resolved PER MACHINE, so a box tagged
+# `canary` in the console is told to boot a different build than the rest of the fleet FROM THE SAME
+# DEPOT. Sent as a query parameter, never a header, because GRUB/dracut fetch the same URL later. A
+# box whose id the server does not know (or one that has not enrolled yet) matches no roll-out ring
+# and is answered with the fleet's active build — exactly the pre-POL-105 behaviour.
+MID="$(sed -n 's/^POLYPTIC_MACHINE_ID=//p' "$ENV_FILE" 2>/dev/null)"
+MURL="$base/dist/image/$arch/manifest.json"
+[ -z "$MID" ] || MURL="$MURL?machineId=$MID"
+
+MANIFEST="$(curl -fsS --max-time 10 "$MURL" 2>/dev/null || true)"
 [ -n "$MANIFEST" ] || exit 0   # server unreachable: try again in 5 minutes, never guess
 
 SERVED="$(printf '%s' "$MANIFEST" | sed -n 's/.*"imageId":"\([^"]*\)".*/\1/p')"
@@ -191,9 +205,8 @@ MARKER="$RUN_DIR/update-reboot-requested"
 [ -f "$MARKER" ] && exit 0
 mkdir -p "$RUN_DIR" && : > "$MARKER"
 
-# Per-box splay (0–240 s) derived from the stable machine id, so every box in a wall lands on a
-# different second and the depot never serves the whole fleet at once.
-MID="$(cat "$ENV_FILE" 2>/dev/null | sed -n 's/^POLYPTIC_MACHINE_ID=//p')"
+# Per-box splay (0–240 s) derived from the stable machine id (read above), so every box in a wall
+# lands on a different second and the depot never serves the whole fleet at once.
 SPLAY=$(( $(printf '%s' "${MID:-$RUNNING}" | cksum | cut -d' ' -f1) % 241 ))
 if [ "$SERVED" = "$RUNNING" ]; then
   echo "update-poll: rebooting to re-pair the kernel with image $SERVED (recovery boot); in ${SPLAY}s"

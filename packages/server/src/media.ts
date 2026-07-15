@@ -426,7 +426,7 @@ export type IngestResult =
   | { ok: true; metadata: MediaMetadata }
   | { ok: false; reason: MediaRejectionReason; message: string };
 
-/** The sentence an operator sees when the server has no probing toolchain (D123 — accept, don't guess). */
+/** The sentence an operator sees when the server has no probing toolchain (D129 — accept, don't guess). */
 const UNPROBED_WARNING =
   "This server has no media toolchain installed, so the file couldn't be checked — if a screen shows " +
   "it as black, the file's codec is the likely cause.";
@@ -439,7 +439,7 @@ const POSTER_SEEK_SECONDS = 1;
  * filename) — or a REJECTION, which the caller turns into a 415 and an unlink: a file we know the wall
  * cannot play must not reach the library, because the library is a promise that a source will show.
  *
- * Degradation is the whole game here (D123):
+ * Degradation is the whole game here (D129):
  *  · no prober on this host          → accept, `probed: false`, warning, no poster (images still get a
  *                                      picture: their own url).
  *  · prober present, file unreadable → for a VIDEO that is evidence of a broken file: reject. For an

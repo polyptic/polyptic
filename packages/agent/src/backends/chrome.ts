@@ -88,7 +88,9 @@ export function buildChromeArgs(
     "--disable-session-crashed-bubble",
     "--noerrdialogs",
     "--disable-features=Translate",
-    // A wall shows video with nobody there to click "play".
+    // A wall shows video with nobody there to click "play" — and, since POL-112, with the sound ON if
+    // an operator asked for it. Without this flag Chrome refuses to autoplay UNMUTED media, and the
+    // player would have to fall back to muted playback (which it does, deliberately — see audio.ts).
     "--autoplay-policy=no-user-gesture-required",
   ];
   // POL-132 — the player's shell service worker (what lets a wall RELOAD while the control plane is
@@ -106,6 +108,62 @@ export function buildChromeArgs(
   const extra = env.POLYPTIC_BROWSER_ARGS?.trim();
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
   return args;
+}
+
+/** What one Chrome WEB-WINDOW launch needs (POL-18): a second, non-kiosk `--app=` window the sway
+ *  backend floats + positions over the player. Sized by the compositor (sway `resize set`), so no
+ *  `--window-size` here — Wayland clients don't self-position anyway. */
+export interface ChromeWindowSpec {
+  /** The (credential-stamped) content URL. */
+  url: string;
+  /** The placement's stable window id — keys the per-window `--user-data-dir`/reap token. */
+  windowId: string;
+  /** Loopback DevTools port for this instance (Chrome requires a non-default data dir for it). */
+  devtoolsPort: number;
+}
+
+/** Per-window Chrome profile dir — process-isolation key AND the stale-reap token (POL-18). */
+export function chromeWindowDataDir(
+  windowId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const base = env.XDG_RUNTIME_DIR?.trim() || "/tmp";
+  return `${base}/polyptic-chrome-win-${sanitizeConnector(windowId)}`;
+}
+
+/**
+ * Build Chrome's argv for one placed web-window (POL-18). Same kiosk hygiene as the player's
+ * instance, but NO `--kiosk`: this window must stay a floating, positionable surface — sway sizes
+ * and moves it; fullscreening it would cover the whole output.
+ */
+export function buildChromeWindowArgs(
+  spec: ChromeWindowSpec,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const args = [
+    "--ozone-platform=wayland",
+    `--app=${spec.url}`,
+    `--user-data-dir=${chromeWindowDataDir(spec.windowId, env)}`,
+    `--remote-debugging-port=${spec.devtoolsPort}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
+    "--noerrdialogs",
+    "--disable-features=Translate",
+    "--autoplay-policy=no-user-gesture-required",
+  ];
+  const extra = env.POLYPTIC_BROWSER_ARGS?.trim();
+  if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
+  return args;
+}
+
+/** Pre-launch hygiene for one placed window: reap an orphan holding its unique data dir (POL-18). */
+export async function prelaunchChromeWindow(
+  windowId: string,
+  log: (m: string) => void,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  await killStaleByToken(chromeWindowDataDir(windowId, env), log);
 }
 
 /** The player URL's origin when (and only when) it is plain `http:` — the one origin the kiosk may

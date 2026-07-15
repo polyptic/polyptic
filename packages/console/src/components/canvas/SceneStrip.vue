@@ -13,6 +13,7 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useConsoleStore } from "../../stores/console";
+import SceneDiffCard from "./SceneDiffCard.vue";
 
 const store = useConsoleStore();
 
@@ -20,6 +21,24 @@ const scenes = computed(() => store.activeMuralScenes);
 
 function apply(id: string) {
   store.applyScene(id);
+}
+
+// ── apply preview (POL-95) ─────────────────────────────────────────────────────
+// Hovering (or keyboard-focusing) a scene chip asks the server what applying it would change. It is a
+// read-out, not a gate: the chip is still one click. A small delay keeps a sweep across the strip from
+// firing a diff per chip.
+const previewId = ref<string | null>(null);
+let previewTimer: ReturnType<typeof setTimeout> | null = null;
+
+function previewSoon(id: string) {
+  if (previewTimer) clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => {
+    previewId.value = id;
+  }, 220);
+}
+function previewOff() {
+  if (previewTimer) clearTimeout(previewTimer);
+  previewId.value = null;
 }
 
 // ── save-current-wall modal ────────────────────────────────────────────────────
@@ -57,9 +76,19 @@ async function confirmSave() {
         :class="{ active: s.id === store.activeSceneId }"
         :title="`Apply ${s.name}`"
         @click="apply(s.id)"
+        @mouseenter="previewSoon(s.id)"
+        @mouseleave="previewOff"
+        @focus="previewSoon(s.id)"
+        @blur="previewOff"
       >
         {{ s.name }}
       </button>
+    </div>
+
+    <!-- POL-95 — what applying the hovered scene would change, under the strip (the pills scroll, so
+         the card cannot live inside them). -->
+    <div v-if="previewId" class="preview">
+      <SceneDiffCard :scene-id="previewId" />
     </div>
 
     <button class="save" :disabled="!store.activeMuralId" @click="openSave">Save scene</button>
@@ -91,10 +120,17 @@ async function confirmSave() {
 
 <style scoped>
 .scene-strip {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+.preview {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 0;
+  z-index: 250;
 }
 .pills {
   display: inline-flex;

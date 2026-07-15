@@ -14,7 +14,7 @@
  *   · admin/state.contentSources carry the ingest decoration, so the console can show real thumbnails.
  *   · assigning the video → the player's `video` surface carries `poster` (the pre-buffer frame).
  *
- * TOOLCHAIN-OPTIONAL (D123). CI (and a dev laptop) may have no media toolchain. The suite detects that
+ * TOOLCHAIN-OPTIONAL (D129). CI (and a dev laptop) may have no media toolchain. The suite detects that
  * ONCE and asserts the OTHER contract in that case: the upload is still ACCEPTED, marked unprobed, and
  * carries a warning — a server without the tool must never refuse an upload it cannot inspect. Both
  * branches are real assertions; neither is a skip.
@@ -243,7 +243,7 @@ describe("POL-109 ingest at the upload route", () => {
         expect(String(body.error)).toContain("AVI");
         expect(body.reason).toBe("codec");
       } else {
-        // D123 — a server with no toolchain knows nothing, so it accepts and SAYS so. It must not
+        // D129 — a server with no toolchain knows nothing, so it accepts and SAYS so. It must not
         // refuse an upload it could not inspect.
         expect(res.status).toBe(201);
         expect(String(body.warning)).toContain("toolchain");
