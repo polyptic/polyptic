@@ -21,6 +21,8 @@
  * registration/approval order. The mapping is stable per (machineId, connector): a reconnecting
  * machine reuses its existing screen ids, and the counter resumes past the highest persisted id.
  */
+import { randomUUID } from "node:crypto";
+
 import {
   ContentSource,
   DashboardSurface,
@@ -34,6 +36,7 @@ import {
   Zoom,
   packRects,
   rectsAreAdjacent,
+  meaningfulHostname,
 } from "@polyptic/protocol";
 import type { Rect } from "@polyptic/protocol";
 import type {
@@ -47,6 +50,7 @@ import type {
   DisplayBackend,
   DisplaySettings,
   Geometry,
+  HostIdentity,
   KioskBrowser,
   Machine,
   Mural,
@@ -58,6 +62,7 @@ import type {
   PageImageResolution,
   PageWeatherData,
   Placement,
+  PreRegistration,
   SceneContent,
   Screen,
   ScreenSlice,
@@ -75,6 +80,8 @@ import type {
 } from "./store/types";
 import type { TokenService } from "./tokens";
 import type { ActivityLog } from "./activity";
+import { matchPreRegistration, normalizeMac } from "./preregistration";
+import type { PreRegistrationMatch } from "./preregistration";
 
 /** Where players live. The agent points each output's browser at this base + ?screen=<id>. */
 const PLAYER_BASE_URL = process.env.PLAYER_BASE_URL ?? "http://localhost:5173";
@@ -131,11 +138,29 @@ export function pendingUrlFor(machineId: string): string {
   return `${PLAYER_BASE_URL}/?pending=${encodeURIComponent(machineId)}`;
 }
 
+/**
+ * POL-117 — which label a (re)registering machine keeps. An operator's name always wins; a label
+ * that merely equals the machineId (the unnamed sentinel) or a meaningless live-image hostname
+ * adopted before this fix ("localhost.localdomain" on every netbooted box) is NOT an operator name
+ * and never wins. Otherwise adopt the box's hostname when it actually means something, else keep
+ * the machineId sentinel — the console renders that honestly as "Unnamed box", never as a hostname
+ * pretending to identify a panel.
+ */
+function labelForHello(existing: Machine | undefined, input: RegisterMachineInput): string {
+  if (existing && existing.label !== existing.id && meaningfulHostname(existing.label) !== null) {
+    return existing.label;
+  }
+  return meaningfulHostname(input.hostname) ?? input.machineId;
+}
+
 /** One entry of the `server/apply` payload: which screen an output is, and where to point its player. */
 export interface ScreenAssignment {
   connector: string;
   screenId: string;
   playerUrl: string;
+  /** POL-119 — run a cast (AirPlay) receiver on this connector, advertised as `friendlyName`. */
+  castEnabled: boolean;
+  friendlyName: string;
 }
 
 export interface RegisterMachineInput {
@@ -148,6 +173,13 @@ export interface RegisterMachineInput {
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
+  /** POL-104 — what the box IS (MACs / DMI serial / arch). Persisted, so a pending card is informative
+   *  even while the box is offline. A hello that carries none NEVER blanks what we already know. */
+  hardware?: HostIdentity;
+  /** POL-104 — the enrolment token this hello authenticated against. Stamped onto the machine at FIRST
+   *  enrolment only (provenance: which stick/batch the box came in on) and never rewritten after. */
+  enrolledTokenId?: string;
+  enrolledTokenName?: string;
 }
 
 export interface RegisterMachineResult {
@@ -230,6 +262,23 @@ export type SetZoomResult =
       wallId?: string;
     };
 
+/** Result of `setScreenPlaylistEntryZoom` / `setWallPlaylistEntryZoom` (POL-133).
+ *  `not-zoomable` = the target isn't showing a playlist; `unknown-entry` = the rotation has no
+ *  framed step resolved from that source (media steps have no page to zoom). */
+export type SetPlaylistEntryZoomResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error:
+        | "unknown-screen"
+        | "unknown-wall"
+        | "wall-member"
+        | "no-content"
+        | "not-zoomable"
+        | "unknown-entry";
+      wallId?: string;
+    };
+
 /**
  * An assignment of content to a screen or wall (Phase 3c): EITHER a library source (`sourceId`) OR an
  * ad-hoc link (`url`). Exactly one is set (the REST edge validates this via `SetContentBody`).
@@ -295,6 +344,8 @@ export class ControlPlane {
   private readonly machines = new Map<string, Machine>();
   /** machineId → sha256(credential) hex. Kept off the wire `Machine`; persisted via the DTO. */
   private readonly credentialHashes = new Map<string, string>();
+  /** POL-104 — boxes declared before they ever booted, keyed by record id. */
+  private readonly preRegistrations = new Map<string, PreRegistration>();
   private screenCounter = 0;
 
   /** Phase 3 — the named, switchable canvases. */
@@ -395,6 +446,12 @@ export class ControlPlane {
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
+      hardware: machine.hardware,
+      enrolledTokenId: machine.enrolledTokenId,
+      enrolledTokenName: machine.enrolledTokenName,
+      preRegistered: machine.preRegistered ?? false,
+      mtlsCertIssuedAt: machine.mtlsCertIssuedAt,
+      mtlsSeenAt: machine.mtlsSeenAt,
     };
   }
 
@@ -419,8 +476,19 @@ export class ControlPlane {
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
         shellArmedAt: m.shellArmedAt,
+        hardware: m.hardware,
+        enrolledTokenId: m.enrolledTokenId,
+        enrolledTokenName: m.enrolledTokenName,
+        preRegistered: m.preRegistered ?? false,
+        mtlsCertIssuedAt: m.mtlsCertIssuedAt,
+        mtlsSeenAt: m.mtlsSeenAt,
       });
       if (m.credentialHash) this.credentialHashes.set(m.id, m.credentialHash);
+    }
+
+    // POL-104 — pre-registrations: boxes an operator declared before they ever booted.
+    for (const record of await this.store.listPreRegistrations()) {
+      this.preRegistrations.set(record.id, record);
     }
 
     for (const s of persisted.screens) {
@@ -429,6 +497,7 @@ export class ControlPlane {
         friendlyName: s.friendlyName,
         machineId: s.machineId,
         connector: s.connector,
+        castEnabled: s.castEnabled ?? false,
       });
     }
 
@@ -665,6 +734,7 @@ export class ControlPlane {
           friendlyName: `Screen ${this.screenCounter}`,
           machineId,
           connector: output.connector,
+          castEnabled: false,
         } satisfies Screen;
         this.state.screens.push(screen);
         const slice: ScreenSlice = {
@@ -692,6 +762,8 @@ export class ControlPlane {
         connector: output.connector,
         screenId: screen.id,
         playerUrl: this.playerUrlFor(screen.id),
+        castEnabled: screen.castEnabled,
+        friendlyName: screen.friendlyName,
       });
     }
 
@@ -748,6 +820,7 @@ export class ControlPlane {
         friendlyName: s.friendlyName,
         machineId: s.machineId,
         connector: s.connector,
+        castEnabled: s.castEnabled,
       });
     }
     for (const slice of result.touchedSlices) {
@@ -781,9 +854,9 @@ export class ControlPlane {
     const existing = this.machines.get(input.machineId);
     const machine: Machine = {
       id: input.machineId,
-      // An operator rename wins (label diverged from the machineId default); otherwise adopt the box
-      // hostname, so an already-registered machine still UUID-labelled relabels on its next hello.
-      label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
+      // An operator rename wins; a MEANINGFUL box hostname is adopted otherwise (POL-117 — see
+      // labelForHello: `localhost.localdomain` from the shared live image is never a name).
+      label: labelForHello(existing, input),
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
@@ -792,6 +865,16 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-104: never blank what we already know. An agent too old to report hardware (or one that
+      // could not read its own DMI this boot) must not erase the card an operator relies on. And a
+      // machine's enrolment provenance is written ONCE, at first enrolment — a later token re-enrol
+      // does not rewrite which batch the box came in on.
+      hardware: input.hardware ?? existing?.hardware,
+      enrolledTokenId: existing?.enrolledTokenId ?? input.enrolledTokenId,
+      enrolledTokenName: existing?.enrolledTokenName ?? input.enrolledTokenName,
+      preRegistered: existing?.preRegistered ?? false,
+      mtlsCertIssuedAt: existing?.mtlsCertIssuedAt,
+      mtlsSeenAt: existing?.mtlsSeenAt,
     };
     this.machines.set(input.machineId, machine);
 
@@ -815,9 +898,9 @@ export class ControlPlane {
     const existing = this.machines.get(input.machineId);
     const machine: Machine = {
       id: input.machineId,
-      // An operator rename wins (label diverged from the machineId default); otherwise adopt the box
-      // hostname, so an already-registered machine still UUID-labelled relabels on its next hello.
-      label: existing && existing.label !== existing.id ? existing.label : (input.hostname ?? input.machineId),
+      // An operator rename wins; a MEANINGFUL box hostname is adopted otherwise (POL-117 — see
+      // labelForHello: `localhost.localdomain` from the shared live image is never a name).
+      label: labelForHello(existing, input),
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
@@ -826,9 +909,81 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      hardware: input.hardware ?? existing?.hardware,
+      enrolledTokenId: existing?.enrolledTokenId ?? input.enrolledTokenId,
+      enrolledTokenName: existing?.enrolledTokenName ?? input.enrolledTokenName,
+      preRegistered: existing?.preRegistered ?? false,
+      mtlsCertIssuedAt: existing?.mtlsCertIssuedAt,
+      mtlsSeenAt: existing?.mtlsSeenAt,
     };
     this.machines.set(input.machineId, machine);
     await this.store.upsertMachine(this.toPersistedMachine(machine));
+  }
+
+  // ── Pre-registration (POL-104) ────────────────────────────────────────────
+
+  /** Every pre-registration record, creation-ordered. */
+  listPreRegistrations(): PreRegistration[] {
+    return [...this.preRegistrations.values()].map((r) => ({ ...r }));
+  }
+
+  /** Declare a box before it boots. Write-through. */
+  async addPreRegistration(input: Omit<PreRegistration, "id" | "createdAt">): Promise<PreRegistration> {
+    const record: PreRegistration = {
+      ...input,
+      id: randomUUID(),
+      createdAt: new Date().toISOString(),
+      // Normalize the soft keys at the door, so a paste of `AA-BB-CC-DD-EE-01` matches a box that
+      // reports `aa:bb:cc:dd:ee:01`.
+      mac: normalizeMac(input.mac) ?? input.mac,
+    };
+    this.preRegistrations.set(record.id, record);
+    await this.store.upsertPreRegistration(record);
+    return { ...record };
+  }
+
+  /** Forget a pre-registration. A box that already matched it keeps its name/approval — the record is
+   *  a declaration, not a lease. */
+  async removePreRegistration(id: string): Promise<boolean> {
+    if (!this.preRegistrations.delete(id)) return false;
+    await this.store.deletePreRegistration(id);
+    return true;
+  }
+
+  /**
+   * A box has just enrolled and AUTHENTICATED. Does an operator's pre-registration claim it? If so:
+   * adopt its label, mark the machine pre-registered, and claim the record for this machine. The
+   * caller (the WS hello handler) then approves the box if the record says `autoApprove` — that is
+   * the zero-click commissioning path (DoD: "a pre-registered box enrolls, auto-names, auto-tags and
+   * auto-approves with zero clicks").
+   *
+   * Returns the match so the handler can log/announce WHICH key matched — a MAC match is a weaker
+   * claim than a serial, and an operator debugging a mis-named box needs to know which it was.
+   */
+  async applyPreRegistration(
+    machineId: string,
+    hardware: HostIdentity | undefined,
+  ): Promise<PreRegistrationMatch | undefined> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return undefined;
+
+    const match = matchPreRegistration(this.listPreRegistrations(), machineId, hardware);
+    if (!match) return undefined;
+
+    const record: PreRegistration = {
+      ...match.record,
+      matchedMachineId: machineId,
+      matchedAt: new Date().toISOString(),
+      matchedOn: match.matchedOn,
+    };
+    this.preRegistrations.set(record.id, record);
+    await this.store.upsertPreRegistration(record);
+
+    if (record.label) machine.label = record.label;
+    machine.preRegistered = true;
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+
+    return { record, matchedOn: match.matchedOn };
   }
 
   /**
@@ -859,6 +1014,32 @@ export class ControlPlane {
     machine.lastSeen = new Date().toISOString();
     machine.outputs = outputs;
     await this.store.upsertMachine(this.toPersistedMachine(machine));
+  }
+
+  /**
+   * POL-134 — record that the server signed this machine's CSR into a client cert. Write-through;
+   * no-op if the machine is unknown (open-mode issuance can precede registration on first contact —
+   * the next hello registers the machine and the following issuance lands the timestamp).
+   */
+  async noteMachineCertIssued(machineId: string): Promise<void> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return;
+    machine.mtlsCertIssuedAt = new Date().toISOString();
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+  }
+
+  /**
+   * POL-134 — record that this machine connected over the mTLS listener (proof it presents a
+   * working cert). Returns true on the FIRST time — the caller narrates the migration in the feed.
+   * Write-through; no-op (false) if the machine is unknown.
+   */
+  async noteMachineMtlsSeen(machineId: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return false;
+    if (machine.mtlsSeenAt) return false;
+    machine.mtlsSeenAt = new Date().toISOString();
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+    return true;
   }
 
   /**
@@ -1150,8 +1331,55 @@ export class ControlPlane {
       friendlyName: screen.friendlyName,
       machineId: screen.machineId,
       connector: screen.connector,
+      castEnabled: screen.castEnabled,
     });
     if (previousName !== friendlyName) this.emit("info", `${previousName} renamed`);
+    return screen;
+  }
+
+  /**
+   * POL-117 — rename a machine (any machine, any status: naming a still-PENDING box is the point,
+   * because several identical netbooted boxes are indistinguishable exactly while they queue for
+   * approval). Writes `Machine.label` — the same field the hostname used to default into — so the
+   * operator's name simply wins from here on (labelForHello never overwrites a real name).
+   * Registry metadata like renameScreen: write-through, NO revision bump; the caller broadcasts
+   * admin/state so every open console relabels live. Returns the machine, or null if unknown.
+   */
+  async renameMachine(machineId: string, label: string): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+    const previous = machine.label;
+    machine.label = label;
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+    if (previous !== label) {
+      // The previous label may be the unnamed sentinel (= machineId) — say so honestly.
+      const from = previous === machine.id ? "Unnamed box" : previous;
+      this.emit("info", `${from} renamed to ${label}`);
+    }
+    return machine;
+  }
+
+  /**
+   * Enable/disable casting (the AirPlay receiver) on one screen (POL-119). Persistent and TTL-less —
+   * unlike the shell arm, a castable meeting-room panel is meant to STAY castable; the on-glass PIN
+   * is the per-session gate. Like renameScreen this is registry metadata: write-through, no revision
+   * bump. The caller re-applies to the driving agent (start/stop the receiver) and re-pushes the
+   * same-revision render (the player's badge glyph). Returns the screen, or null if unknown.
+   */
+  async setScreenCastEnabled(screenId: string, enabled: boolean): Promise<Screen | null> {
+    const screen = this.state.screens.find((s) => s.id === screenId);
+    if (screen === undefined) return null;
+    if (screen.castEnabled !== enabled) {
+      screen.castEnabled = enabled;
+      await this.store.upsertScreen({
+        id: screen.id,
+        friendlyName: screen.friendlyName,
+        machineId: screen.machineId,
+        connector: screen.connector,
+        castEnabled: enabled,
+      });
+      this.emit("info", `Casting ${enabled ? "enabled" : "disabled"} on ${screen.friendlyName}`);
+    }
     return screen;
   }
 
@@ -1393,22 +1621,42 @@ export class ControlPlane {
 
   /** What's on a screen now, for the console's tiles/inspector: the library source's name+kind (a
    *  wall member shows the wall's source), an ad-hoc URL's derived name, or null when nothing's on air. */
-  screenContentSummary(screenId: string): { name: string; kind: ContentKind; zoom?: number } | null {
+  screenContentSummary(
+    screenId: string,
+  ): {
+    name: string;
+    kind: ContentKind;
+    zoom?: number;
+    entries?: { sourceId?: string; name: string; kind: PlaylistEntry["kind"]; zoom?: number }[];
+  } | null {
     const surface = this.state.slices[screenId]?.surfaces[0];
     // POL-57 — the live zoom, present only for framed content. Its absence is how the console knows
     // this screen has nothing to zoom (media, or no content at all) and hides the control.
     const zoom = surface && isFramed(surface) ? surface.zoom : undefined;
+    // POL-133 — for a playlist, the rotation's steps with each framed step's live zoom on THIS
+    // screen, so the console can draw one zoom control per zoomable step.
+    const entries =
+      surface?.type === "playlist"
+        ? surface.items.map((entry) => ({
+            ...(entry.sourceId !== undefined ? { sourceId: entry.sourceId } : {}),
+            name:
+              (entry.sourceId && this.contentSources.get(entry.sourceId)?.name) ||
+              this.contentNameFromUrl(entry.url, entry.kind),
+            kind: entry.kind,
+            ...(ControlPlane.entryFramed(entry) ? { zoom: entry.zoom } : {}),
+          }))
+        : undefined;
 
     const wall = this.getWallForScreen(screenId);
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind, zoom };
+      if (src) return { name: src.name, kind: src.kind, zoom, entries };
     }
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind, zoom };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, entries };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -1549,6 +1797,150 @@ export class ControlPlane {
     return sourceId ? `source:${sourceId}` : `url:${url}`;
   }
 
+  // ── Playlist step zoom (POL-133) ────────────────────────────────────────────
+  //
+  // The same D62 model, one level down: a page playing as a playlist STEP is still "this content on
+  // this target", so its zoom is remembered against the (target, step source) pair — in the SAME
+  // zoom_preferences table, under the same `source:<id>` key a direct assignment of that source
+  // would use. That is deliberate: the pair identifies the content and the glass, not the route the
+  // content took to get there.
+
+  /** True for a playlist entry that frames a page — the only kind of step that can be zoomed. */
+  private static entryFramed(entry: PlaylistEntry): boolean {
+    return entry.kind === "web" || entry.kind === "dashboard";
+  }
+
+  /** Each framed entry stamped with the zoom remembered for (target, its source); media untouched. */
+  private entriesWithZoom(targetId: string, entries: PlaylistEntry[]): PlaylistEntry[] {
+    return entries.map((entry) =>
+      ControlPlane.entryFramed(entry) && entry.sourceId
+        ? { ...entry, zoom: this.zoomFor(targetId, this.sourceKeyFor(entry.sourceId, entry.url)) }
+        : entry,
+    );
+  }
+
+  /** A resolved spec specialised to ONE target: playlist entries pick up that target's remembered
+   *  per-step zooms. Non-playlists (and target-agnostic fields like `startedAt`) pass through. */
+  private specForTarget(targetId: string, spec: ResolvedSpec): ResolvedSpec {
+    if (spec.kind !== "playlist" || spec.entries === undefined) return spec;
+    return { ...spec, entries: this.entriesWithZoom(targetId, spec.entries) };
+  }
+
+  /** The playlist surface a step-zoom request targets, or the reason there isn't one. */
+  private playlistSurfaceOf(
+    slice: ScreenSlice | undefined,
+  ): { ok: true; surface: PlaylistSurface } | { ok: false; error: "no-content" | "not-zoomable" } {
+    const surface = slice?.surfaces[0];
+    if (slice === undefined || surface === undefined) return { ok: false, error: "no-content" };
+    if (surface.type !== "playlist") return { ok: false, error: "not-zoomable" };
+    return { ok: true, surface };
+  }
+
+  /** `surface` with every framed entry resolved from `sourceId` re-stamped to `zoom`, in place in
+   *  `slice` — same surface id, same `startedAt`, so the player's rotation identity is untouched
+   *  and the live iframe (if that step is on air) restyles without a reload. */
+  private static withEntryZoom(
+    slice: ScreenSlice,
+    surface: PlaylistSurface,
+    sourceId: string,
+    zoom: number,
+  ): { slice: ScreenSlice; matched: boolean } {
+    let matched = false;
+    const items = surface.items.map((entry) => {
+      if (entry.sourceId !== sourceId || !ControlPlane.entryFramed(entry)) return entry;
+      matched = true;
+      return { ...entry, zoom };
+    });
+    return {
+      slice: { ...slice, surfaces: [{ ...surface, items }, ...slice.surfaces.slice(1)] },
+      matched,
+    };
+  }
+
+  /**
+   * Set the page zoom on ONE step of the playlist a single screen is showing (POL-133). Patches the
+   * step's entries in the EXISTING surface — same surface id, same `startedAt`, so the rotation keeps
+   * its position (the player's rotation signature ignores zoom) and, if the step is on air, the live
+   * iframe rescales without a reload. Remembered against (screen, step source), exactly like D62.
+   */
+  async setScreenPlaylistEntryZoom(
+    screenId: string,
+    sourceId: string,
+    zoom: number,
+  ): Promise<SetPlaylistEntryZoomResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const found = this.playlistSurfaceOf(this.state.slices[screenId]);
+    if (!found.ok) return { ok: false, error: found.error };
+    const patched = ControlPlane.withEntryZoom(this.state.slices[screenId]!, found.surface, sourceId, zoom);
+    if (!patched.matched) return { ok: false, error: "unknown-entry" };
+
+    this.state.slices[screenId] = patched.slice;
+    this.bumpRevision();
+
+    await this.rememberZoom(screenId, this.sourceKeyFor(sourceId, ""), zoom);
+    await this.store.upsertContent({
+      screenId,
+      canvas: patched.slice.canvas,
+      surfaces: patched.slice.surfaces,
+      sourceId: this.screenSourceIds.get(screenId) ?? null,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    const stepName = this.contentSources.get(sourceId)?.name ?? sourceId;
+    this.emit("good", `${screen.friendlyName} · ${stepName} zoom ${zoomLabel(zoom)}`);
+    return { ok: true, slices: [patched.slice] };
+  }
+
+  /**
+   * Set the page zoom on ONE step of the playlist spanning a combined surface: every member carries
+   * the same rotation, so the step re-stamps on all of them and the wall keeps reading as one page.
+   */
+  async setWallPlaylistEntryZoom(
+    wallId: string,
+    sourceId: string,
+    zoom: number,
+  ): Promise<SetPlaylistEntryZoomResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices: ScreenSlice[] = [];
+    let matchedAny = false;
+    for (const screenId of wall.memberScreenIds) {
+      const slice = this.state.slices[screenId];
+      const found = this.playlistSurfaceOf(slice);
+      if (!found.ok) {
+        if (found.error === "not-zoomable") return { ok: false, error: "not-zoomable" };
+        continue;
+      }
+      const patched = ControlPlane.withEntryZoom(slice!, found.surface, sourceId, zoom);
+      if (!patched.matched) continue;
+      matchedAny = true;
+      this.state.slices[screenId] = patched.slice;
+      slices.push(patched.slice);
+    }
+    if (slices.length === 0) return { ok: false, error: matchedAny ? "no-content" : "unknown-entry" };
+
+    this.bumpRevision();
+    await this.rememberZoom(wallId, this.sourceKeyFor(sourceId, ""), zoom);
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: this.wallSourceIds.get(wallId) ?? null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    const stepName = this.contentSources.get(sourceId)?.name ?? sourceId;
+    this.emit("good", `${wall.name ?? wall.id} · ${stepName} zoom ${zoomLabel(zoom)}`);
+    return { ok: true, slices };
+  }
+
   /**
    * Set the page zoom on a single screen's framed content. Zoom changes the surface and nothing else,
    * so we patch the EXISTING surface rather than re-resolve it: the keyed id is untouched, the player
@@ -1655,6 +2047,8 @@ export class ControlPlane {
             ? { durationSeconds: DEFAULT_PLAYLIST_ITEM_SECONDS }
             : {}),
         sourceId: step.id,
+        // POL-133 — target-agnostic default; specForTarget stamps the remembered per-step zoom in.
+        zoom: DEFAULT_ZOOM,
       });
     }
     return { kind: "playlist", url: "", entries, startedAt: new Date().toISOString() };
@@ -1915,7 +2309,8 @@ export class ControlPlane {
     const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
 
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
-    const slices = this.computeWallSlices(wall, resolved.spec, zoom);
+    // POL-133 — a playlist's framed steps pick up this wall's remembered per-step zooms.
+    const slices = this.computeWallSlices(wall, this.specForTarget(wallId, resolved.spec), zoom);
     if (slices.length === 0) return { ok: false, error: "no-placements" };
 
     // Record which library source (if any) this wall now spans, persisting the wall row.
@@ -1963,8 +2358,9 @@ export class ControlPlane {
     const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
 
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
+    // POL-133 — a playlist's framed steps pick up this screen's remembered per-step zooms.
     const surface = this.buildSurface(
-      resolved.spec,
+      this.specForTarget(screenId, resolved.spec),
       "content-web",
       { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
       undefined,
@@ -2358,7 +2754,7 @@ export class ControlPlane {
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
       const surface = this.buildSurface(
-        spec,
+        this.specForTarget(screenId, spec),
         "content-web",
         { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
         undefined,
@@ -2374,7 +2770,8 @@ export class ControlPlane {
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
       const zoom = this.zoomFor(wallId, sourceKey);
-      for (const next of this.computeWallSlices(wall, spec, zoom)) byScreen.set(next.screenId, next);
+      for (const next of this.computeWallSlices(wall, this.specForTarget(wallId, spec), zoom))
+        byScreen.set(next.screenId, next);
     }
 
     return [...byScreen.values()];
@@ -2640,6 +3037,22 @@ export class ControlPlane {
   /** POL-54 — wire the player-token minter after construction (same pattern as setTokenProvider). */
   setPlayerTokenMinter(minter: PlayerTokenMinter): void {
     this.playerTokenMinter = minter;
+  }
+
+  /** POL-119 — the current `server/apply` assignments for ONE machine, from the screen registry.
+   *  Re-pushed live when a cast toggle or a rename changes what the box's receiver should be doing,
+   *  so the agent reconciles NOW instead of on its next reconnect. Same revision: neither mutation
+   *  is render data. */
+  assignmentsFor(machineId: string): ScreenAssignment[] {
+    return this.state.screens
+      .filter((s) => s.machineId === machineId)
+      .map((s) => ({
+        connector: s.connector,
+        screenId: s.id,
+        playerUrl: this.playerUrlFor(s.id),
+        castEnabled: s.castEnabled,
+        friendlyName: s.friendlyName,
+      }));
   }
 
   /** The URL an agent points one output's browser at: base + `?screen=<id>` + the screen's bearer

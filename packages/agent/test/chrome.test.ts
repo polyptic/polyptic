@@ -18,6 +18,7 @@ import { join } from "node:path";
 import {
   buildChromeArgs,
   chromeDataDir,
+  insecurePlayerOrigin,
   matchesChromeWindow,
   selectKioskBrowser,
 } from "../src/backends/chrome";
@@ -58,6 +59,27 @@ describe("buildChromeArgs", () => {
 
   test("chromeDataDir sanitises hostile connector names and falls back to /tmp", () => {
     expect(chromeDataDir("DP 1/../x", {})).toBe("/tmp/polyptic-chrome-DP_1_.._x");
+  });
+
+  // POL-132 — the shell service worker (reload-survives-outage) needs a secure context, and netboot
+  // walls speak plain HTTP to the control plane by design (D47/D52). Exactly the player's own origin
+  // is exempted — and ONLY for http; an https deploy must not grow a needless security carve-out.
+  test("an http player origin is treated as secure so the shell service worker can register", () => {
+    expect(args).toContain("--unsafely-treat-insecure-origin-as-secure=http://localhost:5173");
+  });
+
+  test("an https player URL gets no insecure-origin exemption", () => {
+    const httpsArgs = buildChromeArgs(
+      { url: "https://walls.example.org/player/?screen=s1", connector: "DP-1", devtoolsPort: 9222 },
+      ENV,
+    );
+    expect(httpsArgs.some((a) => a.startsWith("--unsafely-treat-insecure-origin-as-secure"))).toBe(false);
+  });
+
+  test("insecurePlayerOrigin: http origin extracted, https/garbage → null", () => {
+    expect(insecurePlayerOrigin("http://10.0.0.5:8080/player/?screen=s1")).toBe("http://10.0.0.5:8080");
+    expect(insecurePlayerOrigin("https://walls.example.org/player/")).toBeNull();
+    expect(insecurePlayerOrigin("not a url")).toBeNull();
   });
 });
 

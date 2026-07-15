@@ -365,6 +365,7 @@ case "$url" in
   */builds/*/SHA256SUMS)  cp "$STUB/new-sums" "$out" ;;
   */boot/theme.txt) [ -f "$STUB/served-theme" ] || exit 22; cp "$STUB/served-theme" "$out" ;;
   */boot/logo.png)  [ -f "$STUB/served-logo" ]  || exit 22; cp "$STUB/served-logo"  "$out" ;;
+  */boot/bg.png)    [ -f "$STUB/served-bg" ]    || exit 22; cp "$STUB/served-bg"    "$out" ;;
   *) exit 22 ;;
 esac
 exit 0
@@ -384,6 +385,18 @@ EOF
 chmod +x "$BIN/uname" "$BIN/curl" "$BIN/date" "$BIN/sleep" "$BIN/systemctl"
 
 shahex() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
+
+# mk_png <out> <tag> [bad]: a minimal PNG whose header satisfies (or, with "bad", violates — an
+# interlaced image) grub-png-check.sh — signature + IHDR (8x8, 8-bit truecolour), then <tag> as
+# trailing bytes so two "versions" of a served bitmap differ in content. The heal validates every
+# fetched bitmap against the check (POL-130), so the stub server must speak real-enough PNG.
+mk_png() {
+  printf '\211PNG\r\n\032\nxxxxIHDR\000\000\000\010\000\000\000\010\010\002\000\000' > "$1"
+  if [ "${3:-}" = bad ]; then printf '\001' >> "$1"; else printf '\000' >> "$1"; fi
+  printf 'crc4%s' "$2" >> "$1"
+}
+# Binary-safe equality for the heal assertions (a `$(cat …)` would mangle PNG bytes).
+same() { cmp -s "$2" "$3" 2>/dev/null && ok "$1" || bad "$1" "files differ" "$2 vs $3"; }
 
 # new_poll_case <name> <running-id> <served-id> [medium-image-id]: a netbooted arm64 box; when a
 # 4th arg is given, a POLYPTIC-BT medium with an `a`-slot payload pinned to that image rides along.
@@ -464,12 +477,14 @@ eq "poll window: no reboot"          "" "$(cat "$d/systemctl.log" 2>/dev/null ||
 #      refresh. The theme dir does not exist on the medium beforehand.
 d="$(new_poll_case poll-theme cur-9 cur-9 cur-9)"   # up to date: heal runs, no reboot
 printf 'THEME-BODY-v1\n' > "$d/served-theme"
-printf 'LOGO-BYTES-v1\n' > "$d/served-logo"
+mk_png "$d/served-logo" logo-v1
+mk_png "$d/served-bg"   bg-v1
 eq "theme heal: medium starts theme-less" "" "$(ls "$d/vol-POLYPTIC-BT/polyptic/boot/theme" 2>/dev/null || true)"
 out="$(up "$d")"
 tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"
 eq "theme heal: theme.txt baked from the server" "THEME-BODY-v1" "$(cat "$tdir/theme.txt" 2>/dev/null)"
-eq "theme heal: logo.png baked from the server"  "LOGO-BYTES-v1" "$(cat "$tdir/logo.png" 2>/dev/null)"
+same "theme heal: logo.png baked from the server" "$d/served-logo" "$tdir/logo.png"
+same "theme heal: bg.png baked from the server (POL-130)" "$d/served-bg" "$tdir/bg.png"
 has "theme heal: logs the heal"                  "healed the offline boot splash" "$out"
 eq "theme heal: up-to-date box does not reboot"  "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
 
@@ -493,17 +508,20 @@ out="$(up "$d")"
 hasnt "theme heal: silent when server serves no theme" "healed the offline boot splash" "$out"
 eq "theme heal: no theme.txt written on 404" "" "$(cat "$d/vol-POLYPTIC-BT/polyptic/boot/theme/theme.txt" 2>/dev/null || true)"
 
-# ─── POL-87: a theme without its logo makes GRUB error on a keyboard-less screen ────────────────────
-# theme.txt references logo.png; a medium carrying one without the other paints
+# ─── POL-87/POL-130: a theme without its bitmaps makes GRUB error on a keyboard-less screen ─────────
+# theme.txt references logo.png (its image block) AND bg.png (the desktop-image GRUB 2.12's gfxmenu
+# scales at every draw); a medium carrying the theme without EITHER paints
 # "error: null src bitmap ... Press any key to continue" on every offline boot. Pinned here:
-# an already-broken stick repairs itself even when the server serves no theme, a zero-byte logo
-# counts as missing, and a torn heal can never CREATE the broken state (logo first, theme.txt last —
-# theme.txt is the commit, because it is what the GRUB guard keys on).
+# an already-broken stick repairs itself even when the server serves no theme, a zero-byte bitmap
+# counts as missing, a bg-less-but-otherwise-complete theme (every pre-POL-130 medium) counts as
+# broken, a torn heal can never CREATE the broken state (bitmaps first, theme.txt last — theme.txt
+# is the commit, because it is what the GRUB guard keys on), and a served bitmap GRUB cannot DECODE
+# is never committed at all ("file exists" is not "file loads").
 
 # 38e) orphan repair: theme.txt with NO logo.png (the pre-fix heal's torn-write legacy) is removed
 #      on the next poll — even with the server serving no theme — so the box falls back to the
 #      plain menu, which boots silently.
-d="$(new_poll_case poll-orphan cur-9 cur-9 cur-9)"   # no served-theme/served-logo → curl exits 22
+d="$(new_poll_case poll-orphan cur-9 cur-9 cur-9)"   # no served-theme/-logo/-bg → curl exits 22
 tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"; mkdir -p "$tdir"
 printf 'ORPHANED-THEME\n' > "$tdir/theme.txt"
 out="$(up "$d")"
@@ -516,13 +534,24 @@ hasnt "orphan repair: second run is silent" "removed an orphan theme.txt" "$out2
 #      hit the same null bitmap, so the orphan repair fires on it too.
 d="$(new_poll_case poll-orphan0 cur-9 cur-9 cur-9)"
 tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"; mkdir -p "$tdir"
-printf 'ORPHANED-THEME\n' > "$tdir/theme.txt"; : > "$tdir/logo.png"
+printf 'ORPHANED-THEME\n' > "$tdir/theme.txt"; : > "$tdir/logo.png"; mk_png "$tdir/bg.png" bg
 out="$(up "$d")"
 eq  "orphan repair: fires on a zero-byte logo" "" "$(cat "$tdir/theme.txt" 2>/dev/null || true)"
 
+# 38f2) POL-130: a COMPLETE-looking pre-POL-130 theme (theme.txt + logo, NO bg.png — what every
+#       fielded stick carries) is the state that reproduced on real hardware: GRUB scales a NULL
+#       desktop image and errors the moment the menu boots. The orphan repair must treat it as
+#       broken and fall back to the plain menu even when the server is unreachable.
+d="$(new_poll_case poll-orphan-nobg cur-9 cur-9 cur-9)"
+tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"; mkdir -p "$tdir"
+printf 'PRE-POL130-THEME\n' > "$tdir/theme.txt"; mk_png "$tdir/logo.png" logo
+out="$(up "$d")"
+eq  "orphan repair: fires on a missing bg.png (POL-130)" "" "$(cat "$tdir/theme.txt" 2>/dev/null || true)"
+has "orphan repair: logs the bg removal" "removed an orphan theme.txt" "$out"
+
 # 38g) torn-write ordering: if the FINAL mv dies (yanked stick, FAT error), the medium must be left
-#      WITHOUT a theme.txt — plain menu — never with a theme that references a bitmap it doesn't
-#      have. The next healthy poll completes the pair.
+#      WITHOUT a theme.txt — plain menu — never with a theme that references bitmaps it doesn't
+#      have. The next healthy poll completes the set.
 cat > "$BIN/mv" <<'EOF'
 #!/bin/sh
 if [ -f "$STUB/mv_fail_theme" ]; then
@@ -533,7 +562,8 @@ EOF
 chmod +x "$BIN/mv"
 d="$(new_poll_case poll-torn cur-9 cur-9 cur-9)"
 printf 'THEME-BODY-v1\n' > "$d/served-theme"
-printf 'LOGO-BYTES-v1\n' > "$d/served-logo"
+mk_png "$d/served-logo" logo-v1
+mk_png "$d/served-bg"   bg-v1
 : > "$d/mv_fail_theme"
 tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"
 out="$(up "$d")"
@@ -542,9 +572,28 @@ hasnt "torn heal: does not claim success"  "healed the offline boot splash" "$ou
 eq    "torn heal: no stray temp files"     "" "$(ls "$tdir" 2>/dev/null | grep '\.new$' || true)"
 rm -f "$d/mv_fail_theme"
 out2="$(up "$d")"
-eq  "torn heal: next poll completes the pair (theme)" "THEME-BODY-v1" "$(cat "$tdir/theme.txt" 2>/dev/null)"
-eq  "torn heal: next poll completes the pair (logo)"  "LOGO-BYTES-v1" "$(cat "$tdir/logo.png" 2>/dev/null)"
+eq   "torn heal: next poll completes the set (theme)" "THEME-BODY-v1" "$(cat "$tdir/theme.txt" 2>/dev/null)"
+same "torn heal: next poll completes the set (logo)"  "$d/served-logo" "$tdir/logo.png"
+same "torn heal: next poll completes the set (bg)"    "$d/served-bg" "$tdir/bg.png"
 rm -f "$BIN/mv"   # later cases must see the real mv
+
+# 38h) POL-130 "file exists is not file loads": a served bitmap grub-png-check.sh rejects (here an
+#      INTERLACED png — GRUB 2.12: "png: interlace method not supported") must never be committed.
+#      The heal skips the round entirely: no theme.txt, no partial writes, no success log.
+d="$(new_poll_case poll-badpng cur-9 cur-9 cur-9)"
+printf 'THEME-BODY-v1\n' > "$d/served-theme"
+mk_png "$d/served-logo" logo-v1 bad
+mk_png "$d/served-bg"   bg-v1
+tdir="$d/vol-POLYPTIC-BT/polyptic/boot/theme"
+out="$(up "$d")"
+eq    "bad-png heal: no theme.txt committed"      "" "$(cat "$tdir/theme.txt" 2>/dev/null || true)"
+eq    "bad-png heal: no logo committed"           "" "$(ls "$tdir" 2>/dev/null || true)"
+hasnt "bad-png heal: does not claim success"      "healed the offline boot splash" "$out"
+# …and the same round starts healing again the moment the server serves a decodable bitmap.
+mk_png "$d/served-logo" logo-v1
+out2="$(up "$d")"
+has  "bad-png heal: recovers once the served png is decodable" "healed the offline boot splash" "$out2"
+same "bad-png heal: bg.png committed after recovery" "$d/served-bg" "$tdir/bg.png"
 
 # ─── wifi-diagnostics.sh: the keyboard-less failure report (POL-77) ──────────────────────────────────
 # When association can't start the hook writes this report to the medium so a screen with no keyboard

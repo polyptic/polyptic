@@ -9,6 +9,10 @@
 # Secure Boot stays ON end to end. Output into deploy/dist/boot/:
 #   shimx64.efi grubx64.efi shimaa64.efi grubaa64.efi   the signed loaders (offload + UEFI HTTP Boot)
 #   polyptic-boot.img                                   UNIVERSAL dd-able FAT32 medium (amd64 AND arm64)
+#   polyptic-boot.json                                  its SIDECAR MANIFEST (POL-122): lean or full, the
+#                                                       arches + image ids baked in, whether a token is
+#                                                       baked. The server parses it so the console can
+#                                                       say what the download actually is.
 # The server serves these UNGATED at GET /dist/boot/<file> and links the .img from Console > Settings >
 # Onboard Screens (Download bootloader).
 #
@@ -42,8 +46,19 @@
 #   POLYPTIC_BASE=http://10.0.0.5:8080 POLYPTIC_TOKEN=fleet-token deploy/build-boot-medium.sh
 #     env: POLYPTIC_BASE   (required) PLAIN http; baked into stage 1 AND the local menu
 #          POLYPTIC_TOKEN  (recommended) enrolment token for the LOCAL menu; without it the local
-#                          path only enrols on an OPEN-enrolment control plane (loud warning)
-#          LEAN=1          old v1 behavior: tiny, tokenless, network-only (no payload, no Wi-Fi)
+#                          path only enrols on an OPEN-enrolment control plane (loud warning).
+#                          POL-104: a deployment now holds SEVERAL named tokens and exactly one is
+#                          flagged "On new media" in Console ▸ Settings ▸ Enrolment tokens — that is
+#                          the one `/boot/grub.cfg` bakes, and the helm bake Job lifts it straight out
+#                          of that menu, so the medium picks up the operator's choice with no change
+#                          here. Pass POLYPTIC_TOKEN explicitly to bake a DIFFERENT token (e.g. a
+#                          short-lived, capped batch token cut for one site's sticks).
+#          LEAN=1          ESCAPE HATCH, opt-in only (POL-122): the old v1 medium — tiny, tokenless,
+#                          WIRED-ONLY (no payload, no Wi-Fi). Nothing selects it automatically any
+#                          more (the helm Job used to, on a fresh install, and quietly shipped every
+#                          new deployment a stick that boots no Wi-Fi screen). Pass it only when you
+#                          genuinely want a wired-only dongle; the manifest marks it `lean` and the
+#                          console says so out loud.
 #          IMAGE_DIR_BASE  where per-arch payloads live (default deploy/dist/image; an arch missing
 #                          locally is fetched from POLYPTIC_BASE's depot, else skipped)
 #          POLYPTIC_WIFI_SSID/POLYPTIC_WIFI_PSK  bake simple PSK credentials (else an editable
@@ -228,6 +243,8 @@ LOCALCFG
   HAVE_THEME=0
   THEME_SRC="$REPO_ROOT/packages/server/assets/boot-theme.txt"
   LOGO_SRC="$REPO_ROOT/packages/server/assets/boot-logo.png"
+  BG_SRC="$REPO_ROOT/packages/server/assets/boot-bg.png"
+  PNG_CHECK="$REPO_ROOT/deploy/live/usr/local/lib/polyptic/grub-png-check.sh"
   mkdir -p "$WORK/theme"
   if [ ! -f "$THEME_SRC" ]; then
     rm -rf "$WORK/theme"
@@ -235,10 +252,25 @@ LOCALCFG
   elif [ ! -f "$LOGO_SRC" ]; then
     rm -rf "$WORK/theme"
     echo "==> Boot theme: missing $LOGO_SRC (run 'bun deploy/render-boot-logo.ts') — offline menu will be plain (still boots)" >&2
+  elif [ ! -f "$BG_SRC" ]; then
+    rm -rf "$WORK/theme"
+    echo "==> Boot theme: missing $BG_SRC (run 'bun deploy/render-boot-theme.ts') — offline menu will be plain (still boots)" >&2
   else
-    # Logo first, theme.txt last (POL-87 discipline shared by every theme writer): theme.txt is the
-    # file the GRUB guard keys on, so its bitmap must exist before it at every instant.
+    # A PNG that EXISTS but that GRUB 2.12's decoder cannot LOAD (interlaced, greyscale, palette,
+    # torn) passes every file-exists guard and still paints "error: null src bitmap ... Press any
+    # key to continue" on the wall (POL-130). That is a repo/asset bug, so it FAILS the build with
+    # a message naming the file — a medium that errors on the glass must be unbuildable, and a
+    # silently-plain medium would hide the defect (POL-121's lesson about quiet degradation).
+    for png in "$LOGO_SRC" "$BG_SRC"; do
+      if ! sh "$PNG_CHECK" "$png"; then
+        echo "build-boot-medium: $png is not a PNG GRUB can decode (needs 8/16-bit truecolour, non-interlaced — see deploy/live/usr/local/lib/polyptic/grub-png-check.sh). Regenerate it: bun deploy/render-boot-logo.ts && bun deploy/render-boot-theme.ts" >&2
+        exit 1
+      fi
+    done
+    # Bitmaps first, theme.txt last (POL-87 discipline shared by every theme writer): theme.txt is
+    # the file the GRUB guard keys on, so everything it references must exist before it, always.
     cp "$LOGO_SRC"  "$WORK/theme/logo.png"
+    cp "$BG_SRC"    "$WORK/theme/bg.png"
     cp "$THEME_SRC" "$WORK/theme/theme.txt"
     HAVE_THEME=1
     echo "==> Boot theme: baked from committed repo assets (offline menu shows the branded splash)"
@@ -246,6 +278,9 @@ LOCALCFG
 fi
 
 IMG="$DIST/polyptic-boot.img"
+MANIFEST="$DIST/polyptic-boot.json"
+BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+MEDIUM_ID="medium-$(date -u +%Y%m%dT%H%M%SZ)-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 echo "==> Assembling the universal FAT32 medium -> $IMG"
 # FAT32 needs >= 65,525 data clusters or a spec-strict UEFI FAT driver (EDK2/OVMF, incl. arm64 UTM
 # VMs) counts clusters, decides FAT16, misreads the BPB, and never finds \EFI\BOOT\<name> — the USB
@@ -280,7 +315,7 @@ if [ "$LEAN" != "1" ]; then
   mmd   -i "$IMG" ::/polyptic ::/polyptic/boot
   mcopy -i "$IMG" "$WORK/local.cfg" ::/grub/local.cfg
   # The marker find-boot-medium.sh trusts (identity by CONTENT, the label is just the fast path).
-  printf 'medium-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$WORK/medium-id"
+  printf '%s\n' "$MEDIUM_ID" > "$WORK/medium-id"
   mcopy -i "$IMG" "$WORK/medium-id" ::/polyptic/medium-id
   mcopy -i "$IMG" "$WORK/wifi.conf" ::/polyptic/wifi.conf
   if [ -n "${POLYPTIC_WIFI_CERTS:-}" ]; then
@@ -296,16 +331,39 @@ if [ "$LEAN" != "1" ]; then
     mcopy -i "$IMG" "$ird" "::/polyptic/boot/$arch/a/initrd"
   done
   # The offline splash theme (POL-74), at the path render-local-grub.sh points `set theme=` at.
+  # Bitmaps before theme.txt, same POL-87 ordering as every other writer.
   if [ "${HAVE_THEME:-0}" = 1 ]; then
     mmd   -i "$IMG" ::/polyptic/boot/theme
-    mcopy -i "$IMG" "$WORK/theme/theme.txt" ::/polyptic/boot/theme/theme.txt
     mcopy -i "$IMG" "$WORK/theme/logo.png"  ::/polyptic/boot/theme/logo.png
+    mcopy -i "$IMG" "$WORK/theme/bg.png"    ::/polyptic/boot/theme/bg.png
+    mcopy -i "$IMG" "$WORK/theme/theme.txt" ::/polyptic/boot/theme/theme.txt
   fi
 fi
 
+# ── The sidecar manifest: the medium describes itself (POL-122/D110) ─────────────────────────────
+# A lean medium and a full one wear the SAME filename at the SAME URL. Without this, nothing
+# downstream — server, console, operator — can tell which one it just downloaded, and a wired-only
+# stick gets flashed for a Wi-Fi screen that then never boots. The server parses this file (zod,
+# at the edge) and the console says what the download actually is. It rides to the depot with the
+# image: the boot-medium Job copies deploy/dist/boot/* wholesale.
+MANIFEST_PAIRS=()
+if [ "$LEAN" != "1" ]; then
+  for arch in "${PAYLOAD_ARCHES[@]}"; do
+    eval "iid=\$PAYLOAD_IID_$arch"
+    MANIFEST_PAIRS+=("$arch:$iid")
+  done
+fi
+sh "$HERE/write-boot-manifest.sh" "$MANIFEST" \
+  "$([ "$LEAN" = "1" ] && echo 1 || echo 0)" \
+  "$MEDIUM_ID" "$BUILT_AT" \
+  "$([ "$LEAN" != "1" ] && [ -n "${POLYPTIC_TOKEN:-}" ] && echo 1 || echo 0)" \
+  "$(wc -c < "$IMG" | tr -d '[:space:]')" \
+  "${MANIFEST_PAIRS[@]+"${MANIFEST_PAIRS[@]}"}"
+echo "==> Manifest -> $MANIFEST ($([ "$LEAN" = "1" ] && echo "LEAN, wired-only" || echo "full: ${PAYLOAD_ARCHES[*]}"))"
+
 echo
 echo "==> Done. Point BOOT_DIST_DIR at $DIST/ ; the server serves GET /dist/boot/<file>:"
-ls -1 "$DIST"/polyptic-boot.img "$DIST"/shim*.efi "$DIST"/grub*.efi
+ls -1 "$DIST"/polyptic-boot.img "$DIST"/polyptic-boot.json "$DIST"/shim*.efi "$DIST"/grub*.efi
 if [ "$LEAN" = "1" ]; then
   cat <<EOF
 

@@ -28,8 +28,11 @@ const screenCount = computed(() => store.screens.length);
 const librarySources = computed(() => store.sources);
 const pickedSourceId = computed(() => store.pickedSourceId);
 
-/** Arm a library source for click-to-assign: click it, then click a screen/wall on the canvas. */
+/** Arm a library source for click-to-assign: click it, then click a screen/wall on the canvas.
+ *  POL-107 — a VIEWER may not assign content (the server 403s `PUT /screens/:id/content`), so the
+ *  library is read-only for it: nothing arms, nothing drags. */
 function pickSource(id: string) {
+  if (!store.canAuthor) return;
   store.pickSource(id);
 }
 
@@ -43,6 +46,10 @@ const alertColor = computed(() => (alerts.value > 0 ? "var(--warn)" : "var(--ok)
 
 /** Drag a library source onto a screen/surface to assign it (distinct DnD type from screen placement). */
 function onSourceDragStart(e: DragEvent, id: string) {
+  if (!store.canAuthor) {
+    e.preventDefault(); // a viewer's drag never starts — it could only end in a 403
+    return;
+  }
   store.beginSourceDrag(id); // the drop reads this (store), not the unreliable dataTransfer.getData
   if (!e.dataTransfer) return;
   e.dataTransfer.setData("application/x-polyptic-source", id);
@@ -85,7 +92,7 @@ function onSourceDragStart(e: DragEvent, id: string) {
             class="lib-item"
             :class="{ armed: pickedSourceId === s.id }"
             :title="s.url"
-            draggable="true"
+            :draggable="store.canAuthor"
             @click="pickSource(s.id)"
             @dragstart="onSourceDragStart($event, s.id)"
             @dragend="store.endSourceDrag()"

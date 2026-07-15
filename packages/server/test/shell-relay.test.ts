@@ -108,6 +108,26 @@ describe("ShellRelay gating (POL-59)", () => {
     expect(Buffer.from(admin.last().dataBase64, "base64").toString()).toBe("hello");
   });
 
+  test("a resize reaches the PTY with the operator's exact cols×rows (POL-131)", async () => {
+    // The console fits xterm to whole cells and sends THAT grid; the relay must pass it through
+    // verbatim so `stty size` on the box agrees with what the operator can see.
+    await control.setShellEnabled("box-1", true);
+    const admin = new FakeSocket();
+    relay.openFromAdmin(admin as unknown as WebSocket, "box-1", 113, 41);
+    const sessionId = lastToAgent().sessionId as string;
+    expect(lastToAgent()).toMatchObject({ t: "server/shell-open", cols: 113, rows: 41 });
+    relay.openedFromAgent("box-1", sessionId, true);
+
+    relay.resizeFromAdmin(admin as unknown as WebSocket, "box-1", sessionId, 109, 40);
+    expect(lastToAgent()).toMatchObject({ t: "server/shell-resize", sessionId, cols: 109, rows: 40 });
+
+    // Another operator's socket cannot resize this session.
+    agentSock.sent = [];
+    const b = new FakeSocket();
+    relay.resizeFromAdmin(b as unknown as WebSocket, "box-1", sessionId, 10, 10);
+    expect(agentSock.sent).toHaveLength(0);
+  });
+
   test("disarming closes a live session on both sides", async () => {
     await control.setShellEnabled("box-1", true);
     const admin = new FakeSocket();
