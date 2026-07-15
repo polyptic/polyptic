@@ -79,6 +79,25 @@ describe("resolveAgentMtlsEnv — default ON, explicit escape hatches", () => {
     expect(cfg.publicUrl).toBe("wss://walls.example:8443");
     expect(cfg.sans).toEqual(["walls.example", "10.0.0.5"]);
   });
+
+  // POL-143 — the box dials the ADVERTISED port (a NodePort on stock K3s), not the pod's bind port.
+  test("AGENT_MTLS_ADVERTISE_PORT is parsed when set, and left undefined when not (advertise the bind port)", () => {
+    expect(resolveAgentMtlsEnv({ AGENT_MTLS_ADVERTISE_PORT: "30843" }).advertisePort).toBe(30843);
+    expect(resolveAgentMtlsEnv({}).advertisePort).toBeUndefined();
+    expect(resolveAgentMtlsEnv({ AGENT_MTLS_ADVERTISE_PORT: "" }).advertisePort).toBeUndefined();
+    // The bind port is independent of the advertised one: bind :8443 in the pod, dial :30843.
+    const cfg = resolveAgentMtlsEnv({ AGENT_MTLS_PORT: "8443", AGENT_MTLS_ADVERTISE_PORT: "30843" });
+    expect(cfg.port).toBe(8443);
+    expect(cfg.advertisePort).toBe(30843);
+  });
+
+  test("an unparseable AGENT_MTLS_ADVERTISE_PORT is FATAL — a wrong dial address would strand the fleet", () => {
+    for (const v of ["abc", "-1", "0", "1.5", "99999", "30843x"]) {
+      expect(() => resolveAgentMtlsEnv({ AGENT_MTLS_ADVERTISE_PORT: v })).toThrow(
+        /AGENT_MTLS_ADVERTISE_PORT is not a valid port/,
+      );
+    }
+  });
 });
 
 // ── mtlsStartupFailureIsFatal (finding: required must never silently degrade) ─

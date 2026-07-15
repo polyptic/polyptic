@@ -12,6 +12,7 @@
 import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
+  BootOrderPolicy,
   ActivityEvent,
   AudioIntent,
   AuthUser,
@@ -159,6 +160,9 @@ export interface ConsoleState {
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
+  /** The fleet's UEFI boot-order policy (POL-115) — may a box put its own entry back at the head of
+   *  BootOrder when firmware displaces it? Null until Settings fetches it; the safe read is `false`. */
+  bootOrder: BootOrderPolicy | null;
   /** POL-101 — the deployment's panel-hours timezone, mirrored from admin/state.panelPower. Optional
    *  on the wire (an older server omits it) → null until the first snapshot that carries it. */
   panelPower: PanelPowerConfig | null;
@@ -232,6 +236,7 @@ export const useConsoleStore = defineStore("console", {
     netboot: null,
     imageUpdates: null,
     settings: null,
+    bootOrder: null,
     panelPower: null,
     connected: false,
     stateReceived: false,
@@ -495,6 +500,7 @@ export const useConsoleStore = defineStore("console", {
         dashboard: [],
         image: [],
         video: [],
+        stream: [],
         playlist: [],
         page: [],
         deck: [],
@@ -815,6 +821,29 @@ export const useConsoleStore = defineStore("console", {
         this.settings = await auth.getDisplaySettings();
       } catch (err) {
         console.error("[console] fetchDisplaySettings failed", err);
+      }
+    },
+
+    /** The fleet's UEFI boot-order policy (POL-115). Report-only until the operator opts in. */
+    async fetchBootOrderPolicy(): Promise<void> {
+      try {
+        this.bootOrder = await auth.getBootOrderPolicy();
+      } catch (err) {
+        console.error("[console] fetchBootOrderPolicy failed", err);
+      }
+    },
+
+    /** Opt the fleet in (or out) of self-healing its UEFI boot order. Optimistic; reverts + rethrows
+     *  on failure, because "the boxes may now write firmware NVRAM" must never be shown unless true. */
+    async setBootOrderReassert(reassert: boolean): Promise<void> {
+      const previous = this.bootOrder;
+      this.bootOrder = { reassert };
+      try {
+        this.bootOrder = await auth.updateBootOrderPolicy(reassert);
+      } catch (err) {
+        this.bootOrder = previous;
+        console.error("[console] setBootOrderReassert failed", err);
+        throw err;
       }
     },
 
@@ -1403,6 +1432,25 @@ export const useConsoleStore = defineStore("console", {
       } catch (err) {
         if (screen) screen.castEnabled = !enabled; // revert
         console.error("[console] setScreenCast failed", err);
+      }
+    },
+
+    /**
+     * Replace one screen's template variables (POL-111). Whole-map semantics — the Inspector edits a
+     * small table and sends it entire. Optimistic like the cast toggle; the authoritative admin/state
+     * broadcast reconciles (and brings the recomputed `unresolvedVariables` warning list with it).
+     * Throws on rejection so the Inspector can show WHY (an invalid key/value is a 400, not a shrug).
+     */
+    async setScreenVariables(screenId: string, variables: Record<string, string>): Promise<void> {
+      const screen = this.screenById(screenId);
+      const previous = screen ? { ...screen.variables } : undefined;
+      if (screen) screen.variables = { ...variables }; // optimistic
+      try {
+        await api.setScreenVariables(screenId, variables);
+      } catch (err) {
+        if (screen && previous) screen.variables = previous; // revert
+        console.error("[console] setScreenVariables failed", err);
+        throw err;
       }
     },
 

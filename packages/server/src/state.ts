@@ -36,6 +36,7 @@ import {
   SceneDiff,
   Schedule,
   SchedulerSettings,
+  StreamSurface,
   VideoSurface,
   VideoWall,
   WebSurface,
@@ -57,6 +58,7 @@ import type {
   CreateContentSourceBody,
   PlaylistEntry,
   PlaylistItem,
+  BootOrderPolicy,
   CreateCredentialProfileBody,
   CredentialProfileView,
   Deck,
@@ -87,7 +89,9 @@ import type {
   SceneDiffContent,
   SceneDiffEntry,
   Screen,
+  PageElement,
   ScreenSlice,
+  ScreenVariables,
   SourceUsage,
   Surface,
   UpdateContentSourceBody,
@@ -105,6 +109,8 @@ import type {
 } from "./store/types";
 import type { TokenService } from "./tokens";
 import type { ActivityLog } from "./activity";
+// POL-111 — per-screen template variables, substituted at SEND time (never persisted). See templates.ts.
+import { buildScope, substituteText, substituteUrl, unresolvedIn, type VariableScope } from "./templates";
 import { matchPreRegistration, normalizeMac } from "./preregistration";
 import type { PreRegistrationMatch } from "./preregistration";
 
@@ -559,6 +565,10 @@ export class ControlPlane {
    *  at the env default; `init()` loads any persisted operator override on top. */
   private displaySettings: DisplaySettings = { showBadges: DEFAULT_SHOW_BADGES };
 
+  /** POL-115 — the fleet's UEFI boot-order policy. Report-only until an operator opts in, so a fleet
+   *  that never touches this setting NEVER writes a firmware boot variable. `init()` loads the override. */
+  private bootOrderPolicy: BootOrderPolicy = { reassert: false };
+
   /** POL-101 — the zone every panel-hours window is read in. Defaults to the SERVER's zone purely so
    *  the console's picker opens somewhere sane; an operator's save makes it explicit and persisted. */
   private panelTimezone: string = defaultTimezone();
@@ -584,7 +594,7 @@ export class ControlPlane {
   private suppressEmit = false;
 
   /** Push a Live Activity line if a log is wired (no-op otherwise). Never throws into a mutation. */
-  private emit(severity: "info" | "good" | "warn" | "bad", text: string): void {
+  private emit(severity: "info" | "good" | "warn" | "bad" | "accent", text: string): void {
     if (this.suppressEmit) return;
     this.activity?.push(severity, text);
   }
@@ -676,6 +686,7 @@ export class ControlPlane {
         machineId: s.machineId,
         connector: s.connector,
         castEnabled: s.castEnabled ?? false,
+        variables: s.variables ?? {},
       });
     }
 
@@ -924,6 +935,10 @@ export class ControlPlane {
     const persistedSettings = await this.store.getDisplaySettings();
     if (persistedSettings) this.displaySettings = { showBadges: persistedSettings.showBadges };
 
+    // POL-115 — absent an operator opt-in, boxes report boot-order drift and write nothing.
+    const persistedBootOrder = await this.store.getBootOrderPolicy();
+    if (persistedBootOrder) this.bootOrderPolicy = { reassert: persistedBootOrder.reassert };
+
     // POL-101 — panel hours. Absent until an operator sets one, in which case every wall runs 24/7,
     // exactly as it did before this feature existed. The default zone is the server's own only as a
     // starting value for the console's picker; the moment an operator saves, the choice is explicit.
@@ -1031,6 +1046,7 @@ export class ControlPlane {
           machineId,
           connector: output.connector,
           castEnabled: false,
+          variables: {},
         } satisfies Screen;
         this.state.screens.push(screen);
         const slice: ScreenSlice = {
@@ -1112,16 +1128,23 @@ export class ControlPlane {
     return true;
   }
 
+  /** Write-through ONE screen row (the whole registry row — name, cast toggle, POL-111 variables).
+   *  Every screen mutation funnels through here so no field can be silently dropped by a caller. */
+  private async persistScreen(screen: Screen): Promise<void> {
+    await this.store.upsertScreen({
+      id: screen.id,
+      friendlyName: screen.friendlyName,
+      machineId: screen.machineId,
+      connector: screen.connector,
+      castEnabled: screen.castEnabled,
+      variables: screen.variables,
+    });
+  }
+
   /** Write-through newly created screens + their (empty) content rows, and drop any pruned ones. */
   private async persistScreens(result: EnsureScreensResult): Promise<void> {
     for (const s of result.newScreens) {
-      await this.store.upsertScreen({
-        id: s.id,
-        friendlyName: s.friendlyName,
-        machineId: s.machineId,
-        connector: s.connector,
-        castEnabled: s.castEnabled,
-      });
+      await this.persistScreen(s);
     }
     for (const slice of result.touchedSlices) {
       await this.store.upsertContent({
@@ -1641,6 +1664,29 @@ export class ControlPlane {
     return this.getDisplaySettings();
   }
 
+  /** The fleet's UEFI boot-order policy (POL-115). Served to boxes at `GET /boot/policy`. */
+  getBootOrderPolicy(): BootOrderPolicy {
+    return { ...this.bootOrderPolicy };
+  }
+
+  /**
+   * Set + persist the fleet's UEFI boot-order policy (POL-115). Nothing is pushed anywhere: boxes
+   * READ the policy on their own 5-minute poll, so the control plane never has to reach into a box
+   * to make it edit firmware NVRAM — a box only ever writes its own boot order, on its own schedule,
+   * having just asked whether it may. The flip is loud in the activity feed, both ways.
+   */
+  async setBootOrderPolicy(next: BootOrderPolicy): Promise<BootOrderPolicy> {
+    this.bootOrderPolicy = { reassert: next.reassert };
+    await this.store.setBootOrderPolicy({ reassert: next.reassert });
+    this.emit(
+      "accent",
+      next.reassert
+        ? "Boxes may now put themselves back at the head of their UEFI boot order when firmware displaces them"
+        : "Boxes will now only REPORT UEFI boot-order drift — no boot variable will be written",
+    );
+    return this.getBootOrderPolicy();
+  }
+
   /**
    * Replace a screen's surfaces wholesale, bump the revision, write-through, return the new slice.
    * Returns null if the screen is unknown.
@@ -1711,13 +1757,7 @@ export class ControlPlane {
     const previousName = screen.friendlyName;
     screen.friendlyName = friendlyName;
 
-    await this.store.upsertScreen({
-      id: screen.id,
-      friendlyName: screen.friendlyName,
-      machineId: screen.machineId,
-      connector: screen.connector,
-      castEnabled: screen.castEnabled,
-    });
+    await this.persistScreen(screen);
     if (previousName !== friendlyName) this.emit("info", `${previousName} renamed`);
     return screen;
   }
@@ -1756,16 +1796,82 @@ export class ControlPlane {
     if (screen === undefined) return null;
     if (screen.castEnabled !== enabled) {
       screen.castEnabled = enabled;
-      await this.store.upsertScreen({
-        id: screen.id,
-        friendlyName: screen.friendlyName,
-        machineId: screen.machineId,
-        connector: screen.connector,
-        castEnabled: enabled,
-      });
+      await this.persistScreen(screen);
       this.emit("info", `Casting ${enabled ? "enabled" : "disabled"} on ${screen.friendlyName}`);
     }
     return screen;
+  }
+
+  // ── Per-screen template variables (POL-111) ─────────────────────────────────
+  //
+  // Local flavour without duplicated sources: a screen carries a small key/value map, and content it
+  // is sent gets `{{placeholder}}` tokens substituted from that map (plus the built-ins) at SEND time
+  // — `decorateSliceForSend`, exactly where POL-24 stamps credential tokens, and under exactly the
+  // same rule: the DB and the stored slices keep the CLEAN, tokenised value. Substituting on the way
+  // in would fossilise fifty copies of one source, which is the problem this feature exists to kill.
+
+  /**
+   * Replace a screen's variable map (whole-map semantics). Registry metadata like a rename: it does
+   * NOT bump the revision (the slice itself is unchanged — only its send-time decoration is), so the
+   * caller re-pushes the SAME revision and the player DOM-diffs the new text/URL in place. No reload.
+   * Returns the updated screen, or null if unknown.
+   */
+  async setScreenVariables(screenId: string, variables: ScreenVariables): Promise<Screen | null> {
+    const screen = this.state.screens.find((s) => s.id === screenId);
+    if (screen === undefined) return null;
+    screen.variables = { ...variables };
+    await this.persistScreen(screen);
+    const count = Object.keys(screen.variables).length;
+    this.emit("info", `${screen.friendlyName}: ${count} variable${count === 1 ? "" : "s"} set`);
+    return screen;
+  }
+
+  /** The scope one screen's content resolves against: built-ins + its own variables (D133). */
+  private scopeForScreen(screenId: string): VariableScope | undefined {
+    const screen = this.getScreen(screenId);
+    if (!screen) return undefined;
+    return buildScope(screen, this.getMachine(screen.machineId));
+  }
+
+  /**
+   * Placeholders the content STORED for a screen uses that resolve to nothing in its scope — the
+   * console's warning badge (they render as empty on the glass, never as literal braces). Read off the
+   * clean slice, which is the only place templates ever live.
+   */
+  unresolvedVariablesFor(screenId: string): string[] {
+    const scope = this.scopeForScreen(screenId);
+    const slice = this.state.slices[screenId];
+    if (!scope || !slice) return [];
+    return unresolvedIn(this.templateStringsOf(slice), scope);
+  }
+
+  /** Every operator-authored string on a slice that substitution looks at (URLs + on-glass text) —
+   *  including the library URL behind a page embed, which is resolved (and substituted) at send time. */
+  private *templateStringsOf(slice: ScreenSlice): Iterable<string> {
+    for (const surface of slice.surfaces) {
+      switch (surface.type) {
+        case "web":
+        case "dashboard":
+          yield surface.url;
+          break;
+        case "playlist":
+          for (const item of surface.items) yield item.url;
+          break;
+        case "page":
+          for (const el of surface.definition.elements) {
+            if (el.kind === "text" || el.kind === "ticker") yield el.props.text;
+            else if (el.kind === "countdown") yield el.props.label;
+            else if (el.kind === "embed") {
+              if (el.props.url) yield el.props.url;
+              const src = el.props.sourceId ? this.contentSources.get(el.props.sourceId) : undefined;
+              if (src?.url) yield src.url;
+            }
+          }
+          break;
+        default:
+          break;
+      }
+    }
   }
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────
@@ -2086,9 +2192,11 @@ export class ControlPlane {
           ? "Image"
           : kind === "video"
             ? "Video"
-            : kind === "playlist"
-              ? "Playlist"
-              : "Page";
+            : kind === "stream"
+              ? "Live stream"
+              : kind === "playlist"
+                ? "Playlist"
+                : "Page";
   }
 
   /** A human content name for an activity line: the library source's name, else the ad-hoc URL's host. */
@@ -2167,6 +2275,11 @@ export class ControlPlane {
         });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
+      case "stream":
+        // POL-108 — a LIVE source. No loop (it never ends) and no zoom (there is no page to zoom);
+        // the player mounts its own stream engine on it. `protocol` is the vendor-neutral seam: hls
+        // today, whep declared. An RTSP camera is restreamed to HLS OUTSIDE the control plane.
+        return StreamSurface.parse({ ...base, type: "stream", url: spec.url, protocol: "hls" });
       case "video": {
         // POL-109 — the ingest's poster frame rides along, so the panel paints the video's own first
         // frame while it buffers instead of a black rectangle. Absent for a linked/unprobed video.
@@ -2633,6 +2746,8 @@ export class ControlPlane {
         url,
         durationSeconds: deck?.dwellSeconds ?? DEFAULT_PLAYLIST_ITEM_SECONDS,
         sourceId: source.id,
+        // POL-133 — image pages carry no zoom; the target-agnostic default keeps the entry shape whole.
+        zoom: DEFAULT_ZOOM,
       }));
       return { kind: "playlist", url: "", entries, startedAt: new Date().toISOString() };
     }
@@ -2649,10 +2764,20 @@ export class ControlPlane {
     const entries: PlaylistEntry[] = [];
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
-      // A deck is itself a rotation — a playlist cannot nest one (same rule, same reason, as a
-      // playlist inside a playlist). Authoring-time validation refuses it; this is the belt.
-      if (!step || step.kind === "playlist" || step.kind === "page" || step.kind === "deck") continue;
-      if (!step.url) continue;
+      // POL-108 — a `stream` is not a playlist step: rotating a live feed away and back re-negotiates
+      // the stream every cycle for no operator value, and a live source has no meaningful "duration".
+      // POL-114 — a `deck` is itself a rotation, so a playlist cannot nest one (same rule, same reason,
+      // as a playlist inside a playlist). Both skipped here (as `page` already is) so a drifted
+      // authoring never ships an unrenderable entry. Authoring-time validation refuses them; this is the belt.
+      if (
+        !step ||
+        step.kind === "playlist" ||
+        step.kind === "page" ||
+        step.kind === "stream" ||
+        step.kind === "deck" ||
+        !step.url
+      )
+        continue;
       // POL-109 — a video step carries its ingest poster, so each step of a rotation pre-paints its
       // own first frame rather than flashing black on every advance.
       const poster = step.kind === "video" ? this.mediaFor(step.url)?.posterUrl : undefined;
@@ -3430,7 +3555,9 @@ export class ControlPlane {
    * Authoring-time validation of a playlist's items (POL-34): every step must reference an EXISTING,
    * NON-PLAYLIST source (playlists cannot nest — the player would otherwise need a rotation stack and
    * the console a cycle detector, for no operator value), and any step whose content never ends by
-   * itself (everything but video) must say how long it holds the screen.
+   * itself (everything but video) must say how long it holds the screen. POL-108: a LIVE stream is
+   * rejected outright rather than silently dropped — an operator who put a camera in a carousel has
+   * misunderstood the kind, and a wall that quietly skips a step teaches them nothing.
    */
   private validatePlaylistItems(
     items: PlaylistItem[],
@@ -3438,7 +3565,7 @@ export class ControlPlane {
     | { ok: true }
     | {
         ok: false;
-        error: "unknown-item-source" | "nested-playlist" | "item-needs-duration";
+        error: "unknown-item-source" | "nested-playlist" | "live-stream-step" | "item-needs-duration";
         itemSourceId: string;
       } {
     for (const item of items) {
@@ -3448,6 +3575,8 @@ export class ControlPlane {
       // playlist does. Same error, because it is the same mistake.
       if (step.kind === "playlist" || step.kind === "deck")
         return { ok: false, error: "nested-playlist", itemSourceId: item.sourceId };
+      if (step.kind === "stream")
+        return { ok: false, error: "live-stream-step", itemSourceId: item.sourceId };
       if (step.kind !== "video" && item.durationSeconds === undefined)
         return { ok: false, error: "item-needs-duration", itemSourceId: item.sourceId };
     }
@@ -3462,7 +3591,12 @@ export class ControlPlane {
     | { ok: true; source: ContentSource }
     | {
         ok: false;
-        error: "unknown-profile" | "unknown-item-source" | "nested-playlist" | "item-needs-duration";
+        error:
+          | "unknown-profile"
+          | "unknown-item-source"
+          | "nested-playlist"
+          | "live-stream-step"
+          | "item-needs-duration";
         itemSourceId?: string;
       }
   > {
@@ -3561,6 +3695,7 @@ export class ControlPlane {
           | "invalid-shape"
           | "unknown-item-source"
           | "nested-playlist"
+          | "live-stream-step"
           | "item-needs-duration";
         itemSourceId?: string;
       }
@@ -4138,17 +4273,35 @@ export class ControlPlane {
       };
     }
 
+    // POL-111 — the receiving screen's variable scope. Built FIRST, because every url/text below is a
+    // TEMPLATE until it is resolved against this screen: substitute, THEN stamp credentials (so the
+    // token is never fed through an encoder) and THEN resolve page data.
+    const scope = this.scopeForScreen(slice.screenId);
+
     // POL-42 — page surfaces get their live half stamped in: resolved (credential-stamped) embeds,
     // resolved image sources, and the poller's last-good feed/weather data. Independent of the
     // framed-content token stamp below, which needs the slice's own source to carry a profile.
+    // POL-111 — the page's authored TEXT (text/ticker/countdown) is substituted into the copy's
+    // definition here; the stored definition keeps its `{{placeholders}}`.
     let decorated: ScreenSlice = slice.surfaces.some((s) => s.type === "page")
       ? {
           ...slice,
           surfaces: slice.surfaces.map((surface) =>
-            surface.type === "page" ? { ...surface, data: this.buildPageData(surface.definition) } : surface,
+            surface.type === "page"
+              ? {
+                  ...surface,
+                  definition: scope
+                    ? ControlPlane.substitutePage(surface.definition, scope)
+                    : surface.definition,
+                  data: this.buildPageData(surface.definition, scope),
+                }
+              : surface,
           ),
         }
       : slice;
+
+    // POL-111 — variable substitution into the framed/media URLs of the send-time COPY.
+    if (scope) decorated = ControlPlane.substituteSliceUrls(decorated, scope);
 
     if (!this.tokenProvider) return decorated;
     const wall = this.getWallForScreen(slice.screenId);
@@ -4176,6 +4329,84 @@ export class ControlPlane {
     return changed ? { ...decorated, surfaces } : decorated;
   }
 
+  /**
+   * POL-111 — substitute the screen's variables into every URL a slice renders (web/dashboard/media
+   * surfaces + playlist entries). Values are percent-encoded by `substituteUrl`, so a value can never
+   * introduce a scheme, a parameter or a quote. Returns the same object when nothing had a token.
+   */
+  private static substituteSliceUrls(slice: ScreenSlice, scope: VariableScope): ScreenSlice {
+    let changed = false;
+    const surfaces = slice.surfaces.map((surface): Surface => {
+      switch (surface.type) {
+        case "web":
+        case "dashboard": {
+          const url = substituteUrl(surface.url, scope);
+          if (url === surface.url) return surface;
+          changed = true;
+          return { ...surface, url };
+        }
+        case "image":
+        case "video": {
+          const src = substituteUrl(surface.src, scope);
+          if (src === surface.src) return surface;
+          changed = true;
+          return { ...surface, src };
+        }
+        case "playlist": {
+          let entriesChanged = false;
+          const items = surface.items.map((entry) => {
+            const url = substituteUrl(entry.url, scope);
+            if (url === entry.url) return entry;
+            entriesChanged = true;
+            return { ...entry, url };
+          });
+          if (!entriesChanged) return surface;
+          changed = true;
+          return { ...surface, items };
+        }
+        default:
+          return surface;
+      }
+    });
+    return changed ? { ...slice, surfaces } : slice;
+  }
+
+  /**
+   * POL-111 — the send-time COPY of a page definition, with the operator-authored TEXT resolved for
+   * this screen (text, ticker, countdown label). No escaping: the player renders these as text nodes
+   * (there is no `v-html` in the elements package), so a `<` is a `<` on the glass, not markup.
+   *
+   * NOT substituted, deliberately: a feed URL and a weather location are inputs to a SERVER-side
+   * poller whose cache is keyed by that string — making them per-screen would fan the cache out per
+   * screen for no product win. QR text is likewise left alone (a scanned link is a different threat
+   * model, and nobody asked for it).
+   */
+  private static substitutePage(definition: PageDefinition, scope: VariableScope): PageDefinition {
+    let changed = false;
+    const elements = definition.elements.map((el): PageElement => {
+      if (el.kind === "text") {
+        const text = substituteText(el.props.text, scope);
+        if (text === el.props.text) return el;
+        changed = true;
+        return { ...el, props: { ...el.props, text } };
+      }
+      if (el.kind === "ticker") {
+        const text = substituteText(el.props.text, scope);
+        if (text === el.props.text) return el;
+        changed = true;
+        return { ...el, props: { ...el.props, text } };
+      }
+      if (el.kind === "countdown") {
+        const label = substituteText(el.props.label, scope);
+        if (label === el.props.label) return el;
+        changed = true;
+        return { ...el, props: { ...el.props, label } };
+      }
+      return el;
+    });
+    return changed ? { ...definition, elements } : definition;
+  }
+
   /** POL-42 — wire the poller after construction (same pattern as setTokenProvider). */
   setPageDataProvider(provider: PageDataProvider): void {
     this.pageDataProvider = provider;
@@ -4188,7 +4419,7 @@ export class ControlPlane {
    * last-good data. A dangling sourceId (deleted, or pointing at another page) resolves to nothing
    * and the element renders its placeholder. Stored slices never carry any of this.
    */
-  private buildPageData(definition: PageDefinition): PageData {
+  private buildPageData(definition: PageDefinition, scope?: VariableScope): PageData {
     const embeds: Record<string, PageEmbedResolution> = {};
     const images: Record<string, PageImageResolution> = {};
     const feeds: Record<string, PageFeedData> = {};
@@ -4196,11 +4427,13 @@ export class ControlPlane {
 
     for (const el of definition.elements) {
       if (el.kind === "embed") {
-        const resolution = this.resolveEmbed(el.props.sourceId, el.props.url);
+        const resolution = this.resolveEmbed(el.props.sourceId, el.props.url, scope);
         if (resolution) embeds[el.id] = resolution;
       } else if (el.kind === "image") {
         const source = el.props.sourceId ? this.contentSources.get(el.props.sourceId) : undefined;
-        if (source?.kind === "image" && source.url) images[el.id] = { src: source.url };
+        if (source?.kind === "image" && source.url) {
+          images[el.id] = { src: scope ? substituteUrl(source.url, scope) : source.url };
+        }
       } else if (el.kind === "feed" && el.props.url.trim()) {
         const data = this.pageDataProvider?.feedFor(el.props.url.trim());
         if (data) feeds[el.id] = data;
@@ -4224,14 +4457,26 @@ export class ControlPlane {
   private resolveEmbed(
     sourceId: string | undefined,
     rawUrl: string | undefined,
+    scope?: VariableScope,
   ): PageEmbedResolution | undefined {
     if (sourceId) {
       const source = this.contentSources.get(sourceId);
-      // POL-114 — a deck is a rotation, not a single addressable page: it cannot be embedded either.
-      if (!source || source.kind === "page" || source.kind === "playlist" || source.kind === "deck")
+      // POL-108 — a `stream` source cannot be embedded in a page either: the page's embed element is
+      // an iframe/media tag, and a live HLS feed needs the player's stream engine (MSE), which only a
+      // top-level `stream` surface mounts. A stream-referencing embed renders its placeholder.
+      // POL-114 — a `deck` is a rotation, not a single addressable page: it cannot be embedded either.
+      if (
+        !source ||
+        source.kind === "page" ||
+        source.kind === "playlist" ||
+        source.kind === "stream" ||
+        source.kind === "deck" ||
+        !source.url
+      )
         return undefined;
-      if (!source.url) return undefined;
-      let url = source.url;
+      // POL-111 — substitute BEFORE stamping: the token is appended to an already-resolved URL, so it
+      // can never be fed through the value encoder, and the DB still holds the clean template.
+      let url = scope ? substituteUrl(source.url, scope) : source.url;
       if (source.credentialProfileId && this.tokenProvider) {
         const profile = this.credentialProfiles.get(source.credentialProfileId);
         const token = profile ? this.tokenProvider.getToken(profile.id) : undefined;
@@ -4239,7 +4484,7 @@ export class ControlPlane {
       }
       return { url, kind: source.kind };
     }
-    if (rawUrl) return { url: rawUrl, kind: "web" };
+    if (rawUrl) return { url: scope ? substituteUrl(rawUrl, scope) : rawUrl, kind: "web" };
     return undefined;
   }
 
@@ -4288,6 +4533,7 @@ export class ControlPlane {
     switch (surface.type) {
       case "web":
       case "dashboard":
+      case "stream":
         return surface.url;
       case "image":
       case "video":

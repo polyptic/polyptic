@@ -195,6 +195,13 @@ class Agent {
   private socketOpened = false;
   /** Consecutive failed mTLS dials; at MTLS_FALLBACK_AFTER the next dial is a one-shot plain retry. */
   private mtlsFailStreak = 0;
+  /** POL-143 — TOTAL consecutive failed mTLS dials since the last mTLS success (the streak above
+   *  resets on every fallback cycle, so it cannot tell the server how long this has been going on).
+   *  Reported in the plain-channel hello as `mtlsDialFailure` so the console can say "this box
+   *  cannot reach the secure port at <url>" instead of promising a migration that never comes.
+   *  Reset on an mTLS `open`, and when a fresh bundle points at a DIFFERENT URL (new door, fresh
+   *  count). */
+  private mtlsDialFailuresTotal = 0;
 
   /** Remote-shell PTYs (POL-59), created on first `server/shell-open`. A dev/non-Linux backend
    *  reports it can't provide a real terminal, and every open on such a box is refused. */
@@ -317,6 +324,7 @@ class Agent {
       if (this.connectedViaMtls && !this.socketOpened && !dialFailureCounted) {
         dialFailureCounted = true;
         this.mtlsFailStreak += 1;
+        this.mtlsDialFailuresTotal += 1;
         log(`mTLS dial failed (${this.mtlsFailStreak}/${MTLS_FALLBACK_AFTER} before a plain-channel retry)`);
       }
     };
@@ -324,7 +332,10 @@ class Agent {
     ws.on("open", () => {
       this.attempt = 0;
       this.socketOpened = true;
-      if (this.connectedViaMtls) this.mtlsFailStreak = 0;
+      if (this.connectedViaMtls) {
+        this.mtlsFailStreak = 0;
+        this.mtlsDialFailuresTotal = 0;
+      }
       // A fresh connection: clear the stale "rejected" flag. If the server rejects us again it
       // re-sets the flag before close, so the long backoff persists across rejection cycles.
       this.rejected = false;
@@ -808,6 +819,9 @@ class Agent {
         caPem: msg.mtls.caPem,
         url: deriveMtlsUrl(this.url, { port: msg.mtls.port, url: msg.mtls.url }),
       };
+      // A bundle pointing at a DIFFERENT door restarts the failure count — the old count described
+      // the old address, and carrying it over would report a URL nobody is dialling any more.
+      if (this.mtls?.url !== bundle.url) this.mtlsDialFailuresTotal = 0;
       this.mtls = bundle;
       this.mtlsFailStreak = 0;
       try {
@@ -911,6 +925,13 @@ class Agent {
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,
+      // POL-143 — on a PLAIN hello while holding a bundle whose dials keep failing, tell the server
+      // exactly what was dialled and how many times it failed, so an unreachable mTLS port surfaces
+      // on the console instead of reading "moves over on next connection" forever.
+      mtlsDialFailure:
+        !this.connectedViaMtls && this.mtls !== null && this.mtlsDialFailuresTotal > 0
+          ? { url: this.mtls.url, attempts: this.mtlsDialFailuresTotal }
+          : undefined,
     };
     this.send(hello);
   }

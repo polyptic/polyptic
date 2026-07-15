@@ -55,7 +55,7 @@ import ColdStartWizard from "../components/ColdStartWizard.vue";
 import MachineName from "../components/MachineName.vue";
 import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
-import { machineDisplayName, machineIdTail } from "../machine-name";
+import { machineCardName, machineDisplayName, machineIdTail } from "../machine-name";
 
 const store = useConsoleStore();
 
@@ -719,13 +719,15 @@ function showToast(message: string): void {
                   <div class="machine-id-line">
                     <!-- POL-117 — the operator's name is the identity; edit in place. -->
                     <MachineName :machine="m" />
-                    <span class="machine-uuid">{{ m.id }}</span>
                   </div>
                 </div>
 
                 <!-- status chips: Shell armed is a passive security indicator, always visible while
                      armed, independent of the console button state (POL-68 §2). -->
                 <span v-if="m.shellEnabled" class="chip-armed" :title="shellArmedHint(m)">Shell armed</span>
+                <!-- POL-141 — the id tail, left of the Online pill: uniqueness stays checkable
+                     without the full dmi-… UUID (which is on hover). -->
+                <span class="id-tail" :title="m.id">{{ machineIdTail(m.id) }}</span>
                 <span class="status-badge" :class="m.online ? 'online' : 'offline'">
                   {{ m.online ? "Online" : "Offline" }}
                 </span>
@@ -893,14 +895,17 @@ function showToast(message: string): void {
                 <span class="dot dot-off"></span>
                 <div class="machine-id">
                   <div class="machine-id-line">
-                    <!-- POL-117 — honest fallback; never `localhost.localdomain` posing as a name. -->
-                    <span class="machine-label">{{ machineDisplayName(m) }}</span>
-                    <span class="machine-uuid">{{ m.id }}</span>
+                    <!-- POL-117 — honest fallback; never `localhost.localdomain` posing as a name.
+                         POL-141 — the tail lives in the badge, so the card name is badge-aware. -->
+                    <span class="machine-label">{{ machineCardName(m) }}</span>
                   </div>
                   <div class="machine-meta">
                     Access denied · {{ formatLastSeen(m.lastSeen, now) }}
                   </div>
                 </div>
+                <!-- POL-141 — the id tail as a badge, visible to everyone (identity, not a verb). -->
+                <span class="id-tail" :title="m.id">{{ machineIdTail(m.id) }}</span>
+                <!-- POL-107 — Remove / Re-approve are admin verbs (server 403s otherwise). -->
                 <template v-if="store.isAdmin">
                   <button class="btn-remove" @click="remove(m)">Remove</button>
                   <button class="btn-approve" @click="reapprove(m)">Re-approve</button>
@@ -1177,6 +1182,7 @@ function showToast(message: string): void {
   font-weight: 600;
   white-space: nowrap;
 }
+/* POL-104 — the pre-registration import list still prints a full mac/serial/id in-line. */
 .machine-uuid {
   font-size: 11px;
   color: var(--muted2);
@@ -1184,6 +1190,20 @@ function showToast(message: string): void {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* POL-141 — the id tail, a small mono badge beside the status pill. The full dmi-… UUID came off
+   the name row; hovering the badge still reveals it. */
+.id-tail {
+  font-size: 10.5px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  color: var(--muted);
+  background: var(--muted-bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  cursor: default;
+  flex: 0 0 auto;
 }
 .machine-meta {
   font-size: 12px;

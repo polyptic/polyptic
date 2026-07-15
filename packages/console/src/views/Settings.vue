@@ -21,6 +21,7 @@ onMounted(() => {
   void store.fetchEnrollment();
   void store.fetchNetboot();
   void store.fetchDisplaySettings();
+  void store.fetchBootOrderPolicy();
   void store.fetchImageUpdates();
   void loadHttps();
   void loadOperators();
@@ -72,6 +73,28 @@ async function setBadges(show: boolean): Promise<void> {
     /* the store already reverted the optimistic value; the switch reflects the true state */
   } finally {
     badgesSaving.value = false;
+  }
+}
+
+// ── UEFI boot order (POL-115) ──────────────────────────────────────────────────
+// Opt-in, and deliberately worded as one: the box writes a firmware boot variable. Off means a box
+// that finds its entry displaced REPORTS the drift and writes nothing.
+const bootOrderSaving = ref(false);
+
+async function setBootOrderReassert(reassert: boolean): Promise<void> {
+  if (bootOrderSaving.value || store.bootOrder?.reassert === reassert) return;
+  bootOrderSaving.value = true;
+  try {
+    await store.setBootOrderReassert(reassert);
+    showToast(
+      reassert
+        ? "Boxes may now re-assert their own boot order"
+        : "Boxes will only report boot-order drift",
+    );
+  } catch {
+    /* the store already reverted the optimistic value; the switch reflects the true state */
+  } finally {
+    bootOrderSaving.value = false;
   }
 }
 
@@ -250,6 +273,10 @@ const mtlsMigrated = computed(() => (agentSec.value?.machines ?? []).filter((m) 
 /** One plain-words state per machine, for the card's list. */
 function machineCertState(m: AgentSecurityInfo["machines"][number]): { label: string; cls: string } {
   if (m.online && m.agentChannel === "mtls") return { label: "Secure channel", cls: "asec-ok" };
+  // POL-143 — the box holds a cert but reports it can't reach the mTLS door. This BEATS the
+  // "moves over on next connection" promise: the migration is stalled, not pending, and the card
+  // must say so (the address it tried is shown on the sub-line below).
+  if (m.mtlsDialError) return { label: "Can't reach the secure port", cls: "asec-bad" };
   if (m.mtlsSeenAt) return { label: "Has certificate", cls: "asec-ok" };
   if (m.mtlsCertIssuedAt) return { label: "Certificate issued — moves over on next connection", cls: "asec-warn" };
   return { label: "No certificate yet", cls: "asec-warn" };
@@ -1155,6 +1182,33 @@ async function onSignOut(): Promise<void> {
         </div>
       </section>
 
+      <!-- UEFI boot order (POL-115) --------------------------------------------- -->
+      <section class="card">
+        <div class="card-head">
+          <div class="min-w-0">
+            <h2 class="card-title">Boot order</h2>
+            <p class="card-sub wrap">
+              Firmware re-prepends its own OS after updates and reflashes, and the box quietly boots the
+              wrong thing on its next power-on. Every box watches its own UEFI boot order and reports
+              drift here. It only puts itself back at the front if you let it.
+            </p>
+          </div>
+          <Toggle
+            label="Re-assert boot order"
+            :model-value="store.bootOrder?.reassert ?? false"
+            :disabled="bootOrderSaving || store.bootOrder === null"
+            @update:model-value="setBootOrderReassert"
+          />
+        </div>
+        <p class="hint">
+          {{
+            store.bootOrder?.reassert
+              ? "Boxes put their own UEFI entry back at the head of the boot order, keep every other entry, and report what the firmware accepted."
+              : "Report only — no box writes a firmware boot variable. Drift shows up in Live Activity."
+          }}
+        </p>
+      </section>
+
       <!-- Enrolment tokens (POL-104) — admin-only (POL-107) ---------------------- -->
       <section v-if="store.isAdmin" class="card">
         <h2 class="card-title">Enrolment tokens</h2>
@@ -1381,6 +1435,9 @@ async function onSignOut(): Promise<void> {
           <ul v-if="agentSec.mode !== 'off' && agentSec.machines.length > 0" class="asec-list">
             <li v-for="m in agentSec.machines" :key="m.id" class="asec-row">
               <span class="asec-name">{{ m.label }}</span>
+              <!-- POL-143 — when the box reports the mTLS door is unreachable, name the address it
+                   tried so the operator can fix the routing, instead of "next connection" forever. -->
+              <span v-if="m.mtlsDialError" class="asec-detail">tried {{ m.mtlsDialError.url }}</span>
               <span class="asec-badge" :class="machineCertState(m).cls">{{ machineCertState(m).label }}</span>
             </li>
           </ul>
@@ -2563,6 +2620,21 @@ async function onSignOut(): Promise<void> {
 .asec-warn {
   background: var(--warn-soft);
   color: var(--warn);
+}
+.asec-bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+/* POL-143 — the address a stalled box tried to reach the mTLS door on. */
+.asec-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Update schedule ───────────────────────────────────────────────────────── */

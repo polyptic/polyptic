@@ -527,7 +527,13 @@ if (agentMtlsEnv.enabled) {
         server: listener,
         caPem: mtls.caPem,
         signCsr: (csrPem, machineId) => mtls.signCsr(csrPem, machineId),
-        advertise: { port: agentMtlsEnv.port, ...(AGENT_MTLS_PUBLIC_URL ? { url: AGENT_MTLS_PUBLIC_URL } : {}) },
+        // POL-143 — advertise the port boxes must DIAL, which is the NodePort (not the pod's bind
+        // port) on stock K3s; a full AGENT_MTLS_PUBLIC_URL still overrides both. Getting this wrong
+        // is exactly what stranded the homelab fleet on "moves over on next connection".
+        advertise: {
+          port: agentMtlsEnv.advertisePort ?? agentMtlsEnv.port,
+          ...(AGENT_MTLS_PUBLIC_URL ? { url: AGENT_MTLS_PUBLIC_URL } : {}),
+        },
         required: () => posture.required,
         noteCertIssued: (machineId) => {
           void control.noteMachineCertIssued(machineId);
@@ -544,8 +550,20 @@ if (agentMtlsEnv.enabled) {
         },
       };
       fastify.log.info(
-        { event: "mtls.listening", port: agentMtlsEnv.port, require: posture.required, publicUrl: AGENT_MTLS_PUBLIC_URL },
-        `mTLS agent channel up on :${agentMtlsEnv.port} (self-test passed: no-cert and rogue-CA handshakes rejected)` +
+        {
+          event: "mtls.listening",
+          port: agentMtlsEnv.port,
+          // POL-143 — the port boxes are told to DIAL (a NodePort on stock K3s), when it differs
+          // from the bind port. Logged because a mismatch here is exactly what stranded the fleet.
+          advertisePort: agentMtlsEnv.advertisePort ?? agentMtlsEnv.port,
+          require: posture.required,
+          publicUrl: AGENT_MTLS_PUBLIC_URL,
+        },
+        `mTLS agent channel up on :${agentMtlsEnv.port}` +
+          (agentMtlsEnv.advertisePort && agentMtlsEnv.advertisePort !== agentMtlsEnv.port
+            ? ` (boxes dial :${agentMtlsEnv.advertisePort})`
+            : "") +
+          ` (self-test passed: no-cert and rogue-CA handshakes rejected)` +
           (posture.required
             ? " — REQUIRED: the plain /agent channel only enrols + issues certs"
             : " — migrating: the plain /agent channel still admits while the fleet picks up certs"),
@@ -707,6 +725,9 @@ registerProvisionRoutes(
       "Netboot depot artifacts served (kernel, initrd, root image, …).",
       { arch, file },
     ),
+  // POL-115 — what a box may do about its own UEFI boot order when the firmware displaces our entry.
+  // Report-only unless an operator opted in, so the fleet's default is "never write firmware NVRAM".
+  () => control.getBootOrderPolicy(),
   // POL-105 — the depot's manifest route resolves PER MACHINE: a box appends `?machineId=…`, and its
   // tags decide which roll-out ring (if any) it matches. The registry is the only place tags live.
   (machineId) => control.machineTags(machineId),

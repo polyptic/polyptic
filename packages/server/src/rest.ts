@@ -57,6 +57,7 @@ import {
   IdentBody,
   ImportPreRegistrationsBody,
   InspectBody,
+  machineHasName,
   MoveTargetsBody,
   PanelHoursBody,
   PanelPowerBody,
@@ -69,6 +70,7 @@ import {
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
+  ScreenVariablesBody,
   ServerToAgentApply,
   ServerToAgentInspect,
   ServerToAgentPending,
@@ -86,6 +88,7 @@ import {
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateBootOrderPolicyBody,
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
@@ -139,7 +142,7 @@ const ContentSourceParams = z.object({ id: z.string().min(1) });
 
 /** A plain sentence for each playlist authoring error (POL-34), shown to the operator verbatim. */
 function playlistItemErrorDetail(
-  error: "unknown-item-source" | "nested-playlist" | "item-needs-duration",
+  error: "unknown-item-source" | "nested-playlist" | "live-stream-step" | "item-needs-duration",
   itemSourceId?: string,
 ): string {
   switch (error) {
@@ -147,6 +150,8 @@ function playlistItemErrorDetail(
       return `playlist item references an unknown source: ${itemSourceId}`;
     case "nested-playlist":
       return `a playlist cannot contain another playlist (${itemSourceId})`;
+    case "live-stream-step":
+      return `a playlist cannot contain a live stream — assign it to a screen directly (${itemSourceId})`;
     case "item-needs-duration":
       return `playlist items that are not videos need a duration (${itemSourceId})`;
   }
@@ -559,15 +564,23 @@ export function registerRestRoutes(
     }
 
     if (machine.status === "pending") {
-      const sendPendingBoard = (ident: boolean): number =>
-        agentHub.send(
+      const sendPendingBoard = (ident: boolean): number => {
+        // POL-145 — a NAMED machine flashes its name (the id rides small underneath); only an
+        // unnamed box falls back to the raw id. The label is re-read at send time so the TTL-off
+        // (and any ident after a rename) always carries the current truth. Same additive URL-param
+        // path as `ident=1`, so deployed agents need no change — they just re-place the URL.
+        const current = control.getMachine(machine.id) ?? machine;
+        const name =
+          ident && machineHasName(current) ? `&name=${encodeURIComponent(current.label.trim())}` : "";
+        return agentHub.send(
           machine.id,
           ServerToAgentPending.parse({
             t: "server/pending",
             machineId: machine.id,
-            pendingUrl: pendingUrlFor(machine.id) + (ident ? "&ident=1" : ""),
+            pendingUrl: pendingUrlFor(machine.id) + (ident ? `&ident=1${name}` : ""),
           }),
         );
+      };
       const delivered = sendPendingBoard(body.data.on);
       if (body.data.on && body.data.ttlMs) {
         setTimeout(() => {
@@ -1196,6 +1209,43 @@ export function registerRestRoutes(
     return { ok: true, screen, delivered };
   });
 
+  // POST /api/v1/screens/:screenId/variables  { variables }  -> per-screen template variables (POL-111)
+  //
+  // The whole map, replaced. Registry metadata (like a rename), so no revision bump — but the screen's
+  // render IS re-pushed at the SAME revision, because what the player should now show HAS changed:
+  // `decorateSliceForSend` re-substitutes the clean, stored templates against the new scope and the
+  // player DOM-diffs the new URL/text in place. No reload, no duplicated source, nothing substituted
+  // written to the DB.
+  fastify.post("/api/v1/screens/:screenId/variables", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = ScreenVariablesBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const screen = await control.setScreenVariables(params.data.screenId, body.data.variables);
+    if (!screen) {
+      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+    }
+
+    pushRender(screen.id, control.sliceForPlayer(screen.id));
+    broadcaster.broadcast();
+
+    fastify.log.info(
+      {
+        event: "screen.variables",
+        screenId: screen.id,
+        // Keys only — a value is operator content and has no business in the logs.
+        keys: Object.keys(screen.variables),
+      },
+      "screen variables set",
+    );
+    return { ok: true, screen };
+  });
+
   // ── Phase 2b operator routes (enrollment) ─────────────────────────────────────
 
   // POST /api/v1/machines/:machineId/approve  -> pending → approved; create screens; live apply.
@@ -1454,6 +1504,28 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return settings;
+  });
+
+  // ── UEFI boot-order policy (POL-115) ──────────────────────────────────────────
+  //
+  // One fleet-wide boolean: may a running box put its own UEFI boot entry back at the head of
+  // BootOrder when the firmware displaces it? Default OFF — a box reports the drift and writes
+  // nothing. Nothing is pushed to boxes here: they read the policy on their own poll (GET
+  // /boot/policy) right before they would act on it, so this route only records the operator's intent.
+
+  // GET /api/v1/settings/boot-order -> BootOrderPolicy { reassert }
+  fastify.get("/api/v1/settings/boot-order", async () => control.getBootOrderPolicy());
+
+  // PUT /api/v1/settings/boot-order  { reassert }  -> BootOrderPolicy
+  fastify.put("/api/v1/settings/boot-order", async (request, reply) => {
+    const body = UpdateBootOrderPolicyBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const policy = await control.setBootOrderPolicy({ reassert: body.data.reassert });
+    fastify.log.info({ event: "settings.boot-order.set", reassert: policy.reassert }, "boot-order policy updated");
+    broadcaster.broadcast();
+    return policy;
   });
 
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────

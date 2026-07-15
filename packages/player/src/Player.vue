@@ -60,6 +60,9 @@ import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle, isAgentPlacedWindow } from "./surface-style";
 import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
+import StreamSurfaceView from "./StreamSurface.vue";
+import StreamBoard from "./StreamBoard.vue";
+import type { StreamHealth } from "./stream-engine";
 import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
 import { openIdbMediaStore } from "./media-cache-idb";
@@ -111,6 +114,14 @@ const pendingMachineId = readPendingMachineId();
  *  page with the overlay up, and "ident off" is the plain board again. */
 const pendingIdent =
   pendingMachineId !== "" && new URLSearchParams(window.location.search).get("ident") === "1";
+
+/** POL-145 — `&name=<label>` alongside `&ident=1`: the machine's operator-given name, stamped by the
+ *  server only when the box actually HAS one (never a hostname posing as a name — machineHasName).
+ *  When present the flash leads with the name and keeps the id small underneath; only an unnamed box
+ *  flashes the raw id, because then the id IS its only identity. */
+const pendingIdentName = pendingIdent
+  ? (new URLSearchParams(window.location.search).get("name") ?? "").trim()
+  : "";
 
 const screenId = readScreenId();
 const playerToken = readPlayerToken();
@@ -347,10 +358,27 @@ const prober = new SurfaceProber({
   // Re-fetch WITHOUT rewriting the URL — a token the server stamped into the content URL at send
   // time (POL-24) survives, and the keyed element that makes flips instant (D5) is never remounted.
   reload: (id) => {
+    // POL-108 — a live surface heals by RE-ATTACHING its pipeline, not by re-fetching an element:
+    // an MSE `<video>` has no `src` to reload (it is fed by a SourceBuffer), so `el.load()` would
+    // simply blank it. The component owns the pipeline; the player asks it to start over.
+    const stream = streamViews.get(id);
+    if (stream) {
+      stream.restart("the prober healed this surface");
+      return;
+    }
     const el = surfaceEls.get(id);
     if (!el) return;
     if (el instanceof HTMLVideoElement) el.load();
     else el.src = el.src;
+  },
+  // POL-108 — a stream whose URL will not even PROVE (the camera/restreamer is unreachable: DNS,
+  // route, host down) must say so, not sit on "Connecting…". Two failures in a row is enough to stop
+  // pretending; the prober keeps trying underneath, and the board flips back the moment it proves.
+  onProbeFail: (id, attempts, error) => {
+    if (attempts < 2) return;
+    const surface = surfaces.value.find((s) => s.id === id);
+    if (surface?.type !== "stream") return;
+    streamState[id] = { health: "down", detail: `cannot reach the source (${error})` };
   },
   onHealth: reportHealth,
   log: (msg) => diag(msg),
@@ -361,14 +389,68 @@ const prober = new SurfaceProber({
  *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
  *  (POL-42) are excluded for the same reason: a page renders locally (text/clock/shapes need no
  *  network) and its embeds carry send-time-resolved data with their own calm placeholders.
+ *
+ *  A STREAM (POL-108) is very much INCLUDED, and it is the case the exclusions clarify: unlike a
+ *  playlist or a page it has exactly ONE url — the HLS playlist the pipeline fetches first — so the
+ *  prober's oracle applies to it verbatim. It is also the surface that most needs it: a wall box
+ *  cold-boots before its network settles, and an MSE pipeline pointed at a not-yet-resolvable host
+ *  fails immediately and permanently in a way `<video>` never does. Prove first, then attach; and
+ *  when the engine has exhausted its own reconnects (see stream-engine.ts) it hands the surface BACK
+ *  to the prober, whose forever-backoff re-prove is what heals a feed that comes back an hour later.
+ *
  *  Agent-placed WINDOW surfaces (POL-18) are excluded because the player fetches NOTHING for them —
  *  the content is a top-level window the agent places over the region; probing its URL would be
  *  probing on behalf of a load this page never makes. */
 const probeTargets = computed(() =>
   surfaces.value
     .filter((s) => s.type !== "playlist" && s.type !== "page" && !isAgentPlacedWindow(s))
-    .map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
+    .map((s) => ({ id: s.id, url: isFrame(s) || s.type === "stream" ? s.url : mediaSrc(s) })),
 );
+
+// ── Live streams (POL-108) ───────────────────────────────────────────────────
+// The engine lives in the StreamSurface component (one per live surface); the player holds the two
+// ends it must own: the surface's LAST-SAID health (so the region can still speak after the element
+// is cleared) and a handle to re-attach the pipeline when the PROBER heals this surface in place.
+
+const streamState = reactive<Record<string, { health: StreamHealth; detail: string }>>({});
+const streamViews = new Map<string, { restart: (reason: string) => void }>();
+
+function bindStream(id: string, el: unknown): void {
+  if (el && typeof (el as { restart?: unknown }).restart === "function") {
+    streamViews.set(id, el as { restart: (reason: string) => void });
+  } else {
+    streamViews.delete(id);
+  }
+}
+
+/** The feed as a human names it: its host. Never the full URL — it may carry a token (POL-24). */
+function streamLabel(surface: Surface): string {
+  const url = surface.type === "stream" ? surface.url : "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "live stream";
+  }
+}
+
+function onStreamHealth(id: string, health: StreamHealth, detail: string): void {
+  streamState[id] = { health, detail };
+  // Frames are arriving again: the surface is healthy, so the prober's element-error backoff resets.
+  if (health === "live") prober.elementLoaded(id);
+}
+
+/** The engine gave up on its own reconnects: the wall says "No signal", and the prober takes over —
+ *  it clears the element and re-proves the playlist URL forever, repainting when the source returns. */
+function onStreamGiveUp(id: string, reason: string): void {
+  streamState[id] = { health: "down", detail: reason };
+  diag(`${id}: live stream DOWN — ${reason}`);
+  prober.elementError(id);
+}
+
+/** What the region says while nothing is painted: the last thing the engine said, else "connecting". */
+function streamBoard(id: string): { health: StreamHealth; detail: string } {
+  return streamState[id] ?? { health: "connecting", detail: "connecting to the live stream" };
+}
 
 watch(probeTargets, (targets) => prober.sync(targets), { immediate: true });
 
@@ -674,10 +756,16 @@ function connLabel(state: ConnState): string {
       sub="Pending Approval"
       caption="Approve this machine in Console ▸ Machines"
     />
-    <!-- POL-117 — pre-approval ident: the same flash overlay approved screens get, labelled with the
-         machine id (the one identity a pending box has), so the operator can match panel to card. -->
+    <!-- POL-117 — pre-approval ident: the same flash overlay approved screens get. POL-145 — a NAMED
+         box flashes its name (matching the approved ident, which flashes the screen's name) with the
+         id small underneath as the tie-breaker against the console card's uuid; only an unnamed box
+         flashes the raw id, because then the id is the only identity there is. -->
     <div v-if="pendingIdent" class="ident" style="background-color: #00c2ff">
-      <span class="ident-name pending-ident-name">{{ pendingMachineId }}</span>
+      <div v-if="pendingIdentName" class="pending-ident-stack">
+        <span class="ident-name pending-ident-title">{{ pendingIdentName }}</span>
+        <span class="pending-ident-id">{{ pendingMachineId }}</span>
+      </div>
+      <span v-else class="ident-name pending-ident-name">{{ pendingMachineId }}</span>
     </div>
   </template>
 
@@ -735,6 +823,27 @@ function connLabel(state: ConnState): string {
           live
         />
       </div>
+      <!-- POL-108 — a LIVE surface. Gated on the prober like every other url-bearing surface, and
+           it owns its own MSE pipeline + reconnect (StreamSurface.vue / stream-engine.ts). -->
+      <StreamSurfaceView
+        v-else-if="surface.type === 'stream' && painted[surface.id]"
+        :ref="(el) => bindStream(surface.id, el)"
+        :surface="surface"
+        :src="painted[surface.id] ?? ''"
+        :content-style="contentStyle(surface)"
+        :label="streamLabel(surface)"
+        @health="(h, d) => onStreamHealth(surface.id, h, d)"
+        @giveup="(reason) => onStreamGiveUp(surface.id, reason)"
+        @log="(msg) => diag(`${surface.id}: stream ${msg}`)"
+      />
+      <!-- A live surface whose playlist URL is not (yet, or no longer) reachable: the wall SAYS so.
+           A dead camera that reads as a dead camera is a five-minute fix; a black tile is a site visit. -->
+      <StreamBoard
+        v-else-if="surface.type === 'stream'"
+        :label="streamLabel(surface)"
+        :health="streamBoard(surface.id).health"
+        :detail="streamBoard(surface.id).detail"
+      />
       <!-- POL-18: an agent-placed WINDOW surface is a hole — the real content is a top-level
            browser window the agent floats over this region. Render nothing (a transparent region,
            never a placeholder dot: the window above is the content, and a spinner peeking out from

@@ -9,6 +9,9 @@
   --surface: #ffffff;
   --card: #ffffff;
   --muted-bg: #f4f4f5;
+  /* POL-141 — one tier LIGHTER than --muted-bg: the vitals band's facts shelf. Operator feedback:
+     the facts row sharing the bars' tone read heavy and low-contrast. */
+  --muted-bg2: #fafafb;
   --line: #e4e4e7;
   --line2: #d4d4d8;
   --fg: #09090b;
@@ -49,6 +52,8 @@
   --card: #18181b;
   /* One step off --card, so filled strips and inset fields read as recessed rather than flush. */
   --muted-bg: #1c1c20;
+  /* POL-141 — in dark, "lighter" means brighter: the facts shelf lifts one step above the bars. */
+  --muted-bg2: #232329;
   --line: #27272a;
   --line2: #3f3f46;
   --fg: #fafafa;

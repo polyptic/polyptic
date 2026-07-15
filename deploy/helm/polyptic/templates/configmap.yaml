@@ -48,7 +48,16 @@ data:
   AGENT_MTLS_REQUIRE: {{ ternary "1" "0" (eq (toString .Values.agentMtls.require) "true") | quote }}
   {{- end }}
   {{- if .Values.agentMtls.publicUrl }}
+  # Full wss:// override — the operator pointed agents at a specific endpoint
+  # (a dedicated LoadBalancer, an IngressRouteTCP SNI host, …). Beats every guess.
   AGENT_MTLS_PUBLIC_URL: {{ .Values.agentMtls.publicUrl | quote }}
+  {{- else if eq .Values.agentMtls.expose "nodePort" }}
+  # POL-143 — boxes reach the listener through the NodePort, NOT the pod's bind
+  # port. Advertise the port they must actually DIAL (same host they already know,
+  # this port), or a stock-K3s fleet dials :8443 on the LB — which routes nothing —
+  # and sits on "moves over on next connection" forever. The server sends this in
+  # the cert bundle; the agent dials it instead of guessing.
+  AGENT_MTLS_ADVERTISE_PORT: {{ .Values.agentMtls.nodePort | quote }}
   {{- end }}
   {{- if .Values.agentMtls.sans }}
   AGENT_MTLS_SANS: {{ join "," .Values.agentMtls.sans | quote }}

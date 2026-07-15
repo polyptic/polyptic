@@ -204,6 +204,9 @@ install -m0755 "$AGENT_BIN" "$ROOTFS/usr/local/bin/polyptic-agent"
 # builds. That drop-in is why this runs BEFORE dracut. Chrome costs ~300-400 MB in the squashfs —
 # the POL-35 ~492 MiB amd64 image lands back around ~800 MiB (re-measure the RAM floor accordingly);
 # correctness on real GPUs beats the size win (D77).
+# The cast substrate (uxplay/avahi/gstreamer + the POL-144/D120 VA hardware-decode driver) also
+# lands here, via corePackages()'s `cast` set — so a change to those packages needs a FULL IMAGE
+# REBUILD (this script) before it can be re-tested on a box; the running fleet won't have them.
 chroot "$ROOTFS" /usr/local/bin/polyptic-agent setup \
   --backend wayland-sway --user kiosk --render auto
 chroot "$ROOTFS" /bin/sh -c 'apt-get clean'

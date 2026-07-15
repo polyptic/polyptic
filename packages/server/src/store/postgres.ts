@@ -29,6 +29,7 @@ import {
   OperatorRole,
   Output,
   PlaylistItem,
+  ScreenVariables,
   Surface,
 } from "@polyptic/protocol";
 
@@ -38,6 +39,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedBootOrderPolicy,
   PersistedDaypart,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
@@ -124,6 +126,7 @@ interface ScreenRow {
   machine_id: string;
   connector: string;
   cast_enabled: boolean | null;
+  variables: unknown;
 }
 
 interface ContentRow {
@@ -276,6 +279,10 @@ interface DisplaySettingsRow {
   show_badges: boolean;
 }
 
+interface BootOrderPolicyRow {
+  reassert: boolean;
+}
+
 /** POL-101 — panel power: the deployment timezone + a jsonb map of screenId → daily window. */
 interface PanelPowerRow {
   timezone: string;
@@ -341,11 +348,15 @@ export class PostgresStore implements Store {
         friendly_name text NOT NULL,
         machine_id    text NOT NULL,
         connector     text NOT NULL,
-        cast_enabled  boolean NOT NULL DEFAULT false
+        cast_enabled  boolean NOT NULL DEFAULT false,
+        variables     jsonb NOT NULL DEFAULT '{}'::jsonb
       )
     `;
     // Idempotent migration for databases created before POL-119: existing screens are not castable.
     await sql`ALTER TABLE screens ADD COLUMN IF NOT EXISTS cast_enabled boolean NOT NULL DEFAULT false`;
+    // POL-111 — per-screen template variables. Clean-at-rest holds: this is the ONLY place a
+    // substitution input is persisted; no substituted OUTPUT is ever written anywhere.
+    await sql`ALTER TABLE screens ADD COLUMN IF NOT EXISTS variables jsonb NOT NULL DEFAULT '{}'::jsonb`;
     await sql`
       CREATE TABLE IF NOT EXISTS screen_content (
         screen_id text PRIMARY KEY,
@@ -664,6 +675,15 @@ export class PostgresStore implements Store {
         show_badges boolean NOT NULL
       )
     `;
+    // UEFI boot-order policy (POL-115): a single row holding the one boolean that decides whether a
+    // box may re-assert its own UEFI boot entry. No row = report-only, which is also what the control
+    // plane falls back to, so an un-migrated / un-flipped fleet never writes firmware NVRAM.
+    await sql`
+      CREATE TABLE IF NOT EXISTS boot_order_policy (
+        id       int PRIMARY KEY DEFAULT 1,
+        reassert boolean NOT NULL
+      )
+    `;
     // Panel power (POL-101): a single row — the deployment's timezone plus every screen's daily
     // on/off window as jsonb. One row rather than a table per screen because that is all the shape
     // this has, and because the whole thing is read on every scheduler tick. Absent until an operator
@@ -696,7 +716,7 @@ export class PostgresStore implements Store {
       audioPreferenceRows,
     ] = await Promise.all([
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
-      sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled FROM screens`,
+      sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled, variables FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision, active_scene_id FROM meta WHERE id = 1`,
       sql<MuralRow[]>`SELECT id, name FROM murals`,
@@ -744,13 +764,19 @@ export class PostgresStore implements Store {
       };
     });
 
-    const screens: PersistedScreen[] = screenRows.map((row) => ({
-      id: row.id,
-      friendlyName: row.friendly_name,
-      machineId: row.machine_id,
-      connector: row.connector,
-      castEnabled: row.cast_enabled ?? false,
-    }));
+    const screens: PersistedScreen[] = screenRows.map((row) => {
+      // POL-111 — a row written by a future/rogue writer is not allowed to smuggle an unvalidated
+      // variable into the substituter: parse at the edge, drop the map wholesale if it doesn't hold.
+      const variables = ScreenVariables.safeParse(row.variables ?? {});
+      return {
+        id: row.id,
+        friendlyName: row.friendly_name,
+        machineId: row.machine_id,
+        connector: row.connector,
+        castEnabled: row.cast_enabled ?? false,
+        variables: variables.success ? variables.data : {},
+      };
+    });
 
     const content: PersistedContent[] = contentRows.map((row) => {
       const canvas = Geometry.safeParse(row.canvas);
@@ -963,13 +989,21 @@ export class PostgresStore implements Store {
   async upsertScreen(screen: PersistedScreen): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO screens (id, friendly_name, machine_id, connector, cast_enabled)
-      VALUES (${screen.id}, ${screen.friendlyName}, ${screen.machineId}, ${screen.connector}, ${screen.castEnabled ?? false})
+      INSERT INTO screens (id, friendly_name, machine_id, connector, cast_enabled, variables)
+      VALUES (
+        ${screen.id},
+        ${screen.friendlyName},
+        ${screen.machineId},
+        ${screen.connector},
+        ${screen.castEnabled ?? false},
+        ${sql.json(screen.variables ?? {})}
+      )
       ON CONFLICT (id) DO UPDATE SET
         friendly_name = EXCLUDED.friendly_name,
         machine_id    = EXCLUDED.machine_id,
         connector     = EXCLUDED.connector,
-        cast_enabled  = EXCLUDED.cast_enabled
+        cast_enabled  = EXCLUDED.cast_enabled,
+        variables     = EXCLUDED.variables
     `;
   }
 
@@ -1846,6 +1880,24 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO display_settings (id, show_badges) VALUES (1, ${settings.showBadges})
       ON CONFLICT (id) DO UPDATE SET show_badges = EXCLUDED.show_badges
+    `;
+  }
+
+  async getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined> {
+    const sql = this.sql;
+    const rows = await sql<BootOrderPolicyRow[]>`
+      SELECT reassert FROM boot_order_policy WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return { reassert: row.reassert };
+  }
+
+  async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO boot_order_policy (id, reassert) VALUES (1, ${policy.reassert})
+      ON CONFLICT (id) DO UPDATE SET reassert = EXCLUDED.reassert
     `;
   }
 

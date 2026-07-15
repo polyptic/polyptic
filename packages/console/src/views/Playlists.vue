@@ -18,11 +18,12 @@ const store = useConsoleStore();
 
 const playlists = computed(() => store.sources.filter((s) => s.kind === "playlist"));
 
-/** What a playlist may contain: every library source except playlists themselves (no nesting). */
-// POL-114 — a deck is itself a rotation (of its converted pages), so it can't be a playlist STEP any
-// more than a playlist can: the server refuses both, for the same reason. Assign a deck directly.
+/** What a playlist may contain: every library source except playlists themselves (no nesting),
+ *  except live streams (POL-108) — a rotation over a never-ending feed re-negotiates the stream every
+ *  cycle and has no natural duration — and except decks (POL-114), which are themselves a rotation of
+ *  their converted pages; the server rejects such steps, so we never offer them. Assign a deck directly. */
 const stepSources = computed(() =>
-  store.sources.filter((s) => s.kind !== "playlist" && s.kind !== "deck"),
+  store.sources.filter((s) => s.kind !== "playlist" && s.kind !== "stream" && s.kind !== "deck"),
 );
 
 /** The row's sub-line: step count plus the running order by name, e.g. "3 steps · A → B → C". */

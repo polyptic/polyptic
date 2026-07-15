@@ -176,6 +176,14 @@ const authPickable = computed(() => draftKind.value === "web" || draftKind.value
  *  therefore offers exactly one thing, its name. */
 const editingDeck = computed(() => editingId.value !== null && draftKind.value === "deck");
 
+/** POL-108 — a live stream is addressed by its HLS playlist. The placeholder says so, and the hint
+ *  below the field names the RTSP seam explicitly (a restreamer sits OUTSIDE Polyptic, by design)
+ *  without naming any product: the operator picks their own. */
+const urlPlaceholder = computed(() =>
+  draftKind.value === "stream" ? "https://…/stream.m3u8" : "https://…",
+);
+const isStream = computed(() => draftKind.value === "stream");
+
 const modalTitle = computed(() =>
   editingDeck.value ? "Rename deck" : editingId.value ? "Edit source" : "Add content source",
 );
@@ -956,10 +964,17 @@ function mediaFacts(s: ContentSource): string {
         <input
           v-model="draftUrl"
           class="field mono"
-          placeholder="https://…"
+          :placeholder="urlPlaceholder"
           @keyup.enter="save"
         />
 
+        <!-- POL-108 — the live-stream seam, stated plainly to the operator: HLS in, RTSP restreamed
+             outside Polyptic. No product is named; any restreamer works. -->
+        <p v-if="isStream" class="field-hint">
+          A live feed: point at an HLS playlist (<code>.m3u8</code>). The player reconnects by itself
+          if the source drops. RTSP cameras need an RTSP-to-HLS restreamer in front — Polyptic plays
+          what the restreamer publishes.
+        </p>
 
         </template>
 

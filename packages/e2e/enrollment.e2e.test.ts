@@ -605,6 +605,9 @@ describe("POL-117 — naming + pre-approval ident", () => {
       );
       expect(on.machineId).toBe(BOX);
       expect(on.pendingUrl).toContain(`pending=${encodeURIComponent(BOX)}`);
+      // POL-145 — this box is UNNAMED (its live-image hostname was refused as a label), so the
+      // ident URL must NOT claim a name: the board falls back to flashing the raw id.
+      expect(on.pendingUrl).not.toContain("name=");
 
       // The TTL restores the plain holding board — same frame, no ident marker.
       const off = await boxAgent.waitFor(
@@ -657,6 +660,33 @@ describe("POL-117 — naming + pre-approval ident", () => {
       );
       expect(machine.label).toBe("Lobby Left");
       expect(machine.status).toBe("pending"); // naming never changes enrollment status
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "POL-145 — a NAMED pending box's ident carries the name; the TTL-off stays the plain board",
+    async () => {
+      // The box was just renamed "Lobby Left" (previous test) — the ident should now lead with it.
+      const res = await postJson(`/api/v1/machines/${BOX}/ident`, { on: true, ttlMs: 800 });
+      expect(res.status).toBe(200);
+      await res.body?.cancel();
+
+      const on = await boxAgent.waitFor(
+        (m) => m.t === "server/pending" && typeof m.pendingUrl === "string" && m.pendingUrl.includes("name="),
+        "server/pending with ident name",
+      );
+      expect(on.pendingUrl).toContain("ident=1");
+      expect(on.pendingUrl).toContain(`name=${encodeURIComponent("Lobby Left")}`);
+
+      // The TTL-off frame is the PLAIN holding board — no ident, no name (it must byte-match the
+      // hello-time pendingUrl so the agent's URL-diff sees "back to normal", not a third variant).
+      const off = await boxAgent.waitFor(
+        (m) => m.t === "server/pending" && typeof m.pendingUrl === "string" && !m.pendingUrl.includes("ident="),
+        "server/pending plain (ttl off, named box)",
+        4_000,
+      );
+      expect(off.pendingUrl).not.toContain("name=");
     },
     TEST_TIMEOUT,
   );

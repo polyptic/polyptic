@@ -8,7 +8,7 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { machineDisplayName, machineHasName, machineIdTail } from "../src/machine-name";
+import { machineCardName, machineDisplayName, machineHasName, machineIdTail } from "../src/machine-name";
 
 const ID = "dmi-4c4c4544-0035-3010-8057-b8c04f4a3f9a";
 
@@ -46,5 +46,23 @@ describe("machineIdTail", () => {
   test("last 6 characters of a long id; short ids pass through", () => {
     expect(machineIdTail(ID)).toBe("4a3f9a");
     expect(machineIdTail("abc")).toBe("abc");
+  });
+});
+
+describe("machineCardName — POL-141, the badge-aware card name", () => {
+  test("a named machine shows its name, same as everywhere else", () => {
+    expect(machineCardName({ id: ID, label: "Lobby Left" })).toBe("Lobby Left");
+  });
+
+  test("an unnamed machine is a plain 'Unnamed box' — the id tail lives in the card's badge, never twice", () => {
+    for (const label of [ID, "", "   ", "localhost.localdomain"]) {
+      const shown = machineCardName({ id: ID, label });
+      expect(shown).toBe("Unnamed box");
+      expect(shown).not.toContain(machineIdTail(ID));
+    }
+  });
+
+  test("prose contexts keep the tail: machineDisplayName is unchanged", () => {
+    expect(machineDisplayName({ id: ID, label: ID })).toBe(`Unnamed box · ${ID.slice(-6)}`);
   });
 });

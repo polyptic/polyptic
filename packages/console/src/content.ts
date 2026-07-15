@@ -9,14 +9,16 @@ import type { ContentKind } from "@polyptic/protocol";
 
 /** The URL-backed kinds, in the order they're offered in the Add-source type picker. A playlist
  *  (POL-34) is deliberately NOT here — it is authored in its own modal, not typed as an address —
- *  and neither is `page` (POL-42), which is composed in the Studio ("New page"). */
-export const CONTENT_KINDS: ContentKind[] = ["web", "dashboard", "image", "video"];
+ *  and neither is `page` (POL-42), which is composed in the Studio ("New page"). `stream` (POL-108)
+ *  IS here: a live feed is an address like any other — an HLS playlist URL. */
+export const CONTENT_KINDS: ContentKind[] = ["web", "dashboard", "image", "video", "stream"];
 
 const LABELS: Record<ContentKind, string> = {
   web: "Web page",
   dashboard: "Dashboard",
   image: "Image",
   video: "Video",
+  stream: "Live stream",
   playlist: "Playlist",
   page: "Page",
   deck: "Deck",
@@ -27,6 +29,7 @@ const SHORT_LABELS: Record<ContentKind, string> = {
   dashboard: "Dashboard",
   image: "Image",
   video: "Video",
+  stream: "Live",
   playlist: "Playlist",
   page: "Page",
   deck: "Deck",
@@ -37,6 +40,7 @@ const GLYPHS: Record<ContentKind, string> = {
   dashboard: "D",
   image: "▦",
   video: "▷",
+  stream: "◉",
   playlist: "≣",
   page: "▣",
   // POL-114 — a converted document: a stack of pages.
@@ -49,6 +53,7 @@ const COLOR_VARS: Record<ContentKind, string> = {
   dashboard: "--ok",
   image: "--accent-fg",
   video: "--warn",
+  stream: "--bad",
   playlist: "--accent",
   page: "--accent",
   deck: "--ok",

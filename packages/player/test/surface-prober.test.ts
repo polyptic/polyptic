@@ -54,6 +54,21 @@ function harness(overrides: Partial<SurfaceProberOptions> = {}) {
 }
 
 describe("SurfaceProber", () => {
+  test("onProbeFail reports each failed probe (POL-108: a live surface says 'cannot reach the source')", async () => {
+    const failures: Array<[string, number, string]> = [];
+    const h = harness({
+      probe: () => Promise.reject(new Error("dns is not ready")),
+      onProbeFail: (id, attempts, error) => failures.push([id, attempts, error]),
+    });
+    h.prober.sync([{ id: "s1", url: "http://cam/live.m3u8" }]);
+
+    await sleep(40);
+    expect(failures.length).toBeGreaterThanOrEqual(2);
+    expect(failures[0]).toEqual(["s1", 1, "dns is not ready"]);
+    expect(failures[1]![1]).toBe(2); // the streak is what tells the player to stop saying "connecting"
+    h.prober.stop();
+  });
+
   test("nothing is painted until the probe passes", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));

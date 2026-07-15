@@ -80,6 +80,10 @@ export interface PersistedScreen {
   /** POL-119 — operator enabled casting (AirPlay receiver) on this screen. Persistent, no TTL.
    *  Undefined on legacy rows → false. */
   castEnabled?: boolean;
+  /** POL-111 — the screen's template variables ("line" → "Line 3"). Undefined on legacy rows → {}.
+   *  Note what is NOT here: any substituted content. Variables live on the SCREEN; the content rows
+   *  keep their clean `{{placeholder}}` templates and substitution happens at send time. */
+  variables?: Record<string, string>;
 }
 
 /** A screen's renderable content: its canvas + the surfaces currently placed on it. */
@@ -436,6 +440,15 @@ export interface PersistedDisplaySettings {
 }
 
 /**
+ * The fleet's UEFI boot-order policy (POL-115): may a running box put its own UEFI entry back at the
+ * head of BootOrder when the firmware displaces it? Absent until an operator first flips it, and the
+ * control plane's fallback is `false` — report the drift, write nothing.
+ */
+export interface PersistedBootOrderPolicy {
+  reassert: boolean;
+}
+
+/**
  * Panel power (POL-101): the deployment's timezone plus each screen's daily on/off window. ONE row,
  * because that is genuinely all this is — a per-screen window and the zone to read it in. Kept
  * deliberately small: the full recurrence machinery belongs to the scene scheduler, and the two are
@@ -693,6 +706,12 @@ export interface Store {
   getDisplaySettings(): Promise<PersistedDisplaySettings | undefined>;
   /** Persist the fleet-wide display settings (single row). */
   setDisplaySettings(settings: PersistedDisplaySettings): Promise<void>;
+
+  // ── UEFI boot-order policy (POL-115) ───────────────────────────────────────
+  /** The persisted boot-order policy. Undefined until an operator first flips it (default: report-only). */
+  getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined>;
+  /** Persist the fleet-wide boot-order policy (single row). */
+  setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void>;
 
   // ── Panel power (POL-101) ──────────────────────────────────────────────────
   /** The persisted panel-power config (timezone + per-screen hours). Undefined until first set. */

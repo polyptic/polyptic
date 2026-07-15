@@ -14,7 +14,7 @@
  * The server refuses to ADOPT meaningless hostnames as labels (state.ts labelForHello); this helper
  * is the display-side belt to that brace, so machines registered before the fix render honestly too.
  */
-import { meaningfulHostname } from "@polyptic/protocol";
+import { machineHasName } from "@polyptic/protocol";
 
 /** The human-comparable tail of a machine id: the last 6 characters, e.g. "…3f9a2c". */
 export function machineIdTail(id: string): string {
@@ -22,16 +22,24 @@ export function machineIdTail(id: string): string {
   return compact.length <= 6 ? compact : compact.slice(-6);
 }
 
-/** True when this machine has a real, operator-meaningful name (vs the unnamed sentinel). */
-export function machineHasName(machine: { id: string; label: string }): boolean {
-  const label = machine.label.trim();
-  if (!label || label === machine.id) return false;
-  // A label that is a meaningless hostname (adopted before POL-117) is not a name either.
-  return meaningfulHostname(label) !== null;
-}
+/** True when this machine has a real, operator-meaningful name (vs the unnamed sentinel).
+ *  POL-145 — the logic moved to the protocol so the SERVER can apply the same rule when deciding
+ *  what the pending board's ident flashes; re-exported so console call sites don't churn. */
+export { machineHasName };
 
 /** The name to display for a machine — the operator's name, or an honest "Unnamed box · <tail>". */
 export function machineDisplayName(machine: { id: string; label: string }): string {
   if (machineHasName(machine)) return machine.label.trim();
   return `Unnamed box · ${machineIdTail(machine.id)}`;
+}
+
+/**
+ * POL-141 — the name as shown ON A MACHINE CARD, where the id-tail badge sits beside the status
+ * pill. The badge is the tail's single home there, so the unnamed placeholder is a plain
+ * "Unnamed box" — printing the tail twice on one row would just be noise. Prose contexts
+ * (confirm dialogs, toasts, the terminal header) have no badge, so they keep using
+ * `machineDisplayName`, where the tail is what disambiguates "Reboot Unnamed box?".
+ */
+export function machineCardName(machine: { id: string; label: string }): string {
+  return machineHasName(machine) ? machine.label.trim() : "Unnamed box";
 }

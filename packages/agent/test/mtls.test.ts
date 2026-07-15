@@ -106,4 +106,14 @@ describe("deriveMtlsUrl", () => {
       deriveMtlsUrl("ws://localhost:8080/agent", { port: 1, url: "wss://mtls.example.com:7443/custom" }),
     ).toBe("wss://mtls.example.com:7443/custom");
   });
+
+  // POL-143 — the homelab regression, verbatim. The box knows its server as polyptic.homelab (:80,
+  // the plain boot host); the server ADVERTISES the NodePort it must dial. Reusing the box's own
+  // host and swapping in the advertised port is what makes the migration reachable — dialling the
+  // pod's :8443 bind port instead (which stock K3s Traefik never routes) is the whole bug.
+  test("reuses the box's own host on the server-advertised NodePort (the reachable door)", () => {
+    expect(deriveMtlsUrl("ws://polyptic.homelab/agent", { port: 30843 })).toBe(
+      "wss://polyptic.homelab:30843/agent",
+    );
+  });
 });

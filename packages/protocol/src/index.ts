@@ -231,6 +231,19 @@ export function meaningfulHostname(hostname: string | undefined | null): string 
   return h;
 }
 
+/**
+ * POL-145 — does this machine have a real, human-meaningful name? True when the label diverged from
+ * the id (the unnamed sentinel) AND is not itself a meaningless hostname adopted before POL-117.
+ * Shared by the console (the "Unnamed box" display fallback) and the server (which stamps the name
+ * onto the pending board's ident URL, so the panel flashes what the operator called it — never a
+ * hostname posing as a name, never the raw id when a better identity exists).
+ */
+export function machineHasName(machine: { id: string; label: string }): boolean {
+  const label = machine.label.trim();
+  if (!label || label === machine.id) return false;
+  return meaningfulHostname(label) !== null;
+}
+
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
@@ -282,6 +295,52 @@ export const Machine = z.object({
 });
 export type Machine = z.infer<typeof Machine>;
 
+// ── Per-screen template variables (POL-111) ──────────────────────────────────
+//
+// One source, fifty screens: a single dashboard URL / page / ticker carries `{{placeholder}}` tokens
+// and the SERVER substitutes them per screen on the way out (decorateSliceForSend — the same send-time
+// seam as POL-24 credential stamping). The DB and the stored slices always keep the CLEAN, tokenised
+// value; nothing substituted is ever persisted, so one edit of the source still reaches every screen.
+//
+// Scope for a screen = its own `variables` map, plus the always-available built-ins
+// `{{screen.name}}`, `{{screen.id}}` and `{{machine.hostname}}`. Custom keys may NOT contain a dot,
+// which is what makes shadowing a built-in impossible.
+
+/** A custom variable key: identifier-ish, dot-free (dots are reserved for the built-in namespaces). */
+export const ScreenVariableKey = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,31}$/, {
+  message: "keys start with a letter and use letters/digits/_/- (max 32, no dots)",
+});
+export type ScreenVariableKey = z.infer<typeof ScreenVariableKey>;
+
+/**
+ * A variable value. Deliberately narrow — this string is inserted into URLs and on-glass text, so the
+ * edge refuses the two things that would make substitution an injection primitive:
+ *   - control characters (header/line-break smuggling, invisible payloads),
+ *   - `{{` / `}}` (a value that could be re-expanded on a second pass — there IS no second pass, and
+ *     forbidding braces here means there never can be one, even if a future caller loops).
+ * Everything else (quotes, `<`, `&`, `javascript:`) is allowed as DATA and neutralised per context by
+ * the substituter: percent-encoded in a URL, rendered as a text node in page text.
+ */
+export const ScreenVariableValue = z
+  .string()
+  .max(200)
+  .refine((v) => ![...v].some((c) => (c.codePointAt(0) ?? 0) < 0x20 || c.codePointAt(0) === 0x7f), {
+    message: "value cannot contain control characters",
+  })
+  .refine((v) => !v.includes("{{") && !v.includes("}}"), {
+    message: "value cannot contain template braces",
+  });
+export type ScreenVariableValue = z.infer<typeof ScreenVariableValue>;
+
+/** A screen's custom variables. Capped — this is local flavour ("Line 3"), not a config store. */
+export const ScreenVariables = z
+  .record(ScreenVariableKey, ScreenVariableValue)
+  .refine((v) => Object.keys(v).length <= 32, { message: "at most 32 variables per screen" });
+export type ScreenVariables = z.infer<typeof ScreenVariables>;
+
+/** The built-in variable names, always in scope, never overridable (custom keys cannot contain a dot). */
+export const BUILT_IN_VARIABLES = ["screen.name", "screen.id", "machine.hostname"] as const;
+
 /** A screen: the first-class, named entity users actually configure. */
 export const Screen = z.object({
   id: z.string(), // control-plane assigned, stable
@@ -294,6 +353,9 @@ export const Screen = z.object({
    *  advertised under the screen's friendlyName, and a sender's PIN entry (always on, displayed on the
    *  glass) is the per-session gate, so leaving this enabled is not an open door. */
   castEnabled: z.boolean().default(false),
+  /** POL-111 — this screen's local flavour ("line" → "Line 3"), substituted into the content it is
+   *  sent at SEND time. Part of the screen registry, not of any content: one source stays one source. */
+  variables: ScreenVariables.default({}),
 });
 export type Screen = z.infer<typeof Screen>;
 
@@ -388,6 +450,36 @@ export const VideoSurface = SurfaceBase.extend({
    *  video buffers, so a wall never flashes black between the paint and the first decoded frame. */
   poster: z.string().url().optional(),
 });
+
+// ── Live streams (POL-108) ───────────────────────────────────────────────────
+// A `stream` is a LIVE source — a camera feed, a channel — as opposed to a `video`, which is a file
+// with a beginning and an end. The distinction is not cosmetic: a file is fetched once and can be
+// cached, looped and seeked; a live source has a moving window, no end, and fails in ways a file
+// cannot (the origin goes down mid-play, a segment 404s, the playlist stops advancing while the
+// element still reports itself "playing"). The player therefore renders it with its own engine —
+// reconnect, stall watchdog, plain-English "no signal" board — rather than as a `<video src>`.
+//
+// The TRANSPORT is an enum, and that enum is the vendor-neutral seam. `hls` is what ships: it is a
+// plain-HTTP, firewall-friendly, universally-restreamable format. RTSP cameras are explicitly OUT of
+// scope of the core — an operator puts any RTSP→HLS restreamer in front, and Polyptic never learns a
+// vendor's name. `whep` (WebRTC-HTTP Egress Protocol) is declared here as the sub-second seam the
+// same surface will grow into; a player build that cannot play a declared protocol says so on the
+// glass instead of showing black.
+
+/** How a live stream is delivered. `hls` today; `whep` is the declared WebRTC seam (POL-108). */
+export const StreamProtocol = z.enum(["hls", "whep"]);
+export type StreamProtocol = z.infer<typeof StreamProtocol>;
+
+export const StreamSurface = SurfaceBase.extend({
+  type: z.literal("stream"),
+  /** The live source's address — for `hls`, the .m3u8 playlist. */
+  url: z.string().url(),
+  protocol: StreamProtocol.default("hls"),
+  /** Walls are silent by default; an operator may unmute one screen deliberately. */
+  muted: z.boolean().default(true),
+  fit: z.enum(["cover", "contain"]).default("contain"),
+});
+export type StreamSurface = z.infer<typeof StreamSurface>;
 
 // ── Playlists (POL-34) ────────────────────────────────────────────────────────
 // A playlist is a library-authored CAROUSEL of content. The server resolves each step's source to a
@@ -741,6 +833,7 @@ export const Surface = z.discriminatedUnion("type", [
   DashboardSurface,
   ImageSurface,
   VideoSurface,
+  StreamSurface,
   PlaylistSurface,
   PageSurface,
 ]);
@@ -806,6 +899,22 @@ export const AgentHello = z.object({
    * in `server/enrolled.mtls`. Servers without mTLS ignore it.
    */
   csrPem: z.string().optional(),
+  /**
+   * POL-143 — the box's own account of WHY it is on the plain channel despite holding a cert: its
+   * mTLS dials keep failing. Attached to a plain-channel hello after repeated failures, carrying
+   * the exact URL it tried and the consecutive-failure count, so the server can surface "this box
+   * cannot reach the secure port at <url>" instead of promising a migration that never comes
+   * (measured live: a chart that never routed :8443 left every box saying "moves over on next
+   * connection" forever). Absent on an mTLS-channel hello, a first contact, or a healthy fleet.
+   */
+  mtlsDialFailure: z
+    .object({
+      /** The wss:// URL the agent dialled (from its bundle). */
+      url: z.string(),
+      /** Consecutive failed mTLS dials since the last success. */
+      attempts: z.number().int().positive(),
+    })
+    .optional(),
 });
 
 // ── Host vitals (POL-92) ─────────────────────────────────────────────────────
@@ -1206,7 +1315,12 @@ export const ServerToAgentPending = z.object({
    *  there is no player WS to pulse, and the trust model wants nothing new reachable pre-approval.
    *  The server re-sends `server/pending` with `&ident=1` appended to the URL (and again without it
    *  to clear); the agent's existing "re-place when the URL changed" handling swaps the board, and
-   *  the pending page renders its flash overlay. No new frame, no new agent code, old agents included. */
+   *  the pending page renders its flash overlay. No new frame, no new agent code, old agents included.
+   *
+   *  POL-145 — when the machine HAS a name (`machineHasName`: renamed while pending, or named by
+   *  pre-registration), the ident URL also carries `&name=<label>` and the board flashes THE NAME,
+   *  with the id small underneath; only an unnamed box flashes the raw id. Same additive URL-param
+   *  path, so it still needs no agent change. */
   pendingUrl: z.string().optional(),
 });
 
@@ -1452,7 +1566,7 @@ export const ScreenView = Screen.extend({
     .object({
       name: z.string(),
       // Mirrors ContentKind (declared below); inlined because this schema evaluates first.
-      kind: z.enum(["web", "dashboard", "image", "video", "playlist", "page", "deck"]),
+      kind: z.enum(["web", "dashboard", "image", "video", "stream", "playlist", "page", "deck"]),
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
@@ -1515,6 +1629,12 @@ export const ScreenView = Screen.extend({
    *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
    *  toggle — is inherited from `Screen`.) */
   castActive: z.boolean().optional(),
+  /** POL-111 — placeholders the content on this screen uses that resolve to NOTHING in its scope
+   *  (neither a built-in nor one of its own `variables`). They render as EMPTY on the glass — never as
+   *  literal braces — so the only way an operator learns about a typo'd `{{lien}}` is this list, which
+   *  the console shows as a warning badge on the screen's Variables card. Server-computed from the
+   *  screen's STORED (clean) slice at broadcast time. */
+  unresolvedVariables: z.array(z.string()).optional(),
 });
 export type ScreenView = z.infer<typeof ScreenView>;
 
@@ -1615,11 +1735,22 @@ export type VideoWall = z.infer<typeof VideoWall>;
 
 /** The kind of a content source — mirrors the renderable Surface types. `playlist` (POL-34) is the
  *  composite kind: a carousel over the other renderables. `page` (POL-42) is an authored composition
- *  created in the console's Studio; it has a `definition`, not a `url`. `deck` (POL-114) is an
+ *  created in the console's Studio; it has a `definition`, not a `url`. `stream` (POL-108) is a LIVE
+ *  source (an HLS playlist), distinct from `video` (a file): it never ends, is never cached, and is
+ *  not a playlist step — a rotation over a live feed is a contradiction. `deck` (POL-114) is an
  *  uploaded DOCUMENT (PDF/slides) that the server pre-converted to page images: its `url` addresses
  *  the original document and its pages are server-derived (`deck`) — it RENDERS as a playlist of
  *  images, so the player needs no new surface for it. */
-export const ContentKind = z.enum(["web", "dashboard", "image", "video", "playlist", "page", "deck"]);
+export const ContentKind = z.enum([
+  "web",
+  "dashboard",
+  "image",
+  "video",
+  "stream",
+  "playlist",
+  "page",
+  "deck",
+]);
 export type ContentKind = z.infer<typeof ContentKind>;
 
 /** One AUTHORED step of a playlist source (POL-34): a reference to another library source plus how
@@ -2124,6 +2255,17 @@ export const BootReportCode = z.enum([
   "boot-order-not-first", // the entry exists but the firmware still boots something else first
   "esp-too-small", // POL-63: the Wi-Fi local payload (kernel + initrd-wifi + spare slot) won't fit
   "no-local-payload", // POL-63: a Wi-Fi box's offload found no payload for its arch on the medium
+  // ── POL-115: boot-order DRIFT, reported by a box that is already up and netbooted ────────────────
+  // Firmware re-prepends its own OS entry to BootOrder after firmware updates, reflashes, and a disk
+  // OS running `grub-install` — so a box that offloaded cleanly months ago silently boots a stale disk
+  // OS on its next power-cycle, and the wall goes dark. The running box watches its own boot path and
+  // says so. `boot-order-drift` is the REPORT-ONLY verdict (the default posture: nothing was written);
+  // `boot-order-reasserted` is a drift the box corrected and then PROVED by re-reading NVRAM;
+  // `boot-order-reassert-failed` is a firmware that would not keep our entry first (a persistent fight
+  // an operator must settle in firmware setup — the box says so once and goes on rendering).
+  "boot-order-drift",
+  "boot-order-reasserted",
+  "boot-order-reassert-failed",
   // POL-116: not a bootloader outcome at all — an initramfs one. The box's boot medium pinned a build
   // (D67's offline menu) that retention (D54) has since pruned from the depot, so it healed itself in
   // the initramfs and streamed the ACTIVE image instead. It IS up, on a rootfs its on-stick kernel did
@@ -2142,6 +2284,26 @@ export const BootReportBody = z.object({
   machineId: z.string().max(128).default(""),
 });
 export type BootReportBody = z.infer<typeof BootReportBody>;
+
+/**
+ * The fleet's UEFI boot-order policy (POL-115), served to booted boxes at `GET /boot/policy` and
+ * flipped by the operator in Console ▸ Settings.
+ *
+ * `reassert: false` is the DEFAULT and the safe posture: a box that finds its UEFI entry displaced
+ * writes NOTHING and only reports the drift, so an operator learns about a firmware fight from the
+ * activity feed instead of from a dark screen. Turning it on lets the box put its own entry back at
+ * the head of BootOrder — a write to firmware NVRAM, hence opt-in, and never an implicit default.
+ */
+export const BootOrderPolicy = z.object({
+  reassert: z.boolean(),
+});
+export type BootOrderPolicy = z.infer<typeof BootOrderPolicy>;
+
+/** Flip the fleet's UEFI boot-order policy from the console (POL-115). */
+export const UpdateBootOrderPolicyBody = z.object({
+  reassert: z.boolean(),
+});
+export type UpdateBootOrderPolicyBody = z.infer<typeof UpdateBootOrderPolicyBody>;
 
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
@@ -2320,6 +2482,13 @@ export type BulkOpResponse = z.infer<typeof BulkOpResponse>;
  *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
 export const CastArmBody = z.object({ enabled: z.boolean() });
 export type CastArmBody = z.infer<typeof CastArmBody>;
+
+/** POST /api/v1/screens/:id/variables — replace this screen's variable map wholesale (POL-111).
+ *  Whole-map PUT semantics: the console edits a small table, and a partial patch protocol would only
+ *  invent a delete-vs-blank ambiguity. Registry metadata, so no revision bump — but the screen's
+ *  render IS re-pushed (same revision) because the substituted content changed. */
+export const ScreenVariablesBody = z.object({ variables: ScreenVariables });
+export type ScreenVariablesBody = z.infer<typeof ScreenVariablesBody>;
 
 // REST bodies — murals & placement (Phase 3)
 export const CreateMuralBody = z.object({ name: z.string().min(1).max(64) });
@@ -2863,6 +3032,17 @@ export const AgentSecurityInfo = z.object({
       agentChannel: z.enum(["plain", "mtls"]).optional(),
       mtlsCertIssuedAt: z.string().optional(),
       mtlsSeenAt: z.string().optional(),
+      /** POL-143 — the box reported that it CANNOT reach the mTLS listener: the URL it dialled,
+       *  how many consecutive dials failed, and when it last said so. Live-only (cleared the
+       *  moment the box connects over mTLS, or goes offline) — this is why the card must stop
+       *  promising "moves over on next connection". */
+      mtlsDialError: z
+        .object({
+          url: z.string(),
+          attempts: z.number().int().positive(),
+          at: z.string(),
+        })
+        .optional(),
     }),
   ),
 });
