@@ -10,3 +10,4 @@ export { ELEMENT_LIBRARY, defaultElement, libraryEntry } from "./library";
 export type { ElementLibraryEntry } from "./library";
 export { formatAge, formatClock, formatCountdown, useNow } from "./clock";
 export { qrSvgPath, qrModuleCount } from "./qr";
+export { embedZoomStyle, feedFontSizes } from "./style";

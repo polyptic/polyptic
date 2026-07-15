@@ -19,15 +19,20 @@ import type {
   ContentSource,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  CreateEnrollmentTokenBody,
+  CreatePreRegistrationBody,
   CredentialProfileTestResult,
   CredentialProfileView,
   DisplaySettings,
   EnrollmentInfo,
+  EnrollmentTokenView,
   LoginBody,
   MachineView,
   Mural,
   NetbootInfo,
+  OperatorRole,
   Placement,
+  PreRegistration,
   Scene,
   ScreenView,
   UpdateContentSourceBody,
@@ -110,8 +115,11 @@ export interface ConsoleState {
   /** Whether the initial /auth/me probe has resolved. The router guard runs it exactly once per load
    *  and then trusts `currentUser`, so navigations don't re-hit the network. */
   sessionChecked: boolean;
-  /** Enrollment-token visibility for Settings + the cold-start wizard (open mode vs gated token). */
+  /** Enrollment-token visibility for Settings + the cold-start wizard (open mode vs gated token).
+   *  POL-104: `enrollment.tokens` is the batch-token table the Settings card renders. */
   enrollment: EnrollmentInfo | null;
+  /** POL-104 — boxes an operator declared before they ever booted (Machines ▸ Pre-registered). */
+  preRegistrations: PreRegistration[];
   /** Netboot info for Settings (POL-33): control-plane base, the `/boot/grub.cfg` boot config URL,
    *  and the optional boot-medium download. Null until the Settings view fetches it. */
   netboot: NetbootInfo | null;
@@ -167,6 +175,7 @@ export const useConsoleStore = defineStore("console", {
     currentUser: null,
     sessionChecked: false,
     enrollment: null,
+    preRegistrations: [],
     netboot: null,
     imageUpdates: null,
     settings: null,
@@ -203,6 +212,26 @@ export const useConsoleStore = defineStore("console", {
       return state.currentUser?.email ?? "";
     },
 
+    // ── Roles (POL-107) ─────────────────────────────────────────────────────────
+    // These drive which affordances the console DRAWS. They are a courtesy, not a permission system:
+    // every one of them mirrors a policy the SERVER enforces on the route (and 403s on), so a hand-
+    // crafted fetch from a viewer's console gains nothing. Signed out ⇒ the most restrictive answer.
+
+    /** The signed-in operator's role (`viewer` until we know better — never assume power). */
+    role(state): OperatorRole {
+      return state.currentUser?.role ?? "viewer";
+    },
+
+    /** Machines, enrolment, image builds, settings, credential profiles, the shell, DevTools. */
+    isAdmin(state): boolean {
+      return state.currentUser?.role === "admin";
+    },
+
+    /** Content + layout mutations (an admin is also an operator). */
+    canAuthor(state): boolean {
+      return state.currentUser?.role === "admin" || state.currentUser?.role === "operator";
+    },
+
     /** Two-letter avatar initials derived from the operator's email (e.g. "operator@…" → "OP"). */
     accountInitials(state): string {
       const email = state.currentUser?.email;
@@ -223,9 +252,14 @@ export const useConsoleStore = defineStore("console", {
       return state.enrollment?.mode === "open";
     },
 
-    /** The gated bootstrap token, when in gated mode and loaded; else null. */
+    /** The gated bootstrap token (POL-104: the BAKE token's secret), when gated and loaded; else null. */
     enrollmentToken(state): string | null {
       return state.enrollment?.mode === "gated" ? state.enrollment.token : null;
+    },
+
+    /** POL-104 — every enrolment token, newest first (the Settings table). */
+    enrollmentTokens(state): EnrollmentTokenView[] {
+      return [...(state.enrollment?.tokens ?? [])].reverse();
     },
 
     /** Whether on-screen badges are shown fleet-wide (POL-6). Defaults to false until settings load. */
@@ -546,13 +580,114 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Mint a fresh gated bootstrap token, replacing the shown one. Returns false (no throw) on error. */
+    /** Rotate the baked token (POL-104: the old secret keeps enrolling for its 24 h grace window, so
+     *  media already flashed are not stranded). Returns false (no throw) on error. */
     async regenerateEnrollment(): Promise<boolean> {
       try {
         this.enrollment = await auth.regenerateEnrollment();
         return true;
       } catch (err) {
         console.error("[console] regenerateEnrollment failed", err);
+        return false;
+      }
+    },
+
+    // ── Enrolment tokens (POL-104) ───────────────────────────────────────────────
+
+    async createEnrollmentToken(body: CreateEnrollmentTokenBody): Promise<boolean> {
+      try {
+        this.enrollment = await auth.createEnrollmentToken(body);
+        return true;
+      } catch (err) {
+        console.error("[console] createEnrollmentToken failed", err);
+        return false;
+      }
+    },
+
+    async rotateEnrollmentToken(id: string, graceHours: number): Promise<boolean> {
+      try {
+        this.enrollment = await auth.rotateEnrollmentToken(id, graceHours);
+        return true;
+      } catch (err) {
+        console.error("[console] rotateEnrollmentToken failed", err);
+        return false;
+      }
+    },
+
+    async revokeEnrollmentToken(id: string): Promise<boolean> {
+      try {
+        this.enrollment = await auth.revokeEnrollmentToken(id);
+        return true;
+      } catch (err) {
+        console.error("[console] revokeEnrollmentToken failed", err);
+        return false;
+      }
+    },
+
+    async bakeEnrollmentToken(id: string): Promise<boolean> {
+      try {
+        this.enrollment = await auth.bakeEnrollmentToken(id);
+        return true;
+      } catch (err) {
+        console.error("[console] bakeEnrollmentToken failed", err);
+        return false;
+      }
+    },
+
+    async deleteEnrollmentToken(id: string): Promise<boolean> {
+      try {
+        this.enrollment = await auth.deleteEnrollmentToken(id);
+        return true;
+      } catch (err) {
+        console.error("[console] deleteEnrollmentToken failed", err);
+        return false;
+      }
+    },
+
+    // ── Pre-registration (POL-104) ───────────────────────────────────────────────
+
+    async fetchPreRegistrations(): Promise<void> {
+      try {
+        this.preRegistrations = await api.fetchPreRegistrations();
+      } catch (err) {
+        console.error("[console] fetchPreRegistrations failed", err);
+      }
+    },
+
+    async addPreRegistration(body: CreatePreRegistrationBody): Promise<boolean> {
+      try {
+        await api.createPreRegistration(body);
+        await this.fetchPreRegistrations();
+        return true;
+      } catch (err) {
+        console.error("[console] addPreRegistration failed", err);
+        return false;
+      }
+    },
+
+    /** Paste a CSV of boxes. Returns the per-line errors so the view can show WHICH rows were bad —
+     *  a silently-dropped row in a 50-box paste is a box that never auto-approves and nobody knows why. */
+    async importPreRegistrations(
+      csv: string,
+      autoApprove: boolean,
+    ): Promise<{ created: number; errors: { line: number; text: string; reason: string }[] } | null> {
+      try {
+        const result = await api.importPreRegistrations(csv, autoApprove);
+        await this.fetchPreRegistrations();
+        return { created: result.created.length, errors: result.errors };
+      } catch (err) {
+        console.error("[console] importPreRegistrations failed", err);
+        return null;
+      }
+    },
+
+    async removePreRegistration(id: string): Promise<boolean> {
+      try {
+        await api.deletePreRegistration(id);
+        await this.fetchPreRegistrations();
+        return true;
+      } catch (err) {
+        console.error("[console] removePreRegistration failed", err);
         return false;
       }
     },
@@ -801,12 +936,33 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box. */
+    /** Flash every screen a machine drives (fire-and-forget pulse) so an operator can spot the box.
+     *  POL-117: works pre-approval too — the server flips the box's holding board to its flashing
+     *  face over the agent channel. That path re-places the kiosk browser (seconds, not millis), so
+     *  a pending box gets a longer TTL or the flash would be over before the board came back up. */
     async identMachine(id: string): Promise<void> {
+      const pending = this.machines.find((m) => m.id === id)?.status === "pending";
       try {
-        await api.identMachine(id, { on: true, ttlMs: 3000 });
+        await api.identMachine(id, { on: true, ttlMs: pending ? 12000 : 3000 });
       } catch (err) {
         console.error("[console] identMachine failed", err);
+      }
+    },
+
+    /**
+     * Name a machine (POL-117) — any machine, any status. Optimistic like renameScreen; the
+     * authoritative admin/state broadcast (<150ms) then relabels every open console, including the
+     * box's own pending card while it queues for approval.
+     */
+    async renameMachine(id: string, label: string): Promise<void> {
+      const trimmed = label.trim();
+      if (!trimmed) return;
+      const machine = this.machines.find((m) => m.id === id);
+      if (machine) machine.label = trimmed; // optimistic
+      try {
+        await api.renameMachine(id, trimmed);
+      } catch (err) {
+        console.error("[console] renameMachine failed", err);
       }
     },
 
@@ -1120,6 +1276,48 @@ export const useConsoleStore = defineStore("console", {
           if (!screenIds.includes(screen.id) || !screen.content) continue;
           if (screen.content.zoom === undefined) continue;
           screen.content = { ...screen.content, zoom };
+        }
+      }
+    },
+
+    /**
+     * Zoom one framed step of the playlist a single screen is showing (POL-133). Same shape as
+     * `setScreenZoom`: optimistic patch of the step's read-out so the − / + buttons step from the
+     * value the operator sees; the authoritative value returns on the next `admin/state`.
+     */
+    async setScreenPlaylistZoom(screenId: string, sourceId: string, zoom: number): Promise<void> {
+      this.patchPlaylistEntryZoom([screenId], sourceId, zoom);
+      try {
+        await api.setScreenPlaylistZoom(screenId, sourceId, zoom);
+      } catch (err) {
+        console.error("[console] setScreenPlaylistZoom failed", err);
+      }
+    },
+
+    /** Zoom one framed step of the playlist spanning a combined surface (POL-133). */
+    async setWallPlaylistZoom(wallId: string, sourceId: string, zoom: number): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchPlaylistEntryZoom(wall.memberScreenIds, sourceId, zoom);
+      try {
+        await api.setWallPlaylistZoom(wallId, sourceId, zoom);
+      } catch (err) {
+        console.error("[console] setWallPlaylistZoom failed", err);
+      }
+    },
+
+    /** Optimistically write a step zoom onto the given screens' playlist read-outs. Steps that are
+     *  not zoomable (media — no zoom in the read-out) are left alone, mirroring the server. */
+    patchPlaylistEntryZoom(screenIds: readonly string[], sourceId: string, zoom: number): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content?.entries) continue;
+          screen.content = {
+            ...screen.content,
+            entries: screen.content.entries.map((entry) =>
+              entry.sourceId === sourceId && entry.zoom !== undefined ? { ...entry, zoom } : entry,
+            ),
+          };
         }
       }
     },
