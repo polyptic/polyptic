@@ -10,6 +10,12 @@
  */
 import { z } from "zod";
 
+import { Daypart, Schedule, SchedulerSettings } from "./schedule";
+
+// The scene scheduler (POL-89/D93): dayparts, schedules, settings AND the shared resolver — the
+// server's ticker and the console's week strip answer "what plays when" with the same function.
+export * from "./schedule";
+
 export const PROTOCOL_VERSION = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1431,7 +1437,8 @@ export const Scene = z.object({
   placements: z.array(ScenePlacement), // layout
   walls: z.array(SceneWall), // grouping + each wall's content
   screens: z.array(SceneScreen), // content for placed, non-walled screens
-  scheduleAt: z.string().optional(), // "HH:MM" — illustrative; stored, not fired
+  // A scene carries NO time of its own (POL-89/D93 dropped D24's illustrative `scheduleAt`): WHEN a
+  // scene plays is a `Schedule` — a scene bound to a daypart on a recurrence, at a priority.
 });
 export type Scene = z.infer<typeof Scene>;
 
@@ -1578,6 +1585,11 @@ export const ServerToAdminState = z.object({
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
+  // POL-89 — the scene scheduler. The console feeds these three straight into the shared resolver to
+  // paint its "what plays when" week strip, so the strip cannot disagree with the server's ticker.
+  dayparts: z.array(Daypart).optional(), // optional = back-compat
+  schedules: z.array(Schedule).optional(),
+  scheduler: SchedulerSettings.optional(),
 });
 export const ServerToAdminMessage = z.discriminatedUnion("t", [ServerToAdminState]);
 export type ServerToAdminMessage = z.infer<typeof ServerToAdminMessage>;
@@ -1766,10 +1778,9 @@ export const CreateSceneBody = z.object({
 });
 export type CreateSceneBody = z.infer<typeof CreateSceneBody>;
 
-/** Rename a scene and/or set its illustrative schedule time (null clears it). */
+/** Rename a scene. (Scheduling is NOT here — a scene's time of day is a `Schedule`, POL-89/D93.) */
 export const UpdateSceneBody = z.object({
   name: z.string().min(1).max(120).optional(),
-  scheduleAt: z.string().nullable().optional(),
 });
 export type UpdateSceneBody = z.infer<typeof UpdateSceneBody>;
 

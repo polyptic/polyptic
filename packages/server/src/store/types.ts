@@ -190,15 +190,45 @@ export interface PersistedVideoWall {
 /**
  * Phase 3d — a SCENE row: a named SNAPSHOT of a mural's whole wall. The layout (placements),
  * grouping (video walls) and content (per screen + per wall) live together in the `snapshot` jsonb,
- * mirroring the protocol `Scene`'s {placements, walls, screens}. `scheduleAt` is the illustrative
- * "HH:MM" time — STORED, NOT FIRED — and is null/undefined when unscheduled.
+ * mirroring the protocol `Scene`'s {placements, walls, screens}. WHEN a scene plays is not here:
+ * POL-89/D93 dropped D24's illustrative `schedule_at` in favour of real `schedules` rows.
  */
 export interface PersistedScene {
   id: string;
   name: string;
   muralId: string;
   snapshot: Pick<Scene, "placements" | "walls" | "screens">;
-  scheduleAt?: string | null;
+}
+
+/** POL-89 — a named window of the day ("Opening hours", 08:00–18:00). `end <= start` wraps midnight. */
+export interface PersistedDaypart {
+  id: string;
+  name: string;
+  start: string;
+  end: string;
+}
+
+/** POL-89 — a scene bound to a daypart on a recurrence, at a priority. The scheduler's unit. */
+export interface PersistedSchedule {
+  id: string;
+  sceneId: string;
+  daypartId: string;
+  /** Weekdays the window is armed on (0=Sun…6=Sat). */
+  days: number[];
+  priority: number;
+  enabled: boolean;
+  /** Inclusive date range (`YYYY-MM-DD`), tested against the window's START date. */
+  from: string | null;
+  until: string | null;
+  createdAt: string;
+}
+
+/** POL-89 — deployment-wide scheduler settings (one row): master switch, timezone, default scene. */
+export interface PersistedSchedulerSettings {
+  enabled: boolean;
+  /** IANA zone. Explicit and configurable — never implied by the browser or the process env. */
+  timezone: string;
+  defaultSceneId: string | null;
 }
 
 // ── Local operator accounts + sessions + enrollment bootstrap (Phase 3f / D29) ──
@@ -388,6 +418,9 @@ export interface PersistedState {
   contentSources: PersistedContentSource[];
   /** Phase 3d — saved wall snapshots (scenes). */
   scenes: PersistedScene[];
+  /** POL-89 — the scene scheduler: the daypart library and the schedules bound to it. */
+  dayparts: PersistedDaypart[];
+  schedules: PersistedSchedule[];
   /** POL-24 — credential profiles (content auth). */
   credentialProfiles: PersistedCredentialProfile[];
   /** POL-57 — remembered page zoom per (screen-or-wall, content) pair. */
@@ -477,12 +510,31 @@ export interface Store {
   listCredentialProfiles(): Promise<PersistedCredentialProfile[]>;
 
   // ── Scenes (Phase 3d) ──────────────────────────────────────────────────────
-  /** Insert-or-update a scene row (id + name + mural + snapshot jsonb + schedule_at). */
+  /** Insert-or-update a scene row (id + name + mural + snapshot jsonb). */
   upsertScene(scene: PersistedScene): Promise<void>;
   /** Delete a scene row. No-op if absent. */
   deleteScene(id: string): Promise<void>;
   /** All persisted scenes. */
   listScenes(): Promise<PersistedScene[]>;
+
+  // ── Scene scheduler (POL-89) ───────────────────────────────────────────────
+  /** Insert-or-update a daypart row. */
+  upsertDaypart(daypart: PersistedDaypart): Promise<void>;
+  /** Delete a daypart row (the control plane deletes the schedules bound to it first). No-op if absent. */
+  deleteDaypart(id: string): Promise<void>;
+  /** All persisted dayparts. */
+  listDayparts(): Promise<PersistedDaypart[]>;
+  /** Insert-or-update a schedule row. */
+  upsertSchedule(schedule: PersistedSchedule): Promise<void>;
+  /** Delete a schedule row. No-op if absent. */
+  deleteSchedule(id: string): Promise<void>;
+  /** All persisted schedules. */
+  listSchedules(): Promise<PersistedSchedule[]>;
+  /** The persisted scheduler settings (single row). Undefined until first set — the control plane
+   *  then falls back to its default (scheduler on, the server's own zone, no default scene). */
+  getSchedulerSettings(): Promise<PersistedSchedulerSettings | undefined>;
+  /** Replace the scheduler settings (single row). */
+  setSchedulerSettings(settings: PersistedSchedulerSettings): Promise<void>;
 
   // ── Local operator accounts + sessions (Phase 3f / D29) ────────────────────
   /** Look up a user by (normalized) email. Used by login + change-password. */

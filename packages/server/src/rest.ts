@@ -1770,10 +1770,11 @@ export function registerRestRoutes(
 
   // ── Phase 3d routes (scenes) ──────────────────────────────────────────────────
   //
-  // A scene is a named SNAPSHOT of a mural's whole wall. Saving/renaming/scheduling/deleting a scene is
-  // registry metadata → those routes broadcast a fresh admin/state (which now carries scenes[]). APPLY
-  // re-lays the wall (split/place/move + combine + content), so it ALSO pushes `server/render` to every
-  // affected member's player (the instant path). The schedule time is illustrative — STORED, NOT FIRED.
+  // A scene is a named SNAPSHOT of a mural's whole wall. Saving/renaming/deleting a scene is registry
+  // metadata → those routes broadcast a fresh admin/state (which now carries scenes[]). APPLY re-lays
+  // the wall (split/place/move + combine + content), so it ALSO pushes `server/render` to every
+  // affected member's player (the instant path). WHEN a scene plays lives in `schedule-routes.ts`
+  // (POL-89): dayparts + schedules, resolved by a ticker that calls this same apply path.
 
   // GET /api/v1/scenes -> Scene[]
   fastify.get("/api/v1/scenes", async () => control.getScenes());
@@ -1840,7 +1841,7 @@ export function registerRestRoutes(
     };
   });
 
-  // PATCH /api/v1/scenes/:id  { name?, scheduleAt? }  -> rename and/or set illustrative schedule time
+  // PATCH /api/v1/scenes/:id  { name? }  -> rename a saved scene
   fastify.patch("/api/v1/scenes/:id", async (request, reply) => {
     const params = SceneParams.safeParse(request.params);
     if (!params.success) {
@@ -1857,7 +1858,7 @@ export function registerRestRoutes(
     }
 
     fastify.log.info(
-      { event: "scene.update", sceneId: scene.id, name: scene.name, scheduleAt: scene.scheduleAt ?? null },
+      { event: "scene.update", sceneId: scene.id, name: scene.name },
       "scene updated",
     );
     broadcaster.broadcast();

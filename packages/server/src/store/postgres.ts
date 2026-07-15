@@ -36,10 +36,13 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedDaypart,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
   PersistedImageRollout,
   PersistedMachine,
+  PersistedSchedule,
+  PersistedSchedulerSettings,
   PersistedAgentMtlsPosture,
   PersistedMtlsCa,
   PersistedPreRegistration,
@@ -202,7 +205,31 @@ interface SceneRow {
   name: string;
   mural_id: string;
   snapshot: unknown;
-  schedule_at: string | null;
+}
+
+interface DaypartRow {
+  id: string;
+  name: string;
+  start_time: string;
+  end_time: string;
+}
+
+interface ScheduleRow {
+  id: string;
+  scene_id: string;
+  daypart_id: string;
+  days: unknown;
+  priority: number;
+  enabled: boolean;
+  from_date: string | null;
+  until_date: string | null;
+  created_at: Date;
+}
+
+interface SchedulerSettingsRow {
+  enabled: boolean;
+  timezone: string;
+  default_scene_id: string | null;
 }
 
 interface UserRow {
@@ -383,14 +410,54 @@ export class PostgresStore implements Store {
       )
     `;
     // Scenes (Phase 3d). A named SNAPSHOT of a mural's whole wall — layout + grouping + content live
-    // in the `snapshot` jsonb. `schedule_at` is the illustrative "HH:MM" time (stored, NOT fired).
+    // in the `snapshot` jsonb.
     await sql`
       CREATE TABLE IF NOT EXISTS scenes (
         id          text PRIMARY KEY,
         name        text NOT NULL,
         mural_id    text NOT NULL,
-        snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb,
-        schedule_at text
+        snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb
+      )
+    `;
+    // POL-89/D93: D24's `schedule_at` was an illustrative "HH:MM" that was STORED and NEVER FIRED.
+    // Real scheduling is the `schedules` table below, so the decoy column is DROPPED rather than
+    // migrated: an existing value is not a schedule (no recurrence, no window, no priority), and
+    // inventing one from it would make a live wall start flipping scenes nobody asked it to.
+    await sql`ALTER TABLE scenes DROP COLUMN IF EXISTS schedule_at`;
+    // The scene scheduler (POL-89). A DAYPART is a named window of the day; `end_time <= start_time`
+    // wraps past midnight; `start_time = end_time` is the all-day window.
+    await sql`
+      CREATE TABLE IF NOT EXISTS dayparts (
+        id         text PRIMARY KEY,
+        name       text NOT NULL,
+        start_time text NOT NULL,
+        end_time   text NOT NULL
+      )
+    `;
+    // A SCHEDULE binds a scene to a daypart on a recurrence (weekdays + optional inclusive date
+    // range), at an integer priority. `days` is a jsonb array of 0=Sun…6=Sat.
+    await sql`
+      CREATE TABLE IF NOT EXISTS schedules (
+        id          text PRIMARY KEY,
+        scene_id    text NOT NULL,
+        daypart_id  text NOT NULL,
+        days        jsonb NOT NULL DEFAULT '[]'::jsonb,
+        priority    int NOT NULL DEFAULT 0,
+        enabled     boolean NOT NULL DEFAULT true,
+        from_date   text,
+        until_date  text,
+        created_at  timestamptz NOT NULL DEFAULT now()
+      )
+    `;
+    // Deployment-wide scheduler settings (one row): master switch, the ONE timezone every window is
+    // evaluated in, and the default scene (the always-on floor). Absent until first changed — the
+    // control plane defaults to the server's own zone.
+    await sql`
+      CREATE TABLE IF NOT EXISTS scheduler_settings (
+        id               int PRIMARY KEY DEFAULT 1,
+        enabled          boolean NOT NULL,
+        timezone         text NOT NULL,
+        default_scene_id text
       )
     `;
     // Local operator accounts (Phase 3f / D29). Passwords are stored ONLY as argon2id hashes; the
@@ -555,6 +622,8 @@ export class PostgresStore implements Store {
       videoWallRows,
       contentSourceRows,
       sceneRows,
+      daypartRows,
+      scheduleRows,
       credentialProfileRows,
       zoomPreferenceRows,
     ] = await Promise.all([
@@ -566,7 +635,9 @@ export class PostgresStore implements Store {
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
       sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition FROM content_sources`,
-      sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`,
+      sql<SceneRow[]>`SELECT id, name, mural_id, snapshot FROM scenes`,
+      sql<DaypartRow[]>`SELECT id, name, start_time, end_time FROM dayparts`,
+      sql<ScheduleRow[]>`SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
     ]);
@@ -678,9 +749,28 @@ export class PostgresStore implements Store {
           walls: Array.isArray(raw.walls) ? (raw.walls as PersistedScene["snapshot"]["walls"]) : [],
           screens: Array.isArray(raw.screens) ? (raw.screens as PersistedScene["snapshot"]["screens"]) : [],
         },
-        scheduleAt: row.schedule_at ?? null,
       };
     });
+
+    const dayparts: PersistedDaypart[] = daypartRows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      start: row.start_time,
+      end: row.end_time,
+    }));
+
+    const schedules: PersistedSchedule[] = scheduleRows.map((row) => ({
+      id: row.id,
+      sceneId: row.scene_id,
+      daypartId: row.daypart_id,
+      // jsonb comes back parsed; keep only the weekday numbers (the control plane re-validates).
+      days: Array.isArray(row.days) ? (row.days as unknown[]).map(Number).filter(Number.isInteger) : [],
+      priority: Number(row.priority),
+      enabled: row.enabled,
+      from: row.from_date ?? null,
+      until: row.until_date ?? null,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
 
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
 
@@ -694,6 +784,8 @@ export class PostgresStore implements Store {
       videoWalls,
       contentSources,
       scenes,
+      dayparts,
+      schedules,
       credentialProfiles,
       zoomPreferences,
     };
@@ -1034,19 +1126,17 @@ export class PostgresStore implements Store {
   async upsertScene(scene: PersistedScene): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO scenes (id, name, mural_id, snapshot, schedule_at)
+      INSERT INTO scenes (id, name, mural_id, snapshot)
       VALUES (
         ${scene.id},
         ${scene.name},
         ${scene.muralId},
-        ${sql.json(scene.snapshot)},
-        ${scene.scheduleAt ?? null}
+        ${sql.json(scene.snapshot)}
       )
       ON CONFLICT (id) DO UPDATE SET
         name        = EXCLUDED.name,
         mural_id    = EXCLUDED.mural_id,
-        snapshot    = EXCLUDED.snapshot,
-        schedule_at = EXCLUDED.schedule_at
+        snapshot    = EXCLUDED.snapshot
     `;
   }
 
@@ -1057,7 +1147,7 @@ export class PostgresStore implements Store {
 
   async listScenes(): Promise<PersistedScene[]> {
     const sql = this.sql;
-    const rows = await sql<SceneRow[]>`SELECT id, name, mural_id, snapshot, schedule_at FROM scenes`;
+    const rows = await sql<SceneRow[]>`SELECT id, name, mural_id, snapshot FROM scenes`;
     return rows.map((row) => {
       const raw =
         row.snapshot && typeof row.snapshot === "object" ? (row.snapshot as Record<string, unknown>) : {};
@@ -1070,9 +1160,104 @@ export class PostgresStore implements Store {
           walls: Array.isArray(raw.walls) ? (raw.walls as PersistedScene["snapshot"]["walls"]) : [],
           screens: Array.isArray(raw.screens) ? (raw.screens as PersistedScene["snapshot"]["screens"]) : [],
         },
-        scheduleAt: row.schedule_at ?? null,
       };
     });
+  }
+
+  // ── Scene scheduler (POL-89) ────────────────────────────────────────────────
+
+  async upsertDaypart(daypart: PersistedDaypart): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO dayparts (id, name, start_time, end_time)
+      VALUES (${daypart.id}, ${daypart.name}, ${daypart.start}, ${daypart.end})
+      ON CONFLICT (id) DO UPDATE SET
+        name       = EXCLUDED.name,
+        start_time = EXCLUDED.start_time,
+        end_time   = EXCLUDED.end_time
+    `;
+  }
+
+  async deleteDaypart(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM dayparts WHERE id = ${id}`;
+  }
+
+  async listDayparts(): Promise<PersistedDaypart[]> {
+    const sql = this.sql;
+    const rows = await sql<DaypartRow[]>`SELECT id, name, start_time, end_time FROM dayparts`;
+    return rows.map((row) => ({ id: row.id, name: row.name, start: row.start_time, end: row.end_time }));
+  }
+
+  async upsertSchedule(schedule: PersistedSchedule): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO schedules (id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at)
+      VALUES (
+        ${schedule.id},
+        ${schedule.sceneId},
+        ${schedule.daypartId},
+        ${sql.json(schedule.days)},
+        ${schedule.priority},
+        ${schedule.enabled},
+        ${schedule.from},
+        ${schedule.until},
+        ${schedule.createdAt}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        scene_id   = EXCLUDED.scene_id,
+        daypart_id = EXCLUDED.daypart_id,
+        days       = EXCLUDED.days,
+        priority   = EXCLUDED.priority,
+        enabled    = EXCLUDED.enabled,
+        from_date  = EXCLUDED.from_date,
+        until_date = EXCLUDED.until_date
+    `;
+  }
+
+  async deleteSchedule(id: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM schedules WHERE id = ${id}`;
+  }
+
+  async listSchedules(): Promise<PersistedSchedule[]> {
+    const sql = this.sql;
+    const rows = await sql<ScheduleRow[]>`
+      SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      sceneId: row.scene_id,
+      daypartId: row.daypart_id,
+      days: Array.isArray(row.days) ? (row.days as unknown[]).map(Number).filter(Number.isInteger) : [],
+      priority: Number(row.priority),
+      enabled: row.enabled,
+      from: row.from_date ?? null,
+      until: row.until_date ?? null,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+  }
+
+  async getSchedulerSettings(): Promise<PersistedSchedulerSettings | undefined> {
+    const sql = this.sql;
+    const rows = await sql<SchedulerSettingsRow[]>`
+      SELECT enabled, timezone, default_scene_id FROM scheduler_settings WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return { enabled: row.enabled, timezone: row.timezone, defaultSceneId: row.default_scene_id ?? null };
+  }
+
+  async setSchedulerSettings(settings: PersistedSchedulerSettings): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO scheduler_settings (id, enabled, timezone, default_scene_id)
+      VALUES (1, ${settings.enabled}, ${settings.timezone}, ${settings.defaultSceneId})
+      ON CONFLICT (id) DO UPDATE SET
+        enabled          = EXCLUDED.enabled,
+        timezone         = EXCLUDED.timezone,
+        default_scene_id = EXCLUDED.default_scene_id
+    `;
   }
 
   // ── Local operator accounts + sessions (Phase 3f) ────────────────────────────
