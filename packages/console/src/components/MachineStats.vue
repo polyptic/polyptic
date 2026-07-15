@@ -2,7 +2,8 @@
   MachineStats.vue — the per-machine vitals band (POL-92 data, POL-137 design).
 
   The redesign from "Polyptych Console v2": under the machine card's header row the vitals are a
-  TWO-ROW band inside one rounded --muted-bg container —
+  TWO-ROW band inside one rounded container — bars on --muted-bg, the facts shelf one tier
+  lighter (--muted-bg2, POL-141) behind a hairline seam —
 
    1. Bar row.   CPU · MEMORY · DISK as labelled horizontal progress bars, the percentage at the
                  end of each bar. Healthy fill is green (--ok); the D112 thresholds still recolour
@@ -204,18 +205,18 @@ watch(
 .band {
   display: flex;
   flex-direction: column;
-  gap: 9px;
   margin-top: 11px;
-  padding: 8px 13px;
   background: var(--muted-bg);
   border-radius: 8px;
+  overflow: hidden;
 }
 
-/* Row 1 — the labelled progress bars. */
+/* Row 1 — the labelled progress bars, on the band's base tone. */
 .bars {
   display: flex;
   align-items: center;
   gap: 24px;
+  padding: 8px 13px;
 }
 .meter {
   flex: 1;
@@ -275,13 +276,21 @@ watch(
   color: var(--bad);
 }
 
-/* Row 2 — the icon'd facts, image id pinned right. */
+/* Row 2 — the icon'd facts, image id pinned right. POL-141: the facts shelf sits one tier
+   LIGHTER than the bars (--muted-bg2, both themes) behind a hairline seam — operator feedback
+   was that the shared tone read heavy and the muted facts lacked contrast. */
 .facts {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 5px 16px;
   min-height: 16px;
+  padding: 7px 13px;
+  background: var(--muted-bg2);
+}
+/* The seam only exists where two tiers actually meet — a facts-only band draws no stray line. */
+.bars + .facts {
+  border-top: 1px solid var(--line);
 }
 .fact {
   display: inline-flex;

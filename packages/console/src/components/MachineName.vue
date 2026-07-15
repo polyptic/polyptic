@@ -5,8 +5,8 @@
   hostname `localhost.localdomain`, which identifies nothing). Mirrors ScreenRow's inline rename:
   click the name, type, Enter/blur commits, Esc reverts; the draft re-syncs from the authoritative
   admin/state unless the operator is mid-edit. An UNNAMED machine renders an empty input whose
-  placeholder says so honestly ("Unnamed box · <id tail>") — never the hostname pretending to be
-  a name — and simply typing into it is the naming affordance.
+  placeholder says so honestly ("Unnamed box" — the id tail lives in the card's badge, POL-141) —
+  never the hostname pretending to be a name — and simply typing into it is the naming affordance.
 
   Works on any card — naming a still-PENDING box is the point, since boxes are indistinguishable
   exactly while several queue for approval.
@@ -15,7 +15,7 @@
 import { computed, ref, watch } from "vue";
 import type { MachineView } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
-import { machineDisplayName, machineHasName } from "../machine-name";
+import { machineCardName, machineHasName } from "../machine-name";
 
 const props = defineProps<{ machine: MachineView }>();
 
@@ -37,7 +37,8 @@ watch(
   },
 );
 
-const placeholder = computed(() => machineDisplayName(props.machine));
+// POL-141 — the id tail lives in the card's badge now, so the placeholder is just "Unnamed box".
+const placeholder = computed(() => machineCardName(props.machine));
 
 const trimmed = computed(() => draft.value.trim());
 const canRename = computed(() => {
