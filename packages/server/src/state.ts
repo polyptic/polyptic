@@ -83,6 +83,7 @@ import type {
   SceneContent,
   Screen,
   ScreenSlice,
+  SourceUsage,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -3288,6 +3289,59 @@ export class ControlPlane {
     return source ? this.decorateSource(source) : undefined;
   }
 
+  /**
+   * POL-94 — the usage fold: for every library source, everything in desired state that references
+   * it. One pass over the four places a reference can hide (a screen's assignment, a wall's
+   * assignment, a playlist's steps, a page's embedded/image elements), so the console can answer
+   * "where is this used?" and a delete can name exactly what it will break instead of the vague
+   * "any screen currently showing it will be cleared".
+   *
+   * A wall counts as ONE wall, not as its member screens: an operator assigns content to the wall,
+   * and telling them "used on 4 screens" for a 2×2 they think of as one surface is a lie of shape.
+   * A source referenced only by an unassigned playlist/page is still "used" — deleting it silently
+   * shortens that rotation, which is exactly the surprise this fold exists to prevent.
+   */
+  getContentSourceUsage(): SourceUsage[] {
+    const usage = new Map<string, SourceUsage>();
+    for (const id of this.contentSources.keys()) {
+      usage.set(id, { sourceId: id, screenIds: [], wallIds: [], playlistIds: [], pageIds: [] });
+    }
+
+    for (const [screenId, sid] of this.screenSourceIds) {
+      usage.get(sid)?.screenIds.push(screenId);
+    }
+    for (const [wallId, sid] of this.wallSourceIds) {
+      // A wall whose members were split/removed keeps no entry — skip a dangling assignment.
+      if (this.videoWalls.has(wallId)) usage.get(sid)?.wallIds.push(wallId);
+    }
+    for (const source of this.contentSources.values()) {
+      if (source.kind === "playlist") {
+        // A playlist may reference the same source twice (two slots in the rotation) — the LIBRARY
+        // usage list is a set of referencing playlists, not a count of steps.
+        for (const stepId of new Set((source.items ?? []).map((i) => i.sourceId))) {
+          usage.get(stepId)?.playlistIds.push(source.id);
+        }
+      } else if (source.kind === "page" && source.definition) {
+        const referenced = new Set<string>();
+        for (const el of source.definition.elements) {
+          if ((el.kind === "embed" || el.kind === "image") && el.props.sourceId) {
+            referenced.add(el.props.sourceId);
+          }
+        }
+        for (const sid of referenced) usage.get(sid)?.pageIds.push(source.id);
+      }
+    }
+
+    return [...usage.values()];
+  }
+
+  /** The library source a screen is currently rendering — its own assignment, or (if it is a wall
+   *  member) the wall's. This is what a surface is stamped with at send time (POL-94). */
+  private assignedSourceIdFor(screenId: string): string | undefined {
+    const wall = this.getWallForScreen(screenId);
+    return wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
+  }
+
   private nextSourceId(): string {
     this.sourceCounter += 1;
     return `source-${this.sourceCounter}`;
@@ -3983,6 +4037,17 @@ export class ControlPlane {
    */
   decorateSliceForSend(slice: ScreenSlice): ScreenSlice {
     if (slice.surfaces.length === 0) return slice;
+
+    // POL-94 — stamp the library source this screen is showing onto its surfaces, so the player's
+    // reachability reports can be attributed back to a library entry. Send-time only: an ad-hoc URL
+    // has no source and is left unstamped (there is nothing in the library to report health for).
+    const assignedSourceId = this.assignedSourceIdFor(slice.screenId);
+    if (assignedSourceId !== undefined) {
+      slice = {
+        ...slice,
+        surfaces: slice.surfaces.map((surface) => ({ ...surface, sourceId: assignedSourceId })),
+      };
+    }
 
     // POL-42 — page surfaces get their live half stamped in: resolved (credential-stamped) embeds,
     // resolved image sources, and the poller's last-good feed/weather data. Independent of the

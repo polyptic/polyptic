@@ -19,6 +19,7 @@ import type {
   ChangePasswordBody,
   ContentKind,
   ContentSource,
+  ContentSourceStatus,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
   CreateEnrollmentTokenBody,
@@ -43,6 +44,7 @@ import type {
   Schedule,
   SchedulerSettings,
   ScreenView,
+  SourceHealthState,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateDaypartBody,
@@ -173,6 +175,10 @@ export interface ConsoleState {
    *  admin/state.credentialProfiles (optional on the wire → [] against an older server). Never
    *  carries a client secret. */
   credentialProfiles: CredentialProfileView[];
+  /** POL-94 — per-source usage (where each library source is referenced) + live content health (what
+   *  the players' probes report), mirrored from admin/state.sourceStatus. Optional on the wire →
+   *  [] against an older server, which the library reads as "unknown, no usage". */
+  sourceStatus: ContentSourceStatus[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
   /** The scene scheduler (POL-89), mirrored from admin/state: the daypart library, the schedules
@@ -226,6 +232,7 @@ export const useConsoleStore = defineStore("console", {
     videoWalls: [],
     contentSources: [],
     credentialProfiles: [],
+    sourceStatus: [],
     scenes: [],
     dayparts: [],
     schedules: [],
@@ -494,6 +501,37 @@ export const useConsoleStore = defineStore("console", {
 
     profileById(): (id: string) => CredentialProfileView | undefined {
       return (id: string) => this.credentialProfiles.find((p) => p.id === id);
+    },
+
+    // ── Library usage + health (POL-94) ──────────────────────────────────────
+
+    /** A source's usage + health, or undefined against a server that doesn't report it. */
+    statusForSource(state): (id: string) => ContentSourceStatus | undefined {
+      return (id: string) => state.sourceStatus.find((s) => s.sourceId === id);
+    },
+
+    /** The live health badge for a source: what the screens showing it report. `unknown` when nobody
+     *  is showing it, the screens showing it are offline, or the server is older than POL-94. */
+    healthForSource(): (id: string) => SourceHealthState {
+      return (id: string) => this.statusForSource(id)?.health ?? "unknown";
+    },
+
+    /**
+     * "Used on 2 screens · 1 wall · in 1 playlist" — the library row's usage line, and the sentence a
+     * delete confirmation is built from. Empty string when the source is referenced nowhere.
+     */
+    usageSummary(): (id: string) => string {
+      return (id: string) => {
+        const usage = this.statusForSource(id)?.usage;
+        if (!usage) return "";
+        const parts: string[] = [];
+        const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+        if (usage.screenIds.length) parts.push(plural(usage.screenIds.length, "screen", "screens"));
+        if (usage.wallIds.length) parts.push(plural(usage.wallIds.length, "video wall", "video walls"));
+        if (usage.playlistIds.length) parts.push(plural(usage.playlistIds.length, "playlist", "playlists"));
+        if (usage.pageIds.length) parts.push(plural(usage.pageIds.length, "page", "pages"));
+        return parts.length ? `Used on ${parts.join(" · ")}` : "";
+      };
     },
 
     /** The library source currently armed for click-to-assign on the canvas, if any. */
@@ -879,6 +917,8 @@ export const useConsoleStore = defineStore("console", {
         this.contentSources = msg.contentSources;
         // POL-24 — credential profiles are optional on the wire (older servers omit them).
         this.credentialProfiles = msg.credentialProfiles ?? [];
+        // POL-94 — usage + health per source; optional on the wire (older servers omit it).
+        this.sourceStatus = msg.sourceStatus ?? [];
         this.scenes = msg.scenes;
         // POL-89 — the scene scheduler. Optional on the wire (back-compat): an older server simply
         // has no scheduler, and the Scenes view says so rather than painting an empty week.

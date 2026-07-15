@@ -106,6 +106,7 @@ import type { AdminBroadcaster, Presence } from "./admin";
 import type { MediaProber } from "./media-probe";
 import type { MediaStore } from "./media";
 import type { TokenService } from "./tokens";
+import type { SourceHealthTracker } from "./source-health";
 
 /** Phase 7 — where uploaded media lands + how its serve URL is built. Wired from env in index.ts. */
 export interface MediaConfig {
@@ -166,6 +167,8 @@ export function registerRestRoutes(
   presence: Presence,
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
+  /** POL-94 — per-source content health; a deleted source's reports are dropped with it. */
+  health: SourceHealthTracker,
   panelPower: PanelPowerScheduler,
 ): void {
   // POL-18 — machines whose placed windows the agent may still be holding. A content change on such
@@ -2384,6 +2387,9 @@ export function registerRestRoutes(
     // Phase 7 lifecycle: if this source was backed by an uploaded file, unlink it from the disk volume
     // (a linked / non-uploaded source has nothing on disk → this is a no-op for it).
     const unlinked = await media.deleteBySourceId(params.data.id);
+
+    // POL-94 — the source is gone; so is anything the players ever said about it.
+    health.forgetSource(params.data.id);
 
     // Cleared every screen/wall that was showing this source — push the (now empty) slice to each.
     for (const slice of result.slices) pushRender(slice.screenId, slice);

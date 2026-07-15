@@ -25,6 +25,7 @@ import {
 
 import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import { SourceHealthTracker } from "./source-health";
 import { AuthService, authConfigFromEnv } from "./auth-local";
 import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
@@ -243,7 +244,11 @@ const hub = new PlayerHub();
 const agentHub = new AgentHub();
 const adminHub = new AdminHub();
 const presence = new Presence();
-const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, log: fastify.log, enrollment });
+// POL-94 — live per-source content health, folded from the players' own reachability probes
+// (POL-86's SurfaceProber). Live-only, like Presence: a restart starts blank and the players
+// re-report on reconnect.
+const sourceHealth = new SourceHealthTracker();
+const broadcaster = new AdminBroadcaster({ control, playerHub: hub, presence, adminHub, activity, health: sourceHealth, log: fastify.log, enrollment });
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
 // profiles; refreshes in the background at ~75% of each token's lifetime. When a profile's token
@@ -530,6 +535,7 @@ const shellRelay = attachWebSockets({
   broadcaster,
   activity,
   capture,
+  health: sourceHealth,
   devtoolsRelay,
   panelPower,
   log: fastify.log,
@@ -555,6 +561,7 @@ registerRestRoutes(
   presence,
   shellRelay,
   devtoolsRelay,
+  sourceHealth,
   panelPower,
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.

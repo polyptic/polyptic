@@ -62,6 +62,7 @@ import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
+import type { SourceHealthTracker } from "./source-health";
 import { powerAckLine } from "./panel-power";
 import type { PanelPowerScheduler } from "./panel-power";
 
@@ -84,6 +85,8 @@ interface WsDeps {
   activity: ActivityLog;
   /** Live-preview capture (Phase 5) — ingests inbound `agent/thumbnail` frames. */
   capture: CaptureCoordinator;
+  /** POL-94 — per-source content health, fed by the players' `player/surface-health` reports. */
+  health: SourceHealthTracker;
   /** Remote-DevTools relay (POL-67) — bridges an operator's DevTools frontend to a wall's Chrome. */
   devtoolsRelay: DevtoolsRelay;
   /** POL-101 — panel-hours scheduler; reconciles a box's panels to their window when it says hello. */
@@ -160,7 +163,7 @@ function peerAddress(req: IncomingMessage): string | undefined {
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -314,7 +317,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
     });
   }
   playerWss.on("connection", (ws: WebSocket) =>
-    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, log),
+    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, health, log),
   );
   adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
     handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, log),
@@ -934,6 +937,7 @@ function handlePlayer(
   presence: Presence,
   broadcaster: AdminBroadcaster,
   activity: ActivityLog,
+  health: SourceHealthTracker,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "player.connected" }, "player socket opened");
@@ -1037,6 +1041,35 @@ function handlePlayer(
         { event: "player.diag", screenId, playerAt: msg.at },
         `player diag: ${msg.msg}`,
       );
+    } else if (msg.t === "player/surface-health") {
+      // POL-94: the box's verdict on a surface's URL — the POL-86 prober's knowledge, addressed by
+      // library source instead of buried in the diag trail. Sent only on a state CHANGE (and re-sent
+      // on reconnect, since a dropped screen is forgotten below), so this path is cheap by design.
+      // An ad-hoc URL carries no sourceId: there is no library entry to attribute it to, so we log
+      // it and stop — the console's badge is a LIBRARY badge.
+      log.info(
+        {
+          event: "player.surface-health",
+          screenId,
+          surfaceId: msg.surfaceId,
+          sourceId: msg.sourceId,
+          state: msg.state,
+          url: msg.url, // redacted player-side (origin + path) — never a stamped token
+          playerAt: msg.at,
+        },
+        `player surface health: ${msg.sourceId ?? "ad-hoc"} is ${msg.state}${msg.detail ? ` (${msg.detail})` : ""}`,
+      );
+      if (msg.sourceId && control.getContentSource(msg.sourceId)) {
+        health.record({
+          screenId,
+          surfaceId: msg.surfaceId,
+          sourceId: msg.sourceId,
+          state: msg.state,
+          at: msg.at,
+          ...(msg.detail ? { detail: msg.detail } : {}),
+        });
+        broadcaster.broadcast();
+      }
     } else {
       // player/ack — record the revision this screen has observed.
       presence.setScreenObservedRevision(screenId, msg.revision);
@@ -1055,6 +1088,9 @@ function handlePlayer(
       hub.remove(screenId, ws);
       if (hub.count(screenId) === 0) {
         activity.push("bad", `${name} went unreachable`);
+        // POL-94 — an offline screen knows nothing about a URL's reachability. Forget what it told
+        // us, or a source stays red forever on the word of a box that has been unplugged for a week.
+        health.forgetScreen(screenId);
       }
       // Screen may have gone offline (no sockets left) — refresh the admin view.
       broadcaster.broadcast();
