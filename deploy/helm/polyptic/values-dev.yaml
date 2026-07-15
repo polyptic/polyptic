@@ -24,6 +24,11 @@ config:
   # Ephemeral registry — no Postgres to stand up. Wall/screen state resets on
   # pod restart; fine for chart iteration, wrong for anything real.
   store: memory
+
+# The chart bundles Postgres and turns it on by default (POL-123/D108); with
+# store=memory there is nothing to talk to it, so say so explicitly.
+postgresql:
+  enabled: false
   corsOrigin: "http://localhost:8080"
   playerBaseUrl: "http://localhost:8080"
   nodeEnv: development

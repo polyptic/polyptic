@@ -15,12 +15,12 @@
   and editors render correctly. Bytes are base64 so a PTY's raw output survives the JSON frames.
 -->
 <script setup lang="ts">
-import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { useConsoleStore } from "../stores/console";
+import { fitGrid } from "./termFit";
 
 const props = defineProps<{ machineId: string; machineLabel: string }>();
 const emit = defineEmits<{ (e: "close"): void }>();
@@ -37,10 +37,43 @@ const online = computed(() => machine.value?.online ?? false);
 const shellEnabled = computed(() => machine.value?.shellEnabled ?? false);
 
 let term: Terminal | null = null;
-let fit: FitAddon | null = null;
 let sessionId: string | null = null;
 let unsubscribe: (() => void) | null = null;
 let resizeObserver: ResizeObserver | null = null;
+
+/** xterm keeps its measured cell metrics on the (stable, but private) core — same source FitAddon read. */
+type XtermWithCore = Terminal & {
+  _core?: {
+    _renderService?: { clear(): void; dimensions?: { css?: { cell?: { width: number; height: number } } } };
+    viewport?: { scrollBarWidth?: number };
+  };
+};
+
+/**
+ * Fit the terminal to the largest WHOLE-cell grid inside `.term-host`'s content box (POL-131).
+ *
+ * FitAddon is gone: under the app's `* { box-sizing: border-box }` reset it measured the host's
+ * border-box height, counted the padding as rows, and painted the bottom row — the prompt —
+ * half-clipped once the buffer filled. Here the content box is measured explicitly (clientWidth/
+ * Height minus computed padding, so fractional padding at odd zooms is exact), the grid is floored
+ * to whole cells (termFit.ts), and the leftover fraction of a row is letterboxed by the host's own
+ * background instead of clipped. Whenever the grid actually changes, the SAME cols×rows go to the
+ * PTY over the relay, so `stty size` on the box always matches what the operator can see.
+ */
+function refit(): void {
+  if (!term || !host.value) return;
+  const core = (term as XtermWithCore)._core;
+  const cell = core?._renderService?.dimensions?.css?.cell;
+  if (!cell) return;
+  const cs = getComputedStyle(host.value);
+  const contentW = host.value.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const contentH = host.value.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  const grid = fitGrid(contentW, contentH, cell, core?.viewport?.scrollBarWidth ?? 0);
+  if (!grid || (grid.cols === term.cols && grid.rows === term.rows)) return;
+  core?._renderService?.clear();
+  term.resize(grid.cols, grid.rows);
+  pushResize();
+}
 
 const enc = new TextEncoder();
 const b64encode = (s: string): string => btoa(String.fromCharCode(...enc.encode(s)));
@@ -60,10 +93,8 @@ onMounted(() => {
     theme: { background: "#0b0b0e" },
     scrollback: 5000,
   });
-  fit = new FitAddon();
-  term.loadAddon(fit);
   term.open(host.value);
-  fit.fit();
+  refit();
 
   // Operator keystrokes → the box.
   term.onData((data) => {
@@ -100,14 +131,18 @@ onMounted(() => {
     term.writeln("\x1b[31mThe console is not connected to the control plane.\x1b[0m");
   }
 
-  // Keep the PTY sized to the panel.
-  resizeObserver = new ResizeObserver(() => {
-    fit?.fit();
-    pushResize();
-  });
+  // Keep the grid (and through pushResize, the PTY) sized to the panel. The observer covers
+  // layout changes; the window listener covers browser zoom, which changes xterm's fractional
+  // cell metrics WITHOUT necessarily changing the host's CSS box.
+  resizeObserver = new ResizeObserver(() => refit());
   resizeObserver.observe(host.value);
+  window.addEventListener("resize", onWindowResize);
   term.focus();
 });
+
+function onWindowResize(): void {
+  refit();
+}
 
 function pushResize(): void {
   if (term && sessionId) {
@@ -117,6 +152,7 @@ function pushResize(): void {
 
 onBeforeUnmount(() => {
   if (sessionId) store.sendShellFrame({ t: "admin/shell-close", machineId: props.machineId, sessionId });
+  window.removeEventListener("resize", onWindowResize);
   resizeObserver?.disconnect();
   unsubscribe?.();
   term?.dispose();
@@ -234,5 +270,8 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   padding: 12px 14px;
+  /* The grid is floored to whole cells (termFit.ts); the sub-cell remainder letterboxes here
+     against the shared background instead of a half-painted row (POL-131). */
+  overflow: hidden;
 }
 </style>

@@ -7,21 +7,27 @@
  * Phase 3 murals & placement and Phase 3b combined surfaces (walls + content).
  */
 import {
+  CastArmBody,
   CombineScreensBody,
   CreateContentSourceBody,
   CreateCredentialProfileBody,
   CreateDaypartBody,
   CreateMuralBody,
+  CreatePreRegistrationBody,
   CreateSceneBody,
   CreateScheduleBody,
   IdentBody,
+  ImportPreRegistrationsBody,
+  RenameMachineBody,
   InspectBody,
   PlaceScreenBody,
+  PreRegistration,
   RenameMuralBody,
   RenameScreenBody,
   RenameVideoWallBody,
   SetContentBody,
   SetZoomBody,
+  SetPlaylistEntryZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateDaypartBody,
@@ -31,6 +37,7 @@ import {
 } from "@polyptic/protocol";
 import type {
   ContentSource,
+  CreatePreRegistrationBody as CreatePreRegistrationBodyT,
   CredentialProfileTestResult,
   CredentialProfileView,
   Daypart,
@@ -205,6 +212,41 @@ export function unplaceScreen(screenId: string): Promise<unknown> {
   return send("DELETE", `/screens/${encodeURIComponent(screenId)}/placement`);
 }
 
+// ── Pre-registration (POL-104) ───────────────────────────────────────────────
+
+/** GET /api/v1/pre-registrations — the boxes an operator declared before they ever booted. */
+export async function fetchPreRegistrations(): Promise<PreRegistration[]> {
+  const raw = await send<{ records?: unknown }>("GET", "/pre-registrations");
+  return PreRegistration.array().parse(raw?.records ?? []);
+}
+
+/** POST /api/v1/pre-registrations — declare one box. */
+export function createPreRegistration(body: CreatePreRegistrationBodyT): Promise<unknown> {
+  return send("POST", "/pre-registrations", CreatePreRegistrationBody.parse(body));
+}
+
+/** POST /api/v1/pre-registrations/import — paste a CSV of boxes. Bad lines come back with their
+ *  line number rather than being dropped in silence. */
+export async function importPreRegistrations(
+  csv: string,
+  autoApprove: boolean,
+): Promise<{ created: PreRegistration[]; errors: { line: number; text: string; reason: string }[] }> {
+  const raw = await send<{ created?: unknown; errors?: unknown }>(
+    "POST",
+    "/pre-registrations/import",
+    ImportPreRegistrationsBody.parse({ csv, autoApprove }),
+  );
+  return {
+    created: PreRegistration.array().parse(raw?.created ?? []),
+    errors: (raw?.errors ?? []) as { line: number; text: string; reason: string }[],
+  };
+}
+
+/** DELETE /api/v1/pre-registrations/:id */
+export function deletePreRegistration(id: string): Promise<unknown> {
+  return send("DELETE", `/pre-registrations/${encodeURIComponent(id)}`);
+}
+
 // ── Machines (enrollment, Phase 2b) ──────────────────────────────────────────
 
 /**
@@ -228,9 +270,21 @@ export function rejectMachine(machineId: string, reason?: string): Promise<unkno
   );
 }
 
-/** POST /api/v1/machines/:machineId/ident { on, ttlMs? } — flash every screen the machine drives. */
+/** POST /api/v1/machines/:machineId/ident { on, ttlMs? } — flash every screen the machine drives.
+ *  POL-117: also works on a still-PENDING machine — the server re-points its holding board at the
+ *  flashing variant over the agent channel, so the operator can tell which panel they're approving. */
 export function identMachine(machineId: string, body: IdentBody): Promise<unknown> {
   return send("POST", `/machines/${encodeURIComponent(machineId)}/ident`, IdentBody.parse(body));
+}
+
+/** POST /api/v1/machines/:machineId/rename { label } — name a machine (POL-117). Any status, any
+ *  time; the operator's name replaces the meaningless live-image hostname as the box's identity. */
+export function renameMachine(machineId: string, label: string): Promise<unknown> {
+  return send(
+    "POST",
+    `/machines/${encodeURIComponent(machineId)}/rename`,
+    RenameMachineBody.parse({ label }),
+  );
 }
 
 /**
@@ -281,6 +335,12 @@ export function inspectScreen(screenId: string, body: InspectBody): Promise<unkn
   return send("POST", `/screens/${encodeURIComponent(screenId)}/inspect`, InspectBody.parse(body));
 }
 
+/** POST /api/v1/screens/:screenId/cast { enabled } — enable/disable casting (AirPlay) on one screen
+ *  (POL-119). Persistent, no TTL; disabling kills the receiver and any live session immediately. */
+export function setScreenCast(screenId: string, enabled: boolean): Promise<unknown> {
+  return send("POST", `/screens/${encodeURIComponent(screenId)}/cast`, CastArmBody.parse({ enabled }));
+}
+
 /**
  * DELETE /api/v1/screens/:screenId — permanently forget a single screen (POL-14). Dissolves any
  * combined surface it belonged to and clears its player. If the screen's machine is still connected
@@ -307,6 +367,20 @@ export function setScreenContent(screenId: string, body: SetContentBody): Promis
  *  server remembers it for this (screen, page) pair, so the page returns at this zoom next time. */
 export function setScreenZoom(screenId: string, zoom: number): Promise<unknown> {
   return send("PUT", `/screens/${encodeURIComponent(screenId)}/zoom`, SetZoomBody.parse({ zoom }));
+}
+
+/** PUT /api/v1/screens/:screenId/playlist-zoom { sourceId, zoom } — zoom ONE framed step of the
+ *  playlist this screen is showing (POL-133). Remembered per (screen, step source), like D62. */
+export function setScreenPlaylistZoom(
+  screenId: string,
+  sourceId: string,
+  zoom: number,
+): Promise<unknown> {
+  return send(
+    "PUT",
+    `/screens/${encodeURIComponent(screenId)}/playlist-zoom`,
+    SetPlaylistEntryZoomBody.parse({ sourceId, zoom }),
+  );
 }
 
 // ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
@@ -342,6 +416,16 @@ export function setWallContent(wallId: string, body: SetContentBody): Promise<un
  *  Every member takes the same zoom, so the wall stays one continuous page. */
 export function setWallZoom(wallId: string, zoom: number): Promise<unknown> {
   return send("PUT", `/walls/${encodeURIComponent(wallId)}/zoom`, SetZoomBody.parse({ zoom }));
+}
+
+/** PUT /api/v1/walls/:wallId/playlist-zoom { sourceId, zoom } — zoom ONE framed step of the playlist
+ *  spanning a combined surface (POL-133). Every member re-stamps the step, one continuous page. */
+export function setWallPlaylistZoom(wallId: string, sourceId: string, zoom: number): Promise<unknown> {
+  return send(
+    "PUT",
+    `/walls/${encodeURIComponent(wallId)}/playlist-zoom`,
+    SetPlaylistEntryZoomBody.parse({ sourceId, zoom }),
+  );
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */

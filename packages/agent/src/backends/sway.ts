@@ -23,6 +23,7 @@
  * changes (handled by SupervisedBrowser).
  */
 import type { ChildProcess } from "node:child_process";
+import { hostname as osHostname } from "node:os";
 import type { KioskBrowser } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
@@ -35,9 +36,24 @@ import {
   resolveChrome,
   selectKioskBrowser,
 } from "./chrome";
-import { SupervisedBrowser } from "./supervise";
+import { browserProbesFrom, SupervisedBrowser, SupervisedProcess, killStaleByToken } from "./supervise";
 import type { LaunchTarget } from "./supervise";
+import {
+  CAST_PORT_BASE,
+  CAST_PORT_STRIDE,
+  CastPairingTracker,
+  buildUxplayArgs,
+  castDeviceMac,
+  castRegFileFor,
+  ensureCastStateDir,
+  matchesUxplayWindow,
+  resolveUxplay,
+  sameCastTarget,
+  wrapLineBuffered,
+} from "./cast";
+import type { CastTarget } from "./cast";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
+import type { BrowserProbe } from "../vitals";
 
 /** How long to wait for the freshly-launched browser window to appear on the sway tree. */
 const PLACE_TIMEOUT_MS = 8_000;
@@ -144,6 +160,93 @@ function startSwayWindowSubscription(
   };
 }
 
+/** A live, PERSISTENT window watch for one supervised pid (POL-119). Unlike the launch-time
+ *  `waitForWindow` (one window, right after spawn, then closed), a cast receiver grows windows at
+ *  MIRROR-START time — the PIN prompt is NOT a window (POL-136: it goes to stdout; see cast.ts) —
+ *  so this stays subscribed for the receiver's whole life, calling back on every
+ *  appearance/disappearance. The subscription child is respawned if it dies: losing it silently
+ *  would freeze the console's "casting" signal. */
+interface PidWindowWatch {
+  close(): void;
+}
+
+function startPidWindowWatch(
+  opts: {
+    /** Is this the watched process? Checked per event (the supervised pid changes on respawn). */
+    matchesPid: (pid: number) => boolean;
+    /** `app_id` fallback for the rare compositor path that reports no pid. */
+    matchesAppId: (appId: string) => boolean;
+    onWindow: (conId: number) => void;
+    onClose: (conId: number) => void;
+  },
+  log: (m: string) => void,
+): PidWindowWatch {
+  let closed = false;
+  let proc: ReturnType<typeof spawnChild> | null = null;
+  /** con_ids currently attributed to the watched process, so `close` events can be filtered without
+   *  trusting the (sometimes absent) pid on the closing container. */
+  const owned = new Set<number>();
+
+  const spawn = (): void => {
+    if (closed) return;
+    proc = spawnChild("swaymsg", ["-t", "subscribe", "-m", '["window"]']);
+    const splitter = makeJsonStreamSplitter((obj) => {
+      const ev = obj as SwayWindowEvent;
+      if (!ev.container || typeof ev.container.id !== "number") return;
+      const c = ev.container;
+      const conId = c.id as number;
+      const pid = typeof c.pid === "number" ? c.pid : -1;
+      const appId =
+        typeof c.app_id === "string"
+          ? c.app_id
+          : c.window_properties && typeof c.window_properties.class === "string"
+            ? c.window_properties.class
+            : "";
+      if (ev.change === "new") {
+        if ((pid > 0 && opts.matchesPid(pid)) || opts.matchesAppId(appId)) {
+          owned.add(conId);
+          opts.onWindow(conId);
+        }
+      } else if (ev.change === "close") {
+        if (owned.delete(conId)) opts.onClose(conId);
+      }
+    });
+    proc.stdout?.on("data", (chunk: Buffer) => splitter.push(chunk));
+    proc.on("error", (err) => log(`cast window watch: swaymsg subscribe failed: ${err.message}`));
+    proc.on("exit", () => {
+      if (closed) return;
+      log("cast window watch: swaymsg subscribe died — respawning in 2s");
+      setTimeout(spawn, 2_000);
+    });
+  };
+  spawn();
+
+  return {
+    close(): void {
+      closed = true;
+      try {
+        proc?.kill();
+      } catch {
+        // already gone
+      }
+    },
+  };
+}
+
+/** Everything the sway backend keeps per cast-enabled connector (POL-119). */
+interface CastInstance {
+  supervised: SupervisedProcess<CastTarget>;
+  watch: PidWindowWatch;
+  /** The receiver's live windows (the mirror; POL-136 established the PIN prompt is NOT a window).
+   *  Non-empty = a session is on the glass. */
+  windows: Set<number>;
+  /** This connector's fixed UxPlay base port, stable across relaunches. */
+  basePort: number;
+  /** POL-136 — the PIN lifecycle, fed from the receiver's stdout/stderr. The receiver never draws
+   *  its PIN (stdout only), so this is how the number reaches the panel at all. */
+  tracker: CastPairingTracker;
+}
+
 export class SwayBackend implements DisplayBackend {
   readonly id = "wayland-sway" as const;
 
@@ -165,6 +268,15 @@ export class SwayBackend implements DisplayBackend {
   private readonly devtoolsPorts = new Map<string, number>();
   /** Connectors an operator has ARMED for the DevTools tunnel (`inspect on`, chrome only). */
   private readonly devtoolsArmed = new Set<string>();
+  /** connector → its live cast receiver (POL-119). */
+  private readonly casts = new Map<string, CastInstance>();
+  /** connector → its UxPlay base port, assigned once in arrival order (the DevTools-port pattern)
+   *  and kept across enable/disable so a toggled connector never lands on a sibling's ports. */
+  private readonly castPorts = new Map<string, number>();
+  /** The agent's cast-session listener — told when a connector's receiver gains/loses its windows. */
+  private castSession: ((connector: string, active: boolean) => void) | null = null;
+  /** POL-136 — the agent's PIN listener: told the PIN a pairing sender must type (null = clear). */
+  private castPin: ((connector: string, pin: string | null) => void) | null = null;
 
   private log(msg: string): void {
     console.log(`[${ts()}] [sway] ${msg}`);
@@ -183,7 +295,7 @@ export class SwayBackend implements DisplayBackend {
    * failure was thrown away, and the only way to read its mind was to open DevTools against it. It is
    * also, pointedly, how surf's `DRI3 error` line — the entire POL-67 finding — stayed invisible.
    */
-  private pipeBrowserOutput(child: ChildProcess, browser: KioskBrowser, connector: string): void {
+  private pipeBrowserOutput(child: ChildProcess, browser: string, connector: string): void {
     const verbose = process.env.POLYPTIC_BROWSER_LOG?.trim() === "all";
     // Worth reading on a wall that is misbehaving: renderer/GPU deaths, the EGL/DRI3 class that
     // started POL-67, aborted loads, sandbox refusals, plain errors.
@@ -510,6 +622,208 @@ export class SwayBackend implements DisplayBackend {
     if (!this.browsers.get(connector)?.running) return null;
     const port = this.devtoolsPorts.get(connector);
     return port === undefined ? null : { port };
+  }
+
+  // ── casting (POL-119) ─────────────────────────────────────────────────────────
+
+  onCastSession(listener: (connector: string, active: boolean) => void): void {
+    this.castSession = listener;
+  }
+
+  onCastPin(listener: (connector: string, pin: string | null) => void): void {
+    this.castPin = listener;
+  }
+
+  /**
+   * Reconcile one connector's cast receiver to `spec`. `{ name }` ensures a supervised UxPlay is
+   * running and advertised under that name (a name change relaunches it — the mDNS rename);
+   * `null` tears the receiver down, killing any live session with it. Idempotent both ways.
+   */
+  async setCast(connector: string, spec: { name: string } | null): Promise<void> {
+    if (spec === null) {
+      const inst = this.casts.get(connector);
+      if (!inst) return;
+      this.casts.delete(connector);
+      inst.watch.close();
+      inst.tracker.processEnded(); // clears any on-glass PIN with the receiver (POL-136)
+      await inst.supervised.stop();
+      if (inst.windows.size > 0) {
+        // The operator pulled the plug mid-session: the windows die with the receiver, but sway's
+        // close events land on a watch we just closed — report the session over ourselves.
+        inst.windows.clear();
+        this.castSession?.(connector, false);
+      }
+      this.log(`cast(${connector}): receiver torn down`);
+      return;
+    }
+    await requireSwaymsg();
+    const output = await this.resolveConnector(connector);
+    const inst = this.ensureCast(connector, output);
+    await inst.supervised.setTarget({ name: spec.name });
+  }
+
+  /** This connector's UxPlay base port — assigned once, in arrival order from the base. */
+  private castPortFor(connector: string): number {
+    let port = this.castPorts.get(connector);
+    if (port === undefined) {
+      port = CAST_PORT_BASE + CAST_PORT_STRIDE * this.castPorts.size;
+      this.castPorts.set(connector, port);
+    }
+    return port;
+  }
+
+  private ensureCast(connector: string, output: string): CastInstance {
+    let inst = this.casts.get(connector);
+    if (inst) return inst;
+    const basePort = this.castPortFor(connector);
+    const created: CastInstance = {
+      supervised: new SupervisedProcess<CastTarget>(
+        connector,
+        (target) => this.launchCast(connector, target, basePort),
+        sameCastTarget,
+        (t) => `cast receiver "${t.name}"`,
+        "cast receiver",
+        (m) => this.log(m),
+      ),
+      // The watch outlives any single receiver process (it respawns): match on the CURRENT
+      // supervised pid per event. The app_id fallback is only safe when this is the box's sole
+      // receiver — with two instances an anonymous "uxplay" window can't be attributed.
+      watch: startPidWindowWatch(
+        {
+          matchesPid: (pid) => this.casts.get(connector)?.supervised.pid === pid,
+          matchesAppId: (appId) => this.casts.size === 1 && matchesUxplayWindow(appId),
+          onWindow: (conId) => this.onCastWindow(connector, output, conId),
+          onClose: (conId) => this.onCastWindowClosed(connector, conId),
+        },
+        (m) => this.log(m),
+      ),
+      windows: new Set(),
+      basePort,
+      // POL-136 — the receiver prints its per-pairing PIN to stdout and never draws it, so the PIN
+      // lifecycle rides the process output we supervise. Both callbacks are deliberately LOUD: a
+      // pairing the panel can't explain is this ticket's whole failure mode.
+      tracker: new CastPairingTracker({
+        onPinChange: (pin) => {
+          this.log(
+            pin === null
+              ? `cast(${connector}): pairing PIN cleared`
+              : `cast(${connector}): sender pairing — PIN ${pin} must be visible on the panel now`,
+          );
+          this.castPin?.(connector, pin);
+        },
+        onPinMissing: () => {
+          this.log(
+            `cast(${connector}): *** a sender started pairing but NO PIN could be learned from the ` +
+              `receiver's output — the phone is asking for a code the wall cannot show ` +
+              `(uxplay output format changed?)`,
+          );
+        },
+      }),
+    };
+    this.casts.set(connector, created);
+    return created;
+  }
+
+  /** Launch one connector's UxPlay. No launch-time window wait: receiver windows appear at
+   *  SENDER-CONNECT time (and per session), so placement rides the persistent watch instead. */
+  private async launchCast(
+    connector: string,
+    target: CastTarget,
+    basePort: number,
+  ): Promise<ChildProcess> {
+    const bin = await resolveUxplay();
+    const regFile = castRegFileFor(connector);
+    ensureCastStateDir(regFile);
+    // Reap any receiver we don't track that still advertises this connector (an orphan from an
+    // agent crash would hold the ports and the mDNS name). The reg-file path is this instance's
+    // unique argv token, exactly like Chrome's --user-data-dir.
+    await killStaleByToken(regFile, (m) => this.log(m));
+
+    const args = buildUxplayArgs({
+      name: target.name,
+      basePort,
+      regFile,
+      mac: castDeviceMac(`${osHostname()}:${connector}`),
+    });
+    // POL-136 — the PIN only ever exists on the receiver's stdout, and UxPlay never flushes: into a
+    // pipe, libc block-buffers its printf output at ~4 KiB, which can hold the PIN lines back past
+    // the whole pairing window. `stdbuf -oL -eL` forces line buffering (and execs uxplay, so the
+    // pid and cmdline stay pid-match/reap compatible). coreutils is Essential on the image, but a
+    // box without stdbuf must still cast — just with the delayed-PIN risk called out LOUDLY.
+    const hasStdbuf = await which("stdbuf");
+    if (!hasStdbuf) {
+      this.log(
+        `cast(${connector}): *** stdbuf not found — the receiver's stdout will be block-buffered ` +
+          `and pairing PINs may reach neither the panel nor the journal in time (install coreutils)`,
+      );
+    }
+    const { cmd, argv } = wrapLineBuffered(bin, args, hasStdbuf);
+    const child = spawnChild(cmd, argv, { stdio: ["ignore", "pipe", "pipe"] });
+    this.pipeBrowserOutput(child, "uxplay", connector);
+    // POL-136 — the PIN pairing lifecycle lives in the receiver's output (see cast.ts): feed every
+    // line to this connector's tracker. This is SEPARATE from pipeBrowserOutput above, whose
+    // "interesting lines only" journal filter would drop the PIN lines (none of them look like an
+    // error — which is exactly how this stayed invisible in the logs too).
+    this.pipeCastPairingOutput(child, connector);
+    child.on("exit", () => this.casts.get(connector)?.tracker.processEnded());
+    this.log(
+      `spawned uxplay pid=${child.pid ?? "?"} for ${connector} — advertising "${target.name}" ` +
+        `(ports ${basePort}-${basePort + 2}, PIN mode)`,
+    );
+    return child;
+  }
+
+  /** Feed the receiver's stdout+stderr, line by line, to its connector's pairing tracker. */
+  private pipeCastPairingOutput(child: ChildProcess, connector: string): void {
+    const sink = (): ((chunk: Buffer) => void) => {
+      let buf = "";
+      return (chunk: Buffer): void => {
+        buf += chunk.toString("utf8");
+        for (;;) {
+          const nl = buf.indexOf("\n");
+          if (nl < 0) break;
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          this.casts.get(connector)?.tracker.onLine(line);
+        }
+        // An unterminated tail longer than any real log line is noise (or binary). Keep the TAIL
+        // rather than dropping wholesale, so a PIN line arriving right after a large newline-less
+        // burst isn't truncated with it; the classifier shrugs at the garbled joint line.
+        if (buf.length > 8192) buf = buf.slice(-4096);
+      };
+    };
+    child.stdout?.on("data", sink());
+    child.stderr?.on("data", sink());
+  }
+
+  /** A receiver window appeared (the mirror — POL-136 established the PIN prompt never is one):
+   *  fullscreen it on the right output and, on the first window, report the session live.
+   *  Placement is best-effort, like the browsers'. */
+  private onCastWindow(connector: string, output: string, conId: number): void {
+    const inst = this.casts.get(connector);
+    if (!inst) return;
+    inst.windows.add(conId);
+    inst.tracker.windowAppeared(); // mirroring is starting — the pairing PIN has served its purpose
+    if (inst.windows.size === 1) this.castSession?.(connector, true);
+    void this.moveToOutput(conId, output)
+      .then(() => this.log(`cast(${connector}): placed receiver window con_id=${conId} on ${output}`))
+      .catch((err: Error) =>
+        this.log(`cast(${connector}): placement of con_id=${conId} failed: ${err.message}`),
+      );
+  }
+
+  /** A receiver window closed (sender disconnected / PIN done): report only when the LAST one goes —
+   *  the scene content underneath is simply revealed, nothing to re-render. */
+  private onCastWindowClosed(connector: string, conId: number): void {
+    const inst = this.casts.get(connector);
+    if (!inst) return;
+    inst.windows.delete(conId);
+    if (inst.windows.size === 0) this.castSession?.(connector, false);
+  }
+
+  /** POL-92 — the browsers this backend supervises, for the heartbeat's vitals sampler. */
+  browserProbes(): BrowserProbe[] {
+    return browserProbesFrom(this.browsers);
   }
 
   /** Grab a thumbnail of `connector` via `grim`. Returns JPEG bytes (or PNG), `null` on failure. */

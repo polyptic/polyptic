@@ -154,15 +154,25 @@ describe("playlist resolution (POL-34)", () => {
 
     const surface = playlistOn(cp, screen.id);
     expect(surface.items).toEqual([
-      { kind: "dashboard", url: "https://grafana.test/d/abc", durationSeconds: 45, sourceId: dash },
-      { kind: "video", url: "https://media.test/promo.mp4", sourceId: video }, // untimed: plays out
+      // POL-133: every entry carries a zoom; framed steps take the (screen, step) remembered value.
+      { kind: "dashboard", url: "https://grafana.test/d/abc", durationSeconds: 45, sourceId: dash, zoom: 1 },
+      { kind: "video", url: "https://media.test/promo.mp4", sourceId: video, zoom: 1 }, // untimed: plays out
     ]);
     // The rotation anchor is a real instant (wall members + reboots derive their phase from it).
     expect(Number.isFinite(Date.parse(surface.startedAt))).toBe(true);
 
-    // The console reads this as the library source it is — and offers no zoom (not one page).
+    // The console reads this as the library source it is — and offers no whole-rotation zoom (not
+    // one page); POL-133 surfaces the steps instead, framed ones with their per-step zoom.
     const summary = cp.screenContentSummary(screen.id);
-    expect(summary).toEqual({ name: "Rotation", kind: "playlist", zoom: undefined });
+    expect(summary).toEqual({
+      name: "Rotation",
+      kind: "playlist",
+      zoom: undefined,
+      entries: [
+        { sourceId: dash, name: "Grafana", kind: "dashboard", zoom: 1 },
+        { sourceId: video, name: "Promo", kind: "video" },
+      ],
+    });
   });
 
   test("a playlist SPANS a video wall: every member carries the same rotation and anchor", async () => {

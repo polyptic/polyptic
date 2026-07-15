@@ -287,7 +287,7 @@ async function remove(id: string) {
             <span v-if="activeMural" class="mural-tag">· {{ activeMural.name }}</span>
           </p>
         </div>
-        <button class="save-btn" :disabled="!store.activeMuralId" @click="openSave">
+        <button v-if="store.canAuthor" class="save-btn" :disabled="!store.activeMuralId" @click="openSave">
           + Save current wall
         </button>
       </header>
@@ -416,9 +416,11 @@ async function remove(id: string) {
             <span class="summary">{{ store.sceneSummary(s.id) }}</span>
             <span v-if="s.id === store.activeSceneId" class="active-badge">Active</span>
             <span v-if="s.id === scheduler?.defaultSceneId" class="default-badge">Default</span>
-            <button class="apply-btn" @click="openEditor(s.id)">+ Schedule</button>
+            <button v-if="store.canAuthor" class="apply-btn" @click="openEditor(s.id)">+ Schedule</button>
+            <!-- POL-107: Apply is the ONE mutation a viewer holds — recalling a layout someone else
+                 authored. Scheduling and deleting are operator verbs. -->
             <button class="apply-btn" @click="apply(s.id)">Apply</button>
-            <button class="del-btn" title="Delete scene" @click="remove(s.id)">✕</button>
+            <button v-if="store.canAuthor" class="del-btn" title="Delete scene" @click="remove(s.id)">✕</button>
           </div>
 
           <div v-if="schedulesForScene(s.id).length" class="sched-list">
@@ -445,7 +447,7 @@ async function remove(id: string) {
           Lay out the wall on the Wall view, then save it here as a scene you can re-apply in one
           click — or hand to the scheduler.
         </span>
-        <button class="save-btn ghost" :disabled="!store.activeMuralId" @click="openSave">
+        <button v-if="store.canAuthor" class="save-btn ghost" :disabled="!store.activeMuralId" @click="openSave">
           + Save current wall
         </button>
       </div>

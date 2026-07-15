@@ -17,8 +17,9 @@ import { join } from "node:path";
 import type { DisplayBackend } from "./types";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
 import { buildSurfArgs, prelaunchSurf, resolveSurf } from "./surf";
-import { sanitizeConnector, SupervisedBrowser } from "./supervise";
+import { browserProbesFrom, sanitizeConnector, SupervisedBrowser } from "./supervise";
 import type { LaunchTarget } from "./supervise";
+import type { BrowserProbe } from "../vitals";
 import { captureStdout, delay, run, spawnChild, which } from "./proc";
 
 /** How long to wait for the freshly-launched browser window to be mapped + named. */
@@ -328,6 +329,28 @@ export class X11Backend implements DisplayBackend {
   /** x11-i3 drives surf, which has no tunnel-able remote inspector (D63) — never a DevTools port. */
   devtoolsEndpoint(): { port: number } | null {
     return null;
+  }
+
+  /** POL-119 — casting is sway-only for now: the receiver renders via waylandsink natively, and
+   *  POL-67 rules out the Xwayland/X11 software sinks (they peg the CPU on real boxes). Disabling
+   *  (`null`) is always safe; enabling refuses with the reason the console shows the operator. */
+  async setCast(connector: string, spec: { name: string } | null): Promise<void> {
+    if (spec === null) return;
+    throw new Error(`casting needs the wayland-sway backend (this box runs x11-i3)`);
+  }
+
+  onCastSession(): void {
+    // Never fires: no receiver can run here.
+  }
+
+  onCastPin(): void {
+    // Never fires: no receiver can run here (POL-136).
+  }
+
+  /** POL-92 — the browsers this backend supervises, for the heartbeat's vitals sampler. On X11 that
+   *  is surf under Xwayland, the very stack whose lost DRI3 path (D77) the GPU tell exists to catch. */
+  browserProbes(): BrowserProbe[] {
+    return browserProbesFrom(this.browsers);
   }
 
   /** Crop the output's region out of the root window via ImageMagick `import`, else `scrot`. */
