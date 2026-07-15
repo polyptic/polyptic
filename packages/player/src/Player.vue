@@ -64,6 +64,7 @@ import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
 import { openIdbMediaStore } from "./media-cache-idb";
 import { loadLastSlice, saveLastSlice } from "./last-slice";
+import { initShellWorker, shellFromCache, shellServerContact } from "./sw-register";
 import IdleSplash from "./IdleSplash.vue";
 
 // Injected by Vite (see vite.config.ts) from package.json — the build version shown on the idle splash.
@@ -354,6 +355,16 @@ onMounted(() => {
   window.addEventListener("offline", onOffline);
   window.addEventListener("error", onResourceError, true);
 
+  // POL-132 — the player APP survives a page reload while the control plane is down: a service
+  // worker serves the shell cache-first (prod builds only; ?sw=off is the kill switch). A newer
+  // build swaps in only at a safe moment — when the player WS is open, i.e. the reload it costs
+  // repaints instantly from the last-good slice and reconnects immediately.
+  initShellWorker({
+    log: diag,
+    version: APP_VERSION,
+    safeToSwap: () => connState.value === "open",
+  });
+
   if (!screenId) {
     connState.value = "closed";
     return;
@@ -371,7 +382,12 @@ onMounted(() => {
     screenName.value = restored.friendlyName;
     if (restored.showBadges !== undefined) showBadges.value = restored.showBadges;
     if (restored.castEnabled !== undefined) castEnabled.value = restored.castEnabled;
-    diag(`restored last-good slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`);
+    // POL-132 acceptance line: a reload-from-cache must SAY it painted from cache in the trail.
+    diag(
+      shellFromCache()
+        ? `shell from cache, restored slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`
+        : `restored last-good slice rev ${restored.revision} (${restored.surfaces.length} surfaces)`,
+    );
   }
 
   // POL-32 — bring up the blob cache. If IndexedDB is unavailable the player runs uncached (media
@@ -395,6 +411,12 @@ onMounted(() => {
     {
       onMessage: handleMessage,
       onState: (state) => {
+        // Update the reactive state FIRST: everything below (and everything IT calls) must see the
+        // socket's true state. shellServerContact()'s safe-swap gate once read a stale "connecting"
+        // here and deferred a shell update at every contact, forever (caught in review) — the gate
+        // no longer depends on this ordering (serverContact() IS the safe moment), but stale-state
+        // callbacks are a bug class, not a one-off.
+        connState.value = state;
         diag(`player socket ${state}`);
         if (state === "open") {
           // A RECONNECT (not the first connect) means the socket dropped — itself evidence the network
@@ -402,8 +424,10 @@ onMounted(() => {
           if (everOpen) prober.recheck("player socket reconnected");
           everOpen = true;
           flushDiag();
+          // POL-132 — server contact is the safe moment: revalidate the cached shell, and if a
+          // newer build already finished installing, swap into it now (logged in the trail).
+          shellServerContact();
         }
-        connState.value = state;
       },
     },
     playerToken,
