@@ -1,0 +1,32 @@
+{{- /*
+POL-143 — a dedicated NodePort Service for the raw-TCP mTLS agent listener.
+
+The main Service is ClusterIP (it sits behind Traefik) and stock K3s Traefik only
+routes :80/:443, both HTTP — neither can carry a raw mutual-TLS handshake without
+terminating it and stripping the agent's client certificate. So the mTLS listener
+gets its OWN NodePort Service: reachable on every node at `nodePort`, off-cluster,
+with no extra Traefik entrypoint. The chart advertises this port to agents
+(AGENT_MTLS_ADVERTISE_PORT in the ConfigMap), so a box dials the same host it
+already knows on the NodePort and the node forwards it to the pod's :8443.
+
+This is the fix for a box that gets its certificate but never migrates: before it,
+the chart exposed :8443 only in-cluster and agents dialled a door nobody had opened.
+*/ -}}
+{{- if and .Values.agentMtls.enabled (eq .Values.agentMtls.expose "nodePort") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "polyptic.fullname" . }}-agent-mtls
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+spec:
+  type: NodePort
+  ports:
+    - name: agent-mtls
+      port: {{ .Values.agentMtls.port }}
+      targetPort: agent-mtls
+      nodePort: {{ .Values.agentMtls.nodePort }}
+      protocol: TCP
+  selector:
+    {{- include "polyptic.selectorLabels" . | nindent 4 }}
+{{- end }}

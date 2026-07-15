@@ -73,10 +73,12 @@ containerPort: 8080
 # + issues certs, never carries a session. Console ▸ Settings ▸ Agent security
 # shows the posture and each machine's cert state.
 #
-# The port is added to the Service — but it must reach the pod as raw TCP
-# (LoadBalancer / NodePort / TCP passthrough): an HTTP(S) Ingress would terminate
-# TLS itself and strip the client certificate. Requires a server image on
-# Bun ≥ 1.3 (the boot self-test refuses to serve mTLS otherwise).
+# The listener must reach the pod as raw TCP (never an HTTP(S) Ingress, which
+# would terminate TLS and strip the client certificate). By default (POL-143) the
+# chart publishes a dedicated NodePort Service for it and tells agents to dial
+# that port — reachable on stock K3s with nothing to configure; see `expose`
+# below. Requires a server image on Bun ≥ 1.3 (the boot self-test refuses to
+# serve mTLS otherwise).
 agentMtls:
   # The escape hatch for debugging: false renders AGENT_MTLS=off — the agent
   # channel then runs unauthenticated at the transport (app credentials still gate).
@@ -97,9 +99,27 @@ agentMtls:
   #     a failed mTLS listener at boot is FATAL rather than a silent fallback
   #     to plaintext sessions.
   require: ""
+  # How the raw-TCP listener is PUBLISHED so wall boxes can reach it (POL-143).
+  # This is the fix for "Certificate issued — moves over on next connection" that
+  # never completes: on stock K3s the pod Service is ClusterIP (unreachable off
+  # the cluster) and Traefik exposes only :80/:443, both HTTP — so an mTLS box
+  # dialling <host>:8443 hits a door nobody opened. The options:
+  #   nodePort (DEFAULT) — a dedicated NodePort Service publishes the listener on
+  #     EVERY node at `nodePort`, and the chart advertises that port to agents
+  #     (AGENT_MTLS_ADVERTISE_PORT): a box dials the same host it already knows on
+  #     the NodePort, which forwards to the pod. Works out of the box on K3s.
+  #   none — publish nothing extra; bring your own reachability (a LoadBalancer on
+  #     `port`, or a Traefik IngressRouteTCP passthrough on an existing entrypoint)
+  #     and point agents at it with `publicUrl`. See README ▸ mTLS exposure.
+  expose: nodePort
+  # The NodePort the mTLS listener is published on when expose=nodePort. Must sit
+  # in the cluster's NodePort range (K3s default 30000–32767) and be the port a
+  # box can reach the node on. Agents are told to dial THIS port.
+  nodePort: 30843
   # Optional full wss:// URL agents should dial (AGENT_MTLS_PUBLIC_URL) when the
   # mTLS listener is exposed somewhere other than "same host, this port" — e.g. a
-  # dedicated LoadBalancer. Empty = agents reuse the host they already dial.
+  # dedicated LoadBalancer or an IngressRouteTCP SNI host. Set with expose=none.
+  # Empty = agents reuse the host they already dial (on the NodePort, per above).
   publicUrl: ""
   # Extra SAN hostnames/IPs for the listener's server certificate — every name a
   # box might dial it by (joined into AGENT_MTLS_SANS).

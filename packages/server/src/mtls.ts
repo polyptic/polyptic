@@ -348,6 +348,15 @@ export const DEFAULT_AGENT_MTLS_PORT = 8443;
 export interface AgentMtlsEnv {
   enabled: boolean;
   port: number;
+  /**
+   * POL-143 — the port agents are told to DIAL, when it differs from the bind `port`. On stock K3s
+   * the listener binds :8443 inside the pod but is reached from a box through a NodePort (e.g.
+   * :30843); the server must advertise the REACHABLE port, not the internal one, or every box dials
+   * a door that isn't open and sits on "moves over on next connection" forever. Unset → advertise
+   * `port` (same-host-same-port, the plain LoadBalancer case). A full `AGENT_MTLS_PUBLIC_URL`
+   * override still wins over both.
+   */
+  advertisePort?: number;
   /** True when any AGENT_MTLS* env was set — failures are then fatal instead of degrading. */
   explicit: boolean;
   /**
@@ -371,6 +380,7 @@ export interface AgentMtlsEnv {
 export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): AgentMtlsEnv {
   const modeRaw = env.AGENT_MTLS?.trim();
   const portRaw = env.AGENT_MTLS_PORT?.trim();
+  const advertisePortRaw = env.AGENT_MTLS_ADVERTISE_PORT?.trim();
   const requireRaw = env.AGENT_MTLS_REQUIRE?.trim();
 
   const explicit = modeRaw !== undefined || (portRaw !== undefined && portRaw !== "");
@@ -383,6 +393,20 @@ export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): Agent
     );
   }
 
+  // POL-143 — the advertised (dialled) port, when it differs from the bind port. A typo here is
+  // explicit configuration that would strand the fleet at a wrong address, so refuse to boot rather
+  // than silently advertise the bind port.
+  let advertisePort: number | undefined;
+  if (advertisePortRaw !== undefined && advertisePortRaw !== "") {
+    advertisePort = Number(advertisePortRaw);
+    if (!Number.isFinite(advertisePort) || !Number.isInteger(advertisePort) || advertisePort < 1 || advertisePort > 65535) {
+      throw new Error(
+        `AGENT_MTLS_ADVERTISE_PORT is not a valid port: ${JSON.stringify(env.AGENT_MTLS_ADVERTISE_PORT)} — ` +
+          "set the port boxes should DIAL (1–65535, e.g. a NodePort), or unset it to advertise the bind port",
+      );
+    }
+  }
+
   const requirePin =
     requireRaw === undefined || requireRaw === ""
       ? undefined
@@ -391,6 +415,7 @@ export function resolveAgentMtlsEnv(env: NodeJS.ProcessEnv = process.env): Agent
   return {
     enabled: !modeOff && port > 0,
     port,
+    ...(advertisePort !== undefined ? { advertisePort } : {}),
     explicit,
     ...(requirePin !== undefined ? { requirePin } : {}),
     publicUrl: env.AGENT_MTLS_PUBLIC_URL?.trim() || undefined,
@@ -545,6 +570,9 @@ export function registerAgentSecurityRoutes(
       ...(presence.machineChannel(m.id) ? { agentChannel: presence.machineChannel(m.id) } : {}),
       ...(m.mtlsCertIssuedAt ? { mtlsCertIssuedAt: m.mtlsCertIssuedAt } : {}),
       ...(m.mtlsSeenAt ? { mtlsSeenAt: m.mtlsSeenAt } : {}),
+      // POL-143 — the box's live report that the mTLS door is unreachable, with the address it
+      // dialled: the card must say WHY a migration stalled, not keep promising "next connection".
+      ...(presence.machineMtlsDialError(m.id) ? { mtlsDialError: presence.machineMtlsDialError(m.id) } : {}),
     }));
     return AgentSecurityInfo.parse({
       mode: !runtime.posture ? "off" : runtime.posture.required ? "required" : "migrating",

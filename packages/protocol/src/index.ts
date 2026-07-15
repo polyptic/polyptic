@@ -899,6 +899,22 @@ export const AgentHello = z.object({
    * in `server/enrolled.mtls`. Servers without mTLS ignore it.
    */
   csrPem: z.string().optional(),
+  /**
+   * POL-143 — the box's own account of WHY it is on the plain channel despite holding a cert: its
+   * mTLS dials keep failing. Attached to a plain-channel hello after repeated failures, carrying
+   * the exact URL it tried and the consecutive-failure count, so the server can surface "this box
+   * cannot reach the secure port at <url>" instead of promising a migration that never comes
+   * (measured live: a chart that never routed :8443 left every box saying "moves over on next
+   * connection" forever). Absent on an mTLS-channel hello, a first contact, or a healthy fleet.
+   */
+  mtlsDialFailure: z
+    .object({
+      /** The wss:// URL the agent dialled (from its bundle). */
+      url: z.string(),
+      /** Consecutive failed mTLS dials since the last success. */
+      attempts: z.number().int().positive(),
+    })
+    .optional(),
 });
 
 // ── Host vitals (POL-92) ─────────────────────────────────────────────────────
@@ -2928,6 +2944,17 @@ export const AgentSecurityInfo = z.object({
       agentChannel: z.enum(["plain", "mtls"]).optional(),
       mtlsCertIssuedAt: z.string().optional(),
       mtlsSeenAt: z.string().optional(),
+      /** POL-143 — the box reported that it CANNOT reach the mTLS listener: the URL it dialled,
+       *  how many consecutive dials failed, and when it last said so. Live-only (cleared the
+       *  moment the box connects over mTLS, or goes offline) — this is why the card must stop
+       *  promising "moves over on next connection". */
+      mtlsDialError: z
+        .object({
+          url: z.string(),
+          attempts: z.number().int().positive(),
+          at: z.string(),
+        })
+        .optional(),
     }),
   ),
 });

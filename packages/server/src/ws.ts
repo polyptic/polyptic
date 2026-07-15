@@ -645,6 +645,36 @@ function handleAgent(
       // let the posture re-evaluate its promotion to require.
       if (channel === "mtls") agentMtls?.noteMtlsHello?.(msg.machineId);
 
+      // POL-143 — the box's own account of an unreachable mTLS door. Recorded live (never
+      // persisted: a stale address on a healed box would lie) and narrated ONCE per edge — a new
+      // report or a changed URL — because the agent re-reports on every fallback cycle and the feed
+      // must not scroll with carbon copies. An mTLS-channel hello is the proof it healed: clear it.
+      if (channel === "mtls") {
+        presence.clearMachineMtlsDialError(msg.machineId);
+      } else if (msg.mtlsDialFailure) {
+        const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+        const isNew = presence.setMachineMtlsDialError(msg.machineId, {
+          url: msg.mtlsDialFailure.url,
+          attempts: msg.mtlsDialFailure.attempts,
+          at: new Date().toISOString(),
+        });
+        if (isNew) {
+          activity.push(
+            "bad",
+            `${label} cannot reach the secure agent channel at ${msg.mtlsDialFailure.url} (${msg.mtlsDialFailure.attempts} failed dials) — staying on the plain channel`,
+          );
+        }
+        log.warn(
+          {
+            event: "agent.mtls.unreachable",
+            machineId: msg.machineId,
+            url: msg.mtlsDialFailure.url,
+            attempts: msg.mtlsDialFailure.attempts,
+          },
+          "agent reports it cannot reach the mTLS listener",
+        );
+      }
+
       // A machine came online (and possibly new screens / a status change) — refresh the admin view.
       if (cameOnline) {
         const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;

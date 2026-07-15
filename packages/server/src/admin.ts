@@ -72,6 +72,10 @@ export class Presence {
   private readonly agentConns = new Map<string, number>();
   /** POL-134 — machineId → the channel its live agent session arrived on. Live-only. */
   private readonly agentChannel = new Map<string, "plain" | "mtls">();
+  /** POL-143 — machineId → the box's own report that it cannot reach the mTLS listener (the URL it
+   *  dialled + consecutive failures + when it last said so). Live-only, like everything here: it is
+   *  cleared the moment the box proves otherwise (an mTLS-channel hello) or goes fully offline. */
+  private readonly mtlsDialErrors = new Map<string, { url: string; attempts: number; at: string }>();
   private readonly screenRevision = new Map<string, number>();
   /** screenIds whose panel currently shows the browser's Web Inspector (POL-50). */
   private readonly inspecting = new Set<string>();
@@ -132,7 +136,27 @@ export class Presence {
       // POL-104 — the box is gone, and so is the address it was dialling from.
       this.addresses.delete(machineId);
       this.agentChannel.delete(machineId);
+      // A fully-offline box's dial error describes a session that no longer exists.
+      this.mtlsDialErrors.delete(machineId);
     } else this.agentConns.set(machineId, n);
+  }
+
+  /** POL-143 — record a box's mTLS-unreachable report. Returns true on the EDGE (first report, or
+   *  the dialled URL changed) so the caller pushes ONE feed line, not one per fallback cycle. */
+  setMachineMtlsDialError(machineId: string, report: { url: string; attempts: number; at: string }): boolean {
+    const previous = this.mtlsDialErrors.get(machineId);
+    this.mtlsDialErrors.set(machineId, report);
+    return previous === undefined || previous.url !== report.url;
+  }
+
+  /** POL-143 — the box connected over mTLS (or was healed): the error is disproven. */
+  clearMachineMtlsDialError(machineId: string): void {
+    this.mtlsDialErrors.delete(machineId);
+  }
+
+  /** POL-143 — the live mTLS-unreachable report for a machine, if any. */
+  machineMtlsDialError(machineId: string): { url: string; attempts: number; at: string } | undefined {
+    return this.mtlsDialErrors.get(machineId);
   }
 
   isMachineOnline(machineId: string): boolean {
