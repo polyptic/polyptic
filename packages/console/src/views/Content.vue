@@ -19,6 +19,7 @@ import type {
   ContentKind,
   ContentSource,
   CredentialProfileView,
+  PlacementMode,
   UpdateCredentialProfileBody,
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
@@ -57,6 +58,7 @@ const draftName = ref("");
 const draftKind = ref<ContentKind>("web");
 const draftUrl = ref("");
 const draftProfileId = ref(""); // "" = no authentication (POL-24)
+const draftPlacement = ref<PlacementMode>("auto"); // POL-18 — display override (web/dashboard)
 const errorMsg = ref<string | null>(null);
 const saving = ref(false);
 
@@ -72,6 +74,7 @@ function openAdd() {
   draftKind.value = "web";
   draftUrl.value = "";
   draftProfileId.value = "";
+  draftPlacement.value = "auto";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -82,6 +85,7 @@ function openEdit(s: ContentSource) {
   draftKind.value = s.kind;
   draftUrl.value = s.url ?? "";
   draftProfileId.value = s.credentialProfileId ?? "";
+  draftPlacement.value = s.placementMode ?? "auto";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -100,6 +104,9 @@ async function save() {
     url: draftUrl.value.trim(),
     // Auth only rides on browser-loaded kinds; "" (None) and a non-authable kind both mean detach.
     credentialProfileId: authPickable.value && draftProfileId.value ? draftProfileId.value : null,
+    // POL-18 — the display override, web/dashboard only. "auto" travels explicitly so an edit back
+    // to auto actually clears a previously forced mode.
+    ...(authPickable.value ? { placementMode: draftPlacement.value } : {}),
   });
   if (!parsed.success) {
     errorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
@@ -136,6 +143,17 @@ function rowSub(s: ContentSource): string {
   return facts
     ? `${kindLabel(s.kind)} · ${facts} · ${pretty(s.url ?? "")}`
     : `${kindLabel(s.kind)} · ${pretty(s.url ?? "")}`;
+}
+
+/** POL-18 — the row's framing/display read-out, or null when there is nothing worth saying. A
+ *  source that frames fine in auto mode stays quiet — the badge is for the exceptions. */
+function placementNote(s: ContentSource): string | null {
+  if (s.kind !== "web" && s.kind !== "dashboard") return null;
+  const mode = s.placementMode ?? "auto";
+  if (mode === "window") return "windowed (forced)";
+  if (mode === "iframe") return s.framing === "blocked" ? "framed (forced — blocks framing)" : null;
+  if (s.framing === "blocked") return "blocks framing → windowed";
+  return null;
 }
 
 /** The profile a source references, for the library row's auth read-out. */
@@ -459,6 +477,7 @@ function mediaFacts(s: ContentSource): string {
               <template v-else>
                 {{ rowSub(c) }}
                 <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
+                <template v-if="placementNote(c)"> · ▣ {{ placementNote(c) }}</template>
               </template>
             </div>
           </div>
@@ -591,6 +610,16 @@ function mediaFacts(s: ContentSource): string {
             Protected content? Add a credential profile under Access credentials below, then pick it
             here.
           </p>
+
+          <!-- POL-18 — the display override. Auto probes the address's framing headers and falls
+               back to an agent-placed window when the site refuses to be framed; the forced modes
+               exist because header detection can never be perfect. -->
+          <label class="field-label">Display</label>
+          <select v-model="draftPlacement" class="field select">
+            <option value="auto">Auto — windowed only if the site blocks framing</option>
+            <option value="iframe">Always framed (embed in the player)</option>
+            <option value="window">Always windowed (placed by the box)</option>
+          </select>
         </template>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>

@@ -15,7 +15,7 @@
  * implementing the same three methods. The binaries are configurable (`MEDIA_PROBE_CMD` /
  * `MEDIA_FRAME_CMD`) so an operator can point us at their own build without touching code.
  *
- * DEGRADE, NEVER REFUSE (D114). A dev laptop or a minimal container may have no toolchain at all. In
+ * DEGRADE, NEVER REFUSE (D129). A dev laptop or a minimal container may have no toolchain at all. In
  * that case `available()` is false, ingest still accepts the upload, the source carries
  * `media.probed = false` plus a warning, and the wall behaves exactly as it did before this ticket.
  * A server that cannot inspect a file has learned NOTHING about it — turning "I don't know" into "no"
@@ -236,7 +236,7 @@ interface ToolProbeJson {
 /**
  * The one implementation that shells out to an external media toolchain (the usual pair: a JSON-
  * emitting stream inspector + a frame extractor). Both binaries are configurable; if either is
- * missing the prober simply reports itself unavailable and the server degrades (D114).
+ * missing the prober simply reports itself unavailable and the server degrades (D129).
  */
 export class ExternalToolMediaProber implements MediaProber {
   readonly name: string;
