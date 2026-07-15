@@ -550,3 +550,153 @@ describe("phase 2b enrollment (gated mode)", () => {
     TEST_TIMEOUT,
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POL-117 — manual naming + pre-approval ident
+//
+// Every netbooted box reports the hostname `localhost.localdomain` (the shared live image), so the
+// hostname is never adopted as the machine's label — and a still-PENDING machine can be named and
+// told to flash its holding board (over the AGENT channel: `server/pending` re-sent with `&ident=1`
+// on the board URL) so the operator knows which physical panel they are approving. Everything ELSE
+// stays refused pre-approval: reboot and the shell arm both 409.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("POL-117 — naming + pre-approval ident", () => {
+  const BOX = "dmi-pol117-aabbcc";
+  let boxAgent: WsClient;
+
+  test(
+    "a live-image hostname is never adopted as the label (admin/state shows the id sentinel)",
+    async () => {
+      boxAgent = await openAgent();
+      boxAgent.send({
+        ...helloWithToken(BOX, "DP-1", BOOTSTRAP_TOKEN),
+        hostname: "localhost.localdomain",
+      });
+      await boxAgent.waitFor((m) => m.t === "server/pending", "server/pending for pol117 box");
+
+      const admin = await connectAdmin();
+      const machine = await machineFromAdmin(
+        admin,
+        BOX,
+        (mm) => mm.status === "pending",
+        "admin/state with pol117 pending machine",
+      );
+      // The label must NOT be the meaningless hostname — it stays = the machine id (the unnamed
+      // sentinel the console renders as "Unnamed box · <tail>").
+      expect(machine.label).not.toBe("localhost.localdomain");
+      expect(machine.label).toBe(BOX);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "pending ident reaches the agent channel: server/pending with ident=1, then auto-off",
+    async () => {
+      const res = await postJson(`/api/v1/machines/${BOX}/ident`, { on: true, ttlMs: 800 });
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as { ok: boolean; delivered: number };
+      expect(payload.ok).toBe(true);
+      expect(payload.delivered).toBe(1); // the fake agent's socket
+
+      const on = await boxAgent.waitFor(
+        (m) => m.t === "server/pending" && typeof m.pendingUrl === "string" && m.pendingUrl.includes("ident=1"),
+        "server/pending with ident=1",
+      );
+      expect(on.machineId).toBe(BOX);
+      expect(on.pendingUrl).toContain(`pending=${encodeURIComponent(BOX)}`);
+
+      // The TTL restores the plain holding board — same frame, no ident marker.
+      const off = await boxAgent.waitFor(
+        (m) => m.t === "server/pending" && typeof m.pendingUrl === "string" && !m.pendingUrl.includes("ident="),
+        "server/pending without ident (ttl off)",
+        4_000,
+      );
+      expect(off.machineId).toBe(BOX);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "everything else is refused pre-approval: reboot 409, shell arm 409",
+    async () => {
+      const reboot = await postJson(`/api/v1/machines/${BOX}/reboot`, {});
+      expect(reboot.status).toBe(409);
+      await reboot.body?.cancel();
+
+      const shell = await postJson(`/api/v1/machines/${BOX}/shell`, { enabled: true });
+      expect(shell.status).toBe(409);
+      await shell.body?.cancel();
+
+      // ... and the agent saw none of it — no reboot or shell frame slipped through.
+      const sawForbidden = await boxAgent.sawWithin(
+        (m) => m.t === "server/reboot" || m.t === "server/shell-open",
+        600,
+      );
+      expect(sawForbidden).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "renaming a PENDING machine round-trips: REST 200, admin/state broadcasts the new label live",
+    async () => {
+      const admin = await connectAdmin();
+      const res = await postJson(`/api/v1/machines/${BOX}/rename`, { label: "Lobby Left" });
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as { ok: boolean; machine: { label: string } };
+      expect(payload.ok).toBe(true);
+      expect(payload.machine.label).toBe("Lobby Left");
+
+      // The rename is a registry mutation: every open console hears it on the next broadcast.
+      const machine = await machineFromAdmin(
+        admin,
+        BOX,
+        (mm) => mm.label === "Lobby Left",
+        "admin/state with renamed machine",
+      );
+      expect(machine.label).toBe("Lobby Left");
+      expect(machine.status).toBe("pending"); // naming never changes enrollment status
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the operator's name survives the box's next hello (hostname never wins it back)",
+    async () => {
+      // Re-hello with the same meaningless hostname on a fresh socket (credential re-issue path).
+      const again = await openAgent();
+      again.send({
+        ...helloWithToken(BOX, "DP-1", BOOTSTRAP_TOKEN),
+        hostname: "localhost.localdomain",
+      });
+      await again.waitFor((m) => m.t === "server/pending", "server/pending on re-hello");
+
+      const admin = await connectAdmin();
+      const machine = await machineFromAdmin(
+        admin,
+        BOX,
+        (mm) => mm.label === "Lobby Left",
+        "admin/state keeps the operator name",
+      );
+      expect(machine.label).toBe("Lobby Left");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "rename on an unknown machine returns 404; an empty label is a 400",
+    async () => {
+      const missing = await postJson("/api/v1/machines/machine-does-not-exist/rename", {
+        label: "Ghost",
+      });
+      expect(missing.status).toBe(404);
+      await missing.body?.cancel();
+
+      const empty = await postJson(`/api/v1/machines/${BOX}/rename`, { label: "   " });
+      expect(empty.status).toBe(400);
+      await empty.body?.cancel();
+    },
+    TEST_TIMEOUT,
+  );
+});

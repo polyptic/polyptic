@@ -31,9 +31,10 @@
 #   4. Neither reachable → change NOTHING. A dead network must not be dressed up as a pruned build:
 #      leaving $netroot alone hands the boot back to livenet's own retry loop and the existing
 #      "Cannot fetch the OS image" narration, exactly as before this file existed.
-#   5. When it DOES swap the image, say so loudly — splash, console, and a `POST /boot/report`
-#      (code `pinned-build-missing`) — because the box is now running a rootfs its on-stick kernel
-#      did not ship with. A genuine kernel/module mismatch is still owned by the existing D67
+#   5. When it DOES swap the image, say so where the OPERATOR looks — console and a `POST
+#      /boot/report` (code `pinned-build-missing`) — because the box is now running a rootfs its
+#      on-stick kernel did not ship with. NOT on the splash (POL-140): the wall is public signage,
+#      the swap is self-healing bookkeeping, and to anyone in the room this boot looks standard. A genuine kernel/module mismatch is still owned by the existing D67
 #      recovery machinery (update-poll's missing-/lib/modules tell): it refreshes the medium and
 #      reboots into a matched pair. Across daily rebuilds of one kernel ABI that mismatch is usually
 #      a non-event, and a box that boots with a loud warning beats a box that never boots.
@@ -55,10 +56,6 @@
 # them installed by this module's inst_multiple (POL-78 is the cautionary tale — the initramfs
 # shipped no `dirname`, so every Wi-Fi config was silently "rejected"). tr is additionally guarded
 # with `command -v`, and its absence only costs the machine id in the report.
-
-# The splash line. Public signage, so no hostnames and no build ids (they go to the console and the
-# boot report). polyptic-progress-done.sh hides this exact text before switch-root.
-POLYPTIC_PIN_SPLASH="The OS image this screen was set up with is gone; starting the newest one ..."
 
 # Is the depot really serving this image? A 1-byte RANGED GET on the very route livenet will use
 # (the depot answers 206 — provision.ts parseRange), so this proves the fetch, not a HEAD route that
@@ -165,10 +162,8 @@ polyptic_pin_fallback() { # <pinned-url> <outfile>
     return 0
   fi
 
-  # 5) Loud, on the glass and off the box.
-  if type plymouth > /dev/null 2>&1 && plymouth --ping 2> /dev/null; then
-    plymouth display-message --text="$POLYPTIC_PIN_SPLASH" 2> /dev/null || true
-  fi
+  # 5) Loud where the operator looks (console + report) — never on the glass (POL-140). The splash
+  #    keeps showing the ordinary boot narration; to the room this is a standard startup.
   echo "polyptic: $_why" > "$_console" 2> /dev/null || true
   polyptic_pin_report "$_why"
 

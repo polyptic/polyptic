@@ -24,8 +24,8 @@ IMAGE_ID="${4:?missing imageId}"
 TOKEN="${5:-}"
 
 BOOT="/polyptic/boot/$ARCH/$SLOT"
-# Where build-boot-medium.sh / offload.sh bake the POL-47 theme (theme.txt + logo.png) so the
-# offline menu can paint the branded splash with no network to fetch it from (POL-74).
+# Where build-boot-medium.sh / offload.sh bake the POL-47 theme (theme.txt + logo.png + bg.png) so
+# the offline menu can paint the branded splash with no network to fetch it from (POL-74).
 THEME_DIR="/polyptic/boot/theme"
 tok=""
 [ -z "$TOKEN" ] || tok=" polyptic.token=$TOKEN"
@@ -47,9 +47,12 @@ cat <<EOF
 # own copy. Same guard discipline as the server's bootGfxPreamble (packages/server/src/boot-theme.ts):
 # the whole block hangs off loadfont, and \`set theme\` only fires if the theme was actually baked,
 # so a LEAN or theme-less medium still boots to a plain menu on the correct dark background.
-# BOTH files are checked (POL-87): the theme references logo.png, and handing GRUB a theme whose
-# bitmap is missing paints "error: null src bitmap ... Press any key to continue" on a screen that
-# has no keyboard. Nested ifs, not -a: plain [ -f ] is the only test form every GRUB build has.
+# ALL THREE files are checked (POL-87, then POL-130): the theme references logo.png AND bg.png —
+# bg.png is the desktop-image GRUB 2.12's gfxmenu insists on scaling at every draw, and a theme
+# without one (or with a bitmap that is missing) leaves "error: null src bitmap ... Press any key
+# to continue" on a screen that has no keyboard the moment the menu boots its entry. A medium
+# missing ANY of the three degrades to the plain menu on the correct dark background, which boots
+# silently. Nested ifs, not -a: plain [ -f ] is the only test form every GRUB build has.
 if loadfont (memdisk)/fonts/unicode.pf2 ; then
   insmod all_video
   insmod gfxterm
@@ -60,7 +63,7 @@ if loadfont (memdisk)/fonts/unicode.pf2 ; then
   set gfxpayload=keep
   terminal_output gfxterm
   background_color "#0b0b0d"
-  if [ -f (\$root)$THEME_DIR/theme.txt ]; then if [ -f (\$root)$THEME_DIR/logo.png ]; then set theme=(\$root)$THEME_DIR/theme.txt ; fi ; fi
+  if [ -f (\$root)$THEME_DIR/theme.txt ]; then if [ -f (\$root)$THEME_DIR/logo.png ]; then if [ -f (\$root)$THEME_DIR/bg.png ]; then set theme=(\$root)$THEME_DIR/theme.txt ; fi ; fi ; fi
 fi
 set timeout=5
 set default=live
