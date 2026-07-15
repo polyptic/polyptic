@@ -14,6 +14,13 @@
  *     proof of physical presence. There is no PIN-less code path.
  *   - Video only (`-as 0`): walls are silent by design; the box ships no audio server.
  *   - `waylandsink` natively — never an Xwayland sink (POL-67: Xwayland software paths peg the CPU).
+ *
+ * POL-144/D120: the sink was never the defect — a real iPhone mirror came through torn and banded.
+ * The cause is a layer down, in DECODE, not display: the image shipped the GStreamer `va` plugin but
+ * no VA driver, so UxPlay's `decodebin` fell back to software `avdec_h264` and the CPU-bound frames
+ * reached waylandsink via its SHM stride path (the banding). The fix is a package one (ship the VA
+ * driver so H.264 decodes in hardware to dmabuf — see setup/distro.ts `cast`), NOT an argv one:
+ * `-vs waylandsink` stays exactly right, it just needed a hardware decoder feeding it.
  */
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
