@@ -161,13 +161,15 @@ describe("playlist resolution (POL-34)", () => {
     // The rotation anchor is a real instant (wall members + reboots derive their phase from it).
     expect(Number.isFinite(Date.parse(surface.startedAt))).toBe(true);
 
-    // The console reads this as the library source it is — and offers no whole-rotation zoom (not
-    // one page); POL-133 surfaces the steps instead, framed ones with their per-step zoom.
+    // The console reads this as the library source it is — and offers no whole-rotation zoom (not one
+    // page); POL-133 surfaces the steps instead, framed ones with their per-step zoom. It DOES offer
+    // sound (POL-112): a rotation can hold a video, so the audio read-out is present — muted.
     const summary = cp.screenContentSummary(screen.id);
     expect(summary).toEqual({
       name: "Rotation",
       kind: "playlist",
       zoom: undefined,
+      audio: { muted: true, volume: 1 },
       entries: [
         { sourceId: dash, name: "Grafana", kind: "dashboard", zoom: 1 },
         { sourceId: video, name: "Promo", kind: "video" },

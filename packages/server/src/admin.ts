@@ -17,12 +17,19 @@
  */
 import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
-import type { MachineVitals, MachineView, ScreenView, ServerToAdminMessage } from "@polyptic/protocol";
+import type {
+  MachineVitals,
+  MachineView,
+  PanelPowerMethod,
+  ScreenView,
+  ServerToAdminMessage,
+} from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
 import type { ControlPlane } from "./state";
 import type { PlayerHub } from "./hub";
 import type { ActivityLog } from "./activity";
+import type { SourceHealthTracker } from "./source-health";
 
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
 export class AdminHub {
@@ -84,6 +91,12 @@ export class Presence {
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
 
+  /** POL-101 — screenIds whose panel is ASLEEP, with the rungs that got it there. Ephemeral by
+   *  design: a box that drops comes back with its panels LIT (the compositor re-asserts `dpms on` at
+   *  startup), so a remembered "asleep" would be a lie the operator can't see through. */
+  private readonly asleep = new Map<string, PanelPowerMethod[]>();
+  /** POL-101 — screenId → why the box last refused a power request (same role as `inspectErrors`). */
+  private readonly powerErrors = new Map<string, string>();
   /** POL-92 — machineId → a small ring of host-vitals samples, newest LAST. Live-only, exactly like
    *  the rest of Presence: vitals describe a running box, and a box that isn't running has none. The
    *  ring (not just the latest sample) is what lets an operator surface, and a future feature graph,
@@ -243,6 +256,49 @@ export class Presence {
     }
   }
 
+  /**
+   * POL-101 — record a panel's power state. Written ONLY from the agent's `agent/power-ack`: the
+   * operator's click is a request, the box's answer is the truth. A screen that is not in the map is
+   * awake, which is the safe default — the console must never show a wall as dark when it might be lit.
+   */
+  setScreenAsleep(screenId: string, asleep: boolean, methods: PanelPowerMethod[] = []): void {
+    if (asleep) this.asleep.set(screenId, methods);
+    else this.asleep.delete(screenId);
+  }
+
+  isScreenAsleep(screenId: string): boolean {
+    return this.asleep.has(screenId);
+  }
+
+  /** How the panel was slept (`["dpms"]` = the output is dark; `["dpms","cec"]` = the display is off). */
+  screenPowerMethods(screenId: string): PanelPowerMethod[] | undefined {
+    return this.asleep.get(screenId);
+  }
+
+  /** POL-101 — why the box last refused a power request (or `null` to clear a stale one). */
+  setScreenPowerError(screenId: string, reason: string | null): void {
+    if (reason === null) this.powerErrors.delete(screenId);
+    else this.powerErrors.set(screenId, reason);
+  }
+
+  screenPowerError(screenId: string): string | undefined {
+    return this.powerErrors.get(screenId);
+  }
+
+  /**
+   * POL-101 — forget the power state for these screens: their machine dropped. A box that comes back
+   * has LIT panels (the compositor asserts `output * dpms on` at startup), so keeping "asleep" across
+   * a drop would strand the console showing a dark wall that is, in fact, showing content. The
+   * scheduler re-applies the desired state on the box's next hello, which is what re-sleeps a screen
+   * that rebooted outside its panel hours.
+   */
+  clearScreensPower(screenIds: readonly string[]): void {
+    for (const id of screenIds) {
+      this.asleep.delete(id);
+      this.powerErrors.delete(id);
+    }
+  }
+
   // ── Host vitals (POL-92) ───────────────────────────────────────────────────
 
   /** Record one heartbeat's arrival, with or without vitals (an old agent proves liveness too). */
@@ -306,6 +362,9 @@ export function buildAdminState(
   playerHub: PlayerHub,
   presence: Presence,
   activity: ActivityLog,
+  /** POL-94 — live per-source health from the players' probes. Optional so the older call sites (and
+   *  tests) that only care about machines keep working; absent = every source reads "unknown". */
+  health?: SourceHealthTracker,
   /** POL-104 — the enrolment policy, so a machine's card can say which token it came in on and whether
    *  that token has since been revoked. Optional: unit tests that build a view need no policy. */
   enrollment?: { list(): { id: string; revokedAt: string | null }[] },
@@ -331,6 +390,12 @@ export function buildAdminState(
           content: control.screenContentSummary(s.id),
           inspecting: presence.isScreenInspecting(s.id),
           inspectError: presence.screenInspectError(s.id),
+          // POL-101 — asleep is NOT offline: the player is still connected, still holding its slice,
+          // and the box is healthy. The console renders the two differently, deliberately.
+          asleep: presence.isScreenAsleep(s.id),
+          powerMethods: presence.screenPowerMethods(s.id),
+          powerError: presence.screenPowerError(s.id),
+          panelHours: control.getPanelHours(s.id),
           castEnabled: s.castEnabled, // POL-119 — the persistent operator toggle
           castActive: presence.isScreenCasting(s.id), // POL-119 — a session is live NOW
         } satisfies ScreenView;
@@ -344,12 +409,20 @@ export function buildAdminState(
       browser: machine.browser,
       online: presence.isMachineOnline(machine.id),
       status: machine.status,
+      tags: machine.tags ?? [], // POL-103 — the chips + what a selector matches
+      // POL-105 — the build this box last reported BOOTING. Unlike vitals this is NOT gated on the
+      // box being online: the machine a roll-out stranded is exactly the machine that is now dark,
+      // and the version-distribution view exists to find it.
+      imageId: machine.imageId,
+      imageIdAt: machine.imageIdAt,
+
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       rebooting: presence.isMachineRebooting(machine.id),
       shellArmedAt: machine.shellArmedAt,
+      power: machine.power, // POL-101 — dpms / cec, as the box itself reported it
       // POL-92 — the latest host-vitals sample, but ONLY while the box is online. A CPU reading from
       // a machine that has since gone dark is not health data, it is an epitaph; the console says
       // "System stats unavailable while offline" instead of drawing a stale meter.
@@ -393,7 +466,23 @@ export function buildAdminState(
     activeSceneId: control.state.activeSceneId,
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
+    panelPower: control.getPanelPowerConfig(), // POL-101 — the panel-hours timezone
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
+    // POL-94 — the library's inventory half: where each source is used (a fold over desired state)
+    // and whether the screens showing it can actually fetch it (a fold over the players' probes).
+    sourceStatus: health
+      ? health.statusList(control.getContentSourceUsage())
+      : control.getContentSourceUsage().map((usage) => ({
+          sourceId: usage.sourceId,
+          usage,
+          health: "unknown" as const,
+          unreachableScreenIds: [],
+        })),
+    // POL-89 — the scene scheduler. The console feeds these three into the SHARED resolver to paint
+    // its week strip, so "what plays when" cannot drift from what the server's ticker will do.
+    dayparts: control.getDayparts(),
+    schedules: control.getSchedules(),
+    scheduler: control.getSchedulerSettings(),
   });
 }
 
@@ -403,6 +492,8 @@ interface BroadcasterDeps {
   presence: Presence;
   adminHub: AdminHub;
   activity: ActivityLog;
+  /** POL-94 — per-source content health, as reported by the players' probes. */
+  health?: SourceHealthTracker;
   log: FastifyBaseLogger;
   /** POL-104 — the live enrolment policy (which token a machine came in on, and whether it is revoked). */
   enrollment?: { list(): { id: string; revokedAt: string | null }[] };
@@ -425,6 +516,7 @@ export class AdminBroadcaster {
       this.deps.playerHub,
       this.deps.presence,
       this.deps.activity,
+      this.deps.health,
       this.deps.enrollment,
     );
   }

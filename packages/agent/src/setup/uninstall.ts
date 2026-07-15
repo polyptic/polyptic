@@ -17,6 +17,7 @@ import {
   REBOOT_PATH_UNIT,
   REBOOT_SERVICE,
   REBOOT_TMPFILES_PATH,
+  CEC_UDEV_RULES_PATH,
   SESSION_TARGET,
   SYSTEM_UNIT_DIR,
 } from "./templates";
@@ -73,6 +74,12 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
   sys.remove(`${SYSTEM_UNIT_DIR}/${REBOOT_SERVICE}`);
   sys.remove(REBOOT_TMPFILES_PATH);
   sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
+
+  // 3c ─ remove the HDMI-CEC udev rule (POL-101). The device node reverts to its stock ownership on
+  // the next boot/hot-plug, so the kiosk user loses CEC access along with everything else.
+  log.step("remove the HDMI-CEC udev rule");
+  sys.remove(CEC_UDEV_RULES_PATH);
+  sys.exec("udevadm", ["control", "--reload-rules"], { desc: "reload udev rules", allowFail: true });
 
   // 4 ─ greetd config: restore the original if we backed one up, else remove ours.
   log.step("restore/remove greetd config");

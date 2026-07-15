@@ -57,13 +57,14 @@ import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
-import { contentStyle as spanContentStyle } from "./surface-style";
+import { contentStyle as spanContentStyle, isAgentPlacedWindow } from "./surface-style";
 import { PageCanvas } from "@polyptic/elements";
 import PlaylistRotator from "./PlaylistRotator.vue";
 import { MediaCache } from "./media-cache";
 import type { WantedMedia } from "./media-cache";
 import { openIdbMediaStore } from "./media-cache-idb";
 import { loadLastSlice, saveLastSlice } from "./last-slice";
+import { applyAudio, ensurePlaying, surfaceAudio } from "./audio";
 import { initShellWorker, shellFromCache, shellServerContact } from "./sw-register";
 import IdleSplash from "./IdleSplash.vue";
 
@@ -307,6 +308,35 @@ function bindEl(id: string, el: unknown): void {
   }
 }
 
+/** POL-94 — surface id → the library source it is rendering (stamped by the server at send time).
+ *  A report about an ad-hoc URL carries no sourceId; the server has nothing to attribute it to. */
+const surfaceSourceIds = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {};
+  for (const s of surfaces.value) if (s.sourceId) map[s.id] = s.sourceId;
+  return map;
+});
+
+/**
+ * POL-94 — tell the control plane what this box knows about its content. The prober fires only on a
+ * CHANGE of verdict, so a healthy wall sends nothing and a dead dashboard sends one frame — the
+ * console's library badge is live without anybody polling anything. The URL is redacted (origin +
+ * path): the query is where the server stamps credentials at send time (POL-24), and a health report
+ * must never carry one back off the box.
+ */
+function reportHealth(change: { id: string; url: string; state: "reachable" | "unreachable"; detail?: string }): void {
+  if (!screenId) return;
+  socket?.send({
+    t: "player/surface-health",
+    screenId,
+    surfaceId: change.id,
+    ...(surfaceSourceIds.value[change.id] ? { sourceId: surfaceSourceIds.value[change.id] } : {}),
+    url: redactUrl(change.url),
+    state: change.state,
+    at: new Date().toISOString(),
+    ...(change.detail ? { detail: change.detail } : {}),
+  });
+}
+
 const prober = new SurfaceProber({
   paint: (id, url) => {
     painted[id] = url;
@@ -322,6 +352,7 @@ const prober = new SurfaceProber({
     if (el instanceof HTMLVideoElement) el.load();
     else el.src = el.src;
   },
+  onHealth: reportHealth,
   log: (msg) => diag(msg),
 });
 
@@ -329,10 +360,13 @@ const prober = new SurfaceProber({
  *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
  *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
  *  (POL-42) are excluded for the same reason: a page renders locally (text/clock/shapes need no
- *  network) and its embeds carry send-time-resolved data with their own calm placeholders. */
+ *  network) and its embeds carry send-time-resolved data with their own calm placeholders.
+ *  Agent-placed WINDOW surfaces (POL-18) are excluded because the player fetches NOTHING for them —
+ *  the content is a top-level window the agent places over the region; probing its URL would be
+ *  probing on behalf of a load this page never makes. */
 const probeTargets = computed(() =>
   surfaces.value
-    .filter((s) => s.type !== "playlist" && s.type !== "page")
+    .filter((s) => s.type !== "playlist" && s.type !== "page" && !isAgentPlacedWindow(s))
     .map((s) => ({ id: s.id, url: isFrame(s) ? s.url : mediaSrc(s) })),
 );
 
@@ -461,6 +495,10 @@ onMounted(() => {
           if (everOpen) prober.recheck("player socket reconnected");
           everOpen = true;
           flushDiag();
+          // POL-94 — the server forgets a screen's content health when it drops, so re-state what we
+          // already know. Without this, a wall that reconnected while its dashboard was dead would
+          // read "unknown" in the console until the URL changed state again — i.e. never.
+          for (const change of prober.snapshot()) reportHealth(change);
           // POL-132 — server contact is the safe moment: revalidate the cached shell, and if a
           // newer build already finished installing, swap into it now (logged in the trail).
           shellServerContact();
@@ -556,11 +594,57 @@ function rehomeMediaSrc(src: string): string {
 function isInteractive(surface: Surface): boolean {
   return surface.type === "web" ? surface.interactive : false;
 }
+/** POL-109 — the ingest poster frame for a video surface, re-homed like its src (POL-5). The <video>
+ *  paints it while the file buffers: the black gap between "surface arrives" and "first frame decodes"
+ *  is exactly the flash this ticket set out to remove. */
+function videoPoster(surface: Surface): string | undefined {
+  const raw = surface.type === "video" ? surface.poster : undefined;
+  return raw ? resolveMediaSrc(raw, SERVER_HTTP_BASE) : undefined;
+}
 function videoLoop(surface: Surface): boolean {
   return surface.type === "video" ? surface.loop : true;
 }
-function videoMuted(surface: Surface): boolean {
-  return surface.type === "video" ? surface.muted : true;
+/**
+ * POL-112 — the surface's audio intent, straight off the wire. The player no longer decides: the flag
+ * the control plane sent is the flag the element gets (a surface that carries none is silent).
+ */
+function videoAudio(surface: Surface) {
+  return surfaceAudio(surface);
+}
+
+/** Re-apply audio to the elements already on the wall whenever the intent changes. The elements are
+ *  keyed by surface id and SURVIVE the push (D5), so unmuting a wall does not restart the clip — the
+ *  volume simply comes up on the video that is already playing. */
+watch(
+  () => surfaces.value.map((s) => `${s.id}:${JSON.stringify(surfaceAudio(s))}`).join("|"),
+  () => {
+    for (const surface of surfaces.value) {
+      const el = surfaceEls.get(surface.id);
+      if (el instanceof HTMLVideoElement) void applyVideoAudio(surface, el);
+    }
+  },
+);
+
+/** Apply the intent, then make sure the element is actually PLAYING: an unmuted autoplay that the
+ *  browser's policy refuses (surf/Xwayland, a dev browser, no `--autoplay-policy` flag) falls back to
+ *  muted playback rather than freezing the wall on a dead frame. The fallback is logged, never fatal. */
+async function applyVideoAudio(surface: Surface, el: HTMLVideoElement): Promise<void> {
+  const intent = surfaceAudio(surface);
+  applyAudio(el, intent);
+  if (intent.muted) return; // a muted element autoplays everywhere; nothing to rescue
+  const outcome = await ensurePlaying(el);
+  if (outcome === "muted-fallback") {
+    diag(`${surface.id}: unmuted autoplay was BLOCKED by the browser — playing muted instead`);
+  } else if (outcome === "blocked") {
+    diag(`${surface.id}: playback was blocked by the browser even muted`);
+  }
+}
+
+/** The video element has data: it is safe to apply audio and (if unmuted) to force playback. */
+function onVideoReady(surface: Surface, event: Event): void {
+  onContentLoad(surface.id, "video");
+  const el = event.target;
+  if (el instanceof HTMLVideoElement) void applyVideoAudio(surface, el);
 }
 
 function connLabel(state: ConnState): string {
@@ -651,6 +735,16 @@ function connLabel(state: ConnState): string {
           live
         />
       </div>
+      <!-- POL-18: an agent-placed WINDOW surface is a hole — the real content is a top-level
+           browser window the agent floats over this region. Render nothing (a transparent region,
+           never a placeholder dot: the window above is the content, and a spinner peeking out from
+           under it would read as a fault). NOTE, honestly: the player's badge/ident overlays CANNOT
+           sit above an OS-level window — they win the page's z-order, not the compositor's. -->
+      <div
+        v-else-if="isAgentPlacedWindow(surface)"
+        class="surface-window-hole"
+        aria-hidden="true"
+      />
       <template v-else-if="painted[surface.id]">
         <iframe
           v-if="isFrame(surface)"
@@ -677,12 +771,14 @@ function connLabel(state: ConnState): string {
           :ref="(el) => bindEl(surface.id, el)"
           class="surface-media"
           :src="painted[surface.id]"
+          :poster="videoPoster(surface)"
           :style="mediaStyle(surface)"
           autoplay
           playsinline
           :loop="videoLoop(surface)"
-          :muted="videoMuted(surface)"
-          @loadeddata="onContentLoad(surface.id, 'video')"
+          :muted="videoAudio(surface).muted"
+          :volume="videoAudio(surface).volume"
+          @loadeddata="onVideoReady(surface, $event)"
           @error="onContentError(surface.id, 'video')"
         />
       </template>
