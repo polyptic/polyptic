@@ -23,6 +23,7 @@ import {
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
+  OperatorRole,
   Output,
   PlaylistItem,
   Surface,
@@ -171,6 +172,8 @@ interface UserRow {
   email: string;
   password_hash: string;
   created_at: Date;
+  /** POL-107. Nullable in the type on purpose: a pre-POL-107 row read by a mid-migration replica. */
+  role: string | null;
 }
 
 interface SessionRow {
@@ -355,6 +358,11 @@ export class PostgresStore implements Store {
         created_at    timestamptz NOT NULL DEFAULT now()
       )
     `;
+    // POL-107 — roles. THE UPGRADE PATH: an existing single-admin deployment has exactly one row in
+    // `users`, and that account IS the deployment's admin. The DEFAULT back-fills every pre-POL-107
+    // row with 'admin', so the configured admin keeps every capability it had — an upgrade is never a
+    // lockout, and it needs no operator action. New rows are written with an explicit role.
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'admin'`;
     // Server-side sessions (Phase 3f). `id` is sha256(cookieToken) so a DB read never yields a usable
     // token. Sessions are revocable (delete the row) and expire at expires_at.
     await sql`
@@ -972,7 +980,7 @@ export class PostgresStore implements Store {
   async getUserByEmail(email: string): Promise<PersistedUser | undefined> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at FROM users WHERE email = ${email} LIMIT 1
+      SELECT id, email, password_hash, created_at, role FROM users WHERE email = ${email} LIMIT 1
     `;
     const row = rows[0];
     return row ? this.toUser(row) : undefined;
@@ -981,7 +989,7 @@ export class PostgresStore implements Store {
   async getUserById(id: string): Promise<PersistedUser | undefined> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at FROM users WHERE id = ${id} LIMIT 1
+      SELECT id, email, password_hash, created_at, role FROM users WHERE id = ${id} LIMIT 1
     `;
     const row = rows[0];
     return row ? this.toUser(row) : undefined;
@@ -996,14 +1004,42 @@ export class PostgresStore implements Store {
   async createUser(user: PersistedUser): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO users (id, email, password_hash, created_at)
-      VALUES (${user.id}, ${user.email}, ${user.passwordHash}, ${new Date(user.createdAt)})
+      INSERT INTO users (id, email, password_hash, created_at, role)
+      VALUES (${user.id}, ${user.email}, ${user.passwordHash}, ${new Date(user.createdAt)}, ${user.role})
     `;
   }
 
   async updateUserPassword(id: string, passwordHash: string): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE users SET password_hash = ${passwordHash} WHERE id = ${id}`;
+  }
+
+  async listUsers(): Promise<PersistedUser[]> {
+    const sql = this.sql;
+    const rows = await sql<UserRow[]>`
+      SELECT id, email, password_hash, created_at, role FROM users ORDER BY created_at ASC, id ASC
+    `;
+    return rows.map((row) => this.toUser(row));
+  }
+
+  async updateUserRole(id: string, role: OperatorRole): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE users SET role = ${role} WHERE id = ${id}`;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    const sql = this.sql;
+    // Sessions first: a deleted account must not keep a live cookie for the length of its TTL.
+    await sql`DELETE FROM sessions WHERE user_id = ${id}`;
+    await sql`DELETE FROM users WHERE id = ${id}`;
+  }
+
+  async countAdmins(): Promise<number> {
+    const sql = this.sql;
+    const rows = await sql<CountRow[]>`
+      SELECT count(*)::text AS count FROM users WHERE role = 'admin'
+    `;
+    return rows[0] ? Number(rows[0].count) : 0;
   }
 
   async createSession(session: PersistedSession): Promise<void> {
@@ -1051,11 +1087,15 @@ export class PostgresStore implements Store {
   }
 
   private toUser(row: UserRow): PersistedUser {
+    // An absent/unknown role reads as `admin` — see the migration note: a row that predates POL-107
+    // belonged to the deployment's ONLY account, which was an admin in all but name.
+    const parsed = OperatorRole.safeParse(row.role);
     return {
       id: row.id,
       email: row.email,
       passwordHash: row.password_hash,
       createdAt: row.created_at.toISOString(),
+      role: parsed.success ? parsed.data : "admin",
     };
   }
 

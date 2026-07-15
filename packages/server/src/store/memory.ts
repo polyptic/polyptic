@@ -6,7 +6,7 @@
  * deep-cloned on the way in and out so callers can never mutate the store's copy by reference —
  * mirroring the isolation a real database gives you.
  */
-import type { EnrollmentStatus } from "@polyptic/protocol";
+import type { EnrollmentStatus, OperatorRole } from "@polyptic/protocol";
 import type {
   PersistedBootstrap,
   PersistedContent,
@@ -291,6 +291,28 @@ export class MemoryStore implements Store {
   async updateUserPassword(id: string, passwordHash: string): Promise<void> {
     const user = this.users.get(id);
     if (user) user.passwordHash = passwordHash;
+  }
+
+  async listUsers(): Promise<PersistedUser[]> {
+    return [...this.users.values()]
+      .map(clone)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  }
+
+  async updateUserRole(id: string, role: OperatorRole): Promise<void> {
+    const user = this.users.get(id);
+    if (user) user.role = role;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    this.users.delete(id);
+    await this.deleteSessionsForUser(id);
+  }
+
+  async countAdmins(): Promise<number> {
+    let n = 0;
+    for (const user of this.users.values()) if (user.role === "admin") n += 1;
+    return n;
   }
 
   async createSession(session: PersistedSession): Promise<void> {

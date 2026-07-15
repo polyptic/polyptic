@@ -290,17 +290,20 @@ fastify.log.info(
     : "player channel OPEN (AUTH_ENABLED=false) — hellos are not token-checked",
 );
 
-// THE GATE: require a valid session on every /api/v1/** route except the public auth endpoints. The
-// device channels (/agent, /player), health/metrics and the WS upgrades are NOT /api/v1 and untouched.
+// THE GATE: require a valid session on every /api/v1/** route except the public auth endpoints, AND
+// (POL-107) a role that satisfies that route's policy — deny by default, so an unlisted route is
+// admin-only. The device channels (/agent, /player), health/metrics and the WS upgrades are NOT
+// /api/v1 and untouched (the /admin + DevTools upgrades run their own role check in ws.ts).
 fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyReply) => {
   if (!auth.enabled) return;
   // Collapse duplicate slashes the SAME way find-my-way does under ignoreDuplicateSlashes (above),
   // or the gate desyncs from the router: `//api/v1/x` would route to the real handler while this
   // raw-url check saw a leading `//`, failed startsWith, and skipped requireAuth entirely (bypass).
+  // The SAME collapsed path is what the role policy matches against, for the same reason.
   const path = (request.url.split("?")[0] ?? request.url).replace(/\/{2,}/g, "/");
   if (!path.startsWith("/api/v1/")) return;
   if (AUTH_PUBLIC_PATHS.has(path)) return;
-  await auth.requireAuth(request, reply);
+  await auth.requireAuth(request, reply, path);
 });
 
 registerAuthRoutes(fastify, auth, enrollment);

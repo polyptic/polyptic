@@ -10,10 +10,24 @@
  *   GET  /api/v1/settings/enrollment            EnrollmentInfo {mode, token} (auth-gated).
  *   POST /api/v1/settings/enrollment/regenerate new gated token → EnrollmentInfo (auth-gated).
  *
+ *   GET    /api/v1/operators       list the accounts (POL-107; admin-only).
+ *   POST   /api/v1/operators       CreateOperatorBody → 201 {operator}; 409 on a duplicate email.
+ *   PATCH  /api/v1/operators/:id   UpdateOperatorBody → change role and/or reset the password.
+ *   DELETE /api/v1/operators/:id   remove the account + its sessions.
+ *
  * The global gate (registered in index.ts) protects every /api/v1/** route EXCEPT login, logout and
- * me (which authenticate themselves). NEVER log a password or hash.
+ * me (which authenticate themselves), and (POL-107) enforces the per-route ROLE policy in `roles.ts`
+ * — the operator routes above are admin-only by that policy's deny-by-default, not by a check here.
+ * NEVER log a password or hash.
  */
-import { ChangePasswordBody, EnrollmentInfo, LoginBody } from "@polyptic/protocol";
+import {
+  ChangePasswordBody,
+  CreateOperatorBody,
+  EnrollmentInfo,
+  LoginBody,
+  Operator,
+  UpdateOperatorBody,
+} from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
 
 import { SESSION_COOKIE } from "./auth-local";
@@ -66,9 +80,10 @@ export function registerAuthRoutes(
   // GET /api/v1/auth/me  -> {user} or 401 (self-reports; never forced by the gate)
   fastify.get("/api/v1/auth/me", async (request, reply) => {
     // When auth is disabled (tests/dev), mirror open-mode: report a synthetic operator so the console
-    // proceeds without a sign-in. No session is involved.
+    // proceeds without a sign-in. No session is involved — and it reports `admin`, because with the
+    // gate off the server enforces nothing: an open stack must not render a half-disabled console.
     if (!auth.enabled) {
-      return { user: { id: "auth-disabled", email: "operator@polyptic.local" } };
+      return { user: { id: "auth-disabled", email: "operator@polyptic.local", role: "admin" } };
     }
     const user = await auth.verifyRequest(request);
     if (!user) return reply.code(401).send({ error: "unauthorized" });
@@ -97,6 +112,72 @@ export function registerAuthRoutes(
     const token = await auth.issueSession(current.id);
     reply.setCookie(SESSION_COOKIE, token, auth.cookieOptions());
     fastify.log.info({ event: "auth.password.changed", userId: current.id }, "operator changed password");
+    return { ok: true };
+  });
+
+  // ── Operator accounts (POL-107). ADMIN-ONLY — enforced by the gate's role policy (these paths are
+  // absent from ROUTE_POLICY, so they fall through to its deny-by-default `admin`), NOT by anything
+  // here. The handlers below may therefore assume the caller is an admin. ──
+
+  // GET /api/v1/operators -> Operator[] (never a hash)
+  fastify.get("/api/v1/operators", async () => {
+    const operators = await auth.listOperators();
+    return { operators: operators.map((o) => Operator.parse(o)) };
+  });
+
+  // POST /api/v1/operators { email, password(min8), role }
+  fastify.post("/api/v1/operators", async (request, reply) => {
+    const body = CreateOperatorBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const created = await auth.createOperator(body.data.email, body.data.password, body.data.role);
+    if (created === "duplicate") {
+      return reply.code(409).send({ error: "an operator with that email already exists" });
+    }
+    // Log the id + role; NEVER the password.
+    fastify.log.info(
+      { event: "auth.operator.created", userId: created.id, role: created.role },
+      "operator account created",
+    );
+    return reply.code(201).send({ operator: Operator.parse(created) });
+  });
+
+  // PATCH /api/v1/operators/:id { role?, password? } — change role and/or reset the password
+  fastify.patch<{ Params: { id: string } }>("/api/v1/operators/:id", async (request, reply) => {
+    const body = UpdateOperatorBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const target = request.params.id;
+    // An admin demoting ITSELF would 403 on its very next call — refuse rather than strand the console.
+    if (body.data.role && body.data.role !== "admin" && request.authUser?.id === target) {
+      return reply.code(409).send({ error: "you cannot change your own role" });
+    }
+    const updated = await auth.updateOperator(target, body.data);
+    if (updated === "not-found") return reply.code(404).send({ error: "no such operator" });
+    if (updated === "last-admin") {
+      return reply.code(409).send({ error: "the last admin cannot be demoted" });
+    }
+    fastify.log.info(
+      { event: "auth.operator.updated", userId: updated.id, role: updated.role, passwordReset: Boolean(body.data.password) },
+      "operator account updated",
+    );
+    return { operator: Operator.parse(updated) };
+  });
+
+  // DELETE /api/v1/operators/:id
+  fastify.delete<{ Params: { id: string } }>("/api/v1/operators/:id", async (request, reply) => {
+    const target = request.params.id;
+    if (request.authUser?.id === target) {
+      return reply.code(409).send({ error: "you cannot delete your own account" });
+    }
+    const result = await auth.deleteOperator(target);
+    if (result === "not-found") return reply.code(404).send({ error: "no such operator" });
+    if (result === "last-admin") {
+      return reply.code(409).send({ error: "the last admin cannot be removed" });
+    }
+    fastify.log.info({ event: "auth.operator.deleted", userId: target }, "operator account deleted");
     return { ok: true };
   });
 

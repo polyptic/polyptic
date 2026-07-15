@@ -44,7 +44,7 @@ import {
   ServerToPlayerSettings,
   parseMessage,
 } from "@polyptic/protocol";
-import type { MtlsBundle } from "@polyptic/protocol";
+import type { MtlsBundle, OperatorRole, ServerToAdminShellMessage } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
 import type { Server } from "node:http";
 import type { Server as HttpsServer } from "node:https";
@@ -185,8 +185,13 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
       }
       // Operator channel — gate on a valid signed session cookie (Phase 3f). When auth is disabled the
       // check is skipped (mirrors the REST gate). Reject the upgrade outright if there is no session.
+      //
+      // POL-107: the socket carries the operator's ROLE from here on. EVERY role may open it (it is how
+      // a viewer receives state at all — read access), but the frames that DO something (the POL-59
+      // remote shell) are re-checked against that role in `handleAdmin`. With auth disabled there is no
+      // session and nothing is enforced anywhere, so the socket runs as `admin` — same as /auth/me.
       if (!auth.enabled) {
-        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, req));
+        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, "admin"));
         return;
       }
       void auth
@@ -198,7 +203,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
-          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, req));
+          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, user.role));
         })
         .catch((err) => {
           log.warn({ event: "admin.ws.error", err: String(err) }, "error gating /admin upgrade");
@@ -240,6 +245,18 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
+          // POL-107 — a live remote debugger inside a wall's browser is an ADMIN capability, and the
+          // CDP socket is a second door to it: the REST `/screens/:id/devtools*` routes are admin-only
+          // by the gate's deny-by-default, and this upgrade must match them or the door is unlocked.
+          if (user.role !== "admin") {
+            log.warn(
+              { event: "devtools.ws.forbidden", userId: user.id, role: user.role },
+              "rejected devtools upgrade — role is not admin",
+            );
+            socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+            socket.destroy();
+            return;
+          }
           admit();
         })
         .catch((err) => {
@@ -277,8 +294,8 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   playerWss.on("connection", (ws: WebSocket) =>
     handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, log),
   );
-  adminWss.on("connection", (ws: WebSocket) =>
-    handleAdmin(ws, adminHub, broadcaster, control, shellRelay, log),
+  adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
+    handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, log),
   );
 
   return shellRelay;
@@ -899,6 +916,8 @@ function handlePlayer(
 
 function handleAdmin(
   ws: WebSocket,
+  /** The role of the operator who opened this socket (POL-107) — fixed for its lifetime. */
+  role: OperatorRole,
   adminHub: AdminHub,
   broadcaster: AdminBroadcaster,
   control: ControlPlane,
@@ -906,7 +925,7 @@ function handleAdmin(
   log: FastifyBaseLogger,
 ): void {
   adminHub.add(ws);
-  log.info({ event: "admin.connected", admins: adminHub.count() }, "admin socket opened");
+  log.info({ event: "admin.connected", role, admins: adminHub.count() }, "admin socket opened");
 
   // On connect: push the current registry snapshot straight away.
   if (ws.readyState === WebSocket.OPEN) {
@@ -928,7 +947,33 @@ function handleAdmin(
         ws.send(JSON.stringify(broadcaster.snapshot()));
       }
       log.info({ event: "admin.hello" }, "admin registered");
-    } else if (msg.t === "admin/shell-open") {
+      return;
+    }
+
+    // POL-107 — every remaining frame is a SHELL frame: a root PTY on a wall box. That is the single
+    // most powerful thing this socket can do, so it is ADMIN-only, enforced here rather than in the
+    // console. A non-admin that forges the frame is told the session was refused (the same shape the
+    // relay uses when a box isn't armed) and nothing is relayed to the machine.
+    if (role !== "admin") {
+      log.warn(
+        { event: "admin.shell.forbidden", role, frame: msg.t },
+        "refused a shell frame — role is not admin",
+      );
+      if (msg.t === "admin/shell-open" && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            t: "server/shell-opened",
+            machineId: msg.machineId,
+            sessionId: "refused",
+            ok: false,
+            reason: "your role may not open a console on a machine",
+          } satisfies ServerToAdminShellMessage),
+        );
+      }
+      return;
+    }
+
+    if (msg.t === "admin/shell-open") {
       // POL-59: the operator opened a terminal on a box. The relay enforces armed + approved + online.
       shellRelay.openFromAdmin(ws, msg.machineId, msg.cols, msg.rows);
     } else if (msg.t === "admin/shell-data") {

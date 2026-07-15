@@ -1736,9 +1736,66 @@ export const LoginBody = z.object({
 });
 export type LoginBody = z.infer<typeof LoginBody>;
 
-/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). */
-export const AuthUser = z.object({ id: z.string(), email: z.string().email() });
+/**
+ * What an operator account is ALLOWED to do (POL-107). Three roles, ordered — each one strictly
+ * contains the one below it:
+ *
+ *   - `viewer`   — read the whole registry, and INVOKE a saved scene (`POST /scenes/:id/apply`).
+ *                  The "staff invoke" half of the author/invoke split: a receptionist can recall a
+ *                  layout the wall's owner authored, and can change nothing else.
+ *   - `operator` — everything a viewer can do, plus the CONTENT + LAYOUT verbs: the content library,
+ *                  murals/placements/walls, per-screen + per-wall content and zoom, scenes CRUD,
+ *                  ident, capture, casting, screen renames.
+ *   - `admin`    — everything, plus the FLEET + SECRETS verbs: machines (approve/reject/reboot/remove),
+ *                  the remote shell and the DevTools tunnel, every `/settings/**` route (enrolment
+ *                  token, image builds, display settings, HTTPS, credential profiles) and operator
+ *                  management itself.
+ *
+ * The ordering is the whole contract: a role may do anything its rank allows, and the SERVER decides
+ * (a console that hides a button is a nicety, not a permission system).
+ */
+export const OperatorRole = z.enum(["admin", "operator", "viewer"]);
+export type OperatorRole = z.infer<typeof OperatorRole>;
+
+/** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). `role` is what
+ *  the console keys its affordances off; the server enforces the same role on every route. Defaulted
+ *  to `admin` so a pre-POL-107 payload (or an upgraded single-admin deployment) parses as the admin it
+ *  effectively was — never as a lockout. */
+export const AuthUser = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  role: OperatorRole.default("admin"),
+});
 export type AuthUser = z.infer<typeof AuthUser>;
+
+/** An operator account as listed in Settings ▸ Operators (admin-only). Never carries a hash. */
+export const Operator = z.object({
+  id: z.string(),
+  email: z.string().email(),
+  role: OperatorRole,
+  createdAt: z.string(),
+});
+export type Operator = z.infer<typeof Operator>;
+
+/** Create an operator account (admin-only). The password is min-8, same as a self-service change. */
+export const CreateOperatorBody = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(200),
+  role: OperatorRole,
+});
+export type CreateOperatorBody = z.infer<typeof CreateOperatorBody>;
+
+/** Update an operator (admin-only): change the role and/or reset the password. At least one of the
+ *  two must be present — an empty patch is a client bug, not a no-op. */
+export const UpdateOperatorBody = z
+  .object({
+    role: OperatorRole.optional(),
+    password: z.string().min(8).max(200).optional(),
+  })
+  .refine((b) => b.role !== undefined || b.password !== undefined, {
+    message: "provide role and/or password",
+  });
+export type UpdateOperatorBody = z.infer<typeof UpdateOperatorBody>;
 
 /** Change the current operator's password. */
 export const ChangePasswordBody = z.object({

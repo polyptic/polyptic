@@ -18,6 +18,7 @@ import type {
   DisplayBackend,
   EnrollmentStatus,
   Geometry,
+  OperatorRole,
   Output,
   PlaylistItem,
   Scene,
@@ -201,6 +202,12 @@ export interface PersistedUser {
   passwordHash: string;
   /** ISO-8601 creation timestamp. */
   createdAt: string;
+  /**
+   * POL-107 — what this account may do (`admin` | `operator` | `viewer`). A row written before
+   * POL-107 has no role column value; the Postgres migration back-fills `admin` (that single account
+   * WAS the admin) and every read normalizes an unknown/absent value to `admin` for the same reason.
+   */
+  role: OperatorRole;
 }
 
 /**
@@ -440,10 +447,18 @@ export interface Store {
   getUserById(id: string): Promise<PersistedUser | undefined>;
   /** How many users exist — drives "seed an admin on first boot if none exist". */
   countUsers(): Promise<number>;
-  /** Insert a new user row (id + email + argon2id hash + created_at). */
+  /** Insert a new user row (id + email + argon2id hash + created_at + role). */
   createUser(user: PersistedUser): Promise<void>;
   /** Replace a user's password hash (after verifying the current password). No-op if absent. */
   updateUserPassword(id: string, passwordHash: string): Promise<void>;
+  /** Every operator account, oldest first (POL-107 — Settings ▸ Operators). Hashes stay in the row. */
+  listUsers(): Promise<PersistedUser[]>;
+  /** Change an account's role (POL-107). No-op if absent. */
+  updateUserRole(id: string, role: OperatorRole): Promise<void>;
+  /** Delete an account and every session it holds (POL-107). No-op if absent. */
+  deleteUser(id: string): Promise<void>;
+  /** How many accounts hold `admin` — the last-admin guard reads this before a demote/delete. */
+  countAdmins(): Promise<number>;
 
   /** Insert a session row (its id is sha256(token); the raw token only ever lives in the cookie). */
   createSession(session: PersistedSession): Promise<void>;

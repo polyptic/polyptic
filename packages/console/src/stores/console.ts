@@ -27,6 +27,7 @@ import type {
   MachineView,
   Mural,
   NetbootInfo,
+  OperatorRole,
   Placement,
   Scene,
   ScreenView,
@@ -201,6 +202,26 @@ export const useConsoleStore = defineStore("console", {
     /** The signed-in operator's email, or "" when not signed in. */
     currentEmail(state): string {
       return state.currentUser?.email ?? "";
+    },
+
+    // ── Roles (POL-107) ─────────────────────────────────────────────────────────
+    // These drive which affordances the console DRAWS. They are a courtesy, not a permission system:
+    // every one of them mirrors a policy the SERVER enforces on the route (and 403s on), so a hand-
+    // crafted fetch from a viewer's console gains nothing. Signed out ⇒ the most restrictive answer.
+
+    /** The signed-in operator's role (`viewer` until we know better — never assume power). */
+    role(state): OperatorRole {
+      return state.currentUser?.role ?? "viewer";
+    },
+
+    /** Machines, enrolment, image builds, settings, credential profiles, the shell, DevTools. */
+    isAdmin(state): boolean {
+      return state.currentUser?.role === "admin";
+    },
+
+    /** Content + layout mutations (an admin is also an operator). */
+    canAuthor(state): boolean {
+      return state.currentUser?.role === "admin" || state.currentUser?.role === "operator";
     },
 
     /** Two-letter avatar initials derived from the operator's email (e.g. "operator@…" → "OP"). */
