@@ -28,6 +28,9 @@ import { fileURLToPath } from "node:url";
 
 import type { FastifyBaseLogger } from "fastify";
 
+import { parseSelector, resolveRolloutImage } from "@polyptic/protocol";
+import type { ImageRing } from "@polyptic/protocol";
+
 import type { PersistedImageRollout, Store } from "./store/types";
 
 /** The hook runs from the REPO ROOT (…/packages/server/src → repo), so `deploy/…` paths in
@@ -42,6 +45,8 @@ type Arch = (typeof ARCHES)[number];
 export const IMAGE_ROLLOUT_DEFAULTS: PersistedImageRollout = {
   scheduleEnabled: true,
   scheduleTime: "01:00",
+  // POL-105 — no rings: one image for the whole fleet, exactly the pre-POL-105 behaviour.
+  rings: [],
   // Weekly FULL rebuild (POL-43): Sundays 02:00 by default — an hour after the daily refresh slot
   // so a both-scheduled Sunday cannot contend (the refresh finishes in ~2 min).
   fullScheduleEnabled: true,
@@ -367,6 +372,132 @@ export class ImageUpdates {
     );
     await this.prune(arch);
     return this.builds(arch);
+  }
+
+  // ── Staged roll-outs (POL-105) ───────────────────────────────────────────────────────────────
+  //
+  // A RING pins one build for the machines a POL-103 selector matches. `manifest.json?machineId=…`
+  // is resolved per machine: first matching ring wins, everyone else gets the arch's ACTIVE build —
+  // so a ring can only ever narrow who deviates from the fleet, never widen it, and a box the depot
+  // has never heard of (or one that predates the query param) gets exactly today's answer.
+  //
+  // RETENTION (D54) IS DELIBERATELY LEFT ALONE. Pin-aware retention — "never prune a build some ring
+  // still wants" — was rejected once already (D105) and is not re-litigated here: it means a forgotten
+  // ring can stop the depot pruning forever. Instead: a ring must name a RETAINED build when it is
+  // set (you cannot pin a build the depot cannot serve), and if retention later prunes that build out
+  // from under a long-lived ring, the resolver degrades that ring's machines back onto the ACTIVE
+  // build and says so out loud. In practice a canary pins the NEWEST build, which prune keeps by
+  // definition, and the fleet's active build is never pruned — so the interaction only bites a ring
+  // left pinned to an ageing build across `retainBuilds` rebuilds, which is a stale canary anyway.
+
+  /** The operator's roll-out rings, in order. */
+  async rings(): Promise<ImageRing[]> {
+    return (await this.state()).rings ?? [];
+  }
+
+  /**
+   * Replace the whole ring list. Every ring is validated: its selector must parse (POL-103's grammar)
+   * and its build must be RETAINED for its arch — a ring naming a build the depot cannot serve would
+   * point a box at a 404 on its next boot. Throws with a plain sentence on the first bad ring.
+   */
+  async setRings(rings: ImageRing[]): Promise<PersistedImageRollout> {
+    const seen = new Set<string>();
+    for (const ring of rings) {
+      const parsed = parseSelector(ring.selector);
+      if (!parsed.ok) throw new Error(`ring "${ring.selector}": ${parsed.error}`);
+      const key = `${ring.arch} ${parsed.selector.tags.join(",")}`;
+      if (seen.has(key)) {
+        throw new Error(`two rings target ${ring.selector} on ${ring.arch} — a machine must have one answer`);
+      }
+      seen.add(key);
+      const retained = await this.builds(ring.arch);
+      if (!retained.some((b) => b.imageId === ring.imageId)) {
+        throw new Error(`no retained ${ring.arch} build ${ring.imageId} — pin a build the depot still has`);
+      }
+    }
+
+    const next: PersistedImageRollout = { ...(await this.state()), rings };
+    await this.store.setImageRollout(next);
+    this.log.info(
+      { event: "image.rings.set", rings: rings.map((r) => `${r.selector}→${r.arch}:${r.imageId}`) },
+      "image roll-out rings updated",
+    );
+    return next;
+  }
+
+  /**
+   * Resolve the manifest ONE machine should see, given its tags. Falls back to the arch's active
+   * build when no ring matches — and also when a matching ring's build has been pruned, which is
+   * announced once per (ring, build) so a canary that has silently rejoined the fleet is not silent.
+   * Null when the arch has no published image at all.
+   */
+  async resolveFor(arch: string, tags: readonly string[]): Promise<(ArchManifest & { urgent: boolean }) | null> {
+    const active = await this.manifest(arch);
+    if (!active) return null;
+    const st = await this.state();
+    const retained = new Set((await this.builds(arch)).map((b) => b.imageId));
+    const resolved = resolveRolloutImage(st.rings ?? [], arch, tags, active.imageId, st.urgent, retained);
+
+    if (resolved.strandedRing) this.warnStranded(resolved.strandedRing, active.imageId);
+    if (resolved.imageId === active.imageId) return { ...active, urgent: resolved.urgent };
+
+    // A ring's build: its own identity + checksum, read from its retained build directory. The box
+    // then re-pins its medium at `builds/<that id>/` exactly as it does for the fleet build.
+    const build = (await this.builds(arch)).find((b) => b.imageId === resolved.imageId);
+    if (!build) return { ...active, urgent: st.urgent }; // raced with a prune — the fleet build is always safe
+    return {
+      arch: build.arch,
+      imageId: build.imageId,
+      builtAt: build.builtAt,
+      sha256: build.sha256,
+      urgent: resolved.urgent,
+    };
+  }
+
+  /** One line per stranded (ring, active) pair — the resolver runs every 5 minutes per box. */
+  private readonly strandedWarned = new Set<string>();
+  private warnStranded(ring: ImageRing, activeImageId: string): void {
+    const key = `${ring.arch} ${ring.selector} ${ring.imageId}`;
+    if (this.strandedWarned.has(key)) return;
+    this.strandedWarned.add(key);
+    this.log.warn(
+      { event: "image.ring.stranded", selector: ring.selector, arch: ring.arch, imageId: ring.imageId },
+      "a roll-out ring pins a build the depot has pruned — its machines follow the fleet build",
+    );
+    this.announce(
+      "warn",
+      `Roll-out ring ${ring.selector} pinned ${ring.arch} build ${ring.imageId}, which has been pruned — those machines now follow the fleet build ${activeImageId}`,
+    );
+  }
+
+  /**
+   * PROMOTE a ring to the whole fleet: activate its build for that arch (the D54 relink → every box
+   * on another image reboots into it) and DROP the ring, so the canary machines and everyone else
+   * converge on one id. One action, one activity line. `urgent` sets the FLEET switch, because after
+   * a promotion the ring's own urgency no longer targets anybody. Throws when no such ring exists.
+   */
+  async promote(arch: string, selector: string, urgent: boolean): Promise<PersistedImageRollout> {
+    const st = await this.state();
+    const rings = st.rings ?? [];
+    const ring = rings.find((r) => r.arch === arch && r.selector === selector);
+    if (!ring) throw new Error(`no roll-out ring ${selector} for ${arch}`);
+
+    await this.activate(arch, ring.imageId);
+    const next: PersistedImageRollout = {
+      ...(await this.state()),
+      urgent,
+      rings: rings.filter((r) => r !== ring),
+    };
+    await this.store.setImageRollout(next);
+    this.log.info(
+      { event: "image.ring.promoted", arch, selector, imageId: ring.imageId, urgent },
+      "promoted a roll-out ring's build to the whole fleet",
+    );
+    this.announce(
+      "good",
+      `Promoted ${arch} build ${ring.imageId} from ${selector} to the whole fleet${urgent ? " — boxes reboot within minutes" : " — boxes roll in the nightly window"}`,
+    );
+    return next;
   }
 
   /** Adopt + prune every arch. Best-effort: depot bookkeeping must never fail a serve or a build. */

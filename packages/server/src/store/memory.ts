@@ -12,7 +12,11 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedDaypart,
   PersistedDisplaySettings,
+  PersistedPanelPower,
+  PersistedSchedule,
+  PersistedSchedulerSettings,
   PersistedImageRollout,
   PersistedEnrollmentToken,
   PersistedMachine,
@@ -56,6 +60,12 @@ export class MemoryStore implements Store {
   private readonly contentSources = new Map<string, PersistedContentSource>();
   /** Keyed by scene id — saved wall snapshots (Phase 3d). */
   private readonly scenes = new Map<string, PersistedScene>();
+  /** Keyed by daypart id — the named windows of the day (POL-89). */
+  private readonly dayparts = new Map<string, PersistedDaypart>();
+  /** Keyed by schedule id — scene ⇄ daypart bindings (POL-89). */
+  private readonly schedules = new Map<string, PersistedSchedule>();
+  /** Deployment-wide scheduler settings (POL-89), undefined until first changed. */
+  private schedulerSettings: PersistedSchedulerSettings | undefined;
   /** Keyed by profile id — credential profiles for content auth (POL-24). */
   private readonly credentialProfiles = new Map<string, PersistedCredentialProfile>();
   /** Keyed by `<targetId>\0<sourceKey>` — remembered page zoom per pair (POL-57). */
@@ -97,6 +107,8 @@ export class MemoryStore implements Store {
       videoWalls: [...this.videoWalls.values()].map(clone),
       contentSources: [...this.contentSources.values()].map(clone),
       scenes: [...this.scenes.values()].map(clone),
+      dayparts: [...this.dayparts.values()].map(clone),
+      schedules: [...this.schedules.values()].map(clone),
       credentialProfiles: [...this.credentialProfiles.values()].map(clone),
       zoomPreferences: [...this.zoomPreferences.values()].map(clone),
       audioPreferences: [...this.audioPreferences.values()].map(clone),
@@ -117,6 +129,19 @@ export class MemoryStore implements Store {
     if (machine) {
       machine.shellEnabled = enabled;
       machine.shellArmedAt = armedAt ?? undefined;
+    }
+  }
+
+  async setMachineTags(id: string, tags: string[]): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) machine.tags = [...tags];
+  }
+
+  async setMachineImage(id: string, imageId: string, at: string): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) {
+      machine.imageId = imageId;
+      machine.imageIdAt = at;
     }
   }
 
@@ -297,6 +322,40 @@ export class MemoryStore implements Store {
     return [...this.scenes.values()].map(clone);
   }
 
+  // ── Scene scheduler (POL-89) ────────────────────────────────────────────────
+
+  async upsertDaypart(daypart: PersistedDaypart): Promise<void> {
+    this.dayparts.set(daypart.id, clone(daypart));
+  }
+
+  async deleteDaypart(id: string): Promise<void> {
+    this.dayparts.delete(id);
+  }
+
+  async listDayparts(): Promise<PersistedDaypart[]> {
+    return [...this.dayparts.values()].map(clone);
+  }
+
+  async upsertSchedule(schedule: PersistedSchedule): Promise<void> {
+    this.schedules.set(schedule.id, clone(schedule));
+  }
+
+  async deleteSchedule(id: string): Promise<void> {
+    this.schedules.delete(id);
+  }
+
+  async listSchedules(): Promise<PersistedSchedule[]> {
+    return [...this.schedules.values()].map(clone);
+  }
+
+  async getSchedulerSettings(): Promise<PersistedSchedulerSettings | undefined> {
+    return this.schedulerSettings ? clone(this.schedulerSettings) : undefined;
+  }
+
+  async setSchedulerSettings(settings: PersistedSchedulerSettings): Promise<void> {
+    this.schedulerSettings = clone(settings);
+  }
+
   // ── Local operator accounts + sessions (Phase 3f) ────────────────────────────
 
   async getUserByEmail(email: string): Promise<PersistedUser | undefined> {
@@ -470,6 +529,18 @@ export class MemoryStore implements Store {
 
   async setDisplaySettings(settings: PersistedDisplaySettings): Promise<void> {
     this.displaySettings = clone(settings);
+  }
+
+  // ── Panel power (POL-101) ────────────────────────────────────────────────────
+
+  private panelPower: PersistedPanelPower | undefined;
+
+  async getPanelPower(): Promise<PersistedPanelPower | undefined> {
+    return this.panelPower ? clone(this.panelPower) : undefined;
+  }
+
+  async setPanelPower(power: PersistedPanelPower): Promise<void> {
+    this.panelPower = clone(power);
   }
 
   async close(): Promise<void> {

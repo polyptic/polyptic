@@ -27,6 +27,8 @@ function fakeBackend(
     },
     async showScreen(): Promise<void> {},
     async hideScreen(): Promise<void> {},
+    async showWindow(): Promise<void> {},
+    async hideWindow(): Promise<void> {},
     async ident(): Promise<void> {},
     async capture(): Promise<Buffer | null> {
       return null;

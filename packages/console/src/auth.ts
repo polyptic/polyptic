@@ -22,6 +22,8 @@ import {
   LoginBody,
   ImageUpdateInfo,
   NetbootInfo,
+  PromoteImageRingBody,
+  SetImageRingsBody,
   RotateEnrollmentTokenBody,
   Operator,
   UpdateImageSettingsBody,
@@ -32,6 +34,7 @@ import type {
   CreateEnrollmentTokenBody as CreateEnrollmentTokenBodyT,
   CreateOperatorBody as CreateOperatorBodyT,
   DisplaySettings as DisplaySettingsT,
+  ImageRing,
   LoginBody as LoginBodyT,
   UpdateOperatorBody as UpdateOperatorBodyT,
 } from "@polyptic/protocol";
@@ -262,6 +265,26 @@ export async function rebuildImageNow(kind: "refresh" | "full" = "refresh"): Pro
  *  different image reboot into it per the roll-out policy, so an older build is a rollback. */
 export async function activateImage(arch: "arm64" | "amd64", imageId: string): Promise<ImageUpdateInfo> {
   const raw = await send<unknown>("POST", `${BASE_SETTINGS}/image/activate`, { arch, imageId });
+  return ImageUpdateInfo.parse(raw);
+}
+
+/** PUT /api/v1/settings/image/rings → replace the whole staged-rollout ring list (POL-105). The
+ *  server rejects a ring whose selector does not parse or whose build the depot no longer retains. */
+export async function setImageRings(rings: ImageRing[]): Promise<ImageUpdateInfo> {
+  const body = SetImageRingsBody.parse({ rings });
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/image/rings`, body);
+  return ImageUpdateInfo.parse(raw);
+}
+
+/** POST /api/v1/settings/image/promote → activate a ring's build fleet-wide AND drop the ring, so
+ *  the canary machines and the rest of the fleet converge on one build (POL-105). */
+export async function promoteImageRing(
+  arch: "arm64" | "amd64",
+  selector: string,
+  urgent: boolean,
+): Promise<ImageUpdateInfo> {
+  const body = PromoteImageRingBody.parse({ arch, selector, urgent });
+  const raw = await send<unknown>("POST", `${BASE_SETTINGS}/image/promote`, body);
   return ImageUpdateInfo.parse(raw);
 }
 

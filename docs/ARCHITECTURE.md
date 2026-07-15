@@ -69,6 +69,9 @@ POST   /api/v1/screens/:id (rename, remap)
 POST   /api/v1/machines/:id/reboot {reason?} # power-cycle one box (409 offline / not approved)
 POST   /api/v1/scenes                        # create immutable versioned scene
 POST   /api/v1/fleet:activate-scene {sceneId}
+GET/POST/PATCH/DELETE /api/v1/dayparts       # named windows of the day (POL-89; DELETE 409s while in use)
+GET/POST/PATCH/DELETE /api/v1/schedules      # scene ⇄ daypart, recurrence + priority
+GET/PUT /api/v1/settings/scheduler           # master switch · THE deployment timezone · default scene
 GET    /api/v1/screens/:id/preview            # latest grim thumbnail
 POST   /api/v1/screens/:id/inspect {on}       # chrome: arm the remote-DevTools tunnel · surf: pop the on-panel inspector
 GET    /api/v1/screens/:id/devtools[/**]      # remote DevTools entry + proxied frontend/CDP (POL-67; armed screens only)
