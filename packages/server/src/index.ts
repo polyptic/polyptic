@@ -671,6 +671,9 @@ registerProvisionRoutes(
       "Netboot depot artifacts served (kernel, initrd, root image, …).",
       { arch, file },
     ),
+  // POL-115 — what a box may do about its own UEFI boot order when the firmware displaces our entry.
+  // Report-only unless an operator opted in, so the fleet's default is "never write firmware NVRAM".
+  () => control.getBootOrderPolicy(),
   // POL-105 — the depot's manifest route resolves PER MACHINE: a box appends `?machineId=…`, and its
   // tags decide which roll-out ring (if any) it matches. The registry is the only place tags live.
   (machineId) => control.machineTags(machineId),

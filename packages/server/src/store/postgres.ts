@@ -39,6 +39,7 @@ import type {
   PersistedContent,
   PersistedContentSource,
   PersistedCredentialProfile,
+  PersistedBootOrderPolicy,
   PersistedDaypart,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
@@ -276,6 +277,10 @@ interface BootstrapRow {
 
 interface DisplaySettingsRow {
   show_badges: boolean;
+}
+
+interface BootOrderPolicyRow {
+  reassert: boolean;
 }
 
 /** POL-101 — panel power: the deployment timezone + a jsonb map of screenId → daily window. */
@@ -668,6 +673,15 @@ export class PostgresStore implements Store {
       CREATE TABLE IF NOT EXISTS display_settings (
         id          int PRIMARY KEY DEFAULT 1,
         show_badges boolean NOT NULL
+      )
+    `;
+    // UEFI boot-order policy (POL-115): a single row holding the one boolean that decides whether a
+    // box may re-assert its own UEFI boot entry. No row = report-only, which is also what the control
+    // plane falls back to, so an un-migrated / un-flipped fleet never writes firmware NVRAM.
+    await sql`
+      CREATE TABLE IF NOT EXISTS boot_order_policy (
+        id       int PRIMARY KEY DEFAULT 1,
+        reassert boolean NOT NULL
       )
     `;
     // Panel power (POL-101): a single row — the deployment's timezone plus every screen's daily
@@ -1866,6 +1880,24 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO display_settings (id, show_badges) VALUES (1, ${settings.showBadges})
       ON CONFLICT (id) DO UPDATE SET show_badges = EXCLUDED.show_badges
+    `;
+  }
+
+  async getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined> {
+    const sql = this.sql;
+    const rows = await sql<BootOrderPolicyRow[]>`
+      SELECT reassert FROM boot_order_policy WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return { reassert: row.reassert };
+  }
+
+  async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO boot_order_policy (id, reassert) VALUES (1, ${policy.reassert})
+      ON CONFLICT (id) DO UPDATE SET reassert = EXCLUDED.reassert
     `;
   }
 

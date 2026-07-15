@@ -87,6 +87,7 @@ import {
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateBootOrderPolicyBody,
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
@@ -1485,6 +1486,28 @@ export function registerRestRoutes(
     );
     broadcaster.broadcast();
     return settings;
+  });
+
+  // ── UEFI boot-order policy (POL-115) ──────────────────────────────────────────
+  //
+  // One fleet-wide boolean: may a running box put its own UEFI boot entry back at the head of
+  // BootOrder when the firmware displaces it? Default OFF — a box reports the drift and writes
+  // nothing. Nothing is pushed to boxes here: they read the policy on their own poll (GET
+  // /boot/policy) right before they would act on it, so this route only records the operator's intent.
+
+  // GET /api/v1/settings/boot-order -> BootOrderPolicy { reassert }
+  fastify.get("/api/v1/settings/boot-order", async () => control.getBootOrderPolicy());
+
+  // PUT /api/v1/settings/boot-order  { reassert }  -> BootOrderPolicy
+  fastify.put("/api/v1/settings/boot-order", async (request, reply) => {
+    const body = UpdateBootOrderPolicyBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    const policy = await control.setBootOrderPolicy({ reassert: body.data.reassert });
+    fastify.log.info({ event: "settings.boot-order.set", reassert: policy.reassert }, "boot-order policy updated");
+    broadcaster.broadcast();
+    return policy;
   });
 
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────

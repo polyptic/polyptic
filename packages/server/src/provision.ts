@@ -39,7 +39,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from "@polyptic/protocol";
-import type { BootReportBody as BootReport } from "@polyptic/protocol";
+import type { BootOrderPolicy, BootReportBody as BootReport } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
@@ -378,6 +378,33 @@ export function bootReportLine(report: BootReport): { severity: "good" | "warn" 
       }`,
     };
   }
+  // POL-115: boot-order drift. These are NOT install outcomes — they come from a box that is up and
+  // running, watching its own boot path, so they get their own sentences. The wording is the point:
+  // an operator who reads "will boot something else next time" knows a truck roll is coming and can
+  // stop it; "could not install the Polyptic bootloader (boot-order-drift)" would have told them
+  // nothing true.
+  if (report.code === "boot-order-drift") {
+    return {
+      severity: "warn",
+      text: `${who} found its UEFI boot order changed and would boot something else next time${
+        detail ? `: ${detail}` : ""
+      }. Nothing was written — turn on Settings ▸ Boot order ▸ "Re-assert" to let boxes fix this themselves`,
+    };
+  }
+  if (report.code === "boot-order-reasserted") {
+    return {
+      severity: "good",
+      text: `${who} put itself back at the head of its UEFI boot order${detail ? `: ${detail}` : ""}`,
+    };
+  }
+  if (report.code === "boot-order-reassert-failed") {
+    return {
+      severity: "bad",
+      text: `${who} could not put itself back at the head of its UEFI boot order — its firmware keeps winning${
+        detail ? `: ${detail}` : ""
+      }. The boot order is unchanged; fix it in firmware setup`,
+    };
+  }
   const severity = report.code === "ambiguous-esp" || report.code === "not-uefi" ? "warn" : "bad";
   return {
     severity,
@@ -637,6 +664,8 @@ export function registerProvisionRoutes(
   onBootReport?: ActivitySink,
   /** POL-92 — called for every depot artifact actually served, for the `/metrics` fetch counter. */
   onDepotFetch?: (arch: string, file: string) => void,
+  /** POL-115 — the fleet's UEFI boot-order policy, served to booted boxes at `GET /boot/policy`. */
+  bootOrderPolicy?: () => BootOrderPolicy | Promise<BootOrderPolicy>,
   /** POL-105 — the tags a machine carries, for the per-machine manifest. Absent (or an unknown
    *  machineId) → no tags → no ring can match → the box follows the fleet's active build. */
   machineTags?: (machineId: string) => readonly string[],
@@ -740,6 +769,28 @@ export function registerProvisionRoutes(
   //    can only ever produce ONE bounded activity line: the code is a closed enum, `detail` is capped
   //    at 200 chars by the contract, and the bucket below stops a hostile boot network from flooding
   //    the feed. Nothing here mutates the registry. ──
+  // ── GET /boot/policy — what a running box may do about its own UEFI boot order (POL-115).
+  //    A box polls this before it touches NVRAM. It is a READ, it carries no secret (one boolean the
+  //    operator set in the console), and it is gated exactly like `/boot/report` — the fleet token in
+  //    GATED mode, ungated in OPEN (dev) mode — because the reporter is the same box, on the same boot
+  //    depot, before any agent session exists.
+  //
+  //    FAIL-SAFE BY CONSTRUCTION: a box that cannot reach this endpoint, or gets a 401, falls back to
+  //    report-only and writes nothing. There is no reachable state in which a control plane going away
+  //    makes a box start editing firmware variables. ──
+  fastify.get("/boot/policy", async (request, reply) => {
+    if (!enrollment.open) {
+      const provided = bearerToken(request);
+      const expected = enrollment.currentToken;
+      if (expected === undefined || provided === undefined || !constantTimeEqual(provided, expected)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+    }
+    reply.header("Cache-Control", "no-store");
+    const policy = (await bootOrderPolicy?.()) ?? { reassert: false };
+    return { reassert: policy.reassert };
+  });
+
   const reportBucket = { tokens: REPORT_BURST, refilledAt: Date.now() };
   fastify.post("/boot/report", async (request, reply) => {
     if (!enrollment.open) {

@@ -58,6 +58,7 @@ import type {
   CreateContentSourceBody,
   PlaylistEntry,
   PlaylistItem,
+  BootOrderPolicy,
   CreateCredentialProfileBody,
   CredentialProfileView,
   DesiredState,
@@ -558,6 +559,10 @@ export class ControlPlane {
    *  at the env default; `init()` loads any persisted operator override on top. */
   private displaySettings: DisplaySettings = { showBadges: DEFAULT_SHOW_BADGES };
 
+  /** POL-115 — the fleet's UEFI boot-order policy. Report-only until an operator opts in, so a fleet
+   *  that never touches this setting NEVER writes a firmware boot variable. `init()` loads the override. */
+  private bootOrderPolicy: BootOrderPolicy = { reassert: false };
+
   /** POL-101 — the zone every panel-hours window is read in. Defaults to the SERVER's zone purely so
    *  the console's picker opens somewhere sane; an operator's save makes it explicit and persisted. */
   private panelTimezone: string = defaultTimezone();
@@ -583,7 +588,7 @@ export class ControlPlane {
   private suppressEmit = false;
 
   /** Push a Live Activity line if a log is wired (no-op otherwise). Never throws into a mutation. */
-  private emit(severity: "info" | "good" | "warn" | "bad", text: string): void {
+  private emit(severity: "info" | "good" | "warn" | "bad" | "accent", text: string): void {
     if (this.suppressEmit) return;
     this.activity?.push(severity, text);
   }
@@ -923,6 +928,10 @@ export class ControlPlane {
     // default (so a deployment that never touches the setting follows its NODE_ENV each boot).
     const persistedSettings = await this.store.getDisplaySettings();
     if (persistedSettings) this.displaySettings = { showBadges: persistedSettings.showBadges };
+
+    // POL-115 — absent an operator opt-in, boxes report boot-order drift and write nothing.
+    const persistedBootOrder = await this.store.getBootOrderPolicy();
+    if (persistedBootOrder) this.bootOrderPolicy = { reassert: persistedBootOrder.reassert };
 
     // POL-101 — panel hours. Absent until an operator sets one, in which case every wall runs 24/7,
     // exactly as it did before this feature existed. The default zone is the server's own only as a
@@ -1647,6 +1656,29 @@ export class ControlPlane {
     await this.store.setDisplaySettings({ showBadges: next.showBadges });
     this.emit("info", `On-screen badges ${next.showBadges ? "shown on" : "hidden from"} every screen`);
     return this.getDisplaySettings();
+  }
+
+  /** The fleet's UEFI boot-order policy (POL-115). Served to boxes at `GET /boot/policy`. */
+  getBootOrderPolicy(): BootOrderPolicy {
+    return { ...this.bootOrderPolicy };
+  }
+
+  /**
+   * Set + persist the fleet's UEFI boot-order policy (POL-115). Nothing is pushed anywhere: boxes
+   * READ the policy on their own 5-minute poll, so the control plane never has to reach into a box
+   * to make it edit firmware NVRAM — a box only ever writes its own boot order, on its own schedule,
+   * having just asked whether it may. The flip is loud in the activity feed, both ways.
+   */
+  async setBootOrderPolicy(next: BootOrderPolicy): Promise<BootOrderPolicy> {
+    this.bootOrderPolicy = { reassert: next.reassert };
+    await this.store.setBootOrderPolicy({ reassert: next.reassert });
+    this.emit(
+      "accent",
+      next.reassert
+        ? "Boxes may now put themselves back at the head of their UEFI boot order when firmware displaces them"
+        : "Boxes will now only REPORT UEFI boot-order drift — no boot variable will be written",
+    );
+    return this.getBootOrderPolicy();
   }
 
   /**
