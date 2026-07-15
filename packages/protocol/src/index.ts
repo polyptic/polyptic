@@ -167,6 +167,11 @@ export const PlaylistEntry = z.object({
   /** The library source this entry resolved from — how send-time auth stamping (POL-24) finds the
    *  entry's credential profile. Absent on an entry with nothing to stamp. */
   sourceId: z.string().optional(),
+  /** POL-133 — page zoom for THIS entry while it is on air, meaningful only for the framed kinds
+   *  (web/dashboard; media has no page to zoom). Same D62 model as a directly-assigned page: the
+   *  server remembers the operator's value per (target, entry source) pair and stamps it in at
+   *  resolution time. Default 1 so a pre-POL-133 payload parses to exactly the old behaviour. */
+  zoom: Zoom.default(1),
 });
 export type PlaylistEntry = z.infer<typeof PlaylistEntry>;
 
@@ -218,6 +223,13 @@ export const PageEmbedElement = PageElementBase.extend({
   props: z.object({
     sourceId: z.string().optional(),
     url: z.string().url().optional(),
+    /** POL-133 — page zoom for the framed page, AUTHORED in the Studio as a property of the element
+     *  (not per-screen like D62): a composition must render identically in the Studio preview and on
+     *  every wall showing it (the D74 one-renderer invariant), so anything that changes how the page
+     *  lays out is part of the composition itself. Same browser-zoom semantics as `WebSurface.zoom`
+     *  (the frame is laid out at 1/zoom and scaled back up); default 1 keeps old compositions
+     *  byte-identical. */
+    zoom: Zoom.default(1),
   }),
 });
 
@@ -241,6 +253,10 @@ export const PageFeedElement = PageElementBase.extend({
   props: z.object({
     url: z.string().max(500).default(""),
     items: z.number().int().min(2).max(8).default(4),
+    /** POL-133 — text size as a PERCENT of the feed's height-proportional default (100 = exactly the
+     *  pre-POL-133 sizing, so an old composition parses to an identical render). Scales the masthead,
+     *  headlines and ages together, keeping the card's own proportions. */
+    fontScale: z.number().min(50).max(200).default(100),
   }),
 });
 
@@ -294,12 +310,87 @@ export const PageWeatherElement = PageElementBase.extend({
   }),
 });
 
-/** Static QR code, encoded to SVG client-side in the shared elements package — no network. */
+// ── QR colours + scannability (POL-133) ──────────────────────────────────────
+// A QR that doesn't scan is worse than an ugly one, so the colour pair is validated AT THE CONTRACT
+// EDGE: the module/background contrast a camera needs is part of what makes the stored definition a
+// QR element at all. The helpers live here (not in the elements package) because the zod refine needs
+// them, and the console reuses them for its authoring-time warning.
+
+/** Parse `#rgb` / `#rrggbb` to sRGB relative luminance (0..1), or null for any other colour text.
+ *  Non-hex colours (named colours, gradients) can't be judged, so they're never refused. */
+export function hexLuminance(color: string): number | null {
+  const m = /^#(?:([0-9a-f]{3})|([0-9a-f]{6}))$/i.exec(color.trim());
+  if (!m) return null;
+  const hex = m[1] ? m[1].split("").map((c) => c + c).join("") : m[2]!;
+  const channel = (i: number) => {
+    const v = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16) / 255;
+    return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2);
+}
+
+/** WCAG-style contrast ratio (1..21) between two hex colours, or null when either isn't hex. */
+export function contrastRatio(a: string, b: string): number | null {
+  const la = hexLuminance(a);
+  const lb = hexLuminance(b);
+  if (la === null || lb === null) return null;
+  const [hi, lo] = la >= lb ? [la, lb] : [lb, la];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** The contrast a QR needs to scan reliably. Below this the pair is REFUSED at the contract edge. */
+export const QR_MIN_CONTRAST = 3;
+/** Below this (but ≥ the minimum) the pair is allowed with a loud authoring-time warning. */
+export const QR_SAFE_CONTRAST = 4.5;
+
+/**
+ * Why a QR colour pair is a problem, or null when it's fine. `refuse` fails the schema; `warn` is
+ * for the Studio to shout about (inverted codes and low-but-legal contrast scan on most, not all,
+ * cameras). Non-hex colours return null — unjudgeable, so never refused.
+ */
+export function qrContrastIssue(
+  fg: string,
+  bg: string,
+): { level: "refuse" | "warn"; message: string } | null {
+  const ratio = contrastRatio(fg, bg);
+  if (ratio === null) return null;
+  if (ratio < QR_MIN_CONTRAST) {
+    return {
+      level: "refuse",
+      message: `QR contrast ${ratio.toFixed(1)}:1 is below ${QR_MIN_CONTRAST}:1 — this code will not scan`,
+    };
+  }
+  const lfg = hexLuminance(fg)!;
+  const lbg = hexLuminance(bg)!;
+  if (lfg > lbg) {
+    return { level: "warn", message: "Light modules on a dark background — some cameras refuse inverted QR codes" };
+  }
+  if (ratio < QR_SAFE_CONTRAST) {
+    return {
+      level: "warn",
+      message: `QR contrast ${ratio.toFixed(1)}:1 is marginal — may not scan in poor light`,
+    };
+  }
+  return null;
+}
+
+/** Static QR code, encoded to SVG client-side in the shared elements package — no network.
+ *  POL-133 — module (`fg`) and background (`bg`) colours are authorable; the defaults are exactly
+ *  the pre-POL-133 hardcoded render, so an old composition parses to an identical code. A pair the
+ *  camera provably can't read (hex colours below the minimum contrast) is refused here, at the
+ *  contract edge — an unscannable QR is worse than an ugly one. */
 export const PageQrElement = PageElementBase.extend({
   kind: z.literal("qr"),
-  props: z.object({
-    url: z.string().max(500).default(""),
-  }),
+  props: z
+    .object({
+      url: z.string().max(500).default(""),
+      fg: z.string().max(32).default("#09090b"),
+      bg: z.string().max(32).default("#ffffff"),
+    })
+    .superRefine((p, ctx) => {
+      const issue = qrContrastIssue(p.fg, p.bg);
+      if (issue?.level === "refuse") ctx.addIssue({ code: "custom", message: issue.message });
+    }),
 });
 
 /** Time to a target time-of-day. Updates a text node per minute — no animation (D66). */
@@ -1001,6 +1092,20 @@ export const ScreenView = Screen.extend({
       /** POL-57 — the page zoom currently applied, present only for framed (web/dashboard) content.
        *  Absent for media, which has no zoom, so the console knows when to offer the control. */
       zoom: Zoom.optional(),
+      /** POL-133 — present only for playlist content: the live rotation's steps, in order, each with
+       *  its display name and (for framed steps only) the zoom currently applied on THIS screen. The
+       *  console renders one per-step zoom control from exactly this — the same presence-is-the-
+       *  question pattern as `zoom` above. */
+      entries: z
+        .array(
+          z.object({
+            sourceId: z.string().optional(),
+            name: z.string(),
+            kind: PlaylistEntryKind,
+            zoom: Zoom.optional(),
+          }),
+        )
+        .optional(),
     })
     .nullable()
     .optional(),
@@ -1447,6 +1552,18 @@ export type SetContentBody = z.infer<typeof SetContentBody>;
  *  screen later restores the zoom the operator last dialled in. */
 export const SetZoomBody = z.object({ zoom: Zoom });
 export type SetZoomBody = z.infer<typeof SetZoomBody>;
+
+/** POL-133 — set the page zoom on ONE step of the playlist a screen/wall is showing, identified by
+ *  the step's library source. Same D62 model, same table: the value is remembered against the
+ *  (target, step source) pair, so it survives restarts, scene switches and re-assignment — and the
+ *  same source assigned DIRECTLY to that target shares the dialled-in zoom, which is D62's "zoom
+ *  belongs to the (target, content) pair" taken at its word. */
+export const SetPlaylistEntryZoomBody = z.object({
+  /** The step's library source id (`PlaylistEntry.sourceId`). */
+  sourceId: z.string().min(1),
+  zoom: Zoom,
+});
+export type SetPlaylistEntryZoomBody = z.infer<typeof SetPlaylistEntryZoomBody>;
 
 // REST bodies — content library (Phase 3c; playlists POL-34; pages POL-42)
 export const CreateContentSourceBody = z

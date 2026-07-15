@@ -1123,6 +1123,48 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /**
+     * Zoom one framed step of the playlist a single screen is showing (POL-133). Same shape as
+     * `setScreenZoom`: optimistic patch of the step's read-out so the − / + buttons step from the
+     * value the operator sees; the authoritative value returns on the next `admin/state`.
+     */
+    async setScreenPlaylistZoom(screenId: string, sourceId: string, zoom: number): Promise<void> {
+      this.patchPlaylistEntryZoom([screenId], sourceId, zoom);
+      try {
+        await api.setScreenPlaylistZoom(screenId, sourceId, zoom);
+      } catch (err) {
+        console.error("[console] setScreenPlaylistZoom failed", err);
+      }
+    },
+
+    /** Zoom one framed step of the playlist spanning a combined surface (POL-133). */
+    async setWallPlaylistZoom(wallId: string, sourceId: string, zoom: number): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchPlaylistEntryZoom(wall.memberScreenIds, sourceId, zoom);
+      try {
+        await api.setWallPlaylistZoom(wallId, sourceId, zoom);
+      } catch (err) {
+        console.error("[console] setWallPlaylistZoom failed", err);
+      }
+    },
+
+    /** Optimistically write a step zoom onto the given screens' playlist read-outs. Steps that are
+     *  not zoomable (media — no zoom in the read-out) are left alone, mirroring the server. */
+    patchPlaylistEntryZoom(screenIds: readonly string[], sourceId: string, zoom: number): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content?.entries) continue;
+          screen.content = {
+            ...screen.content,
+            entries: screen.content.entries.map((entry) =>
+              entry.sourceId === sourceId && entry.zoom !== undefined ? { ...entry, zoom } : entry,
+            ),
+          };
+        }
+      }
+    },
+
     // ── Combined surfaces (video walls, Phase 3b) ───────────────────────────────
 
     /** Combine ≥2 placed screens on a mural into one spanning surface. Optimistically shows the

@@ -55,6 +55,7 @@ import {
   ServerToPlayerSettings,
   SetContentBody,
   SetZoomBody,
+  SetPlaylistEntryZoomBody,
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
@@ -1193,6 +1194,97 @@ export function registerRestRoutes(
       zoom: body.data.zoom,
       screens: result.slices.map((s) => s.screenId),
     };
+  });
+
+  // ── Playlist step zoom (POL-133) ─────────────────────────────────────────────
+  //
+  // Zoom ONE framed step of the playlist a screen/wall is showing, identified by the step's library
+  // source. Same D62 model as page zoom — remembered against the (target, step source) pair — and the
+  // same instant path: the push re-stamps the entry inside the SAME playlist surface (same id, same
+  // startedAt), so the rotation keeps its position and a live step rescales without a reload.
+
+  // PUT /api/v1/screens/:screenId/playlist-zoom  { sourceId, zoom }
+  fastify.put("/api/v1/screens/:screenId/playlist-zoom", async (request, reply) => {
+    const params = ScreenParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetPlaylistEntryZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setScreenPlaylistEntryZoom(
+      params.data.screenId,
+      body.data.sourceId,
+      body.data.zoom,
+    );
+    if (!result.ok) {
+      if (result.error === "wall-member") {
+        return reply.code(409).send({
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; zoom the wall's step`,
+          wallId: result.wallId,
+        });
+      }
+      if (result.error === "unknown-screen") {
+        return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
+      }
+      // no-content / not-zoomable / unknown-entry conflict with the screen's current state.
+      return reply.code(409).send({ error: result.error, screenId: params.data.screenId });
+    }
+
+    fastify.log.info(
+      {
+        event: "screen.playlist-zoom",
+        screenId: params.data.screenId,
+        sourceId: body.data.sourceId,
+        zoom: body.data.zoom,
+        revision: control.state.revision,
+      },
+      "playlist step zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast(); // the console's step read-out carries the live zoom
+    return { ok: true, revision: control.state.revision, zoom: body.data.zoom };
+  });
+
+  // PUT /api/v1/walls/:wallId/playlist-zoom  { sourceId, zoom }  -> re-stamp on every member
+  fastify.put("/api/v1/walls/:wallId/playlist-zoom", async (request, reply) => {
+    const params = WallParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = SetPlaylistEntryZoomBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const result = await control.setWallPlaylistEntryZoom(
+      params.data.wallId,
+      body.data.sourceId,
+      body.data.zoom,
+    );
+    if (!result.ok) {
+      if (result.error === "unknown-wall") {
+        return reply.code(404).send({ error: `unknown wall: ${params.data.wallId}` });
+      }
+      return reply.code(409).send({ error: result.error, wallId: params.data.wallId });
+    }
+
+    fastify.log.info(
+      {
+        event: "wall.playlist-zoom",
+        wallId: params.data.wallId,
+        sourceId: body.data.sourceId,
+        zoom: body.data.zoom,
+        screens: result.slices.map((s) => s.screenId),
+        revision: control.state.revision,
+      },
+      "video wall playlist step zoom set",
+    );
+    for (const slice of result.slices) pushRender(slice.screenId, slice);
+    broadcaster.broadcast();
+    return { ok: true, wallId: params.data.wallId, revision: control.state.revision, zoom: body.data.zoom };
   });
 
   // POST /api/v1/walls/:wallId/ident  { on, ttlMs? }  -> ident-pulse to every member

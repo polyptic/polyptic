@@ -21,6 +21,7 @@ import {
   RenameVideoWallBody,
   SetContentBody,
   SetZoomBody,
+  SetPlaylistEntryZoomBody,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
@@ -308,6 +309,20 @@ export function setScreenZoom(screenId: string, zoom: number): Promise<unknown> 
   return send("PUT", `/screens/${encodeURIComponent(screenId)}/zoom`, SetZoomBody.parse({ zoom }));
 }
 
+/** PUT /api/v1/screens/:screenId/playlist-zoom { sourceId, zoom } — zoom ONE framed step of the
+ *  playlist this screen is showing (POL-133). Remembered per (screen, step source), like D62. */
+export function setScreenPlaylistZoom(
+  screenId: string,
+  sourceId: string,
+  zoom: number,
+): Promise<unknown> {
+  return send(
+    "PUT",
+    `/screens/${encodeURIComponent(screenId)}/playlist-zoom`,
+    SetPlaylistEntryZoomBody.parse({ sourceId, zoom }),
+  );
+}
+
 // ── Combined surfaces / video walls (Phase 3b) ───────────────────────────────
 
 /** POST /api/v1/murals/:muralId/walls { muralId, memberScreenIds } — combine ≥2 adjacent screens. */
@@ -341,6 +356,16 @@ export function setWallContent(wallId: string, body: SetContentBody): Promise<un
  *  Every member takes the same zoom, so the wall stays one continuous page. */
 export function setWallZoom(wallId: string, zoom: number): Promise<unknown> {
   return send("PUT", `/walls/${encodeURIComponent(wallId)}/zoom`, SetZoomBody.parse({ zoom }));
+}
+
+/** PUT /api/v1/walls/:wallId/playlist-zoom { sourceId, zoom } — zoom ONE framed step of the playlist
+ *  spanning a combined surface (POL-133). Every member re-stamps the step, one continuous page. */
+export function setWallPlaylistZoom(wallId: string, sourceId: string, zoom: number): Promise<unknown> {
+  return send(
+    "PUT",
+    `/walls/${encodeURIComponent(wallId)}/playlist-zoom`,
+    SetPlaylistEntryZoomBody.parse({ sourceId, zoom }),
+  );
 }
 
 /** POST /api/v1/walls/:wallId/ident { on, ttlMs? } — flash every panel of a combined surface. */

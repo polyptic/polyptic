@@ -196,6 +196,23 @@ export type SetZoomResult =
       wallId?: string;
     };
 
+/** Result of `setScreenPlaylistEntryZoom` / `setWallPlaylistEntryZoom` (POL-133).
+ *  `not-zoomable` = the target isn't showing a playlist; `unknown-entry` = the rotation has no
+ *  framed step resolved from that source (media steps have no page to zoom). */
+export type SetPlaylistEntryZoomResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error:
+        | "unknown-screen"
+        | "unknown-wall"
+        | "wall-member"
+        | "no-content"
+        | "not-zoomable"
+        | "unknown-entry";
+      wallId?: string;
+    };
+
 /**
  * An assignment of content to a screen or wall (Phase 3c): EITHER a library source (`sourceId`) OR an
  * ad-hoc link (`url`). Exactly one is set (the REST edge validates this via `SetContentBody`).
@@ -1389,22 +1406,42 @@ export class ControlPlane {
 
   /** What's on a screen now, for the console's tiles/inspector: the library source's name+kind (a
    *  wall member shows the wall's source), an ad-hoc URL's derived name, or null when nothing's on air. */
-  screenContentSummary(screenId: string): { name: string; kind: ContentKind; zoom?: number } | null {
+  screenContentSummary(
+    screenId: string,
+  ): {
+    name: string;
+    kind: ContentKind;
+    zoom?: number;
+    entries?: { sourceId?: string; name: string; kind: PlaylistEntry["kind"]; zoom?: number }[];
+  } | null {
     const surface = this.state.slices[screenId]?.surfaces[0];
     // POL-57 — the live zoom, present only for framed content. Its absence is how the console knows
     // this screen has nothing to zoom (media, or no content at all) and hides the control.
     const zoom = surface && isFramed(surface) ? surface.zoom : undefined;
+    // POL-133 — for a playlist, the rotation's steps with each framed step's live zoom on THIS
+    // screen, so the console can draw one zoom control per zoomable step.
+    const entries =
+      surface?.type === "playlist"
+        ? surface.items.map((entry) => ({
+            ...(entry.sourceId !== undefined ? { sourceId: entry.sourceId } : {}),
+            name:
+              (entry.sourceId && this.contentSources.get(entry.sourceId)?.name) ||
+              this.contentNameFromUrl(entry.url, entry.kind),
+            kind: entry.kind,
+            ...(ControlPlane.entryFramed(entry) ? { zoom: entry.zoom } : {}),
+          }))
+        : undefined;
 
     const wall = this.getWallForScreen(screenId);
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind, zoom };
+      if (src) return { name: src.name, kind: src.kind, zoom, entries };
     }
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind, zoom };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, entries };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -1545,6 +1582,150 @@ export class ControlPlane {
     return sourceId ? `source:${sourceId}` : `url:${url}`;
   }
 
+  // ── Playlist step zoom (POL-133) ────────────────────────────────────────────
+  //
+  // The same D62 model, one level down: a page playing as a playlist STEP is still "this content on
+  // this target", so its zoom is remembered against the (target, step source) pair — in the SAME
+  // zoom_preferences table, under the same `source:<id>` key a direct assignment of that source
+  // would use. That is deliberate: the pair identifies the content and the glass, not the route the
+  // content took to get there.
+
+  /** True for a playlist entry that frames a page — the only kind of step that can be zoomed. */
+  private static entryFramed(entry: PlaylistEntry): boolean {
+    return entry.kind === "web" || entry.kind === "dashboard";
+  }
+
+  /** Each framed entry stamped with the zoom remembered for (target, its source); media untouched. */
+  private entriesWithZoom(targetId: string, entries: PlaylistEntry[]): PlaylistEntry[] {
+    return entries.map((entry) =>
+      ControlPlane.entryFramed(entry) && entry.sourceId
+        ? { ...entry, zoom: this.zoomFor(targetId, this.sourceKeyFor(entry.sourceId, entry.url)) }
+        : entry,
+    );
+  }
+
+  /** A resolved spec specialised to ONE target: playlist entries pick up that target's remembered
+   *  per-step zooms. Non-playlists (and target-agnostic fields like `startedAt`) pass through. */
+  private specForTarget(targetId: string, spec: ResolvedSpec): ResolvedSpec {
+    if (spec.kind !== "playlist" || spec.entries === undefined) return spec;
+    return { ...spec, entries: this.entriesWithZoom(targetId, spec.entries) };
+  }
+
+  /** The playlist surface a step-zoom request targets, or the reason there isn't one. */
+  private playlistSurfaceOf(
+    slice: ScreenSlice | undefined,
+  ): { ok: true; surface: PlaylistSurface } | { ok: false; error: "no-content" | "not-zoomable" } {
+    const surface = slice?.surfaces[0];
+    if (slice === undefined || surface === undefined) return { ok: false, error: "no-content" };
+    if (surface.type !== "playlist") return { ok: false, error: "not-zoomable" };
+    return { ok: true, surface };
+  }
+
+  /** `surface` with every framed entry resolved from `sourceId` re-stamped to `zoom`, in place in
+   *  `slice` — same surface id, same `startedAt`, so the player's rotation identity is untouched
+   *  and the live iframe (if that step is on air) restyles without a reload. */
+  private static withEntryZoom(
+    slice: ScreenSlice,
+    surface: PlaylistSurface,
+    sourceId: string,
+    zoom: number,
+  ): { slice: ScreenSlice; matched: boolean } {
+    let matched = false;
+    const items = surface.items.map((entry) => {
+      if (entry.sourceId !== sourceId || !ControlPlane.entryFramed(entry)) return entry;
+      matched = true;
+      return { ...entry, zoom };
+    });
+    return {
+      slice: { ...slice, surfaces: [{ ...surface, items }, ...slice.surfaces.slice(1)] },
+      matched,
+    };
+  }
+
+  /**
+   * Set the page zoom on ONE step of the playlist a single screen is showing (POL-133). Patches the
+   * step's entries in the EXISTING surface — same surface id, same `startedAt`, so the rotation keeps
+   * its position (the player's rotation signature ignores zoom) and, if the step is on air, the live
+   * iframe rescales without a reload. Remembered against (screen, step source), exactly like D62.
+   */
+  async setScreenPlaylistEntryZoom(
+    screenId: string,
+    sourceId: string,
+    zoom: number,
+  ): Promise<SetPlaylistEntryZoomResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const found = this.playlistSurfaceOf(this.state.slices[screenId]);
+    if (!found.ok) return { ok: false, error: found.error };
+    const patched = ControlPlane.withEntryZoom(this.state.slices[screenId]!, found.surface, sourceId, zoom);
+    if (!patched.matched) return { ok: false, error: "unknown-entry" };
+
+    this.state.slices[screenId] = patched.slice;
+    this.bumpRevision();
+
+    await this.rememberZoom(screenId, this.sourceKeyFor(sourceId, ""), zoom);
+    await this.store.upsertContent({
+      screenId,
+      canvas: patched.slice.canvas,
+      surfaces: patched.slice.surfaces,
+      sourceId: this.screenSourceIds.get(screenId) ?? null,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    const stepName = this.contentSources.get(sourceId)?.name ?? sourceId;
+    this.emit("good", `${screen.friendlyName} · ${stepName} zoom ${zoomLabel(zoom)}`);
+    return { ok: true, slices: [patched.slice] };
+  }
+
+  /**
+   * Set the page zoom on ONE step of the playlist spanning a combined surface: every member carries
+   * the same rotation, so the step re-stamps on all of them and the wall keeps reading as one page.
+   */
+  async setWallPlaylistEntryZoom(
+    wallId: string,
+    sourceId: string,
+    zoom: number,
+  ): Promise<SetPlaylistEntryZoomResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices: ScreenSlice[] = [];
+    let matchedAny = false;
+    for (const screenId of wall.memberScreenIds) {
+      const slice = this.state.slices[screenId];
+      const found = this.playlistSurfaceOf(slice);
+      if (!found.ok) {
+        if (found.error === "not-zoomable") return { ok: false, error: "not-zoomable" };
+        continue;
+      }
+      const patched = ControlPlane.withEntryZoom(slice!, found.surface, sourceId, zoom);
+      if (!patched.matched) continue;
+      matchedAny = true;
+      this.state.slices[screenId] = patched.slice;
+      slices.push(patched.slice);
+    }
+    if (slices.length === 0) return { ok: false, error: matchedAny ? "no-content" : "unknown-entry" };
+
+    this.bumpRevision();
+    await this.rememberZoom(wallId, this.sourceKeyFor(sourceId, ""), zoom);
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: this.wallSourceIds.get(wallId) ?? null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    const stepName = this.contentSources.get(sourceId)?.name ?? sourceId;
+    this.emit("good", `${wall.name ?? wall.id} · ${stepName} zoom ${zoomLabel(zoom)}`);
+    return { ok: true, slices };
+  }
+
   /**
    * Set the page zoom on a single screen's framed content. Zoom changes the surface and nothing else,
    * so we patch the EXISTING surface rather than re-resolve it: the keyed id is untouched, the player
@@ -1651,6 +1832,8 @@ export class ControlPlane {
             ? { durationSeconds: DEFAULT_PLAYLIST_ITEM_SECONDS }
             : {}),
         sourceId: step.id,
+        // POL-133 — target-agnostic default; specForTarget stamps the remembered per-step zoom in.
+        zoom: DEFAULT_ZOOM,
       });
     }
     return { kind: "playlist", url: "", entries, startedAt: new Date().toISOString() };
@@ -1895,7 +2078,8 @@ export class ControlPlane {
     const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
 
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
-    const slices = this.computeWallSlices(wall, resolved.spec, zoom);
+    // POL-133 — a playlist's framed steps pick up this wall's remembered per-step zooms.
+    const slices = this.computeWallSlices(wall, this.specForTarget(wallId, resolved.spec), zoom);
     if (slices.length === 0) return { ok: false, error: "no-placements" };
 
     // Record which library source (if any) this wall now spans, persisting the wall row.
@@ -1943,8 +2127,9 @@ export class ControlPlane {
     const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
 
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
+    // POL-133 — a playlist's framed steps pick up this screen's remembered per-step zooms.
     const surface = this.buildSurface(
-      resolved.spec,
+      this.specForTarget(screenId, resolved.spec),
       "content-web",
       { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
       undefined,
@@ -2082,7 +2267,7 @@ export class ControlPlane {
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
       const surface = this.buildSurface(
-        spec,
+        this.specForTarget(screenId, spec),
         "content-web",
         { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
         undefined,
@@ -2098,7 +2283,8 @@ export class ControlPlane {
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
       const zoom = this.zoomFor(wallId, sourceKey);
-      for (const next of this.computeWallSlices(wall, spec, zoom)) byScreen.set(next.screenId, next);
+      for (const next of this.computeWallSlices(wall, this.specForTarget(wallId, spec), zoom))
+        byScreen.set(next.screenId, next);
     }
 
     return [...byScreen.values()];
