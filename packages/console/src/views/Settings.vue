@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { HttpsInfo, ImageBuild } from "@polyptic/protocol";
+import type { AgentSecurityInfo, HttpsInfo, ImageBuild } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
@@ -21,6 +21,7 @@ onMounted(() => {
   void store.fetchDisplaySettings();
   void store.fetchImageUpdates();
   void loadHttps();
+  void loadAgentSecurity();
   document.addEventListener("keydown", onKeydown);
 });
 onBeforeUnmount(() => document.removeEventListener("keydown", onKeydown));
@@ -120,6 +121,30 @@ async function downloadCa(): Promise<void> {
   } finally {
     caDownloading.value = false;
   }
+}
+
+// ── Agent security (POL-134) ───────────────────────────────────────────────────
+// The mTLS posture of the agent channel, in operator words. Loaded non-throwing like the HTTPS
+// card: a failed fetch leaves the card in its loading state rather than breaking Settings.
+const agentSec = ref<AgentSecurityInfo | null>(null);
+
+async function loadAgentSecurity(): Promise<void> {
+  try {
+    agentSec.value = await auth.getAgentSecurity();
+  } catch (err) {
+    console.error("[console] loadAgentSecurity failed", err);
+  }
+}
+
+/** How many machines have proven they hold a working cert (connected over mTLS at least once). */
+const mtlsMigrated = computed(() => (agentSec.value?.machines ?? []).filter((m) => m.mtlsSeenAt).length);
+
+/** One plain-words state per machine, for the card's list. */
+function machineCertState(m: AgentSecurityInfo["machines"][number]): { label: string; cls: string } {
+  if (m.online && m.agentChannel === "mtls") return { label: "Secure channel", cls: "asec-ok" };
+  if (m.mtlsSeenAt) return { label: "Has certificate", cls: "asec-ok" };
+  if (m.mtlsCertIssuedAt) return { label: "Certificate issued — moves over on next connection", cls: "asec-warn" };
+  return { label: "No certificate yet", cls: "asec-warn" };
 }
 
 // ── Onboard Screens: the ⋯ build menu ──────────────────────────────────────────
@@ -816,6 +841,62 @@ async function onSignOut(): Promise<void> {
               Install a certificate ▸ CA certificate.
             </li>
           </ul>
+        </template>
+      </section>
+
+      <!-- Agent security (POL-134) ---------------------------------------------- -->
+      <section id="sec-agent-security" class="card">
+        <h2 class="card-title">Agent security</h2>
+        <p class="card-sub wrap gap">
+          Machines talk to the control plane over the <strong>agent channel</strong> — it carries the remote shell,
+          browser DevTools, screen previews and window placement. Each machine is issued its own certificate
+          automatically when it enrols, so only your machines can open that channel. Screens (players) and the boot
+          flow have their own separate gates and are not affected by this.
+        </p>
+
+        <div v-if="agentSec === null" class="hint">Loading…</div>
+
+        <template v-else>
+          <div v-if="agentSec.mode === 'off'" class="open-note">
+            <span class="asec-badge asec-warn">Off</span>
+            <span>
+              The certificate channel is not running{{ agentSec.detail ? ` — ${agentSec.detail}` : "" }}. Machines
+              still authenticate with their enrolment credentials, but the transport is not mutually authenticated.
+            </span>
+          </div>
+
+          <div v-else-if="agentSec.mode === 'required'" class="open-note">
+            <span class="asec-badge asec-ok">Secured</span>
+            <span>
+              Every live machine connection is certificate-authenticated{{ agentSec.requiredSince ? ` (since ${new Date(agentSec.requiredSince).toLocaleDateString()})` : "" }}.
+              New machines still enrol with the enrolment token and are handed a certificate on first contact —
+              nothing extra to do when you add a box.
+            </span>
+          </div>
+
+          <div v-else class="open-note">
+            <span class="asec-badge asec-warn">Migrating</span>
+            <span>
+              Certificates are being handed out: <strong>{{ mtlsMigrated }} of {{ agentSec.machines.length }}</strong>
+              machines are on the secure channel; the rest move over by themselves the next time they connect. Once
+              every machine is on it, the secure channel becomes <em>required</em> automatically — the activity feed
+              will say so.
+            </span>
+          </div>
+
+          <p v-if="agentSec.pinned && agentSec.mode !== 'off'" class="hint gap-sm">
+            This posture is pinned by the server's configuration (AGENT_MTLS_REQUIRE) — it will not change by itself.
+          </p>
+
+          <ul v-if="agentSec.mode !== 'off' && agentSec.machines.length > 0" class="asec-list">
+            <li v-for="m in agentSec.machines" :key="m.id" class="asec-row">
+              <span class="asec-name">{{ m.label }}</span>
+              <span class="asec-badge" :class="machineCertState(m).cls">{{ machineCertState(m).label }}</span>
+            </li>
+          </ul>
+          <p v-else-if="agentSec.mode !== 'off'" class="hint gap-sm">
+            No machines yet — the first box to enrol gets a certificate on its first hello.
+          </p>
         </template>
       </section>
 
@@ -1704,6 +1785,48 @@ async function onSignOut(): Promise<void> {
   height: 6px;
   border-radius: 50%;
   background: #22c55e;
+}
+
+/* ── Agent security (POL-134) ──────────────────────────────────────────────── */
+.asec-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.asec-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  font-size: 12.5px;
+}
+.asec-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asec-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.asec-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.asec-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
 }
 
 /* ── Update schedule ───────────────────────────────────────────────────────── */

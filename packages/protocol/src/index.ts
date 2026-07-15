@@ -72,6 +72,13 @@ export const Machine = z.object({
   /** POL-59 — when the shell was armed / last used. A sweep auto-disarms a box idle past the TTL
    *  (SHELL_ARM_TTL_MS) so a forgotten armed box is not a standing shell-openable target. */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-134 — when the server last signed this machine's CSR into an mTLS client cert. Absent on
+   *  machines that never asked (pre-POL-25 agents, or an mTLS-off deployment). */
+  mtlsCertIssuedAt: z.string().datetime().optional(),
+  /** POL-134 — when this machine FIRST connected over the mTLS listener: proof the box actually
+   *  holds and presents a working cert, not just that one was issued. Drives the auto-promotion to
+   *  require-mTLS and the per-machine cert state in Settings. */
+  mtlsSeenAt: z.string().datetime().optional(),
 });
 export type Machine = z.infer<typeof Machine>;
 
@@ -1151,6 +1158,12 @@ export const MachineView = z.object({
    *  Absent while the box is offline, before its first heartbeat, or when it runs an agent/backend
    *  that samples nothing — the console then says so rather than drawing empty meters. */
   vitals: MachineVitals.optional(),
+  /** POL-134 — which agent channel this machine's LIVE session arrived on. Present only while
+   *  online; `mtls` means the box completed the client-cert handshake for its current session. */
+  agentChannel: z.enum(["plain", "mtls"]).optional(),
+  /** POL-134 — per-machine cert state for the Settings card (mirrors `Machine`). */
+  mtlsCertIssuedAt: z.string().datetime().optional(),
+  mtlsSeenAt: z.string().datetime().optional(),
   screens: z.array(ScreenView),
 });
 export type MachineView = z.infer<typeof MachineView>;
@@ -1782,6 +1795,41 @@ export const HttpsInfo = z.object({
     .nullable(),
 });
 export type HttpsInfo = z.infer<typeof HttpsInfo>;
+
+/**
+ * POL-134 — `GET /api/v1/settings/agent-security` (auth-gated): the agent-channel security posture
+ * in operator words, for the Settings card. `mode` is the whole story:
+ *   - "off"       the mTLS listener is not running (explicitly disabled, or the runtime/port could
+ *                 not offer it — `detail` says which).
+ *   - "migrating" certs are being issued and agents move over as they reconnect; the plain channel
+ *                 still admits sessions while the fleet catches up.
+ *   - "required"  every live agent session rides the mTLS listener; the plain channel only
+ *                 authenticates first contact and issues certs — it never carries a session.
+ */
+export const AgentSecurityInfo = z.object({
+  mode: z.enum(["off", "migrating", "required"]),
+  /** The mTLS listener's port (absent when mode is "off"). */
+  port: z.number().int().positive().optional(),
+  /** When the deployment graduated to require-mTLS (auto-promotion or a pinned env). */
+  requiredSince: z.string().optional(),
+  /** True when AGENT_MTLS_REQUIRE pins the posture (no auto-promotion either way). */
+  pinned: z.boolean(),
+  /** Why the listener is off, when it is ("AGENT_MTLS=off", "port 8443 in use", …). */
+  detail: z.string().optional(),
+  /** Per-machine cert state, one row per known machine. */
+  machines: z.array(
+    z.object({
+      id: z.string(),
+      label: z.string(),
+      online: z.boolean(),
+      /** The channel of the machine's live session (present only while online). */
+      agentChannel: z.enum(["plain", "mtls"]).optional(),
+      mtlsCertIssuedAt: z.string().optional(),
+      mtlsSeenAt: z.string().optional(),
+    }),
+  ),
+});
+export type AgentSecurityInfo = z.infer<typeof AgentSecurityInfo>;
 
 /** One arch's published live image, as served UNGATED at `/dist/image/<arch>/manifest.json` and
  *  compared by every netbooted box's 5-minute update poll (POL-41). `urgent` is the fleet-wide

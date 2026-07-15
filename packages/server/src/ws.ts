@@ -111,8 +111,17 @@ export interface AgentMtlsChannel {
    * When true the PLAIN /agent channel never admits a machine: it authenticates, issues the cert
    * bundle, answers, and CLOSES — every live agent session must ride the mTLS listener. When false
    * (roll-out mode) the plain channel keeps admitting while the fleet picks its certs up.
+   *
+   * POL-134 — a FUNCTION, not a flag: the posture promotes itself to required at runtime (once
+   * every known machine has been seen on the mTLS listener), so the channel policy must read the
+   * live value on every hello.
    */
-  require: boolean;
+  required(): boolean;
+  /** POL-134 — called whenever a CSR is signed, so the machine's cert state is persisted. */
+  noteCertIssued?(machineId: string): void;
+  /** POL-134 — called on every authenticated hello that arrived OVER the mTLS listener: records
+   *  first-seen (the "wall1 now on mTLS" feed line) and re-evaluates the require promotion. */
+  noteMtlsHello?(machineId: string): void;
 }
 
 /** Which listener an agent socket arrived on (POL-25). */
@@ -388,7 +397,7 @@ function handleAgent(
     // POL-25 require mode: the PLAIN channel exists only to authenticate + hand out cert bundles.
     // Nothing on it is admitted, marked online, or kept open past this hello's answer — every live
     // agent session must arrive through the mTLS listener.
-    const issueOnly = channel === "plain" && agentMtls?.require === true;
+    const issueOnly = channel === "plain" && agentMtls?.required() === true;
 
     // From here the connection is kept: mark presence + register the socket by machineId.
     machineId = msg.machineId;
@@ -401,7 +410,7 @@ function handleAgent(
     let cameOnline = false;
     if (!issueOnly && !presenceMarked) {
       cameOnline = !presence.isMachineOnline(machineId);
-      presence.agentConnected(machineId);
+      presence.agentConnected(machineId, channel);
       presenceMarked = true;
     }
 
@@ -514,6 +523,14 @@ function handleAgent(
           break;
         }
       }
+
+      // POL-134 — persist the cert-issued timestamp AFTER the switch registered the machine, or a
+      // first contact (machine row not yet created at signing time) would never record it.
+      if (mtlsBundle) agentMtls?.noteCertIssued?.(msg.machineId);
+      // POL-134 — an authenticated hello that arrived OVER the mTLS listener is proof this box
+      // presents a working cert: record it (the first time narrates "now on mTLS" in the feed) and
+      // let the posture re-evaluate its promotion to require.
+      if (channel === "mtls") agentMtls?.noteMtlsHello?.(msg.machineId);
 
       // A machine came online (and possibly new screens / a status change) — refresh the admin view.
       if (cameOnline) {

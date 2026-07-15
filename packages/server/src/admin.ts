@@ -63,6 +63,8 @@ export class AdminHub {
  */
 export class Presence {
   private readonly agentConns = new Map<string, number>();
+  /** POL-134 — machineId → the channel its live agent session arrived on. Live-only. */
+  private readonly agentChannel = new Map<string, "plain" | "mtls">();
   private readonly screenRevision = new Map<string, number>();
   /** screenIds whose panel currently shows the browser's Web Inspector (POL-50). */
   private readonly inspecting = new Set<string>();
@@ -92,18 +94,28 @@ export class Presence {
    *  this is a fleet-sized in-memory structure, not a time-series database. */
   private static readonly VITALS_RING = 30;
 
-  agentConnected(machineId: string): void {
+  agentConnected(machineId: string, channel?: "plain" | "mtls"): void {
     this.agentConns.set(machineId, (this.agentConns.get(machineId) ?? 0) + 1);
+    // POL-134 — remember which agent channel the live session rides (the newest admitted socket
+    // wins; overlapping reconnects converge on the surviving one within a heartbeat anyway).
+    if (channel) this.agentChannel.set(machineId, channel);
   }
 
   agentDisconnected(machineId: string): void {
     const n = (this.agentConns.get(machineId) ?? 0) - 1;
-    if (n <= 0) this.agentConns.delete(machineId);
-    else this.agentConns.set(machineId, n);
+    if (n <= 0) {
+      this.agentConns.delete(machineId);
+      this.agentChannel.delete(machineId);
+    } else this.agentConns.set(machineId, n);
   }
 
   isMachineOnline(machineId: string): boolean {
     return (this.agentConns.get(machineId) ?? 0) > 0;
+  }
+
+  /** POL-134 — the channel of the machine's live agent session (undefined while offline). */
+  machineChannel(machineId: string): "plain" | "mtls" | undefined {
+    return this.isMachineOnline(machineId) ? this.agentChannel.get(machineId) : undefined;
   }
 
   setScreenObservedRevision(screenId: string, revision: number): void {
@@ -283,6 +295,11 @@ export function buildAdminState(
       // a machine that has since gone dark is not health data, it is an epitaph; the console says
       // "System stats unavailable while offline" instead of drawing a stale meter.
       vitals: presence.isMachineOnline(machine.id) ? presence.machineVitals(machine.id) : undefined,
+      // POL-134 — the agent channel of the live session + persisted cert state, for the Settings
+      // card and the Machines view ("is this box actually on mTLS?").
+      agentChannel: presence.machineChannel(machine.id),
+      mtlsCertIssuedAt: machine.mtlsCertIssuedAt,
+      mtlsSeenAt: machine.mtlsSeenAt,
       screens: machineScreens,
     } satisfies MachineView;
   });

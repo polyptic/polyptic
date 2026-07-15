@@ -378,6 +378,8 @@ export class ControlPlane {
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
+      mtlsCertIssuedAt: machine.mtlsCertIssuedAt,
+      mtlsSeenAt: machine.mtlsSeenAt,
     };
   }
 
@@ -402,6 +404,8 @@ export class ControlPlane {
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
         shellArmedAt: m.shellArmedAt,
+        mtlsCertIssuedAt: m.mtlsCertIssuedAt,
+        mtlsSeenAt: m.mtlsSeenAt,
       });
       if (m.credentialHash) this.credentialHashes.set(m.id, m.credentialHash);
     }
@@ -780,6 +784,8 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      mtlsCertIssuedAt: existing?.mtlsCertIssuedAt,
+      mtlsSeenAt: existing?.mtlsSeenAt,
     };
     this.machines.set(input.machineId, machine);
 
@@ -814,6 +820,8 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      mtlsCertIssuedAt: existing?.mtlsCertIssuedAt,
+      mtlsSeenAt: existing?.mtlsSeenAt,
     };
     this.machines.set(input.machineId, machine);
     await this.store.upsertMachine(this.toPersistedMachine(machine));
@@ -847,6 +855,32 @@ export class ControlPlane {
     machine.lastSeen = new Date().toISOString();
     machine.outputs = outputs;
     await this.store.upsertMachine(this.toPersistedMachine(machine));
+  }
+
+  /**
+   * POL-134 — record that the server signed this machine's CSR into a client cert. Write-through;
+   * no-op if the machine is unknown (open-mode issuance can precede registration on first contact —
+   * the next hello registers the machine and the following issuance lands the timestamp).
+   */
+  async noteMachineCertIssued(machineId: string): Promise<void> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return;
+    machine.mtlsCertIssuedAt = new Date().toISOString();
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+  }
+
+  /**
+   * POL-134 — record that this machine connected over the mTLS listener (proof it presents a
+   * working cert). Returns true on the FIRST time — the caller narrates the migration in the feed.
+   * Write-through; no-op (false) if the machine is unknown.
+   */
+  async noteMachineMtlsSeen(machineId: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return false;
+    if (machine.mtlsSeenAt) return false;
+    machine.mtlsSeenAt = new Date().toISOString();
+    await this.store.upsertMachine(this.toPersistedMachine(machine));
+    return true;
   }
 
   /**

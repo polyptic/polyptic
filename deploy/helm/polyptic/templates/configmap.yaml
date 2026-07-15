@@ -38,12 +38,14 @@ data:
   CAPTURE_INTERVAL_MS: {{ .Values.config.captureIntervalMs | quote }}
   {{- end }}
   {{- if .Values.agentMtls.enabled }}
-  # ── mTLS agent identity (POL-25) ────────────────────────────────────────────
+  # ── mTLS agent identity (POL-25, default-on since POL-134) ──────────────────
   # The dedicated TLS agent listener. Reaches the pod as raw TCP (see values.yaml:
   # an HTTP(S) Ingress would terminate TLS and strip the client certificate).
   AGENT_MTLS_PORT: {{ .Values.agentMtls.port | quote }}
-  {{- if .Values.agentMtls.require }}
-  AGENT_MTLS_REQUIRE: "1"
+  {{- if ne (toString .Values.agentMtls.require) "" }}
+  # Pinned require posture — "" (the default) omits this and lets the server
+  # auto-promote to require-mTLS once every known machine holds a working cert.
+  AGENT_MTLS_REQUIRE: {{ ternary "1" "0" (eq (toString .Values.agentMtls.require) "true") | quote }}
   {{- end }}
   {{- if .Values.agentMtls.publicUrl }}
   AGENT_MTLS_PUBLIC_URL: {{ .Values.agentMtls.publicUrl | quote }}
@@ -51,6 +53,10 @@ data:
   {{- if .Values.agentMtls.sans }}
   AGENT_MTLS_SANS: {{ join "," .Values.agentMtls.sans | quote }}
   {{- end }}
+  {{- else }}
+  # agentMtls.enabled=false — the explicit escape hatch. Without this the server
+  # would still bring the listener up by itself (POL-134 default-on).
+  AGENT_MTLS: "off"
   {{- end }}
   # ── Phase 7 — MEDIA ─────────────────────────────────────────────────────────
   # Uploads (POST /api/v1/media) are streamed to MEDIA_DIR (a mounted volume, see

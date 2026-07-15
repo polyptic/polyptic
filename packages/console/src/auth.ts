@@ -15,6 +15,7 @@ import {
   ChangePasswordBody,
   DisplaySettings,
   EnrollmentInfo,
+  AgentSecurityInfo,
   HttpsInfo,
   LoginBody,
   ImageUpdateInfo,
@@ -116,6 +117,15 @@ export async function getNetboot(): Promise<NetbootInfo> {
 export async function getHttpsInfo(): Promise<HttpsInfo> {
   const raw = await send<unknown>("GET", `${BASE_SETTINGS}/https`);
   return HttpsInfo.parse(raw);
+}
+
+/**
+ * GET /api/v1/settings/agent-security → the agent-channel mTLS posture in operator words + each
+ * machine's cert state (POL-134). Drives the Settings ▸ Agent security card.
+ */
+export async function getAgentSecurity(): Promise<AgentSecurityInfo> {
+  const raw = await send<unknown>("GET", `${BASE_SETTINGS}/agent-security`);
+  return AgentSecurityInfo.parse(raw);
 }
 
 /**

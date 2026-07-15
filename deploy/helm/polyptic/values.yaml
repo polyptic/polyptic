@@ -58,21 +58,36 @@ service:
 # to match server.Dockerfile (EXPOSE 8080) and the Service default.
 containerPort: 8080
 
-# ── mTLS agent identity (POL-25) ──────────────────────────────────────────────
-# A second, TLS-terminating listener for the /agent channel only: enrolment issues
+# ── mTLS agent identity (POL-25, ON BY DEFAULT since POL-134) ─────────────────
+# The agent channel carries the remote shell, DevTools, screenshots and window
+# placement — so it is mutually authenticated OUT OF THE BOX, with nothing to
+# configure. A second, TLS-terminating listener serves /agent: enrolment issues
 # each machine a durable client certificate (signed by the deployment's own CA,
 # persisted in the store) and a box without a valid cert is rejected in the TLS
-# HANDSHAKE, before any app code. The port is added to the Service — but it must
-# reach the pod as raw TCP (LoadBalancer / NodePort / TCP passthrough): an HTTP(S)
-# Ingress would terminate TLS itself and strip the client certificate. Requires a
-# server image on Bun ≥ 1.3 (the boot self-test refuses to serve mTLS otherwise).
+# HANDSHAKE, before any app code. New boxes still enrol over the plain channel
+# with their token (zero-click netboot survives): they receive a cert on that
+# first hello and reconnect over mTLS by themselves; an upgraded fleet migrates
+# the same way, box by box, narrated in the activity feed. Once every known
+# machine has been seen on the mTLS listener the server promotes itself to
+# REQUIRE mode (announced first in the feed): the plain channel then only enrols
+# + issues certs, never carries a session. Console ▸ Settings ▸ Agent security
+# shows the posture and each machine's cert state.
+#
+# The port is added to the Service — but it must reach the pod as raw TCP
+# (LoadBalancer / NodePort / TCP passthrough): an HTTP(S) Ingress would terminate
+# TLS itself and strip the client certificate. Requires a server image on
+# Bun ≥ 1.3 (the boot self-test refuses to serve mTLS otherwise).
 agentMtls:
-  enabled: false
+  # The escape hatch for debugging: false renders AGENT_MTLS=off — the agent
+  # channel then runs unauthenticated at the transport (app credentials still gate).
+  enabled: true
   # Container + Service port for the TLS agent listener (AGENT_MTLS_PORT).
   port: 8443
-  # Once the fleet holds certs, set true (AGENT_MTLS_REQUIRE): the plain /agent
-  # channel then only authenticates + issues certs and never admits a session.
-  require: false
+  # The require posture. "" (default) = self-managing: the server auto-promotes
+  # to require-mTLS once every known machine holds a working cert. true = pin
+  # required NOW (AGENT_MTLS_REQUIRE=1). false = pin it off — never auto-promote
+  # (AGENT_MTLS_REQUIRE=0), for fleets that must keep certless agents admitted.
+  require: ""
   # Optional full wss:// URL agents should dial (AGENT_MTLS_PUBLIC_URL) when the
   # mTLS listener is exposed somewhere other than "same host, this port" — e.g. a
   # dedicated LoadBalancer. Empty = agents reuse the host they already dial.
