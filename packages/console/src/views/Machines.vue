@@ -4,7 +4,9 @@
 
   Machines are grouped by enrollment status:
     • Pending  — newly dialed-in boxes awaiting a decision: Approve (admits their screens) or Reject
-                 (with an optional reason). Surfaced first, with a warning treatment.
+                 (with an optional reason). Surfaced first, with the v2 mock's full amber treatment
+                 (POL-139): a pulsing warn border, a boxed "Name this box" input, a short monospace
+                 id tail, ghost Reject → outlined Ident → primary Approve, and an amber note strip.
     • Approved — admitted machines, online first. Each card shows exactly three action clusters
                  (POL-68): [Ident all] · [console button] · [⋯ overflow]. The ⋯ menu holds Reboot and
                  the destructive actions (Revoke access / Remove machine); status chips (Online pill +
@@ -45,7 +47,7 @@ import ColdStartWizard from "../components/ColdStartWizard.vue";
 import MachineName from "../components/MachineName.vue";
 import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
-import { machineDisplayName } from "../machine-name";
+import { machineDisplayName, machineIdTail } from "../machine-name";
 
 const store = useConsoleStore();
 
@@ -65,6 +67,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (clock) clearInterval(clock);
   window.clearTimeout(toastTimer);
+  for (const t of identTimers) window.clearTimeout(t);
 });
 
 /** "just now" while online, "rebooting…" while an operator reboot is in flight, else relative. */
@@ -114,6 +117,30 @@ function remove(m: MachineView): void {
 
 function identAll(m: MachineView): void {
   void store.identMachine(m.id);
+}
+
+// While a pending box's holding board flashes, its Ident button reads "Identing…" and won't
+// re-fire. The store flashes a pending box for 12 s (identMachine's pending TTL) — mirror that.
+const PENDING_IDENT_MS = 12000;
+const identing = reactive(new Set<string>());
+const identTimers = new Set<number>();
+
+function identPending(m: MachineView): void {
+  if (identing.has(m.id)) return;
+  identing.add(m.id);
+  void store.identMachine(m.id);
+  const timer = window.setTimeout(() => {
+    identing.delete(m.id);
+    identTimers.delete(timer);
+  }, PENDING_IDENT_MS);
+  identTimers.add(timer);
+}
+
+/** The note strip's subject: "its screen" / "its 3 screens" / "its screens" (none reported yet). */
+function pendingScreensPhrase(m: MachineView): string {
+  if (m.outputCount === 1) return "its screen";
+  if (m.outputCount > 1) return `its ${m.outputCount} screens`;
+  return "its screens";
 }
 
 /**
@@ -250,41 +277,40 @@ function showToast(message: string): void {
           </div>
           <div class="stack">
             <div v-for="m in pending" :key="m.id" class="machine pending">
-              <div class="machine-row">
+              <div class="machine-row pending-row">
                 <div class="machine-id">
                   <div class="machine-id-line">
                     <span class="dot" :class="m.online ? 'dot-on' : 'dot-off'"></span>
                     <!-- POL-117 — name it while it queues: pending boxes are exactly when several
-                         identical `localhost.localdomain` machines need telling apart. -->
-                    <MachineName :machine="m" />
-                    <span class="machine-uuid">{{ m.id }}</span>
-                  </div>
-                  <div class="machine-meta">
-                    {{ m.online ? "Online" : "Offline" }} · reports
-                    {{ countLabel(m.outputCount, "screen") }} · {{ lastSeen(m) }}
+                         identical `localhost.localdomain` machines need telling apart. Boxed here
+                         (unlike the approved card's ghost input) — naming is part of approving. -->
+                    <MachineName :machine="m" boxed />
+                    <span class="machine-hex" :title="m.id">{{ machineIdTail(m.id) }}</span>
                   </div>
                 </div>
-                <!-- POL-117 — flash the box's holding board so the operator knows WHICH physical
-                     panel they are approving. Rides the agent channel; needs the box online. -->
-                <button
-                  class="btn-ghost-sm"
-                  :disabled="!m.online"
-                  :title="
-                    m.online
-                      ? 'Flash this box\'s screens so you can tell which panel it is'
-                      : `${machineDisplayName(m)} is offline — nothing to flash`
-                  "
-                  @click="identAll(m)"
-                >
-                  <span class="ident-dot"></span>Ident
-                </button>
-                <button class="btn-remove" @click="remove(m)">Remove</button>
-                <button class="btn-reject" @click="reject(m)">Reject</button>
-                <button class="btn-approve" @click="approve(m)">Approve</button>
+                <div class="pending-actions">
+                  <button class="btn-reject-ghost" @click="reject(m)">Reject</button>
+                  <!-- POL-117 — flash the box's holding board so the operator knows WHICH physical
+                       panel they are approving. Rides the agent channel; needs the box online. -->
+                  <button
+                    class="btn-ghost-sm"
+                    :disabled="!m.online || identing.has(m.id)"
+                    :title="
+                      m.online
+                        ? 'Flashes a badge on every screen this box drives'
+                        : `${machineDisplayName(m)} is offline — nothing to flash`
+                    "
+                    @click="identPending(m)"
+                  >
+                    <span class="ident-dot"></span>{{ identing.has(m.id) ? "Identing…" : "Ident" }}
+                  </button>
+                  <button class="btn-approve pending-approve" @click="approve(m)">Approve</button>
+                </div>
               </div>
               <div class="pending-note">
-                Not yet admitted — shows nothing until you approve it. Its
-                {{ countLabel(m.outputCount, "screen") }} will land in the Unplaced tray.
+                Nothing plays on this box until you approve it. Once you do,
+                {{ pendingScreensPhrase(m) }} will show up in the Unplaced tray, ready to place on
+                the wall.
               </div>
             </div>
           </div>
@@ -630,9 +656,57 @@ function showToast(message: string): void {
   background: var(--card);
   box-shadow: var(--shadow-sm);
 }
+/* POL-139 — the v2 mock's pending treatment: a full amber border whose colour and 3px soft glow
+   breathe on a 2s cycle. All the card's urgency comes from this pulse + the amber palette. */
 .machine.pending {
-  border-color: var(--warn-soft);
-  border-left: 3px solid var(--warn);
+  border-color: var(--warn);
+  padding: 16px 18px;
+  animation: pendingPulse 2s ease-in-out infinite;
+}
+@keyframes pendingPulse {
+  0%,
+  100% {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 3px var(--warn-soft);
+  }
+  50% {
+    border-color: var(--warn-soft);
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .machine.pending {
+    animation: none;
+  }
+}
+.pending-row {
+  gap: 14px;
+}
+.pending-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.machine-hex {
+  font-size: 11.5px;
+  color: var(--muted2);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  white-space: nowrap;
+}
+/* Boxed name input (MachineName's `boxed` variant) + the pending row's button weights: ghost
+   Reject → outlined Ident → primary Approve, escalating left to right per the mock. */
+.pending .btn-ghost-sm {
+  padding: 8px 13px;
+  font-size: 12.5px;
+  border-color: var(--line);
+  background: transparent;
+  box-shadow: none;
+}
+.pending-approve {
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 12.5px;
 }
 .machine.rejected {
   opacity: 0.7;
@@ -730,19 +804,21 @@ function showToast(message: string): void {
 .btn-approve:hover {
   opacity: 0.92;
 }
-.btn-reject {
-  padding: 9px 15px;
-  border-radius: 9px;
-  border: 1px solid var(--line2);
-  background: var(--surface);
-  font-size: 13px;
+/* Reject is a ghost button — quiet until hovered, when it turns destructive. */
+.btn-reject-ghost {
+  padding: 8px 13px;
+  border-radius: 8px;
+  border: none;
+  background: none;
+  font-size: 12.5px;
   font-weight: 500;
-  color: var(--bad);
+  color: var(--muted);
   cursor: pointer;
   font-family: inherit;
 }
-.btn-reject:hover {
+.btn-reject-ghost:hover {
   background: var(--bad-soft);
+  color: var(--bad);
 }
 .btn-ghost-sm {
   display: inline-flex;
@@ -942,12 +1018,13 @@ function showToast(message: string): void {
 }
 
 .pending-note {
-  margin-top: 11px;
+  margin-top: 12px;
   font-size: 12px;
   color: var(--warn);
   background: var(--warn-soft);
   padding: 8px 11px;
   border-radius: 8px;
+  line-height: 1.5;
 }
 
 /* screens under an approved machine */
