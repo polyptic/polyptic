@@ -18,6 +18,19 @@
  * region pixels, exactly as the server's span math assumes.
  */
 import type { CSSProperties } from "vue";
+import type { Surface } from "@polyptic/protocol";
+
+/**
+ * POL-18 — is this surface an AGENT-PLACED WINDOW? Such a surface is a hole in the player: the real
+ * content is a top-level browser window the agent floats over this region, so the player renders
+ * nothing for it and the SurfaceProber must never probe (or paint) its URL — the probe target list
+ * and the template both branch on this one predicate so they can never disagree.
+ */
+export function isAgentPlacedWindow(surface: Surface): boolean {
+  return (
+    (surface.type === "web" || surface.type === "dashboard") && surface.placement === "window"
+  );
+}
 
 /** The Phase-3b spanning descriptor a surface may carry (see protocol `SurfaceBase.span`). */
 export interface Span {

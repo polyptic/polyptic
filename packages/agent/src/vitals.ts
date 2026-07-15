@@ -301,6 +301,16 @@ export class VitalsSampler {
     return hottest;
   }
 
+  /**
+   * POL-105 — the image id this box BOOTED, for `agent/hello`. Same cached read the heartbeat's
+   * vitals use (an immutable live image cannot change its id without a reboot, and a reboot is a new
+   * process), exposed so the very first frame of a session already carries it: an operator watching
+   * a canary reboot should see the new id the moment the box is back, not one heartbeat later.
+   */
+  async bootedImageId(): Promise<string | undefined> {
+    return (await this.readImageId()) ?? undefined;
+  }
+
   /** The image id this box booted, read once. `null` on a box that isn't running a live image. */
   private async readImageId(): Promise<string | null> {
     if (this.imageId !== undefined) return this.imageId;

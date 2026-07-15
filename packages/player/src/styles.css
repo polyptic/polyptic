@@ -169,6 +169,15 @@ body {
   color: #7f8b99;
 }
 
+/* POL-18 — an agent-placed WINDOW surface: the region under a top-level browser window the agent
+   floats over the player. A plain dark rectangle, no dot, no motion — the window ABOVE is the
+   content, and anything animated here would peek out during the window's launch/respawn. */
+.surface-window-hole {
+  width: 100%;
+  height: 100%;
+  background: #0b0f14;
+}
+
 /* Playlist (POL-34): the NEXT entry pre-warming invisibly behind the current one, so a rotation
    swaps without flashing a blank region. Same box as the content, just never seen or clicked. */
 .playlist-preload {

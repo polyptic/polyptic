@@ -165,6 +165,23 @@ If a screen's machine is offline the button is disabled — the request rides th
 | `output * dpms on` | sway config | outputs forced on at session start |
 | autologin via greetd `initial_session` | greetd config | no login prompt, no typed password on cold boot |
 
+> **Panel power (POL-101 / D100) does not weaken the two rows above.** A panel can now be slept — by an
+> operator, or by a daily *panel-hours* window they set — but **only** on an explicit `server/display-power`
+> from the control plane. There is still no idle timeout anywhere in the stack: the sway config keeps
+> asserting `output * dpms on` at every session start (so a box that reboots comes back **lit**, and the
+> scheduler re-sleeps it on `agent/hello` if it is still out of hours), and the x11-i3 fallback pins every
+> DPMS timeout to zero *before* enabling the extension, so nothing but an explicit `xset dpms force off`
+> can darken it. A screen that should be showing content is never blanked.
+>
+> Sleep has **two rungs**, and the console reports which one a box actually has:
+> **DPMS** stops driving the output (always available on a real compositor), and **HDMI-CEC** tells the
+> display itself to stand by — the only rung that reliably powers a TV down, since many panels answer a
+> dead signal by staying lit with a black backlight. CEC is *probed at agent startup* (`cec-ctl` on
+> `/dev/cec*`, else libcec's `cec-client`); `v4l-utils`/`cec-utils` install in a **failure-tolerant**
+> transaction, and `/etc/udev/rules.d/70-polyptic-cec.rules` grants `/dev/cec*` to the `video` group the
+> kiosk user is already in — the agent stays unprivileged. **A box with no CEC adapter is a normal box:**
+> it sleeps the output via DPMS and says so, loudly in the log and honestly in the console.
+
 ### Fleet health — the stats strip and `/metrics` (POL-92 / D112)
 
 Every heartbeat (10s) carries the box's own **vitals**, sampled straight from `/proc` and `/sys`: CPU, memory, root-filesystem usage (on a netbooted box that **is** the RAM image), the hottest thermal zone, load, uptime, the **running image id**, and per-output browser health — resident memory, respawn count, and whether the browser holds an open fd on **`/dev/dri`**.
