@@ -13,7 +13,9 @@ import { defineStore } from "pinia";
 import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
   ActivityEvent,
+  AudioIntent,
   AuthUser,
+  BulkOpResponse,
   ChangePasswordBody,
   ContentKind,
   ContentSource,
@@ -22,8 +24,10 @@ import type {
   CreateCredentialProfileBody,
   CreateEnrollmentTokenBody,
   CreatePreRegistrationBody,
+  CreateScheduleBody,
   CredentialProfileTestResult,
   CredentialProfileView,
+  Daypart,
   DisplaySettings,
   EnrollmentInfo,
   EnrollmentTokenView,
@@ -32,20 +36,36 @@ import type {
   Mural,
   NetbootInfo,
   OperatorRole,
+  PanelHours,
+  PanelPowerConfig,
   Placement,
   PreRegistration,
   Scene,
+  Schedule,
+  SchedulerSettings,
   ScreenView,
   SourceHealthState,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateDaypartBody,
   UpdateSceneBody,
+  UpdateScheduleBody,
+  UpdateSchedulerSettingsBody,
   VideoWall,
   ImageUpdateInfo,
 } from "@polyptic/protocol";
 
 import * as api from "../api";
 import * as auth from "../auth";
+
+/** A server 4xx explains itself in `{error: "<sentence>"}`; ApiError.message is only method+status. */
+function errorSentence(err: unknown, fallback: string): string {
+  const detail =
+    err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+      ? (err.payload as { error: string }).error
+      : null;
+  return detail ?? fallback;
+}
 
 /** Assigning content takes EITHER a library source by id OR an ad-hoc URL — exactly one (the
  *  contract's SetContentBody refinement). The ad-hoc URL path is the Phase-3b behaviour. */
@@ -82,6 +102,13 @@ let stopped = false;
 // When a Combine round-trips, the server assigns the real wall id; we remember the optimistic
 // member set so the next authoritative broadcast can re-point `selectedWallId` at the real wall.
 let pendingWallMembers: string[] | null = null;
+
+/** The server's own sentence for a failed call ("daypart still used by 2 schedules"), when it sent
+ *  one — `ApiError.message` is only method/path/status, which is useless to an operator. */
+function errorText(err: api.ApiError): string {
+  const payload = err.payload as { error?: unknown } | undefined;
+  return typeof payload?.error === "string" ? payload.error : err.message;
+}
 
 /** Two membership lists describe the same wall iff they hold the same screen ids (order-insensitive). */
 function sameMembers(a: readonly string[], b: readonly string[]): boolean {
@@ -130,6 +157,9 @@ export interface ConsoleState {
   /** Fleet-wide display settings (POL-6) — the on-screen badge toggle. Mirrored from admin/state
    *  (optional on the wire → null until the first snapshot with it lands, or against an older server). */
   settings: DisplaySettings | null;
+  /** POL-101 — the deployment's panel-hours timezone, mirrored from admin/state.panelPower. Optional
+   *  on the wire (an older server omits it) → null until the first snapshot that carries it. */
+  panelPower: PanelPowerConfig | null;
   connected: boolean;
   /** True once the FIRST admin/state snapshot has been folded in — the difference between "the
    *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
@@ -151,6 +181,13 @@ export interface ConsoleState {
   sourceStatus: ContentSourceStatus[];
   /** Saved wall snapshots (Phase 3d), mirrored from admin/state. */
   scenes: Scene[];
+  /** The scene scheduler (POL-89), mirrored from admin/state: the daypart library, the schedules
+   *  bound to it, and the deployment's settings row (master switch + timezone + default scene).
+   *  Optional on the wire (back-compat) → [] / null against an older server. The Scenes view feeds
+   *  exactly these into the protocol's shared resolver to paint the week strip. */
+  dayparts: Daypart[];
+  schedules: Schedule[];
+  scheduler: SchedulerSettings | null;
   /** The Live Activity feed (D25) — bounded, newest-first human event log, mirrored from
    *  admin/state.activity. The field is OPTIONAL on the wire (back-compat), so it defaults to []
    *  when a server omits it. */
@@ -185,6 +222,7 @@ export const useConsoleStore = defineStore("console", {
     netboot: null,
     imageUpdates: null,
     settings: null,
+    panelPower: null,
     connected: false,
     stateReceived: false,
     revision: 0,
@@ -196,6 +234,9 @@ export const useConsoleStore = defineStore("console", {
     credentialProfiles: [],
     sourceStatus: [],
     scenes: [],
+    dayparts: [],
+    schedules: [],
+    scheduler: null,
     activity: [],
     activeSceneId: null,
     activeMuralId: null,
@@ -879,12 +920,19 @@ export const useConsoleStore = defineStore("console", {
         // POL-94 — usage + health per source; optional on the wire (older servers omit it).
         this.sourceStatus = msg.sourceStatus ?? [];
         this.scenes = msg.scenes;
+        // POL-89 — the scene scheduler. Optional on the wire (back-compat): an older server simply
+        // has no scheduler, and the Scenes view says so rather than painting an empty week.
+        this.dayparts = msg.dayparts ?? [];
+        this.schedules = msg.schedules ?? [];
+        if (msg.scheduler) this.scheduler = msg.scheduler;
         // The Live Activity feed is optional on the wire (older servers omit it); default to [].
         // The server sends it newest-first and pre-bounded, so we mirror it as-is.
         this.activity = msg.activity ?? [];
         // POL-6 — fleet-wide display settings (badge toggle). Optional on the wire (back-compat); keep
         // the last known value when a snapshot omits it rather than clobbering the toggle to null.
         if (msg.settings) this.settings = msg.settings;
+        // POL-101 — the panel-hours timezone; same back-compat rule as settings above.
+        if (msg.panelPower) this.panelPower = msg.panelPower;
 
         // Forget an active-scene marker whose scene the server no longer knows (e.g. deleted).
         if (this.activeSceneId && !this.scenes.some((sc) => sc.id === this.activeSceneId)) {
@@ -941,6 +989,54 @@ export const useConsoleStore = defineStore("console", {
         this.openSocket();
       }, delay);
       backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+    },
+
+    // ── Tags + bulk operations (POL-103) ────────────────────────────────────────
+
+    /**
+     * Replace a machine's whole tag set. Optimistic (the chips redraw at once); the authoritative
+     * admin/state broadcast reconciles — including the server's normalization (lowercase, de-duped).
+     */
+    async setMachineTags(id: string, tags: string[]): Promise<string | null> {
+      const machine = this.machines.find((m) => m.id === id);
+      const previous = machine ? [...(machine.tags ?? [])] : [];
+      if (machine) machine.tags = tags;
+      try {
+        await api.setMachineTags(id, tags);
+        return null;
+      } catch (err) {
+        if (machine) machine.tags = previous; // revert
+        console.error("[console] setMachineTags failed", err);
+        return errorSentence(err, "Could not save those tags.");
+      }
+    },
+
+    /**
+     * Fan a verb out over a target (a tag selector, or the operator's checkbox selection) and hand
+     * back the server's per-machine result. Partial success is NORMAL — three offline boxes are
+     * reported, not thrown — so the caller summarizes rather than treating it as a failure.
+     */
+    async bulkAction(
+      action: "reboot" | "arm" | "disarm" | "ident" | "approve",
+      target: api.BulkTarget,
+    ): Promise<BulkOpResponse | string> {
+      try {
+        switch (action) {
+          case "reboot":
+            return await api.bulkReboot(target);
+          case "arm":
+            return await api.bulkShell(target, true);
+          case "disarm":
+            return await api.bulkShell(target, false);
+          case "ident":
+            return await api.bulkIdent(target);
+          case "approve":
+            return await api.bulkApprove(target);
+        }
+      } catch (err) {
+        console.error(`[console] bulk ${action} failed`, err);
+        return errorSentence(err, `The ${action} could not be sent to those machines.`);
+      }
     },
 
     // ── Machines / enrollment (Phase 2b) ────────────────────────────────────────
@@ -1181,6 +1277,79 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
+    /** Return a whole selection to the tray in ONE call (POL-96) — one broadcast, one activity line.
+     *  Unplacing a wall member dissolves that wall, exactly as the single-screen path does. */
+    async unplaceScreens(screenIds: readonly string[]): Promise<void> {
+      const ids = [...new Set(screenIds)];
+      if (ids.length === 0) return;
+      const gone = new Set(ids);
+      this.placements = this.placements.filter((p) => !gone.has(p.screenId)); // optimistic
+      this.videoWalls = this.videoWalls.filter(
+        (w) => !w.memberScreenIds.some((sid) => gone.has(sid)),
+      );
+      this.selectedScreenIds = this.selectedScreenIds.filter((sid) => !gone.has(sid));
+      try {
+        await api.unplaceScreens(ids);
+      } catch (err) {
+        console.error("[console] unplaceScreens failed", err);
+      }
+    },
+
+    /**
+     * Translate a canvas selection by (dx, dy) in ONE atomic server call (POL-100): a combined surface
+     * moves as a unit, and a multi-screen nudge/drag is a single round trip rather than one per screen.
+     * Optimistic (the canvas must track the keyboard), reconciled by the next admin/state. The server
+     * REFUSES a move that would break up a wall — the refusal comes back as a message for the caller
+     * to show, and the optimistic shift is rolled back.
+     */
+    async moveTargets(
+      targets: { screenIds?: readonly string[]; wallIds?: readonly string[] },
+      dx: number,
+      dy: number,
+    ): Promise<string | null> {
+      const muralId = this.activeMuralId;
+      if (!muralId) return null;
+      if (dx === 0 && dy === 0) return null;
+
+      const screenIds = [...(targets.screenIds ?? [])];
+      const wallIds = [...(targets.wallIds ?? [])];
+      if (wallIds.some((id) => id.startsWith("wall-pending"))) return null;
+
+      // Every screen the move touches: the named ones plus the members of every named wall.
+      const moving = new Set(screenIds);
+      for (const wallId of wallIds) {
+        const wall = this.videoWalls.find((w) => w.id === wallId);
+        for (const sid of wall?.memberScreenIds ?? []) moving.add(sid);
+      }
+      if (moving.size === 0) return null;
+
+      for (const p of this.placements) {
+        if (moving.has(p.screenId)) {
+          p.x += dx; // optimistic
+          p.y += dy;
+        }
+      }
+
+      try {
+        await api.moveTargets(muralId, { screenIds, wallIds }, dx, dy);
+        return null;
+      } catch (err) {
+        // Roll the optimistic shift back — the server kept the old geometry.
+        for (const p of this.placements) {
+          if (moving.has(p.screenId)) {
+            p.x -= dx;
+            p.y -= dy;
+          }
+        }
+        console.error("[console] moveTargets failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "That move was refused by the control plane.";
+      }
+    },
+
     // ── Screen registry / content ─────────────────────────────────────────────
 
     async renameScreen(screenId: string, name: string): Promise<void> {
@@ -1251,6 +1420,71 @@ export const useConsoleStore = defineStore("console", {
     },
 
     /**
+     * POL-101 — wake or sleep ONE panel. NOT optimistic, for the same reason as inspectScreen: only
+     * the box knows whether the compositor took the DPMS command, so `asleep` is written solely by the
+     * agent's ack arriving on the next admin/state. Showing a wall as dark when it might still be lit
+     * is precisely the lie an operator cannot check from their desk.
+     */
+    async setScreenPower(screenId: string, on: boolean): Promise<string | null> {
+      try {
+        await api.setScreenPower(screenId, { on });
+        return null;
+      } catch (err) {
+        console.error("[console] setScreenPower failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? `The control plane could not ${on ? "wake" : "sleep"} that screen.`;
+      }
+    },
+
+    /** POL-101 — wake/sleep every panel a box drives (the bulk action on the Machines card). */
+    async setMachinePower(machineId: string, on: boolean): Promise<string | null> {
+      try {
+        await api.setMachinePower(machineId, { on });
+        return null;
+      } catch (err) {
+        console.error("[console] setMachinePower failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? `The control plane could not ${on ? "wake" : "sleep"} that machine's panels.`;
+      }
+    },
+
+    /** POL-101 — set (or clear, with `null`) a screen's daily panel-hours window. */
+    async setScreenPanelHours(screenId: string, hours: PanelHours | null): Promise<string | null> {
+      try {
+        await api.setScreenPanelHours(screenId, hours);
+        return null;
+      } catch (err) {
+        console.error("[console] setScreenPanelHours failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "Could not save those panel hours.";
+      }
+    },
+
+    /** POL-101 — the deployment's panel-hours timezone (Settings). */
+    async setPanelTimezone(timezone: string): Promise<string | null> {
+      try {
+        this.panelPower = await api.setPanelPowerTimezone(timezone);
+        return null;
+      } catch (err) {
+        console.error("[console] setPanelTimezone failed", err);
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "Could not save that timezone.";
+      }
+    },
+
+    /**
      * Permanently forget a single screen (POL-14): drop it from its machine, plus its placement, any
      * combined surface it belonged to, and any selection — optimistically; the authoritative
      * admin/state broadcast reconciles. If the screen's machine still reports the output, the screen
@@ -1294,6 +1528,52 @@ export const useConsoleStore = defineStore("console", {
     },
 
     /**
+     * Clear a single screen's content (POL-96) — it shows nothing and falls back to the idle splash.
+     * The explicit "show nothing" intent: until now content could only be replaced, never removed.
+     */
+    async clearScreenContent(screenId: string): Promise<void> {
+      try {
+        await api.clearScreenContent(screenId);
+      } catch (err) {
+        console.error("[console] clearScreenContent failed", err);
+      }
+    },
+
+    /** Clear a combined surface's spanning content. The wall itself survives (it's a grouping). */
+    async clearWallContent(wallId: string): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      try {
+        await api.clearWallContent(wallId);
+      } catch (err) {
+        console.error("[console] clearWallContent failed", err);
+      }
+    },
+
+    /**
+     * Assign one library source across a whole selection — or CLEAR the selection (`content: null`) —
+     * in ONE call (POL-96). The server fans out to every player and emits a single activity line, so
+     * "put this dashboard on those five screens" costs one interaction and one broadcast.
+     */
+    async bulkSetContent(
+      targets: { screenIds?: readonly string[]; wallIds?: readonly string[] },
+      content: ContentAssignment | null,
+    ): Promise<void> {
+      const screenIds = [...(targets.screenIds ?? [])];
+      // A freshly-combined wall is optimistic until its real id lands; sending against it would 404.
+      const wallIds = [...(targets.wallIds ?? [])].filter((id) => !id.startsWith("wall-pending"));
+      if (screenIds.length + wallIds.length === 0) return;
+
+      const body = content === null ? null : normalizeAssignment(content);
+      if (content !== null && body === null) return; // a blank ad-hoc URL is not an intent
+
+      try {
+        await api.bulkContent({ screenIds, wallIds }, body);
+      } catch (err) {
+        console.error("[console] bulkSetContent failed", err);
+      }
+    },
+
+    /**
      * Zoom the page on a single screen (POL-57). The authoritative zoom comes back on the next
      * `admin/state`, but we patch the screen's content read-out optimistically so repeated clicks on
      * the − / + buttons step from the value the operator can see rather than from a stale one.
@@ -1315,6 +1595,31 @@ export const useConsoleStore = defineStore("console", {
           if (!screenIds.includes(screen.id) || !screen.content) continue;
           if (screen.content.zoom === undefined) continue;
           screen.content = { ...screen.content, zoom };
+        }
+      }
+    },
+
+    /**
+     * Set the sound on a single screen's audible content (POL-112). Optimistic like zoom: the slider
+     * must track the operator's thumb, and the authoritative value arrives on the next `admin/state`.
+     */
+    async setScreenAudio(screenId: string, audio: AudioIntent): Promise<void> {
+      this.patchScreenAudio([screenId], audio);
+      try {
+        await api.setScreenAudio(screenId, audio);
+      } catch (err) {
+        console.error("[console] setScreenAudio failed", err);
+      }
+    },
+
+    /** Write an audio intent onto the given screens' content read-outs in place (optimistic; the
+     *  server's broadcast overwrites it moments later). Silent content is left alone. */
+    patchScreenAudio(screenIds: readonly string[], audio: AudioIntent): void {
+      for (const machine of this.machines) {
+        for (const screen of machine.screens) {
+          if (!screenIds.includes(screen.id) || !screen.content) continue;
+          if (screen.content.audio === undefined) continue;
+          screen.content = { ...screen.content, audio: { ...audio } };
         }
       }
     },
@@ -1363,34 +1668,69 @@ export const useConsoleStore = defineStore("console", {
 
     // ── Combined surfaces (video walls, Phase 3b) ───────────────────────────────
 
-    /** Combine ≥2 placed screens on a mural into one spanning surface. Optimistically shows the
-     *  combined box immediately (temp id) and selects it; the server's broadcast supplies the real
-     *  wall, which `applyMessage` re-points the selection onto. */
-    async combine(muralId: string, memberScreenIds: string[]): Promise<void> {
+    /**
+     * Combine ≥2 placed screens on a mural into one spanning surface. Optimistically shows the
+     * combined box immediately (temp id) and selects it; the server's broadcast supplies the real
+     * wall, which `applyMessage` re-points the selection onto.
+     *
+     * The server REFUSES a selection whose screens don't form one contiguous region (POL-100) — a
+     * wall with a hole in it would span content across canvas nobody is showing. That refusal comes
+     * back as `"not-adjacent"` so the toolbar can offer to close the gaps; `pack: true` re-tries with
+     * the members packed bezel-tight first.
+     */
+    async combine(
+      muralId: string,
+      memberScreenIds: string[],
+      pack = false,
+    ): Promise<"ok" | "not-adjacent" | "failed"> {
       const members = [...new Set(memberScreenIds)];
-      if (!muralId || members.length < 2) return;
+      if (!muralId || members.length < 2) return "failed";
       // Only combine screens that are actually placed on this mural.
       const placedHere = members.filter((id) =>
         this.placements.some((p) => p.screenId === id && p.muralId === muralId),
       );
-      if (placedHere.length < 2) return;
+      if (placedHere.length < 2) return "failed";
 
       const tempId = `wall-pending-${Date.now()}`;
+      const selection = [...this.selectedScreenIds];
       this.videoWalls.push({ id: tempId, muralId, memberScreenIds: placedHere });
       this.selectedScreenIds = [];
       this.selectedWallId = tempId;
       pendingWallMembers = [...placedHere];
 
-      try {
-        await api.combineScreens(muralId, placedHere);
-      } catch (err) {
-        // Roll the optimistic surface back.
+      const rollback = () => {
         this.videoWalls = this.videoWalls.filter((w) => w.id !== tempId);
         if (this.selectedWallId === tempId) this.selectedWallId = null;
+        this.selectedScreenIds = selection; // give the operator their selection back
         if (pendingWallMembers && sameMembers(pendingWallMembers, placedHere)) {
           pendingWallMembers = null;
         }
-        console.error("[console] combine failed", err);
+      };
+
+      try {
+        await api.combineScreens(muralId, placedHere, pack);
+        return "ok";
+      } catch (err) {
+        rollback();
+        const reason =
+          err instanceof api.ApiError && (err.payload as { error?: unknown })?.error === "not-adjacent"
+            ? "not-adjacent"
+            : "failed";
+        if (reason !== "not-adjacent") console.error("[console] combine failed", err);
+        return reason;
+      }
+    },
+
+    /** Set the sound on a combined surface (POL-112). The server hands it to ONE panel (the anchor)
+     *  and keeps the others muted — N panels sounding the same clip would echo the room. */
+    async setWallAudio(wallId: string, audio: AudioIntent): Promise<void> {
+      if (wallId.startsWith("wall-pending")) return;
+      const wall = this.videoWalls.find((w) => w.id === wallId);
+      if (wall) this.patchScreenAudio(wall.memberScreenIds, audio);
+      try {
+        await api.setWallAudio(wallId, audio);
+      } catch (err) {
+        console.error("[console] setWallAudio failed", err);
       }
     },
 
@@ -1578,21 +1918,29 @@ export const useConsoleStore = defineStore("console", {
       file: File,
       name?: string,
       onProgress?: (fraction: number) => void,
-    ): Promise<{ ok: boolean; error?: string }> {
+    ): Promise<{ ok: boolean; error?: string; warning?: string }> {
       try {
-        await api.uploadMedia(file, name, onProgress);
-        return { ok: true };
+        // POL-109 — an accepted upload can still carry a caveat (an unprobeable file on a server with
+        // no media toolchain). The caller shows it as a note, not as a failure.
+        const result = await api.uploadMedia(file, name, onProgress);
+        return result.warning ? { ok: true, warning: result.warning } : { ok: true };
       } catch (err) {
         console.error("[console] uploadSource failed", err);
         if (err instanceof api.ApiError) {
           if (err.status === 413) return { ok: false, error: "File too large for upload." };
-          if (err.status === 415) {
-            return { ok: false, error: "Unsupported file type — upload an image or video." };
-          }
           const payloadMsg =
             err.payload && typeof err.payload === "object" && "error" in err.payload
               ? String((err.payload as { error: unknown }).error)
               : null;
+          // POL-109 — a 415 is now the INGEST verdict as often as it is a wrong file type, and the
+          // server's sentence already names the codec and says what to do about it. Show it verbatim;
+          // only fall back to the generic line when the server sent nothing.
+          if (err.status === 415) {
+            return {
+              ok: false,
+              error: payloadMsg ?? "Unsupported file type — upload an image or video.",
+            };
+          }
           return { ok: false, error: payloadMsg ?? "Upload failed. Please try again." };
         }
         return { ok: false, error: "Upload failed. Please try again." };
@@ -1675,20 +2023,10 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /**
-     * Update a saved scene: rename it and/or set its illustrative schedule time (`scheduleAt` is
-     * "HH:MM", or null to clear). The schedule is STORED, NOT FIRED — it's illustrative only (D24);
-     * nothing in the console or server activates a scene at that time.
-     */
+    /** Update a saved scene (rename). WHEN it plays is a `Schedule` — see the scheduler actions. */
     async updateScene(id: string, body: UpdateSceneBody): Promise<void> {
       const scene = this.scenes.find((sc) => sc.id === id);
-      if (scene) {
-        // optimistic patch
-        if (body.name !== undefined) scene.name = body.name;
-        if (body.scheduleAt !== undefined) {
-          scene.scheduleAt = body.scheduleAt === null ? undefined : body.scheduleAt;
-        }
-      }
+      if (scene && body.name !== undefined) scene.name = body.name; // optimistic
       try {
         await api.updateScene(id, body);
       } catch (err) {
@@ -1703,20 +2041,99 @@ export const useConsoleStore = defineStore("console", {
       await this.updateScene(id, { name: trimmed });
     },
 
-    /** Convenience: set (or clear, with "") a scene's illustrative schedule time. */
-    async scheduleScene(id: string, scheduleAt: string): Promise<void> {
-      const trimmed = scheduleAt.trim();
-      await this.updateScene(id, { scheduleAt: trimmed === "" ? null : trimmed });
-    },
-
-    /** Delete a saved scene. */
+    /** Delete a saved scene. The server also drops any schedule bound to it. */
     async deleteScene(id: string): Promise<void> {
       this.scenes = this.scenes.filter((sc) => sc.id !== id); // optimistic
+      this.schedules = this.schedules.filter((s) => s.sceneId !== id);
       if (this.activeSceneId === id) this.activeSceneId = null;
       try {
         await api.deleteScene(id);
       } catch (err) {
         console.error("[console] deleteScene failed", err);
+      }
+    },
+
+    // ── The scene scheduler (POL-89) ────────────────────────────────────────────
+    //
+    // Thin write-throughs: the authoritative admin/state broadcast (which carries dayparts,
+    // schedules and the settings row) lands within a beat and overwrites whatever we did locally.
+    // Every failure returns a string the view shows verbatim — a 409 on a daypart still in use, a
+    // rejected timezone — because silently swallowing them is how a decoy control happens.
+
+    async createDaypart(name: string, start: string, end: string): Promise<string | null> {
+      try {
+        await api.createDaypart({ name: name.trim(), start, end });
+        return null;
+      } catch (err) {
+        console.error("[console] createDaypart failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not add the daypart";
+      }
+    },
+
+    async updateDaypart(id: string, patch: UpdateDaypartBody): Promise<string | null> {
+      try {
+        await api.updateDaypart(id, patch);
+        return null;
+      } catch (err) {
+        console.error("[console] updateDaypart failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not update the daypart";
+      }
+    },
+
+    async deleteDaypart(id: string): Promise<string | null> {
+      try {
+        await api.deleteDaypart(id);
+        return null;
+      } catch (err) {
+        console.error("[console] deleteDaypart failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not delete the daypart";
+      }
+    },
+
+    async createSchedule(body: CreateScheduleBody): Promise<string | null> {
+      try {
+        await api.createSchedule(body);
+        return null;
+      } catch (err) {
+        console.error("[console] createSchedule failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not add the schedule";
+      }
+    },
+
+    async updateSchedule(id: string, patch: UpdateScheduleBody): Promise<string | null> {
+      const local = this.schedules.find((s) => s.id === id);
+      if (local) Object.assign(local, patch); // optimistic — the broadcast is authoritative
+      try {
+        await api.updateSchedule(id, patch);
+        return null;
+      } catch (err) {
+        console.error("[console] updateSchedule failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not update the schedule";
+      }
+    },
+
+    async deleteSchedule(id: string): Promise<string | null> {
+      this.schedules = this.schedules.filter((s) => s.id !== id); // optimistic
+      try {
+        await api.deleteSchedule(id);
+        return null;
+      } catch (err) {
+        console.error("[console] deleteSchedule failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not delete the schedule";
+      }
+    },
+
+    /** The master switch, THE deployment timezone, and the default scene (the always-on floor). */
+    async updateSchedulerSettings(patch: UpdateSchedulerSettingsBody): Promise<string | null> {
+      const previous = this.scheduler;
+      if (this.scheduler) this.scheduler = { ...this.scheduler, ...patch }; // optimistic
+      try {
+        this.scheduler = await api.updateSchedulerSettings(patch);
+        return null;
+      } catch (err) {
+        this.scheduler = previous;
+        console.error("[console] updateSchedulerSettings failed", err);
+        return err instanceof api.ApiError ? errorText(err) : "could not save the scheduler settings";
       }
     },
 

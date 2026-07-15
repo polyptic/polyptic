@@ -206,9 +206,17 @@ export function swayConfig(p: SwayParams): string {
 
 ### Outputs — pin connectors so per-output placement is deterministic, and keep panels awake.
 ${swayOutputLines(p.outputs)}
-# always-on wall; power is the smart plug's job (no DPMS sleep). NB: sway does NOT accept a trailing
-# '#' comment on a directive line — it parses the rest as arguments — so every comment sits on its
-# own line here.
+# Panels come up LIT and stay lit. This line is the wall's standing state, re-asserted on every
+# compositor start, so a box that reboots comes back showing content — never dark.
+#
+# POL-101 did NOT weaken this. Panel power is now drivable (an operator can sleep a screen, and a
+# panel-hours schedule can sleep it out of hours), but ONLY ever by an explicit \`swaymsg output …
+# dpms off\` from the agent, on the control plane's say-so. Nothing below blanks anything on a timer,
+# and idleness remains meaningless to this wall: a screen that should be showing content must never
+# blank, which is precisely why there is still no swayidle and no lock.
+#
+# NB: sway does NOT accept a trailing '#' comment on a directive line — it parses the rest as
+# arguments — so every comment sits on its own line here.
 output * dpms on
 
 ### No idle / no blank / no lock. A wall runs unattended for days.
@@ -290,6 +298,11 @@ for_window [class=".*"] border none
 ${i3OutputLines(p.outputs)}
 
 ### Always-on: disable the X screensaver + DPMS blanking; hide the cursor.
+# Idleness can never blank this wall. POL-101's panel power does not change that: to sleep a panel the
+# agent pins every DPMS timeout to zero, enables the extension, and issues an explicit
+# \`xset dpms force off\` — so the only thing that can ever darken the glass is the control plane
+# saying so. Waking restores exactly the line below. (X11 DPMS is per-DISPLAY, not per-connector, so
+# on a multi-output x11-i3 box sleep applies to every panel it drives — see backends/x11.ts.)
 exec_always --no-startup-id xset s off -dpms s noblank
 exec_always --no-startup-id unclutter -idle 3
 
@@ -379,6 +392,27 @@ Type=oneshot
 ExecStartPre=-/usr/bin/rm -f ${REBOOT_REQUEST_PATH}
 # --no-block: enqueue the shutdown job and exit, rather than waiting for a transaction that stops us.
 ExecStart=/usr/bin/systemctl --no-block reboot
+`;
+}
+
+// ── HDMI-CEC device access (POL-101) ───────────────────────────────────────────
+//
+// The kernel CEC API lives at /dev/cec* and, on a stock Ubuntu box, is root-owned with no group that
+// an unprivileged kiosk user belongs to — so the agent (which stays unprivileged, D7) cannot open it
+// and CEC silently reports itself unavailable. This rule hands the device to the `video` group, which
+// `setup` already puts the kiosk user in (for the GPU), giving the agent exactly one new capability:
+// telling the attached display to stand by or wake. No sudo, no polkit, nothing else widened.
+//
+// Absent adapter → no device node → the rule matches nothing and costs nothing.
+
+export const CEC_UDEV_RULES_PATH = "/etc/udev/rules.d/70-polyptic-cec.rules";
+
+export function cecUdevRules(): string {
+  return `# ${CEC_UDEV_RULES_PATH} — ${MANAGED}
+# Let the unprivileged kiosk agent drive HDMI-CEC (POL-101): panel standby/wake on the display itself,
+# which is the only rung that actually powers a TV down (DPMS merely stops driving the output).
+# 'video' is the group setup already adds the kiosk user to for GPU access.
+KERNEL=="cec[0-9]*", SUBSYSTEM=="cec", GROUP="video", MODE="0660"
 `;
 }
 

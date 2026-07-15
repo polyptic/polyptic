@@ -24,20 +24,35 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  AudioIntent,
   ContentSource,
   DashboardSurface,
+  Daypart,
   ImageSurface,
+  normalizeTag,
   PlaylistSurface,
   PageSurface,
   Scene,
+  Schedule,
+  SchedulerSettings,
   VideoSurface,
   VideoWall,
   WebSurface,
   Zoom,
+  isValidTimeZone,
   meaningfulHostname,
+  packRects,
+  rectsAreAdjacent,
 } from "@polyptic/protocol";
+import type { Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
+  CreateDaypartBody,
+  CreateScheduleBody,
+  ScheduleSet,
+  UpdateDaypartBody,
+  UpdateScheduleBody,
+  UpdateSchedulerSettingsBody,
   CreateContentSourceBody,
   PlaylistEntry,
   PlaylistItem,
@@ -46,10 +61,12 @@ import type {
   DesiredState,
   DisplayBackend,
   DisplaySettings,
+  FramingVerdict,
   Geometry,
   HostIdentity,
   KioskBrowser,
   Machine,
+  MediaMetadata,
   Mural,
   Output,
   PageData,
@@ -58,7 +75,10 @@ import type {
   PageFeedData,
   PageImageResolution,
   PageWeatherData,
+  PanelHours,
+  PanelPowerConfig,
   Placement,
+  PowerCapabilities,
   PreRegistration,
   SceneContent,
   Screen,
@@ -68,12 +88,14 @@ import type {
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateSceneBody,
+  WindowPlacement,
 } from "@polyptic/protocol";
 
 import type {
   PersistedCredentialProfile,
   PersistedMachine,
   PersistedScene,
+  PersistedSchedulerSettings,
   Store,
 } from "./store/types";
 import type { TokenService } from "./tokens";
@@ -97,6 +119,35 @@ const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
 
 /** POL-57 — an unzoomed page: 100%, the same scale a browser opens a tab at. */
 const DEFAULT_ZOOM = 1;
+
+/**
+ * POL-101 — the zone panel hours START in, before an operator has said anything. This is the server's
+ * own zone (or UTC if the runtime won't say), and it is a SEED, not a policy: the console shows it,
+ * the operator confirms or changes it, and from then on the deployment's choice is explicit and
+ * persisted. A wall in a lobby keeps the lobby's hours, not the datacentre's.
+ */
+function defaultTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+/**
+ * POL-89 — the scheduler's defaults until the operator first touches Settings. The TIMEZONE defaults
+ * to the SERVER's own zone (a deployment has exactly one — a wall lives in one building) but is
+ * stored explicitly the moment anything is saved, so "what plays when" never silently depends on the
+ * host's `TZ` changing under it. `TZ`/the runtime's resolved zone is only ever the seed.
+ */
+export function defaultSchedulerSettings(): SchedulerSettings {
+  const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return {
+    enabled: true,
+    timezone: hostZone && isValidTimeZone(hostZone) ? hostZone : "UTC",
+    defaultSceneId: null,
+  };
+}
 
 /** The two surface kinds that frame a page, and so are the only ones that can be zoomed. */
 type FramedSurface = Extract<Surface, { type: "web" | "dashboard" }>;
@@ -126,6 +177,55 @@ function withZoomedFirstSurface(
   return { ...slice, surfaces: [{ ...surface, zoom }, ...slice.surfaces.slice(1)] };
 }
 
+// ── Audio (POL-112) ──────────────────────────────────────────────────────────
+
+/** The muted-by-default posture, in one place: a wall that nobody asked to make sound makes none. */
+const DEFAULT_AUDIO: AudioIntent = { muted: true, volume: 1 };
+
+/** The surface kinds that can make sound — the only ones the audio control applies to. A framed page
+ *  may well have its own audio, but that is the PAGE's business, not the control plane's. */
+type AudibleSurface = Extract<Surface, { type: "video" | "playlist" }>;
+
+function isAudible(surface: Surface): surface is AudibleSurface {
+  return surface.type === "video" || surface.type === "playlist";
+}
+
+/** The url half of an audible surface's pref key. Mirrors `specUrl`: a video is identified by its
+ *  src, a playlist has no url of its own (its sourceId always identifies it). */
+function audioSurfaceUrl(surface: AudibleSurface): string {
+  return surface.type === "video" ? surface.src : "";
+}
+
+/** "on · 60%" / "muted" — how an audio intent reads in the activity feed. */
+function audioLabel(audio: AudioIntent): string {
+  return audio.muted ? "muted" : `on · ${Math.round(audio.volume * 100)}%`;
+}
+
+/**
+ * THE ONE-UNMUTED-PANEL GUARD (POL-112), enforced server-side so no client can talk a wall into an
+ * echo. Every member of a combined surface renders the same spanning video — N panels means N decoded
+ * video elements — so if they all unmuted, the room would hear N slightly-out-of-phase copies. Only
+ * the ANCHOR member (index 0, deterministic across pushes) carries the operator's intent; every other
+ * member is forced muted, whatever the caller asked for.
+ */
+function wallMemberAudio(audio: AudioIntent, memberIndex: number): AudioIntent {
+  return memberIndex === 0 ? audio : { ...audio, muted: true };
+}
+
+/** A copy of `slice` whose FIRST surface carries `audio`. Same in-place discipline as the zoom patch:
+ *  the surface keeps its id and src, so the player re-applies volume to the element it already has —
+ *  it never remounts, i.e. a video does not restart when the sound comes on. */
+function withAudibleFirstSurface(
+  slice: ScreenSlice,
+  surface: AudibleSurface,
+  audio: AudioIntent,
+): ScreenSlice {
+  return {
+    ...slice,
+    surfaces: [{ ...surface, muted: audio.muted, volume: audio.volume }, ...slice.surfaces.slice(1)],
+  };
+}
+
 /** POL-54 — whoever can mint a screen's player token (the PlayerAuth service, wired after
  *  construction like the token provider; absent in unit tests → tokenless URLs). */
 export type PlayerTokenMinter = (screenId: string) => string;
@@ -151,11 +251,14 @@ function labelForHello(existing: Machine | undefined, input: RegisterMachineInpu
   return meaningfulHostname(input.hostname) ?? input.machineId;
 }
 
-/** One entry of the `server/apply` payload: which screen an output is, and where to point its player. */
+/** One entry of the `server/apply` payload: which screen an output is, where to point its player,
+ *  and (POL-18) any top-level windows the agent must place over that player. */
 export interface ScreenAssignment {
   connector: string;
   screenId: string;
   playerUrl: string;
+  /** Present (non-empty) only when this screen's slice carries `placement: "window"` surfaces. */
+  windows?: WindowPlacement[];
   /** POL-119 — run a cast (AirPlay) receiver on this connector, advertised as `friendlyName`. */
   castEnabled: boolean;
   friendlyName: string;
@@ -168,9 +271,16 @@ export interface RegisterMachineInput {
   /** POL-67 — the kiosk browser the agent reported (chrome = remote DevTools). Held in memory only:
    *  it is re-reported on every hello, and only matters while the box is online. */
   browser?: KioskBrowser;
+  /** POL-101 — what the box can do about panel power (DPMS / CEC), as probed on the box. Memory-only
+   *  for the same reason as `browser`: it is re-reported on every hello, and a box that is offline
+   *  has no panels to power anyway. A pre-POL-101 agent reports nothing and gets no power affordance. */
+  power?: PowerCapabilities;
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
+  /** POL-105 — the OS image the box BOOTED (`/etc/polyptic/image-id`). Absent on a dev box (no live
+   *  image) and on any pre-POL-105 agent; an absent value never ERASES the id we already knew. */
+  imageId?: string;
   /** POL-104 — what the box IS (MACs / DMI serial / arch). Persisted, so a pending card is informative
    *  even while the box is offline. A hello that carries none NEVER blanks what we already know. */
   hardware?: HostIdentity;
@@ -201,10 +311,44 @@ export type CombineScreensResult =
         | "unknown-screen"
         | "not-placed"
         | "wrong-mural"
-        | "already-combined";
+        | "already-combined"
+        // POL-100 — the members don't form one contiguous region (a gap, or a corner-only join). The
+        // caller may retry with `pack: true`, which closes the gaps first.
+        | "not-adjacent";
       screenId?: string;
       wallId?: string;
     };
+
+/** Result of the atomic canvas move (POL-100): the placements that shifted, or why nothing did.
+ *  `breaks-wall` = the move would tear a combined surface apart; NOTHING is written in that case. */
+export type MoveTargetsResult =
+  | { ok: true; placements: Placement[] }
+  | {
+      ok: false;
+      error: "unknown-mural" | "unknown-screen" | "unknown-wall" | "wrong-mural" | "not-placed" | "breaks-wall";
+      screenId?: string;
+      wallId?: string;
+    };
+
+/** Result of an explicit CLEAR (POL-96): the emptied slices to push, or why nothing was cleared. */
+export type ClearContentResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | { ok: false; error: "unknown-screen" | "unknown-wall" | "wall-member"; wallId?: string };
+
+/**
+ * Result of a bulk content apply/clear (POL-96). `slices` is the whole fan-out (one per affected
+ * screen, deduped); `applied` counts the targets that took the change and `skipped` names the ones
+ * that could not (an unknown id, or a screen that is really a wall member) — a partial selection
+ * still does the useful work rather than refusing the lot.
+ */
+export type BulkContentResult =
+  | {
+      ok: true;
+      slices: ScreenSlice[];
+      applied: { screens: number; walls: number };
+      skipped: Array<{ id: string; reason: string }>;
+    }
+  | { ok: false; error: "unknown-source" };
 
 /** Result of `setWallContent`: the per-member slices to render, or why it could not be computed. */
 export type SetWallContentResult =
@@ -223,6 +367,16 @@ export type SetZoomResult =
   | {
       ok: false;
       error: "unknown-screen" | "unknown-wall" | "wall-member" | "no-content" | "not-zoomable";
+      wallId?: string;
+    };
+
+/** Result of `setScreenAudio` / `setWallAudio` (POL-112): the re-sounded slices to push, or why not.
+ *  `not-audible` = the target shows content that cannot make sound (a page, a dashboard, an image). */
+export type SetAudioResult =
+  | { ok: true; slices: ScreenSlice[] }
+  | {
+      ok: false;
+      error: "unknown-screen" | "unknown-wall" | "wall-member" | "no-content" | "not-audible";
       wallId?: string;
     };
 
@@ -258,13 +412,29 @@ export interface ContentAssignment {
  *  page (POL-42) has no url either — it carries the authored definition (embeds inside it resolve
  *  at send time). */
 type ResolvedSpec =
-  | { kind: Exclude<ContentKind, "page">; url: string; entries?: PlaylistEntry[]; startedAt?: string }
+  | {
+      kind: Exclude<ContentKind, "page">;
+      url: string;
+      entries?: PlaylistEntry[];
+      startedAt?: string;
+      /** POL-18 — the placement the SOURCE wants (override, else the framing verdict). Only set for
+       *  web/dashboard kinds; capability gating per target machine happens at build time. */
+      placement?: "iframe" | "window";
+    }
   | { kind: "page"; definition: PageDefinition };
 
 /** The url half of a zoom/name key. Pages carry no url (and take no zoom), so they contribute an
  *  empty url — their sourceId always identifies them. */
 function specUrl(spec: ResolvedSpec): string {
   return spec.kind === "page" ? "" : spec.url;
+}
+
+/** POL-109 — the ingest catalogue's READ seam: what the server probed about an uploaded media URL.
+ *  The MediaStore implements it; the ControlPlane consumes it to decorate a library source with its
+ *  metadata (`ContentSource.media`) and to hand a video surface its poster frame. Absent in unit tests
+ *  (and on a server with no probing toolchain) → sources simply carry no metadata, exactly as before. */
+export interface MediaMetadataProvider {
+  metadataForUrl(url: string): MediaMetadata | undefined;
 }
 
 /** POL-42 — the live data the poller holds for pages: last-good feed items + cached weather. The
@@ -334,9 +504,22 @@ export class ControlPlane {
    *  a wall; a sourceKey identifies the page. Assigning that page there again restores this zoom. */
   private readonly zoomPrefs = new Map<string, number>();
 
+  /** POL-112 — remembered audio intent, keyed by the SAME (target, content) pair as a zoom pref. A
+   *  pair with no entry is MUTED: new content is silent until an operator says otherwise. */
+  private readonly audioPrefs = new Map<string, AudioIntent>();
+
   /** Phase 3d — saved wall snapshots (scenes), keyed by scene id. */
   private readonly scenes = new Map<string, Scene>();
   private sceneCounter = 0;
+
+  /** POL-89 — the scene scheduler: the daypart library, the schedules bound to it, and the one
+   *  deployment-wide settings row. The server's ticker and the console's week strip both resolve
+   *  from exactly this set (it rides `admin/state`), so they can never disagree. */
+  private readonly dayparts = new Map<string, Daypart>();
+  private daypartCounter = 0;
+  private readonly schedules = new Map<string, Schedule>();
+  private scheduleCounter = 0;
+  private schedulerSettings: SchedulerSettings = defaultSchedulerSettings();
 
   /** POL-24 — credential profiles keyed by id. Held as the FULL persisted row (incl. the client
    *  secret) because the control plane is where the secret is written through; every outward-facing
@@ -350,6 +533,9 @@ export class ControlPlane {
   /** POL-42 — the poller's live feed/weather data, consumed at send time (buildPageData). */
   private pageDataProvider?: PageDataProvider;
 
+  /** POL-109 — what ingest probed about each uploaded file, read (never written) by the control plane. */
+  private mediaProvider?: MediaMetadataProvider;
+
   /** POL-54 — mints the per-screen token stamped into every playerUrl the server hands an agent, so
    *  the /player WS can authenticate the hello that comes back. Wired after construction (same
    *  pattern as setTokenProvider); when absent (unit tests), playerUrls simply go out tokenless. */
@@ -358,6 +544,13 @@ export class ControlPlane {
   /** POL-6 — fleet-wide display settings (on-screen badge visibility) pushed to every player. Starts
    *  at the env default; `init()` loads any persisted operator override on top. */
   private displaySettings: DisplaySettings = { showBadges: DEFAULT_SHOW_BADGES };
+
+  /** POL-101 — the zone every panel-hours window is read in. Defaults to the SERVER's zone purely so
+   *  the console's picker opens somewhere sane; an operator's save makes it explicit and persisted. */
+  private panelTimezone: string = defaultTimezone();
+  /** POL-101 — screenId → its daily on/off window. A screen with no entry is never touched by the
+   *  scheduler (it runs 24/7, the pre-POL-101 behaviour, which stays the default for every screen). */
+  private readonly panelHours = new Map<string, PanelHours>();
 
   /**
    * @param store    the durable backing store.
@@ -393,7 +586,6 @@ export class ControlPlane {
         walls: scene.walls,
         screens: scene.screens,
       },
-      scheduleAt: scene.scheduleAt ?? null,
     };
   }
 
@@ -410,6 +602,9 @@ export class ControlPlane {
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
+      tags: machine.tags ?? [],
+      imageId: machine.imageId,
+      imageIdAt: machine.imageIdAt,
       hardware: machine.hardware,
       enrolledTokenId: machine.enrolledTokenId,
       enrolledTokenName: machine.enrolledTokenName,
@@ -440,6 +635,11 @@ export class ControlPlane {
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
         shellArmedAt: m.shellArmedAt,
+        // POL-103 — legacy rows have no tags column value; they load untagged.
+        tags: m.tags ?? [],
+        // POL-105 — the last build this box reported booting (absent until it reports one).
+        imageId: m.imageId,
+        imageIdAt: m.imageIdAt,
         hardware: m.hardware,
         enrolledTokenId: m.enrolledTokenId,
         enrolledTokenName: m.enrolledTokenName,
@@ -559,6 +759,14 @@ export class ControlPlane {
       if (zoom.success) this.zoomPrefs.set(zoomKey(p.targetId, p.sourceKey), zoom.data);
     }
 
+    // ── Audio preferences (POL-112) ───────────────────────────────────────────
+    for (const p of persisted.audioPreferences) {
+      // Re-validate at the edge; a row outside 0–1 (or otherwise malformed) is ignored, which leaves
+      // that pair at the muted default — the failure mode is silence, never a surprise noise.
+      const audio = AudioIntent.safeParse({ muted: p.muted, volume: p.volume });
+      if (audio.success) this.audioPrefs.set(zoomKey(p.targetId, p.sourceKey), audio.data);
+    }
+
     // ── Content library (Phase 3c) ────────────────────────────────────────────
     for (const cs of persisted.contentSources) {
       // Re-validate at the edge; drop a malformed/legacy row rather than crash the boot. Storage
@@ -572,6 +780,8 @@ export class ControlPlane {
         credentialProfileId: cs.credentialProfileId ?? null,
         items: cs.items ?? undefined,
         definition: cs.definition ?? undefined,
+        framing: cs.framing ?? undefined,
+        placementMode: cs.placementMode ?? undefined,
       });
       if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
     }
@@ -603,7 +813,6 @@ export class ControlPlane {
         placements: ps.snapshot.placements ?? [],
         walls: ps.snapshot.walls ?? [],
         screens: ps.snapshot.screens ?? [],
-        ...(ps.scheduleAt ? { scheduleAt: ps.scheduleAt } : {}),
       });
       if (parsed.success) this.scenes.set(parsed.data.id, parsed.data);
     }
@@ -617,6 +826,47 @@ export class ControlPlane {
       }
     }
     this.sceneCounter = maxScene;
+
+    // ── Scene scheduler (POL-89) ──────────────────────────────────────────────
+    for (const pd of persisted.dayparts) {
+      const parsed = Daypart.safeParse(pd);
+      if (parsed.success) this.dayparts.set(parsed.data.id, parsed.data);
+    }
+    let maxDaypart = 0;
+    for (const d of this.dayparts.values()) {
+      const match = /^daypart-(\d+)$/.exec(d.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxDaypart = Math.max(maxDaypart, n);
+      }
+    }
+    this.daypartCounter = maxDaypart;
+
+    for (const psch of persisted.schedules) {
+      const parsed = Schedule.safeParse(psch);
+      if (parsed.success) this.schedules.set(parsed.data.id, parsed.data);
+    }
+    let maxSchedule = 0;
+    for (const s of this.schedules.values()) {
+      const match = /^schedule-(\d+)$/.exec(s.id);
+      if (match) {
+        const n = Number(match[1]);
+        if (Number.isFinite(n)) maxSchedule = Math.max(maxSchedule, n);
+      }
+    }
+    this.scheduleCounter = maxSchedule;
+
+    const persistedScheduler = await this.store.getSchedulerSettings();
+    if (persistedScheduler) {
+      const parsed = SchedulerSettings.safeParse(persistedScheduler);
+      // A stored zone the runtime does not know (an ICU/tzdata downgrade) must not silently become
+      // UTC on a live wall — keep it loud and fall back to the host's zone.
+      if (parsed.success && isValidTimeZone(parsed.data.timezone)) {
+        this.schedulerSettings = parsed.data;
+      } else {
+        this.emit("warn", `Scheduler timezone "${persistedScheduler.timezone}" is unknown here — using ${this.schedulerSettings.timezone}`);
+      }
+    }
 
     // ── Credential profiles (POL-24) ──────────────────────────────────────────
     for (const cp of persisted.credentialProfiles) {
@@ -651,6 +901,66 @@ export class ControlPlane {
     // default (so a deployment that never touches the setting follows its NODE_ENV each boot).
     const persistedSettings = await this.store.getDisplaySettings();
     if (persistedSettings) this.displaySettings = { showBadges: persistedSettings.showBadges };
+
+    // POL-101 — panel hours. Absent until an operator sets one, in which case every wall runs 24/7,
+    // exactly as it did before this feature existed. The default zone is the server's own only as a
+    // starting value for the console's picker; the moment an operator saves, the choice is explicit.
+    const persistedPower = await this.store.getPanelPower();
+    if (persistedPower) {
+      this.panelTimezone = persistedPower.timezone;
+      this.panelHours.clear();
+      for (const [screenId, hours] of Object.entries(persistedPower.hours)) {
+        this.panelHours.set(screenId, { ...hours });
+      }
+    }
+  }
+
+  // ── Panel power (POL-101) ────────────────────────────────────────────────────
+
+  /** The deployment's panel-hours timezone (an IANA zone). Read on every scheduler tick. */
+  getPanelPowerConfig(): PanelPowerConfig {
+    return { timezone: this.panelTimezone };
+  }
+
+  /** One screen's daily window, or undefined when it has none (→ the scheduler never touches it). */
+  getPanelHours(screenId: string): PanelHours | undefined {
+    const hours = this.panelHours.get(screenId);
+    return hours ? { ...hours } : undefined;
+  }
+
+  /** Every screen that HAS a window, for the scheduler. Screens without one are simply absent. */
+  listPanelHours(): Array<{ screenId: string; hours: PanelHours }> {
+    return [...this.panelHours.entries()].map(([screenId, hours]) => ({
+      screenId,
+      hours: { ...hours },
+    }));
+  }
+
+  /** Set (or, with `null`, clear) one screen's panel hours. Persisted; no revision bump — panel hours
+   *  are not part of any render slice, so nothing on the glass changes when they are edited. */
+  async setPanelHours(screenId: string, hours: PanelHours | null): Promise<void> {
+    if (hours) this.panelHours.set(screenId, { ...hours });
+    else this.panelHours.delete(screenId);
+    await this.persistPanelPower();
+  }
+
+  /** Set the deployment's panel-hours timezone. */
+  async setPanelTimezone(timezone: string): Promise<PanelPowerConfig> {
+    this.panelTimezone = timezone;
+    await this.persistPanelPower();
+    return this.getPanelPowerConfig();
+  }
+
+  private async persistPanelPower(): Promise<void> {
+    const hours: Record<string, { enabled: boolean; on: string; off: string }> = {};
+    for (const [screenId, h] of this.panelHours) hours[screenId] = { ...h };
+    await this.store.setPanelPower({ timezone: this.panelTimezone, hours });
+  }
+
+  /** Forget a removed screen's panel hours, so a re-created screen doesn't inherit a ghost schedule. */
+  private async forgetPanelHours(screenId: string): Promise<void> {
+    if (!this.panelHours.delete(screenId)) return;
+    await this.persistPanelPower();
   }
 
   private nextMuralId(): string {
@@ -722,10 +1032,14 @@ export class ControlPlane {
         changed = true;
       }
 
+      // POL-18 — a screen may already hold windowed content (persisted across a restart / an agent
+      // reconnect), so the hello-path apply carries its windows too, not just the player URL.
+      const windows = this.windowsForScreen(screen.id);
       assignments.push({
         connector: output.connector,
         screenId: screen.id,
         playerUrl: this.playerUrlFor(screen.id),
+        ...(windows.length > 0 ? { windows } : {}),
         castEnabled: screen.castEnabled,
         friendlyName: screen.friendlyName,
       });
@@ -824,11 +1138,19 @@ export class ControlPlane {
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
+      power: input.power,
       outputs: input.outputs,
       status: "approved",
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
+      // anything the box reports about itself.
+      tags: existing?.tags ?? [],
+      // POL-105 — the box's own report of the image it BOOTED. A hello that carries none (dev box,
+      // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
+      imageId: input.imageId ?? existing?.imageId,
+      imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
       // POL-104: never blank what we already know. An agent too old to report hardware (or one that
       // could not read its own DMI this boot) must not erase the card an operator relies on. And a
       // machine's enrolment provenance is written ONCE, at first enrolment — a later token re-enrol
@@ -868,11 +1190,19 @@ export class ControlPlane {
       agentVersion: input.agentVersion,
       backend: input.backend,
       browser: input.browser,
+      power: input.power,
       outputs: input.outputs,
       status: "pending",
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
+      // anything the box reports about itself.
+      tags: existing?.tags ?? [],
+      // POL-105 — the box's own report of the image it BOOTED. A hello that carries none (dev box,
+      // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
+      imageId: input.imageId ?? existing?.imageId,
+      imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
       hardware: input.hardware ?? existing?.hardware,
       enrolledTokenId: existing?.enrolledTokenId ?? input.enrolledTokenId,
       enrolledTokenName: existing?.enrolledTokenName ?? input.enrolledTokenName,
@@ -1042,6 +1372,71 @@ export class ControlPlane {
   }
 
   /**
+   * POL-103 — replace a machine's whole tag set. Registry state, like a rename: it changes nothing a
+   * player or an agent renders, so it does NOT bump the revision (a tag edit must not restate the
+   * fleet's desired state). Tags are normalized (trimmed + lowercased) and de-duplicated, so
+   * "Atrium " and "atrium" are the same tag and a selector can never miss a box on casing.
+   * Returns the machine, or null if it is unknown.
+   */
+  async setMachineTags(machineId: string, tags: string[]): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+
+    const next: string[] = [];
+    for (const raw of tags) {
+      const tag = normalizeTag(raw);
+      if (tag !== "" && !next.includes(tag)) next.push(tag);
+    }
+    machine.tags = next;
+    await this.store.setMachineTags(machineId, next);
+
+    this.emit(
+      "info",
+      next.length > 0
+        ? `${machine.label} tagged ${next.join(", ")}`
+        : `${machine.label} untagged`,
+    );
+    return machine;
+  }
+
+  /** POL-105 — the tags a machine carries, for the depot's per-machine manifest (an unknown machine
+   *  carries none, so it can match no ring and simply follows the fleet's active build). */
+  machineTags(machineId: string): string[] {
+    return this.machines.get(machineId)?.tags ?? [];
+  }
+
+  /**
+   * POL-105 — record the OS image a box reports BOOTING (`agent/hello`, and every heartbeat's vitals
+   * so a long-lived session still tells the truth). Persisted, because the box a roll-out stranded is
+   * the box that has gone dark, and "which machines are still on 20260711T…?" has to be answerable
+   * about exactly that box.
+   *
+   * A CHANGE is announced: the id a box comes back on is the only evidence that a roll-out — or a
+   * canary, or a rollback — actually reached it. An unchanged id is silent (it arrives every 5s).
+   * Returns true when the value changed.
+   */
+  async noteMachineImage(machineId: string, imageId: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine || imageId.trim() === "") return false;
+    const next = imageId.trim();
+    if (machine.imageId === next) return false;
+
+    const previous = machine.imageId;
+    const at = new Date().toISOString();
+    machine.imageId = next;
+    machine.imageIdAt = at;
+    await this.store.setMachineImage(machineId, next, at);
+
+    this.emit(
+      "good",
+      previous
+        ? `${machine.label} booted image ${next} (was ${previous})`
+        : `${machine.label} is running image ${next}`,
+    );
+    return true;
+  }
+
+  /**
    * Arm/disarm a machine for the remote shell (POL-59). Returns the machine when it exists (so the
    * caller can broadcast the new state), else null. Disarming does NOT itself kill a live session —
    * the WS relay checks `shellEnabled` on every frame, so a disarm is enforced on the next byte and
@@ -1140,6 +1535,7 @@ export class ControlPlane {
       const idx = this.state.screens.findIndex((s) => s.id === id);
       if (idx >= 0) this.state.screens.splice(idx, 1);
       await this.forgetZooms(id);
+      await this.forgetPanelHours(id); // POL-101 — a screen that no longer exists keeps no schedule
     }
 
     // Drop the machine itself (+ its off-band credential). deleteMachine cascades screens/content/placements.
@@ -1541,6 +1937,7 @@ export class ControlPlane {
     await this.store.deletePlacement(screenId);
     await this.store.deleteScreen(screenId);
     await this.forgetZooms(screenId);
+    await this.forgetPanelHours(screenId); // POL-101 — no screen, no schedule
 
     this.bumpRevision();
     // Persist the cleared content of SURVIVING screens only — the removed one's row is already gone.
@@ -1591,12 +1988,17 @@ export class ControlPlane {
     name: string;
     kind: ContentKind;
     zoom?: number;
+    audio?: AudioIntent;
+    windowed?: boolean;
     entries?: { sourceId?: string; name: string; kind: PlaylistEntry["kind"]; zoom?: number }[];
   } | null {
     const surface = this.state.slices[screenId]?.surfaces[0];
     // POL-57 — the live zoom, present only for framed content. Its absence is how the console knows
     // this screen has nothing to zoom (media, or no content at all) and hides the control.
     const zoom = surface && isFramed(surface) ? surface.zoom : undefined;
+    // POL-18 — flagged when the content renders as an agent-placed window, not a player iframe.
+    const windowed =
+      surface && isFramed(surface) && surface.placement === "window" ? true : undefined;
     // POL-133 — for a playlist, the rotation's steps with each framed step's live zoom on THIS
     // screen, so the console can draw one zoom control per zoomable step.
     const entries =
@@ -1612,15 +2014,28 @@ export class ControlPlane {
         : undefined;
 
     const wall = this.getWallForScreen(screenId);
+    // POL-112 — the live audio, present only for audible content (its absence hides the control). For
+    // a WALL member we report the wall's remembered INTENT rather than the panel's own surface: the
+    // one-unmuted-panel guard leaves every non-anchor member muted, and the console must show the
+    // operator what they asked the wall to do, not the guard's per-panel consequence.
+    const audio = !surface || !isAudible(surface)
+      ? undefined
+      : wall
+        ? this.audioFor(
+            wall.id,
+            this.sourceKeyFor(this.wallSourceIds.get(wall.id) ?? null, audioSurfaceUrl(surface)),
+          )
+        : { muted: surface.muted, volume: surface.volume };
+
     const sourceId = wall ? this.wallSourceIds.get(wall.id) : this.screenSourceIds.get(screenId);
     if (sourceId) {
       const src = this.contentSources.get(sourceId);
-      if (src) return { name: src.name, kind: src.kind, zoom, entries };
+      if (src) return { name: src.name, kind: src.kind, zoom, audio, windowed, entries };
     }
     if (!surface) return null;
     const kind = surface.type as ContentKind;
     const raw = "url" in surface ? surface.url : "src" in surface ? surface.src : "";
-    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, entries };
+    return { name: this.contentNameFromUrl(raw, kind), kind, zoom, audio, windowed, entries };
   }
 
   /** A friendly name for ad-hoc content: the URL host, else a kind label. */
@@ -1684,6 +2099,7 @@ export class ControlPlane {
    * makes the surface render only its slice of a larger spanning content (video walls). The surface id
    * is caller-supplied and STABLE so consecutive pushes reconcile to the same keyed tile (in-place swap,
    * the INSTANT property — D5). `zoom` (POL-57) rides on framed kinds only; media has no page to zoom.
+   * `audio` (POL-112) rides on AUDIBLE kinds only (video, playlist) and defaults to muted.
    */
   private buildSurface(
     spec: ResolvedSpec,
@@ -1691,6 +2107,7 @@ export class ControlPlane {
     region: Geometry,
     span?: Span,
     zoom: number = DEFAULT_ZOOM,
+    audio: AudioIntent = DEFAULT_AUDIO,
   ): Surface {
     const base = span ? { id, region, span } : { id, region };
     switch (spec.kind) {
@@ -1704,16 +2121,36 @@ export class ControlPlane {
           ...base,
           type: "web",
           url: spec.url,
-          placement: "iframe",
+          placement: spec.placement ?? "iframe",
           interactive: false,
           zoom,
         });
       case "dashboard":
-        return DashboardSurface.parse({ ...base, type: "dashboard", url: spec.url, zoom });
+        return DashboardSurface.parse({
+          ...base,
+          type: "dashboard",
+          url: spec.url,
+          placement: spec.placement ?? "iframe",
+          zoom,
+        });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
-      case "video":
-        return VideoSurface.parse({ ...base, type: "video", src: spec.url, loop: true, muted: true });
+      case "video": {
+        // POL-109 — the ingest's poster frame rides along, so the panel paints the video's own first
+        // frame while it buffers instead of a black rectangle. Absent for a linked/unprobed video.
+        // POL-112 — `audio` is the operator's remembered intent for this (target, content) pair; a
+        // pair nobody has touched resolves to DEFAULT_AUDIO, i.e. muted. It is NOT hardcoded here.
+        const poster = this.mediaFor(spec.url)?.posterUrl;
+        return VideoSurface.parse({
+          ...base,
+          type: "video",
+          src: spec.url,
+          loop: true,
+          muted: audio.muted,
+          volume: audio.volume,
+          ...(poster ? { poster } : {}),
+        });
+      }
       case "playlist":
         // POL-34 — the whole resolved rotation ships in one surface; the player advances it locally.
         // `startedAt` came off the spec (resolved once per assignment), so every wall member anchors
@@ -1723,6 +2160,8 @@ export class ControlPlane {
           type: "playlist",
           items: spec.entries ?? [],
           startedAt: spec.startedAt ?? new Date().toISOString(),
+          muted: audio.muted,
+          volume: audio.volume,
         });
     }
   }
@@ -1754,6 +2193,11 @@ export class ControlPlane {
       if (key.startsWith(`${targetId}\u0000`)) this.zoomPrefs.delete(key);
     }
     await this.store.deleteZoomPreferencesForTarget(targetId);
+    // POL-112 — the audio prefs of a dead screen/wall are dead weight too (ids are never reused).
+    for (const key of [...this.audioPrefs.keys()]) {
+      if (key.startsWith(`${targetId}\u0000`)) this.audioPrefs.delete(key);
+    }
+    await this.store.deleteAudioPreferencesForTarget(targetId);
   }
 
   /** The page identity a zoom is remembered against: a library source by id, else the ad-hoc URL. */
@@ -1983,12 +2427,162 @@ export class ControlPlane {
     return { ok: true, slices };
   }
 
+  // ── Audio (POL-112) ─────────────────────────────────────────────────────────
+  //
+  // Audio is a property of the (target, content) PAIR — the same reasoning as zoom (POL-57), and for
+  // the same reason it is NOT a property of the screen: the lobby panel wants the showreel loud and
+  // the same panel wants the safety briefing silent, so a per-screen master volume would be a knob an
+  // operator has to remember to re-set on every content change. It is not a property of the library
+  // source either: one clip is the sound of the lobby and background wallpaper in the boardroom.
+  //
+  // The default for a pair nobody has touched is MUTED. That asymmetry with zoom is deliberate: an
+  // unexpectedly loud wall is a support call, so sound is opt-in, per placement, every time — a NEW
+  // assignment has no pref row and therefore arrives silent, and only the same content returning to
+  // the same target restores what the operator dialled in.
+
+  /** The remembered audio for a (target, content) pair — muted when the operator never set one. */
+  private audioFor(targetId: string, sourceKey: string): AudioIntent {
+    return this.audioPrefs.get(zoomKey(targetId, sourceKey)) ?? DEFAULT_AUDIO;
+  }
+
+  /** Remember the audio for a pair, write-through. An explicit re-mute is STORED, not dropped: the
+   *  operator turning the sound back off must survive a restart as firmly as turning it on. */
+  private async rememberAudio(targetId: string, sourceKey: string, audio: AudioIntent): Promise<void> {
+    this.audioPrefs.set(zoomKey(targetId, sourceKey), audio);
+    await this.store.upsertAudioPreference({ targetId, sourceKey, muted: audio.muted, volume: audio.volume });
+  }
+
+  /**
+   * Set the audio on a single screen's audible content. Patches the EXISTING surface (id and src
+   * untouched) so the player re-applies muted/volume to the element it already has: the sound comes on
+   * mid-clip, the video does not restart, no reload (D5). Rejected if the screen is a wall member
+   * (audio belongs to the combined surface — see the guard), shows nothing, or shows silent content.
+   */
+  async setScreenAudio(screenId: string, audio: AudioIntent): Promise<SetAudioResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slice = this.state.slices[screenId];
+    const surface = slice?.surfaces[0];
+    if (slice === undefined || surface === undefined) return { ok: false, error: "no-content" };
+    if (!isAudible(surface)) return { ok: false, error: "not-audible" };
+
+    const next: ScreenSlice = withAudibleFirstSurface(slice, surface, audio);
+    this.state.slices[screenId] = next;
+    this.bumpRevision();
+
+    const sourceId = this.screenSourceIds.get(screenId) ?? null;
+    await this.rememberAudio(screenId, this.sourceKeyFor(sourceId, audioSurfaceUrl(surface)), audio);
+    await this.store.upsertContent({
+      screenId,
+      canvas: next.canvas,
+      surfaces: next.surfaces,
+      sourceId,
+    });
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${screen.friendlyName} sound ${audioLabel(audio)}`);
+    return { ok: true, slices: [next] };
+  }
+
+  /**
+   * Set the audio on a combined surface. Every member decodes its own copy of the spanning video, so
+   * unmuting them all would play the room N out-of-phase copies of the same soundtrack: the ANCHOR
+   * member takes the operator's intent and every other member is forced muted (`wallMemberAudio`).
+   * The guard lives HERE, server-side — a client cannot opt out of it.
+   */
+  async setWallAudio(wallId: string, audio: AudioIntent): Promise<SetAudioResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices: ScreenSlice[] = [];
+    let sourceKey: string | undefined;
+    let memberIndex = 0;
+    for (const screenId of wall.memberScreenIds) {
+      const slice = this.state.slices[screenId];
+      const surface = slice?.surfaces[0];
+      if (slice === undefined || surface === undefined) continue;
+      if (!isAudible(surface)) return { ok: false, error: "not-audible" };
+      sourceKey ??= this.sourceKeyFor(this.wallSourceIds.get(wallId) ?? null, audioSurfaceUrl(surface));
+      const next: ScreenSlice = withAudibleFirstSurface(
+        slice,
+        surface,
+        wallMemberAudio(audio, memberIndex),
+      );
+      this.state.slices[screenId] = next;
+      slices.push(next);
+      memberIndex += 1;
+    }
+    if (slices.length === 0 || sourceKey === undefined) return { ok: false, error: "no-content" };
+
+    this.bumpRevision();
+    // Remember the operator's INTENT against the wall (not the per-member guarded value): the guard is
+    // re-applied on every rebuild, so a member joining/leaving never resurrects a second sounding panel.
+    await this.rememberAudio(wallId, sourceKey, audio);
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: this.wallSourceIds.get(wallId) ?? null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("good", `${wall.name ?? wall.id} sound ${audioLabel(audio)}`);
+    return { ok: true, slices };
+  }
+
   /**
    * Resolve a library source to its renderable spec. A playlist (POL-34) resolves each authored item
    * to a concrete entry AT THIS MOMENT — an item whose source was deleted (or somehow became another
    * playlist) is skipped, and a timed kind that lost its duration to authoring-time drift falls back
    * to the default hold — and stamps the rotation anchor once, shared by every surface built from it.
    */
+  /**
+   * POL-18 — the placement a web/dashboard SOURCE wants: the operator's override when set, else
+   * "window" iff the framing probe said the source refuses to be framed. `unknown` (unprobed / probe
+   * failed) resolves to "iframe" — a false "blocked" would windowize content that frames fine.
+   */
+  private desiredPlacement(source: ContentSource): "iframe" | "window" {
+    if (source.kind !== "web" && source.kind !== "dashboard") return "iframe";
+    const mode = source.placementMode ?? "auto";
+    if (mode !== "auto") return mode;
+    return source.framing === "blocked" ? "window" : "iframe";
+  }
+
+  /**
+   * POL-18 — can this screen's machine actually PLACE a top-level window? Only the wayland-sway
+   * backend implements window placement (swaymsg floating + absolute move); everything else — the
+   * x11-i3 fallback, dev-open — degrades to the iframe rather than showing nothing. The degrade is
+   * decided HERE (the server knows the machine) so the wall never renders a hole nobody will fill.
+   */
+  private canPlaceWindows(screenId: string): boolean {
+    const screen = this.getScreen(screenId);
+    const machine = screen ? this.machines.get(screen.machineId) : undefined;
+    return machine?.backend === "wayland-sway";
+  }
+
+  /**
+   * POL-18 — the spec as it must resolve ON THIS SCREEN: a window-wanting spec degrades to the
+   * iframe when the box can't place windows (and says so in the activity feed — the operator asked
+   * for a window and should learn from the console, not from a dead tile, why they got a frame).
+   */
+  private specForScreen(spec: ResolvedSpec, screenId: string): ResolvedSpec {
+    if (spec.kind !== "web" && spec.kind !== "dashboard") return spec;
+    if (spec.placement !== "window") return spec;
+    if (this.canPlaceWindows(screenId)) return spec;
+    const screen = this.getScreen(screenId);
+    this.emit(
+      "warn",
+      `${screen?.friendlyName ?? screenId} cannot place windows (backend without window placement) — showing framed instead`,
+    );
+    return { ...spec, placement: "iframe" };
+  }
+
   private specFor(source: ContentSource): ResolvedSpec {
     if (source.kind === "page") {
       // A malformed row that lost its definition resolves to an EMPTY page rather than crashing.
@@ -1997,11 +2591,23 @@ export class ControlPlane {
         definition: source.definition ?? { aspect: "16:9", bg: "#0b0b0e", elements: [] },
       };
     }
-    if (source.kind !== "playlist") return { kind: source.kind, url: source.url ?? "" };
+    if (source.kind !== "playlist") {
+      return {
+        kind: source.kind,
+        url: source.url ?? "",
+        // POL-18 — web/dashboard carry the source's desired placement; media ignores it.
+        ...(source.kind === "web" || source.kind === "dashboard"
+          ? { placement: this.desiredPlacement(source) }
+          : {}),
+      };
+    }
     const entries: PlaylistEntry[] = [];
     for (const item of source.items ?? []) {
       const step = this.contentSources.get(item.sourceId);
       if (!step || step.kind === "playlist" || step.kind === "page" || !step.url) continue;
+      // POL-109 — a video step carries its ingest poster, so each step of a rotation pre-paints its
+      // own first frame rather than flashing black on every advance.
+      const poster = step.kind === "video" ? this.mediaFor(step.url)?.posterUrl : undefined;
       entries.push({
         kind: step.kind,
         url: step.url,
@@ -2011,6 +2617,7 @@ export class ControlPlane {
             ? { durationSeconds: DEFAULT_PLAYLIST_ITEM_SECONDS }
             : {}),
         sourceId: step.id,
+        ...(poster ? { poster } : {}),
         // POL-133 — target-agnostic default; specForTarget stamps the remembered per-step zoom in.
         zoom: DEFAULT_ZOOM,
       });
@@ -2060,8 +2667,26 @@ export class ControlPlane {
    * if none of the wall's members are still placed on its mural). Does NOT bump/persist — the caller does.
    *
    * POL-57: `zoom` is the wall's remembered zoom for this page, applied uniformly to every member.
+   * POL-112: `audio` is the wall's remembered audio intent — NOT applied uniformly. The one-unmuted-
+   * panel guard gives it to the anchor member only; every other member is forced muted, so a wall can
+   * never echo itself. Membership order is stable, so the same panel keeps the sound across pushes.
    */
-  private computeWallSlices(wall: VideoWall, spec: ResolvedSpec, zoom = DEFAULT_ZOOM): ScreenSlice[] {
+  private computeWallSlices(
+    wall: VideoWall,
+    spec: ResolvedSpec,
+    zoom = DEFAULT_ZOOM,
+    audio: AudioIntent = DEFAULT_AUDIO,
+  ): ScreenSlice[] {
+    // POL-18 — a video wall never windows: a spanned surface is one CONTENT sliced across members,
+    // and a top-level window can neither be sliced nor span outputs. A window-wanting source on a
+    // wall degrades to the iframe (with a console-visible note) rather than leaving member holes.
+    if ((spec.kind === "web" || spec.kind === "dashboard") && spec.placement === "window") {
+      this.emit(
+        "warn",
+        `${wall.name ?? wall.id}: windowed placement is not supported on a video wall — showing framed instead`,
+      );
+      spec = { ...spec, placement: "iframe" };
+    }
     const members: { screenId: string; placement: Placement }[] = [];
     for (const screenId of wall.memberScreenIds) {
       const placement = this.placements.get(screenId);
@@ -2084,6 +2709,7 @@ export class ControlPlane {
     const contentH = unionMaxY - unionMinY;
 
     const slices: ScreenSlice[] = [];
+    let memberIndex = 0;
     for (const { screenId, placement } of members) {
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
@@ -2100,7 +2726,9 @@ export class ControlPlane {
           offsetY: placement.y - unionMinY,
         },
         zoom,
+        wallMemberAudio(audio, memberIndex),
       );
+      memberIndex += 1;
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
       slices.push(next);
@@ -2120,6 +2748,7 @@ export class ControlPlane {
     muralId: string,
     memberScreenIds: string[],
     name?: string,
+    pack = false,
   ): Promise<CombineScreensResult> {
     if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
 
@@ -2137,6 +2766,21 @@ export class ControlPlane {
       const existing = this.getWallForScreen(screenId);
       if (existing) {
         return { ok: false, error: "already-combined", screenId, wallId: existing.id };
+      }
+    }
+
+    // POL-100 — a wall must be ONE contiguous region (see the adjacency rule in protocol/geometry).
+    // A gappy selection is either packed bezel-tight first (the operator asked) or refused outright:
+    // combining it would span content across canvas that no screen is showing.
+    const rects = ids.map((sid) => this.placements.get(sid)!);
+    if (!rectsAreAdjacent(rects)) {
+      if (!pack) return { ok: false, error: "not-adjacent" };
+      const packed = packRects(rects);
+      if (!rectsAreAdjacent(packed)) return { ok: false, error: "not-adjacent" };
+      for (let i = 0; i < ids.length; i++) {
+        const next: Placement = { ...rects[i]!, x: packed[i]!.x, y: packed[i]!.y };
+        this.placements.set(next.screenId, next);
+        await this.store.upsertPlacement(next);
       }
     }
 
@@ -2253,12 +2897,21 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
+    const sourceKey = this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec));
     // POL-57 — restore the zoom this wall last used FOR THIS PAGE (100% if it never has).
-    const zoom = this.zoomFor(wallId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
+    const zoom = this.zoomFor(wallId, sourceKey);
+    // POL-112 — restore the audio this wall last used FOR THIS CONTENT. Content it has never sounded
+    // arrives MUTED: assigning something new to a wall never surprises the room.
+    const audio = this.audioFor(wallId, sourceKey);
 
     // Recompute each member's span slice (union-bbox math, any surface kind — Phase 3b + 3c).
     // POL-133 — a playlist's framed steps pick up this wall's remembered per-step zooms.
-    const slices = this.computeWallSlices(wall, this.specForTarget(wallId, resolved.spec), zoom);
+    const slices = this.computeWallSlices(
+      wall,
+      this.specForTarget(wallId, resolved.spec),
+      zoom,
+      audio,
+    );
     if (slices.length === 0) return { ok: false, error: "no-placements" };
 
     // Record which library source (if any) this wall now spans, persisting the wall row.
@@ -2301,18 +2954,24 @@ export class ControlPlane {
     const resolved = this.resolveSpec(a);
     if ("error" in resolved) return { ok: false, error: resolved.error };
 
+    const sourceKey = this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec));
     // POL-57 — restore the zoom this screen last used FOR THIS PAGE (100% if it never has), so the
     // operator dials a dashboard in once per screen and it comes back that way every time.
-    const zoom = this.zoomFor(screenId, this.sourceKeyFor(resolved.sourceId, specUrl(resolved.spec)));
+    const zoom = this.zoomFor(screenId, sourceKey);
+    // POL-112 — likewise the audio, which defaults to MUTED for content this screen has never sounded.
+    const audio = this.audioFor(screenId, sourceKey);
 
     // Stable surface id ("content-web") so repeated assignments patch the player's tile in place (D5).
     // POL-133 — a playlist's framed steps pick up this screen's remembered per-step zooms.
     const surface = this.buildSurface(
-      this.specForTarget(screenId, resolved.spec),
+      // POL-18 — degrade a window-wanting spec on a box that can't place windows.
+      // POL-133 — stamp this screen's remembered per-step zoom into a playlist's framed steps.
+      this.specForScreen(this.specForTarget(screenId, resolved.spec), screenId),
       "content-web",
       { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
       undefined,
       zoom,
+      audio,
     );
     const next: ScreenSlice = { ...slice, surfaces: [surface] };
     this.state.slices[screenId] = next;
@@ -2334,6 +2993,262 @@ export class ControlPlane {
     return { ok: true, slice: next };
   }
 
+  // ── Clearing content + bulk canvas operations (POL-96) ──────────────────────
+  //
+  // Until now content could only be REPLACED, never removed: "show nothing" had no API path at all.
+  // Clearing is the same mutation combine/split already make internally (empty the slice, drop the
+  // library-source assignment, push) — it just becomes something the operator can ask for. A cleared
+  // screen falls back to the player's idle splash (D39). Bulk is the same primitives run under one
+  // emit, so a 20-screen selection is one REST call, one broadcast and one activity line.
+
+  /** Clear a single screen's content (it falls back to the idle splash). A wall member is refused —
+   *  its content belongs to the combined surface, so the WALL is what gets cleared. */
+  async clearScreenContent(screenId: string): Promise<ClearContentResult> {
+    const screen = this.getScreen(screenId);
+    if (screen === undefined) return { ok: false, error: "unknown-screen" };
+
+    const wall = this.getWallForScreen(screenId);
+    if (wall) return { ok: false, error: "wall-member", wallId: wall.id };
+
+    const slices = this.clearSlices([screenId]);
+    if (slices.length === 0) return { ok: false, error: "unknown-screen" };
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("info", `${screen.friendlyName} cleared`);
+    return { ok: true, slices };
+  }
+
+  /** Clear a combined surface's spanning content — every member goes blank (idle splash), and the
+   *  wall keeps existing (it is a grouping, not a piece of content). */
+  async clearWallContent(wallId: string): Promise<ClearContentResult> {
+    const wall = this.videoWalls.get(wallId);
+    if (wall === undefined) return { ok: false, error: "unknown-wall" };
+
+    const slices = this.clearSlices(wall.memberScreenIds);
+    await this.setWallSourceAssignment(wall, null);
+
+    this.bumpRevision();
+    for (const slice of slices) {
+      await this.store.upsertContent({
+        screenId: slice.screenId,
+        canvas: slice.canvas,
+        surfaces: slice.surfaces,
+        sourceId: null,
+      });
+    }
+    await this.store.setRevision(this.state.revision);
+
+    this.emit("info", `${wall.name ?? wall.id} cleared`);
+    return { ok: true, slices };
+  }
+
+  /**
+   * Assign content to — or clear it from — many screens and walls in ONE mutation (POL-96). Runs the
+   * per-target primitives with their activity lines suppressed and emits a single summary instead;
+   * the caller pushes the returned slices (deduped) and broadcasts once. Targets that cannot take the
+   * change (an unknown id; a screen that is a member of a wall) are SKIPPED and named back, so a
+   * selection that includes one awkward screen still does the operator's work.
+   */
+  async applyBulkContent(
+    targets: { screenIds: readonly string[]; wallIds: readonly string[] },
+    content: ContentAssignment | null,
+  ): Promise<BulkContentResult> {
+    // Fail fast on a bad source: a bulk assign that can't resolve should change nothing at all.
+    if (content) {
+      const resolved = this.resolveSpec(content);
+      if ("error" in resolved) return { ok: false, error: "unknown-source" };
+    }
+
+    const touched = new Map<string, ScreenSlice>();
+    const skipped: Array<{ id: string; reason: string }> = [];
+    let screens = 0;
+    let walls = 0;
+    let name = "";
+
+    this.suppressEmit = true;
+    try {
+      for (const wallId of targets.wallIds) {
+        const result = content
+          ? await this.setWallContent(wallId, content)
+          : await this.clearWallContent(wallId);
+        if (!result.ok) {
+          skipped.push({ id: wallId, reason: result.error });
+          continue;
+        }
+        for (const slice of result.slices) touched.set(slice.screenId, slice);
+        walls += 1;
+        name ||= this.videoWalls.get(wallId)?.name ?? wallId;
+      }
+
+      for (const screenId of targets.screenIds) {
+        if (content) {
+          const result = await this.setScreenContent(screenId, content);
+          if (!result.ok) {
+            skipped.push({ id: screenId, reason: result.error });
+            continue;
+          }
+          touched.set(result.slice.screenId, result.slice);
+        } else {
+          const result = await this.clearScreenContent(screenId);
+          if (!result.ok) {
+            skipped.push({ id: screenId, reason: result.error });
+            continue;
+          }
+          for (const slice of result.slices) touched.set(slice.screenId, slice);
+        }
+        screens += 1;
+        name ||= this.getScreen(screenId)?.friendlyName ?? screenId;
+      }
+    } finally {
+      this.suppressEmit = false;
+    }
+
+    const applied = screens + walls;
+    if (applied > 0) {
+      const what = applied === 1 ? name : `${applied} targets`;
+      if (content) {
+        const resolved = this.resolveSpec(content);
+        const contentName =
+          "error" in resolved ? "content" : this.resolvedContentName(resolved.spec, resolved.sourceId);
+        this.emit("good", `${what} → ${contentName}`);
+      } else {
+        this.emit("info", `${what} cleared`);
+      }
+    }
+
+    return { ok: true, slices: [...touched.values()], applied: { screens, walls }, skipped };
+  }
+
+  /**
+   * Return several screens to the unplaced tray in one mutation (POL-96). Unplacing a wall member
+   * dissolves that wall exactly as the single-screen path does — the returned slices are every screen
+   * that must be re-rendered. One activity line for the lot.
+   */
+  async unplaceScreens(screenIds: readonly string[]): Promise<{ slices: ScreenSlice[]; unplaced: string[] }> {
+    const touched = new Map<string, ScreenSlice>();
+    const unplaced: string[] = [];
+    let name = "";
+
+    this.suppressEmit = true;
+    try {
+      for (const screenId of screenIds) {
+        const result = await this.unplaceScreen(screenId);
+        if (result === false) continue;
+        for (const slice of result.slices) touched.set(slice.screenId, slice);
+        unplaced.push(screenId);
+        name ||= this.getScreen(screenId)?.friendlyName ?? screenId;
+      }
+    } finally {
+      this.suppressEmit = false;
+    }
+
+    if (unplaced.length === 1) this.emit("info", `${name} unplaced`);
+    else if (unplaced.length > 1) this.emit("info", `${unplaced.length} screens unplaced`);
+
+    return { slices: [...touched.values()], unplaced };
+  }
+
+  // ── The atomic canvas move (POL-100) ────────────────────────────────────────
+  //
+  // Dragging a WALL moves every member together; a keyboard nudge moves a whole selection. Both are
+  // ONE intent, so both are one mutation: every named screen and every member of every named wall is
+  // translated by the same (dx, dy), and the result is written through only if EVERY wall the move
+  // touches is still adjacent afterwards. A rigid translation preserves adjacency by construction —
+  // the re-check is what makes that a guarantee rather than an assumption, and it also catches the
+  // case where a loose screen in the same move happens to be a member of another wall.
+
+  /**
+   * Translate placements by (dx, dy), atomically. All targets must live on `muralId`. Returns the new
+   * placements, or an error result — and on ANY error nothing at all is written (the check runs on a
+   * projection of the move before a single row is touched), so a move can never leave a broken wall.
+   */
+  async moveTargets(
+    muralId: string,
+    targets: { screenIds: readonly string[]; wallIds: readonly string[] },
+    dx: number,
+    dy: number,
+  ): Promise<MoveTargetsResult> {
+    if (!this.murals.has(muralId)) return { ok: false, error: "unknown-mural" };
+
+    // Collect the screens to move: the named ones plus every member of every named wall.
+    const moving = new Set<string>();
+    for (const wallId of targets.wallIds) {
+      const wall = this.videoWalls.get(wallId);
+      if (!wall) return { ok: false, error: "unknown-wall", wallId };
+      if (wall.muralId !== muralId) return { ok: false, error: "wrong-mural", wallId };
+      for (const sid of wall.memberScreenIds) moving.add(sid);
+    }
+    for (const screenId of targets.screenIds) {
+      if (!this.getScreen(screenId)) return { ok: false, error: "unknown-screen", screenId };
+      moving.add(screenId);
+    }
+
+    for (const screenId of moving) {
+      const placement = this.placements.get(screenId);
+      if (!placement) return { ok: false, error: "not-placed", screenId };
+      if (placement.muralId !== muralId) return { ok: false, error: "wrong-mural", screenId };
+    }
+
+    // Project the move, then re-check every wall it touches BEFORE writing anything.
+    const next = new Map<string, Placement>();
+    for (const screenId of moving) {
+      const p = this.placements.get(screenId)!;
+      next.set(screenId, { ...p, x: p.x + dx, y: p.y + dy });
+    }
+    const projected = (screenId: string): Placement | undefined =>
+      next.get(screenId) ?? this.placements.get(screenId);
+
+    for (const wall of this.videoWalls.values()) {
+      if (!wall.memberScreenIds.some((sid) => moving.has(sid))) continue;
+      const rects: Rect[] = [];
+      for (const sid of wall.memberScreenIds) {
+        const p = projected(sid);
+        if (p) rects.push(p);
+      }
+      if (!rectsAreAdjacent(rects)) return { ok: false, error: "breaks-wall", wallId: wall.id };
+    }
+
+    for (const [screenId, placement] of next) {
+      this.placements.set(screenId, placement);
+      await this.store.upsertPlacement(placement);
+    }
+
+    // Placements are not part of any render slice (the span offsets are union-RELATIVE, so a rigid
+    // translation leaves every member's slice byte-identical) — no revision bump, no push. The
+    // console repaints from the admin/state broadcast the REST layer sends.
+    return { ok: true, placements: [...next.values()] };
+  }
+
+  /**
+   * Would placing `screenId` at `rect` tear apart the wall it belongs to? Returns that wall, or null
+   * when the screen is wall-free or the wall survives the move. The REST placement edge calls this so
+   * a single-screen drag can never leave a wall with a hole in it (POL-100).
+   */
+  wallBrokenByPlacement(screenId: string, rect: Rect): VideoWall | null {
+    const wall = this.getWallForScreen(screenId);
+    if (!wall) return null;
+    const rects: Rect[] = [];
+    for (const sid of wall.memberScreenIds) {
+      if (sid === screenId) {
+        rects.push(rect);
+        continue;
+      }
+      const p = this.placements.get(sid);
+      if (p) rects.push(p);
+    }
+    return rectsAreAdjacent(rects) ? null : wall;
+  }
+
   // ── Content library (Phase 3c) ──────────────────────────────────────────────
   //
   // A ContentSource is a reusable, named library entry ({id, name, kind, url}). Screens/walls are
@@ -2342,12 +3257,36 @@ export class ControlPlane {
   // that editing or deleting an IN-USE source re-resolves (or clears) every screen/wall showing it and
   // returns those slices for the caller to push.
 
+  /** POL-109 — wire the ingest catalogue after construction (same pattern as setTokenProvider). */
+  setMediaProvider(provider: MediaMetadataProvider): void {
+    this.mediaProvider = provider;
+  }
+
+  /** POL-109 — the probed metadata for an uploaded media url, if we ingested it. */
+  private mediaFor(url: string | undefined): MediaMetadata | undefined {
+    if (!url || !this.mediaProvider) return undefined;
+    return this.mediaProvider.metadataForUrl(url);
+  }
+
+  /**
+   * POL-109 — hang the ingest facts (duration/dimensions/codec/poster) on a library source on the way
+   * OUT. Derived, never stored: the media catalogue (which travels with the media volume) is the one
+   * source of truth, so nothing has to be migrated and a re-ingest is instantly visible. Only uploaded
+   * image/video sources have any — a linked URL was never probed and honestly says nothing.
+   */
+  private decorateSource(source: ContentSource): ContentSource {
+    if (source.kind !== "image" && source.kind !== "video") return source;
+    const media = this.mediaFor(source.url);
+    return media ? { ...source, media } : source;
+  }
+
   getContentSources(): ContentSource[] {
-    return [...this.contentSources.values()];
+    return [...this.contentSources.values()].map((s) => this.decorateSource(s));
   }
 
   getContentSource(id: string): ContentSource | undefined {
-    return this.contentSources.get(id);
+    const source = this.contentSources.get(id);
+    return source ? this.decorateSource(source) : undefined;
   }
 
   /**
@@ -2418,6 +3357,8 @@ export class ControlPlane {
       credentialProfileId: source.credentialProfileId ?? null,
       items: source.items ?? null,
       definition: source.definition ?? null,
+      framing: source.framing ?? null,
+      placementMode: source.placementMode ?? null,
     };
   }
 
@@ -2476,6 +3417,11 @@ export class ControlPlane {
       credentialProfileId,
       items: body.items,
       definition: body.definition,
+      // POL-18 — the override only means something on frameable kinds; framing arrives later, from
+      // the caller's async probe (setSourceFraming).
+      ...(body.kind === "web" || body.kind === "dashboard"
+        ? { placementMode: body.placementMode }
+        : {}),
     });
     this.contentSources.set(id, source);
     await this.store.upsertContentSource(this.toPersistedSource(source));
@@ -2499,11 +3445,16 @@ export class ControlPlane {
       const slice = this.state.slices[screenId];
       if (slice === undefined) continue;
       const surface = this.buildSurface(
-        this.specForTarget(screenId, spec),
+        // POL-18 — degrade a window-wanting spec per screen (a mixed fleet resolves per machine).
+        // POL-133 — stamp this screen's remembered per-step zoom into a playlist's framed steps.
+        this.specForScreen(this.specForTarget(screenId, spec), screenId),
         "content-web",
         { x: 0, y: 0, w: slice.canvas.w, h: slice.canvas.h },
         undefined,
         this.zoomFor(screenId, sourceKey),
+        // POL-112 — an edit to the source must not silently mute (or unmute) a screen that is already
+        // sounding it: the remembered intent for this pair rides through the re-resolve.
+        this.audioFor(screenId, sourceKey),
       );
       const next: ScreenSlice = { ...slice, surfaces: [surface] };
       this.state.slices[screenId] = next;
@@ -2515,7 +3466,8 @@ export class ControlPlane {
       const wall = this.videoWalls.get(wallId);
       if (wall === undefined) continue;
       const zoom = this.zoomFor(wallId, sourceKey);
-      for (const next of this.computeWallSlices(wall, this.specForTarget(wallId, spec), zoom))
+      const audio = this.audioFor(wallId, sourceKey);
+      for (const next of this.computeWallSlices(wall, this.specForTarget(wallId, spec), zoom, audio))
         byScreen.set(next.screenId, next);
     }
 
@@ -2582,6 +3534,15 @@ export class ControlPlane {
       credentialProfileId,
       items,
       definition,
+      // POL-18 — placement fields live on web/dashboard kinds only. A changed URL DROPS the framing
+      // verdict (it described the old address; the caller re-probes and stamps the new one), and a
+      // kind change away from web/dashboard sheds both.
+      ...(kind === "web" || kind === "dashboard"
+        ? {
+            framing: nextUrl === existing.url ? existing.framing : undefined,
+            placementMode: patch.placementMode ?? existing.placementMode,
+          }
+        : {}),
     });
     if (!merged.success) return { ok: false, error: "invalid-source" };
     const source = merged.data;
@@ -2624,6 +3585,104 @@ export class ControlPlane {
     const pageSlices = this.slicesShowingPagesEmbedding(id).filter((s) => !seen.has(s.screenId));
 
     return { ok: true, source, slices: [...slices, ...pageSlices] };
+  }
+
+  /**
+   * POL-18 — record a framing-probe verdict on a web/dashboard source. Persists the verdict and,
+   * when it can change how the source RENDERS (the override is "auto"), re-resolves every screen
+   * showing it — the automatic web → web-window fallback. Returns the touched slices for the caller
+   * to push (renders to players + a fresh apply to the affected machines). No-ops (changed: false)
+   * on unknown sources, non-frameable kinds, and an unchanged verdict.
+   */
+  async setSourceFraming(
+    id: string,
+    verdict: FramingVerdict,
+  ): Promise<{ changed: boolean; source?: ContentSource; slices: ScreenSlice[] }> {
+    const existing = this.contentSources.get(id);
+    if (!existing || (existing.kind !== "web" && existing.kind !== "dashboard")) {
+      return { changed: false, slices: [] };
+    }
+    if ((existing.framing ?? "unknown") === verdict) {
+      return { changed: false, source: existing, slices: [] };
+    }
+    const source: ContentSource = { ...existing, framing: verdict };
+    this.contentSources.set(id, source);
+    await this.store.upsertContentSource(this.toPersistedSource(source));
+
+    // Only an "auto" source renders differently on a verdict change — a forced source is pinned.
+    const slices =
+      (source.placementMode ?? "auto") === "auto" ? this.reresolveAssignments(id) : [];
+    if (slices.length > 0) {
+      this.bumpRevision();
+      for (const slice of slices) {
+        await this.store.upsertContent({
+          screenId: slice.screenId,
+          canvas: slice.canvas,
+          surfaces: slice.surfaces,
+          sourceId: id,
+        });
+      }
+      await this.store.setRevision(this.state.revision);
+    }
+    if (verdict === "blocked" && (source.placementMode ?? "auto") === "auto") {
+      this.emit("info", `${source.name} refuses framing — it will show as a placed window`);
+    }
+    return { changed: true, source, slices };
+  }
+
+  /**
+   * POL-18 — the top-level windows the agent must place over ONE screen's player: every
+   * `placement: "window"` surface of its slice, URL credential-stamped AT SEND TIME (the same
+   * decorate pass the player render uses, so the placed window loads authenticated too). `region`
+   * is canvas px; the slice canvas rides along for the agent's region → output-pixel scale.
+   */
+  windowsForScreen(screenId: string): WindowPlacement[] {
+    const slice = this.state.slices[screenId];
+    if (!slice || slice.surfaces.length === 0) return [];
+    const decorated = this.decorateSliceForSend(slice);
+    const windows: WindowPlacement[] = [];
+    for (const surface of decorated.surfaces) {
+      if (
+        (surface.type === "web" || surface.type === "dashboard") &&
+        surface.placement === "window"
+      ) {
+        windows.push({
+          id: surface.id,
+          url: surface.url,
+          region: surface.region,
+          canvas: decorated.canvas,
+        });
+      }
+    }
+    return windows;
+  }
+
+  /**
+   * POL-18 — the full per-output assignment list for ONE machine, for a live `server/apply` push
+   * outside the hello path (content changed → the window set on some output changed). Always the
+   * COMPLETE list: the agent retires any connector not listed, so a partial apply would tear down
+   * healthy screens.
+   */
+  assignmentsForMachine(machineId: string): ScreenAssignment[] {
+    const machine = this.machines.get(machineId);
+    if (!machine) return [];
+    const assignments: ScreenAssignment[] = [];
+    for (const output of machine.outputs) {
+      const screen = this.state.screens.find(
+        (s) => s.machineId === machineId && s.connector === output.connector,
+      );
+      if (!screen) continue;
+      const windows = this.windowsForScreen(screen.id);
+      assignments.push({
+        connector: output.connector,
+        screenId: screen.id,
+        playerUrl: this.playerUrlFor(screen.id),
+        ...(windows.length > 0 ? { windows } : {}),
+        castEnabled: screen.castEnabled,
+        friendlyName: screen.friendlyName,
+      });
+    }
+    return assignments;
   }
 
   /** POL-42 — the slices of every screen currently showing a PAGE whose definition embeds (or draws
@@ -3114,8 +4173,9 @@ export class ControlPlane {
   // placement / combine / content primitives, so the INSTANT property (stable-id render paths, D5) is
   // preserved on apply. Content is captured as the ASSIGNMENT (a library `sourceId` or an ad-hoc
   // `url`), never the resolved surface — so applying a scene re-resolves each source to its CURRENT
-  // url. `scheduleAt` ("HH:MM") is ILLUSTRATIVE: it is stored, NOT fired (D24) — nothing here activates
-  // a scene at that time.
+  // url. WHEN a scene plays is NOT here: that is a `Schedule` (POL-89/D93), resolved by the ticker in
+  // `scheduler.ts`, which fires this very `applyScene` — so a scheduled switch is the operator's own
+  // Apply, minus the operator.
 
   getScenes(): Scene[] {
     return [...this.scenes.values()];
@@ -3338,9 +4398,8 @@ export class ControlPlane {
   }
 
   /**
-   * Update a saved scene: rename it and/or set its ILLUSTRATIVE schedule time (`scheduleAt` is "HH:MM";
-   * null clears it — STORED, NOT FIRED, D24). Write-through. Does NOT bump the revision (registry
-   * metadata). Returns the updated scene, or null if unknown.
+   * Rename a saved scene. Write-through. Does NOT bump the revision (registry metadata). Returns the
+   * updated scene, or null if unknown. (WHEN a scene plays is a `Schedule` — POL-89/D93.)
    */
   async updateScene(id: string, patch: UpdateSceneBody): Promise<Scene | null> {
     const existing = this.scenes.get(id);
@@ -3348,10 +4407,6 @@ export class ControlPlane {
 
     const next: Scene = { ...existing };
     if (patch.name !== undefined) next.name = patch.name;
-    if (patch.scheduleAt !== undefined) {
-      if (patch.scheduleAt === null) delete next.scheduleAt;
-      else next.scheduleAt = patch.scheduleAt;
-    }
 
     const scene = Scene.parse(next);
     this.scenes.set(id, scene);
@@ -3360,14 +4415,172 @@ export class ControlPlane {
   }
 
   /**
-   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId. Write-through.
-   * Does NOT touch the live wall (a scene is just a saved snapshot). Returns false if unknown.
+   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId; any SCHEDULE
+   * bound to it (and its standing as the default scene) goes with it — a schedule pointing at a scene
+   * that no longer exists would resolve to nothing every tick. Write-through. Does NOT touch the live
+   * wall (a scene is just a saved snapshot). Returns false if unknown.
    */
   async deleteScene(id: string): Promise<boolean> {
     if (!this.scenes.has(id)) return false;
     this.scenes.delete(id);
     if (this.state.activeSceneId === id) this.state.activeSceneId = null;
     await this.store.deleteScene(id);
+
+    for (const schedule of [...this.schedules.values()].filter((s) => s.sceneId === id)) {
+      this.schedules.delete(schedule.id);
+      await this.store.deleteSchedule(schedule.id);
+    }
+    if (this.schedulerSettings.defaultSceneId === id) {
+      this.schedulerSettings = { ...this.schedulerSettings, defaultSceneId: null };
+      await this.store.setSchedulerSettings(this.toPersistedSchedulerSettings());
+    }
     return true;
+  }
+
+  // ── The scene scheduler (POL-89) ──────────────────────────────────────────────
+  //
+  // Dayparts + schedules + one settings row. This layer only STORES and validates; the ticker
+  // (`scheduler.ts`) resolves them against the clock and calls the existing applyScene path, so the
+  // fan-out is the ordinary instant WS push and nothing on a box or in a player changes.
+
+  private toPersistedSchedulerSettings(): PersistedSchedulerSettings {
+    return { ...this.schedulerSettings };
+  }
+
+  getDayparts(): Daypart[] {
+    return [...this.dayparts.values()];
+  }
+
+  getSchedules(): Schedule[] {
+    return [...this.schedules.values()];
+  }
+
+  getSchedulerSettings(): SchedulerSettings {
+    return { ...this.schedulerSettings };
+  }
+
+  /** Everything the shared resolver needs — the same set the console gets in `admin/state`. */
+  getScheduleSet(): ScheduleSet {
+    return {
+      dayparts: this.getDayparts(),
+      schedules: this.getSchedules(),
+      settings: this.getSchedulerSettings(),
+    };
+  }
+
+  async createDaypart(body: CreateDaypartBody): Promise<Daypart> {
+    this.daypartCounter += 1;
+    const daypart = Daypart.parse({
+      id: `daypart-${this.daypartCounter}`,
+      name: body.name,
+      start: body.start,
+      end: body.end,
+    });
+    this.dayparts.set(daypart.id, daypart);
+    await this.store.upsertDaypart(daypart);
+    this.emit("info", `Added daypart ${daypart.name} (${daypart.start}–${daypart.end})`);
+    return daypart;
+  }
+
+  async updateDaypart(id: string, patch: UpdateDaypartBody): Promise<Daypart | null> {
+    const existing = this.dayparts.get(id);
+    if (existing === undefined) return null;
+    const daypart = Daypart.parse({ ...existing, ...patch });
+    this.dayparts.set(id, daypart);
+    await this.store.upsertDaypart(daypart);
+    this.emit("info", `Daypart ${daypart.name} is now ${daypart.start}–${daypart.end}`);
+    return daypart;
+  }
+
+  /**
+   * Delete a daypart. Refuses while any schedule is bound to it (returns the binding count) — an
+   * operator must not be able to silently unschedule a wall by tidying up the library.
+   */
+  async deleteDaypart(id: string): Promise<{ ok: true } | { ok: false; error: "unknown" | "in-use"; schedules: number }> {
+    const existing = this.dayparts.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown", schedules: 0 };
+    const bound = [...this.schedules.values()].filter((s) => s.daypartId === id);
+    if (bound.length > 0) return { ok: false, error: "in-use", schedules: bound.length };
+    this.dayparts.delete(id);
+    await this.store.deleteDaypart(id);
+    this.emit("info", `Deleted daypart ${existing.name}`);
+    return { ok: true };
+  }
+
+  async createSchedule(
+    body: CreateScheduleBody,
+  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown-scene" | "unknown-daypart" }> {
+    if (!this.scenes.has(body.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (!this.dayparts.has(body.daypartId)) return { ok: false, error: "unknown-daypart" };
+    this.scheduleCounter += 1;
+    const schedule = Schedule.parse({
+      id: `schedule-${this.scheduleCounter}`,
+      sceneId: body.sceneId,
+      daypartId: body.daypartId,
+      days: [...new Set(body.days)].sort((a, b) => a - b),
+      priority: body.priority,
+      enabled: body.enabled,
+      from: body.from,
+      until: body.until,
+      createdAt: new Date().toISOString(),
+    });
+    this.schedules.set(schedule.id, schedule);
+    await this.store.upsertSchedule(schedule);
+    this.emit(
+      "info",
+      `Scheduled ${this.scenes.get(schedule.sceneId)?.name ?? schedule.sceneId} in ${this.dayparts.get(schedule.daypartId)?.name ?? schedule.daypartId}`,
+    );
+    return { ok: true, schedule };
+  }
+
+  async updateSchedule(
+    id: string,
+    patch: UpdateScheduleBody,
+  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown" | "unknown-scene" | "unknown-daypart" }> {
+    const existing = this.schedules.get(id);
+    if (existing === undefined) return { ok: false, error: "unknown" };
+    if (patch.sceneId !== undefined && !this.scenes.has(patch.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (patch.daypartId !== undefined && !this.dayparts.has(patch.daypartId)) {
+      return { ok: false, error: "unknown-daypart" };
+    }
+    const schedule = Schedule.parse({
+      ...existing,
+      ...patch,
+      ...(patch.days ? { days: [...new Set(patch.days)].sort((a, b) => a - b) } : {}),
+    });
+    this.schedules.set(id, schedule);
+    await this.store.upsertSchedule(schedule);
+    return { ok: true, schedule };
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    if (!this.schedules.has(id)) return false;
+    this.schedules.delete(id);
+    await this.store.deleteSchedule(id);
+    return true;
+  }
+
+  /**
+   * Patch the deployment's scheduler settings. An unknown timezone or an unknown default scene is
+   * REFUSED, not coerced: a wall's whole daily rhythm hangs off this row, so a typo must fail loudly
+   * at the edge rather than quietly move every window an hour.
+   */
+  async updateSchedulerSettings(
+    patch: UpdateSchedulerSettingsBody,
+  ): Promise<{ ok: true; settings: SchedulerSettings } | { ok: false; error: "unknown-timezone" | "unknown-scene" }> {
+    if (patch.timezone !== undefined && !isValidTimeZone(patch.timezone)) {
+      return { ok: false, error: "unknown-timezone" };
+    }
+    if (patch.defaultSceneId != null && !this.scenes.has(patch.defaultSceneId)) {
+      return { ok: false, error: "unknown-scene" };
+    }
+    const settings = SchedulerSettings.parse({ ...this.schedulerSettings, ...patch });
+    this.schedulerSettings = settings;
+    await this.store.setSchedulerSettings(this.toPersistedSchedulerSettings());
+    if (patch.enabled !== undefined) {
+      this.emit(patch.enabled ? "good" : "warn", patch.enabled ? "Scene scheduler ON" : "Scene scheduler OFF");
+    }
+    if (patch.timezone !== undefined) this.emit("info", `Scheduler timezone set to ${settings.timezone}`);
+    return { ok: true, settings };
   }
 }

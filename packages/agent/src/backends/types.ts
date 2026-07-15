@@ -9,7 +9,12 @@
  * The agent stays unprivileged and dumb: it never decides *what* to show (the control plane
  * does that and pushes content straight to the player), only *where* a player lives.
  */
-import type { DisplayBackend as BackendId } from "@polyptic/protocol";
+import type {
+  DisplayBackend as BackendId,
+  PanelPowerMethod,
+  PowerCapabilities,
+  WindowPlacement,
+} from "@polyptic/protocol";
 
 import type { BrowserProbe } from "../vitals";
 
@@ -32,6 +37,19 @@ export interface DisplayBackend {
   /** Tear down whatever `showScreen` placed on `connector`. */
   hideScreen(connector: string): Promise<void>;
 
+  /**
+   * POL-18 — place (or re-place) ONE top-level browser window over the player on `connector`:
+   * launch a second, supervised kiosk browser window for `window.url` and position it at
+   * `window.region` (slice-canvas pixels, scaled onto the output's mode). Keyed by `window.id`:
+   * calling again with the same id relaunches/moves that window in place. Backends that cannot
+   * place windows throw — but the SERVER already gates on backend capability, so in practice only
+   * `wayland-sway` ever receives one (the throw is defence in depth + an honest status note).
+   */
+  showWindow(connector: string, window: WindowPlacement): Promise<void>;
+
+  /** POL-18 — tear down the placed window keyed `id`. Idempotent; unknown ids are a logged no-op. */
+  hideWindow(id: string): Promise<void>;
+
   /** Toggle an operator "which panel is this?" overlay across the host's outputs. */
   ident(on: boolean): Promise<void>;
 
@@ -51,6 +69,23 @@ export interface DisplayBackend {
    * in depth under the server's own gate.
    */
   devtoolsEndpoint(connector: string): { port: number } | null;
+
+  /**
+   * POL-101 — what this box can do about panel power, probed once at startup and reported on hello:
+   * DPMS on any real compositor, CEC only where an adapter is present. `dev-open` reports neither.
+   */
+  powerCapabilities(): Promise<PowerCapabilities>;
+
+  /**
+   * POL-101 — sleep (`on: false`) or wake (`on: true`) the panel driven by `connector`, returning the
+   * rungs that were actually applied (`["dpms"]`, or `["dpms","cec"]` on a box with a CEC adapter).
+   *
+   * ONLY ever called for an explicit operator action or a panel-hours boundary the operator set —
+   * never on idleness. The player underneath is left running, so waking puts the existing content back
+   * on the glass with no reload. Throws when the panel could not be powered (a dev backend, no
+   * compositor, a connector nothing is placed on), and the reason reaches the operator on the ack.
+   */
+  setPower(connector: string, on: boolean): Promise<PanelPowerMethod[]>;
 
   /** Grab a thumbnail of `connector`, or `null` if this backend can't capture. */
   capture(connector: string): Promise<Buffer | null>;

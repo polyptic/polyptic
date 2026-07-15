@@ -19,6 +19,7 @@ import type {
   ContentKind,
   ContentSource,
   CredentialProfileView,
+  PlacementMode,
   UpdateCredentialProfileBody,
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
@@ -164,6 +165,7 @@ const draftName = ref("");
 const draftKind = ref<ContentKind>("web");
 const draftUrl = ref("");
 const draftProfileId = ref(""); // "" = no authentication (POL-24)
+const draftPlacement = ref<PlacementMode>("auto"); // POL-18 — display override (web/dashboard)
 const errorMsg = ref<string | null>(null);
 const saving = ref(false);
 
@@ -179,6 +181,7 @@ function openAdd() {
   draftKind.value = "web";
   draftUrl.value = "";
   draftProfileId.value = "";
+  draftPlacement.value = "auto";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -189,6 +192,7 @@ function openEdit(s: ContentSource) {
   draftKind.value = s.kind;
   draftUrl.value = s.url ?? "";
   draftProfileId.value = s.credentialProfileId ?? "";
+  draftPlacement.value = s.placementMode ?? "auto";
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -207,6 +211,9 @@ async function save() {
     url: draftUrl.value.trim(),
     // Auth only rides on browser-loaded kinds; "" (None) and a non-authable kind both mean detach.
     credentialProfileId: authPickable.value && draftProfileId.value ? draftProfileId.value : null,
+    // POL-18 — the display override, web/dashboard only. "auto" travels explicitly so an edit back
+    // to auto actually clears a previously forced mode.
+    ...(authPickable.value ? { placementMode: draftPlacement.value } : {}),
   });
   if (!parsed.success) {
     errorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
@@ -274,9 +281,23 @@ function pretty(url: string | undefined): string {
   return (url ?? "").replace(/^https?:\/\//, "");
 }
 
-/** The library row's sub-line: the kind plus the compact address. */
+/** The library row's sub-line: the kind, the probed facts (POL-109), then the compact address. */
 function rowSub(s: ContentSource): string {
-  return `${kindLabel(s.kind)} · ${pretty(s.url ?? "")}`;
+  const facts = mediaFacts(s);
+  return facts
+    ? `${kindLabel(s.kind)} · ${facts} · ${pretty(s.url ?? "")}`
+    : `${kindLabel(s.kind)} · ${pretty(s.url ?? "")}`;
+}
+
+/** POL-18 — the row's framing/display read-out, or null when there is nothing worth saying. A
+ *  source that frames fine in auto mode stays quiet — the badge is for the exceptions. */
+function placementNote(s: ContentSource): string | null {
+  if (s.kind !== "web" && s.kind !== "dashboard") return null;
+  const mode = s.placementMode ?? "auto";
+  if (mode === "window") return "windowed (forced)";
+  if (mode === "iframe") return s.framing === "blocked" ? "framed (forced — blocks framing)" : null;
+  if (s.framing === "blocked") return "blocks framing → windowed";
+  return null;
 }
 
 /** The profile a source references, for the library row's auth read-out. */
@@ -501,20 +522,45 @@ async function doUpload() {
   });
   uploading.value = false;
   if (res.ok) {
+    // POL-109 — an accepted-with-a-caveat upload (nothing could be checked) says so ONCE, above the
+    // library; a REJECTED one never gets here — its message is the server's, shown in the modal.
+    notice.value = res.warning ?? null;
     uploadOpen.value = false; // the new source appears in the library via admin/state
   } else {
     uploadError.value = res.error ?? "Upload failed. Please try again.";
   }
 }
 
-/** Whether a source's `url` resolves to a directly-renderable picture (for a list thumbnail). */
-function isImage(s: ContentSource): boolean {
-  return s.kind === "image" && !!s.url;
+// ── ingest read-outs (POL-109) ────────────────────────────────────────────────
+// The library now shows what the server PROBED at upload: a real thumbnail/poster for every image and
+// video, and the facts (duration · dimensions · codec) on the row. A source with no `media` was never
+// probed (a linked URL, or a server with no toolchain) — it falls back to the kind glyph, as before.
+const notice = ref<string | null>(null);
+
+/** The picture for a row: the ingest poster/thumbnail, or (for a linked image) the image itself. */
+function thumbSrc(s: ContentSource): string | null {
+  const poster = s.media?.posterUrl;
+  if (poster) return poster;
+  return s.kind === "image" && s.url ? s.url : null;
 }
 
-/** The thumbnail address for an image row (guarded by `isImage`; typed for the template). */
-function thumbSrc(s: ContentSource): string {
-  return s.url ?? "";
+/** mm:ss for a probed duration (a 90-minute video reads 90:00, not 1:30:00 — wall content is short). */
+function fmtDuration(seconds: number): string {
+  const total = Math.round(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+/** The probed facts for a row's sub-line — only what we actually know. */
+function mediaFacts(s: ContentSource): string {
+  const m = s.media;
+  if (!m) return "";
+  const bits: string[] = [];
+  if (m.durationSeconds !== undefined) bits.push(fmtDuration(m.durationSeconds));
+  if (m.width && m.height) bits.push(`${m.width}×${m.height}`);
+  if (m.videoCodec) bits.push(m.videoCodec.toUpperCase());
+  return bits.join(" · ");
 }
 </script>
 
@@ -544,6 +590,12 @@ function thumbSrc(s: ContentSource): string {
           <button class="add-btn" @click="openAdd">+ Add source</button>
         </div>
       </header>
+
+      <!-- POL-109 — an accepted-but-unchecked upload says so once, here. -->
+      <div v-if="notice" class="notice">
+        <span>⚠ {{ notice }}</span>
+        <button class="notice-x" title="Dismiss" @click="notice = null">✕</button>
+      </div>
 
       <!-- ── search · filter · sort (POL-94) ────────────────────────────────── -->
       <div v-if="sources.length" class="toolbar">
@@ -586,7 +638,14 @@ function thumbSrc(s: ContentSource): string {
       <!-- list -->
       <div v-if="visibleSources.length" class="list">
         <div v-for="c in visibleSources" :key="c.id" class="row">
-          <img v-if="isImage(c)" class="thumb" :src="thumbSrc(c)" :alt="c.name" loading="lazy" />
+          <img
+            v-if="thumbSrc(c)"
+            class="thumb"
+            :class="{ 'is-video': c.kind === 'video' }"
+            :src="thumbSrc(c) ?? ''"
+            :alt="c.name"
+            loading="lazy"
+          />
           <span v-else class="glyph" :style="{ color: `var(${kindColorVar(c.kind)})` }">
             {{ kindGlyph(c.kind) }}
           </span>
@@ -600,6 +659,7 @@ function thumbSrc(s: ContentSource): string {
               <template v-else>
                 {{ rowSub(c) }}
                 <template v-if="profileName(c)"> · 🔒 {{ profileName(c) }}</template>
+                <template v-if="placementNote(c)"> · ▣ {{ placementNote(c) }}</template>
               </template>
             </div>
             <!-- POL-94 — where this source is used: an inventory, not a pile. -->
@@ -762,6 +822,16 @@ function thumbSrc(s: ContentSource): string {
             Protected content? Add a credential profile under Access credentials below, then pick it
             here.
           </p>
+
+          <!-- POL-18 — the display override. Auto probes the address's framing headers and falls
+               back to an agent-placed window when the site refuses to be framed; the forced modes
+               exist because header detection can never be perfect. -->
+          <label class="field-label">Display</label>
+          <select v-model="draftPlacement" class="field select">
+            <option value="auto">Auto — windowed only if the site blocks framing</option>
+            <option value="iframe">Always framed (embed in the player)</option>
+            <option value="window">Always windowed (placed by the box)</option>
+          </select>
         </template>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>
@@ -1221,7 +1291,7 @@ function thumbSrc(s: ContentSource): string {
   padding: 9px 13px;
 }
 
-/* image thumbnail in a list row (replaces the glyph badge for uploaded/linked images) */
+/* image thumbnail / video poster in a list row (replaces the glyph badge — POL-109) */
 .thumb {
   width: 34px;
   height: 34px;
@@ -1230,6 +1300,36 @@ function thumbSrc(s: ContentSource): string {
   object-fit: cover;
   background: var(--muted-bg);
   border: 1px solid var(--line);
+}
+/* a video's poster reads as film, not as a photo */
+.thumb.is-video {
+  border-color: var(--accent-line, var(--line));
+}
+
+/* POL-109 — the accepted-with-a-caveat note above the library */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--fg2);
+  background: var(--muted-bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.notice span {
+  flex: 1;
+}
+.notice-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
 }
 
 /* empty-state action pair */

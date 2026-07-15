@@ -28,6 +28,8 @@ import { devtoolsUrl } from "../api";
 import { useConsoleStore } from "../stores/console";
 import { useScreenThumbnail } from "./canvas/useThumbnails";
 import { useScreenInspect, type InspectTarget } from "./useInspect";
+import { useScreenPower, powerMethodLabel, type PowerTarget } from "./usePanelPower";
+import type { PowerCapabilities } from "@polyptic/protocol";
 
 const props = defineProps<{
   screen: ScreenView;
@@ -36,6 +38,8 @@ const props = defineProps<{
   machineOnline: boolean;
   /** The machine's kiosk browser (POL-67): chrome = remote DevTools, else the on-panel inspector. */
   browser?: KioskBrowser;
+  /** What the box can do about panel power (POL-101): dpms always, cec if it has an adapter. */
+  power?: PowerCapabilities;
 }>();
 
 const emit = defineEmits<{ notify: [message: string] }>();
@@ -112,6 +116,42 @@ const inspectLabel = computed(() => {
   return inspecting.value ? "Inspecting" : "Inspect";
 });
 
+// ── Panel power (POL-101) ──────────────────────────────────────────────────────
+// A sleeping screen is HEALTHY: its player is still connected, still holding its content, and the box
+// is fine — the glass is simply dark because someone (or a schedule) asked for it. So it gets its own
+// calm "Asleep" chip and a moon on the preview, NOT the offline dot. The two must never be confused,
+// or an operator will be dispatched to fix a wall that is working exactly as instructed.
+const powerTarget = computed<PowerTarget>(() => ({
+  screen: props.screen,
+  machineLabel: props.machineLabel,
+  machineOnline: props.machineOnline,
+  power: props.power,
+}));
+const {
+  asleep,
+  pending: powerPending,
+  supported: powerSupported,
+  disabled: powerDisabled,
+  title: powerTitle,
+  toggle: togglePower,
+} = useScreenPower(powerTarget, {
+  setPower: (id, on) => store.setScreenPower(id, on),
+  notify: (message) => emit("notify", message),
+});
+const powerLabel = computed(() => {
+  if (powerPending.value) return asleep.value ? "Waking…" : "Sleeping…";
+  return asleep.value ? "Wake" : "Sleep";
+});
+/** The chip's tooltip: which rung slept it (DPMS-only vs CEC) — an operator standing at a still-lit
+ *  panel deserves to know that is expected, not broken. */
+const asleepDetail = computed(() => powerMethodLabel(props.screen.powerMethods));
+/** A screen with a daily window shows it, so "why did that go dark at 19:00?" answers itself. */
+const hoursSummary = computed(() => {
+  const h = props.screen.panelHours;
+  if (!h || !h.enabled) return null;
+  return `${h.on}–${h.off}`;
+});
+
 onUnmounted(() => {
   if (identTimer) clearTimeout(identTimer);
 });
@@ -136,8 +176,10 @@ function remove(): void {
       :title="screen.online ? 'player connected' : 'player offline'"
     ></span>
 
-    <!-- live preview tile (falls back to a neutral placeholder when offline / no frame yet) -->
-    <div class="preview" :class="{ live: thumbUrl }">
+    <!-- live preview tile (falls back to a neutral placeholder when offline / no frame yet).
+         Asleep dims it under a moon: the player is still rendering, so the last frame is REAL — but
+         nobody is looking at it, and the tile should say so. -->
+    <div class="preview" :class="{ live: thumbUrl, asleep }">
       <div
         v-if="thumbUrl"
         class="preview-img"
@@ -145,6 +187,7 @@ function remove(): void {
         aria-hidden="true"
       ></div>
       <span v-else class="preview-empty" aria-hidden="true">▦</span>
+      <span v-if="asleep" class="preview-moon" aria-hidden="true">☾</span>
     </div>
 
     <div class="name-col">
@@ -161,6 +204,12 @@ function remove(): void {
       />
       <div class="sub">
         <span class="chip">{{ screen.connector }}</span>
+        <!-- POL-101: a sleeping panel is HEALTHY. Calm, deliberate, its own chip — never the red of a
+             fault, and never mistakable for the offline dot beside it. -->
+        <span v-if="asleep" class="chip chip-asleep" :title="asleepDetail">☾ Asleep</span>
+        <span v-if="hoursSummary" class="chip chip-hours" :title="`Panel hours — this screen sleeps and wakes on a daily schedule`">
+          {{ hoursSummary }}
+        </span>
         <!-- POL-119 — cast-enabled indicator (the toggle itself lives in the canvas Inspector) -->
         <span
           v-if="screen.castEnabled"
@@ -182,6 +231,18 @@ function remove(): void {
          forgets a device: both are ADMIN. Every one of these routes 403s for a lesser role. -->
     <button v-if="store.canAuthor" class="ident-btn" :class="{ active: identing }" @click="ident">
       <span class="ident-dot"></span>{{ identing ? "Flashing…" : "Ident" }}
+    </button>
+
+    <button
+      v-if="powerSupported"
+      class="power-btn"
+      :class="{ asleep, pending: powerPending }"
+      :disabled="powerDisabled"
+      :title="powerTitle"
+      :aria-pressed="asleep"
+      @click="togglePower"
+    >
+      <span class="power-glyph" aria-hidden="true">{{ asleep ? "☀" : "☾" }}</span>{{ powerLabel }}
     </button>
 
     <button
@@ -376,6 +437,73 @@ function remove(): void {
   color: var(--muted2);
 }
 .inspect-btn.active .inspect-glyph {
+  color: var(--accent);
+}
+/* ── Panel power (POL-101) ─────────────────────────────────────────────────────
+   The asleep vocabulary is deliberately COOL and CALM (an indigo moon), never the red/amber of a
+   fault: a sleeping panel is a healthy panel obeying an instruction. It sits next to — and reads
+   differently from — the offline dot, because "dark on purpose" and "we cannot reach this box" are
+   the two states an operator must never confuse. */
+.preview.asleep {
+  position: relative;
+}
+.preview.asleep .preview-img {
+  opacity: 0.25;
+  filter: grayscale(0.6);
+}
+.preview-moon {
+  position: absolute;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--fg2);
+  opacity: 0.85;
+}
+.chip-asleep {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent-fg, var(--fg2));
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chip-hours {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.power-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+.power-btn:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.power-btn.asleep {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.power-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.power-btn.pending {
+  cursor: progress;
+}
+.power-glyph {
+  font-size: 12px;
+  color: var(--muted2);
+}
+.power-btn.asleep .power-glyph {
   color: var(--accent);
 }
 /* Remove is a quiet ✕ icon (POL-68) — deletion shouldn't compete with Ident/Inspect for attention. */

@@ -6,7 +6,7 @@
     - single  : live preview (mirrors the tile's canvas state, status chip overlaid) · rename ·
                 "Driven by {machine}" + mono connector chip · Ident · content (LIBRARY only —
                 ad-hoc URL entry was removed as an anti-pattern; add URLs to the Content library
-                instead) · page zoom · layout read-out · remove from wall. The header carries a ⋯
+                instead) · page zoom · SOUND (POL-112) · layout read-out · remove from wall. The header carries a ⋯
                 overflow menu with the dev-tools quick-launch (POL-85): the same arm-then-open flow
                 as the Machines view (chrome = remote DevTools in a new tab, surf = the on-panel
                 inspector), via the shared useScreenInspect composable — an operator debugging a
@@ -29,8 +29,12 @@ import { kindLabel } from "../../content";
 import { machineDisplayName } from "../../machine-name";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
+import { useScreenPower, powerMethodLabel, type PowerTarget } from "../usePanelPower";
+import type { PanelHours } from "@polyptic/protocol";
 import Toggle from "../Toggle.vue";
 import ZoomControl from "./ZoomControl.vue";
+import AudioControl from "./AudioControl.vue";
+import type { AudioIntent } from "@polyptic/protocol";
 
 const store = useConsoleStore();
 const { ident, identMany, flash, isIdenting } = useIdent();
@@ -76,7 +80,11 @@ const wallSurfaceText = computed(() => {
 const singleContent = computed(() => single.value?.content ?? null);
 const wallContent = computed(() => wallMembers.value.map((m) => m.screen.content).find((c) => !!c) ?? null);
 const singleContentKind = computed(() =>
-  singleContent.value ? kindLabel(singleContent.value.kind) : surfaceText.value,
+  singleContent.value
+    ? // POL-18 — "windowed" = this content is a top-level window the BOX places over the player
+      // (framing-blocked escape hatch), which is why the player's own region reads as empty.
+      `${kindLabel(singleContent.value.kind)}${singleContent.value.windowed ? " · windowed" : ""}`
+    : surfaceText.value,
 );
 const wallContentKind = computed(() =>
   wallContent.value ? `${kindLabel(wallContent.value.kind)} · spans all panels` : wallSurfaceText.value,
@@ -95,6 +103,23 @@ function zoomScreen(zoom: number) {
 function zoomWall(zoom: number) {
   const w = wall.value;
   if (w && !wallPending.value) store.setWallZoom(w.id, zoom);
+}
+
+// ── sound (POL-112) ─────────────────────────────────────────────────────────
+// The live audio rides on the content read-out and is present only for AUDIBLE (video/playlist)
+// content — so `audio !== undefined` is exactly the question "can this selection make sound?", and
+// the control is absent, not disabled, for a dashboard or an empty screen. A wall's read-out carries
+// the operator's INTENT for the surface; the server gives the sound to one panel (see the caption).
+const singleAudio = computed(() => singleContent.value?.audio);
+const wallAudio = computed(() => wallContent.value?.audio);
+
+function soundScreen(audio: AudioIntent) {
+  const s = single.value;
+  if (s) void store.setScreenAudio(s.id, audio);
+}
+function soundWall(audio: AudioIntent) {
+  const w = wall.value;
+  if (w && !wallPending.value) void store.setWallAudio(w.id, audio);
 }
 
 // ── playlist step zoom (POL-133) ────────────────────────────────────────────
@@ -169,11 +194,43 @@ function splitWall() {
   if (wall.value) store.split(wall.value.id);
 }
 
-// ── multi-select pre-combine ───────────────────────────────────────────────
+// ── clearing content (POL-96) ──────────────────────────────────────────────
+// The explicit unset. Until now content could only be REPLACED — "show nothing" had no affordance
+// anywhere in the console. A cleared screen falls back to the player's idle splash (D39).
+function clearSingle() {
+  if (single.value) store.clearScreenContent(single.value.id);
+}
+function clearWall() {
+  if (wall.value && !wallPending.value) store.clearWallContent(wall.value.id);
+}
+
+// ── multi-select: pre-combine + bulk content (POL-96) ──────────────────────
 function combine() {
   const muralId = store.activeMuralId;
   if (!muralId || count.value < 2) return;
   store.combine(muralId, [...selectedIds.value]);
+}
+
+const multiSourcePick = ref("");
+watch(count, () => {
+  multiSourcePick.value = "";
+});
+const multiHasContent = computed(() =>
+  selectedIds.value.some((id) => (store.screenById(id)?.surfaceCount ?? 0) > 0),
+);
+function assignMulti() {
+  const id = multiSourcePick.value;
+  if (!id || count.value < 2) return;
+  store.bulkSetContent({ screenIds: [...selectedIds.value] }, { sourceId: id });
+  multiSourcePick.value = "";
+}
+function clearMulti() {
+  if (count.value < 2) return;
+  store.bulkSetContent({ screenIds: [...selectedIds.value] }, null);
+}
+function unplaceMulti() {
+  if (count.value < 2) return;
+  store.unplaceScreens([...selectedIds.value]);
 }
 
 // ── rename ─────────────────────────────────────────────────────────────────
@@ -213,12 +270,17 @@ const statusLabel = computed(() => {
   const s = single.value;
   if (!s) return "";
   if (identingSingle.value) return "Identing…";
+  // POL-101 — asleep is a THIRD status, between connected and unreachable, and it is not a fault: the
+  // player is still connected and still holding its content; the glass is dark on purpose. An operator
+  // who reads "Unreachable" here goes and checks a cable that is fine.
+  if (s.asleep) return "Asleep";
   if (castingSingle.value) return "Casting now";
   return s.online ? "Connected" : "Unreachable";
 });
 const statusColor = computed(() => {
   const s = single.value;
   if (!s) return "var(--ok)";
+  if (s.asleep) return "var(--accent)";
   if (castingSingle.value) return "var(--accent)";
   return s.online ? "var(--ok)" : "var(--bad)";
 });
@@ -294,6 +356,90 @@ const inspectItemLabel = computed(() => {
   if (isChrome.value) return inspecting.value ? "Disarm DevTools" : "Open DevTools";
   return inspecting.value ? "Close on-panel inspector" : "Inspect on panel";
 });
+
+// ── Panel power + panel hours (POL-101) ──────────────────────────────────────
+// Wake/sleep rides the same ack-driven composable as the Machines view, so the Inspector can never
+// claim a panel is dark before the box has said so. The hours editor below it is the whole schedule
+// UI: ONE daily window per screen, in the deployment's timezone. That is a deliberate floor, not an
+// oversight — full recurrence belongs to the scene scheduler, and the two are meant to converge.
+const powerTarget = computed<PowerTarget | undefined>(() => {
+  const s = single.value;
+  if (!s) return undefined;
+  const m = store.machineForScreen(s.id);
+  return {
+    screen: s,
+    machineLabel: m?.label ?? s.machineId,
+    machineOnline: m?.online === true,
+    power: m?.power,
+  };
+});
+const {
+  asleep,
+  pending: powerPending,
+  supported: powerSupported,
+  disabled: powerDisabled,
+  title: powerTitle,
+  toggle: togglePower,
+} = useScreenPower(powerTarget, {
+  setPower: (id, on) => store.setScreenPower(id, on),
+  notify: showNotice,
+});
+const powerLabel = computed(() => {
+  if (powerPending.value) return asleep.value ? "Waking…" : "Sleeping…";
+  return asleep.value ? "Wake panel" : "Sleep panel";
+});
+const powerDetail = computed(() =>
+  asleep.value ? powerMethodLabel(single.value?.powerMethods) : "",
+);
+
+/** The deployment's zone, shown next to the times so "19:00" is never ambiguous. */
+const panelTimezone = computed(() => store.panelPower?.timezone ?? "");
+
+// The hours draft. Re-synced from the authoritative snapshot whenever the selection moves or the
+// server's value changes — but never while the operator is mid-edit, exactly like the rename field.
+const hoursEnabled = ref(false);
+const onDraft = ref("08:00");
+const offDraft = ref("18:00");
+const hoursEditing = ref(false);
+const hoursError = ref("");
+
+function syncHours(h: PanelHours | undefined): void {
+  hoursEnabled.value = h?.enabled ?? false;
+  onDraft.value = h?.on ?? "08:00";
+  offDraft.value = h?.off ?? "18:00";
+}
+watch(
+  () => [single.value?.id, single.value?.panelHours] as const,
+  ([, h]) => {
+    if (!hoursEditing.value) syncHours(h as PanelHours | undefined);
+  },
+  { immediate: true },
+);
+
+/** Save (or clear) the window. Clearing = the screen runs 24/7 and the scheduler never touches it. */
+async function saveHours(): Promise<void> {
+  const s = single.value;
+  if (!s) return;
+  hoursError.value = "";
+  if (hoursEnabled.value && onDraft.value === offDraft.value) {
+    hoursError.value = "The on and off times must differ.";
+    return;
+  }
+  const hours: PanelHours | null = hoursEnabled.value
+    ? { enabled: true, on: onDraft.value, off: offDraft.value }
+    : null;
+  const error = await store.setScreenPanelHours(s.id, hours);
+  hoursEditing.value = false;
+  if (error) {
+    hoursError.value = error;
+    return;
+  }
+  showNotice(
+    hours
+      ? `Panel hours saved — ${hours.on}–${hours.off} (${panelTimezone.value})`
+      : "Panel hours cleared — this screen runs 24/7",
+  );
+}
 function launchInspect(): void {
   menuOpen.value = false;
   void toggleInspect();
@@ -398,6 +544,9 @@ function selectOne(id: string) {
           <span class="content-name">{{ wallContent?.name ?? "On air" }}</span>
           <span class="content-kind">{{ wallContentKind }}</span>
         </span>
+        <button class="clear-btn" title="Show nothing on this surface" @click="clearWall">
+          Clear
+        </button>
       </div>
       <div v-else class="content-empty">Drag content to span across</div>
 
@@ -430,6 +579,17 @@ function selectOne(id: string) {
           :disabled="wallPending"
           caption="Applies to the whole surface — the page zooms as one, across all panels."
           @update="zoomWall"
+        />
+      </template>
+
+      <template v-if="wallAudio !== undefined">
+        <div class="section-label gap-top">Sound</div>
+        <AudioControl
+          :audio="wallAudio"
+          title="Wall sound"
+          :disabled="wallPending"
+          caption="One panel carries the sound for the whole surface — every panel playing it would echo the room. Muted until you turn it on."
+          @update="soundWall"
         />
       </template>
 
@@ -527,6 +687,64 @@ function selectOne(id: string) {
         {{ identingSingle ? "Flashing on wall…" : "Ident — flash on wall" }}
       </button>
 
+      <!-- Panel power (POL-101). Only for a box that reported it can drive DPMS — a dev backend has
+           no panel, and a pre-POL-101 agent has told us nothing, so we offer nothing rather than a
+           button that will fail. -->
+      <template v-if="powerSupported">
+        <div class="section-label gap-top">Panel</div>
+        <button
+          class="power-btn"
+          :class="{ asleep, pending: powerPending }"
+          :disabled="powerDisabled"
+          :title="powerTitle"
+          :aria-pressed="asleep"
+          @click="togglePower"
+        >
+          <span class="power-glyph" aria-hidden="true">{{ asleep ? "☀" : "☾" }}</span>
+          {{ powerLabel }}
+        </button>
+        <!-- The honest half: DPMS alone leaves plenty of panels lit-but-black. An operator standing
+             in front of one should know that is expected, not a fault. -->
+        <p v-if="asleep" class="power-detail">{{ powerDetail }}</p>
+
+        <div class="hours">
+          <label class="hours-toggle">
+            <input
+              v-model="hoursEnabled"
+              type="checkbox"
+              @change="hoursEditing = true"
+            />
+            <span>Panel hours</span>
+          </label>
+          <div v-if="hoursEnabled" class="hours-row">
+            <input
+              v-model="onDraft"
+              class="time-input"
+              type="time"
+              aria-label="Wake at"
+              @focus="hoursEditing = true"
+            />
+            <span class="hours-dash">→</span>
+            <input
+              v-model="offDraft"
+              class="time-input"
+              type="time"
+              aria-label="Sleep at"
+              @focus="hoursEditing = true"
+            />
+          </div>
+          <p class="hours-caption">
+            <template v-if="hoursEnabled">
+              Wakes and sleeps daily, in {{ panelTimezone || "the deployment timezone" }}. In hours it
+              is never blanked; out of hours the panel powers down.
+            </template>
+            <template v-else> No schedule — this screen runs 24/7. </template>
+          </p>
+          <p v-if="hoursError" class="hours-error">{{ hoursError }}</p>
+          <button class="hours-save" @click="saveHours">Save panel hours</button>
+        </div>
+      </template>
+
       <!-- Casting (POL-119): persistent AirPlay-receiver toggle + live session state. -->
       <div class="section-label gap-top">Casting</div>
       <div class="cast-card" :class="{ live: castingSingle }">
@@ -552,6 +770,9 @@ function selectOne(id: string) {
           <span class="content-name">{{ singleContent?.name ?? "On air" }}</span>
           <span class="content-kind">{{ singleContentKind }}</span>
         </span>
+        <button class="clear-btn" title="Show nothing on this screen" @click="clearSingle">
+          Clear
+        </button>
       </div>
       <div v-else class="content-empty">Drag content here</div>
 
@@ -574,6 +795,16 @@ function selectOne(id: string) {
           :zoom="singleZoom"
           caption="Remembered for this screen and this page."
           @update="zoomScreen"
+        />
+      </template>
+
+      <template v-if="singleAudio !== undefined">
+        <div class="section-label gap-top">Sound</div>
+        <AudioControl
+          :audio="singleAudio"
+          title="Screen sound"
+          caption="Muted until you turn it on. Remembered for this screen and this content — new content always arrives silent."
+          @update="soundScreen"
         />
       </template>
 
@@ -610,6 +841,22 @@ function selectOne(id: string) {
         <button class="ident-btn shrink" @click="identAll">
           <span class="dot accent"></span>Ident
         </button>
+      </div>
+
+      <!-- Bulk (POL-96): one source across the lot, or clear them all. One call, one broadcast. -->
+      <div v-if="librarySources.length" class="lib-pick gap-top">
+        <select v-model="multiSourcePick" class="lib-select" @change="assignMulti">
+          <option value="" disabled>Assign to all {{ count }}…</option>
+          <option v-for="s in librarySources" :key="s.id" :value="s.id">
+            {{ kindLabel(s.kind) }} · {{ s.name }}
+          </option>
+        </select>
+      </div>
+      <div class="group-actions">
+        <button class="unplace-btn flush" :disabled="!multiHasContent" @click="clearMulti">
+          Clear content
+        </button>
+        <button class="unplace-btn flush" @click="unplaceMulti">Unplace all</button>
       </div>
 
       <div class="member-list">
@@ -879,6 +1126,113 @@ function selectOne(id: string) {
   padding: 2px 7px;
 }
 
+/* ── Panel power (POL-101) ───────────────────────────────────────────────────
+   Cool + calm, sharing the accent (never the "bad" red): a sleeping panel is healthy. */
+.power-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+}
+.power-btn:hover:not(:disabled) {
+  background: var(--muted-bg);
+}
+.power-btn.asleep {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+.power-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.power-btn.pending {
+  cursor: progress;
+}
+.power-glyph {
+  font-size: 13px;
+}
+.power-detail {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted2);
+}
+.hours {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--muted-bg);
+}
+.hours-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg2);
+  cursor: pointer;
+}
+.hours-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.time-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12.5px;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.hours-dash {
+  color: var(--muted2);
+  font-size: 12px;
+}
+.hours-caption {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted2);
+}
+.hours-error {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--bad);
+}
+.hours-save {
+  margin-top: 8px;
+  width: 100%;
+  padding: 7px;
+  border-radius: 7px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  color: var(--fg2);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+}
+.hours-save:hover {
+  background: var(--muted-bg);
+}
 /* casting (POL-119) — receiver toggle + live session state */
 .cast-card {
   display: flex;
@@ -974,6 +1328,8 @@ function selectOne(id: string) {
   display: flex;
   flex-direction: column;
   line-height: 1.35;
+  flex: 1;
+  min-width: 0;
 }
 .content-name {
   font-size: 12.5px;
@@ -1081,9 +1437,36 @@ function selectOne(id: string) {
   cursor: pointer;
   font-family: inherit;
 }
-.unplace-btn:hover {
+.unplace-btn:hover:not(:disabled) {
   background: var(--bad-soft);
   border-color: var(--scr-bad-line);
+}
+/* Side-by-side bulk buttons (multi-selection): no top margin, share the row. */
+.unplace-btn.flush {
+  margin-top: 8px;
+  flex: 1;
+}
+.unplace-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* "Clear" — the explicit unset, sitting quietly on the content card (POL-96). */
+.clear-btn {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+}
+.clear-btn:hover {
+  background: var(--bad-soft);
+  color: var(--bad);
 }
 
 .multi-count {
