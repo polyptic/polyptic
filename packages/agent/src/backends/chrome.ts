@@ -64,24 +64,29 @@ export function chromeDataDir(connector: string, env: NodeJS.ProcessEnv = proces
 }
 
 /**
- * Build Chrome's argv for one output. All flags, no positional URL — `--app=` carries it (a
- * chromeless window; `--kiosk` fullscreens it, and sway re-asserts fullscreen on placement anyway).
- * `POLYPTIC_BROWSER_ARGS` (space-split, if set) is appended last so it can override anything here.
+ * The flags EVERY Chrome instance this agent launches must carry — the player's kiosk browser AND
+ * the POL-18 web-window alike. Extracted so the two launchers CANNOT drift on the flags that make
+ * or break a wall: `--ozone-platform=wayland` (POL-67 — native Wayland, EGL/GBM straight to the GPU,
+ * no Xwayland, no DRI3, no 300%-CPU software-render → the very trap POL-146 first suspected here),
+ * the per-instance `--user-data-dir` (separate processes, no dedupe, the reaper's unique token, and
+ * — Chrome ≥136 — the precondition for `--remote-debugging-port` being honoured at all), a loopback
+ * DevTools port, the kiosk hygiene flags, and unmuted autoplay. `--kiosk` is DELIBERATELY not here:
+ * the player fullscreens, the web-window must stay a positionable surface (see buildChromeWindowArgs).
  */
-export function buildChromeArgs(
-  spec: ChromeLaunchSpec,
-  env: NodeJS.ProcessEnv = process.env,
+function chromeBaseArgs(
+  url: string,
+  dataDir: string,
+  devtoolsPort: number,
 ): string[] {
-  const args = [
+  return [
     // The whole point (POL-67): native Wayland — EGL/GBM straight to the GPU, no Xwayland, no DRI3.
     "--ozone-platform=wayland",
-    "--kiosk",
-    `--app=${spec.url}`,
-    // One profile per output: separate processes (no dedupe), and the reaper's unique token.
-    `--user-data-dir=${chromeDataDir(spec.connector, env)}`,
+    `--app=${url}`,
+    // One profile per instance: separate processes (no dedupe), and the reaper's unique token.
+    `--user-data-dir=${dataDir}`,
     // Loopback-only DevTools endpoint for the POL-67 tunnel. Never exposed on the network; the
     // agent only proxies to it for a connector an operator ARMED (server/inspect on).
-    `--remote-debugging-port=${spec.devtoolsPort}`,
+    `--remote-debugging-port=${devtoolsPort}`,
     // Kiosk hygiene: no first-run bubbles, no "restore pages?" after a crash-respawn, no dialogs.
     "--no-first-run",
     "--no-default-browser-check",
@@ -93,6 +98,20 @@ export function buildChromeArgs(
     // player would have to fall back to muted playback (which it does, deliberately — see audio.ts).
     "--autoplay-policy=no-user-gesture-required",
   ];
+}
+
+/**
+ * Build Chrome's argv for one output. All flags, no positional URL — `--app=` carries it (a
+ * chromeless window; `--kiosk` fullscreens it, and sway re-asserts fullscreen on placement anyway).
+ * `POLYPTIC_BROWSER_ARGS` (space-split, if set) is appended last so it can override anything here.
+ */
+export function buildChromeArgs(
+  spec: ChromeLaunchSpec,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const base = chromeBaseArgs(spec.url, chromeDataDir(spec.connector, env), spec.devtoolsPort);
+  // The player fullscreens; splice `--kiosk` in right after the ozone flag (order is cosmetic).
+  const args = [base[0]!, "--kiosk", ...base.slice(1)];
   // POL-132 — the player's shell service worker (what lets a wall RELOAD while the control plane is
   // down and still paint) requires a SECURE CONTEXT, and netboot boxes reach the control plane over
   // plain HTTP by design (D47/D52). This flag grants the player's origin the FULL secure-context
@@ -140,18 +159,10 @@ export function buildChromeWindowArgs(
   spec: ChromeWindowSpec,
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
-  const args = [
-    "--ozone-platform=wayland",
-    `--app=${spec.url}`,
-    `--user-data-dir=${chromeWindowDataDir(spec.windowId, env)}`,
-    `--remote-debugging-port=${spec.devtoolsPort}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-session-crashed-bubble",
-    "--noerrdialogs",
-    "--disable-features=Translate",
-    "--autoplay-policy=no-user-gesture-required",
-  ];
+  // The SAME GPU/native-Wayland base as the player (POL-146): a placed window that software-rendered
+  // while the player ran on the GPU would come up black on real amdgpu — the two must never diverge
+  // on the flags that decide GPU vs software render, which is why both build from chromeBaseArgs.
+  const args = chromeBaseArgs(spec.url, chromeWindowDataDir(spec.windowId, env), spec.devtoolsPort);
   const extra = env.POLYPTIC_BROWSER_ARGS?.trim();
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
   return args;

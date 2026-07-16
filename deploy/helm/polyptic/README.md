@@ -258,7 +258,7 @@ helm upgrade polyptic … # recreates it with stable labels
 database stays up and its data is untouched — the StatefulSet is re-adopted on the
 next upgrade. Fresh installs on v0.2.33+ are unaffected.
 
-## mTLS agent channel — reachability (POL-25/POL-134, POL-143/D136, POL-147/D138)
+## mTLS agent channel — reachability (POL-25/POL-134, POL-143/D136, POL-147/D139)
 
 The agent channel is mutually authenticated out of the box (`agentMtls.enabled`,
 default `true`): a dedicated TLS listener serves `/agent`, enrolment issues each box
@@ -455,7 +455,7 @@ The bundled Service is also named `polyptic-db` for a release called `polyptic`,
 | `config.secureCookies` | `""` (auto) | Secure follows `PUBLIC_BASE_URL`'s scheme, else `NODE_ENV` — see production note. |
 | `config.captureIntervalMs` | `""` | Live-preview capture cadence (server default when empty). |
 | `agentMtls.enabled` / `.port` / `.require` | `true` / `8443` / `""` | mTLS agent channel: on by default, bind port, self-managing require posture (POL-134). |
-| `agentMtls.expose` / `.nodePort` | `nodePort` / `30843` | How the raw-TCP listener is published so boxes can reach it (POL-143/D136). `ingressRouteTCP` = Traefik TLS-passthrough on `:443` by SNI (POL-147/D138); `none` = BYO reachability + `publicUrl`. See the mTLS reachability section. |
+| `agentMtls.expose` / `.nodePort` | `nodePort` / `30843` | How the raw-TCP listener is published so boxes can reach it (POL-143/D136). `ingressRouteTCP` = Traefik TLS-passthrough on `:443` by SNI (POL-147/D139); `none` = BYO reachability + `publicUrl`. See the mTLS reachability section. |
 | `agentMtls.ingressRouteTCP.host` / `.entryPoint` | `""` / `websecure` | POL-147: the passthrough SNI host (empty → `mtls.<ingressRoute.host>`) and Traefik entrypoint, used only when `expose=ingressRouteTCP`. |
 | `agentMtls.publicUrl` / `.sans` | `""` / `[]` | Full `wss://` dial override (a dedicated LB or `IngressRouteTCP` SNI host) + extra cert SANs. |
 | `tls.mode` / `tls.sans` | `""` / `[]` | `self-signed` → server-native TLS with a persisted, downloadable CA (see the self-signed section). |

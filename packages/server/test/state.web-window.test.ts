@@ -191,6 +191,43 @@ describe("capability gating (POL-18)", () => {
     expect(placementOf(cp, a!)).toBe("iframe");
     expect(placementOf(cp, b!)).toBe("iframe");
     expect(cp.state.slices[a!]!.surfaces[0]!.span).toBeDefined();
+    expect(cp.state.slices[b!]!.surfaces[0]!.span).toBeDefined();
+    // POL-146 — the CRITICAL guarantee for the multi-box wall: the agent is asked to place NO
+    // top-level window on either member. A single box cannot span a window across two physical
+    // panels, so a leaked window here is exactly the field bug (a small unspanned window with black
+    // filling the rest of the wall). Both members must degrade to the spanning iframe instead.
+    expect(cp.windowsForScreen(a!)).toEqual([]);
+    expect(cp.windowsForScreen(b!)).toEqual([]);
+    // And the per-machine apply the agent actually receives carries no `windows` for either output.
+    const apply = cp.assignmentsForMachine("sway-box");
+    expect(apply.every((asg) => (asg.windows?.length ?? 0) === 0)).toBe(true);
+  });
+
+  // POL-146 — a wall whose members sit on DIFFERENT boxes is the reported repro (two Dell panels).
+  // The degrade must hold there too: neither box may be handed a window to place.
+  test("a wall spanning two SEPARATE machines still places no window on either box", async () => {
+    await cp.registerMachine(hello("box-1", "wayland-sway", "HDMI-1"));
+    await cp.registerMachine(hello("box-2", "wayland-sway", "HDMI-1"));
+    const [a, b] = cp.getScreens().map((s) => s.id);
+    const mural = await cp.createMural("Concourse");
+    await cp.placeScreen(a!, mural.id, 0, 0, 1920, 1080);
+    await cp.placeScreen(b!, mural.id, 1920, 0, 1920, 1080);
+    const combined = await cp.combineScreens(mural.id, [a!, b!]);
+    if (!combined.ok) throw new Error("combine failed");
+
+    const created = await cp.createContentSource({
+      name: "Blocked",
+      kind: "web",
+      url: "https://blocks.example/",
+      placementMode: "window",
+    });
+    if (!created.ok) throw new Error("create failed");
+    const result = await cp.setWallContent(combined.wall.id, { sourceId: created.source.id });
+    expect(result.ok).toBe(true);
+    expect(cp.windowsForScreen(a!)).toEqual([]);
+    expect(cp.windowsForScreen(b!)).toEqual([]);
+    expect(cp.assignmentsForMachine("box-1").every((x) => (x.windows?.length ?? 0) === 0)).toBe(true);
+    expect(cp.assignmentsForMachine("box-2").every((x) => (x.windows?.length ?? 0) === 0)).toBe(true);
   });
 });
 
