@@ -70,7 +70,7 @@ export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: Power
     if (!t) return "";
     if (!t.machineOnline) return `${t.machineLabel} is offline — panel power rides its agent connection`;
     if (!supported.value) {
-      return `${t.machineLabel} cannot drive panel power (no compositor DPMS — a development backend)`;
+      return `${t.machineLabel} can't turn its panels on or off from here`;
     }
     if (asleep.value) {
       return `Wake this panel. ${powerMethodLabel(t.screen.powerMethods)}. Content is still rendering underneath, so it comes back instantly.`;

@@ -258,6 +258,11 @@ export class SwayBackend implements DisplayBackend {
   /** connector → supervised kiosk browser. */
   private readonly browsers = new Map<string, SupervisedBrowser>();
 
+  /** POL-146 — connector → the sway con_id its PLAYER was last placed as. Kept so a web-window
+   *  placement can drop the player's fullscreen (else sway hides the floating window behind it) and
+   *  restore it once the last window leaves. Set on every (re)placement; a respawn refreshes it. */
+  private readonly playerConIds = new Map<string, number>();
+
   /** POL-18 — window id → its supervised second browser (the placed web-window). */
   private readonly windows = new Map<string, SupervisedBrowser>();
   /** POL-18 — window id → the LATEST placement spec; the launch fn reads it so a respawn after a
@@ -457,16 +462,53 @@ export class SwayBackend implements DisplayBackend {
     );
   }
 
-  /** Move the placed container onto `output` and (re)assert fullscreen there. */
-  private async moveToOutput(conId: number, output: string): Promise<void> {
-    // Disable fullscreen first so sway will relocate the container, then re-enable on the target.
+  /**
+   * Move the placed container onto `output`. Fullscreen there UNLESS a web-window occupies this
+   * output (POL-146): sway hides floating windows behind a workspace-fullscreen view, so a player
+   * left fullscreen would occlude the POL-18 web-window floated over it — the operator sees the
+   * player's black `.stage` through the window-hole, not the content. A non-fullscreen player is
+   * still the sole tiled window on its output, so it fills the glass all the same; the floating
+   * web-window now composites ABOVE it.
+   */
+  private async moveToOutput(conId: number, output: string, fullscreen = true): Promise<void> {
+    // Disable fullscreen first so sway will relocate the container, then re-assert it on the target
+    // only when nothing floats above (fullscreen is also the move MECHANISM — a fullscreen container
+    // can't cross outputs until it's dropped).
     const cmd =
       `[con_id=${conId}] fullscreen disable, ` +
-      `move container to output ${output}, ` +
-      `fullscreen enable`;
+      `move container to output ${output}` +
+      (fullscreen ? ", fullscreen enable" : "");
     const res = await run("swaymsg", [cmd]);
     if (res.code !== 0) {
       throw new Error(`swaymsg move failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+    }
+  }
+
+  /** POL-146 — does an output currently host a placed web-window? Its player must then stay OUT of
+   *  workspace-fullscreen, or sway hides the floating window behind it (black glass). */
+  private connectorHasWindow(connector: string): boolean {
+    for (const spec of this.windowSpecs.values()) {
+      if (spec.connector === connector) return true;
+    }
+    return false;
+  }
+
+  /**
+   * POL-146 — (un)fullscreen the PLAYER on `connector` so a POL-18 web-window floated over it is
+   * visible (`on=false`) or, once the last window leaves, so the player reclaims the full glass as a
+   * fullscreen view again (`on=true`). Best-effort and keyed on the player's tracked con_id: if we
+   * never learned it (an earlier placement failure) there is nothing to toggle, and a wall rendering
+   * content beats a wall stuck black on a swaymsg hiccup — so a failure only logs.
+   */
+  private async setPlayerFullscreen(connector: string, on: boolean): Promise<void> {
+    const conId = this.playerConIds.get(connector);
+    if (conId === undefined) return;
+    const res = await run("swaymsg", [`[con_id=${conId}] fullscreen ${on ? "enable" : "disable"}`]);
+    if (res.code !== 0) {
+      this.log(
+        `player fullscreen ${on ? "enable" : "disable"} on ${connector} failed: ` +
+          `${res.stderr.trim() || `exit ${res.code}`}`,
+      );
     }
   }
 
@@ -519,7 +561,11 @@ export class SwayBackend implements DisplayBackend {
     // placement failure logs but does NOT fail the launch (and never kills the supervised child).
     try {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
-      await this.moveToOutput(conId, output);
+      // POL-146 — a player sharing its output with a web-window must NOT be fullscreen, or sway hides
+      // the floating window behind it. Decide from the current window set so a respawn comes back at
+      // the right fullscreen state (a window placed while the player was dead stays visible).
+      await this.moveToOutput(conId, output, !this.connectorHasWindow(connector));
+      this.playerConIds.set(connector, conId);
       this.log(`placed ${browser} (con_id=${conId}) on ${output}`);
     } catch (err) {
       this.log(`placement on ${output} failed: ${(err as Error).message} (left on default output)`);
@@ -588,6 +634,7 @@ export class SwayBackend implements DisplayBackend {
     }
     await supervised.stop();
     this.browsers.delete(connector);
+    this.playerConIds.delete(connector); // POL-146 — nothing left to (un)fullscreen on this output
     this.log(`hideScreen(${connector}): torn down`);
   }
 
@@ -694,6 +741,9 @@ export class SwayBackend implements DisplayBackend {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
       await this.positionWindow(id, conId, spec.connector, spec.window);
       this.windowConIds.set(id, conId);
+      // POL-146 — reveal it: drop the underlying player's fullscreen so this floating window is not
+      // hidden behind it (the black-glass symptom). Cheap and idempotent to repeat per placement.
+      await this.setPlayerFullscreen(spec.connector, false);
       this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connector}`);
     } catch (err) {
       this.log(`web-window ${id} placement failed: ${(err as Error).message}`);
@@ -724,6 +774,9 @@ export class SwayBackend implements DisplayBackend {
     if (supervised.running && supervised.url === win.url) {
       if (conId !== undefined) {
         await this.positionWindow(win.id, conId, connector, win);
+        // POL-146 — keep the player un-fullscreened under a live window (idempotent), so a geometry-
+        // only nudge can never re-hide it behind a player that a respawn re-fullscreened.
+        await this.setPlayerFullscreen(connector, false);
         this.log(`web-window ${win.id}: repositioned over ${connector}`);
         return;
       }
@@ -736,6 +789,8 @@ export class SwayBackend implements DisplayBackend {
 
   async hideWindow(id: string): Promise<void> {
     const supervised = this.windows.get(id);
+    // Capture the connector BEFORE dropping the spec, so we can restore its player's fullscreen.
+    const connector = this.windowSpecs.get(id)?.connector;
     this.windowSpecs.delete(id);
     this.windowConIds.delete(id);
     if (!supervised) {
@@ -744,6 +799,12 @@ export class SwayBackend implements DisplayBackend {
     }
     await supervised.stop();
     this.windows.delete(id);
+    // POL-146 — the window is gone; if it was the LAST one on that output, give the player its
+    // fullscreen back so it reclaims the whole glass (otherwise it stays a tiled window, which still
+    // fills the output but loses the fullscreen guarantees the rest of the backend assumes).
+    if (connector && !this.connectorHasWindow(connector)) {
+      await this.setPlayerFullscreen(connector, true);
+    }
     this.log(`hideWindow(${id}): torn down`);
   }
 

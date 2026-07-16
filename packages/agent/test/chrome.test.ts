@@ -17,7 +17,9 @@ import { join } from "node:path";
 
 import {
   buildChromeArgs,
+  buildChromeWindowArgs,
   chromeDataDir,
+  chromeWindowDataDir,
   insecurePlayerOrigin,
   matchesChromeWindow,
   selectKioskBrowser,
@@ -80,6 +82,60 @@ describe("buildChromeArgs", () => {
     expect(insecurePlayerOrigin("http://10.0.0.5:8080/player/?screen=s1")).toBe("http://10.0.0.5:8080");
     expect(insecurePlayerOrigin("https://walls.example.org/player/")).toBeNull();
     expect(insecurePlayerOrigin("not a url")).toBeNull();
+  });
+});
+
+// POL-146 — the placed WEB-WINDOW (POL-18) is a SECOND Chrome the sway backend floats over the
+// player. On real amdgpu, a window that software-rendered while the player ran on the GPU comes up
+// BLACK — so it must carry the exact same GPU/native-Wayland launch posture as the player. These
+// pin the flags that decide GPU-vs-software render so the two builders can never drift apart.
+describe("buildChromeWindowArgs (POL-18 web-window)", () => {
+  const args = buildChromeWindowArgs({ url: URL, windowId: "surface-7", devtoolsPort: 9230 }, ENV);
+
+  test("runs native Wayland, same as the player — the flag that keeps it off the black software path", () => {
+    expect(args).toContain("--ozone-platform=wayland");
+  });
+
+  test("carries the URL via --app, never a positional argument", () => {
+    expect(args).toContain(`--app=${URL}`);
+    expect(args.filter((a) => !a.startsWith("-"))).toHaveLength(0);
+  });
+
+  test("is NOT kiosk — it must stay a positionable floating surface", () => {
+    expect(args).not.toContain("--kiosk");
+  });
+
+  test("a per-window user-data-dir isolates it from the player and every sibling window", () => {
+    expect(args).toContain(`--user-data-dir=${chromeWindowDataDir("surface-7", ENV)}`);
+    // Distinct from the player's connector-keyed dir → a separate process, its own GPU context.
+    const playerDir = chromeDataDir("DP-1", ENV);
+    expect(args).not.toContain(`--user-data-dir=${playerDir}`);
+  });
+
+  test("the DevTools port rides the launch (Chrome takes it only at startup)", () => {
+    expect(args).toContain("--remote-debugging-port=9230");
+  });
+
+  test("shares the player's GPU/hygiene base flag-for-flag (only --kiosk / secure-origin differ)", () => {
+    const playerArgs = buildChromeArgs({ url: URL, connector: "DP-1", devtoolsPort: 9230 }, ENV);
+    // Everything except --kiosk, the per-instance data dir, and the player-only http exemption must
+    // be identical — that shared spine is what guarantees the window renders on the GPU like the player.
+    const strip = (a: string[]): string[] =>
+      a.filter(
+        (f) =>
+          f !== "--kiosk" &&
+          !f.startsWith("--user-data-dir=") &&
+          !f.startsWith("--unsafely-treat-insecure-origin-as-secure="),
+      );
+    expect(strip(args)).toEqual(strip(playerArgs));
+  });
+
+  test("POLYPTIC_BROWSER_ARGS is appended last so a lab escape hatch can override", () => {
+    const withExtra = buildChromeWindowArgs(
+      { url: URL, windowId: "surface-7", devtoolsPort: 9230 },
+      { ...ENV, POLYPTIC_BROWSER_ARGS: "--force-dark-mode" },
+    );
+    expect(withExtra.at(-1)).toBe("--force-dark-mode");
   });
 });
 

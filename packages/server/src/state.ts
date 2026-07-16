@@ -2723,7 +2723,7 @@ export class ControlPlane {
     const screen = this.getScreen(screenId);
     this.emit(
       "warn",
-      `${screen?.friendlyName ?? screenId} cannot place windows (backend without window placement) — showing framed instead`,
+      `${screen?.friendlyName ?? screenId} can't show this page in its own window here — showing it embedded instead`,
     );
     return { ...spec, placement: "iframe" };
   }
@@ -2856,7 +2856,7 @@ export class ControlPlane {
     if ((spec.kind === "web" || spec.kind === "dashboard") && spec.placement === "window") {
       this.emit(
         "warn",
-        `${wall.name ?? wall.id}: windowed placement is not supported on a video wall — showing framed instead`,
+        `${wall.name ?? wall.id}: a page can't have its own window when it spans a combined wall — showing it embedded instead`,
       );
       spec = { ...spec, placement: "iframe" };
     }
