@@ -33,6 +33,19 @@ import type { PlayerHub } from "./hub";
 import type { ActivityLog } from "./activity";
 import type { SourceHealthTracker } from "./source-health";
 
+/**
+ * POL-148 — the box clock's offset from ours, in milliseconds (positive = the box is AHEAD), from a
+ * vitals sample's `at` timestamp and our clock at receipt. `undefined` when the sample carried no
+ * `at`, or one we can't parse — we never invent a skew from a missing timestamp. Pure, so the sign
+ * convention and the parse guard are unit-tested without a live heartbeat.
+ */
+export function clockOffsetMs(sampleAt: string | undefined, nowMs: number): number | undefined {
+  if (!sampleAt) return undefined;
+  const at = Date.parse(sampleAt);
+  if (!Number.isFinite(at)) return undefined;
+  return at - nowMs;
+}
+
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
 export class AdminHub {
   private readonly sockets = new Set<WebSocket>();
@@ -108,6 +121,10 @@ export class Presence {
    *  ring (not just the latest sample) is what lets an operator surface, and a future feature graph,
    *  a few minutes of history without touching the store or the <150ms path. */
   private readonly vitals = new Map<string, MachineVitals[]>();
+  /** POL-148 — machineId → the box clock's offset from OURS in ms (positive = box ahead), measured at
+   *  heartbeat receipt from the sample's `at`. Live-only, like the vitals it is derived from: a skew
+   *  is a fact about a running clock, and a stale one on a healed box would be a lie. */
+  private readonly clockOffset = new Map<string, number>();
   /** POL-104 — machineId → the peer address of its live agent socket. Live-only (see `machineAddress`). */
   private readonly addresses = new Map<string, string>();
   /** machineId → ms epoch of the last heartbeat we accepted (with or WITHOUT vitals — a pre-POL-92
@@ -329,8 +346,14 @@ export class Presence {
 
   /** Record one heartbeat's arrival, with or without vitals (an old agent proves liveness too). */
   noteHeartbeat(machineId: string, vitals?: MachineVitals): void {
-    this.lastHeartbeat.set(machineId, Date.now());
+    const now = Date.now();
+    this.lastHeartbeat.set(machineId, now);
     if (!vitals) return;
+    // POL-148 — measure the box clock's skew from ours right here, at receipt: `vitals.at` is the
+    // box's own wall-clock when it sampled, and `now` is ours a LAN hop later. Over a local network
+    // the transit is milliseconds, so a whole-hour skew (the fpd-ago failure) reads unmistakably.
+    const offset = clockOffsetMs(vitals.at, now);
+    if (offset !== undefined) this.clockOffset.set(machineId, offset);
     const ring = this.vitals.get(machineId) ?? [];
     ring.push(vitals);
     if (ring.length > Presence.VITALS_RING) ring.splice(0, ring.length - Presence.VITALS_RING);
@@ -341,6 +364,12 @@ export class Presence {
   machineVitals(machineId: string): MachineVitals | undefined {
     const ring = this.vitals.get(machineId);
     return ring && ring.length > 0 ? ring[ring.length - 1] : undefined;
+  }
+
+  /** POL-148 — the box clock's last measured offset from ours (ms, positive = box ahead), or
+   *  undefined when we've had no timestamped sample this boot. */
+  machineClockOffsetMs(machineId: string): number | undefined {
+    return this.clockOffset.get(machineId);
   }
 
   /** The whole ring, oldest first (a few minutes of history). */
@@ -371,6 +400,7 @@ export class Presence {
    *  never inherits a dead box's vitals. */
   forgetMachine(machineId: string): void {
     this.vitals.delete(machineId);
+    this.clockOffset.delete(machineId);
     this.lastHeartbeat.delete(machineId);
     this.rebootingSince.delete(machineId);
     this.agentConns.delete(machineId);
@@ -467,6 +497,11 @@ export function buildAdminState(
       // a machine that has since gone dark is not health data, it is an epitaph; the console says
       // "System stats unavailable while offline" instead of drawing a stale meter.
       vitals: presence.isMachineOnline(machine.id) ? presence.machineVitals(machine.id) : undefined,
+      // POL-148 — the server-measured clock skew, paired on the card with vitals.clockSynced. Live-
+      // only for the same reason as vitals: a skew from a box that has gone dark is not health data.
+      clockOffsetMs: presence.isMachineOnline(machine.id)
+        ? presence.machineClockOffsetMs(machine.id)
+        : undefined,
       // POL-104 — what the box IS. Persisted (so a PENDING card is informative even between boots)
       // and shown on the card an operator has to make a decision about: 50 identical UUIDs was the
       // whole reason mass commissioning was 50 blind approvals.

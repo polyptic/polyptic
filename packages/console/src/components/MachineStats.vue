@@ -34,6 +34,7 @@ import { computed, ref, watch } from "vue";
 import type { MachineView } from "@polyptic/protocol";
 
 import {
+  clockBadge,
   factsFor,
   formatPercent,
   metersFor,
@@ -57,13 +58,20 @@ const imageId = computed(() => vitals.value?.imageId);
 const softwareRendering = computed(() => softwareRenderingConnectors(vitals.value));
 const respawns = computed(() => totalRespawns(vitals.value));
 
+// POL-148 — the clock-health badge: server-measured skew (machine.clockOffsetMs) + the box's own
+// NTP sync report (vitals.clockSynced). Null when the clock is fine or unknown.
+const clock = computed(() =>
+  props.machine.online ? clockBadge(props.machine.clockOffsetMs, vitals.value?.clockSynced) : null,
+);
+
 /** The facts row renders only when something is in it — an empty row is not a design element. */
 const factsRowShown = computed(
   () =>
     facts.value.length > 0 ||
     imageId.value !== undefined ||
     respawns.value > 0 ||
-    softwareRendering.value.length > 0,
+    softwareRendering.value.length > 0 ||
+    clock.value !== null,
 );
 /** …and the band itself collapses when a box reported vitals but nothing we can draw. */
 const bandShown = computed(() => meters.value.length > 0 || factsRowShown.value);
@@ -136,6 +144,9 @@ watch(
             {{ f.text }}
           </span>
 
+          <span v-if="clock" class="chip" :class="clock.level" :title="clock.title">
+            {{ clock.text }}
+          </span>
           <span
             v-if="respawns > 0"
             class="chip warn"

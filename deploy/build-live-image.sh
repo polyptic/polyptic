@@ -176,8 +176,13 @@ echo "    kernel package: \$kernel"
 # had NO way to answer "what is eating this CPU" from its debug shell (POL-35, 2026-07-10).
 # The Wi-Fi stack (wpasupplicant + wlan firmware, POL-63) is NOT here — it lands between the two
 # dracut runs in step 6, so the lean wired initrd never absorbs it (see WIFI_PACKAGES above).
+# systemd-timesyncd (POL-148) is a SEPARATE package on ubuntu-base minimal — without it a netboot box
+# has NO time client at all (`timedatectl` reads "NTP service: n/a") and free-runs off the RTC, which
+# drifted a real box an hour ahead and broke a relative-range dashboard. It runs as a system service
+# with CAP_SYS_TIME, so it sets the clock without the unprivileged kiosk user; step 5 enables it +
+# our polyptic-timesync-conf.service (which points it at the baked NTP host) under sysinit.target.
 apt-get install -y --no-install-recommends \
-  systemd-sysv systemd-resolved libpam-systemd udev dbus kmod dmsetup \
+  systemd-sysv systemd-resolved systemd-timesyncd libpam-systemd udev dbus kmod dmsetup \
   iproute2 netplan.io ca-certificates curl efibootmgr procps \
   "\$kernel" dracut-core dracut-network
 # The curated firmware set. \`apt-cache policy\` guards each name so a package that does not exist for
@@ -226,6 +231,13 @@ done
 # The update-poll timer (POL-41) is a timer unit, so it enables under timers.target.
 mkdir -p "$ROOTFS/etc/systemd/system/timers.target.wants"
 ln -sf "../polyptic-update-poll.timer" "$ROOTFS/etc/systemd/system/timers.target.wants/polyptic-update-poll.timer"
+# Clock sync (POL-148). systemd-timesyncd's [Install] is WantedBy=sysinit.target, and our conf helper
+# must run BEFORE it (it writes timesyncd's NTP server into a /run drop-in), so both enable under
+# sysinit.target.wants. ubuntu-base's minimal preset does NOT enable timesyncd, hence the explicit
+# symlink; the box then disciplines its clock early at boot instead of free-running off the RTC.
+mkdir -p "$ROOTFS/etc/systemd/system/sysinit.target.wants"
+ln -sf "/usr/lib/systemd/system/systemd-timesyncd.service" "$ROOTFS/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
+ln -sf "../polyptic-timesync-conf.service" "$ROOTFS/etc/systemd/system/sysinit.target.wants/polyptic-timesync-conf.service"
 # A live box must not inherit the build host's SAN/snap baggage: multipathd crashes noisily in a live
 # env and sprays the console during the plymouth→greetd handoff; nothing here uses snaps.
 for unit in multipathd.service multipathd.socket snapd.service snapd.socket snapd.seeded.service; do

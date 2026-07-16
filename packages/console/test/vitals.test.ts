@@ -13,10 +13,12 @@ import { describe, expect, test } from "bun:test";
 import type { MachineVitals } from "@polyptic/protocol";
 
 import {
+  clockBadge,
   cpuTooltip,
   diskTooltip,
   factsFor,
   formatBytes,
+  formatClockOffset,
   formatPercent,
   formatUptime,
   memoryTooltip,
@@ -199,5 +201,43 @@ describe("factsFor — the facts row", () => {
 
   test("a browser with no RSS reading is not a zero-byte fact", () => {
     expect(factsFor({ browsers: [{ connector: "DP-1", running: true }] })).toEqual([]);
+  });
+});
+
+// ── POL-148: the clock-health badge ──────────────────────────────────────────
+describe("formatClockOffset", () => {
+  test("signed, two most-significant units", () => {
+    expect(formatClockOffset(3_720_000)).toBe("+1h02m"); // 1h 2m
+    expect(formatClockOffset(-45_000)).toBe("-45s");
+    expect(formatClockOffset(125_000)).toBe("+2m05s");
+    expect(formatClockOffset(0)).toBe("+0s");
+    expect(formatClockOffset(undefined)).toBe("—");
+  });
+});
+
+describe("clockBadge", () => {
+  test("null when the clock is fine or unknown", () => {
+    expect(clockBadge(500, true)).toBeNull(); // synced, sub-second skew
+    expect(clockBadge(undefined, true)).toBeNull(); // synced, no measurement
+    expect(clockBadge(undefined, undefined)).toBeNull(); // nothing known (pre-POL-148 agent)
+    expect(clockBadge(12_000, true)).toBeNull(); // synced and under the 30s warn floor
+  });
+
+  test("a large skew is BAD and names the offset — the hour-ahead failure", () => {
+    const badge = clockBadge(3_720_000, false);
+    expect(badge?.level).toBe("bad");
+    expect(badge?.text).toBe("clock +1h02m · not synced");
+  });
+
+  test("a small skew but not-yet-synced is a WARN, without inventing a number", () => {
+    const badge = clockBadge(400, false); // sub-floor skew → no number
+    expect(badge?.level).toBe("warn");
+    expect(badge?.text).toBe("clock · not synced");
+  });
+
+  test("a synced box that is nonetheless drifting large reads BAD · synced", () => {
+    const badge = clockBadge(-40_000, true);
+    expect(badge?.level).toBe("bad");
+    expect(badge?.text).toBe("clock -40s · synced");
   });
 });

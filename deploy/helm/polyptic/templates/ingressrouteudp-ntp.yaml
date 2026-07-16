@@ -1,0 +1,28 @@
+{{- /*
+POL-148 — expose the bundled NTP server over Traefik as a UDP route (the sibling of POL-147's
+IngressRouteTCP for mTLS). NTP is UDP/123, and on the AMRC-style cluster a box can reach ONLY what
+Traefik routes — so the fleet's clock sync has to ride Traefik too.
+
+A traefik.io/v1alpha1 IngressRouteUDP has no host match (UDP carries no SNI/Host): it simply binds a
+UDP entrypoint and forwards every datagram to the service. The entrypoint NAME is a value
+(ntp.ingressRouteUDP.entryPoint, default `ntp`) and the operator must add that :123/udp entrypoint to
+Traefik and expose it on the LoadBalancer — Traefik ships no UDP entrypoint by default. See the README.
+
+Requires: the Traefik CRDs (traefik.io/v1alpha1) and the named UDP entrypoint actually exposed.
+*/ -}}
+{{- if and .Values.ntp.enabled (eq .Values.ntp.expose "ingressRouteUDP") }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: {{ include "polyptic.fullname" . }}-ntp
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ntp
+spec:
+  entryPoints:
+    - {{ .Values.ntp.ingressRouteUDP.entryPoint }}
+  routes:
+    - services:
+        - name: {{ include "polyptic.fullname" . }}-ntp
+          port: {{ .Values.ntp.service.port | int }}
+{{- end }}

@@ -49,6 +49,7 @@ describe("agent/status vitals (POL-92)", () => {
         tempC: 61.2,
         uptimeSec: 86_400,
         imageId: "20260714T101500Z-abcd",
+        clockSynced: true,
         browsers: [
           { connector: "DP-1", running: true, pid: 4242, rssBytes: 512_000_000, respawns: 0, gpuAccel: true },
         ],
@@ -56,7 +57,14 @@ describe("agent/status vitals (POL-92)", () => {
     };
     const parsed = AgentStatus.parse(frame);
     expect(parsed.vitals?.cpuPercent).toBe(34.2);
+    expect(parsed.vitals?.clockSynced).toBe(true);
     expect(parsed.vitals?.browsers?.[0]?.gpuAccel).toBe(true);
+  });
+
+  test("clockSynced (POL-148) round-trips and stays optional", () => {
+    expect(MachineVitals.parse({ clockSynced: false }).clockSynced).toBe(false);
+    expect(MachineVitals.parse({}).clockSynced).toBeUndefined();
+    expect(() => MachineVitals.parse({ clockSynced: "yes" })).toThrow();
   });
 
   test("a PARTIAL sample is valid — every field is optional", () => {

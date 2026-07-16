@@ -46,6 +46,11 @@ export interface VitalsSamplerOptions {
   sysRoot?: string;
   /** Where the live image stamps the id it booted (`build-live-image.sh`). */
   imageIdPath?: string;
+  /** POL-148 — systemd-timesyncd's runtime directory. It exists whenever timesyncd has run this
+   *  boot (RuntimeDirectory=systemd/timesync), and gains a `synchronized` file on first sync. We use
+   *  the pair to distinguish "no time client to ask" (dir absent → omit) from "running, not yet
+   *  synced" (dir present, file absent → false). Overridden by tests with a fixture tree. */
+  timesyncRunDir?: string;
   /** The filesystem whose usage we report (the netbooted box's RAM-backed root). */
   rootPath?: string;
   /** Injectable so a test can assert the mapping without depending on the host's real disk. */
@@ -197,6 +202,7 @@ export class VitalsSampler {
   private readonly procRoot: string;
   private readonly sysRoot: string;
   private readonly imageIdPath: string;
+  private readonly timesyncRunDir: string;
   private readonly rootPath: string;
   private readonly statfs: (path: string) => { totalBytes: number; usedBytes: number } | null;
   private readonly coreCount: () => number;
@@ -210,6 +216,7 @@ export class VitalsSampler {
     this.procRoot = opts.procRoot ?? "/proc";
     this.sysRoot = opts.sysRoot ?? "/sys";
     this.imageIdPath = opts.imageIdPath ?? "/etc/polyptic/image-id";
+    this.timesyncRunDir = opts.timesyncRunDir ?? "/run/systemd/timesync";
     this.rootPath = opts.rootPath ?? "/";
     this.statfs = opts.statfs ?? defaultStatfs;
     this.coreCount = opts.coreCount ?? (() => cpus().length);
@@ -276,6 +283,9 @@ export class VitalsSampler {
     const imageId = await this.readImageId();
     if (imageId) vitals.imageId = imageId;
 
+    const clockSynced = await this.clockSynced();
+    if (clockSynced !== undefined) vitals.clockSynced = clockSynced;
+
     if (browsers.length > 0) vitals.browsers = await this.sampleBrowsers(browsers);
 
     return vitals;
@@ -299,6 +309,29 @@ export class VitalsSampler {
       if (c !== null && (hottest === null || c > hottest)) hottest = c;
     }
     return hottest;
+  }
+
+  /**
+   * POL-148 — is the box's clock synchronised to a time source? `true` when
+   * systemd-timesyncd has stamped `<runDir>/synchronized`, `false` when timesyncd is running this
+   * boot (its RuntimeDirectory exists) but has NOT synced yet, and `undefined` when there is no time
+   * client to ask at all (the dir is absent) — a pre-POL-148 image, or a non-Linux dev host. The
+   * distinction matters: an absent flag must never be drawn as "not synced", only a definite `false`.
+   */
+  private async clockSynced(): Promise<boolean | undefined> {
+    let dir;
+    try {
+      dir = await stat(this.timesyncRunDir);
+    } catch {
+      return undefined; // no timesyncd this boot — nothing to claim
+    }
+    if (!dir.isDirectory()) return undefined;
+    try {
+      await stat(join(this.timesyncRunDir, "synchronized"));
+      return true;
+    } catch {
+      return false; // running, but the clock has not been disciplined yet
+    }
   }
 
   /**

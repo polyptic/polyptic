@@ -410,6 +410,71 @@ ingressRoute:
     - web
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bundled NTP server (POL-148) — fleet clock sync WITHOUT the internet.
+#
+# A netboot wall box ships no time client of its own until POL-148, so it
+# free-runs off its RTC: one fpd-ago box drifted an hour ahead and silently
+# broke a Grafana dashboard (a relative `now-1m` range resolved from the box
+# clock queried a FUTURE window → empty). The kiosk user is unprivileged
+# (`set-time` → Access denied), so the fix is a baked-in system service on the
+# box (systemd-timesyncd, in the live image) pointed at a time source it can
+# actually reach on an air-gapped LAN — this bundled server.
+#
+# It runs `chronyd` as a LOCAL stratum reference: NO internet upstream, it just
+# serves this pod's (node's) own clock as authoritative, so boxes discipline to
+# the cluster's time. `chronyd -x` means it never tries to step the container's
+# clock — it only answers client requests.
+#
+# OFF by default. Turn it on AND expose UDP/123 through Traefik (see `expose`).
+ntp:
+  enabled: false
+  image:
+    # Any image that provides /usr/sbin/chronyd works — the chart supplies the
+    # config and overrides the entrypoint, so the image's own is not used.
+    repository: cturra/ntp
+    tag: latest
+    pullPolicy: IfNotPresent
+  # The stratum the local reference advertises (1–15; higher = less authoritative
+  # but always beats a box's un-synced free-running clock). 8 is a sensible middle.
+  stratum: 8
+  # Which clients chronyd answers. Behind a Traefik UDP route the source address
+  # chronyd sees is Traefik's, not the box's, so restricting by the box network
+  # here does not help — the ROUTE is the real boundary. Default: serve anyone who
+  # reaches us. Set explicit CIDRs to also restrict at chronyd (e.g. [10.0.0.0/8]).
+  allow:
+    - all
+  # How UDP/123 is PUBLISHED so wall boxes can reach it (mirrors agentMtls.expose):
+  #   ingressRouteUDP (DEFAULT) — render a traefik.io/v1alpha1 IngressRouteUDP that
+  #     routes a Traefik UDP entrypoint (ntp.ingressRouteUDP.entryPoint) to the
+  #     chrony Service. The operator MUST add that UDP entrypoint (:123/udp) to
+  #     Traefik and expose it on the LoadBalancer — Traefik has no UDP entrypoint
+  #     out of the box. See README ▸ Fleet clock sync.
+  #   none — publish nothing extra; bring your own reachability (a LoadBalancer /
+  #     NodePort on the chrony Service's UDP port) and point boxes at it.
+  expose: ingressRouteUDP
+  ingressRouteUDP:
+    # The Traefik UDP entrypoint this route binds. There is NO stock UDP entrypoint
+    # on K3s Traefik, so this name must match one you add (static config /
+    # additionalArguments: --entryPoints.ntp.address=:123/udp) and expose on the
+    # LoadBalancer. The box dials the boot host on :123/udp, which Traefik forwards.
+    entryPoint: ntp
+  service:
+    # The Service port (and containerPort) chronyd binds. NTP is 123 by convention;
+    # the box uses the default 123, so keep this unless your route remaps it.
+    port: 123
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Netboot depot (POL-33…41).
 #   The server serves the live image (GET /dist/image/<arch>/…) and the signed
 #   boot loaders (GET /dist/boot/<file>) from two directories; both live on one

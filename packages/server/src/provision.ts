@@ -224,6 +224,14 @@ function bootKernelCmdline(
     `polyptic.base=${httpBase}`,
     `polyptic.server_url=${toWsAgentUrl(httpBase)}`,
   ];
+  // POL-148 — the NTP endpoint the box's systemd-timesyncd disciplines its clock to. A netboot fleet
+  // has no working time source of its own (the live image ships no NTP client until POL-148, so boxes
+  // free-run off the RTC — one an hour ahead silently broke a relative-range dashboard). We bake the
+  // BOOT HOST: the bundled chrony server (helm `ntp.enabled`) is reachable there on UDP/123 via a
+  // Traefik UDP route, no internet needed. The image's timesync-conf helper reads this off the cmdline;
+  // if it is ever absent (older baked media) the helper falls back to the server_url host. Port 123 is
+  // the default, so the host alone is enough.
+  parts.push(`polyptic.ntp=${new URL(httpBase).hostname}`);
   if (token !== undefined) parts.push(`polyptic.token=${token}`);
   // POL-7/POL-38: boot splash instead of scrolling kernel/systemd text. The live image carries the
   // Polyptic Plymouth theme, and dracut's plymouth module bundles it into the initramfs (the theme

@@ -1,0 +1,23 @@
+{{- /*
+POL-148 — the ClusterIP Service in front of the bundled chrony server. NTP is UDP/123; the
+IngressRouteUDP (or a bring-your-own LoadBalancer) targets this Service by name + port.
+*/ -}}
+{{- if .Values.ntp.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "polyptic.fullname" . }}-ntp
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ntp
+spec:
+  type: ClusterIP
+  ports:
+    - name: ntp
+      port: {{ .Values.ntp.service.port | int }}
+      targetPort: ntp
+      protocol: UDP
+  selector:
+    {{- include "polyptic.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ntp
+{{- end }}

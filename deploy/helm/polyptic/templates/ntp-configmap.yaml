@@ -1,0 +1,31 @@
+{{- /*
+POL-148 — chrony.conf for the bundled NTP server.
+
+A SELF-CONTAINED time source for an air-gapped wall fleet: no `server`/`pool` line, so chronyd never
+reaches for the internet. `local stratum <n>` makes it an authoritative reference that serves this
+pod's (node's) own clock, which on any real cluster is itself NTP-disciplined — good enough to pull a
+free-running box off its RTC. `allow` admits clients (the Traefik UDP route is the real boundary; see
+the values note). The Deployment runs `chronyd -x`, so it serves time but never tries to step the
+container's own clock.
+*/ -}}
+{{- if .Values.ntp.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "polyptic.fullname" . }}-ntp
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ntp
+data:
+  chrony.conf: |
+    # Managed by the Polyptic chart (POL-148). Do not edit in-cluster; change values.ntp instead.
+    # A LOCAL reference clock — no internet upstream. Serves this node's own clock as authoritative.
+    local stratum {{ .Values.ntp.stratum | int }}
+    {{- range .Values.ntp.allow }}
+    allow {{ . }}
+    {{- end }}
+    # Serve on the standard NTP port; -x on the command line keeps chronyd from stepping our own clock.
+    bindcmdaddress 127.0.0.1
+    # No drift/rtc state to keep for a stateless server that never disciplines its own clock.
+    dumpdir /var/lib/chrony
+{{- end }}

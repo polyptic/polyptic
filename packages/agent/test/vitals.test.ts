@@ -88,6 +88,9 @@ function sampler(): VitalsSampler {
     procRoot,
     sysRoot,
     imageIdPath: join(root, "image-id"),
+    // Points at a path that does NOT exist by default, so the general tests see clockSynced omitted
+    // (no time client to ask); the dedicated tests below create the fixture dir/file.
+    timesyncRunDir: join(root, "timesync"),
     statfs: () => ({ totalBytes: 100 * 1024 ** 3, usedBytes: 22 * 1024 ** 3 }),
     coreCount: () => 4,
   });
@@ -219,5 +222,27 @@ describe("VitalsSampler", () => {
     expect(browser?.gpuAccel).toBeUndefined();
     expect(browser?.rssBytes).toBeUndefined();
     expect(browser?.respawns).toBe(7); // the respawn count still matters: it is why it's down
+  });
+
+  // ── POL-148: the clock-sync tell ────────────────────────────────────────────
+  // Three states, from systemd-timesyncd's runtime dir: no dir = no client to ask (OMIT); dir but no
+  // `synchronized` stamp = running, not yet synced (false); stamp present = synced (true). An absent
+  // flag must never be drawn as "not synced" — only a definite false is.
+  test("clockSynced is OMITTED when there is no timesyncd runtime dir (no time client)", async () => {
+    const v = await sampler().sample([]);
+    expect(v?.clockSynced).toBeUndefined();
+  });
+
+  test("clockSynced is false when timesyncd is running but has not synced yet", async () => {
+    await mkdir(join(root, "timesync"), { recursive: true });
+    const v = await sampler().sample([]);
+    expect(v?.clockSynced).toBe(false);
+  });
+
+  test("clockSynced is true once the synchronized stamp exists", async () => {
+    await mkdir(join(root, "timesync"), { recursive: true });
+    await writeFile(join(root, "timesync", "synchronized"), "");
+    const v = await sampler().sample([]);
+    expect(v?.clockSynced).toBe(true);
   });
 });

@@ -293,6 +293,56 @@ it. If a box still can't reach the door, it says so — the Settings ▸ Agent s
 card shows *"Can't reach the secure port · tried `wss://…`"* and the activity feed
 carries it once, instead of promising *"moves over on next connection"* forever.
 
+## Fleet clock sync — a bundled NTP server (POL-148)
+
+A netboot wall box ships no time client of its own, so it free-runs off its RTC — and
+a box that drifts (one fpd-ago box sat an hour ahead) silently breaks anything that
+resolves a *relative* time range from the box clock (a Grafana `now-1m` panel queried a
+future window and came up empty). The kiosk user is unprivileged, so the fix is baked
+into the live image (systemd-timesyncd, enabled early at boot) pointed at a time source
+the box can actually reach on an air-gapped LAN: this bundled server.
+
+Turn it on with `ntp.enabled=true`. The chart then deploys a small **chrony** server
+configured as a **local stratum reference** — *no internet upstream*, it serves the
+node's own (cluster-disciplined) clock as authoritative — plus a `Service` on **UDP/123**
+and, by default, a Traefik **`IngressRouteUDP`**:
+
+| `ntp.expose` | What the chart does | Operator step |
+| --- | --- | --- |
+| `ingressRouteUDP` (**default**) | Renders a `traefik.io/v1alpha1` **`IngressRouteUDP`** binding `ntp.ingressRouteUDP.entryPoint` (default `ntp`) → the chrony Service. | **You must add that UDP entrypoint to Traefik** and expose it on the LoadBalancer (see below) — Traefik ships no UDP entrypoint. |
+| `none` | Deploys the server + Service but renders no route. | Bring your own reachability (a LoadBalancer / NodePort on the chrony Service's UDP port). |
+
+**Add the `ntp` UDP entrypoint to Traefik (K3s HelmChartConfig):**
+
+```yaml
+# /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      ntp:
+        port: 8123          # container port Traefik listens on
+        exposedPort: 123    # the LoadBalancer/host port boxes dial (UDP/123)
+        protocol: UDP
+        expose:
+          default: true
+```
+
+The boxes are pointed at this automatically: the server bakes `polyptic.ntp=<bootHost>`
+into every box's boot cmdline (the image's timesync helper reads it, falling back to the
+`polyptic.server_url` host for older baked media), so a box disciplines its clock to the
+boot host on UDP/123 — the same host it already netboots from — with nothing per-box to
+configure. The Console ▸ Machines card shows each box's clock health (`clock +1h02m ·
+not synced`) from the server-measured skew + the box's own sync report.
+
+`ntp.stratum` (default `8`), `ntp.allow` (default `all` — behind the UDP route the source
+IP chronyd sees is Traefik's, so the route is the real ACL) and `ntp.image` (any image
+providing `chronyd`) are all overridable.
+
 ## Netboot depot + automated image updates (POL-33…43)
 
 The server serves the netboot artifacts — the live image (`GET /dist/image/<arch>/…`)
@@ -458,6 +508,9 @@ The bundled Service is also named `polyptic-db` for a release called `polyptic`,
 | `agentMtls.expose` / `.nodePort` | `nodePort` / `30843` | How the raw-TCP listener is published so boxes can reach it (POL-143/D136). `ingressRouteTCP` = Traefik TLS-passthrough on `:443` by SNI (POL-147/D139); `none` = BYO reachability + `publicUrl`. See the mTLS reachability section. |
 | `agentMtls.ingressRouteTCP.host` / `.entryPoint` | `""` / `websecure` | POL-147: the passthrough SNI host (empty → `mtls.<ingressRoute.host>`) and Traefik entrypoint, used only when `expose=ingressRouteTCP`. |
 | `agentMtls.publicUrl` / `.sans` | `""` / `[]` | Full `wss://` dial override (a dedicated LB or `IngressRouteTCP` SNI host) + extra cert SANs. |
+| `ntp.enabled` | `false` | POL-148: deploy the bundled chrony NTP server (local stratum, no internet) so the netboot fleet's clocks sync. See the fleet clock sync section. |
+| `ntp.expose` / `.ingressRouteUDP.entryPoint` | `ingressRouteUDP` / `ntp` | How UDP/123 is published; the default renders a Traefik `IngressRouteUDP` on the named entrypoint (you add `:123/udp` to Traefik). `none` = BYO. |
+| `ntp.stratum` / `.allow` / `.image` | `8` / `[all]` / `cturra/ntp:latest` | Local stratum served, client ACL (route is the real boundary), and any image providing `chronyd`. |
 | `tls.mode` / `tls.sans` | `""` / `[]` | `self-signed` → server-native TLS with a persisted, downloadable CA (see the self-signed section). |
 | `letsEncrypt.enabled` / `.email` / `.staging` / `.additionalDnsNames` / `.solverIngressClass` | `false` / `""` / `false` / `[]` / `traefik` | Real ACME certificates via the vendored cert-manager subchart (see the Let's Encrypt section). |
 | `secrets.cookieSecret` | `""` (generated) | Session signing key. |

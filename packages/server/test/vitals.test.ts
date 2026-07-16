@@ -15,7 +15,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { MachineVitals } from "@polyptic/protocol";
 
-import { buildAdminState, Presence } from "../src/admin";
+import { buildAdminState, clockOffsetMs, Presence } from "../src/admin";
 import { ActivityLog } from "../src/activity";
 import { PlayerHub } from "../src/hub";
 import { ControlPlane, type RegisterMachineInput } from "../src/state";
@@ -82,6 +82,55 @@ describe("Presence vitals ring", () => {
     expect(presence.machineVitals("box-1")).toBeUndefined();
     expect(presence.machineLastHeartbeat("box-1")).toBeUndefined();
     expect(presence.isMachineOnline("box-1")).toBe(false);
+  });
+});
+
+// ── POL-148: the server-measured clock offset ────────────────────────────────
+describe("clock offset (POL-148)", () => {
+  test("clockOffsetMs is box − server, sign-honest, and guards a missing/bad timestamp", () => {
+    const now = Date.parse("2026-07-16T12:00:00.000Z");
+    // box a whole hour ahead → +3_600_000
+    expect(clockOffsetMs("2026-07-16T13:00:00.000Z", now)).toBe(3_600_000);
+    // box behind → negative
+    expect(clockOffsetMs("2026-07-16T11:59:30.000Z", now)).toBe(-30_000);
+    expect(clockOffsetMs(undefined, now)).toBeUndefined();
+    expect(clockOffsetMs("not-a-date", now)).toBeUndefined();
+  });
+
+  test("Presence measures the skew at receipt and forgets it with the machine", () => {
+    // A sample stamped an hour in the future relative to the server's clock.
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    presence.noteHeartbeat("box-1", vitals({ at: future }));
+    const off = presence.machineClockOffsetMs("box-1");
+    expect(off).toBeGreaterThan(3_500_000);
+    expect(off).toBeLessThan(3_700_000);
+    presence.forgetMachine("box-1");
+    expect(presence.machineClockOffsetMs("box-1")).toBeUndefined();
+  });
+
+  test("a heartbeat with no vitals (or no `at`) leaves the offset unmeasured", () => {
+    presence.noteHeartbeat("box-1"); // no vitals at all
+    expect(presence.machineClockOffsetMs("box-1")).toBeUndefined();
+    presence.noteHeartbeat("box-1", vitals({ at: undefined }));
+    expect(presence.machineClockOffsetMs("box-1")).toBeUndefined();
+  });
+
+  test("admin/state carries the offset for an ONLINE box and drops it when offline", () => {
+    presence.agentConnected("box-1");
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    presence.noteHeartbeat("box-1", vitals({ at: future, clockSynced: false }));
+
+    let machine = buildAdminState(cp, playerHub, presence, activity).machines.find(
+      (m) => m.id === "box-1",
+    );
+    expect(machine?.clockOffsetMs).toBeGreaterThan(3_500_000);
+    expect(machine?.vitals?.clockSynced).toBe(false);
+
+    presence.agentDisconnected("box-1");
+    machine = buildAdminState(cp, playerHub, presence, activity).machines.find(
+      (m) => m.id === "box-1",
+    );
+    expect(machine?.clockOffsetMs).toBeUndefined(); // a skew from a dark box is not health data
   });
 });
 

@@ -220,6 +220,67 @@ export function factsFor(vitals: MachineVitals | undefined): Fact[] {
   return facts;
 }
 
+// ── Clock health (POL-148) ───────────────────────────────────────────────────
+//
+// A netboot box free-runs off its RTC until systemd-timesyncd disciplines it. Two independent
+// facts feed one badge: the SERVER-measured skew from our clock (MachineView.clockOffsetMs, positive
+// = box ahead) and the box's own report of whether its NTP client has synced (vitals.clockSynced).
+// The badge appears only when there is something to say — a synced box within a few seconds of us
+// gets none. The rule, like every other reading here: a definite fact draws a badge, an absent one
+// (an offline box, a pre-POL-148 agent that reports no clock state) says nothing.
+
+/** A skew at or beyond this is worth flagging even on a box that CLAIMS to be synced (it's drifting). */
+export const CLOCK_OFFSET_WARN_MS = 30_000;
+/** Below this the skew is transit/among-the-noise and never shown as a number. */
+const CLOCK_OFFSET_FLOOR_MS = 1_000;
+
+/** A signed, two-unit skew: "+1h02m", "-45s", "+2m05s". "—" when we have no measurement. */
+export function formatClockOffset(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms)) return "—";
+  const sign = ms < 0 ? "-" : "+";
+  let s = Math.round(Math.abs(ms) / 1000);
+  const h = Math.floor(s / 3600);
+  s -= h * 3600;
+  const m = Math.floor(s / 60);
+  const sec = s - m * 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (h > 0) return `${sign}${h}h${pad(m)}m`;
+  if (m > 0) return `${sign}${m}m${pad(sec)}s`;
+  return `${sign}${sec}s`;
+}
+
+export type ClockBadge = { level: "warn" | "bad"; text: string; title: string };
+
+/**
+ * The Machines card's clock-health badge, or null when the clock is fine / unknown. `bad` when the
+ * skew is large (>= CLOCK_OFFSET_WARN_MS) — a clock this far off silently breaks relative-range
+ * dashboards; `warn` when a time client is present but hasn't synced yet (synced === false) while the
+ * skew is still small. A synced box within the floor, or a box that reports neither fact, gets null.
+ */
+export function clockBadge(
+  offsetMs: number | undefined,
+  synced: boolean | undefined,
+): ClockBadge | null {
+  const magnitude = offsetMs === undefined ? 0 : Math.abs(offsetMs);
+  const big = offsetMs !== undefined && magnitude >= CLOCK_OFFSET_WARN_MS;
+  const notSynced = synced === false;
+  if (!big && !notSynced) return null;
+
+  const level: "warn" | "bad" = big ? "bad" : "warn";
+  const segs: string[] = [
+    offsetMs !== undefined && magnitude >= CLOCK_OFFSET_FLOOR_MS
+      ? `clock ${formatClockOffset(offsetMs)}`
+      : "clock",
+  ];
+  if (notSynced) segs.push("not synced");
+  else if (synced === true) segs.push("synced");
+
+  const title = notSynced
+    ? "This box's clock is not yet synchronised to the NTP server. A wall reading relative time ranges (e.g. a dashboard's last-1m) can show the wrong window until it syncs."
+    : "This box's clock is off from the control plane's. Relative time ranges resolve from the box clock, so a large skew can silently query the wrong window.";
+  return { level, text: segs.join(" · "), title };
+}
+
 /** How stale is this sample? (The strip greys out if a box stops sampling but stays connected.) */
 export function sampleAgeSeconds(vitals: MachineVitals | undefined, now: number): number | null {
   if (!vitals?.at) return null;

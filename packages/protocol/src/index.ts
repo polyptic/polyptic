@@ -973,6 +973,13 @@ export const MachineVitals = z.object({
   /** The live image this box is RUNNING (`/etc/polyptic/image-id`), which is how an operator learns
    *  a box never took the last roll-out. */
   imageId: z.string().optional(),
+  /**
+   * POL-148 — the box's NTP client (systemd-timesyncd) reports whether the clock is synchronised to
+   * a time source, read from `/run/systemd/timesync/synchronized`. `true` = synced, `false` = a time
+   * client is running but has not synced yet. OMITTED when there is no time client to ask at all (a
+   * pre-POL-148 image, a non-Linux dev agent) — an absent flag is never rendered as "not synced".
+   */
+  clockSynced: z.boolean().optional(),
   /** Per-output browser health (RSS, respawns, and the GPU tell). */
   browsers: z.array(BrowserVitals).optional(),
 });
@@ -1672,6 +1679,12 @@ export const MachineView = z.object({
    *  Absent while the box is offline, before its first heartbeat, or when it runs an agent/backend
    *  that samples nothing — the console then says so rather than drawing empty meters. */
   vitals: MachineVitals.optional(),
+  /** POL-148 — the box clock's offset from the CONTROL PLANE's, in milliseconds (positive = the box
+   *  is AHEAD of us), measured SERVER-SIDE at heartbeat receipt from the sample's `at` timestamp.
+   *  Live-only (a stale skew is a lie) and absent when the box is offline or its sample carried no
+   *  `at`. Paired with `vitals.clockSynced` to give the Machines card its clock-health badge — the
+   *  fix for a free-running box whose hour-ahead clock silently broke a relative-range dashboard. */
+  clockOffsetMs: z.number().optional(),
   /** POL-104 — what the box IS: MACs, chassis serial, arch. Persisted from `agent/hello`, so a card
    *  still shows it while the box is OFFLINE (an operator commissioning a rack needs to tell one
    *  pending UUID from another, and the boxes come and go). Absent for a pre-POL-104 agent. */

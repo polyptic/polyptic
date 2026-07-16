@@ -1,0 +1,18 @@
+# POL-148 — point systemd-timesyncd at the NTP server baked into the boot cmdline, BEFORE it starts.
+# Without this a netboot box free-runs off its RTC (the live image ships no time client otherwise) and
+# can drift far enough to break relative-range dashboards. Ordered before timesyncd so the daemon
+# reads our /run drop-in (10-polyptic.conf) at its own start; runs early at boot but never blocks it.
+[Unit]
+Description=Polyptic — point systemd-timesyncd at the fleet NTP server
+DefaultDependencies=no
+Before=systemd-timesyncd.service
+Wants=systemd-timesyncd.service
+ConditionPathExists=/usr/local/lib/polyptic/timesync-conf.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/polyptic/timesync-conf.sh
+
+[Install]
+WantedBy=sysinit.target
