@@ -6,7 +6,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { WindowPlacement } from "@polyptic/protocol";
-import { diffWindows, regionToOutputRect, windowSignature } from "../src/windows";
+import {
+  diffWindows,
+  regionToOutputRect,
+  windowPlacementCommand,
+  windowSignature,
+} from "../src/windows";
 import type { PlacedWindow } from "../src/windows";
 import { buildChromeWindowArgs, chromeWindowDataDir } from "../src/backends/chrome";
 
@@ -99,6 +104,74 @@ describe("regionToOutputRect", () => {
     );
     expect(rect.w).toBeGreaterThanOrEqual(1);
     expect(rect.h).toBeGreaterThanOrEqual(1);
+  });
+
+  // POL-150 — the whole-screen case is the reported bug: a full-canvas region must cover the output
+  // EXACTLY (origin + full size), edge to edge, whatever the output's origin or resolution.
+  test("a full-canvas region covers the whole output edge to edge (single screen at origin)", () => {
+    const rect = regionToOutputRect(
+      { x: 0, y: 0, w: 1920, h: 1080 },
+      canvas,
+      { x: 0, y: 0, width: 1920, height: 1080 },
+    );
+    expect(rect).toEqual({ x: 0, y: 0, w: 1920, h: 1080 });
+  });
+
+  test("a full-canvas region on a 4K output covers it edge to edge (scaled up, still origin 0,0)", () => {
+    const rect = regionToOutputRect(
+      { x: 0, y: 0, w: 1920, h: 1080 },
+      canvas,
+      { x: 0, y: 0, width: 3840, height: 2160 },
+    );
+    expect(rect).toEqual({ x: 0, y: 0, w: 3840, h: 2160 });
+  });
+
+  test("a full-canvas region lands at the output's own origin on a multi-output box", () => {
+    // Screen 3 is the rightmost of three 1080p outputs: its rect origin is global (3840,0). The
+    // window must cover THAT output exactly — origin at the output, size = the output — not (0,0).
+    const rect = regionToOutputRect(
+      { x: 0, y: 0, w: 1920, h: 1080 },
+      canvas,
+      { x: 3840, y: 0, width: 1920, height: 1080 },
+    );
+    expect(rect).toEqual({ x: 3840, y: 0, w: 1920, h: 1080 });
+  });
+
+  test("a right-half sub-region lands on that region's bounds within the output", () => {
+    const rect = regionToOutputRect(
+      { x: 960, y: 0, w: 960, h: 1080 },
+      canvas,
+      { x: 0, y: 0, width: 1920, height: 1080 },
+    );
+    expect(rect).toEqual({ x: 960, y: 0, w: 960, h: 1080 });
+  });
+});
+
+describe("windowPlacementCommand", () => {
+  // POL-150 — pin the FULL rect → swaymsg mapping, not just the pixel math: the window is relocated
+  // to its target output, floated with no border, sized to the rect, and moved to the rect origin in
+  // sway's global coordinate space. A full-output rect ⇒ edge-to-edge cover.
+  test("a whole-screen rect floats + sizes + positions to cover the output exactly", () => {
+    const cmd = windowPlacementCommand(42, "DP-3", { x: 0, y: 0, w: 1920, h: 1080 });
+    expect(cmd).toBe(
+      "[con_id=42] move container to output DP-3, floating enable, border none, " +
+        "resize set width 1920 px height 1080 px, move absolute position 0 0",
+    );
+  });
+
+  test("a sub-region rect positions at the region origin with the region's size", () => {
+    const cmd = windowPlacementCommand(7, "HDMI-1", { x: 960, y: 0, w: 960, h: 540 });
+    expect(cmd).toBe(
+      "[con_id=7] move container to output HDMI-1, floating enable, border none, " +
+        "resize set width 960 px height 540 px, move absolute position 960 0",
+    );
+  });
+
+  test("relocates to the target output so the float/resize applies in that output's context", () => {
+    // The container is re-parented to its output BEFORE floating — the POL-150 origin-offset fix.
+    const cmd = windowPlacementCommand(1, "DP-2", { x: 1920, y: 0, w: 1920, h: 1080 });
+    expect(cmd.startsWith("[con_id=1] move container to output DP-2, floating enable")).toBe(true);
+    expect(cmd.endsWith("move absolute position 1920 0")).toBe(true);
   });
 });
 
