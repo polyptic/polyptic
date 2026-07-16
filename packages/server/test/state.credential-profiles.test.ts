@@ -145,6 +145,63 @@ describe("ControlPlane credential profiles (POL-24)", () => {
     expect(cp.screenIdsUsingProfile(profile.id)).toEqual([screenId]);
   });
 
+  test("POL-149: a renewed token re-stamps only the screens using that profile; others untouched", async () => {
+    // Two profiles, two dashboards, two screens — one on each profile.
+    const profileA = await cp.createCredentialProfile({ ...PROFILE_BODY, name: "Grafana A" });
+    const profileB = await cp.createCredentialProfile({ ...PROFILE_BODY, name: "Grafana B" });
+    const sourceA = await cp.createContentSource({
+      name: "Ops A",
+      kind: "dashboard",
+      url: "https://grafana.example.test/d/aaa?kiosk",
+      credentialProfileId: profileA.id,
+    });
+    const sourceB = await cp.createContentSource({
+      name: "Ops B",
+      kind: "dashboard",
+      url: "https://grafana.example.test/d/bbb?kiosk",
+      credentialProfileId: profileB.id,
+    });
+    if (!sourceA.ok || !sourceB.ok) throw new Error("expected sources");
+
+    const registered = await cp.registerMachine({
+      machineId: "m-1",
+      agentVersion: "test",
+      backend: "dev-open",
+      outputs: [
+        { connector: "HDMI-A-1", width: 1920, height: 1080 },
+        { connector: "HDMI-A-2", width: 1920, height: 1080 },
+      ],
+    });
+    const screenA = registered.assignments[0]!.screenId;
+    const screenB = registered.assignments[1]!.screenId;
+    await cp.setScreenContent(screenA, { sourceId: sourceA.source.id });
+    await cp.setScreenContent(screenB, { sourceId: sourceB.source.id });
+
+    // A mutable token cache — rotating profile A's token models a routine refresh.
+    const currentToken: Record<string, string> = { [profileA.id]: "A-old", [profileB.id]: "B-tok" };
+    cp.setTokenProvider({
+      getToken: (id) => currentToken[id],
+      statusFor: () => ({ tokenStatus: "ok" }),
+    });
+
+    // The re-push set for profile A is EXACTLY screen A (profile B's screen is not disturbed).
+    expect(cp.screenIdsUsingProfile(profileA.id)).toEqual([screenA]);
+    expect(cp.screenIdsUsingProfile(profileB.id)).toEqual([screenB]);
+
+    const tokenInUrl = (screenId: string): string | null => {
+      const decorated = cp.decorateSliceForSend(cp.getSlice(screenId)!);
+      return new URL((decorated.surfaces[0] as { url: string }).url).searchParams.get("auth_token");
+    };
+    expect(tokenInUrl(screenA)).toBe("A-old");
+    expect(tokenInUrl(screenB)).toBe("B-tok");
+
+    // Routine refresh rotates A's token. The re-push (server wiring) re-decorates screen A's slice —
+    // which now carries the NEW token — while screen B (a different profile) still carries B-tok.
+    currentToken[profileA.id] = "A-new";
+    expect(tokenInUrl(screenA)).toBe("A-new");
+    expect(tokenInUrl(screenB)).toBe("B-tok");
+  });
+
   test("profiles and source references survive a restart", async () => {
     const profile = await cp.createCredentialProfile(PROFILE_BODY);
     await cp.createContentSource({
@@ -192,7 +249,12 @@ describe("TokenService (POL-24)", () => {
     });
 
     const usableEdges: string[] = [];
-    const tokens = new TokenService({ log: noopLog, onTokenUsable: (id) => usableEdges.push(id) });
+    const renewals: string[] = [];
+    const tokens = new TokenService({
+      log: noopLog,
+      onTokenUsable: (id) => usableEdges.push(id),
+      onTokenRenewed: (id) => renewals.push(id),
+    });
     tokens.upsertProfile({
       id: "credential-1",
       name: "Test IdP",
@@ -212,7 +274,8 @@ describe("TokenService (POL-24)", () => {
 
     expect(tokens.getToken("credential-1")).toBe("tok-1");
     expect(tokens.statusFor("credential-1").tokenStatus).toBe("ok");
-    expect(usableEdges).toEqual(["credential-1"]);
+    expect(usableEdges).toEqual(["credential-1"]); // the not-usable → usable edge fired once
+    expect(renewals).toEqual([]); // no routine renewal yet
 
     const form = new URLSearchParams(lastBody);
     expect(form.get("grant_type")).toBe("client_credentials");
@@ -221,10 +284,60 @@ describe("TokenService (POL-24)", () => {
     expect(form.get("scope")).toBe("api://grafana/.default");
     expect(form.get("audience")).toBeNull(); // null audience is not sent
 
-    // A forced test re-exchanges but does NOT re-fire the usable edge (it was already usable).
+    // A forced re-exchange while already usable is a RENEWAL (POL-149), not a usable edge: it fires
+    // onTokenRenewed (the re-push that re-stamps a fresh token before the framed session lapses) and
+    // leaves the usable edge untouched. getToken now serves the freshly-minted token.
     const result = await tokens.testProfile("credential-1");
     expect(result).toEqual({ ok: true, expiresIn: 3600 });
     expect(usableEdges).toEqual(["credential-1"]);
+    expect(renewals).toEqual(["credential-1"]);
+    expect(tokens.getToken("credential-1")).toBe("tok-2");
+
+    tokens.stop();
+  });
+
+  test("POL-149: a renewal fires onTokenRenewed (not the usable edge) with the profile id", async () => {
+    let requests = 0;
+    idp = Bun.serve({
+      port: 0,
+      fetch: () => {
+        requests += 1;
+        return Response.json({ access_token: `tok-${requests}`, expires_in: 3600, token_type: "Bearer" });
+      },
+    });
+
+    const usableEdges: string[] = [];
+    const renewals: string[] = [];
+    const tokens = new TokenService({
+      log: noopLog,
+      onTokenUsable: (id) => usableEdges.push(id),
+      onTokenRenewed: (id) => renewals.push(id),
+    });
+    tokens.upsertProfile({
+      id: "credential-7",
+      name: "Grafana IdP",
+      strategy: "oauth-client-credentials",
+      tokenEndpoint: `http://localhost:${idp.port}/token`,
+      clientId: "polyptic-kiosk",
+      clientSecret: "s3cret",
+      scope: null,
+      audience: null,
+      tokenParam: "auth_token",
+    });
+
+    for (let i = 0; i < 100 && tokens.getToken("credential-7") === undefined; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // First fetch: usable edge, no renewal.
+    expect(usableEdges).toEqual(["credential-7"]);
+    expect(renewals).toEqual([]);
+
+    // Two routine refreshes while still usable → two renewals targeting exactly this profile; the
+    // usable edge never re-fires.
+    await tokens.testProfile("credential-7");
+    await tokens.testProfile("credential-7");
+    expect(renewals).toEqual(["credential-7", "credential-7"]);
+    expect(usableEdges).toEqual(["credential-7"]);
 
     tokens.stop();
   });
