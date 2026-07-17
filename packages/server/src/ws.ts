@@ -39,6 +39,7 @@ import {
   ServerToAgentEnrolled,
   ServerToAgentPending,
   ServerToAgentRejected,
+  ServerToAgentUpdateAvailable,
   ServerToPlayerCastPin,
   ServerToPlayerRender,
   ServerToPlayerSettings,
@@ -65,6 +66,7 @@ import type { DevtoolsRelay } from "./devtools-relay";
 import type { SourceHealthTracker } from "./source-health";
 import { powerAckLine } from "./panel-power";
 import type { PanelPowerScheduler } from "./panel-power";
+import type { AgentUpdateService } from "./agent-update";
 
 interface WsDeps {
   /** The main listener the three channels' upgrades hang off — plain HTTP, or the native-TLS
@@ -96,6 +98,8 @@ interface WsDeps {
   allowedOrigins: string[];
   /** POL-25 — the mTLS agent channel; undefined when AGENT_MTLS_PORT is unset. */
   agentMtls?: AgentMtlsChannel;
+  /** POL-160 — decides whether a hello'd box should self-update to the bundled agent binary. */
+  agentUpdate: AgentUpdateService;
 }
 
 /**
@@ -163,7 +167,7 @@ function peerAddress(req: IncomingMessage): string | undefined {
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls, agentUpdate } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -292,7 +296,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   });
 
   agentWss.on("connection", (ws: WebSocket, channel: AgentChannel, remoteAddress?: string) =>
-    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, log),
+    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, agentUpdate, log),
   );
 
   // POL-25 — the mTLS agent channel: a second listener whose TLS handshake already rejected any
@@ -344,6 +348,7 @@ function handleAgent(
   shellRelay: ShellRelay,
   devtoolsRelay: DevtoolsRelay,
   panelPower: PanelPowerScheduler,
+  agentUpdate: AgentUpdateService,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected", channel }, "agent socket opened");
@@ -395,6 +400,28 @@ function handleAgent(
   function sendRejected(reason: string): void {
     const rejected = ServerToAgentRejected.parse({ t: "server/rejected", reason });
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(rejected));
+  }
+
+  /** POL-160 — if this box reports an OLDER agent than the one this server bundles for its arch, tell
+   *  it to self-update (pull `/dist/agent/<arch>` and re-exec). Fire-and-forget on the ADMIT path only
+   *  (an admitted box has an authenticated channel), best-effort: a self-update we cannot compute must
+   *  never disturb the apply that just went out. The agent re-checks the version guard before it
+   *  installs anything, so this frame can only ever move a box FORWARD. */
+  function maybeOfferUpdate(reportedVersion: string | undefined, reportedArch: string | undefined, targetMachineId: string): void {
+    void agentUpdate
+      .offerFor(reportedVersion, reportedArch)
+      .then((offer) => {
+        if (!offer) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify(ServerToAgentUpdateAvailable.parse({ t: "server/update-available", ...offer })));
+        log.info(
+          { event: "agent.update.offered", machineId: targetMachineId, from: reportedVersion, to: offer.version, url: offer.url },
+          "offered a newer agent binary to a box running an older version",
+        );
+      })
+      .catch((err: unknown) => {
+        log.warn({ event: "agent.update.offer_error", machineId: targetMachineId, err: String(err) }, "could not compute an agent self-update offer");
+      });
   }
 
   async function onHello(msg: Extract<AgentMessage, { t: "agent/hello" }>): Promise<void> {
@@ -520,6 +547,10 @@ function handleAgent(
             break;
           }
           sendApply(msg.machineId, assignments);
+          // POL-160 — the box is admitted on an authenticated channel; if it is running an OLDER agent
+          // than this server bundles for its arch, tell it to self-update now. After a `helm upgrade`
+          // this is what actually gets the new agent onto the fleet — no manual full rebuild, no reboot.
+          maybeOfferUpdate(msg.agentVersion, msg.hardware?.arch, msg.machineId);
           // POL-101 — the box is back and its panels are LIT (the compositor asserts `dpms on` at
           // startup). If a screen is outside its panel hours right now, sleep it again; in hours,
           // this does nothing at all — a wall that should be showing content is never blanked.
@@ -810,6 +841,23 @@ function handleAgent(
       log.info(
         { event: "agent.reboot_ack", machineId: msg.machineId, accepted: msg.accepted, reason: msg.reason },
         msg.accepted ? "agent accepted reboot" : "agent refused reboot",
+      );
+    } else if (msg.t === "agent/update-status") {
+      // POL-160 — the box narrating its own self-update, so a fix reaching (or NOT reaching) the fleet
+      // is never silent again. `restarting` and `failed` are the operator-facing edges: the box is
+      // about to blink as the new binary relaunches, or it stayed on the old one and here is why. The
+      // in-between phases (downloading/verifying/swapping) and a `skipped` no-op are log-only noise.
+      const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+      if (msg.phase === "restarting") {
+        activity.push("info", `${label} is self-updating its agent ${msg.fromVersion} → ${msg.toVersion} and will blink as it relaunches`);
+        broadcaster.broadcast();
+      } else if (msg.phase === "failed") {
+        activity.push("bad", `${label} could not self-update its agent to ${msg.toVersion}: ${msg.reason ?? "no reason given"} (still on ${msg.fromVersion})`);
+        broadcaster.broadcast();
+      }
+      log.info(
+        { event: "agent.update_status", machineId: msg.machineId, phase: msg.phase, from: msg.fromVersion, to: msg.toVersion, reason: msg.reason },
+        "agent self-update status",
       );
     } else if (msg.t === "agent/shell-opened") {
       shellRelay.openedFromAgent(msg.machineId, msg.sessionId, msg.ok, msg.reason);

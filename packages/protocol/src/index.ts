@@ -260,6 +260,35 @@ export function machineHasName(machine: { id: string; label: string }): boolean 
   return meaningfulHostname(label) !== null;
 }
 
+/**
+ * POL-160 — is `candidate` a STRICTLY NEWER agent version than `current`? The single shared answer
+ * for "should this box self-update", used by the SERVER (to decide whether to offer an update at all)
+ * and the AGENT (to refuse ever installing an older-or-equal binary — the core safety guard). A
+ * dotted numeric compare (`0.2.41` > `0.2.40`); any non-numeric segment (a `-rc1` suffix, a git sha)
+ * counts as 0, so a pre-release never reads as newer than its release. Equal versions return false —
+ * the update path must be a no-op when the fleet already matches the server.
+ */
+function agentVersionParts(v: string): number[] {
+  return v
+    .trim()
+    .split(/[.\-+]/)
+    .map((s) => {
+      const n = Number.parseInt(s, 10);
+      return Number.isFinite(n) ? n : 0;
+    });
+}
+export function isNewerAgentVersion(candidate: string, current: string): boolean {
+  const a = agentVersionParts(candidate);
+  const b = agentVersionParts(current);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false; // equal — nothing to do
+}
+
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
@@ -1072,6 +1101,27 @@ export const AgentPowerAck = z.object({
   reason: z.string().optional(),
 });
 
+/**
+ * POL-160 — the agent's self-report of an in-progress (or refused) self-update, so the whole
+ * sequence is visible on the console the way POL-77's wifi-debug is: a fix the fleet silently never
+ * received (v0.2.41 shipped, every box stayed on 0.2.40) is exactly what must never be silent again.
+ * The terminal proof is the box coming back reporting the NEW `agentVersion`; these frames narrate
+ * the steps in between and, on a failure, say why the box stayed on the old binary.
+ */
+export const AgentUpdateStatus = z.object({
+  t: z.literal("agent/update-status"),
+  machineId: z.string(),
+  /** Where in the swap the box is. `skipped` = the offer was declined (not newer, or not an
+   *  updatable binary); `restarting` = the new binary is on disk and the agent is exiting for
+   *  systemd to relaunch it; `failed` = the box stayed on `fromVersion` and `reason` says why. */
+  phase: z.enum(["downloading", "verifying", "swapping", "restarting", "skipped", "failed"]),
+  /** The version the box is running RIGHT NOW (before any swap). */
+  fromVersion: z.string(),
+  /** The version the server offered. */
+  toVersion: z.string(),
+  reason: z.string().optional(),
+});
+
 // ── Remote shell (POL-59) ─────────────────────────────────────────────────────
 //
 // An operator-initiated, UNPRIVILEGED PTY on a running box, tunnelled over the agent's EXISTING
@@ -1186,6 +1236,7 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentStatus,
   AgentThumbnail,
   AgentRebootAck,
+  AgentUpdateStatus,
   AgentPowerAck,
   AgentShellOpened,
   AgentShellData,
@@ -1254,6 +1305,34 @@ export const ServerToAgentReboot = z.object({
   t: z.literal("server/reboot"),
   /** Advisory, logged on the box (e.g. "requested by an operator from the console"). */
   reason: z.string().optional(),
+});
+
+/**
+ * POL-160 — RUNTIME AGENT SELF-UPDATE. The agent binary is baked into the netboot squashfs, so an
+ * agent-code fix used to reach a box only on a FULL image rebuild + reboot — and a plain `helm
+ * upgrade` rebuilds the boot medium, not the image, so nothing reached the fleet and nothing said so
+ * (v0.2.41 shipped, every box kept running 0.2.40). This closes that: the server already knows each
+ * box's `agentVersion` from the hello and already serves the binary at `/dist/agent/<arch>`, so when
+ * a box reports an OLDER version than the one the server bundles for its arch, the server tells it to
+ * pull the new binary and re-exec — no rebuild, no reboot, which is what "the control plane keeps the
+ * agent current" is supposed to mean.
+ *
+ * The agent NEVER installs an older-or-equal binary (it re-checks `isNewerAgentVersion` itself), and
+ * gates the swap behind a self-check of the downloaded binary, so a bad offer cannot wedge a box.
+ * This carries ONLY the agent binary; kernel/OS changes stay on the rebuild+reboot path.
+ */
+export const ServerToAgentUpdateAvailable = z.object({
+  t: z.literal("server/update-available"),
+  /** The version the server serves for this box's arch — must be strictly newer than the box's own. */
+  version: z.string().min(1),
+  /** Same-origin path to the binary (`/dist/agent/<arch>`); the agent resolves it against the server
+   *  URL it is already connected to, so the download rides the channel it already trusts. */
+  url: z.string().min(1),
+  /** Hex sha256 of the served binary, when the server can compute it — the agent verifies the
+   *  download against it before swapping. Absent ⇒ the agent falls back to a size + self-check. */
+  sha256: z.string().optional(),
+  /** The served binary's size in bytes, for a cheap first integrity check of the download. */
+  sizeBytes: z.number().int().positive().optional(),
 });
 
 /**
@@ -1434,6 +1513,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentIdent,
   ServerToAgentCapture,
   ServerToAgentReboot,
+  ServerToAgentUpdateAvailable,
   ServerToAgentInspect,
   ServerToAgentDisplayPower,
   ServerToAgentEnrolled,
