@@ -157,6 +157,43 @@ export function spanningOutputRect(
 }
 
 /**
+ * POL-162 — does this web-window cover an ENTIRE single output? Then it is placed EXACTLY like the
+ * player: fullscreened (sway guarantees edge-to-edge, no math), NOT floated with a hand-computed
+ * rect. The floating + geometry + self-verify path is kept ONLY for the two cases that genuinely
+ * need it:
+ *   1. a SUB-REGION window (covers part of one output, player content around it), and
+ *   2. a single-box MULTI-OUTPUT SPAN (POL-156 — a fullscreen surface can't cross outputs, so the
+ *      window must float across the union).
+ * So the fullscreen path is exactly: one connector AND a full-canvas region.
+ */
+export function windowFillsSingleOutput(connectors: string[], win: WindowPlacement): boolean {
+  return connectors.length === 1 && isFullCanvasRegion(win.region, win.canvas);
+}
+
+/** Does `region` cover the whole `canvas` — same origin, same size? A full-canvas region is a
+ *  whole-screen web-window (the common, keeps-breaking case); anything smaller is a sub-region. */
+export function isFullCanvasRegion(region: Geometry, canvas: Geometry): boolean {
+  return (
+    region.x === canvas.x &&
+    region.y === canvas.y &&
+    region.w === canvas.w &&
+    region.h === canvas.h
+  );
+}
+
+/**
+ * POL-162 — the `swaymsg` that places a full-region single-output web-window EXACTLY like the
+ * player: park its container on the target output, then make it that output's FULLSCREEN surface.
+ * sway guarantees edge-to-edge — so there is NO `resize set`, NO `move absolute position`, no target
+ * rect, and no self-verify loop. Enabling fullscreen here takes the workspace's fullscreen from the
+ * player automatically (only one container is fullscreen per workspace), so the web-window becomes
+ * the visible surface. Pure, so the "move + fullscreen, and nothing else" shape is unit-provable.
+ */
+export function windowFullscreenCommand(conId: number, output: string): string {
+  return `[con_id=${conId}] move container to output ${output}, fullscreen enable`;
+}
+
+/**
  * The exact `swaymsg` command that FLOATS + SIZES + POSITIONS a placed web-window's container onto
  * its computed rect (POL-18/POL-150). Pure, so the whole region → sway-geometry mapping — not just
  * the pixel math — is unit-provable without a compositor.
@@ -239,4 +276,52 @@ export function findConRect(tree: unknown, conId: number): PixelRect | null {
     }
   }
   return null;
+}
+
+/** A placed web-window as the surface resolver reasons about it (id + the outputs it covers + its
+ *  region/canvas, so full-region vs sub-region is decidable). */
+export interface SurfaceWindow {
+  id: string;
+  connectors: string[];
+  window: WindowPlacement;
+}
+
+/**
+ * POL-162/POL-146/POL-154 — the ONE rule for WHICH surface owns a connector's glass, so ident,
+ * teardown, placement and respawn all agree instead of two fullscreen mechanisms fighting. Given the
+ * web-windows currently placed on this box, decide the standing state for one connector:
+ *
+ *   - `window-fullscreen` — a FULL-region single-output web-window IS the output's fullscreen surface
+ *     (the POL-162 path); nothing else is drawn there.
+ *   - `player-windowed` — a floating (sub-region / multi-output span) web-window covers PART of the
+ *     output, so the player stays windowed (a tiled view that fills the glass) with the floater
+ *     composited above it (POL-146).
+ *   - `player-fullscreen` — no web-window here, so the player reclaims the whole output as a
+ *     fullscreen surface (the backend's standing invariant).
+ *
+ * Pure, so the surface state machine is unit-pinned without a compositor. The agent maps each result
+ * to the matching swaymsg toggle (fullscreen the window, un-fullscreen the player, or fullscreen the
+ * player).
+ */
+export type VisibleSurface =
+  | { kind: "window-fullscreen"; windowId: string }
+  | { kind: "player-windowed" }
+  | { kind: "player-fullscreen" };
+
+export function visibleSurfaceFor(
+  connector: string,
+  windows: readonly SurfaceWindow[],
+): VisibleSurface {
+  // A full-region single-output web-window is the fullscreen surface (POL-162).
+  for (const w of windows) {
+    if (windowFillsSingleOutput(w.connectors, w.window) && w.connectors[0] === connector) {
+      return { kind: "window-fullscreen", windowId: w.id };
+    }
+  }
+  // A floating (sub-region / span) web-window covers this output — the player stays windowed beneath.
+  for (const w of windows) {
+    if (w.connectors.includes(connector)) return { kind: "player-windowed" };
+  }
+  // Nothing floated here — the player owns the whole glass.
+  return { kind: "player-fullscreen" };
 }
