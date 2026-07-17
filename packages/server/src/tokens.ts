@@ -12,23 +12,25 @@
  * The client secret enters this class from the store and goes nowhere else.
  *
  * `onTokenUsable` fires only on the not-usable → usable EDGE (first fetch, or recovery after an
- * error / secret fix): the wiring re-pushes renders to affected screens, which stamps a fresh
- * `auth_token` into the content URL. For Grafana that first stamped URL is the SIGN-IN: `url_login`
- * validates the JWT once and mints Grafana's OWN session cookie (default ~30-day lifetime, silently
- * self-rotating). After that the framed app stays authenticated with no further help from us. So the
- * usable edge is the only push that signs the wall in — and the recovery heal if the token was ever
- * not-usable.
+ * error / secret fix): the wiring re-pushes renders to affected screens so a wall stuck on a login
+ * page heals itself.
  *
- * POL-155 — a ROUTINE token refresh does NOT re-push. `auth_token` is Grafana's `url_login` sign-in
- * mechanism, not a per-request bearer: once the session cookie exists, re-stamping a NEW auth_token
- * would only change the iframe URL, forcing the player to re-navigate the frame and Grafana to reboot
- * (a visible flash) — for no benefit, because the existing cookie already keeps the wall signed in.
- * POL-149 re-pushed on every routine renewal on the mistaken premise that the framed session expires
- * with the JWT; it does not. The token CACHE still refreshes every cycle (so a future first-usable /
- * recovery push always carries a valid token) — only the wall-facing re-push on routine renewal is
- * gone. Caveat: if Grafana's session genuinely lapses (30+ days, or Grafana restarts) we cannot yet
- * DETECT it — surface-health proves fetchability but can't tell a login page from a dashboard. The
- * proper fix is login-page detection, not a perpetual reload; that gap is accepted for now.
+ * `onTokenRenewed` fires on a ROUTINE refresh — a fresh token replacing one that was still usable
+ * (POL-149). The wiring re-pushes the same screens so the iframe re-presents a fresh `auth_token`
+ * before the old JWT expires. This is NOT optional: Grafana's `url_login` is STATELESS. A HAR
+ * capture on a live wall proved it — no `Set-Cookie` is ever minted and no `Cookie` header is ever
+ * sent; the frontend re-presents the URL JWT on EVERY API request. Everything 200s until the
+ * token's `exp` (+~60s leeway), then everything 401s at once and the next document load 302s to
+ * /login. There is no session for the framed app to "hold" — the re-push at ~75% of the token's
+ * lifetime is the ONLY thing that keeps an unattended wall alive past one token life. (POL-155
+ * briefly removed this re-push on the mistaken belief that url_login minted a session cookie; the
+ * wall bounced back to the login screen and the removal was reversed.)
+ *
+ * The re-push cadence is governed by the TOKEN LIFESPAN, not by suppressing the re-push: set the
+ * access-token lifetime long at the IdP (e.g. Keycloak per-client access.token.lifespan → 30 days)
+ * and the re-push becomes one soft reload every ~22 days. And it IS soft: POL-86's
+ * proven-before-painted player swaps the re-stamped URL in place — the old content stays up until
+ * the new URL proves — so the re-push is an in-place iframe navigation, not a login-screen flash.
  */
 import type { CredentialTokenStatus } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
@@ -65,10 +67,12 @@ const EXPIRY_SLACK_MS = 10_000;
 
 export interface TokenServiceDeps {
   log: FastifyBaseLogger;
-  /** Fired on the not-usable → usable edge (first fetch, or recovery after an error / secret fix).
-   *  The wiring re-pushes affected screens — the push that signs a framed app (e.g. Grafana) in.
-   *  A routine refresh does NOT fire this (POL-155): the framed app holds its own session. */
+  /** Fired on the not-usable → usable edge (never on routine refresh). */
   onTokenUsable?: (profileId: string) => void;
+  /** POL-149 — fired on a routine refresh: a fresh token replaced one that was still usable. The
+   *  wiring re-pushes affected screens so the stateless framed app (url_login re-presents the JWT
+   *  on every request) gets a fresh token before the old one expires. */
+  onTokenRenewed?: (profileId: string) => void;
   /** Fired on any status/expiry change worth reflecting in the console (coalesced by the caller). */
   onStatusChange?: () => void;
 }
@@ -205,12 +209,12 @@ export class TokenService {
         `credential profile ${profile.name}: token refreshed`,
       );
       this.deps.onStatusChange?.();
-      // POL-155 — only the not-usable → usable EDGE re-pushes: that stamped URL is the framed app's
-      // sign-in (Grafana's url_login mints its own session cookie on first load). A routine refresh
-      // (wasUsable) re-fetches the token to keep the cache warm but does NOT re-push — re-stamping a
-      // new auth_token into a live iframe would only re-navigate the frame and reboot the app (a
-      // visible flash) while the app's existing session already keeps the wall signed in.
-      if (!wasUsable) this.deps.onTokenUsable?.(profileId);
+      // Edge: a screen may be sitting on a login page — heal it. Routine refresh (POL-149): re-push
+      // so the wall re-presents a fresh token before the old JWT expires — url_login is stateless
+      // (no session cookie), so without this the wall 401s at exp+leeway and falls to a login
+      // screen. Either way a fresh token reaches the wall; the callbacks differ only in intent.
+      if (wasUsable) this.deps.onTokenRenewed?.(profileId);
+      else this.deps.onTokenUsable?.(profileId);
       return { ok: true, expiresIn };
     } catch (err) {
       const current = this.states.get(profileId);

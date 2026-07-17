@@ -270,18 +270,19 @@ const broadcaster = new AdminBroadcaster({
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
 // profiles; refreshes in the background at ~75% of each token's lifetime, stamping the current token
-// into a referencing source's URL at send time (decorateSliceForSend). Exactly ONE event re-pushes
-// renders to the screens showing content this profile authenticates:
-//   - the token-usable EDGE (first fetch / recovery): the stamped auth_token signs the framed app in
-//     (Grafana's url_login mints its own session cookie on first load) and heals a screen stuck on a
-//     login page after an error/secret fix.
-// POL-155 — a routine token RENEWAL does NOT re-push. auth_token is Grafana's sign-in mechanism, not a
-// per-request bearer: once the session cookie exists the wall stays authenticated with no help from
-// us, so re-stamping a new token would only re-navigate the iframe and reboot the app (a visible
-// flash) for no benefit. POL-149's routine re-push was based on the wrong premise that the framed
-// session expires with the JWT; the token cache still refreshes every cycle so any future edge push
-// carries a valid token. ──
-const rePushForProfile = (profileId: string): void => {
+// into a referencing source's URL at send time (decorateSliceForSend). Two events re-push renders to
+// the screens showing content this profile authenticates, each carrying the fresh token:
+//   - token-usable EDGE (first fetch / recovery): a screen stuck on a login page heals itself.
+//   - routine RENEWAL (POL-149): Grafana's url_login is STATELESS (HAR-proven on a live wall: no
+//     Set-Cookie ever minted, no Cookie ever sent) — the frame re-presents the URL JWT on every API
+//     request and dies wholesale at the token's exp (+~60s leeway). The renewal re-push at ~75% of
+//     lifetime is the only thing that keeps a wall alive past one token life. POL-155 removed it on
+//     the mistaken belief that url_login minted a session cookie; the wall bounced back to the login
+//     screen and the removal was reversed. The cadence is governed by the TOKEN LIFESPAN at the IdP
+//     (e.g. Keycloak access.token.lifespan → 30 days = one re-push every ~22 days), not by
+//     suppressing the re-push — and POL-86's prove-then-swap player makes each re-push an in-place
+//     navigation (old content stays up until the new URL proves), not a flash. ──
+const rePushForProfile = (profileId: string, reason: "token-usable" | "token-renewed"): void => {
   for (const screenId of control.screenIdsUsingProfile(profileId)) {
     const slice = control.getSlice(screenId);
     if (!slice) continue;
@@ -293,15 +294,18 @@ const rePushForProfile = (profileId: string): void => {
     });
     const delivered = hub.send(screenId, message);
     fastify.log.info(
-      { event: "render.push.token", screenId, profileId, delivered },
-      "re-pushed render after credential token became usable",
+      { event: "render.push.token", screenId, profileId, reason, delivered },
+      reason === "token-usable"
+        ? "re-pushed render after credential token became usable"
+        : "re-pushed render after credential token was renewed (POL-149)",
     );
   }
 };
 const tokens = new TokenService({
   log: fastify.log,
   onStatusChange: () => broadcaster.broadcast(),
-  onTokenUsable: (profileId) => rePushForProfile(profileId),
+  onTokenUsable: (profileId) => rePushForProfile(profileId, "token-usable"),
+  onTokenRenewed: (profileId) => rePushForProfile(profileId, "token-renewed"),
 });
 control.setTokenProvider(tokens);
 tokens.setProfiles(control.getCredentialProfilesInternal());
