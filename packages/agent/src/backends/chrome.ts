@@ -139,6 +139,9 @@ export interface ChromeWindowSpec {
   windowId: string;
   /** Loopback DevTools port for this instance (Chrome requires a non-default data dir for it). */
   devtoolsPort: number;
+  /** POL-153 — the source's page zoom (1 = 100%). Applied as Chrome's device scale factor so a placed
+   *  window matches the iframe path's zoom. Optional/absent ⇒ 1 (no flag). */
+  zoom?: number;
 }
 
 /** Per-window Chrome profile dir — process-isolation key AND the stale-reap token (POL-18). */
@@ -163,6 +166,13 @@ export function buildChromeWindowArgs(
   // while the player ran on the GPU would come up black on real amdgpu — the two must never diverge
   // on the flags that decide GPU vs software render, which is why both build from chromeBaseArgs.
   const args = chromeBaseArgs(spec.url, chromeWindowDataDir(spec.windowId, env), spec.devtoolsPort);
+  // POL-153 — a web-window is the agent's to zoom (the player only scales its own iframes). Chrome's
+  // device scale factor is the closest analogue to browser zoom that a `--app` window honours from
+  // launch: it renders the whole page at `zoom×`, matching the iframe path. A no-op 1 adds no flag, so
+  // an unzoomed window's argv is byte-identical to before (and a changed zoom relaunches — see
+  // sway.ts, which folds zoom into the window's launch target).
+  const zoom = spec.zoom ?? 1;
+  if (zoom !== 1) args.push(`--force-device-scale-factor=${zoom}`);
   const extra = env.POLYPTIC_BROWSER_ARGS?.trim();
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
   return args;

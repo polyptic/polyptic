@@ -137,6 +137,26 @@ describe("buildChromeWindowArgs (POL-18 web-window)", () => {
     );
     expect(withExtra.at(-1)).toBe("--force-dark-mode");
   });
+
+  // POL-153 — the player scales an IFRAME surface by its zoom, but a web-window is a separate Chrome the
+  // player never renders, so the agent must zoom it itself. Chrome's device scale factor is the launch
+  // flag that makes a --app window render the whole page bigger, matching the iframe path.
+  test("a zoom carries onto Chrome as --force-device-scale-factor", () => {
+    const zoomed = buildChromeWindowArgs(
+      { url: URL, windowId: "surface-7", devtoolsPort: 9230, zoom: 1.5 },
+      ENV,
+    );
+    expect(zoomed).toContain("--force-device-scale-factor=1.5");
+  });
+
+  test("zoom 1 (or absent) adds NO scale flag — an unzoomed window's argv is unchanged", () => {
+    const unity = buildChromeWindowArgs(
+      { url: URL, windowId: "surface-7", devtoolsPort: 9230, zoom: 1 },
+      ENV,
+    );
+    expect(unity.some((a) => a.startsWith("--force-device-scale-factor"))).toBe(false);
+    expect(unity).toEqual(args); // identical to the no-zoom build above
+  });
 });
 
 describe("matchesChromeWindow", () => {
