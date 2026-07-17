@@ -4,8 +4,11 @@ internet upstream) so an air-gapped wall fleet has a time source to discipline i
 
 The image's own entrypoint is BYPASSED (`command: [chronyd]`) so any image carrying /usr/sbin/chronyd
 works — the chart owns the config via the mounted ConfigMap. `-d` keeps it in the foreground logging
-to stderr for the kubelet, `-f` points it at our conf. chronyd starts as root to bind UDP/123 and
-drops to its own user itself.
+to stderr for the kubelet, `-f` points it at our conf. chronyd runs as root (the image's default user)
+under a restricted capability set — drop ALL, add only NET_BIND_SERVICE — so it can bind UDP/123 but
+holds no CAP_CHOWN. Because the entrypoint is skipped, /run/chrony is never created, and without
+CAP_CHOWN chronyd could not set it up itself; so the conf pins `user root` (no privilege drop, no
+runtime-dir chown) and relocates the pidfile + command socket into the mounted state volume (POL-151).
 
 With NO `ntp.upstream` (default) it serves the node clock: `-x` (never touch the clock) + only
 CAP_NET_BIND_SERVICE. With an upstream it must DISCIPLINE its own clock to that source, so `-x` is
