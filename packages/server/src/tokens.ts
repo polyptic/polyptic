@@ -17,13 +17,22 @@
  *
  * `onTokenRenewed` fires on a ROUTINE refresh — a fresh token replacing one that was still usable
  * (POL-149). The wiring re-pushes the same screens so the iframe re-stamps its `auth_token` and the
- * framed app (e.g. Grafana) re-establishes its session BEFORE the old one lapses. Because refresh
- * runs at ~75% of the token's lifetime, the new token always lands well before expiry. This reverses
+ * framed app (e.g. Grafana) re-establishes its session BEFORE the old one lapses. This reverses
  * POL-24's original "routine refreshes push nothing" stance: that assumed a re-stamp reloads a live
  * iframe and that the framed app's own session carries the page indefinitely. The field proved the
  * session DOES expire (an unattended wall was bounced to Grafana's login screen with a flood of 401s),
  * and POL-86's proven-before-painted player now swaps a re-stamped URL in place — the OLD content
  * stays up until the NEW url proves — so the re-stamp is seamless, not a login-screen flash.
+ *
+ * POL-155 — but a re-stamp still costs a full framed-app re-init (Grafana reloads every plugin) with a
+ * visible flash, and the token refresh runs at ~75% of a SHORT token life (every few minutes), far
+ * more often than the framed session actually needs a fresh token. So `onTokenRenewed` is THROTTLED
+ * per profile: a routine renewal re-pushes at most once per `renewRePushIntervalMs` (sized to the
+ * framed session's lifetime, not the token-refresh cadence). The token cache still refreshes on every
+ * cycle — `getToken` always serves the newest token — only the wall re-push is rate-limited, so each
+ * re-push carries a currently-valid token and lands well before the framed session would lapse, but
+ * the wall is not reloaded on every token refresh. The `onTokenUsable` EDGE is NEVER throttled: a
+ * screen stuck on a login page (first-usable, or recovery after an error) heals immediately.
  */
 import type { CredentialTokenStatus } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
@@ -49,6 +58,10 @@ interface TokenState {
   failures: number;
   /** Guards against a stale in-flight fetch clobbering the state after upsert/remove. */
   generation: number;
+  /** POL-155 — epoch ms of the last re-push (usable edge or a fired routine renewal). Routine
+   *  renewals within `renewRePushIntervalMs` of this are throttled so the wall is not reloaded on
+   *  every token refresh. Undefined until the first re-push. */
+  lastRePushAt?: number;
 }
 
 const RETRY_BASE_MS = 30_000;
@@ -57,22 +70,41 @@ const RETRY_MAX_MS = 300_000;
 const MIN_REFRESH_MS = 15_000;
 /** Treat a token within 10s of expiry as unusable — a player load takes time to reach the app. */
 const EXPIRY_SLACK_MS = 10_000;
+/** POL-155 — default minimum gap between routine renewal re-pushes for one profile. Sized to a framed
+ *  session's lifetime (minutes-to-hours), NOT the token-refresh cadence (~75% of a short token life,
+ *  often every few minutes). Long enough to kill the periodic flash, short enough that the framed
+ *  session is refreshed well before it would lapse. Configurable via the constructor. */
+export const DEFAULT_RENEW_REPUSH_INTERVAL_MS = 30 * 60_000;
 
 export interface TokenServiceDeps {
   log: FastifyBaseLogger;
-  /** Fired on the not-usable → usable edge (never on routine refresh). */
+  /** Fired on the not-usable → usable edge (never on routine refresh; never throttled). */
   onTokenUsable?: (profileId: string) => void;
   /** POL-149 — fired on a routine refresh: a fresh token replaced one that was still usable. The
-   *  wiring re-pushes affected screens so the framed app re-auths before its session lapses. */
+   *  wiring re-pushes affected screens so the framed app re-auths before its session lapses.
+   *  POL-155 — throttled per profile to at most once per `renewRePushIntervalMs`. */
   onTokenRenewed?: (profileId: string) => void;
   /** Fired on any status/expiry change worth reflecting in the console (coalesced by the caller). */
   onStatusChange?: () => void;
+  /** POL-155 — minimum gap between routine renewal re-pushes per profile. Default
+   *  `DEFAULT_RENEW_REPUSH_INTERVAL_MS`. Set ≤0 to re-push on every refresh (POL-149 behaviour). */
+  renewRePushIntervalMs?: number;
+  /** Injectable clock (tests). Defaults to `Date.now`. */
+  now?: () => number;
 }
 
 export class TokenService {
   private readonly states = new Map<string, TokenState>();
+  private readonly renewRePushIntervalMs: number;
+  private readonly now: () => number;
 
-  constructor(private readonly deps: TokenServiceDeps) {}
+  constructor(private readonly deps: TokenServiceDeps) {
+    this.renewRePushIntervalMs =
+      deps.renewRePushIntervalMs !== undefined && Number.isFinite(deps.renewRePushIntervalMs)
+        ? deps.renewRePushIntervalMs
+        : DEFAULT_RENEW_REPUSH_INTERVAL_MS;
+    this.now = deps.now ?? (() => Date.now());
+  }
 
   /** Seed the service with the persisted profiles on boot; fetches all tokens immediately. */
   setProfiles(profiles: PersistedCredentialProfile[]): void {
@@ -201,11 +233,29 @@ export class TokenService {
         `credential profile ${profile.name}: token refreshed`,
       );
       this.deps.onStatusChange?.();
-      // Edge: a screen may be sitting on a login page — heal it. Routine refresh (POL-149): re-push
-      // so the framed app re-auths with the fresh token before its old session lapses. Either way a
-      // fresh token reaches the wall; the two callbacks differ only in intent/logging.
-      if (wasUsable) this.deps.onTokenRenewed?.(profileId);
-      else this.deps.onTokenUsable?.(profileId);
+      if (wasUsable) {
+        // Routine refresh (POL-149): re-push so the framed app re-auths with the fresh token before
+        // its old session lapses. POL-155 — throttle to at most once per renewRePushIntervalMs: the
+        // token cache is already warm (getToken serves the newest token), so skipping a re-push only
+        // defers the next seamless in-place re-stamp; it never lets the wall fall to a login screen,
+        // because the next re-push still lands well before the framed session's (much longer than a
+        // token life) lifetime elapses.
+        const now = this.now();
+        const dueAt = (current.lastRePushAt ?? -Infinity) + this.renewRePushIntervalMs;
+        if (now >= dueAt) {
+          current.lastRePushAt = now;
+          this.deps.onTokenRenewed?.(profileId);
+        } else {
+          this.deps.log.debug(
+            { event: "token.renew.throttled", profileId, nextRePushInMs: Math.round(dueAt - now) },
+            `credential profile ${profile.name}: token renewed, re-push throttled (POL-155)`,
+          );
+        }
+      } else {
+        // Edge: a screen may be sitting on a login page — heal it immediately, never throttled.
+        current.lastRePushAt = this.now();
+        this.deps.onTokenUsable?.(profileId);
+      }
       return { ok: true, expiresIn };
     } catch (err) {
       const current = this.states.get(profileId);

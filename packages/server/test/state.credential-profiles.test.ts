@@ -254,6 +254,7 @@ describe("TokenService (POL-24)", () => {
       log: noopLog,
       onTokenUsable: (id) => usableEdges.push(id),
       onTokenRenewed: (id) => renewals.push(id),
+      renewRePushIntervalMs: 0, // POL-155: isolate the POL-149 callback contract from the throttle
     });
     tokens.upsertProfile({
       id: "credential-1",
@@ -312,6 +313,7 @@ describe("TokenService (POL-24)", () => {
       log: noopLog,
       onTokenUsable: (id) => usableEdges.push(id),
       onTokenRenewed: (id) => renewals.push(id),
+      renewRePushIntervalMs: 0, // POL-155: isolate the POL-149 callback contract from the throttle
     });
     tokens.upsertProfile({
       id: "credential-7",
@@ -338,6 +340,78 @@ describe("TokenService (POL-24)", () => {
     await tokens.testProfile("credential-7");
     expect(renewals).toEqual(["credential-7", "credential-7"]);
     expect(usableEdges).toEqual(["credential-7"]);
+
+    tokens.stop();
+  });
+
+  test("POL-155: routine renewals are throttled — re-push at most once per interval, edge never throttled", async () => {
+    let requests = 0;
+    idp = Bun.serve({
+      port: 0,
+      fetch: () => {
+        requests += 1;
+        return Response.json({ access_token: `tok-${requests}`, expires_in: 3600, token_type: "Bearer" });
+      },
+    });
+
+    const usableEdges: string[] = [];
+    const renewals: string[] = [];
+    const clock = { t: 1_000_000 };
+    const INTERVAL = 60_000;
+    const tokens = new TokenService({
+      log: noopLog,
+      onTokenUsable: (id) => usableEdges.push(id),
+      onTokenRenewed: (id) => renewals.push(id),
+      renewRePushIntervalMs: INTERVAL,
+      now: () => clock.t,
+    });
+    tokens.upsertProfile({
+      id: "credential-9",
+      name: "Grafana IdP",
+      strategy: "oauth-client-credentials",
+      tokenEndpoint: `http://localhost:${idp.port}/token`,
+      clientId: "polyptic-kiosk",
+      clientSecret: "s3cret",
+      scope: null,
+      audience: null,
+      tokenParam: "auth_token",
+    });
+
+    for (let i = 0; i < 100 && tokens.getToken("credential-9") === undefined; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // First fetch: the usable edge fires immediately (it re-stamps a would-be login screen) and anchors
+    // the throttle window at the current clock.
+    expect(usableEdges).toEqual(["credential-9"]);
+    expect(renewals).toEqual([]);
+
+    // A routine renewal within the window does NOT re-push — the wall keeps its live (not-yet-expired)
+    // framed session and is not reloaded on every token refresh.
+    await tokens.testProfile("credential-9");
+    expect(renewals).toEqual([]);
+    clock.t += INTERVAL / 2; // still inside the window
+    await tokens.testProfile("credential-9");
+    expect(renewals).toEqual([]);
+
+    // A renewal at/after the window fires once, re-anchoring the window.
+    clock.t = 1_000_000 + INTERVAL;
+    await tokens.testProfile("credential-9");
+    expect(renewals).toEqual(["credential-9"]);
+
+    // Immediately again: throttled once more.
+    await tokens.testProfile("credential-9");
+    expect(renewals).toEqual(["credential-9"]);
+
+    // Past the window again: fires again.
+    clock.t += INTERVAL;
+    await tokens.testProfile("credential-9");
+    expect(renewals).toEqual(["credential-9", "credential-9"]);
+
+    // The usable EDGE never re-fired (POL-149 "stays signed in" holds), and getToken always serves the
+    // freshest token regardless of whether the wall was re-pushed — so every re-push carries a valid
+    // token and the wall never falls to a login screen.
+    expect(usableEdges).toEqual(["credential-9"]);
+    expect(tokens.getToken("credential-9")).toBe(`tok-${requests}`);
 
     tokens.stop();
   });

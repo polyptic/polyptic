@@ -53,7 +53,7 @@ import { registerDevtoolsRoutes } from "./devtools-routes";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
 import { createStore } from "./store";
-import { TokenService } from "./tokens";
+import { DEFAULT_RENEW_REPUSH_INTERVAL_MS, TokenService } from "./tokens";
 import { attachWebSockets } from "./ws";
 
 import { ServerToPlayerRender } from "@polyptic/protocol";
@@ -77,6 +77,14 @@ const BUILD_VERSION = process.env.POLYPTIC_VERSION?.trim() || "0.0.0";
 const BUILD_REVISION = process.env.POLYPTIC_REVISION?.trim() || process.env.GIT_SHA?.trim() || "dev";
 // Live-preview capture sweep cadence (ms). 0 disables the periodic sweep (on-demand still works).
 const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS ?? 4000);
+// POL-155 — minimum gap between routine credential-token re-pushes for one profile. The token cache
+// refreshes at ~75% of a (short) token life, but re-stamping the wall that often reloads the framed
+// app (Grafana re-inits every plugin) with a visible flash. This throttles the routine re-push to at
+// most once per interval (sized to the framed session's lifetime, not the token cadence) so the wall
+// stays signed in without a periodic flash. Default 30 min; set 0 to re-push on every refresh.
+const CREDENTIAL_REPUSH_MIN_INTERVAL_MS = Number(
+  process.env.CREDENTIAL_REPUSH_MIN_INTERVAL_MS ?? DEFAULT_RENEW_REPUSH_INTERVAL_MS,
+);
 // POL-59 — auto-disarm a remote shell left armed-and-idle this long (default 60 min). 0 disables the
 // sweep (arming stays sticky until a manual disarm). Guards against a forgotten armed box.
 const SHELL_ARM_TTL_MS = Number(process.env.SHELL_ARM_TTL_MS ?? 60 * 60 * 1000);
@@ -276,7 +284,11 @@ const broadcaster = new AdminBroadcaster({
 //   - routine RENEWAL (POL-149): the framed app (e.g. Grafana) re-auths with the new token before its
 //     old session lapses, so an unattended wall never gets bounced to a login screen. POL-86's
 //     proven-before-painted player swaps the re-stamped URL in place (old content stays up until the
-//     new url proves), so this is seamless — not the iframe-reload flash POL-24 originally feared. ──
+//     new url proves), so this is seamless — not the iframe-reload flash POL-24 originally feared.
+// POL-155 — the routine RENEWAL re-push is THROTTLED per profile inside TokenService (at most once per
+// CREDENTIAL_REPUSH_MIN_INTERVAL_MS): a re-stamp still costs a full framed-app re-init with a visible
+// flash, and the token refreshes far more often than the framed session needs. The usable EDGE is
+// never throttled. This helper is unchanged — it only ever runs when TokenService decides to push. ──
 const rePushForProfile = (profileId: string, reason: "token-usable" | "token-renewed"): void => {
   for (const screenId of control.screenIdsUsingProfile(profileId)) {
     const slice = control.getSlice(screenId);
@@ -301,6 +313,9 @@ const tokens = new TokenService({
   onStatusChange: () => broadcaster.broadcast(),
   onTokenUsable: (profileId) => rePushForProfile(profileId, "token-usable"),
   onTokenRenewed: (profileId) => rePushForProfile(profileId, "token-renewed"),
+  renewRePushIntervalMs: Number.isFinite(CREDENTIAL_REPUSH_MIN_INTERVAL_MS)
+    ? CREDENTIAL_REPUSH_MIN_INTERVAL_MS
+    : DEFAULT_RENEW_REPUSH_INTERVAL_MS,
 });
 control.setTokenProvider(tokens);
 tokens.setProfiles(control.getCredentialProfilesInternal());
