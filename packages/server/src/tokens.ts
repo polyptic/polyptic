@@ -12,10 +12,18 @@
  * The client secret enters this class from the store and goes nowhere else.
  *
  * `onTokenUsable` fires only on the not-usable → usable EDGE (first fetch, or recovery after an
- * error / secret fix) — the wiring re-pushes renders to affected screens so a wall stuck on a login
- * page heals itself. Routine refreshes do NOT fire it: rewriting a live iframe's URL every few
- * minutes would reload it (violates "instant"); the running page is carried by the target app's own
- * session, and the fresh token simply waits in cache for the next natural load.
+ * error / secret fix): the wiring re-pushes renders to affected screens so a wall stuck on a login
+ * page heals itself.
+ *
+ * `onTokenRenewed` fires on a ROUTINE refresh — a fresh token replacing one that was still usable
+ * (POL-149). The wiring re-pushes the same screens so the iframe re-stamps its `auth_token` and the
+ * framed app (e.g. Grafana) re-establishes its session BEFORE the old one lapses. Because refresh
+ * runs at ~75% of the token's lifetime, the new token always lands well before expiry. This reverses
+ * POL-24's original "routine refreshes push nothing" stance: that assumed a re-stamp reloads a live
+ * iframe and that the framed app's own session carries the page indefinitely. The field proved the
+ * session DOES expire (an unattended wall was bounced to Grafana's login screen with a flood of 401s),
+ * and POL-86's proven-before-painted player now swaps a re-stamped URL in place — the OLD content
+ * stays up until the NEW url proves — so the re-stamp is seamless, not a login-screen flash.
  */
 import type { CredentialTokenStatus } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
@@ -54,6 +62,9 @@ export interface TokenServiceDeps {
   log: FastifyBaseLogger;
   /** Fired on the not-usable → usable edge (never on routine refresh). */
   onTokenUsable?: (profileId: string) => void;
+  /** POL-149 — fired on a routine refresh: a fresh token replaced one that was still usable. The
+   *  wiring re-pushes affected screens so the framed app re-auths before its session lapses. */
+  onTokenRenewed?: (profileId: string) => void;
   /** Fired on any status/expiry change worth reflecting in the console (coalesced by the caller). */
   onStatusChange?: () => void;
 }
@@ -190,8 +201,11 @@ export class TokenService {
         `credential profile ${profile.name}: token refreshed`,
       );
       this.deps.onStatusChange?.();
-      // Edge only: a screen may be sitting on a login page — heal it. Routine refreshes stay quiet.
-      if (!wasUsable) this.deps.onTokenUsable?.(profileId);
+      // Edge: a screen may be sitting on a login page — heal it. Routine refresh (POL-149): re-push
+      // so the framed app re-auths with the fresh token before its old session lapses. Either way a
+      // fresh token reaches the wall; the two callbacks differ only in intent/logging.
+      if (wasUsable) this.deps.onTokenRenewed?.(profileId);
+      else this.deps.onTokenUsable?.(profileId);
       return { ok: true, expiresIn };
     } catch (err) {
       const current = this.states.get(profileId);

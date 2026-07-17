@@ -41,7 +41,7 @@ import {
 } from "./chrome";
 import { browserProbesFrom, SupervisedBrowser, SupervisedProcess, killStaleByToken } from "./supervise";
 import type { LaunchTarget } from "./supervise";
-import { regionToOutputRect } from "../windows";
+import { regionToOutputRect, windowPlacementCommand } from "../windows";
 import type { OutputRect } from "../windows";
 import {
   CAST_PORT_BASE,
@@ -680,7 +680,15 @@ export class SwayBackend implements DisplayBackend {
     return rects;
   }
 
-  /** Float + size + move a placed web-window's container to its region on `connector` (POL-18). */
+  /**
+   * Float + size + move a placed web-window's container to its region on `connector` (POL-18).
+   *
+   * POL-150 — the caller MUST drop the underlying player's sway fullscreen BEFORE this runs: sway
+   * constrains geometry ops (resize/move) on a workspace that holds a fullscreen container (the same
+   * reason `moveToOutput` has to disable fullscreen to relocate a container), so positioning a
+   * floating window over a still-fullscreen player left it offset and undersized — the whole POL-150
+   * symptom. The rect → swaymsg mapping itself is the pure, unit-pinned `windowPlacementCommand`.
+   */
   private async positionWindow(
     id: string,
     conId: number,
@@ -691,11 +699,7 @@ export class SwayBackend implements DisplayBackend {
     const rect = (await this.getOutputRects()).get(output);
     if (!rect) throw new Error(`no output rect for ${output}`);
     const r = regionToOutputRect(win.region, win.canvas, rect);
-    const cmd =
-      `[con_id=${conId}] floating enable, border none, ` +
-      `resize set width ${r.w} px height ${r.h} px, ` +
-      `move absolute position ${r.x} ${r.y}`;
-    const res = await run("swaymsg", [cmd]);
+    const res = await run("swaymsg", [windowPlacementCommand(conId, output, r)]);
     if (res.code !== 0) {
       throw new Error(`swaymsg window placement failed: ${res.stderr.trim() || `exit ${res.code}`}`);
     }
@@ -739,11 +743,13 @@ export class SwayBackend implements DisplayBackend {
     this.windowConIds.delete(id);
     try {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
+      // POL-146/POL-150 — drop the underlying player's fullscreen FIRST, then position. Un-fullscreen
+      // both reveals the floating window (POL-146: sway hides floaters behind a fullscreen view) AND
+      // frees its geometry: sway constrains resize/move on a workspace with a fullscreen container, so
+      // sizing the window while the player was still fullscreen left it offset+undersized (POL-150).
+      await this.setPlayerFullscreen(spec.connector, false);
       await this.positionWindow(id, conId, spec.connector, spec.window);
       this.windowConIds.set(id, conId);
-      // POL-146 — reveal it: drop the underlying player's fullscreen so this floating window is not
-      // hidden behind it (the black-glass symptom). Cheap and idempotent to repeat per placement.
-      await this.setPlayerFullscreen(spec.connector, false);
       this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connector}`);
     } catch (err) {
       this.log(`web-window ${id} placement failed: ${(err as Error).message}`);
@@ -773,10 +779,12 @@ export class SwayBackend implements DisplayBackend {
     const conId = this.windowConIds.get(win.id);
     if (supervised.running && supervised.url === win.url) {
       if (conId !== undefined) {
-        await this.positionWindow(win.id, conId, connector, win);
-        // POL-146 — keep the player un-fullscreened under a live window (idempotent), so a geometry-
-        // only nudge can never re-hide it behind a player that a respawn re-fullscreened.
+        // POL-146/POL-150 — un-fullscreen the player BEFORE repositioning (idempotent). Ordering
+        // matters: sway constrains a floating window's resize/move while the workspace holds a
+        // fullscreen container, so a geometry-only nudge applied over a player that a respawn
+        // re-fullscreened would land offset+undersized (POL-150), as well as stay hidden (POL-146).
         await this.setPlayerFullscreen(connector, false);
+        await this.positionWindow(win.id, conId, connector, win);
         this.log(`web-window ${win.id}: repositioned over ${connector}`);
         return;
       }
