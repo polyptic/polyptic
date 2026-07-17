@@ -9,7 +9,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { PanelPowerMethod, PowerCapabilities } from "@polyptic/protocol";
+import type { PanelPowerMethod, PowerCapabilities, WindowPlacement } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
 
 const run = promisify(execFile);
@@ -64,9 +64,9 @@ export class DevOpenBackend implements DisplayBackend {
   /** POL-18 — dev has no compositor to position with. The server never sends windows to a dev-open
    *  machine (capability-gated, degrading to the iframe); the throw is defence in depth and rides
    *  back to the console as an honest status note. */
-  async showWindow(connector: string): Promise<void> {
+  async showWindow(_window: WindowPlacement, connectors: string[]): Promise<void> {
     throw new Error(
-      `web-window placement is not supported by the dev-open backend (connector ${connector})`,
+      `web-window placement is not supported by the dev-open backend (connectors ${connectors.join("+")})`,
     );
   }
 
@@ -74,9 +74,11 @@ export class DevOpenBackend implements DisplayBackend {
     console.log(`[dev-open] hideWindow(${id}) — nothing was ever placed in dev`);
   }
 
-  async ident(on: boolean): Promise<void> {
+  async ident(on: boolean, connector?: string): Promise<void> {
     // No compositor overlay available in dev; the player-side ident pulse covers the demo.
-    console.log(`[dev-open] ident ${on ? "on" : "off"} — no-op in dev`);
+    console.log(
+      `[dev-open] ident ${on ? "on" : "off"}${connector ? ` (${connector})` : ""} — no-op in dev`,
+    );
   }
 
   /**

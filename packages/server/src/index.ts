@@ -270,14 +270,18 @@ const broadcaster = new AdminBroadcaster({
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
 // profiles; refreshes in the background at ~75% of each token's lifetime, stamping the current token
-// into a referencing source's URL at send time (decorateSliceForSend). Two events re-push renders to
-// the screens showing content this profile authenticates, each carrying the fresh token:
-//   - token-usable EDGE (first fetch / recovery): a screen stuck on a login page heals itself.
-//   - routine RENEWAL (POL-149): the framed app (e.g. Grafana) re-auths with the new token before its
-//     old session lapses, so an unattended wall never gets bounced to a login screen. POL-86's
-//     proven-before-painted player swaps the re-stamped URL in place (old content stays up until the
-//     new url proves), so this is seamless — not the iframe-reload flash POL-24 originally feared. ──
-const rePushForProfile = (profileId: string, reason: "token-usable" | "token-renewed"): void => {
+// into a referencing source's URL at send time (decorateSliceForSend). Exactly ONE event re-pushes
+// renders to the screens showing content this profile authenticates:
+//   - the token-usable EDGE (first fetch / recovery): the stamped auth_token signs the framed app in
+//     (Grafana's url_login mints its own session cookie on first load) and heals a screen stuck on a
+//     login page after an error/secret fix.
+// POL-155 — a routine token RENEWAL does NOT re-push. auth_token is Grafana's sign-in mechanism, not a
+// per-request bearer: once the session cookie exists the wall stays authenticated with no help from
+// us, so re-stamping a new token would only re-navigate the iframe and reboot the app (a visible
+// flash) for no benefit. POL-149's routine re-push was based on the wrong premise that the framed
+// session expires with the JWT; the token cache still refreshes every cycle so any future edge push
+// carries a valid token. ──
+const rePushForProfile = (profileId: string): void => {
   for (const screenId of control.screenIdsUsingProfile(profileId)) {
     const slice = control.getSlice(screenId);
     if (!slice) continue;
@@ -289,18 +293,15 @@ const rePushForProfile = (profileId: string, reason: "token-usable" | "token-ren
     });
     const delivered = hub.send(screenId, message);
     fastify.log.info(
-      { event: "render.push.token", screenId, profileId, reason, delivered },
-      reason === "token-usable"
-        ? "re-pushed render after credential token became usable"
-        : "re-pushed render after credential token was renewed (POL-149)",
+      { event: "render.push.token", screenId, profileId, delivered },
+      "re-pushed render after credential token became usable",
     );
   }
 };
 const tokens = new TokenService({
   log: fastify.log,
   onStatusChange: () => broadcaster.broadcast(),
-  onTokenUsable: (profileId) => rePushForProfile(profileId, "token-usable"),
-  onTokenRenewed: (profileId) => rePushForProfile(profileId, "token-renewed"),
+  onTokenUsable: (profileId) => rePushForProfile(profileId),
 });
 control.setTokenProvider(tokens);
 tokens.setProfiles(control.getCredentialProfilesInternal());

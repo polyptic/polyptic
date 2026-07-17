@@ -2856,21 +2856,42 @@ export class ControlPlane {
    * panel guard gives it to the anchor member only; every other member is forced muted, so a wall can
    * never echo itself. Membership order is stable, so the same panel keeps the sound across pushes.
    */
+  /**
+   * POL-156 — do ALL of this wall's members live on ONE machine? Only then can a single top-level
+   * window span the wall (sway floats one window across the outputs of one box; it cannot cross two).
+   * A member whose screen we can't resolve, or a memberless wall, is treated as NOT single-box — the
+   * safe answer keeps the iframe fallback, which always renders SOMETHING.
+   */
+  private wallIsSingleBox(wall: VideoWall): boolean {
+    const machineIds = new Set<string>();
+    for (const screenId of wall.memberScreenIds) {
+      const screen = this.getScreen(screenId);
+      if (!screen) return false;
+      machineIds.add(screen.machineId);
+    }
+    return machineIds.size === 1;
+  }
+
   private computeWallSlices(
     wall: VideoWall,
     spec: ResolvedSpec,
     zoom = DEFAULT_ZOOM,
     audio: AudioIntent = DEFAULT_AUDIO,
   ): ScreenSlice[] {
-    // POL-18 — a video wall never windows: a spanned surface is one CONTENT sliced across members,
-    // and a top-level window can neither be sliced nor span outputs. A window-wanting source on a
-    // wall degrades to the iframe (with a console-visible note) rather than leaving member holes.
+    // POL-18/POL-156 — a video wall CAN carry a top-level window, but only when every member lives on
+    // ONE box: sway can float a single window across the outputs of one machine, so a framing-blocked
+    // page fills the combined resolution edge-to-edge (the agent unions those outputs, POL-156). Across
+    // TWO boxes it genuinely can't — a top-level window can neither be sliced nor cross machines — so a
+    // multi-box wall still degrades to the iframe (which each member CSS-slices), with a visible note,
+    // rather than leaving member holes.
     if ((spec.kind === "web" || spec.kind === "dashboard") && spec.placement === "window") {
-      this.emit(
-        "warn",
-        `${wall.name ?? wall.id}: a page can't have its own window when it spans a combined wall — showing it embedded instead`,
-      );
-      spec = { ...spec, placement: "iframe" };
+      if (!this.wallIsSingleBox(wall)) {
+        this.emit(
+          "warn",
+          `${wall.name ?? wall.id}: a page can't have its own window across a wall that spans two machines — showing it embedded instead`,
+        );
+        spec = { ...spec, placement: "iframe" };
+      }
     }
     const members: { screenId: string; placement: Placement }[] = [];
     for (const screenId of wall.memberScreenIds) {
@@ -3892,6 +3913,9 @@ export class ControlPlane {
           url: surface.url,
           region: surface.region,
           canvas: decorated.canvas,
+          // POL-153 — the page zoom rides along so the agent can scale the placed Chrome to match
+          // the iframe path (the player scales an iframe by this; a web-window is the agent's to zoom).
+          zoom: surface.zoom,
         });
       }
     }

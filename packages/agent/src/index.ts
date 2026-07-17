@@ -524,20 +524,23 @@ class Agent {
       this.placedWindows.delete(id);
     }
     for (const place of toPlace) {
+      const where = place.connectors.join("+");
       try {
-        await this.backend.showWindow(place.connector, place.window);
-        this.placedWindows.set(place.window.id, {
-          connector: place.connector,
+        await this.backend.showWindow(place.window, place.connectors);
+        this.placedWindows.set(place.id, {
+          connectors: place.connectors,
           signature: place.signature,
         });
-        log(`placed web-window ${place.window.id} on ${place.connector}`);
+        log(`placed web-window ${place.id} on ${where}`);
       } catch (err) {
-        const note = `web-window ${place.window.id}: ${(err as Error).message}`;
+        const note = `web-window ${place.id}: ${(err as Error).message}`;
         // Keep the screen's ok flag (the player itself placed fine); surface the window's failure
-        // on that connector's note so the console can show why the region is empty.
-        const st = this.status.get(place.connector);
-        this.status.set(place.connector, { ok: st?.ok ?? true, note });
-        log(`FAILED to place web-window ${place.window.id} on ${place.connector}: ${note}`);
+        // on every connector it covers, so the console can show why the region(s) are empty.
+        for (const connector of place.connectors) {
+          const st = this.status.get(connector);
+          this.status.set(connector, { ok: st?.ok ?? true, note });
+        }
+        log(`FAILED to place web-window ${place.id} on ${where}: ${note}`);
       }
     }
 
@@ -584,11 +587,18 @@ class Agent {
    * backend failure is caught and logged — an ident must never crash the reconciler.
    */
   private async onIdent(msg: IdentMsg): Promise<void> {
+    // POL-154 — a `connector` means "raise that output's player over its web-window for the flash": an
+    // OS-level web-window (POL-18) floats above the player and hides the player-drawn ident overlay, so
+    // the agent fullscreens the player over it (on) and drops it back after (off). Without a connector
+    // this is the legacy machine-wide no-op — the visible ident is server→player everywhere else.
     log(
-      `server/ident received (on=${msg.on}) — visible ident is server→player; no agent action required in Phase 2a`,
+      `server/ident received (on=${msg.on}${msg.connector ? `, connector=${msg.connector}` : ""}) — ` +
+        (msg.connector
+          ? "raising the player over any web-window for the flash"
+          : "visible ident is server→player; no agent action required"),
     );
     try {
-      await this.backend.ident(msg.on);
+      await this.backend.ident(msg.on, msg.connector);
     } catch (err) {
       log(`ident(${msg.on}) failed: ${(err as Error).message}`);
     }

@@ -249,11 +249,9 @@ describe("TokenService (POL-24)", () => {
     });
 
     const usableEdges: string[] = [];
-    const renewals: string[] = [];
     const tokens = new TokenService({
       log: noopLog,
       onTokenUsable: (id) => usableEdges.push(id),
-      onTokenRenewed: (id) => renewals.push(id),
     });
     tokens.upsertProfile({
       id: "credential-1",
@@ -275,7 +273,6 @@ describe("TokenService (POL-24)", () => {
     expect(tokens.getToken("credential-1")).toBe("tok-1");
     expect(tokens.statusFor("credential-1").tokenStatus).toBe("ok");
     expect(usableEdges).toEqual(["credential-1"]); // the not-usable → usable edge fired once
-    expect(renewals).toEqual([]); // no routine renewal yet
 
     const form = new URLSearchParams(lastBody);
     expect(form.get("grant_type")).toBe("client_credentials");
@@ -284,19 +281,18 @@ describe("TokenService (POL-24)", () => {
     expect(form.get("scope")).toBe("api://grafana/.default");
     expect(form.get("audience")).toBeNull(); // null audience is not sent
 
-    // A forced re-exchange while already usable is a RENEWAL (POL-149), not a usable edge: it fires
-    // onTokenRenewed (the re-push that re-stamps a fresh token before the framed session lapses) and
-    // leaves the usable edge untouched. getToken now serves the freshly-minted token.
+    // A forced re-exchange while already usable is a ROUTINE renewal, not a usable edge: it warms the
+    // cache with the fresh token but does NOT re-fire onTokenUsable (POL-155 — no wall re-push, so no
+    // framed-app reload). getToken now serves the freshly-minted token.
     const result = await tokens.testProfile("credential-1");
     expect(result).toEqual({ ok: true, expiresIn: 3600 });
-    expect(usableEdges).toEqual(["credential-1"]);
-    expect(renewals).toEqual(["credential-1"]);
+    expect(usableEdges).toEqual(["credential-1"]); // still one edge — the renewal did not re-push
     expect(tokens.getToken("credential-1")).toBe("tok-2");
 
     tokens.stop();
   });
 
-  test("POL-149: a renewal fires onTokenRenewed (not the usable edge) with the profile id", async () => {
+  test("POL-155: a routine renewal does NOT re-push — only the first-usable edge does", async () => {
     let requests = 0;
     idp = Bun.serve({
       port: 0,
@@ -307,11 +303,9 @@ describe("TokenService (POL-24)", () => {
     });
 
     const usableEdges: string[] = [];
-    const renewals: string[] = [];
     const tokens = new TokenService({
       log: noopLog,
       onTokenUsable: (id) => usableEdges.push(id),
-      onTokenRenewed: (id) => renewals.push(id),
     });
     tokens.upsertProfile({
       id: "credential-7",
@@ -328,16 +322,15 @@ describe("TokenService (POL-24)", () => {
     for (let i = 0; i < 100 && tokens.getToken("credential-7") === undefined; i += 1) {
       await new Promise((r) => setTimeout(r, 10));
     }
-    // First fetch: usable edge, no renewal.
+    // First fetch: the usable edge fires once — that stamped auth_token signs Grafana in.
     expect(usableEdges).toEqual(["credential-7"]);
-    expect(renewals).toEqual([]);
 
-    // Two routine refreshes while still usable → two renewals targeting exactly this profile; the
-    // usable edge never re-fires.
+    // Routine refreshes while still usable re-fetch the token (getToken serves the newest) but NEVER
+    // re-push: Grafana holds its own session, so re-stamping would only reboot the frame (a flash).
     await tokens.testProfile("credential-7");
     await tokens.testProfile("credential-7");
-    expect(renewals).toEqual(["credential-7", "credential-7"]);
-    expect(usableEdges).toEqual(["credential-7"]);
+    expect(usableEdges).toEqual(["credential-7"]); // still exactly one edge — no routine re-push
+    expect(tokens.getToken("credential-7")).toBe(`tok-${requests}`); // cache stayed warm
 
     tokens.stop();
   });

@@ -97,6 +97,12 @@ export type DisplayBackend = z.infer<typeof DisplayBackend>;
 export const KioskBrowser = z.enum(["chrome", "surf"]);
 export type KioskBrowser = z.infer<typeof KioskBrowser>;
 
+/** POL-57 — a page zoom factor: 1 = 100%, the scale a browser opens a tab at. Bounded so a fat-finger
+ *  never renders content invisibly small or absurdly huge. Defined here (before WindowPlacement, which
+ *  mirrors it for POL-153) and reused by every framed surface below. */
+export const Zoom = z.number().min(0.25).max(4);
+export type Zoom = z.infer<typeof Zoom>;
+
 // ── Web-window placement (POL-18) ────────────────────────────────────────────
 // Some sources refuse to be framed (CSP `frame-ancestors` / `X-Frame-Options` dashboards) — in an
 // iframe they render as a dead tile. The escape hatch is a TOP-LEVEL browser window placed by the
@@ -125,6 +131,11 @@ export const WindowPlacement = z.object({
   url: z.string().url(),
   region: Geometry,
   canvas: Geometry,
+  /** POL-153 — the source's page zoom, mirrored from its surface. The player scales an IFRAME surface
+   *  by this factor; a web-window is a separate Chrome the agent places, so the player-side zoom never
+   *  reaches it. The agent applies this itself (Chrome `--force-device-scale-factor`), reaching parity
+   *  with the iframe path. Defaults to 1 (100%) so a pre-POL-153 server omitting it renders unscaled. */
+  zoom: Zoom.default(1),
 });
 export type WindowPlacement = z.infer<typeof WindowPlacement>;
 
@@ -396,9 +407,6 @@ const SurfaceBase = z.object({
  *  zoom control (POL-57). The player renders the frame at 1/zoom of its region and scales it up, so
  *  the embedded page sees a proportionally smaller CSS viewport and lays itself out bigger. Bounds
  *  match a browser's practical range; only framed surfaces carry it (media has `fit`/native size). */
-export const Zoom = z.number().min(0.25).max(4);
-export type Zoom = z.infer<typeof Zoom>;
-
 export const WebSurface = SurfaceBase.extend({
   type: z.literal("web"),
   url: z.string().url(),
@@ -1218,6 +1226,14 @@ export const ServerToAgentApply = z.object({
 export const ServerToAgentIdent = z.object({
   t: z.literal("server/ident"),
   on: z.boolean(),
+  /** POL-154 — the output whose player must be raised for the flash. The visible ident overlay is
+   *  drawn by the PLAYER (`server/ident-pulse`), but an OS-level web-window (POL-18) floats ABOVE the
+   *  player and occludes it — page z-order loses to the compositor. So for a screen that hosts a
+   *  web-window the server ALSO sends this frame, and the agent momentarily fullscreens that
+   *  connector's player over the window (sway hides floaters behind a workspace-fullscreen view), then
+   *  restores the window when the flash ends. Absent = the legacy machine-wide no-op (no window to
+   *  clear), so deployed agents that ignore it stay correct. */
+  connector: z.string().optional(),
 });
 
 export const ServerToAgentCapture = z.object({
