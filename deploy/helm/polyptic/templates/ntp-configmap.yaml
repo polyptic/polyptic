@@ -38,8 +38,17 @@ data:
     {{- range .Values.ntp.allow }}
     allow {{ . }}
     {{- end }}
-    # Confine the command port to the loopback (chronyc from inside the pod only).
+    # POL-151: the image entrypoint (which would create /run/chrony) is BYPASSED, and the
+    # pod runs capped (drop ALL, only NET_BIND_SERVICE — no CAP_CHOWN), so chronyd can
+    # neither create nor chown its default /run/chrony. Keep it out of that dir entirely:
+    #  * stay root (don't drop privileges → chronyd never chowns a runtime dir), and
+    #  * put the pidfile and command socket in the already-mounted, writable state volume.
+    user root
+    pidfile /var/lib/chrony/chronyd.pid
+    # Confine the command port to the loopback and move its Unix socket into the state dir
+    # (chronyc from inside the pod only — the server itself needs no external control).
     bindcmdaddress 127.0.0.1
+    bindcmdaddress /var/lib/chrony/chronyd.sock
     driftfile /var/lib/chrony/drift
     dumpdir /var/lib/chrony
 {{- end }}

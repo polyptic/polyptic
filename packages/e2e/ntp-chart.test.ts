@@ -66,6 +66,20 @@ describe.skipIf(!helmAvailable)("helm template — NTP postures", () => {
     expect(doc).toMatch(/kind: Service[\s\S]*?name: test-polyptic-ntp[\s\S]*?protocol: UDP/);
   });
 
+  test("POL-151: the pidfile + command socket live in the writable state dir, NOT the default /run/chrony", () => {
+    // The image entrypoint (which creates /run/chrony) is bypassed and the pod is capped
+    // (no CAP_CHOWN), so chronyd cannot create/chown /run/chrony — a pidfile there is a
+    // guaranteed CrashLoop. Pin the runtime files onto the mounted /var/lib/chrony volume.
+    const doc = render();
+    expect(doc).toContain("pidfile /var/lib/chrony/chronyd.pid");
+    expect(doc).toContain("bindcmdaddress /var/lib/chrony/chronyd.sock");
+    // chronyd must not drop privileges (a drop would chown the runtime dir — no CAP_CHOWN).
+    expect(doc).toContain("user root");
+    // Nothing must point runtime files back at the un-created /run/chrony (or /var/run/chrony).
+    expect(doc).not.toMatch(/pidfile\s+\/(?:var\/)?run\/chrony/);
+    expect(doc).not.toMatch(/bindcmdaddress\s+\/(?:var\/)?run\/chrony/);
+  });
+
   test("ON by default renders an IngressRouteUDP on the named entrypoint, targeting the chrony Service", () => {
     const doc = render();
     expect(doc).toContain("kind: IngressRouteUDP");
