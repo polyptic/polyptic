@@ -116,7 +116,7 @@ report() {
 # Abort: announce, report, hold the message on screen, exit non-zero. Nothing partial is left behind
 # that a later boot would mistake for a finished install (the stamp is written only on success).
 fail() {
-  say "BOOTLOADER INSTALL FAILED — $2"
+  say "BOOTLOADER INSTALL FAILED: $2"
   report false "$1" "$2"
   hold "$HOLD_BAD"
   exit 1
@@ -236,7 +236,7 @@ if [ -z "$candidates" ]; then
   elif [ -n "$skipped_removable" ]; then
     fail no-esp "the only EFI System Partition found is on removable media ($(echo "$skipped_removable" | sed 's/^ //')), which would leave the box unbootable once the stick is pulled. Install to an internal disk (nothing was erased)"
   fi
-  fail no-esp "no EFI System Partition found on any internal disk — this box's existing OS was probably installed in legacy BIOS mode, which cannot chain a signed loader. Nothing was erased"
+  fail no-esp "no EFI System Partition found on any internal disk. This box's existing OS was probably installed in legacy BIOS mode, which cannot chain a signed loader. Nothing was erased."
 fi
 
 # One candidate is the overwhelmingly common case. Several means a dual-boot / multi-disk box: prefer
@@ -256,7 +256,7 @@ else
     fail ambiguous-esp "this box has $(printf '%s\n' $candidates | wc -l | tr -d ' ') EFI System Partitions and none is clearly the one the firmware boots. Re-run the install with polyptic.offload_disk=/dev/<disk> on the kernel command line (nothing was erased)"
   fi
   esp_part="$best"
-  say "several EFI System Partitions; choosing /dev/$esp_part, the one this firmware already boots from"
+  say "several EFI System Partitions. Choosing /dev/$esp_part, the one this firmware already boots from"
 fi
 
 disk="/dev/$(lsblk -no PKNAME "/dev/$esp_part" 2>/dev/null | head -n1)"
@@ -375,7 +375,7 @@ fi
 # The `sleep` is load-bearing: GRUB paints the fallback menu below over the console the instant this
 # script ends, so without a beat to read it the message may as well not have been printed.
 echo ""
-echo "Could not reach the Polyptic control plane at $net over the network."
+echo "Could not reach the Polyptic control plane at $net."
 sleep -i 8
 set timeout=10
 set default=retry
@@ -409,7 +409,7 @@ if [ "$wifi_payload" = 1 ]; then
   need_kb=$(( ( $(fsize "$payload_src/vmlinuz") + $(fsize "$payload_src/initrd") ) * 2 / 1024 + 24576 ))
   avail_kb="$(df -Pk "$mnt" 2>/dev/null | awk 'NR==2 {print $4}')"
   if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
-    fail esp-too-small "the EFI System Partition on $disk has $(( ${avail_kb:-0} / 1024 )) MB free but the Wi-Fi local payload needs ~$(( need_kb / 1024 )) MB (kernel + initrd-wifi, twice: a live slot and an update slot). Nothing was written; keep this box booting from the USB medium, or grow the ESP"
+    fail esp-too-small "the EFI System Partition on $disk has $(( ${avail_kb:-0} / 1024 )) MB free but the Wi-Fi local payload needs ~$(( need_kb / 1024 )) MB (kernel + initrd-wifi, twice: a live slot and an update slot). Nothing was written. Keep this box booting from the USB medium, or grow the ESP"
   fi
 fi
 
@@ -457,7 +457,7 @@ if [ "$wifi_payload" = 1 ]; then
     || fail foreign-grub-cfg "$mnt/grub/local.cfg on /dev/$esp_part is a GRUB config Polyptic did not write; refusing to overwrite it (the loaders were updated; the payload was not)"
   ours_or_absent_local "$mnt/grub/local-$debarch.cfg" \
     || fail foreign-grub-cfg "$mnt/grub/local-$debarch.cfg on /dev/$esp_part is a GRUB config Polyptic did not write; refusing to overwrite it (the loaders were updated; the payload was not)"
-  say "copying the $debarch local payload (image ${imgid:-?}) onto the ESP; this reads a few hundred MB from the USB medium ..."
+  say "copying the $debarch local payload (image ${imgid:-?}) onto the ESP ..."
   mkdir -p "$mnt/polyptic/boot/$debarch/a" "$mnt/grub"
   cp "$payload_src/vmlinuz" "$mnt/polyptic/boot/$debarch/a/vmlinuz"
   cp "$payload_src/initrd"  "$mnt/polyptic/boot/$debarch/a/initrd"
@@ -527,7 +527,7 @@ else efibootmgr -q -o "$entry" >/dev/null 2>&1 || true; fi
 final="$(boot_order)"
 first="${final%%,*}"
 [ -n "$(our_entries | head -n1)" ] \
-  || fail nvram-not-persisted "the UEFI boot entry did not survive being written. The loaders are on $disk; add a boot entry for \\EFI\\polyptic\\shim$efiarch.efi in firmware setup"
+  || fail nvram-not-persisted "the UEFI boot entry did not survive being written. The loaders are on $disk, so add a boot entry for \\EFI\\polyptic\\shim$efiarch.efi in firmware setup"
 [ "$(printf '%s' "$first" | tr 'a-f' 'A-F')" = "$(printf '%s' "$entry" | tr 'a-f' 'A-F')" ] \
   || fail boot-order-not-first "the firmware kept '$LABEL' but would not make it the first boot option (it still boots ${first:-something else} first). Move '$LABEL' to the top of the boot order in firmware setup"
 
@@ -536,6 +536,6 @@ detail="installed the signed loaders on $disk (partition $partnum) and made '$LA
 if [ "$wifi_payload" = 1 ]; then detail="$detail, with the Wi-Fi local payload (image ${imgid:-unknown})"; fi
 if [ "$fallback" = "yes" ]; then detail="$detail, plus the removable-media fallback path"; fi
 report true installed "$detail"
-say "bootloader installed on $disk. Remove the USB stick and reboot — nothing was erased, and the previous OS is still on this disk and bootable from the firmware boot menu."
+say "bootloader installed on $disk. Remove the USB stick and reboot. Nothing was erased, and the previous OS is still on this disk and bootable from the firmware boot menu."
 hold "$HOLD_OK"
 exit 0

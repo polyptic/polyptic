@@ -53,7 +53,7 @@ if [ ! -e /tmp/polyptic-wifi-done ]; then
                     # A present-but-invalid config: say WHY on the screen the operator is facing.
                     # Not fatal here — a wired link (if any) still boots the box.
                     if type plymouth > /dev/null 2>&1 && plymouth --ping 2> /dev/null; then
-                        plymouth display-message --text="Wi-Fi config rejected — see polyptic/wifi-debug.txt on the boot medium" 2> /dev/null || :
+                        plymouth display-message --text="Wi-Fi config rejected. See polyptic/wifi-debug.txt on the boot medium" 2> /dev/null || :
                     fi
                     echo "polyptic: wifi.conf rejected: $(cat /run/polyptic/wifi.err 2>/dev/null)" > /dev/console 2> /dev/null || :
                     # A keyboard-less display node can't read that console line, so persist the full

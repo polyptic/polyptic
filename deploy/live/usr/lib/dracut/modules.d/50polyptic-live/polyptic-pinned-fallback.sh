@@ -150,15 +150,15 @@ polyptic_pin_fallback() { # <pinned-url> <outfile>
   if [ -n "$_active" ] && [ "$_active" != "$_pinned" ] \
     && polyptic_pin_probe "$_root/builds/$_active/rootfs.squashfs"; then
     _new="$_root/builds/$_active/rootfs.squashfs"
-    _why="the OS image this screen was pinned to ($_pinned) is gone from the depot; booting the current image ($_active) instead"
+    _why="the OS image this screen was pinned to ($_pinned) is gone from the depot, so booting the current image ($_active) instead"
   elif polyptic_pin_probe "$_root/rootfs.squashfs"; then
     # 3) No usable manifest — but the arch root is always the active build, and it 200s.
     _new="$_root/rootfs.squashfs"
-    _why="the OS image this screen was pinned to ($_pinned) is gone from the depot; booting the depot's current image instead"
+    _why="the OS image this screen was pinned to ($_pinned) is gone from the depot, so booting the depot's current image instead"
   else
     # 4) The DEPOT, not the pin, is the problem. Say nothing, change nothing: livenet's own retry
     #    loop and the initqueue timeout narration own a network outage, and always have.
-    echo "polyptic: cannot reach the OS image depot; retrying the pinned image" > "$_console" 2> /dev/null || true
+    echo "polyptic: cannot reach the OS image depot. Retrying the pinned image" > "$_console" 2> /dev/null || true
     return 0
   fi
 

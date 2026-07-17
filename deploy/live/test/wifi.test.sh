@@ -486,7 +486,7 @@ d="$(new_poll_case poll-window old-1 new-2 old-1)"
 printf '{"imageId":"new-2","urgent":false}\n' > "$d/manifest"
 printf '14\n' > "$d/hour"
 out="$(up "$d")"
-has "poll window: waits"             "waiting for the nightly window" "$out"
+has "poll window: waits"             "Waiting for the nightly window" "$out"
 has "poll window: medium untouched"  "slot=a image=old-1" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
 eq "poll window: no reboot"          "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
 

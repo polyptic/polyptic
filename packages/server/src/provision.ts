@@ -349,7 +349,7 @@ export function buildBootGrubCfg(base: string, token: string | undefined, ntpHos
     // it scrolling past — and then boots the same kernel WITHOUT `quiet splash`, so the transcript
     // continues into the initramfs instead of hitting a curtain. Same exemption as the debug entry:
     // nobody sees any of it unless they deliberately chose it, so D65's happy path is untouched.
-    'menuentry "Watch this screen boot (verbose)" --id verbose {',
+    'menuentry "Watch this screen boot" --id verbose {',
     '  echo "Showing everything this screen does. Press a key each time it pauses ..."',
     "  set debug=net,efinet,http",
     "  set pager=1",

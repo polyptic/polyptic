@@ -200,13 +200,13 @@ describe("useScreenInspect (POL-85 shared Inspect/DevTools toggle)", () => {
     h.stop();
   });
 
-  test("a box that never answers times out with a check-the-screen notice", async () => {
+  test("a box that never answers times out with a notice", async () => {
     const h = harness({ timeoutMs: 30 });
     await h.api.toggle();
     expect(h.api.pending.value).toBe(true);
     await new Promise((r) => setTimeout(r, 60));
     expect(h.api.pending.value).toBe(false);
-    expect(h.notices).toEqual(["Nessie did not confirm the inspector — check the screen."]);
+    expect(h.notices).toEqual(["Nessie did not confirm the inspector."]);
     h.stop();
   });
 

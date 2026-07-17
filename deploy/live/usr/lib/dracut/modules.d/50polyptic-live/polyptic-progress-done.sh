@@ -14,7 +14,7 @@
 #
 # SOURCED by dracut (see polyptic-ram.sh for the sourcing rules: no set -e/-u, no exit).
 if type plymouth > /dev/null 2>&1 && plymouth --ping 2> /dev/null; then
-    plymouth hide-message --text="Waiting for the network (DHCP) ..." 2> /dev/null || :
+    plymouth hide-message --text="Waiting for the network ..." 2> /dev/null || :
     plymouth hide-message --text="Downloading the OS image ..." 2> /dev/null || :
     plymouth hide-message --text="Cannot fetch the OS image" 2> /dev/null || :
 fi

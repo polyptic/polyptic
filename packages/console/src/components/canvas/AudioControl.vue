@@ -89,7 +89,7 @@ function setVolume(event: Event): void {
       @input="setVolume"
     />
 
-    <div class="audio-caption">{{ caption }}</div>
+    <div v-if="caption" class="audio-caption">{{ caption }}</div>
   </div>
 </template>
 

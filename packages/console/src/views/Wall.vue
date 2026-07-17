@@ -117,7 +117,7 @@ function onSourceDragStart(e: DragEvent, id: string) {
 
         <div class="lib-hint">
           Shift-click (or shift-drag a box) to select several screens, then <b>Combine</b> them into
-          one surface. Arrow keys nudge a selection — hold <b>Shift</b> for a bigger step.
+          one surface.
         </div>
       </aside>
 

@@ -188,8 +188,7 @@ async function remove(p: ContentSource) {
           <h1 class="title">Playlists</h1>
           <p class="subtitle">
             Carousels of content. Compose sources from your library into a rotation, then assign it
-            to any screen or video wall — statics show for the time you set, videos can play to the
-            end.
+            to any screen or video wall.
           </p>
         </div>
         <div class="head-actions">
@@ -276,10 +275,6 @@ async function remove(p: ContentSource) {
           </div>
         </div>
         <button class="add-step" @click="addStep">+ Add step</button>
-        <p class="field-hint steps-hint">
-          Web pages, dashboards and images show for the seconds you set. An uploaded video's time is
-          filled in from the file itself — clear it to let the video play to the end instead.
-        </p>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>
 
@@ -666,8 +661,5 @@ async function remove(p: ContentSource) {
 }
 .add-step:hover {
   background: var(--muted-bg);
-}
-.steps-hint {
-  margin: 0 0 16px;
 }
 </style>

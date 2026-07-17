@@ -75,7 +75,7 @@ function contentLabel(side: SceneDiffEntry["from"]): string {
 
     <template v-else-if="diff">
       <div v-if="diff.identical" class="line muted">
-        Nothing would change — the wall already matches this scene.
+        Nothing would change because the wall already matches this scene.
       </div>
 
       <template v-else>

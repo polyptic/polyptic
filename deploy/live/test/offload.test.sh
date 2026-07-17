@@ -215,7 +215,7 @@ eq "happy: config carries the marker"     "# polyptic-offload" "$(head -n1 "$d/e
 eq "happy: config carries the base"       "set net=(http,10.0.0.10)" "$(grep '^set net=' "$d/esp/grub/x86_64-efi/grub.cfg")"
 eq "happy: our entry leads BootOrder"     "0001,0000" "$(sed -n 's/^BootOrder: //p' "$d/nvram")"
 eq "happy: entry is labelled"             "Boot0001* Polyptic Netboot" "$(grep 'Polyptic Netboot' "$d/nvram")"
-has "happy: says nothing was erased"      "nothing was erased" "$out"
+has "happy: says nothing was erased"      "Nothing was erased" "$out"
 has "happy: reported to the control plane" '"code":"installed"' "$(posted "$d")"
 has "happy: report carries the token"     "Authorization: Bearer secret-fleet-token" "$(posted "$d")"
 has "happy: report goes to /boot/report"  "http://10.0.0.10/boot/report" "$(posted "$d")"

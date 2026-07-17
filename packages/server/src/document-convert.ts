@@ -134,8 +134,8 @@ export class NullDocumentConverter implements DocumentConverter {
 /** The sentence an operator sees when this server cannot convert documents (D132 — refuse, because a
  *  deck with no pages is a black screen with a name). */
 export const NO_CONVERTER_MESSAGE =
-  "This server can't convert documents — no document toolchain is installed. Export your slides to " +
-  "PDF or images and upload those, or install the converter on the server.";
+  "This server can't convert documents because no document toolchain is installed. Export your " +
+  "slides to PDF or images and upload those instead.";
 
 /** Natural (numeric) sort, so page 10 follows page 9 and not page 1. */
 function byPageNumber(a: string, b: string): number {
@@ -210,7 +210,7 @@ export class ExternalToolDocumentConverter implements DocumentConverter {
           return {
             ok: false,
             message:
-              `This server can only convert PDFs — it has no office toolchain to read ` +
+              `This server can only convert PDFs because it has no office toolchain to read ` +
               `${documentFormatLabel(ext)} files. Export the deck to PDF and upload that.`,
           };
         }
@@ -220,7 +220,7 @@ export class ExternalToolDocumentConverter implements DocumentConverter {
           return {
             ok: false,
             message:
-              `This ${documentFormatLabel(ext)} file couldn't be converted — it may be corrupt or ` +
+              `This ${documentFormatLabel(ext)} file couldn't be converted. It may be corrupt or ` +
               "password-protected. Open it, export it to PDF, and upload that.",
           };
         }
@@ -232,7 +232,7 @@ export class ExternalToolDocumentConverter implements DocumentConverter {
         return {
           ok: false,
           message:
-            "This document produced no pages — it may be empty, corrupt, or password-protected. " +
+            "This document produced no pages. It may be empty, corrupt, or password-protected. " +
             "Open it, export it to PDF, and upload that.",
         };
       }

@@ -72,7 +72,7 @@ fi
 # The `sleep` is load-bearing: GRUB paints the fallback menu below over the console the instant this
 # script ends, so without a beat to read it the message may as well not have been printed.
 echo ""
-echo "Could not reach the Polyptic control plane at $net over the network."
+echo "Could not reach the Polyptic control plane at $net."
 sleep -i 8
 set timeout=10
 set default=retry

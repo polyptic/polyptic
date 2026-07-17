@@ -1195,7 +1195,7 @@ export const useConsoleStore = defineStore("console", {
           err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
             ? (err.payload as { error: string }).error
             : null;
-        return detail ?? "Reboot failed — the control plane could not reach that machine.";
+        return detail ?? "Reboot failed because the control plane could not reach that machine.";
       }
     },
 
@@ -1971,7 +1971,7 @@ export const useConsoleStore = defineStore("console", {
         return await api.testCredentialProfile(id);
       } catch (err) {
         console.error("[console] testProfile failed", err);
-        return { ok: false, error: "Request failed — is the server reachable?" };
+        return { ok: false, error: "Request failed. Is the server reachable?" };
       }
     },
 
@@ -2013,7 +2013,7 @@ export const useConsoleStore = defineStore("console", {
           if (err.status === 415) {
             return {
               ok: false,
-              error: payloadMsg ?? "Unsupported file type — upload an image or video.",
+              error: payloadMsg ?? "Unsupported file type. Upload an image or video.",
             };
           }
           return { ok: false, error: payloadMsg ?? "Upload failed. Please try again." };

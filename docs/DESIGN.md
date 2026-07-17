@@ -1,145 +1,113 @@
-# Polyptic — Design Notes
+# Polyptic design notes
 
-*Last updated 2026-06-29.*
-
-Design record for **Polyptic** — a *generic, vendor-neutral* display-wall / kiosk-fleet orchestration product: one declarative control plane and thin reconciling agents in place of fragile per-machine boot scripts. The repo `README.md` + `docs/ARCHITECTURE.md` are the concise mirrors; this is the working narrative.
+Design narrative for **Polyptic**, a generic, vendor-neutral display-wall and kiosk-fleet orchestration product. One declarative control plane and thin reconciling agents replace fragile per-machine boot scripts. `README.md` and `docs/ARCHITECTURE.md` are the concise mirrors. This document records why the system is built the way it is.
 
 ---
 
-## TL;DR — the recommendation
+## The shape of the system
 
-Build **Polyptic**: a small **bespoke TypeScript control plane** (`polyptic-server`, runs on any Kubernetes or Docker host), **thin per-client agents** (`polyptic-agent`) that dial *outbound* and reconcile to desired state (Kubernetes-controller-style), and a **web "mosaic player"** (`polyptic-player`) that renders each screen's slice of *one global layout*. Run the player **on a minimal Wayland compositor (`sway`)** for a free VNC/screenshot preview and a **native-window escape hatch**.
+Polyptic is a small **bespoke TypeScript control plane** (`polyptic-server`, runs on any Kubernetes or Docker host), **thin per-client agents** (`polyptic-agent`) that dial outbound and reconcile to desired state in the Kubernetes-controller style, and a **web player** (`polyptic-player`) that renders each screen's slice of one global layout. The player runs on a minimal Wayland compositor (`sway`), which gives a free screenshot/VNC preview path and a native-window escape hatch.
 
-**Buy the substrate, build the brain.** Device management (Ubuntu + `sway` + `greetd` + `systemd`) and rendering (Google Chrome as the kiosk browser, `surf` fallback) are borrowed wholesale. The *only* net-new build is the control plane that owns **one global layout + named scenes + an API** — which no off-the-shelf signage product provides.
+**Buy the substrate, build the brain.** Device management (Ubuntu + `sway` + `greetd` + `systemd`) and rendering (Google Chrome as the kiosk browser, `surf` fallback) are borrowed wholesale. The only net-new build is the control plane that owns one global layout, named scenes and an API, which no off-the-shelf signage product provides.
 
-**Screens, not machines.** Users drive *named screens* ("Nessie", "Bertha"…); a client is just plumbing. An **ident mode** flashes each screen's name on its physical panel so onboarding/relabelling is point-and-confirm.
+**Screens, not machines.** Users drive named screens ("Nessie", "Bertha"…) and a client machine is just plumbing. An **ident mode** flashes each screen's name on its physical panel, so onboarding and relabelling is point-and-confirm.
 
-**Vendor-neutral.** Any web content/dashboard/image/video; **generic OIDC** (any IdP); content **adapters** (dashboards, media and native apps are first-class *optional* adapters, never dependencies). Ships as a Helm chart **and** a docker-compose.
-
-**Quick win first (days):** point an existing wall at anonymous/`kiosk` dashboard URLs to prove the wall can be decoupled from human auth before building anything. Reversible, no new infra.
+**Vendor-neutral.** Any web content, dashboard, image or video. Operator sign-in is built in: local accounts with argon2id-hashed passwords and signed session cookies, no IdP required (console SSO via OIDC is a planned add-on on the same seam). Content **adapters** make dashboards, media and native apps first-class optional integrations, never dependencies. Ships as a Helm chart and a docker-compose.
 
 ---
 
 ## Core design principles
 
-1. **Screen is first-class; machine is plumbing.** Registry/layout/scenes/API all address *named screens*. Onboarding maps a machine's outputs to screen identities. → **ident mode** (flash name/number/colour on each output).
-2. **One global layout, reconciled** — Kubernetes-controller pattern (spec/status, generation/observedGeneration). The fleet is one consistent system, not N kiosks.
-3. **Buy the substrate, build the brain** — only the global-layout + scenes + API + UI is bespoke.
-4. **Compositor owns geometry; systemd owns lifecycle** — no click/sleep timing hacks; crash recovery is `Restart=always`.
-5. **Typed surfaces** so we're never trapped in an iframe-only model.
-6. **Outbound-only agents** — no inbound ports/NAT into the client LAN.
-7. **Pluggable adapters + generic OIDC** — integrations are seams, not foundations.
+1. **Screen is first-class and machine is plumbing.** Registry, layout, scenes and API all address named screens. Onboarding maps a machine's outputs to screen identities via ident mode (flash name/number/colour on each output).
+2. **One global layout, reconciled.** The Kubernetes-controller pattern (spec/status, generation/observedGeneration). The fleet is one consistent system, not N kiosks.
+3. **Buy the substrate, build the brain.** Only the global layout, scenes, API and UI are bespoke.
+4. **Compositor owns geometry and systemd owns lifecycle.** No click or sleep timing hacks. Crash recovery is `Restart=always`.
+5. **Typed surfaces**, so the system is never trapped in an iframe-only model.
+6. **Outbound-only agents.** No inbound ports or NAT into the client LAN.
+7. **Pluggable adapters.** Integrations are seams, not foundations.
 
 ---
 
 ## Architecture (layers)
 
-- **Device:** Ubuntu 24.04 minimal → `greetd` passwordless autologin (`kiosk`) → `sway` (outputs pinned by connector) → `systemd --user` services launch the agent + one kiosk browser per output (Chrome native-Wayland, D77; `surf` fallback; isolation is one process per output). No `swayidle`; `output * dpms on`. **Wayland's no-self-positioning is the feature** — all geometry goes through the compositor via `swaymsg` IPC. *GPU caveat:* Intel/AMD trouble-free; NVIDIA needs extra config or an X11+i3 fallback — verify on real hardware.
-- **Rendering — hybrid typed surfaces:** default `web-url`/`dashboard-*` tiles render in the CSS-grid **player**; `web-window`/`native-app` are placed by the agent as **top-level windows** (escape hatch for framing-blocked / non-web / future sources). Dashboards use single-panel embeds (all parameters + any kiosk flag baked into the URL).
-- **Control plane (`polyptic-server`):** TypeScript/Node (Fastify + `ws` + Postgres + `zod`), standalone, runs on any k8s/Docker. Owns the Machine/Output/Screen registry, the **one global virtual-canvas Layout** (arbitrary regions — not a fixed grid), and named **immutable versioned Scenes**. Reconcile: bump one global `desiredRevision` → recompute each machine's slice → fan out apply; optional PREPARE/COMMIT barrier for tear-free flips. Web UI: layout editor, scenes, live preview, ident trigger, fleet health. Prometheus `/metrics`.
-- **Transport:** agents dial **outbound `wss://` only**; ~10s lease, reconnect backoff+jitter; each agent **caches its last-good slice** and keeps rendering through controller outages.
-- **Auth (generic):** admin UI/API via **OIDC** standard discovery (any IdP). Per-content-source strategies: `public` · `anonymous-viewer` · `reverse-proxy-header-injection` · `persisted-session` · `oidc`. Agent identity: bootstrap token → mTLS cert keyed to `/etc/machine-id` (or OIDC client creds).
-- **Preview:** always-on `grim` JPEG thumbnails up the outbound WSS (show *real* render + auth state); on-demand `wayvnc`→noVNC tunnelled through the control plane; WYSIWYG intended-layout diagram alongside.
+- **Device:** Ubuntu Server minimal → `greetd` passwordless autologin (`kiosk` user) → `sway` (outputs pinned by connector) → `systemd --user` services launch the agent plus one kiosk browser per output (Chrome native Wayland, `surf` fallback, and isolation is one process per output). No `swayidle`. `output * dpms on`. Wayland's ban on self-positioning is the feature, because all geometry then goes through the compositor via `swaymsg` IPC. GPU caveat: Intel and AMD are trouble-free, but NVIDIA needs extra config or the X11+i3 fallback, so verify on real hardware.
+- **Rendering (hybrid typed surfaces):** default `web`/`dashboard` tiles render in the CSS-grid **player**, and a surface carrying `placement: "window"` is placed by the agent as a top-level browser window (the escape hatch for framing-blocked, non-web or future sources). Dashboards use single-panel embeds with all parameters and any kiosk flag baked into the URL.
+- **Control plane (`polyptic-server`):** TypeScript (Fastify + `ws` + Postgres + `zod`), standalone, runs on any k8s or Docker host. Owns the Machine/Output/Screen registry, the one global virtual-canvas layout (arbitrary regions, not a fixed grid), and named immutable versioned scenes. Reconcile: bump one global `desiredRevision`, recompute each machine's slice, fan out apply. An optional PREPARE/COMMIT barrier gives tear-free flips. Web UI: layout editor, scenes, live preview, ident trigger, fleet health. Prometheus `/metrics`.
+- **Transport:** agents dial outbound `wss://` only, with a ~10s lease and reconnect backoff+jitter. Each agent caches its last-good slice and keeps rendering through controller outages.
+- **Auth:** admin UI/API session-gated behind local operator accounts (argon2id password hashing, signed http-only session cookies, per-email and per-IP login lockout); console SSO via OIDC is a planned add-on. Per-content-source strategies: `public` · `anonymous-viewer` · `reverse-proxy-header-injection` · `persisted-session` · `oidc`. Agent identity: bootstrap token, then an mTLS cert keyed to `/etc/machine-id`.
+- **Preview:** always-on `grim` JPEG thumbnails up the outbound WSS, showing the real render and auth state · on-demand `wayvnc`→noVNC tunnelled through the control plane · a WYSIWYG intended-layout diagram alongside.
 
 ---
 
-## Content model (typed surfaces) + adapters + media
+## Content model (typed surfaces), adapters and media
 
-Surface types: `web-url` · `dashboard-panel` · `dashboard-page` (player iframes) · `web-window` · `native-app` (agent top-level windows) · `image` · `video` · `slideshow`.
+Surface types: `web` · `dashboard` · `image` · `video` · `stream` · `playlist` · `page`. All render in the player; a framing-blocked `web`/`dashboard` surface carries `placement: "window"` and is placed by the agent as a top-level browser window instead. A `deck` content source (an uploaded PDF/slide document) converts to page images server-side and renders as a playlist of images, so it needs no surface of its own.
 
-**Adapters** resolve a logical source → concrete URL/launch-spec + auth strategy + refresh. `web`, `dashboard`, `media`, `native`. New integrations = new adapters; the core model never changes.
+**Adapters** resolve a logical source into a concrete URL or launch-spec plus an auth strategy and refresh policy. `web`, `dashboard`, `media`, `native`. New integrations are new adapters, and the core model never changes.
 
-**Office/PowerPoint (nice-to-have, phase 5):** pre-convert PPTX → images/PDF/MP4 server-side (`soffice --headless --convert-to`) and play as `image`/`slideshow`/`video`. Never render Office live. Images/MP4 the player handles natively. Whole media track is a clearly-labelled phase-5 item so v1 stays lean.
+**Office/PowerPoint:** upload the PPTX/PDF as a `deck` source. The server converts it once, at upload, into page images (behind the `DocumentConverter` seam) and it plays as a playlist of images with a per-page dwell. Never render Office live.
 
 ---
 
-## Swarm / "screens not machines" / ident mode
+## Swarm, "screens not machines", ident mode
 
-- `Machine { id=/etc/machine-id, label, outputs[] }`, `Screen { id, friendlyName, machineId, output, resolution }`. Screen carries the stable id + fun name; Machine is onboarding plumbing.
-- **Onboarding:** image a client → agent registers + enumerates outputs (`swaymsg -t get_outputs` → connector + make/model/serial) → trigger **ident mode** → each panel shows its name/number/colour → confirm/rename in UI. Swap a panel → re-ident.
-- **One global layout** = the screens are regions of a single canvas; scenes are named snapshots; switching fans out atomically.
+- `Machine { id=/etc/machine-id, label, outputs[] }`, `Screen { id, friendlyName, machineId, output, resolution }`. The Screen carries the stable id and the friendly name, and the Machine is onboarding plumbing.
+- **Onboarding:** image a client → the agent registers and enumerates outputs (`swaymsg -t get_outputs` gives connector plus make/model/serial) → trigger ident mode → each panel shows its name/number/colour → confirm or rename in the UI. Swap a panel, re-ident.
+- **One global layout** means the screens are regions of a single canvas. Scenes are named snapshots, and switching fans out atomically.
 
 ---
 
 ## Build vs buy
 
-**Borrow wholesale:** device stack (Ubuntu, `sway`/`greetd`/`systemd`, the Chrome kiosk browser + `surf` fallback, `grim`); the *discipline* of OTA / env-as-config provisioning (ship the agent as a single-file **binary**, provision declaratively) — without taking on a hosted-SaaS device manager.
+**Borrow wholesale:** the device stack (Ubuntu, `sway`/`greetd`/`systemd`, the Chrome kiosk browser with the `surf` fallback, `grim`) and the discipline of OTA, env-as-config provisioning (ship the agent as a single-file binary, provision declaratively), without taking on a hosted-SaaS device manager.
 
-**Build (only net-new):** `polyptic-server` (registry + global layout + versioned scenes + REST/WS API + web UI) and `polyptic-agent`. Tightly scoped, *not* a generic signage CMS.
+**Build (only net-new):** `polyptic-server` (registry, global layout, versioned scenes, REST/WS API, web UI) and `polyptic-agent`. Tightly scoped, not a generic signage CMS.
 
-**Rejected — off-the-shelf signage & AV controllers:** existing products model a fleet as N independent screens with per-screen playlists — no single global layout, no scenes spanning the whole wall. Hosted-SaaS device managers fail the self-host requirement and are content-agnostic; enterprise AV-controller appliances are off-stack. None offer the one-canvas + named-scenes + API model that is the whole point, so the control plane is net-new.
-
----
-
-## Roadmap (quick win first)
-
-- **Phase 0 (1–3 days, reversible, on current boxes):** anonymous/`kiosk` dashboard URLs → validates auth-decoupling on existing hardware, no new infra.
-- **Phase 1 (≈1–2 wk):** one Ubuntu client, autologin→sway→systemd browser per screen, static config. *Verify GPU/Wayland.*
-- **Phase 2 (≈2–3 wk):** control-plane MVP + agent reconciling one scene; screen registry + ident mode.
-- **Phase 3 (≈3–5 wk):** mosaic player across all screens + typed surfaces + scenes + layout editor + atomic fan-out.
-- **Phase 4 (≈2–3 wk):** thumbnails + on-demand VNC; Helm + compose packaging; OIDC + mTLS identity; Prometheus; last-good-slice caching.
-- **Phase 5 (nice-to-have):** image/video/slideshow + Office→media conversion; native-app surfaces as needs arrive.
-
-**Effort:** ~1.5–3 engineer-months to v1 for 1–2 TS/Linux engineers, front-loaded by the days-scale Phase 0. Biggest estimate risk: GPU/Wayland validation on the real hardware.
+**Rejected: off-the-shelf signage and AV controllers.** Existing products model a fleet as N independent screens with per-screen playlists. No single global layout, no scenes spanning the whole wall. Hosted-SaaS device managers fail the self-host requirement and are content-agnostic. Enterprise AV-controller appliances are off-stack. None offer the one-canvas + named-scenes + API model that is the whole point, so the control plane is net-new.
 
 ---
 
-## Naming — why Polyptic
+## Naming: why Polyptic
 
-A **polyptic** is a multi-panel painting whose panels compose one image — the exact metaphor for a wall of screens showing one composition, and for the scenes/mosaic model. Short, distinct, and with a clean namespace across the package registries.
-
----
-
-## Appendix — key technical gotchas (generic)
-
-- **Wayland positioning:** a client cannot position itself — placement MUST go through `sway` (config or IPC). X11 works (fallback).
-- **Windows are matched by pid**, off sway's `window` event stream: the browser exposes no per-output WM class to match on.
-- **surf (the fallback browser) is an X11 client**, so under sway it needs `xwayland` installed and `DISPLAY` imported into the user session, or it never opens — and its XWayland GPU path needs DRI3, which real wall hardware broke (POL-67): that is why Chrome-native-Wayland is the default.
-- **Hard power cut → "Restore pages":** suppress with `--disable-session-crashed-bubble --hide-crash-restore-bubble` *and* sed-reset `exit_type`/`exited_cleanly` in profile `Preferences`.
-- **Headless autologin:** `--password-store=basic` (avoid gnome-keyring prompt); `--force-device-scale-factor=1`; `--autoplay-policy=no-user-gesture-required` if media plays.
-- **Dashboard embedding:** source must permit framing (no `X-Frame-Options: deny`; if CSP on, list player origin in `frame-ancestors`). Keep player + content on **one registrable domain** for `SameSite=Lax` cookies. If the dashboard tool has an embedding / anonymous-access flag, enable it; prefer a single-panel embed URL and bake every parameter + any kiosk flag into the URL (an in-iframe refresh can otherwise drop query state); pin the version, re-test on upgrade.
-- **Cross-origin iframe load-failure is undetectable** (SOP) → parent-side watchdog: spinner, load timeout, periodic `iframe.src = iframe.src`, error card + backoff.
+A **polyptych** is a multi-panel painting whose panels compose one image, the exact metaphor for a wall of screens showing one composition and for the scenes/mosaic model. The name is short, distinct, and has a clean namespace across the package registries.
 
 ---
 
-## Update 2026-06-29 — Console v2 model
+## The console model
 
-The **Polyptic Console v2** model settles the operator console. We adopt it wholesale (decisions D21–D25). This reshapes **Phase 3**; the contract/code don't change until that build.
+The operator console is built around these entities:
 
-**Entities (the Phase 3 data model):**
-- **Mural** — a named, switchable canvas (e.g. "Reception", "Atrium"). A deployment has several. Top-bar switcher selects the active one.
-- **Screen placement** — a Screen is **unplaced** (lives in a tray) or **placed** on exactly one mural at `{x, y, w, h}`. Enrolment (2b) ≠ placement: an approved screen still has to be dragged onto a mural. (Screens stay independent of their host machine — the machine is only shown as secondary "driven by" metadata, which the v2 design confirmed.)
-- **Surface (combined / video wall)** — adjacent placed screens combined into one logical screen. Content **spans** the surface with bezel seams shown; it has a combined resolution, one content assignment, and "ident all". **Combine** (multi-select adjacent → combine) / **Split** (back to individual screens).
-- **ContentSource** — a reusable library item: `{ name, kind: web|dashboard|image|video, address/config, authStrategy }`. Dragged from the **Content Library** onto a screen or surface. (Promotes the old "content adapters" idea into managed entities; `authStrategy` is the Bucket-A strategy from the auth model.)
-- **Scene** — snapshots a mural's whole composition: each screen/surface's content **and** every screen's position/size **and** which screens are combined. Switching a scene restores it atomically (instant fan-out). Save = "save current wall as scene".
-- **Activity event** — server-emitted event (`machine unreachable`, `content changed`, `scene activated`, `screen approved`…) surfaced as the console's **live activity feed**.
+- **Mural**: a named, switchable canvas (e.g. "Reception", "Atrium"). A deployment has several, and a top-bar switcher selects the active one.
+- **Screen placement**: a Screen is **unplaced** (lives in a tray) or **placed** on exactly one mural at `{x, y, w, h}`. Enrolment is not placement, so an approved screen still has to be dragged onto a mural. Screens stay independent of their host machine, which is only shown as secondary "driven by" metadata.
+- **Surface (combined / video wall)**: adjacent placed screens combined into one logical screen. Content spans the surface with bezel seams shown. The surface has a combined resolution, one content assignment, and "ident all". **Combine** (multi-select adjacent screens) and **Split** (back to individual screens).
+- **ContentSource**: a reusable library item: `{ name, kind: web|dashboard|image|video|stream|playlist|page|deck, address/config, authStrategy }`. Dragged from the **Content Library** onto a screen or surface.
+- **Scene**: a snapshot of a mural's whole composition: each screen or surface's content, every screen's position and size, and which screens are combined. Switching a scene restores it atomically with an instant fan-out. Save means "save the current wall as a scene".
+- **Activity event**: a server-emitted event (`machine unreachable`, `content changed`, `scene activated`, `screen approved`…) surfaced as the console's live activity feed.
 
-**The console (v2) shape:** top bar (mural switcher · scene switcher + save · live/alerts · theme); left = Content Library + Unplaced-screens tray; centre = zoomable canvas of screens + combined surfaces with a floating selection toolbar; right = context inspector (single screen / combined surface / multi-select pre-combine / empty); a live activity feed. Machines appear only as secondary metadata.
-
-**What v2 did NOT cover — missing operator flows** (queued for design, then build): cold-start (nothing connected yet); the **enrolment/approval** UI (Phase 2b's pending → approve/reject "bouncer"); the first-time **ident → name → place** mapping flow; a **fleet/machines** management view (health, enrolment status, reject/revoke, bootstrap-token setting); **content-source** add/edit (incl. auth strategy); **scene management** (list/rename/delete/duplicate/schedule); and console **settings/sign-in** (admin OIDC — Bucket B/Phase 6). Optionally: real **live preview** thumbnails on the canvas (Phase 5) rather than content *names*.
+**The console's shape:** a top bar (mural switcher · scene switcher and save · live/alerts · theme); left, the Content Library and the unplaced-screens tray; centre, a zoomable canvas of screens and combined surfaces with a floating selection toolbar; right, a context inspector (single screen, combined surface, multi-select pre-combine, or empty); plus the live activity feed. Machines appear only as secondary metadata.
 
 ---
 
-## Update 2026-06-29 — Phase 4 device stack: zero-touch depot install, not a (mandatory) image (D26/D27; agent delivery revised by D41)
+## Device stack: zero-touch netboot, not an install
 
-Settled while the design was in flight; build deferred until after Phase 3.
+**Delivery.** The only on-device path is the **netboot live image** served by the control plane: a bare machine boots it into RAM over the network, nothing is installed and nothing is written to disk. The image is built by `polyptic-agent setup` at build time, which wires the whole chain on a stock Ubuntu rootfs: greetd autologin (`kiosk` user) → **sway** → a `systemd`-supervised agent plus a kiosk browser per output (Chrome native Wayland, surf fallback), plus crash hardening (`Restart=always`, no `swayidle`, `dpms on`). Per-machine config (control-plane URL and bootstrap token) arrives on the kernel command line, baked into the boot menu the server generates per request. The split is clean. The boot medium makes the machine a Polyptic display, and the console decides what it shows (the machine enrols and an operator approves it).
 
-**Delivery.** The only on-device path is the **netboot live image** served by the control plane: a bare machine boots it into RAM over the network, nothing is installed and nothing is written to disk (D46/D47/D58, superseding D41's `curl … | sh` one-liner). The image is built by `polyptic-agent setup` at build time, which wires the whole chain on a **stock** Ubuntu rootfs: greetd autologin (`kiosk` user) → **sway** → `systemd`-supervised agent + **a kiosk browser per output** (Chrome native-Wayland; surf fallback), plus crash hardening (`Restart=always`, no `swayidle`, `dpms on`). Per-machine config (control-plane URL + bootstrap token) arrives on the kernel command line, baked into the boot menu the server generates per request. Clean split: **the boot medium = the machine is a Polyptic display; the console = what it shows** (it enrols via 2b → you Approve it).
+**Generic Linux.** The runtime stack (systemd, greetd, sway, the browser, Wayland) is distro-agnostic. Only the package format and the display manager to displace differ. So the setup logic lives in the agent binary (`polyptic-agent setup`), distro-aware for the substrate it installs, one source of truth, run inside the chroot when the live image is built.
 
-**Generic Linux.** The runtime stack (systemd, greetd, sway/cage, the browser, Wayland) is distro-agnostic; only the package format and the DM-to-displace differ. So the **setup logic lives in the agent binary** (`polyptic-agent setup`), distro-aware (apt/dnf/pacman) for the substrate it installs (Ubuntu/Debian = the actual hardware, `.rpm`/AUR later) — one source of truth, run inside the chroot when the live image is built.
+**"How does a browser show on a *server*?"** A "server" install is not CLI-only. It is the same OS with no desktop. The hardware still has a GPU and real outputs, which is how you see boot text. The Linux graphics stack is: kernel **DRM/KMS** (drives the panel) → a **compositor / display server** (sway on Wayland, Xorg on X11) → a **GUI app** (the browser). A "server" is missing only the middle layer. Polyptic adds just a compositor (sway, a few MB) and the browser, with no desktop environment (GNOME and KDE bundle a compositor plus a pile of unwanted apps). Starting from Server-minimal means nothing to fight, lean, fast-booting. `apt install greetd sway google-chrome-stable grim` (plus the `surf xwayland` fallback) is essentially the whole graphical layer.
 
-**"How does a browser show on a *server*?"** A "server" install isn't CLI-*only* — it's the same OS with no desktop. The hardware still has a GPU + real outputs (that's how you see boot text). The Linux graphics stack is: kernel **DRM/KMS** (drives the panel) → a **compositor / display server** (sway on Wayland; Xorg on X11) → a **GUI app** (the browser). A "server" is missing only the middle layer. We add **just a compositor** (sway, a few MB) + the browser — *no* desktop environment (GNOME/KDE bundle a compositor *plus* tons of apps we don't want). So we deliberately start from **Server-minimal**: nothing to fight, lean, fast-booting. `apt install greetd sway google-chrome-stable grim` (plus the `surf xwayland` fallback) is essentially the whole graphical layer.
+**Browser.** **Google Chrome stable, native Wayland**: vendor-signed and security-updated from Google's own apt repo, EGL/GBM straight to the GPU. surf under Xwayland software-rendered and pegged the CPU on real hardware, which is why Chrome is the default. Chrome's loopback remote-debugging port also gives operators Chrome DevTools from their own desk, tunnelled through the console. `surf` (WebKitGTK) remains the fallback. It covers arm64 and Chrome-hostile hardware, at the cost that its dev tools can only be popped on the panel itself.
 
-**Browser.** **Google Chrome stable, native Wayland** (D77) — vendor-signed and security-updated from Google's own apt repo, EGL/GBM straight to the GPU (surf-under-Xwayland software-rendered and CPU-pegged on real hardware, POL-67), and its loopback remote-debugging port gives operators **Chrome DevTools from their own desk**, tunnelled through the console. `surf` (WebKitGTK) remains the fallback — it covers arm64 and Chrome-hostile hardware, at the cost that its dev tools can only be popped **on the panel itself** (POL-50).
-
-**Backends.** Phase 4 makes the agent's `wayland-sway`/`x11-i3` `DisplayBackend`s **real** (swaymsg-IPC window placement + browser launching + `grim` capture + the on-screen inspector), replacing today's Phase-1 stubs; `dev-open` stays for non-Linux dev.
-
-**Test target (noted).** Two complementary VMs: **OrbStack** (headless, no display) for fast iteration on the **install → systemd → agent → enrolment** plumbing + a *headless* sway (`WLR_BACKENDS=headless`); and **UTM** (QEMU + virtio-gpu) — a desktop-virtualization VM with a real virtual display — for the **visual** "cold-boot → active scene, zero clicks" DoD, where sway + the browser actually render. Caveats for the visual VM: it presents ~one virtual output (so *multi-output-per-client* + the real multi-screen wall stay a real-hardware test), the virtual GPU may need `WLR_NO_HARDWARE_CURSORS` or the x11/i3 fallback, and on Apple Silicon the guest is arm64 (build the agent binary for the VM arch *and* the likely-amd64 thin clients).
+**Backends.** The agent's `wayland-sway` and `x11-i3` `DisplayBackend`s are real (swaymsg-IPC window placement, browser launching, `grim` capture, the on-screen inspector), and `dev-open` exists for non-Linux dev.
 
 ---
 
-## Update 2026-06-29 (later) — renamed to "Polyptic" + logo + console design refresh
+## Appendix: key technical gotchas (generic)
 
-- **Renamed Polyptych → Polyptic** across the whole codebase: npm scope `@polyptic/*`, env vars `POLYPTIC_*`, `/etc/polyptic`, `~/.polyptic`, the `polyptic-agent` binary, brand text, and the repo folder `~/code/polyptic`. 115 files; verified typecheck + e2e 28/28. (Easier to spell.)
-- **Logo** (`packages/console/src/components/Logo.vue`): the hinged-panel mark — two angled side panels + a squared-off centre on a rounded holder, **theme-inverting** (holder `--primary`, panels `--primary-fg`). Wired into the nav rail + sign-in. Horizontal lockup = mark + the "Polyptic" wordmark.
-- **Console design refreshed** (`docs/design/console.dc.html` v4): brand is **Polyptic**, the logo mark replaces the old "P", and the **scene controls moved to the top-left of the Wall top bar** (active scene + Save scene lead it). The full scene rail/management lands in **3d** against this reference.
+- **Wayland positioning:** a client cannot position itself. Placement MUST go through `sway` (config or IPC). X11 works and is the fallback.
+- **Windows are matched by pid**, off sway's `window` event stream, because the browser exposes no per-output WM class to match on.
+- **surf (the fallback browser) is an X11 client**, so under sway it needs `xwayland` installed and `DISPLAY` imported into the user session, or it never opens. Its XWayland GPU path needs DRI3, which real wall hardware broke, and that is why Chrome native Wayland is the default.
+- **Hard power cut → "Restore pages":** suppress with `--disable-session-crashed-bubble --hide-crash-restore-bubble` *and* sed-reset `exit_type`/`exited_cleanly` in the profile's `Preferences`.
+- **Headless autologin:** `--password-store=basic` (avoids the gnome-keyring prompt) · `--force-device-scale-factor=1` · `--autoplay-policy=no-user-gesture-required` if media plays.
+- **Dashboard embedding:** the source must permit framing (no `X-Frame-Options: deny`, and if CSP is on, list the player origin in `frame-ancestors`). Keep player and content on one registrable domain for `SameSite=Lax` cookies. If the dashboard tool has an embedding or anonymous-access flag, enable it. Prefer a single-panel embed URL and bake every parameter plus any kiosk flag into the URL, because an in-iframe refresh can otherwise drop query state. Pin the version and re-test on upgrade.
+- **Cross-origin iframe load-failure is undetectable** (Same-Origin Policy), so the parent needs a watchdog: spinner, load timeout, periodic `iframe.src = iframe.src`, error card and backoff.

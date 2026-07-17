@@ -717,18 +717,18 @@ export function qrContrastIssue(
   if (ratio < QR_MIN_CONTRAST) {
     return {
       level: "refuse",
-      message: `QR contrast ${ratio.toFixed(1)}:1 is below ${QR_MIN_CONTRAST}:1 — this code will not scan`,
+      message: `QR contrast ${ratio.toFixed(1)}:1 is below ${QR_MIN_CONTRAST}:1, so this code will not scan`,
     };
   }
   const lfg = hexLuminance(fg)!;
   const lbg = hexLuminance(bg)!;
   if (lfg > lbg) {
-    return { level: "warn", message: "Light modules on a dark background — some cameras refuse inverted QR codes" };
+    return { level: "warn", message: "Light modules on a dark background, and some cameras refuse inverted QR codes" };
   }
   if (ratio < QR_SAFE_CONTRAST) {
     return {
       level: "warn",
-      message: `QR contrast ${ratio.toFixed(1)}:1 is marginal — may not scan in poor light`,
+      message: `QR contrast ${ratio.toFixed(1)}:1 is marginal and may not scan in poor light`,
     };
   }
   return null;

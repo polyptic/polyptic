@@ -291,7 +291,7 @@ function snapCandidates(exceptId: string): { cx: number[]; cy: number[] } {
 function libDown(kind: PageElementKind, e: MouseEvent) {
   e.preventDefault();
   drag = { type: "lib", kind };
-  ghost.value = { x: e.clientX, y: e.clientY, label: `${libraryEntry(kind).name} — drop on the page` };
+  ghost.value = { x: e.clientX, y: e.clientY, label: `${libraryEntry(kind).name}` };
 }
 
 function elementDown(id: string, e: MouseEvent) {
@@ -541,7 +541,7 @@ const propSpecs = computed<PropSpec[]>(() => {
         select("Content source", "sourceId", embeddableSourceOptions.value),
         zoom("Page zoom", "zoom"),
         note(
-          "The player fetches this source with stamped credentials — the page never carries secrets. Sources that refuse framing can't go on a page.",
+          "The player fetches this source with stamped credentials, so the page never carries secrets. Sources that refuse framing can't go on a page.",
         ),
       ];
     case "feed":
@@ -549,7 +549,7 @@ const propSpecs = computed<PropSpec[]>(() => {
         text("Feed URL", "url"),
         range("Items shown", "items", 2, 8, ""),
         range("Font size", "fontScale", 50, 200, "%"),
-        note("Polled server-side every ~5 min; last-good items are served if the feed is down."),
+        note("Polled server-side every ~5 min. Last-good items are served if the feed is down."),
       ];
     case "ticker":
       return [
@@ -585,7 +585,7 @@ const propSpecs = computed<PropSpec[]>(() => {
         ]),
         toggle("Show seconds", "seconds"),
         color("Colour", "color"),
-        note("Updates a text node once a minute — no animation, safe on every box."),
+        note("Updates a text node once a minute. No animation, safe on every box."),
       ];
     case "shape":
       return [color("Fill", "fill"), range("Corner radius", "radius", 0, 48, " px"), range("Opacity", "opacity", 10, 100, "%")];
@@ -607,7 +607,7 @@ const propSpecs = computed<PropSpec[]>(() => {
         color("Modules", "fg"),
         color("Background", "bg"),
         ...(issue ? [warn(issue.level === "refuse" ? `${issue.message}. Saving is refused until the colours are fixed.` : issue.message)] : []),
-        note("Encoded to SVG on the client — static, no network."),
+        note("Encoded to SVG on the client."),
       ];
     }
     case "countdown":
@@ -620,7 +620,7 @@ const propSpecs = computed<PropSpec[]>(() => {
 const embeddableSourceOptions = computed(() =>
   store.sources
     .filter((s) => s.kind !== "page")
-    .map((s) => ({ v: s.id, t: `${s.name} — ${kindLabel(s.kind)}` })),
+    .map((s) => ({ v: s.id, t: `${s.name} · ${kindLabel(s.kind)}` })),
 );
 const imageSourceOptions = computed(() =>
   store.sources.filter((s) => s.kind === "image").map((s) => ({ v: s.id, t: s.name })),
@@ -737,8 +737,8 @@ function badgeText(el: PageElement): string {
         <button class="pill" :class="{ active: aspect === '9:16' }" @click="setAspect('9:16')">9:16</button>
       </div>
       <div class="head-divider"></div>
-      <button class="icon-btn" :disabled="!undoStack.length" title="Undo — ⌘Z" @click="undo">↩</button>
-      <button class="icon-btn" :disabled="!redoStack.length" title="Redo — ⇧⌘Z" @click="redo">↪</button>
+      <button class="icon-btn" :disabled="!undoStack.length" title="Undo (⌘Z)" @click="undo">↩</button>
+      <button class="icon-btn" :disabled="!redoStack.length" title="Redo (⇧⌘Z)" @click="redo">↪</button>
       <div class="head-divider"></div>
       <span v-if="dirty" class="unsaved"><span class="unsaved-dot"></span>Unsaved</span>
       <button class="save-btn" :disabled="saving" @click="save">{{ saving ? "Saving…" : "Save" }}</button>
@@ -766,7 +766,7 @@ function badgeText(el: PageElement): string {
         </div>
         <div class="layers">
           <div v-if="!elements.length" class="layers-empty">
-            Nothing on the page yet — drag an element onto the canvas.
+            Nothing on the page yet.
           </div>
           <div
             v-for="layer in layers"
@@ -830,9 +830,9 @@ function badgeText(el: PageElement): string {
           </div>
         </div>
         <div class="canvas-foot">
-          <span>Positions are % of the screen — pages render at any resolution</span>
+          <span>Positions are % of the screen, so pages render at any resolution</span>
           <span>·</span>
-          <span>Saving re-pushes the slice: assigned walls update in &lt;150 ms, no reload</span>
+          <span>Saving re-pushes the slice, so assigned walls update in &lt;150 ms with no reload</span>
         </div>
       </div>
 
@@ -856,8 +856,8 @@ function badgeText(el: PageElement): string {
           <div class="assigned">
             {{
               assignedTo.length
-                ? `Live on ${assignedTo.join(" · ")} — saving re-pushes the slice, the wall updates without a reload.`
-                : "Not on any screen yet. Assign it from the Wall or a screen inspector, like any other source."
+                ? `Live on ${assignedTo.join(" · ")}`
+                : "Not on any screen yet. Assign it from the Wall or a screen inspector."
             }}
           </div>
           <div class="ins-empty">

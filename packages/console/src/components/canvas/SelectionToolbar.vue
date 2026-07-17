@@ -87,7 +87,7 @@ async function combine(pack: boolean) {
     result === "not-adjacent"
       ? "Those screens don't sit next to each other. Pack them to close the gaps, or move them together."
       : result === "failed"
-        ? "Combine failed — the control plane refused it."
+        ? "Combine failed because the control plane refused it."
         : "";
 }
 
@@ -145,7 +145,7 @@ function splitWall() {
       <span class="note-text">
         {{
           combineNote ||
-          "These screens aren't adjacent — a combined surface must be one contiguous block."
+          "These screens aren't adjacent. A combined surface must be one contiguous block."
         }}
       </span>
       <button class="note-btn" @click="combine(true)">Pack &amp; combine</button>

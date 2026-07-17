@@ -207,7 +207,7 @@ function remove(): void {
         <!-- POL-101: a sleeping panel is HEALTHY. Calm, deliberate, its own chip — never the red of a
              fault, and never mistakable for the offline dot beside it. -->
         <span v-if="asleep" class="chip chip-asleep" :title="asleepDetail">☾ Asleep</span>
-        <span v-if="hoursSummary" class="chip chip-hours" :title="`Panel hours — this screen sleeps and wakes on a daily schedule`">
+        <span v-if="hoursSummary" class="chip chip-hours" :title="`Panel hours. This screen sleeps and wakes on a daily schedule`">
           {{ hoursSummary }}
         </span>
         <!-- POL-119 — cast-enabled indicator (the toggle itself lives in the canvas Inspector) -->
@@ -215,7 +215,7 @@ function remove(): void {
           v-if="screen.castEnabled"
           class="chip cast-chip"
           :class="{ live: screen.castActive }"
-          :title="screen.castActive ? 'A device is casting to this screen now' : 'Casting enabled — discoverable via Screen Mirroring'"
+          :title="screen.castActive ? 'A device is casting to this screen now' : 'Casting enabled. Discoverable via Screen Mirroring'"
         >
           {{ screen.castActive ? "Casting now" : "Cast on" }}
         </span>

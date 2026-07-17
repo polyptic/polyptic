@@ -99,7 +99,7 @@ async function confirmSave() {
         <div class="modal" role="dialog" aria-modal="true">
           <div class="modal-title">Save current wall as scene</div>
           <div class="modal-sub">
-            Captures every screen &amp; surface's content and layout. Switch back in one click.
+            Captures every screen &amp; surface's content and layout.
           </div>
           <input
             v-model="sceneName"

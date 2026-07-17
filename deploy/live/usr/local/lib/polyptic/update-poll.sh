@@ -101,7 +101,7 @@ heal_boot_theme() {
     # which boots silently, until a later poll re-heals the full set.
     if [ -f "$td/theme.txt" ] && { [ ! -s "$td/logo.png" ] || [ ! -s "$td/bg.png" ]; }; then
       rm -f "$td/theme.txt" 2>/dev/null \
-        && echo "update-poll: removed an orphan theme.txt (missing logo.png or bg.png) from $hdev — plain menu until the splash re-heals"
+        && echo "update-poll: removed an orphan theme.txt (missing logo.png or bg.png) from $hdev. The menu stays plain until the splash re-heals"
     fi
     stg="$(mktemp -d 2>/dev/null || true)"
     if [ -n "$stg" ] \
@@ -154,7 +154,7 @@ case "$MANIFEST" in *'"urgent":true'*) URGENT=1 ;; esac
 
 if [ "$URGENT" != "1" ]; then
   hour="$(date +%H)"
-  case "$hour" in 03|04) : ;; *) echo "update-poll: newer image $SERVED available (running $RUNNING$([ "$STALE_BOOT" = 1 ] && printf ', kernel mismatched')); waiting for the nightly window"; exit 0 ;; esac
+  case "$hour" in 03|04) : ;; *) echo "update-poll: newer image $SERVED available (running $RUNNING$([ "$STALE_BOOT" = 1 ] && printf ', kernel mismatched')). Waiting for the nightly window"; exit 0 ;; esac
 fi
 
 # ── Refresh the local boot medium first (POL-63): the reboot must land on the NEW image ─────────────
@@ -199,7 +199,7 @@ if [ -n "$mdev" ] && [ -f "$mmnt/grub/local-$arch.cfg" ]; then
     rm -f "$mmnt/polyptic/SHA256SUMS.new" 2>/dev/null || true
     umount "$mmnt" 2>/dev/null || true; rmdir "$mmnt" 2>/dev/null || true
     if [ "$ok" != 1 ]; then
-      echo "update-poll: medium refresh for $SERVED did not complete; keeping $cur_img and retrying next poll"
+      echo "update-poll: medium refresh for $SERVED did not complete, so keeping $cur_img and retrying next poll"
       exit 0
     fi
     echo "update-poll: medium $mdev now boots $SERVED (slot $new_slot)"
@@ -217,9 +217,9 @@ mkdir -p "$RUN_DIR" && : > "$MARKER"
 # lands on a different second and the depot never serves the whole fleet at once.
 SPLAY=$(( $(printf '%s' "${MID:-$RUNNING}" | cksum | cut -d' ' -f1) % 241 ))
 if [ "$SERVED" = "$RUNNING" ]; then
-  echo "update-poll: rebooting to re-pair the kernel with image $SERVED (recovery boot); in ${SPLAY}s"
+  echo "update-poll: rebooting to re-pair the kernel with image $SERVED (recovery boot) in ${SPLAY}s"
 else
-  echo "update-poll: image $SERVED supersedes $RUNNING (urgent=$URGENT); rebooting to re-pull in ${SPLAY}s"
+  echo "update-poll: image $SERVED supersedes $RUNNING (urgent=$URGENT). Rebooting to re-pull in ${SPLAY}s"
 fi
 sleep "$SPLAY"
 systemctl reboot

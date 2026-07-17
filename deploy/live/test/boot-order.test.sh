@@ -187,7 +187,7 @@ eq  "our entry leads, every other entry keeps its order behind it" "000a,0000,00
 eq  "not one boot entry was created or deleted"                    "$before" "$(entries_of "$d")"
 has "reports the correction"                                       '"code":"boot-order-reasserted"' "$(posts "$d")"
 has "…as a success"                                                '"ok":true'                      "$(posts "$d")"
-has "and says what the order is now, and was"                      "boot order 000a,0000,0002,0001,0003 (was 0000,000a,0002,0001,0003)" "$(posts "$d")"
+has "and says what the order is now, and was"                      "Boot order 000a,0000,0002,0001,0003 (was 0000,000a,0002,0001,0003)" "$(posts "$d")"
 
 printf '\n── the firmware DISABLED our entry ──\n'
 d="$(new_case disabled)"

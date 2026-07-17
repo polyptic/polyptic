@@ -656,7 +656,7 @@ export function registerRestRoutes(
     if (machine.status !== "approved") {
       return reply
         .code(409)
-        .send({ error: `machine ${machine.id} is ${machine.status}, not approved — cannot reboot it` });
+        .send({ error: `machine ${machine.id} is ${machine.status}, not approved, so it cannot be rebooted` });
     }
 
     const reason = body.data.reason?.trim() || "requested by an operator from the console";
@@ -665,7 +665,7 @@ export function registerRestRoutes(
       ServerToAgentReboot.parse({ t: "server/reboot", reason }),
     );
     if (delivered === 0) {
-      return reply.code(409).send({ error: `machine ${machine.id} is offline — nothing to reboot` });
+      return reply.code(409).send({ error: `machine ${machine.id} is offline, so there is nothing to reboot` });
     }
 
     // The feed only reaches the console folded into an admin/state, and a reboot mutates no state that
@@ -698,7 +698,7 @@ export function registerRestRoutes(
     const target = control.getMachine(params.data.machineId);
     if (target && target.status !== "approved" && body.data.enabled) {
       return reply.code(409).send({
-        error: `machine ${target.id} is ${target.status}, not approved — cannot enable its console`,
+        error: `machine ${target.id} is ${target.status}, not approved, so its console cannot be enabled`,
       });
     }
 
@@ -958,7 +958,7 @@ export function registerRestRoutes(
     const machine = control.getMachine(screen.machineId);
     if (!machine || machine.status !== "approved") {
       return reply.code(409).send({
-        error: `screen ${screen.id} belongs to a machine that is not approved — cannot inspect it`,
+        error: `screen ${screen.id} belongs to a machine that is not approved, so it cannot be inspected`,
       });
     }
 
@@ -973,7 +973,7 @@ export function registerRestRoutes(
     if (delivered === 0) {
       return reply
         .code(409)
-        .send({ error: `${machine.label} is offline — nothing to show an inspector on` });
+        .send({ error: `${machine.label} is offline, so there is nothing to show an inspector on` });
     }
 
     // POL-67 — disarming must not leave a DevTools session bridged to a screen the operator just
@@ -1042,7 +1042,7 @@ export function registerRestRoutes(
     const machine = control.getMachine(screen.machineId);
     if (!machine || machine.status !== "approved") {
       return reply.code(409).send({
-        error: `screen ${screen.id} belongs to a machine that is not approved — cannot power it`,
+        error: `screen ${screen.id} belongs to a machine that is not approved, so it cannot be powered`,
       });
     }
 
@@ -1050,7 +1050,7 @@ export function registerRestRoutes(
     if (delivered === 0) {
       return reply
         .code(409)
-        .send({ error: `${machine.label} is offline — nothing to ${body.data.on ? "wake" : "sleep"}` });
+        .send({ error: `${machine.label} is offline, so there is nothing to ${body.data.on ? "wake" : "sleep"}` });
     }
     broadcaster.broadcast();
     return reply.code(202).send({ ok: true, screenId: screen.id, on: body.data.on, delivered });
@@ -1074,7 +1074,7 @@ export function registerRestRoutes(
     if (machine.status !== "approved") {
       return reply
         .code(409)
-        .send({ error: `machine ${machine.id} is ${machine.status}, not approved — cannot power its panels` });
+        .send({ error: `machine ${machine.id} is ${machine.status}, not approved, so its panels cannot be powered` });
     }
 
     const screens = control.getScreens().filter((s) => s.machineId === machine.id);
@@ -1087,7 +1087,7 @@ export function registerRestRoutes(
     if (delivered === 0) {
       return reply
         .code(409)
-        .send({ error: `${machine.label} is offline — nothing to ${body.data.on ? "wake" : "sleep"}` });
+        .send({ error: `${machine.label} is offline, so there is nothing to ${body.data.on ? "wake" : "sleep"}` });
     }
 
     broadcaster.broadcast();
@@ -1637,7 +1637,7 @@ export function registerRestRoutes(
     });
     if (broken) {
       return reply.code(409).send({
-        error: `moving ${params.data.screenId} there would break up ${broken.name ?? broken.id} — split the surface first, or drag the whole surface`,
+        error: `moving ${params.data.screenId} there would break up ${broken.name ?? broken.id}, so split the surface first or drag the whole surface`,
         wallId: broken.id,
       });
     }
@@ -1866,7 +1866,7 @@ export function registerRestRoutes(
     if (!result.ok) {
       if (result.error === "wall-member") {
         return reply.code(409).send({
-          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; set content on the wall`,
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}, so set content on the wall`,
           wallId: result.wallId,
         });
       }
@@ -1909,7 +1909,7 @@ export function registerRestRoutes(
     if (!result.ok) {
       if (result.error === "wall-member") {
         return reply.code(409).send({
-          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; clear the wall`,
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}, so clear the wall`,
           wallId: result.wallId,
         });
       }
@@ -2073,7 +2073,7 @@ export function registerRestRoutes(
     if (!result.ok) {
       if (result.error === "wall-member") {
         return reply.code(409).send({
-          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; zoom the wall`,
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}, so zoom the wall`,
           wallId: result.wallId,
         });
       }
@@ -2160,7 +2160,7 @@ export function registerRestRoutes(
     if (!result.ok) {
       if (result.error === "wall-member") {
         return reply.code(409).send({
-          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; set the wall's audio`,
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}, so set the wall's audio`,
           wallId: result.wallId,
         });
       }
@@ -2253,7 +2253,7 @@ export function registerRestRoutes(
     if (!result.ok) {
       if (result.error === "wall-member") {
         return reply.code(409).send({
-          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}; zoom the wall's step`,
+          error: `screen ${params.data.screenId} is a member of video wall ${result.wallId}, so zoom the wall's step`,
           wallId: result.wallId,
         });
       }
@@ -2441,7 +2441,7 @@ export function registerRestRoutes(
       if (result.error === "invalid-shape") {
         return reply
           .code(400)
-          .send({ error: "a page source needs a definition; every other kind needs a url" });
+          .send({ error: "a page source needs a definition and every other kind needs a url" });
       }
       // POL-34 — playlist authoring errors (bad item reference / missing duration).
       return reply.code(400).send({ error: playlistItemErrorDetail(result.error, result.itemSourceId) });

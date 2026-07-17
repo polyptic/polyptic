@@ -98,7 +98,7 @@ const title = computed(() =>
 const subtitle = computed(() =>
   step.value === 2
     ? "These screens are live but anonymous. Map each one to the physical panel on your wall."
-    : "No machines are on the wall yet. Bring one online to get started.",
+    : "No machines have been onboarded yet.",
 );
 
 const screens = computed(() => enrollingMachine.value?.screens ?? []);
@@ -187,21 +187,19 @@ function close(): void {
               <span class="num">1</span>
               <span>
                 Download the network bootloader below and flash it to a USB stick (2&nbsp;GB or
-                larger). You can use Balena Etcher or Rufus to do this.
+                larger).
               </span>
             </li>
             <li>
               <span class="num">2</span>
               <span>
-                Insert the USB stick into the machine connected to the screen and boot from the USB
-                stick. Leave Secure Boot <b>on</b>.
+                Insert the USB stick into the machine connected to the screen and boot from it.
               </span>
             </li>
             <li>
               <span class="num">3</span>
               <span>
-                Once the machine boots up, you should see it appear below for approval. Approve it,
-                then name and place the screens it drives.
+                Once the machine boots, it appears below for approval.
               </span>
             </li>
           </ol>
@@ -231,20 +229,14 @@ function close(): void {
           <!-- POL-122: an honest gate. "Bootloader not built" was said even while the very image it is
                baked from was building, and a wired-only (lean) medium was offered as if it booted anything. -->
           <div v-if="mediumState === 'building'" class="run-hint gap">
-            Building the first OS image — screens can't netboot until it finishes. The bootloader is baked from
-            that image; it appears here (and in
-            <button type="button" class="link-btn" @click="openOnboardSettings">
-              Settings ▸ Onboard Screens
-            </button>
-            ) the moment it's ready.
+            Building the first OS image...
           </div>
           <div v-else-if="mediumState === 'lean'" class="run-hint gap warn">
-            This bootloader is wired-only — no local payload, no Wi-Fi. It boots a screen on Ethernet; a screen
-            with no cable cannot boot from it. Run a Full rebuild in
+            This bootloader is wired-only and cannot support machines with Wi-Fi. Run a Full rebuild in
             <button type="button" class="link-btn" @click="openOnboardSettings">
               Settings ▸ Onboard Screens
             </button>
-            to publish the full medium.
+            to publish the full Wi-Fi capable medium.
           </div>
           <div v-else-if="mediumState === 'none'" class="run-hint gap">
             No bootloader is published in this deployment.
@@ -259,7 +251,7 @@ function close(): void {
             <span class="spinner"></span>
             <span class="waiting-text">Waiting for a machine to dial in…</span>
             <span class="waiting-hint">
-              It appears here the moment its agent connects — keep this open.
+              The machine appears here the moment its agent connects.
             </span>
           </div>
 
@@ -331,10 +323,10 @@ function close(): void {
           </div>
 
           <p v-if="!targetMuralId" class="no-mural">
-            No mural yet — you can still name screens now and place them later on the Wall.
+            No mural yet. Name screens now and place them later on the Wall.
           </p>
 
-          <button class="btn-finish" @click="finish">Finish — open the Wall</button>
+          <button class="btn-finish" @click="finish">Finish and open the Wall</button>
         </div>
       </div>
     </div>

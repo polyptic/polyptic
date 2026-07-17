@@ -11,10 +11,7 @@ defineProps<{ title: string; subtitle: string }>();
 
       <div class="card cs">
         <span class="cs-badge">Coming soon</span>
-        <p class="cs-text">
-          This view arrives in a later sub-phase of the console. For now, the Wall is where you
-          place, name, ident and assign content to screens.
-        </p>
+        <p class="cs-text">This view arrives in a later sub-phase of the console.</p>
         <router-link class="btn btn-ghost" :to="{ name: 'wall' }">Open the Wall</router-link>
       </div>
     </div>

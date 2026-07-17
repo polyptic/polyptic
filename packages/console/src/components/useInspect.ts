@@ -82,16 +82,16 @@ export function useScreenInspect(target: Ref<InspectTarget | undefined>, deps: I
     const t = target.value;
     if (!t) return "";
     if (!t.machineOnline) {
-      return `${t.machineLabel} is offline — the inspector rides its agent connection`;
+      return `${t.machineLabel} is offline, so the inspector is unavailable`;
     }
     if (isChrome.value) {
       return inspecting.value
         ? "Disarm remote DevTools for this screen (closes any open DevTools tab)"
-        : "Open Chrome DevTools for this screen in a new tab — remote, nothing shows on the wall";
+        : "Open Chrome DevTools for this screen in a new tab";
     }
     return inspecting.value
       ? "Close the Web Inspector on this panel (reloads the page)"
-      : "Open the browser's Web Inspector ON this panel — read it at the screen (reloads the page)";
+      : "Open the browser's Web Inspector ON this panel (reloads the page)";
   });
 
   // The settle watch (rules in the header comment). `target` is a fresh object on every admin/state
@@ -132,8 +132,7 @@ export function useScreenInspect(target: Ref<InspectTarget | undefined>, deps: I
     } else if (!isChrome.value && on) {
       const yes = confirmAsk(
         `Open the Web Inspector on "${t.screen.friendlyName}"?\n\n` +
-          `It appears ON that panel, so anyone looking at the screen will see it, and the page reloads ` +
-          `so the inspector captures the whole load.`,
+          `It appears ON that panel, so anyone looking at the screen will see it.`,
       );
       if (!yes) return;
     }
@@ -145,7 +144,7 @@ export function useScreenInspect(target: Ref<InspectTarget | undefined>, deps: I
     timer = setTimeout(() => {
       if (!pending.value) return;
       pending.value = false;
-      deps.notify(`${t.screen.friendlyName} did not confirm the inspector — check the screen.`);
+      deps.notify(`${t.screen.friendlyName} did not confirm the inspector.`);
     }, timeoutMs);
 
     const error = await deps.inspect(t.screen.id, on);

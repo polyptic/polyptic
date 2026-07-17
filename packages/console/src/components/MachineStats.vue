@@ -104,7 +104,7 @@ watch(
     <div v-if="!machine.online" class="unavailable">System stats unavailable while offline.</div>
 
     <div v-else-if="noReadings" class="unavailable">
-      System stats unavailable — this machine's agent reports no host vitals.
+      System stats unavailable
     </div>
 
     <template v-else>
@@ -150,14 +150,14 @@ watch(
           <span
             v-if="respawns > 0"
             class="chip warn"
-            :title="`The agent has respawned this machine's kiosk browser ${respawns} time(s) since it started. A climbing count is a crash loop — the wall can look fine between respawns.`"
+            :title="`The agent has respawned this machine's kiosk browser ${respawns} time(s) since it started.`"
           >
             {{ respawns }} browser respawn{{ respawns === 1 ? "" : "s" }}
           </span>
           <span
             v-if="softwareRendering.length"
             class="chip bad"
-            :title="`No /dev/dri handle on ${softwareRendering.join(', ')} — the browser is rendering on the CPU.`"
+            title="Browser is rendering on the CPU."
           >
             Software rendering
           </span>
@@ -186,15 +186,13 @@ watch(
            twice is how a card stops being read at all. -->
       <div v-if="softwareRendering.length" class="banner bad">
         <strong>Rendering in software</strong> on
-        {{ softwareRendering.join(", ") }} — the kiosk browser holds no GPU device handle
-        (<code>/dev/dri</code>), so it is painting the wall on the CPU. Expect a pegged processor, a
-        hot box and dropped frames. Usually a broken graphics path on this machine (driver, session
-        or browser flavour), not a Polyptic setting.
+        {{ softwareRendering.join(", ") }} because the kiosk browser holds no GPU device handle
+        (<code>/dev/dri</code>). Usually a broken graphics path on this machine (driver, session
+        or browser flavour).
       </div>
 
       <div v-else-if="overloaded" class="banner warn">
-        Under sustained load — this machine may drop frames on animated content, including Ident
-        flashes.
+        Under sustained load. This machine may drop frames on animated content.
       </div>
     </template>
   </div>

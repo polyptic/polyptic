@@ -200,7 +200,7 @@ async function saveSchedule() {
   const sceneId = editorSceneId.value;
   if (!sceneId || edBusy.value) return;
   if (!edDaypartId.value) {
-    edError.value = "add a daypart first — a schedule plays inside a named window of the day";
+    edError.value = "add a daypart first";
     return;
   }
   if (edDays.value.length === 0) {
@@ -300,8 +300,7 @@ async function remove(id: string) {
         <div class="head-text">
           <h1 class="title">Scenes</h1>
           <p class="subtitle">
-            Saved presets of the whole wall. Apply one in a click, or give it a window of the day and
-            the wall runs itself.
+            Saved presets of the whole wall. Apply one in a click, or assign one to a daypart.
             <span v-if="activeMural" class="mural-tag">· {{ activeMural.name }}</span>
           </p>
         </div>
@@ -336,10 +335,10 @@ async function remove(id: string) {
           <label class="field-row">
             <span class="field-label">Default scene</span>
             <select class="input" :value="scheduler.defaultSceneId ?? ''" @change="setDefaultScene">
-              <option value="">— none (leave the wall alone) —</option>
+              <option value="">None (leave the wall alone)</option>
               <option v-for="s in store.scenes" :key="s.id" :value="s.id">{{ s.name }}</option>
             </select>
-            <span class="hint">The always-on floor: it fills every gap no window covers.</span>
+            <span class="hint">The always-on floor that fills every gap no window covers.</span>
           </label>
         </div>
         <div v-if="tzError" class="error">{{ tzError }}</div>
@@ -389,8 +388,8 @@ async function remove(id: string) {
           </div>
         </div>
         <div class="legend">
-          <span class="legend-item"><span class="swatch conflict-swatch"></span> striped = a lower-priority window is being outranked here (hover for who)</span>
-          <span v-if="!scheduler?.enabled" class="legend-item warn">The scheduler is OFF — this is what it would play.</span>
+          <span class="legend-item"><span class="swatch conflict-swatch"></span> striped = a lower-priority window is being outranked here</span>
+          <span v-if="!scheduler?.enabled" class="legend-item warn">The scheduler is OFF. This strip shows what it would play.</span>
         </div>
       </section>
 
@@ -475,8 +474,8 @@ async function remove(id: string) {
         <span class="empty-glyph">▦</span>
         <span class="empty-title">No scenes saved for this mural yet</span>
         <span class="empty-sub">
-          Lay out the wall on the Wall view, then save it here as a scene you can re-apply in one
-          click — or hand to the scheduler.
+          Lay out the wall on the Wall view, then save it here as a scene to re-apply in one click
+          (or hand to the scheduler).
         </span>
         <button v-if="store.canAuthor" class="save-btn ghost" :disabled="!store.activeMuralId" @click="openSave">
           + Save current wall
@@ -547,7 +546,7 @@ async function remove(id: string) {
       <div class="modal" role="dialog" aria-modal="true">
         <div class="modal-title">Save current wall as scene</div>
         <div class="modal-sub">
-          Captures every screen &amp; surface's content and layout. Switch back in one click.
+          Captures every screen &amp; surface's content and layout.
         </div>
         <input
           v-model="newSceneName"

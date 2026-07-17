@@ -278,7 +278,6 @@ const CLOSE = "}".repeat(2);
 const token = (name: string): string => `${OPEN}${name}${CLOSE}`;
 const unresolvedList = computed(() => unresolvedVars.value.map(token).join(" · "));
 const exampleToken = token("line");
-const builtInTokens = ["screen.name", "screen.id", "machine.hostname"].map(token);
 
 function addVar(): void {
   varRows.value.push({ key: "", value: "" });
@@ -307,7 +306,7 @@ async function commitVars(): Promise<void> {
   } catch {
     // The protocol refused a key or a value (no dots, no braces, no control characters). Say so, and
     // leave the operator's draft on screen so they can fix it rather than retype it.
-    varError.value = "Rejected — keys are letters/digits/_/- (no dots); values can't contain {{ }}.";
+    varError.value = "Rejected. Keys are letters/digits/_/- (no dots) and values can't contain {{ }}.";
   } finally {
     varSaving.value = false;
   }
@@ -357,9 +356,9 @@ const castingSingle = computed(
 );
 const castStateText = computed(() => {
   const s = single.value;
-  if (!s || !castEnabledSingle.value) return "Off — screen is not discoverable";
-  if (castingSingle.value) return "Casting now — a device is mirroring to this screen";
-  return `Discoverable as “${s.friendlyName}” — new devices enter the PIN shown on the screen`;
+  if (!s || !castEnabledSingle.value) return "Off. The screen is not discoverable.";
+  if (castingSingle.value) return "Casting now. A device is mirroring to this screen.";
+  return `Discoverable as “${s.friendlyName}”. New devices enter the PIN shown on the screen.`;
 });
 function toggleCast(enabled: boolean): void {
   const s = single.value;
@@ -499,8 +498,8 @@ async function saveHours(): Promise<void> {
   }
   showNotice(
     hours
-      ? `Panel hours saved — ${hours.on}–${hours.off} (${panelTimezone.value})`
-      : "Panel hours cleared — this screen runs 24/7",
+      ? `Panel hours saved, ${hours.on}–${hours.off} (${panelTimezone.value})`
+      : "Panel hours cleared. This screen runs 24/7.",
   );
 }
 function launchInspect(): void {
@@ -640,7 +639,7 @@ function selectOne(id: string) {
         <ZoomControl
           :zoom="wallZoom"
           :disabled="wallPending"
-          caption="Applies to the whole surface — the page zooms as one, across all panels."
+          caption="The page zooms as one, across all panels."
           @update="zoomWall"
         />
       </template>
@@ -651,7 +650,7 @@ function selectOne(id: string) {
           :audio="wallAudio"
           title="Wall sound"
           :disabled="wallPending"
-          caption="One panel carries the sound for the whole surface — every panel playing it would echo the room. Muted until you turn it on."
+          caption="One panel carries the sound for the whole surface."
           @update="soundWall"
         />
       </template>
@@ -668,7 +667,7 @@ function selectOne(id: string) {
             @update="(z: number) => zoomWallStep(step.sourceId, z)"
           />
         </div>
-        <div class="hint">Remembered per step — the page zooms as one, across all panels.</div>
+        <div class="hint">Remembered per step. The page zooms as one, across all panels.</div>
       </template>
 
       <div class="panels-head">
@@ -747,7 +746,7 @@ function selectOne(id: string) {
 
       <button class="ident-btn" :class="{ on: identingSingle }" @click="identSingle">
         <span class="dot accent"></span>
-        {{ identingSingle ? "Flashing on wall…" : "Ident — flash on wall" }}
+        {{ identingSingle ? "Flashing on wall…" : "Ident (flash on wall)" }}
       </button>
 
       <!-- Panel power (POL-101). Only for a box that reported it can drive DPMS — a dev backend has
@@ -798,10 +797,9 @@ function selectOne(id: string) {
           </div>
           <p class="hours-caption">
             <template v-if="hoursEnabled">
-              Wakes and sleeps daily, in {{ panelTimezone || "the deployment timezone" }}. In hours it
-              is never blanked; out of hours the panel powers down.
+              Wakes and sleeps daily, in {{ panelTimezone || "the deployment timezone" }}.
             </template>
-            <template v-else> No schedule — this screen runs 24/7. </template>
+            <template v-else> No schedule. This screen runs 24/7. </template>
           </p>
           <p v-if="hoursError" class="hours-error">{{ hoursError }}</p>
           <button class="hours-save" @click="saveHours">Save panel hours</button>
@@ -885,11 +883,7 @@ function selectOne(id: string) {
         <button class="var-add" @click="addVar">+ Add variable</button>
       </div>
       <div v-if="varError" class="var-error">{{ varError }}</div>
-      <div class="hint">
-        Use <code>{{ exampleToken }}</code> in a content URL, page or ticker — it resolves per screen.
-        Always available:
-        <code v-for="t in builtInTokens" :key="t">{{ t }}</code>
-      </div>
+      <div class="hint">Use <code>{{ exampleToken }}</code> in a content URL, page or ticker.</div>
 
       <template v-if="singleZoom !== undefined">
         <div class="section-label gap-top">Zoom</div>
@@ -905,7 +899,7 @@ function selectOne(id: string) {
         <AudioControl
           :audio="singleAudio"
           title="Screen sound"
-          caption="Muted until you turn it on. Remembered for this screen and this content — new content always arrives silent."
+          caption=""
           @update="soundScreen"
         />
       </template>
@@ -921,7 +915,7 @@ function selectOne(id: string) {
             @update="(z: number) => zoomScreenStep(step.sourceId, z)"
           />
         </div>
-        <div class="hint">Remembered per step, for this screen — applies live when the step is showing.</div>
+        <div class="hint">Remembered per step, for this screen. Applies live when the step is showing.</div>
       </template>
 
       <div class="section-label gap-top">Layout</div>
@@ -974,8 +968,7 @@ function selectOne(id: string) {
       </div>
 
       <div class="hint gap-top">
-        Combining treats these panels as one screen — content spans across all of
-        them, with bezel seams shown.
+        Treat these panels as one screen, so content spans across all of them.
       </div>
     </section>
 

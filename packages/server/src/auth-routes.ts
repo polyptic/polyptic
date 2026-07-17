@@ -67,7 +67,7 @@ export function registerAuthRoutes(
     if (!result.ok && result.reason === "locked") {
       reply.header("retry-after", String(result.retryAfterSec));
       return reply.code(429).send({
-        error: "too many failed attempts — try again later",
+        error: "too many failed attempts, so try again later",
         retryAfterSec: result.retryAfterSec,
       });
     }

@@ -158,7 +158,7 @@ export class StreamEngine {
     );
     this.setHealth(
       "recovering",
-      `${reason} — reconnecting (attempt ${this.attempts} of ${this.opts.giveUpAfter})`,
+      `${reason}, reconnecting (attempt ${this.attempts} of ${this.opts.giveUpAfter})`,
     );
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;

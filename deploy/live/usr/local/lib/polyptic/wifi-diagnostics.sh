@@ -32,16 +32,16 @@ run()  { if have "$1"; then "$@" 2>&1 || printf '[%s exited %s]\n' "$1" "$?"; el
 
 printf 'Polyptic Wi-Fi diagnostics (POL-77)\n'
 printf 'Written during initramfs Wi-Fi bring-up because association could not start. May contain the\n'
-printf 'Wi-Fi passphrase (same as wifi.conf) — treat accordingly.\n'
+printf 'Wi-Fi passphrase (same as wifi.conf), so treat accordingly.\n'
 
 sec 'reject reason (wifi-supplicant-conf.sh stderr)'
-cat "$RUN/wifi.err" 2>/dev/null || printf '(no wifi.err — the supplicant-config step may not have run)\n'
+cat "$RUN/wifi.err" 2>/dev/null || printf '(no wifi.err, so the supplicant-config step may not have run)\n'
 
 sec 'generated wpa_supplicant.conf (psk/password redacted)'
 if [ -s "$RUN/wpa_supplicant.conf" ]; then
   sed -e 's/^\( *psk=\).*/\1<redacted>/' -e 's/^\( *password=\).*/\1<redacted>/' "$RUN/wpa_supplicant.conf"
 else
-  printf '(empty or absent — nothing was generated, which is what triggered the reject)\n'
+  printf '(empty or absent because nothing was generated, which is what triggered the reject)\n'
 fi
 
 sec 'runtime PATH (does it include where the validator tools live?)'
@@ -65,7 +65,7 @@ for _d in /sys/class/net/*/wireless; do
   [ -d "$_d" ] || continue
   _ifn="${_d%/wireless}"; printf '%s\n' "${_ifn##*/}"; _found=1
 done
-[ -n "$_found" ] || printf '(none — no wireless interface is present in this kernel/initramfs)\n'
+[ -n "$_found" ] || printf '(none because no wireless interface is present in this kernel/initramfs)\n'
 
 sec 'all network interfaces (/sys/class/net)'
 for _d in /sys/class/net/*; do [ -e "$_d" ] || continue; printf '%s\n' "${_d##*/}"; done

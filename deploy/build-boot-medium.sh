@@ -69,7 +69,7 @@ set -euo pipefail
 : "${POLYPTIC_BASE:?set POLYPTIC_BASE, e.g. http://10.0.0.5:8080 (baked into the medium)}"
 case "$POLYPTIC_BASE" in
   https://*) echo "build-boot-medium: POLYPTIC_BASE is https, but GRUB speaks PLAIN HTTP only (no TLS).
-The boot depot is plain-http by contract: keep it on the LAN / management VLAN and pass http://host:port." >&2; exit 2 ;;
+The boot depot is plain-http by contract, so keep it on the LAN / management VLAN and pass http://host:port." >&2; exit 2 ;;
   http://*) ;;
   *) echo "build-boot-medium: POLYPTIC_BASE must look like http://host[:port] (got '$POLYPTIC_BASE')" >&2; exit 2 ;;
 esac
@@ -163,7 +163,7 @@ fsize() { wc -c < "$1" | tr -d '[:space:]'; }
 if [ "$LEAN" != "1" ]; then
   [ -x "$RENDER" ] || [ -f "$RENDER" ] || { echo "build-boot-medium: missing $RENDER" >&2; exit 1; }
   if [ -z "${POLYPTIC_TOKEN:-}" ]; then
-    echo "build-boot-medium: WARNING — no POLYPTIC_TOKEN. The LOCAL boot path (Wi-Fi boxes) carries no
+    echo "build-boot-medium: WARNING: no POLYPTIC_TOKEN. The LOCAL boot path (Wi-Fi boxes) carries no
 enrolment token, so it can only enrol against an OPEN-enrolment control plane. Gated fleets: rebuild
 with POLYPTIC_TOKEN=<enrolment token> (Console > Settings > Enrolment token)." >&2
   fi
@@ -183,7 +183,7 @@ with POLYPTIC_TOKEN=<enrolment token> (Console > Settings > Enrolment token)." >
         vml="$WORK/vmlinuz-$arch"; ird="$WORK/initrd-$arch"
         echo "==> Local payload ($arch): fetched from $POLYPTIC_BASE (image $iid)"
       else
-        echo "==> Local payload ($arch): none locally or at $POLYPTIC_BASE — this arch boots over the wired chain only"
+        echo "==> Local payload ($arch): none locally or at $POLYPTIC_BASE, so this arch boots over the wired chain only"
         continue
       fi
     fi
@@ -218,7 +218,7 @@ if [ "$grub_cpu" = "x86_64" ]; then set arch=amd64; else set arch=arm64; fi
 if [ -e /grub/local-$arch.cfg ]; then
   configfile /grub/local-$arch.cfg
 fi
-echo "Polyptic: this medium carries no local payload for $arch (it was built without that arch's image)."
+echo "Polyptic: this medium carries no local payload for $arch."
 echo "The box can still netboot over a WIRED network. Rebooting in 15s ..."
 sleep 15
 reboot
@@ -248,13 +248,13 @@ LOCALCFG
   mkdir -p "$WORK/theme"
   if [ ! -f "$THEME_SRC" ]; then
     rm -rf "$WORK/theme"
-    echo "==> Boot theme: missing $THEME_SRC (run 'bun deploy/render-boot-theme.ts') — offline menu will be plain (still boots)" >&2
+    echo "==> Boot theme: missing $THEME_SRC, so the offline menu will be plain. Run 'bun deploy/render-boot-theme.ts' to generate it" >&2
   elif [ ! -f "$LOGO_SRC" ]; then
     rm -rf "$WORK/theme"
-    echo "==> Boot theme: missing $LOGO_SRC (run 'bun deploy/render-boot-logo.ts') — offline menu will be plain (still boots)" >&2
+    echo "==> Boot theme: missing $LOGO_SRC, so the offline menu will be plain. Run 'bun deploy/render-boot-logo.ts' to generate it" >&2
   elif [ ! -f "$BG_SRC" ]; then
     rm -rf "$WORK/theme"
-    echo "==> Boot theme: missing $BG_SRC (run 'bun deploy/render-boot-theme.ts') — offline menu will be plain (still boots)" >&2
+    echo "==> Boot theme: missing $BG_SRC, so the offline menu will be plain. Run 'bun deploy/render-boot-theme.ts' to generate it" >&2
   else
     # A PNG that EXISTS but that GRUB 2.12's decoder cannot LOAD (interlaced, greyscale, palette,
     # torn) passes every file-exists guard and still paints "error: null src bitmap ... Press any
@@ -263,7 +263,7 @@ LOCALCFG
     # silently-plain medium would hide the defect (POL-121's lesson about quiet degradation).
     for png in "$LOGO_SRC" "$BG_SRC"; do
       if ! sh "$PNG_CHECK" "$png"; then
-        echo "build-boot-medium: $png is not a PNG GRUB can decode (needs 8/16-bit truecolour, non-interlaced — see deploy/live/usr/local/lib/polyptic/grub-png-check.sh). Regenerate it: bun deploy/render-boot-logo.ts && bun deploy/render-boot-theme.ts" >&2
+        echo "build-boot-medium: $png is not a PNG GRUB can decode (needs 8/16-bit truecolour, non-interlaced). See deploy/live/usr/local/lib/polyptic/grub-png-check.sh. Regenerate it: bun deploy/render-boot-logo.ts && bun deploy/render-boot-theme.ts" >&2
         exit 1
       fi
     done
@@ -273,7 +273,7 @@ LOCALCFG
     cp "$BG_SRC"    "$WORK/theme/bg.png"
     cp "$THEME_SRC" "$WORK/theme/theme.txt"
     HAVE_THEME=1
-    echo "==> Boot theme: baked from committed repo assets (offline menu shows the branded splash)"
+    echo "==> Boot theme: baked from committed repo assets"
   fi
 fi
 
@@ -362,14 +362,14 @@ sh "$HERE/write-boot-manifest.sh" "$MANIFEST" \
 echo "==> Manifest -> $MANIFEST ($([ "$LEAN" = "1" ] && echo "LEAN, wired-only" || echo "full: ${PAYLOAD_ARCHES[*]}"))"
 
 echo
-echo "==> Done. Point BOOT_DIST_DIR at $DIST/ ; the server serves GET /dist/boot/<file>:"
+echo "==> Done. Point BOOT_DIST_DIR at $DIST/ and the server serves GET /dist/boot/<file>:"
 ls -1 "$DIST"/polyptic-boot.img "$DIST"/polyptic-boot.json "$DIST"/shim*.efi "$DIST"/grub*.efi
 if [ "$LEAN" = "1" ]; then
   cat <<EOF
 
 Write it:  dd if=$IMG of=/dev/<usb-disk> bs=1048576   (the whole device, not a partition)
-Boot the box from USB with Secure Boot ON; it DHCPs, then chains http://$HOSTPORT/boot/grub.cfg.
-(LEAN medium: wired netboot only — no local payload, no Wi-Fi.)
+Boot the box from USB with Secure Boot ON. It DHCPs, then chains http://$HOSTPORT/boot/grub.cfg.
+(LEAN medium: wired netboot only, with no local payload and no Wi-Fi.)
 EOF
 else
   cat <<EOF
@@ -377,10 +377,10 @@ else
 Write it:  dd if=$IMG of=/dev/<usb-disk> bs=1048576   (the whole device, not a partition)
 Boot the box from USB with Secure Boot ON. Wired: it DHCPs and chains http://$HOSTPORT/boot/grub.cfg
 exactly as before. No wire: it boots the local payload (arches: ${PAYLOAD_ARCHES[*]}) and joins Wi-Fi
-from polyptic/wifi.conf — edit that file on the flashed stick from any laptop (plain FAT32). The
-booted box refreshes the payload itself on image updates (A/B slots), so the stick never goes stale.
+from polyptic/wifi.conf. Edit that file on the flashed stick from any laptop (plain FAT32). The
+booted box refreshes the payload itself on image updates (A/B slots).
 EOF
   if [ -n "${POLYPTIC_TOKEN:-}" ]; then
-    echo "The baked token makes the IMAGE FILE a credential: share it like one."
+    echo "The baked token makes the IMAGE FILE a credential, so share it like one."
   fi
 fi

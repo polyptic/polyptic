@@ -328,7 +328,7 @@ describe("netboot: GET /boot/grub.cfg", () => {
       expect(body).toContain('menuentry "Polyptic" --id live');
       expect(body).toContain('menuentry "Set up this screen to start without the USB stick" --id offload');
       expect(body).toContain('menuentry "Debug console" --id debug');
-      expect(body).toContain('menuentry "Watch this screen boot (verbose)" --id verbose');
+      expect(body).toContain('menuentry "Watch this screen boot" --id verbose');
       expect(body).not.toContain("submenu ");
     },
     TEST_TIMEOUT,

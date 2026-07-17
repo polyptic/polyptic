@@ -44,7 +44,7 @@ export interface PowerDeps {
 /** How the panel was slept, in words an operator can act on. */
 export function powerMethodLabel(methods: PanelPowerMethod[] | undefined): string {
   if (methods?.includes("cec")) return "Panel powered down over HDMI-CEC";
-  return "Output is dark (DPMS) — without HDMI-CEC the panel itself may stay lit";
+  return "Output is dark (DPMS), and without HDMI-CEC the panel itself may stay lit";
 }
 
 export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: PowerDeps) {
@@ -68,16 +68,16 @@ export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: Power
   const title = computed(() => {
     const t = target.value;
     if (!t) return "";
-    if (!t.machineOnline) return `${t.machineLabel} is offline — panel power rides its agent connection`;
+    if (!t.machineOnline) return `${t.machineLabel} is offline`;
     if (!supported.value) {
       return `${t.machineLabel} can't turn its panels on or off from here`;
     }
     if (asleep.value) {
-      return `Wake this panel. ${powerMethodLabel(t.screen.powerMethods)}. Content is still rendering underneath, so it comes back instantly.`;
+      return `Wake this panel. ${powerMethodLabel(t.screen.powerMethods)}.`;
     }
     return hasCec.value
-      ? "Sleep this panel — the output goes dark AND the display is powered down over HDMI-CEC"
-      : "Sleep this panel — the output goes dark (DPMS). This box has no HDMI-CEC, so the panel itself may stay lit.";
+      ? "Sleep this panel. The output goes dark and the display is powered down over HDMI-CEC"
+      : "Sleep this panel. The output goes dark (DPMS). This box has no HDMI-CEC, so the panel itself may stay lit.";
   });
 
   // The settle watch (rules in the header). `target` is a fresh object on every admin/state broadcast,
@@ -114,7 +114,7 @@ export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: Power
     timer = setTimeout(() => {
       if (!pending.value) return;
       pending.value = false;
-      deps.notify(`${t.screen.friendlyName} did not confirm ${on ? "waking" : "sleeping"} — check the screen.`);
+      deps.notify(`${t.screen.friendlyName} did not confirm ${on ? "waking" : "sleeping"}. Check the screen.`);
     }, timeoutMs);
 
     const error = await deps.setPower(t.screen.id, on);

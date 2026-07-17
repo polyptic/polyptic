@@ -52,7 +52,7 @@ async function copy(text: string, message: string): Promise<void> {
     showToast(message);
   } catch {
     // Clipboard is unavailable outside a secure context — Copy is a best-effort convenience.
-    showToast("Copy failed — clipboard unavailable");
+    showToast("Copy failed because the clipboard is unavailable");
   }
 }
 
@@ -176,21 +176,21 @@ async function rotateToken(token: EnrollmentTokenView): Promise<void> {
   busyToken.value = token.id;
   const ok = await store.rotateEnrollmentToken(token.id, 24);
   busyToken.value = null;
-  showToast(ok ? "Token rotated — old secret valid for 24 h" : "Could not rotate the token");
+  showToast(ok ? "Token rotated. Old secret valid for 24 h" : "Could not rotate the token");
 }
 
 async function revokeToken(token: EnrollmentTokenView): Promise<void> {
   if (busyToken.value) return;
   const yes = window.confirm(
-    `Revoke "${token.name}"?\n\nNo NEW machine can enrol with it — including a box booting from a stick that ` +
+    `Revoke "${token.name}"?\n\nNo NEW machine can enrol with it, including a box booting from a stick that ` +
       `carries it. The ${token.uses} machine(s) already enrolled on it hold their own per-machine credential ` +
-      `and KEEP RUNNING; to take one of those off the wall, reject it in Machines.`,
+      `and KEEP RUNNING. To take one of those off the wall, reject it in Machines.`,
   );
   if (!yes) return;
   busyToken.value = token.id;
   const ok = await store.revokeEnrollmentToken(token.id);
   busyToken.value = null;
-  showToast(ok ? `"${token.name}" revoked — running machines untouched` : "Could not revoke the token");
+  showToast(ok ? `"${token.name}" revoked. Running machines untouched` : "Could not revoke the token");
 }
 
 async function bakeToken(token: EnrollmentTokenView): Promise<void> {
@@ -206,7 +206,7 @@ async function deleteToken(token: EnrollmentTokenView): Promise<void> {
   const last = store.enrollmentTokens.length === 1;
   const yes = window.confirm(
     last
-      ? `Delete the LAST enrolment token?\n\nEnrolment goes back to OPEN mode: every agent that connects is ` +
+      ? `Delete the LAST enrolment token?\n\nEnrolment goes back to OPEN mode. Every agent that connects is ` +
           `auto-registered and auto-approved, with no token at all.`
       : `Delete "${token.name}"? Machines already enrolled on it keep running.`,
   );
@@ -278,7 +278,7 @@ function machineCertState(m: AgentSecurityInfo["machines"][number]): { label: st
   // must say so (the address it tried is shown on the sub-line below).
   if (m.mtlsDialError) return { label: "Can't reach the secure port", cls: "asec-bad" };
   if (m.mtlsSeenAt) return { label: "Has certificate", cls: "asec-ok" };
-  if (m.mtlsCertIssuedAt) return { label: "Certificate issued — moves over on next connection", cls: "asec-warn" };
+  if (m.mtlsCertIssuedAt) return { label: "Certificate issued", cls: "asec-warn" };
   return { label: "No certificate yet", cls: "asec-warn" };
 }
 
@@ -316,7 +316,7 @@ async function setUrgent(urgent: boolean): Promise<void> {
   }
   await applyImageSettings({ urgent });
   if (store.imageUpdates?.urgent === urgent) {
-    showToast(urgent ? "Deploying latest to fleet — boxes reboot within minutes" : "Immediate deployment stopped");
+    showToast(urgent ? "Deploying latest to fleet" : "Immediate deployment stopped");
   }
 }
 
@@ -344,18 +344,18 @@ const netbootNotice = computed<{ tone: "busy" | "warn"; text: string } | null>((
   if (info.lastBuild?.status === "running") {
     return {
       tone: "busy",
-      text: "Building the first OS image — screens can't netboot until this finishes. It takes roughly 15 minutes; the boot loader download is rebuilt when it lands, so grab it after that.",
+      text: "Building the first OS image…",
     };
   }
   if (!info.fullRebuildConfigured) {
     return {
       tone: "warn",
-      text: "No OS image, and this deployment has no image-build hook — screens cannot netboot until an image is put in the depot.",
+      text: "No OS image, and this deployment has no image-build hook, so screens cannot netboot until an image is put in the depot.",
     };
   }
   return {
     tone: "warn",
-    text: "No OS image yet — screens cannot netboot. Build one now from the ⋯ menu above (Full rebuild).",
+    text: "No OS image yet, so screens cannot netboot. Build one from the ⋯ menu above (Full rebuild).",
   };
 });
 
@@ -383,21 +383,21 @@ const buildChip = computed<{ label: string; title: string; tone: "busy" | "bad" 
     if (noImage.value) {
       return {
         label: "Building first image",
-        title: `Building the first OS image — screens can't netboot until this finishes. Started ${new Date(b.startedAt).toLocaleString()}; a full build takes roughly 15 minutes.`,
+        title: `Building the first OS image. Started ${new Date(b.startedAt).toLocaleString()}. A full build takes roughly 15 minutes.`,
         tone: "busy",
       };
     }
     const kind = b.kind === "full" ? "Full rebuild" : "Image update";
     return {
       label: b.kind === "full" ? "Rebuilding" : "Updating",
-      title: `${kind} running — started ${new Date(b.startedAt).toLocaleString()}`,
+      title: `${kind} running, started ${new Date(b.startedAt).toLocaleString()}`,
       tone: "busy",
     };
   }
   if (b.status === "failure") {
     return {
       label: "Build failed",
-      title: `Last build failed — ${new Date(b.finishedAt ?? b.startedAt).toLocaleString()}`,
+      title: `Last build failed at ${new Date(b.finishedAt ?? b.startedAt).toLocaleString()}`,
       tone: "bad",
     };
   }
@@ -405,7 +405,7 @@ const buildChip = computed<{ label: string; title: string; tone: "busy" | "bad" 
 });
 
 /** ISO downloads bake the enrolment token — said at the point of download, not in a footer (POL-68). */
-const ISO_CREDENTIAL_NOTE = "bakes the current enrolment token — treat the file as a credential";
+const ISO_CREDENTIAL_NOTE = "bakes the current enrolment token, so treat the file as a credential";
 
 /**
  * What the bootloader download REALLY is right now (POL-122). "A file exists" was the old test, and
@@ -498,7 +498,7 @@ async function saveRings(rings: ImageRing[], message: string): Promise<void> {
 async function canary(build: ImageBuild): Promise<void> {
   rowMenu.value = null;
   const raw = window.prompt(
-    `Which tag should boot ${formatImageId(build.imageId)} (${build.arch})?\n\nMachines carrying this tag boot this build; every other machine stays on the fleet build. Tag machines in the Machines view.`,
+    `Which tag should boot ${formatImageId(build.imageId)} (${build.arch})?\n\nMachines carrying this tag boot this build, and every other machine stays on the fleet build. Tag machines in the Machines view.`,
     "canary",
   );
   if (raw === null) return;
@@ -707,7 +707,7 @@ async function onChangePassword(): Promise<void> {
     pw.confirm = "";
   } catch {
     // Generic message — never reveal which field was at fault beyond "current password wrong".
-    pwError.value = "Could not change password. Check your current password and try again.";
+    pwError.value = "Could not change password. Check your current password.";
   } finally {
     pwSaving.value = false;
   }
@@ -826,7 +826,7 @@ async function onSignOut(): Promise<void> {
                     </template>
                     <template v-else>
                       <span class="menu-title">Deploy latest to fleet immediately</span>
-                      <span class="menu-sub">Skip the nightly window — boxes reboot now.</span>
+                      <span class="menu-sub">Skip the nightly window, so boxes reboot now.</span>
                     </template>
                   </span>
                 </button>
@@ -893,7 +893,7 @@ async function onSignOut(): Promise<void> {
               download
               :title="
                 mediumState === 'lean'
-                  ? 'Wired-only medium: it netboots a screen on Ethernet, but a Wi-Fi-only screen cannot boot from it.'
+                  ? 'Wired-only medium. It cannot boot a Wi-Fi-only screen.'
                   : `The bootloader ${ISO_CREDENTIAL_NOTE}`
               "
               @click="onDownloadBootloader"
@@ -918,14 +918,13 @@ async function onSignOut(): Promise<void> {
                spoken for by POL-121's notice below, so these two cover only what IT doesn't: a medium that
                is missing even though an image exists, and a medium that is present but WIRED-ONLY. -->
           <p v-if="mediumState === 'none' && !netbootNotice" class="hint gap-sm">
-            No bootloader is published, though this deployment has an OS image to bake one from — run a
+            No bootloader is published, though this deployment has an OS image to bake one from. Run a
             <b>Full rebuild</b> from the ⋯ menu above, or build one into <code class="code">BOOT_DIST_DIR</code>
             with <code class="code">deploy/build-boot-medium.sh</code>.
           </p>
           <p v-else-if="mediumState === 'lean'" class="hint gap-sm hint-warn">
-            This bootloader is <b>wired-only</b>: no local payload, no Wi-Fi config. It netboots a screen on
-            Ethernet, but a screen with no cable cannot boot from it. Run a <b>Full rebuild</b> to publish the
-            full medium — one stick, wired and Wi-Fi, both arches.
+            This bootloader is <b>wired-only</b> and cannot support machines with Wi-Fi. Run a
+            <b>Full rebuild</b> to publish the full Wi-Fi capable medium.
           </p>
 
           <!-- POL-121: an empty depot is not a footnote — it is the difference between a fleet that
@@ -954,7 +953,7 @@ async function onSignOut(): Promise<void> {
               v-for="ring in ringsByBuild.get(rowKey(b)) ?? []"
               :key="ring.selector"
               class="tag tag-ring"
-              :title="`Machines matching ${ring.selector} boot this build${ring.urgent ? ' — within minutes' : ' — in the nightly window'}`"
+              :title="`Machines matching ${ring.selector} boot this build${ring.urgent ? ' within minutes' : ' in the nightly window'}`"
             >
               {{ ring.selector }}{{ ring.urgent ? " · now" : "" }}
             </span>
@@ -967,7 +966,7 @@ async function onSignOut(): Promise<void> {
                 class="row-btn"
                 :href="b.liveIsoUrl"
                 download
-                :title="`Download the bootable live ISO for ${b.imageId} — ${ISO_CREDENTIAL_NOTE}`"
+                :title="`Download the bootable live ISO for ${b.imageId}. It ${ISO_CREDENTIAL_NOTE}`"
               >
                 <svg
                   width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
@@ -1072,7 +1071,7 @@ async function onSignOut(): Promise<void> {
           </div>
         </div>
         <p v-else class="hint">
-          No builds retained yet — the depot fills as images are built. Run a build from the ⋯ menu, or with
+          No builds retained yet. Run a build from the ⋯ menu, or with
           <code class="code">deploy/build-live-image.sh</code>.
         </p>
 
@@ -1097,7 +1096,7 @@ async function onSignOut(): Promise<void> {
               <span
                 v-else-if="bucket.imageId && !bucket.retained"
                 class="tag tag-muted"
-                title="The depot no longer has this build — these boxes are running something it cannot re-serve."
+                title="The depot no longer has this build, so these boxes are running something the depot cannot re-serve."
               >
                 Pruned
               </span>
@@ -1114,8 +1113,8 @@ async function onSignOut(): Promise<void> {
                 :class="{ offline: !m.online }"
                 :title="
                   m.online
-                    ? `${m.label} — online${m.tags.length ? `, tagged ${m.tags.join(', ')}` : ''}`
-                    : `${m.label} — offline; this is the last build it reported`
+                    ? `${m.label} is online${m.tags.length ? `, tagged ${m.tags.join(', ')}` : ''}`
+                    : `${m.label} is offline, and the build shown is the last one it reported`
                 "
               >
                 {{ m.label }}<span v-if="m.tags.length" class="chip-machine-tags">{{ m.tags.join(" · ") }}</span>
@@ -1124,7 +1123,7 @@ async function onSignOut(): Promise<void> {
           </div>
         </div>
         <p v-else class="hint">
-          No machines have reported an image yet — a box reports the build it booted when its agent connects.
+          No machines have reported an image yet.
         </p>
         <!-- Boot without a USB stick (secondary) -------------------------------- -->
         <button type="button" class="disclosure" :class="{ open: advOpen }" @click="advOpen = !advOpen">
@@ -1204,7 +1203,7 @@ async function onSignOut(): Promise<void> {
           {{
             store.bootOrder?.reassert
               ? "Boxes put their own UEFI entry back at the head of the boot order, keep every other entry, and report what the firmware accepted."
-              : "Report only — no box writes a firmware boot variable. Drift shows up in Live Activity."
+              : "Report only. No box writes a firmware boot variable. Drift shows up in Live Activity."
           }}
         </p>
       </section>
@@ -1214,7 +1213,7 @@ async function onSignOut(): Promise<void> {
         <h2 class="card-title">Enrolment tokens</h2>
         <p class="card-sub gap">
           The secrets a new machine presents when it first dials in. Cut one per batch or site, scope it with an
-          expiry and a cap, and revoke it on its own — a lost stick then costs you one batch, not the estate.
+          expiry and a cap, and revoke it on its own, so a lost stick costs you one batch rather than the estate.
         </p>
 
         <div v-if="store.enrollment === null" class="hint">Loading…</div>
@@ -1223,12 +1222,12 @@ async function onSignOut(): Promise<void> {
           <div class="open-note">
             <span class="badge-ok">Open mode</span>
             <span>
-              Any agent that connects is auto-registered <em>and auto-approved</em> — no token, no approval. Fine on a
-              dev box, never on a real fleet.
+              Any agent that connects is auto-registered <em>and auto-approved</em>, with no token and no approval. Fine
+              on a dev box, never on a real fleet.
             </span>
           </div>
           <button type="button" class="btn-ghost-sm gap-sm" :disabled="busyToken === 'new'" @click="showNewToken = true">
-            Gate enrolment — create a token
+            Gate enrolment with a token
           </button>
         </template>
 
@@ -1296,9 +1295,9 @@ async function onSignOut(): Promise<void> {
           </ul>
 
           <p class="hint gap-sm">
-            Revoking blocks NEW enrolments only — a machine that already enrolled holds its own per-machine credential
-            and keeps running. Rotating leaves the old secret alive for 24 hours, so media already flashed (and boots in
-            flight) still land; re-bake your boot medium inside that window.
+            Revoking blocks NEW enrolments only, because a machine that already enrolled holds its own per-machine
+            credential and keeps running. Rotating leaves the old secret alive for 24 hours, so media already flashed
+            (and boots in flight) still land. Re-bake your boot medium inside that window.
           </p>
 
           <button type="button" class="btn-ghost-sm gap-sm" @click="showNewToken = !showNewToken">
@@ -1338,16 +1337,16 @@ async function onSignOut(): Promise<void> {
         <template v-if="https.mode === 'provided'">
           <p class="card-sub gap">
             <span class="badge-ok">Native TLS</span>
-            Serving HTTPS with the certificate you provided (TLS_CERT_FILE / TLS_KEY_FILE). Nothing to trust here —
-            browsers already know your issuer.
+            Serving HTTPS with the certificate you provided (TLS_CERT_FILE / TLS_KEY_FILE). Nothing to trust here
+            because browsers already know your issuer.
           </p>
         </template>
 
         <template v-else>
           <p class="card-sub gap">
             Serving HTTPS with this deployment's own self-signed certificate. Browsers warn until the Polyptic CA is
-            trusted <em>once per device</em> — download it, verify the fingerprint, and follow the steps for your OS.
-            The certificate persists across restarts, so devices stay green after trusting it.
+            trusted <em>once per device</em>. The certificate persists across restarts, so devices stay green after
+            trusting it.
           </p>
 
           <div class="field-row">
@@ -1363,25 +1362,25 @@ async function onSignOut(): Promise<void> {
           </button>
           <ul v-if="trustOpen" class="trust-list">
             <li>
-              <strong>macOS</strong> — double-click <code>polyptic-ca.crt</code>, add it to the <em>System</em> keychain
+              <strong>macOS</strong>: double-click <code>polyptic-ca.crt</code>, add it to the <em>System</em> keychain
               in Keychain Access, open it and set Trust ▸ "Always Trust". Terminal:
               <code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain polyptic-ca.crt</code>
             </li>
             <li>
-              <strong>Windows</strong> — double-click ▸ Install Certificate ▸ Local Machine ▸ place in
+              <strong>Windows</strong>: double-click ▸ Install Certificate ▸ Local Machine ▸ place in
               <em>Trusted Root Certification Authorities</em> (or import there via <code>certmgr.msc</code>).
             </li>
             <li>
-              <strong>Linux</strong> —
+              <strong>Linux</strong>:
               <code>sudo cp polyptic-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates</code>.
               Firefox keeps its own store: Settings ▸ Privacy &amp; Security ▸ Certificates ▸ View Certificates ▸ Import.
             </li>
             <li>
-              <strong>iOS</strong> — open the file (AirDrop/Mail), install the profile under Settings ▸ General ▸ VPN &amp;
+              <strong>iOS</strong>: open the file (AirDrop/Mail), install the profile under Settings ▸ General ▸ VPN &amp;
               Device Management, then enable full trust in Settings ▸ General ▸ About ▸ Certificate Trust Settings.
             </li>
             <li>
-              <strong>Android</strong> — Settings ▸ Security &amp; privacy ▸ More ▸ Encryption &amp; credentials ▸
+              <strong>Android</strong>: Settings ▸ Security &amp; privacy ▸ More ▸ Encryption &amp; credentials ▸
               Install a certificate ▸ CA certificate.
             </li>
           </ul>
@@ -1392,10 +1391,10 @@ async function onSignOut(): Promise<void> {
       <section id="sec-agent-security" class="card">
         <h2 class="card-title">Agent security</h2>
         <p class="card-sub wrap gap">
-          Machines talk to the control plane over the <strong>agent channel</strong> — it carries the remote shell,
+          Machines talk to the control plane over the <strong>agent channel</strong>, which carries the remote shell,
           browser DevTools, screen previews and window placement. Each machine is issued its own certificate
           automatically when it enrols, so only your machines can open that channel. Screens (players) and the boot
-          flow have their own separate gates and are not affected by this.
+          flow have their own separate gates.
         </p>
 
         <div v-if="agentSec === null" class="hint">Loading…</div>
@@ -1404,7 +1403,7 @@ async function onSignOut(): Promise<void> {
           <div v-if="agentSec.mode === 'off'" class="open-note">
             <span class="asec-badge asec-warn">Off</span>
             <span>
-              The certificate channel is not running{{ agentSec.detail ? ` — ${agentSec.detail}` : "" }}. Machines
+              The certificate channel is not running{{ agentSec.detail ? ` (${agentSec.detail})` : "" }}. Machines
               still authenticate with their enrolment credentials, but the transport is not mutually authenticated.
             </span>
           </div>
@@ -1413,23 +1412,21 @@ async function onSignOut(): Promise<void> {
             <span class="asec-badge asec-ok">Secured</span>
             <span>
               Every live machine connection is certificate-authenticated{{ agentSec.requiredSince ? ` (since ${new Date(agentSec.requiredSince).toLocaleDateString()})` : "" }}.
-              New machines still enrol with the enrolment token and are handed a certificate on first contact —
-              nothing extra to do when you add a box.
+              New machines still enrol with the enrolment token and are handed a certificate on first contact.
             </span>
           </div>
 
           <div v-else class="open-note">
             <span class="asec-badge asec-warn">Migrating</span>
             <span>
-              Certificates are being handed out: <strong>{{ mtlsMigrated }} of {{ agentSec.machines.length }}</strong>
-              machines are on the secure channel; the rest move over by themselves the next time they connect. Once
-              every machine is on it, the secure channel becomes <em>required</em> automatically — the activity feed
-              will say so.
+              Certificates are being handed out. <strong>{{ mtlsMigrated }} of {{ agentSec.machines.length }}</strong>
+              machines are on the secure channel, and the rest move over by themselves the next time they connect. Once
+              every machine is on the secure channel, it becomes <em>required</em> automatically.
             </span>
           </div>
 
           <p v-if="agentSec.pinned && agentSec.mode !== 'off'" class="hint gap-sm">
-            This posture is pinned by the server's configuration (AGENT_MTLS_REQUIRE) — it will not change by itself.
+            This posture is pinned by the server's configuration (AGENT_MTLS_REQUIRE) and will not change by itself.
           </p>
 
           <ul v-if="agentSec.mode !== 'off' && agentSec.machines.length > 0" class="asec-list">
@@ -1442,7 +1439,7 @@ async function onSignOut(): Promise<void> {
             </li>
           </ul>
           <p v-else-if="agentSec.mode !== 'off'" class="hint gap-sm">
-            No machines yet — the first box to enrol gets a certificate on its first hello.
+            No machines yet. The first box to enrol gets a certificate on its first hello.
           </p>
         </template>
       </section>
@@ -1451,8 +1448,8 @@ async function onSignOut(): Promise<void> {
       <section v-if="store.isAdmin" id="sec-image" class="card pad-lg">
         <h2 class="card-title">Update schedule</h2>
         <p class="card-sub wrap gap">
-          When the live image is refreshed. A nightly in-place refresh picks up userspace fixes; a weekly full rebuild
-          from the base ISO picks up kernel fixes. Netbooted boxes re-pull whenever the published image changes.
+          When the live image is refreshed. A nightly in-place refresh picks up userspace fixes, and a weekly full
+          rebuild from the base ISO picks up kernel fixes. Netbooted boxes re-pull whenever the published image changes.
         </p>
 
         <div v-if="store.imageUpdates === null" class="hint">Loading image-update state…</div>
@@ -1533,11 +1530,11 @@ async function onSignOut(): Promise<void> {
 
           <p v-if="!store.imageUpdates.rebuildConfigured" class="hint gap-sm">
             This server has no refresh hook (<code class="code">IMAGE_REBUILD_CMD</code>), so the nightly schedule and
-            “Build update” cannot build from here — set it to e.g.
+            “Build update” cannot build from here. Set it to e.g.
             <code class="code">deploy/rebuild-image-docker.sh arm64</code>.
           </p>
           <p v-if="!store.imageUpdates.fullRebuildConfigured" class="hint gap-sm">
-            The nightly refresh holds the kernel, so kernel fixes need the weekly full rebuild — configure
+            The nightly refresh holds the kernel, so kernel fixes need the weekly full rebuild. Configure
             <code class="code">IMAGE_FULL_REBUILD_CMD</code> to enable it.
           </p>
         </template>
@@ -1551,7 +1548,7 @@ async function onSignOut(): Promise<void> {
           Who can sign in, and what they may do.
           <strong>Admin</strong> runs the fleet (machines, enrolment, image builds, settings).
           <strong>Operator</strong> authors content and layout. <strong>Viewer</strong> reads the
-          console and can recall a saved scene — nothing else.
+          console and can recall a saved scene. Nothing else.
         </p>
 
         <div v-if="opsError" class="callout callout-bad"><span class="callout-icon">⚠</span>{{ opsError }}</div>
@@ -1723,7 +1720,7 @@ async function onSignOut(): Promise<void> {
                   <code class="code">polyptic-boot.img</code> and your USB drive, then Flash.
                 </div>
                 <div class="step-aside">
-                  On Windows <b>Rufus</b> works too — select the image and your drive, leave the defaults, and Start.
+                  On Windows <b>Rufus</b> works too. Select the image and your drive, leave the defaults, and Start.
                 </div>
               </div>
             </li>
@@ -1733,15 +1730,14 @@ async function onSignOut(): Promise<void> {
                 <div class="step-title">Wi-Fi screens: add the network credentials</div>
                 <div class="step-text">
                   Re-open the flashed stick in your file manager and edit
-                  <code class="code">polyptic/wifi.conf</code> — set <code class="code">WIFI_SSID</code> and
+                  <code class="code">polyptic/wifi.conf</code>, setting <code class="code">WIFI_SSID</code> and
                   <code class="code">WIFI_PSK</code> (the WPA-Enterprise username/password fields are explained
                   inside the file). Screens with a network cable ignore the file, so <b>one stick serves the
                   whole fleet</b>.
                 </div>
                 <div class="step-aside">
-                  Without a cable the screen boots the system copy carried on the stick, joins your Wi-Fi, and
-                  streams everything else — it keeps that copy fresh on its own. The file holds the Wi-Fi
-                  password in plain text: treat the stick like a key to the network.
+                  Without a cable the screen boots the copy from the USB, joins your Wi-Fi, and streams everything
+                  else. The file holds the Wi-Fi password in plain text, so treat the USB like a key to the network.
                 </div>
               </div>
             </li>
@@ -1750,7 +1746,7 @@ async function onSignOut(): Promise<void> {
               <div class="step-body">
                 <div class="step-title">Boot the screen from USB</div>
                 <div class="step-text">
-                  Leave Secure Boot <b>ON</b>. It streams the latest image and appears in <b>Machines</b> to approve.
+                  The screen streams the latest image and appears in <b>Machines</b> to approve.
                 </div>
               </div>
             </li>
@@ -1763,10 +1759,9 @@ async function onSignOut(): Promise<void> {
                   own, and the same stick can walk down the rack.
                 </div>
                 <div class="step-aside">
-                  <b>Nothing is erased.</b> This copies a signed 4 MB loader — plus, on Wi-Fi screens, the local boot
-                  files and Wi-Fi credentials — to the EFI partition and puts Polyptic first in the UEFI boot order;
-                  disks, partitions and any OS already installed are left exactly as they are.
-                  The result — installed, or why not — appears in <b>Activity</b>.
+                  <b>Nothing is erased.</b> Installing copies a signed 4 MB loader (plus, on Wi-Fi screens, the local
+                  boot files and Wi-Fi credentials) to the EFI partition and puts Polyptic first in the UEFI boot
+                  order. Disks, partitions and any OS already installed are left exactly as they are.
                 </div>
               </div>
             </li>

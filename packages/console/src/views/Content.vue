@@ -114,44 +114,6 @@ function brokenOn(s: ContentSource): string[] {
   return ids.map((id) => store.screenById(id)?.friendlyName ?? id);
 }
 
-function healthLabel(s: ContentSource): string {
-  const health = store.healthForSource(s.id);
-  if (health === "reachable") return "loading";
-  if (health === "unreachable") return "not loading";
-  return "not checked";
-}
-
-/**
- * What the badge means, spelled out — because a health badge that overclaims is worse than none.
- * The player PROVES a URL fetchable before it paints it (POL-86); that is all this knows. It cannot
- * see inside a cross-origin frame (same-origin policy), so a 500, an expired session's login page
- * and an empty dashboard all read as "loading". Say so, in the tooltip, every time.
- */
-function healthTitle(s: ContentSource): string {
-  const status = store.statusForSource(s.id);
-  const health = status?.health ?? "unknown";
-  const seen = status?.lastSeenAt ? ` Last reported ${timeAgo(status.lastSeenAt)}.` : "";
-  if (health === "reachable") {
-    return (
-      `The screens showing this fetched it successfully — it is loading on the glass.${seen} ` +
-      `This does not mean the page rendered what you want: a browser cannot see inside someone ` +
-      `else's page, so an error page or a signed-out dashboard also counts as "loading".`
-    );
-  }
-  if (health === "unreachable") {
-    const where = brokenOn(s);
-    const detail = status?.detail ? ` (${status.detail})` : "";
-    return (
-      `A screen showing this could not fetch it at all${detail} — ` +
-      `${where.length ? where.join(", ") : "the screen"} is showing a placeholder and retrying.${seen}`
-    );
-  }
-  return (
-    "Nobody is showing this right now, so nothing has checked it. Polyptic never probes a source " +
-    "no screen is displaying — a library of 200 links would become 200 requests an hour."
-  );
-}
-
 /** "2 min ago" / "3 h ago" — the badge's "when was this last seen" half, in the operator's terms. */
 function timeAgo(at: string): string {
   const ms = Date.now() - Date.parse(at);
@@ -162,6 +124,37 @@ function timeAgo(at: string): string {
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours} h ago`;
   return `${Math.floor(hours / 24)} d ago`;
+}
+
+function healthLabel(s: ContentSource): string {
+  const health = store.healthForSource(s.id);
+  if (health === "reachable") return "loading";
+  if (health === "unreachable") return "not loading";
+  return "not checked";
+}
+
+/**
+ * What the badge means. The player PROVES a URL fetchable before it paints it (POL-86); that is all
+ * this knows. It cannot see inside a cross-origin frame (same-origin policy), so a 500, an expired
+ * session's login page and an empty dashboard all read as "loading" — the badge does not claim
+ * otherwise, and the unreachable branch names the screens and the reason so the operator can act.
+ */
+function healthTitle(s: ContentSource): string {
+  const status = store.statusForSource(s.id);
+  const health = status?.health ?? "unknown";
+  if (health === "reachable") {
+    return "The screens showing this source fetched it successfully.";
+  }
+  if (health === "unreachable") {
+    const where = brokenOn(s);
+    const detail = status?.detail ? ` (${status.detail})` : "";
+    const seen = status?.lastSeenAt ? ` Last reported ${timeAgo(status.lastSeenAt)}.` : "";
+    return (
+      `A screen showing this source could not fetch it${detail}. ` +
+      `${where.length ? where.join(", ") : "The screen"} is showing a placeholder and retrying.${seen}`
+    );
+  }
+  return "Nobody is showing this source right now, so nothing has checked whether it can be fetched.";
 }
 
 // ── modal state ──────────────────────────────────────────────────────────────
@@ -267,7 +260,7 @@ async function save() {
     if (refresh === null) {
       errorMsg.value =
         draftRefresh.value.mode === "interval"
-          ? "Set how often to reload — a whole number of minutes, hours, or days."
+          ? "Set how often to reload, as a whole number of minutes, hours, or days."
           : "Pick at least one day and a valid time to reload.";
       return;
     }
@@ -366,7 +359,7 @@ function placementNote(s: ContentSource): string | null {
   if (s.kind !== "web" && s.kind !== "dashboard") return null;
   const mode = s.placementMode ?? "auto";
   if (mode === "window") return "windowed (forced)";
-  if (mode === "iframe") return s.framing === "blocked" ? "framed (forced — blocks framing)" : null;
+  if (mode === "iframe") return s.framing === "blocked" ? "framed (forced, blocks framing)" : null;
   if (s.framing === "blocked") return "blocks framing → windowed";
   return null;
 }
@@ -487,7 +480,7 @@ async function removeProfile(p: CredentialProfileView) {
   if (!yes) return;
   const result = await store.deleteProfile(p.id);
   if (result === "in-use") {
-    window.alert(`"${p.name}" is in use by one or more content sources — reassign them first.`);
+    window.alert(`"${p.name}" is in use by one or more content sources. Reassign them first.`);
   }
 }
 
@@ -581,20 +574,20 @@ function acceptFile(file: File | null | undefined): void {
   const isDoc = isDocument(file);
   if (isDoc && !canConvertDocuments.value) {
     uploadError.value =
-      "This server can't convert documents — no document toolchain is installed. Export your slides " +
-      "to PDF or images on a server that can, or upload images instead.";
+      "This server can't convert documents because no document toolchain is installed. Export your " +
+      "slides to PDF or images and upload those instead.";
     uploadFile.value = null;
     return;
   }
   if (!isMedia && !isDoc) {
     uploadError.value = canConvertDocuments.value
-      ? "Unsupported file type — choose an image, a video, a PDF or a slide deck."
-      : "Unsupported file type — choose an image or video.";
+      ? "Unsupported file type. Choose an image, a video, a PDF or a slide deck."
+      : "Unsupported file type. Choose an image or video.";
     uploadFile.value = null;
     return;
   }
   if (file.size > MAX_BYTES) {
-    uploadError.value = "File too large — the limit is 200 MB.";
+    uploadError.value = "File too large. The limit is 200 MB.";
     uploadFile.value = null;
     return;
   }
@@ -642,7 +635,7 @@ const jobLine = computed(() => {
       ? `Rendering pages… ${j.pagesDone} of ${j.pageCount}`
       : `Rendering pages… ${j.pagesDone} so far`;
   }
-  if (j.status === "ready") return `Converted — ${j.pageCount ?? j.pagesDone} pages`;
+  if (j.status === "ready") return `Converted · ${j.pageCount ?? j.pagesDone} pages`;
   return "";
 });
 
@@ -890,8 +883,7 @@ function mediaFacts(s: ContentSource): string {
         <span class="empty-glyph">⌕</span>
         <span class="empty-title">No sources match</span>
         <span class="empty-sub">
-          Nothing in the library matches that search or filter. Clear them to see all
-          {{ sources.length }}.
+          Nothing in the library matches that search or filter.
         </span>
         <div class="empty-actions">
           <button class="add-btn ghost" @click="query = ''; kindFilter = 'all'">Clear filters</button>
@@ -903,7 +895,7 @@ function mediaFacts(s: ContentSource): string {
         <span class="empty-glyph">◇</span>
         <span class="empty-title">No content sources yet</span>
         <span class="empty-sub">
-          Add a web page, dashboard, image or video, then assign it to screens on the Wall.
+          Add a web page, dashboard, image or video.
         </span>
         <div class="empty-actions">
           <button class="add-btn ghost" @click="openUpload">⤓ Upload a file</button>
@@ -916,9 +908,7 @@ function mediaFacts(s: ContentSource): string {
         <div class="head-text">
           <h1 class="title">Access credentials</h1>
           <p class="subtitle">
-            Sign screens into protected content. A profile is an OAuth client at your identity
-            provider — the server keeps a short-lived token fresh and every source that uses the
-            profile loads already authenticated.
+            Sign screens into protected content.
           </p>
         </div>
         <!-- Credential profiles hold content secrets: creating/editing/testing/deleting one is
@@ -962,8 +952,8 @@ function mediaFacts(s: ContentSource): string {
         <span class="empty-glyph">🔒</span>
         <span class="empty-title">No credential profiles yet</span>
         <span class="empty-sub">
-          Showing dashboards that need a sign-in? Register a client at your identity provider, add
-          its details here once, and any number of screens share the session.
+          Register a client at your identity provider and add its details here once. Any number of
+          screens can then share the session.
         </span>
         <div v-if="store.isAdmin" class="empty-actions">
           <button class="add-btn ghost" @click="openAddProfile">+ Add credential profile</button>
@@ -1012,9 +1002,8 @@ function mediaFacts(s: ContentSource): string {
         <!-- POL-108 — the live-stream seam, stated plainly to the operator: HLS in, RTSP restreamed
              outside Polyptic. No product is named; any restreamer works. -->
         <p v-if="isStream" class="field-hint">
-          A live feed: point at an HLS playlist (<code>.m3u8</code>). The player reconnects by itself
-          if the source drops. RTSP cameras need an RTSP-to-HLS restreamer in front — Polyptic plays
-          what the restreamer publishes.
+          Point at an HLS playlist (<code>.m3u8</code>). The player reconnects by itself if the
+          source drops. RTSP cameras need an RTSP-to-HLS restreamer in front.
         </p>
 
         </template>
@@ -1024,12 +1013,11 @@ function mediaFacts(s: ContentSource): string {
         <template v-if="authPickable && !editingDeck">
           <label class="field-label">Authentication</label>
           <select v-model="draftProfileId" class="field select">
-            <option value="">None — public or anonymous access</option>
+            <option value="">None (public or anonymous access)</option>
             <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
           </select>
           <p v-if="!profiles.length" class="field-hint">
-            Protected content? Add a credential profile under Access credentials below, then pick it
-            here.
+            Add a credential profile under Access credentials below, then pick it here.
           </p>
 
           <!-- POL-18 — the display override. Auto probes the address's framing headers and falls
@@ -1037,7 +1025,7 @@ function mediaFacts(s: ContentSource): string {
                exist because header detection can never be perfect. -->
           <label class="field-label">Display</label>
           <select v-model="draftPlacement" class="field select">
-            <option value="auto">Auto — windowed only if the site blocks framing</option>
+            <option value="auto">Auto (windowed only if the site blocks framing)</option>
             <option value="iframe">Always framed (embed in the player)</option>
             <option value="window">Always windowed (placed by the box)</option>
           </select>
@@ -1105,7 +1093,7 @@ function mediaFacts(s: ContentSource): string {
         <input
           v-model="pDraftName"
           class="field"
-          placeholder="e.g. Grafana — works IdP"
+          placeholder="e.g. Grafana (works IdP)"
           @keyup.enter="saveProfile"
         />
 
@@ -1132,16 +1120,16 @@ function mediaFacts(s: ContentSource): string {
           :placeholder="editingProfileId ? '••••••••  (unchanged)' : ''"
         />
 
-        <label class="field-label">Scope <span class="optional">(optional — Entra needs api://…/.default)</span></label>
+        <label class="field-label">Scope <span class="optional">(optional, Entra needs api://…/.default)</span></label>
         <input v-model="pDraftScope" class="field mono" placeholder="" />
 
-        <label class="field-label">Audience <span class="optional">(optional — for IdPs that take one)</span></label>
+        <label class="field-label">Audience <span class="optional">(optional, for IdPs that take one)</span></label>
         <input v-model="pDraftAudience" class="field mono" placeholder="" />
 
         <label class="field-label">Token URL parameter</label>
         <input v-model="pDraftTokenParam" class="field mono" placeholder="auth_token" />
         <p class="field-hint">
-          The query parameter the token is delivered in when a screen loads the content — Grafana's
+          The query parameter the token is delivered in when a screen loads the content. Grafana's
           JWT sign-in reads <code>auth_token</code>.
         </p>
 
@@ -1217,8 +1205,7 @@ function mediaFacts(s: ContentSource): string {
           </span>
         </div>
         <p v-if="converting" class="field-hint">
-          Slides are converted to images on the server — a wall never runs an Office viewer. Large
-          decks take a little while; you can leave this open.
+          Slides are converted to images on the server. Large decks take a little while.
         </p>
 
         <div v-if="uploadError" class="error">⚠ {{ uploadError }}</div>

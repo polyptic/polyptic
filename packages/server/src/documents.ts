@@ -127,7 +127,7 @@ export async function ingestDocument(
 
   if (!result.ok) return { ok: false, message: result.message };
   if (result.pages.length === 0) {
-    return { ok: false, message: "This document produced no pages — nothing could be shown on a wall." };
+    return { ok: false, message: "This document produced no pages." };
   }
 
   const format = record.filename.split(".").pop() ?? "";

@@ -73,7 +73,7 @@ menuentry "Polyptic" --id live {
   initrd $BOOT/initrd
 }
 menuentry "Polyptic (newest image - use after a long time offline)" --id live-latest {
-  echo "Starting Polyptic with the newest image (kernel modules may mismatch until this drive refreshes) ..."
+  echo "Starting Polyptic with the newest image ..."
   linux  $BOOT/vmlinuz $latest
   initrd $BOOT/initrd
 }

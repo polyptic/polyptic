@@ -49,7 +49,7 @@ async function onSignIn(): Promise<void> {
     if (err instanceof ApiError && err.status === 429) {
       // Lockout after too many failed attempts (server-side rate limit). Surface the cooldown.
       errorMessage.value =
-        "Too many attempts. This account is temporarily locked — wait a moment and try again.";
+        "Too many attempts. This account is temporarily locked. Wait a moment and try again.";
     } else if (err instanceof ApiError && err.status === 401) {
       errorMessage.value = "Incorrect email or password.";
     } else {

@@ -319,7 +319,7 @@ INITRD_WIFI="$ROOTFS/boot/initrd-wifi.img-$KVER"
 # without sbsigntool, fall back to requiring a non-empty PE cert table (data-directory entry 4).
 if command -v sbverify >/dev/null 2>&1; then
   sbverify --list "$VMLINUZ" 2>/dev/null | grep -q 'Canonical Ltd. Secure Boot Signing' \
-    || { echo "$VMLINUZ is not Canonical-signed (apt installed an unsigned kernel?), Secure Boot boxes would refuse it" >&2; exit 1; }
+    || { echo "$VMLINUZ is not Canonical-signed (apt installed an unsigned kernel?), so Secure Boot boxes would refuse it" >&2; exit 1; }
 else
   python3 -c 'import struct,sys;d=open(sys.argv[1],"rb").read();assert d[:2]==b"MZ";o=struct.unpack("<I",d[60:64])[0];m=struct.unpack("<H",d[o+24:o+26])[0];dd=o+24+(112 if m==0x20b else 96)+32;va,sz=struct.unpack("<II",d[dd:dd+8]);sys.exit(0 if sz>0 else 1)' "$VMLINUZ" \
     || { echo "$VMLINUZ has an empty PE certificate table (unsigned); install sbsigntool to check the signer" >&2; exit 1; }

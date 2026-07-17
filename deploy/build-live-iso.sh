@@ -87,7 +87,7 @@ done
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/polyptic-liveiso.XXXXXX")"; trap 'rm -rf "$WORK"' EXIT
 TREE="$WORK/tree"; mkdir -p "$TREE" "$(dirname "$OUT")"
 
-echo '==> [1/5] extract the intact ESP out of the base ISO (El Torito UEFI image)'
+echo '==> [1/6] extract the intact ESP out of the base ISO (El Torito UEFI image)'
 # The report line: "El Torito boot img : 1 UEFI y none 0x0000 0x00 <Ldsiz> <LBA>", LBA in
 # 2048-byte blocks, load size in 512-byte blocks. This IS the appended ESP on Ubuntu ISOs.
 ET_LINE="$(xorriso -indev "$BASE_ISO" -report_el_torito plain 2>/dev/null | grep -E '^El Torito boot img.* UEFI ' | head -n1)"
@@ -97,7 +97,7 @@ dd if="$BASE_ISO" of="$WORK/esp.img" bs=512 skip=$((ET_LBA * 4)) count="$ET_LDSI
 # The ESP must be a FAT image, not a stub: boot-sector signature + a jump opcode.
 head -c 512 "$WORK/esp.img" | od -An -tx1 | tr -d ' \n' | grep -q '^eb' || { echo "extracted ESP does not start with a FAT boot sector" >&2; exit 1; }
 
-echo '==> [2/5] lay down our own boot tree (the base ISO gives only /boot/grub + /EFI)'
+echo '==> [2/6] lay down our own boot tree (the base ISO gives only /boot/grub + /EFI)'
 # GRUB resolves its config against the prefix baked into the signed binary on the ESP, which on an
 # Ubuntu live ISO is the CD's own `/boot/grub`. Take that directory (and the /EFI copy beside it)
 # from the base ISO and nothing else — no casper, no installer pool, no second kernel.
@@ -136,7 +136,7 @@ if [ -n "${POLYPTIC_WIFI_CONF:-}" ] || [ -n "${POLYPTIC_WIFI_SSID:-}" ]; then
     cp -R "$POLYPTIC_WIFI_CERTS/." "$TREE/polyptic/certs/"
   fi
   sh "$REPO_ROOT/deploy/live/usr/local/lib/polyptic/wifi-conf.sh" "$TREE/polyptic/wifi.conf" >/dev/null \
-    || { echo "build-live-iso: the Wi-Fi config is invalid (message above); nothing was built" >&2; exit 1; }
+    || { echo "build-live-iso: the Wi-Fi config is invalid (message above), so nothing was built" >&2; exit 1; }
   WIFI_SUMMARY="$(sed -n 's/^WIFI_SSID=//p' "$TREE/polyptic/wifi.conf" | head -n1) (credentials baked, read-only)"
   echo "    Wi-Fi: $WIFI_SUMMARY"
 else

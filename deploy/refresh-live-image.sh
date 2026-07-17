@@ -46,7 +46,7 @@ SQUASHFS_BLOCK="${SQUASHFS_BLOCK:-1M}"
 [ "$(uname -s)" = "Linux" ] || { echo "Linux host required (got $(uname -s))" >&2; exit 1; }
 [ "$(id -u)" = 0 ]          || { echo "must run as root (chroot + mounts)" >&2; exit 1; }
 for t in unsquashfs mksquashfs; do command -v "$t" >/dev/null || { echo "missing $t (squashfs-tools)" >&2; exit 1; }; done
-[ -f "$PAYLOAD" ] || { echo "no payload at $PAYLOAD — build one first (deploy/build-live-image.sh $ARCH)" >&2; exit 1; }
+[ -f "$PAYLOAD" ] || { echo "no payload at $PAYLOAD. Build one first (deploy/build-live-image.sh $ARCH)" >&2; exit 1; }
 
 WORK="$(mktemp -d /var/tmp/polyptic-refresh.XXXXXX)"; ROOTFS="$WORK/rootfs"
 cleanup() { for m in dev/pts dev proc sys run; do mountpoint -q "$ROOTFS/$m" 2>/dev/null && umount -lf "$ROOTFS/$m" || true; done; rm -rf "$WORK"; }
@@ -76,7 +76,7 @@ CHROOT
 PENDING="$(chroot "$ROOTFS" /bin/sh -c "apt-get -s upgrade $APT_ARGS 2>/dev/null | grep -c '^Inst '" || true)"
 echo "    pending upgrades: $PENDING"
 if [ "${PENDING:-0}" = "0" ] && [ "${FORCE:-0}" != "1" ]; then
-  echo '==> nothing to upgrade — artifacts left untouched (FORCE=1 overrides)'
+  echo '==> nothing to upgrade, so artifacts are left untouched (FORCE=1 overrides)'
   exit 0
 fi
 chroot "$ROOTFS" /bin/sh -c "DEBIAN_FRONTEND=noninteractive apt-get -y upgrade $APT_ARGS"

@@ -128,7 +128,7 @@ function bulkTarget(): { machineIds: string[] } | { selector: string } {
 }
 
 const BULK_PROMPT: Record<string, (n: string) => string> = {
-  reboot: (n) => `Reboot ${n}? Their screens go dark until they boot back up — about a minute.`,
+  reboot: (n) => `Reboot ${n}?`,
   arm: (n) => `Enable the console on ${n}? While enabled, an operator can open an unprivileged terminal on each. Sessions are logged.`,
   disarm: (n) => `Disable the console on ${n}? Any open terminal is closed.`,
   ident: (n) => `Flash the ident overlay on every screen of ${n}?`,
@@ -174,7 +174,7 @@ const targetedPending = computed(() => targeted.value.filter((m) => m.status ===
 async function editTags(m: MachineView): Promise<void> {
   menuFor.value = null;
   const answer = window.prompt(
-    `Tags for "${m.label}" — comma-separated (e.g. atrium, floor:2, canary). Empty clears them.`,
+    `Tags for "${m.label}", comma-separated (e.g. atrium, floor:2, canary). Empty clears them.`,
     (m.tags ?? []).join(", "),
   );
   if (answer === null) return;
@@ -184,7 +184,7 @@ async function editTags(m: MachineView): Promise<void> {
     const tag = normalizeTag(raw);
     if (tag === "") continue;
     if (!MachineTag.safeParse(tag).success) {
-      showToast(`"${tag}" is not a valid tag — use a–z, 0–9, and . _ : - (max 32 chars).`);
+      showToast(`"${tag}" is not a valid tag. Use a–z, 0–9, and . _ : - (max 32 chars).`);
       return;
     }
     if (!tags.includes(tag)) tags.push(tag);
@@ -355,13 +355,6 @@ function identPending(m: MachineView): void {
   identTimers.add(timer);
 }
 
-/** The note strip's subject: "its screen" / "its 3 screens" / "its screens" (none reported yet). */
-function pendingScreensPhrase(m: MachineView): string {
-  if (m.outputCount === 1) return "its screen";
-  if (m.outputCount > 1) return `its ${m.outputCount} screens`;
-  return "its screens";
-}
-
 /**
  * Power-cycle a wedged box (POL-55). Offered only while the machine is online, because the reboot
  * rides its live agent socket — an offline box has nothing to receive it. While it's down the card
@@ -372,7 +365,7 @@ async function reboot(m: MachineView): Promise<void> {
   const n = m.screens.length;
   const what = n > 0 ? `Its ${countLabel(n, "screen")} go dark` : "It goes dark";
   const yes = window.confirm(
-    `Reboot "${machineDisplayName(m)}"? ${what} until it boots back up and reconnects — about a minute.`,
+    `Reboot "${machineDisplayName(m)}"?`,
   );
   if (!yes) return;
   const error = await store.rebootMachine(m.id);
@@ -392,8 +385,7 @@ async function powerAll(m: MachineView, on: boolean): Promise<void> {
   if (!on) {
     const n = m.screens.length;
     const yes = window.confirm(
-      `Sleep ${m.label}'s ${countLabel(n, "panel")}? The glass goes dark — the box stays up, content ` +
-        `keeps rendering underneath, and waking is instant.` +
+      `Sleep ${m.label}'s ${countLabel(n, "panel")}?` +
         (m.power?.cec
           ? "\n\nThis box has HDMI-CEC, so the displays themselves will power down."
           : "\n\nThis box has no HDMI-CEC, so the outputs go dark but the panels may stay lit."),
@@ -420,8 +412,7 @@ async function enableConsole(m: MachineView): Promise<void> {
   if (enabling.has(m.id)) return;
   const yes = window.confirm(
     `Enable the console on "${machineDisplayName(m)}"? While enabled, an operator can open an unprivileged ` +
-      `terminal on this box. It cannot change what the screen displays. Sessions are logged to the ` +
-      `activity feed. Disable it when you're done.`,
+      `terminal on this box.`,
   );
   if (!yes) return;
   enabling.add(m.id);
@@ -467,7 +458,7 @@ function closeMenus(): void {
 function shellArmedHint(m: MachineView): string {
   if (!m.shellArmedAt) return "The console is enabled on this box";
   const mins = Math.round((now.value - new Date(m.shellArmedAt).getTime()) / 60000);
-  return `Console enabled ${mins < 1 ? "just now" : `${mins} min ago`} — auto-disables when idle`;
+  return `Console enabled ${mins < 1 ? "just now" : `${mins} min ago`}. Auto-disables when idle`;
 }
 
 const toast = ref("");
@@ -500,8 +491,7 @@ function showToast(message: string): void {
         <span class="empty-glyph">▤</span>
         <span class="empty-title">No machines yet</span>
         <span class="empty-sub">
-          Boot a PC behind your screens from the Polyptic bootloader and it appears here for
-          approval. The guided first-run setup walks you through it.
+          Boot a machine from the Polyptic bootloader and it appears here for approval.
         </span>
         <button class="connect-btn ghost" @click="wizardOpen = true">Start first-run setup →</button>
       </div>
@@ -513,7 +503,7 @@ function showToast(message: string): void {
             v-model="filterText"
             class="filter-input"
             type="search"
-            placeholder="Filter by name, or a selector — tag=atrium · tag=floor:2,tag=canary"
+            placeholder="Filter by name, or a selector (tag=atrium · tag=floor:2,tag=canary)"
             aria-label="Filter machines by name or tag selector"
           />
           <span v-if="selector" class="filter-hint">
@@ -588,7 +578,7 @@ function showToast(message: string): void {
                     :title="
                       m.online
                         ? 'Flashes a badge on every screen this box drives'
-                        : `${machineDisplayName(m)} is offline — nothing to flash`
+                        : `${machineDisplayName(m)} is offline. Nothing to flash`
                     "
                     @click="identPending(m)"
                   >
@@ -621,13 +611,6 @@ function showToast(message: string): void {
                   <dd :class="{ mono: fact.mono }">{{ fact.value }}</dd>
                 </div>
               </dl>
-
-              <div class="pending-note">
-                Nothing plays on this box until you approve it. Its screens show a holding board
-                carrying this same id, so you can walk the room and match a panel to a card. Once you
-                do, {{ pendingScreensPhrase(m) }} will show up in the Unplaced tray, ready to place on
-                the wall.
-              </div>
             </div>
           </div>
         </section>
@@ -646,10 +629,10 @@ function showToast(message: string): void {
 
           <div v-if="showImport" class="card prereg-form">
             <p class="prereg-help">
-              One box per line: <code>label, identifier, tag, tag…</code> — the identifier is a MAC, a chassis serial,
+              One box per line: <code>label, identifier, tag, tag…</code> The identifier is a MAC, a chassis serial,
               or a machine id. A pre-registered box that dials in with a valid enrolment token names itself, takes its
-              tags and (below) approves itself, with no clicks. It is <strong>not</strong> a credential: a box still has
-              to present a valid token to get anywhere.
+              tags and (below) approves itself, with no clicks. A pre-registration is <strong>not</strong> a credential
+              because a box still has to present a valid token to get anywhere.
             </p>
             <textarea
               v-model="importCsv"
@@ -667,7 +650,7 @@ function showToast(message: string): void {
               </button>
             </div>
             <ul v-if="importErrors.length" class="prereg-errors">
-              <li v-for="e in importErrors" :key="e.line">Line {{ e.line }}: {{ e.reason }} — “{{ e.text }}”</li>
+              <li v-for="e in importErrors" :key="e.line">Line {{ e.line }}: {{ e.reason }} (“{{ e.text }}”)</li>
             </ul>
           </div>
 
@@ -695,7 +678,7 @@ function showToast(message: string): void {
             </div>
           </div>
           <div v-else class="muted-line">
-            No boxes pre-registered. Paste them in before they ship and commissioning is zero-click.
+            No boxes pre-registered.
           </div>
         </section>
 
@@ -747,8 +730,8 @@ function showToast(message: string): void {
                   :disabled="!m.online || enabling.has(m.id)"
                   :title="
                     m.online
-                      ? 'Enables an unprivileged debug shell on this box — sessions are logged to the activity feed'
-                      : `${machineDisplayName(m)} is offline — the console rides its agent connection`
+                      ? 'Enables an unprivileged debug shell on this box. Sessions are logged to the activity feed'
+                      : `${machineDisplayName(m)} is offline, so the console is unavailable`
                   "
                   @click="enableConsole(m)"
                 >
@@ -764,7 +747,7 @@ function showToast(message: string): void {
                     :title="
                       m.online
                         ? 'Open a terminal on this machine'
-                        : `${machineDisplayName(m)} is offline — the console rides its agent connection`
+                        : `${machineDisplayName(m)} is offline, so the console is unavailable`
                     "
                     @click="openTerminal(m)"
                   >
@@ -819,12 +802,12 @@ function showToast(message: string): void {
                         :disabled="!m.online || !m.screens.length"
                         :title="
                           !m.online
-                            ? `${m.label} is offline — panel power rides its agent connection`
+                            ? `${m.label} is offline, so panel power is unavailable`
                             : allAsleep(m)
                               ? 'Wake every panel this machine drives'
                               : m.power?.cec
-                                ? 'Sleep every panel — outputs go dark and the displays power down (HDMI-CEC)'
-                                : 'Sleep every panel — outputs go dark (DPMS; no HDMI-CEC on this box)'
+                                ? 'Sleep every panel. Outputs go dark and the displays power down (HDMI-CEC)'
+                                : 'Sleep every panel. Outputs go dark (DPMS; no HDMI-CEC on this box)'
                         "
                         @click="powerAll(m, allAsleep(m))"
                       >
@@ -833,7 +816,7 @@ function showToast(message: string): void {
                       <button
                         class="menu-item"
                         :disabled="!m.online"
-                        :title="m.online ? 'Power-cycle this machine' : `${machineDisplayName(m)} is offline — nothing to reboot`"
+                        :title="m.online ? 'Power-cycle this machine' : `${machineDisplayName(m)} is offline. Nothing to reboot`"
                         @click="reboot(m)"
                       >
                         Reboot
@@ -877,7 +860,7 @@ function showToast(message: string): void {
                 />
               </div>
               <div v-else class="no-screens">
-                Approved — waiting for the agent to report its screens…
+                Approved, waiting for the agent to report its screens…
               </div>
             </div>
           </div>
@@ -1482,16 +1465,6 @@ function showToast(message: string): void {
     opacity: 1;
     transform: none;
   }
-}
-
-.pending-note {
-  margin-top: 12px;
-  font-size: 12px;
-  color: var(--warn);
-  background: var(--warn-soft);
-  padding: 8px 11px;
-  border-radius: 8px;
-  line-height: 1.5;
 }
 
 /* ── POL-104: pending hardware facts + pre-registration ─────────────────────── */

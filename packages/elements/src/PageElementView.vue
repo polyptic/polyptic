@@ -92,7 +92,7 @@ const SAMPLE_FEED: PageFeedItem[] = [
   { title: "Line 3 returns to full rate after maintenance" },
   { title: "Q3 energy usage down 8% on last year" },
   { title: "New visitor sign-in policy starts Monday" },
-  { title: "Apprentice open evening — Thursday 18:00" },
+  { title: "Apprentice open evening, Thursday 18:00" },
   { title: "Car park B resurfacing next week" },
   { title: "Planned network window Sunday 06:00" },
   { title: "Canteen menu refreshed for autumn" },

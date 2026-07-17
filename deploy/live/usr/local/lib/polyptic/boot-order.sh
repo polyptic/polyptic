@@ -166,7 +166,7 @@ else
     what="$what and boots ${usurper_label:-entry $first} first"
   fi
 fi
-drift="$what; '$LABEL' is entry $entry, boot order $order"
+drift="$what. '$LABEL' is entry $entry, boot order $order"
 
 base="$(cmdline_value polyptic.base)"
 token="$(cmdline_value polyptic.token)"
@@ -237,7 +237,7 @@ if [ "$wrote" = 1 ] \
   && [ "$(upper "$final_first")" = "$(upper "$entry")" ] \
   && [ "$final_active" = "1" ]; then
   report true boot-order-reasserted \
-    "$what — '$LABEL' (entry $entry) is the first boot option again; boot order $final_order (was $order)"
+    "$what, and '$LABEL' (entry $entry) is the first boot option again. Boot order $final_order (was $order)"
   rm -f "$STATE_FILE" 2>/dev/null || true
   exit 0
 fi

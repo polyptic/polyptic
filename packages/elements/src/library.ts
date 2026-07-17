@@ -13,12 +13,12 @@ export interface ElementLibraryEntry {
 }
 
 export const ELEMENT_LIBRARY: ElementLibraryEntry[] = [
-  { kind: "embed", name: "Embed", glyph: "▤", hint: "A content source or URL in a region — composites a dashboard onto the page" },
+  { kind: "embed", name: "Embed", glyph: "▤", hint: "A content source or URL in a region" },
   { kind: "ticker", name: "Ticker", glyph: "⇢", hint: "Scrolling text strip" },
   { kind: "feed", name: "Feed", glyph: "≡", hint: "RSS / Atom headlines, polled server-side" },
   { kind: "image", name: "Image", glyph: "▦", hint: "Uploaded media" },
   { kind: "text", name: "Text", glyph: "T", hint: "Text block" },
-  { kind: "clock", name: "Clock", glyph: "◷", hint: "Live clock — updates once a minute" },
+  { kind: "clock", name: "Clock", glyph: "◷", hint: "Live clock, updates once a minute" },
   { kind: "shape", name: "Shape", glyph: "▢", hint: "Background shape" },
   { kind: "weather", name: "Weather", glyph: "☁", hint: "Local conditions via Open-Meteo" },
   { kind: "qr", name: "QR code", glyph: "▩", hint: "Static QR code, encoded client-side" },

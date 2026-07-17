@@ -79,7 +79,7 @@ fi
 # ── Render the supplicant config (validation lives in wifi-conf.sh; failures are named) ─────────────
 conf="$(POLYPTIC_WIFI_CERT_DIR="$RUN_DIR" sh "$LIB/wifi-supplicant-conf.sh" "$RUN_DIR/wifi.conf" 2>"$RUN_DIR/wifi.err")"
 if [ $? -ne 0 ]; then
-  say "Wi-Fi config rejected — $(cat "$RUN_DIR/wifi.err" 2>/dev/null || echo 'see journalctl -u polyptic-wifi')"
+  say "Wi-Fi config rejected. $(cat "$RUN_DIR/wifi.err" 2>/dev/null || echo 'see journalctl -u polyptic-wifi')"
   exit 1
 fi
 [ -n "$conf" ] || exit 0   # a comment-only template configures nothing
@@ -103,6 +103,6 @@ done
 if [ "$started" = 0 ]; then
   # A wifi.conf on the medium + no radio is worth saying out loud: it is either a wired box sharing
   # the fleet stick (fine) or a Wi-Fi box whose adapter has no driver/firmware (the curated-set gap).
-  say "Wi-Fi configured but no wireless interface exists on this box (fine if it is wired; else the adapter needs firmware — see FULL_FIRMWARE in docs/NETBOOT.md)"
+  say "Wi-Fi configured but no wireless interface exists on this box (fine if it is wired, otherwise the adapter needs firmware). See FULL_FIRMWARE in docs/NETBOOT.md"
 fi
 exit 0

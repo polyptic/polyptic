@@ -46,7 +46,7 @@ if [ -z "${VERSION:-}" ]; then
 fi
 
 # ── Prereq checks ────────────────────────────────────────────────────────────────────────────────
-command -v bun  >/dev/null 2>&1 || { echo "build-agent: 'bun' not found — see https://bun.sh" >&2; exit 1; }
+command -v bun  >/dev/null 2>&1 || { echo "build-agent: 'bun' not found. See https://bun.sh" >&2; exit 1; }
 
 OUT_DIR="deploy/dist"
 mkdir -p "$OUT_DIR"
@@ -81,5 +81,5 @@ bun build \
 chmod 0755 "$BIN_OUT"
 
 echo
-echo "==> Done. Serve this at GET /dist/agent/${ARCH} (point AGENT_DIST_DIR at $OUT_DIR/):"
+echo "==> Done. Serve the agent binary at GET /dist/agent/${ARCH} (point AGENT_DIST_DIR at $OUT_DIR/):"
 ls -1 "$BIN_OUT" 2>/dev/null || true

@@ -71,7 +71,7 @@ function revert(): void {
     autocomplete="off"
     :placeholder="placeholder"
     :aria-label="`Rename ${machineDisplayName(machine)}`"
-    :title="machineHasName(machine) ? 'Rename this machine' : 'Name this machine so you can tell it apart'"
+    :title="machineHasName(machine) ? 'Rename this machine' : 'Name this machine'"
     @focus="focused = true"
     @blur="focused = false; commit()"
     @keyup.enter="commit(); ($event.target as HTMLInputElement).blur()"

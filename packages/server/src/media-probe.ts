@@ -155,7 +155,7 @@ export function assessPlayability(probe: ProbeResult): Playability {
       ok: false,
       reason: "undecodable",
       message:
-        "This file has no playable video track — it may be audio-only, corrupt, or not really a video. " +
+        "This file has no playable video track. It may be audio-only, corrupt, or not really a video. " +
         CONVERT_ADVICE,
     };
   }
@@ -169,7 +169,7 @@ export function assessPlayability(probe: ProbeResult): Playability {
     return {
       ok: false,
       reason: "codec",
-      message: `Screens can't play ${name} files — the wall browser has no ${name} support, so this would show as a black screen. ${CONVERT_ADVICE}`,
+      message: `Screens can't play ${name} files, so they would show as a black screen. ${CONVERT_ADVICE}`,
     };
   }
 
@@ -179,7 +179,7 @@ export function assessPlayability(probe: ProbeResult): Playability {
     return {
       ok: false,
       reason: "codec",
-      message: `Screens can't play ${name} video — the wall browser decodes H.264, H.265, VP8, VP9 and AV1 only. ${CONVERT_ADVICE}`,
+      message: `Screens can't play ${name} video because the wall browser decodes H.264, H.265, VP8, VP9 and AV1 only. ${CONVERT_ADVICE}`,
     };
   }
 
@@ -189,14 +189,14 @@ export function assessPlayability(probe: ProbeResult): Playability {
     return {
       ok: false,
       reason: "codec",
-      message: `The video's audio track is ${name}, which the wall browser can't decode — it can refuse the whole file. Re-encode the audio as AAC or Opus (the video track is fine) and upload it again.`,
+      message: `The video's audio track is ${name}, which the wall browser can't decode, so it can refuse the whole file. Re-encode the audio as AAC or Opus (the video track is fine) and upload it again.`,
     };
   }
 
   if (!video) {
     return {
       ok: true,
-      warning: "The video's codec couldn't be identified — check it on a screen before you rely on it.",
+      warning: "The video's codec couldn't be identified. Check it on a screen before you rely on it.",
     };
   }
   return { ok: true };
