@@ -108,6 +108,24 @@ function usageLine(s: ContentSource): string {
   return store.usageSummary(s.id) || "Not used yet";
 }
 
+/** The screens (by friendly name) currently reporting this source as unreachable. */
+function brokenOn(s: ContentSource): string[] {
+  const ids = store.statusForSource(s.id)?.unreachableScreenIds ?? [];
+  return ids.map((id) => store.screenById(id)?.friendlyName ?? id);
+}
+
+/** "2 min ago" / "3 h ago" — the badge's "when was this last seen" half, in the operator's terms. */
+function timeAgo(at: string): string {
+  const ms = Date.now() - Date.parse(at);
+  if (!Number.isFinite(ms) || ms < 0) return "just now";
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
 function healthLabel(s: ContentSource): string {
   const health = store.healthForSource(s.id);
   if (health === "reachable") return "loading";
@@ -116,18 +134,25 @@ function healthLabel(s: ContentSource): string {
 }
 
 /**
- * What the badge means, spelled out — because a health badge that overclaims is worse than none.
- * The player PROVES a URL fetchable before it paints it (POL-86); that is all this knows. It cannot
- * see inside a cross-origin frame (same-origin policy), so a 500, an expired session's login page
- * and an empty dashboard all read as "loading". Say so, in the tooltip, every time.
+ * What the badge means. The player PROVES a URL fetchable before it paints it (POL-86); that is all
+ * this knows. It cannot see inside a cross-origin frame (same-origin policy), so a 500, an expired
+ * session's login page and an empty dashboard all read as "loading" — the badge does not claim
+ * otherwise, and the unreachable branch names the screens and the reason so the operator can act.
  */
 function healthTitle(s: ContentSource): string {
-  const health = store.healthForSource(s.id);
+  const status = store.statusForSource(s.id);
+  const health = status?.health ?? "unknown";
   if (health === "reachable") {
     return "The screens showing this source fetched it successfully.";
   }
   if (health === "unreachable") {
-    return "A screen showing this source could not fetch it";
+    const where = brokenOn(s);
+    const detail = status?.detail ? ` (${status.detail})` : "";
+    const seen = status?.lastSeenAt ? ` Last reported ${timeAgo(status.lastSeenAt)}.` : "";
+    return (
+      `A screen showing this source could not fetch it${detail}. ` +
+      `${where.length ? where.join(", ") : "The screen"} is showing a placeholder and retrying.${seen}`
+    );
   }
   return "Nobody is showing this source right now, so nothing has checked whether it can be fetched.";
 }
