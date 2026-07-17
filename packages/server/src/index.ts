@@ -38,6 +38,7 @@ import { createMediaProber } from "./media-probe";
 import { createDocumentConverter } from "./document-convert";
 import { DocumentJobs } from "./documents";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
+import { AgentUpdateService } from "./agent-update";
 import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
@@ -603,6 +604,14 @@ if (agentMtlsEnv.enabled) {
   }
 }
 
+// POL-160 — the depot config (where the prebuilt agent binaries live) is needed both here, to decide
+// self-updates on the agent channel, and below for the provisioning routes. Built once, ahead of the
+// WS attach, and reused for registerProvisionRoutes.
+const provisionConfig = provisionConfigFromEnv();
+// The runtime agent self-updater: it serves `BUILD_VERSION`'s binary, so a box on an older agent is
+// told to pull `/dist/agent/<arch>` and re-exec — no full image rebuild, no reboot (POL-160).
+const agentUpdate = new AgentUpdateService(provisionConfig.agentDistDir, BUILD_VERSION, fastify.log);
+
 // The WS channels attach first so the remote-shell relay (POL-59) exists before REST — the
 // arm/disarm endpoint closes a box's live sessions the instant it is disarmed.
 const shellRelay = attachWebSockets({
@@ -624,6 +633,7 @@ const shellRelay = attachWebSockets({
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
   agentMtls: agentMtlsChannel,
+  agentUpdate,
 });
 shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
 registerRestRoutes(
@@ -703,7 +713,7 @@ registerAgentSecurityRoutes(fastify, {
 registerMediaServeRoute(fastify, media);
 // TOP-LEVEL, UNGATED provisioning routes (the netboot depot + GET /dist/agent/:arch) — NOT /api/v1,
 // so a machine with no operator session can boot and enrol entirely from the server.
-const provisionConfig = provisionConfigFromEnv();
+// (provisionConfig was built above, ahead of the WS attach, so the agent self-updater could share it.)
 
 // POL-92 — cumulative counters for /metrics (depot artifact fetches). Held here, incremented by the
 // routes that serve the artifacts, rendered by the ops exporter.

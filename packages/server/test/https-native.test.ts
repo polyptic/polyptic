@@ -31,6 +31,7 @@ import { AgentHub, PlayerHub } from "../src/hub";
 import { PanelPowerScheduler } from "../src/panel-power";
 import { PlayerAuth } from "../src/player-auth";
 import { SourceHealthTracker } from "../src/source-health";
+import { AgentUpdateService } from "../src/agent-update";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 import { attachWebSockets } from "../src/ws";
@@ -119,6 +120,7 @@ describe("native TLS on the main listener (POL-70/D89)", () => {
       panelPower: new PanelPowerScheduler({ control, agentHub, presence, activity, broadcaster, log: noopLog }),
       log: noopLog,
       allowedOrigins: [],
+      agentUpdate: new AgentUpdateService("/nonexistent-agent-dist", "0.0.0", noopLog),
     });
 
     await fastify.listen({ port: 0, host: "127.0.0.1" });

@@ -698,14 +698,48 @@ export class ImageUpdates {
     await this.trigger("bootstrap", "full");
   }
 
+  /**
+   * POL-161 — RECONCILE A STALE BUILD ON STARTUP. `trigger()` persists `lastBuildStatus: "running"`
+   * before spawning the hook and only closes the row out in a completion continuation. If the pod
+   * restarts while a build is in flight — exactly what a `helm upgrade` does — that continuation
+   * never runs and the row stays `"running"` FOREVER. Two things then break: the console greys the
+   * rebuild buttons off the persisted status (`Settings.vue` `rebuilding`), and `bootstrapFirstImage`
+   * skips the first build when it sees `"running"`. Meanwhile the real in-process guard (`this.running`)
+   * reset to false when the process died, so the states are inconsistent.
+   *
+   * A build cannot survive a process restart: the child was a child of the pod that spawned it, so a
+   * `"running"` row while THIS process has nothing in flight (`this.running` false) is by definition
+   * orphaned. Close it out to `failure` with a finish time and a loud line, so the buttons re-enable
+   * and bootstrap can proceed. Must run BEFORE `bootstrapFirstImage` so a fresh install whose very
+   * first build was interrupted can still bootstrap. Never touches a genuinely in-flight build
+   * (`this.running` true) — that one's own continuation owns the row.
+   */
+  private async reconcileStaleBuild(): Promise<void> {
+    if (this.running) return; // a build this process started owns its own row — leave it
+    const st = await this.state();
+    if (st.lastBuildStatus !== "running") return;
+    const finishedAt = new Date().toISOString();
+    await this.store.setImageRollout({
+      ...st,
+      lastBuildStatus: "failure",
+      lastBuildFinishedAt: finishedAt,
+    });
+    this.log.warn(
+      { event: "image.rebuild.orphaned", startedAt: st.lastBuildStartedAt, kind: st.lastBuildKind },
+      "found a stale 'running' build at startup with nothing in flight — a build cannot survive a restart, so closing it out as failed (re-enables the rebuild buttons and unwedges bootstrap)",
+    );
+  }
+
   /** Start the schedule ticker (idempotent). Fires at most once per matching minute. */
   start(): void {
     if (this.timer) return;
     // Fold a pre-POL-45 depot (artifacts loose at the arch root) into builds/ so history starts
-    // with whatever is already published, rather than staying empty until the next rebuild — then,
-    // on a depot that has NOTHING to fold because nothing was ever built, fire the one-shot
-    // first-image build (POL-121). Both are async: the server serves while the depot fills.
+    // with whatever is already published, rather than staying empty until the next rebuild. Then
+    // reconcile a build left stuck "running" by a restart mid-build (POL-161) BEFORE bootstrap reads
+    // the status, and finally — on a depot that has NOTHING to fold because nothing was ever built —
+    // fire the one-shot first-image build (POL-121). All async: the server serves while this runs.
     void this.retain()
+      .then(() => this.reconcileStaleBuild())
       .then(() => this.bootstrapFirstImage())
       .catch((err) => {
         this.log.error({ event: "image.bootstrap.error", err: (err as Error).message }, "first-image bootstrap failed");
