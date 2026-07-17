@@ -55,6 +55,8 @@ import type { Geometry, ServerToPlayerMessage, Surface } from "@polyptic/protoco
 import { PlayerSocket } from "./ws";
 import type { ConnState } from "./ws";
 import { SurfaceProber } from "./surface-prober";
+import { RefreshScheduler } from "./refresh-scheduler";
+import type { RefreshTarget } from "./refresh-scheduler";
 import { bindDiagSender, diag, flushDiag, initDiag, redactUrl } from "./diag";
 import { resolveMediaSrc, serverAuthority } from "./media-url";
 import { contentStyle as spanContentStyle, isAgentPlacedWindow } from "./surface-style";
@@ -384,6 +386,29 @@ const prober = new SurfaceProber({
   log: (msg) => diag(msg),
 });
 
+// ── Per-source refresh cadence (POL-157) ──────────────────────────────────────
+// A web/dashboard surface may carry its source's `refresh` policy. The scheduler decides WHEN each is
+// due (the shared, DST-correct `isRefreshDue`); when one is due it re-proves + reloads that surface
+// through the SAME prove-then-swap path a heal uses, so a scheduled reload never black-flashes the
+// wall (the old content stays up until the new load proves). Player-driven = it survives a brief WS
+// drop and needs no server re-push. A CHANGED cadence rides the normal render (the surface's `refresh`
+// field updates on the keyed element), so it propagates live like every other desired-state change.
+const REFRESH_TICK_MS = 10_000;
+const refreshScheduler = new RefreshScheduler({
+  onDue: (id) => prober.refreshDue(id, "source refresh cadence"),
+  log: (msg) => diag(msg),
+});
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
+
+/** The surfaces whose source set a live reload cadence. Only framed kinds carry one, and an `off`
+ *  (or absent) policy is filtered out by the scheduler's own sync. */
+const refreshTargets = computed<RefreshTarget[]>(() =>
+  surfaces.value
+    .filter((s): s is Extract<Surface, { type: "web" | "dashboard" }> => isFrame(s) && !!s.refresh)
+    .map((s) => ({ id: s.id, policy: s.refresh! })),
+);
+watch(refreshTargets, (targets) => refreshScheduler.sync(targets), { immediate: true });
+
 /** What each on-screen surface will actually fetch — the exact URLs the prober must prove.
  *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
  *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
@@ -508,6 +533,10 @@ onMounted(() => {
   window.addEventListener("offline", onOffline);
   window.addEventListener("error", onResourceError, true);
 
+  // POL-157 — the refresh scheduler's heartbeat. Cheap (one interval, a handful of pure comparisons)
+  // and independent of the WS, so a source's cadence keeps firing through a brief control-plane drop.
+  refreshTimer = setInterval(() => refreshScheduler.tick(), REFRESH_TICK_MS);
+
   // POL-132 — the player APP survives a page reload while the control plane is down: a service
   // worker serves the shell cache-first (prod builds only; ?sw=off is the kill switch). A newer
   // build swaps in only at a safe moment — when the player WS is open, i.e. the reload it costs
@@ -597,6 +626,8 @@ onUnmounted(() => {
   window.removeEventListener("online", onOnline);
   window.removeEventListener("offline", onOffline);
   window.removeEventListener("error", onResourceError, true);
+  if (refreshTimer !== undefined) clearInterval(refreshTimer);
+  refreshScheduler.stop();
   prober.stop();
   socket?.stop();
 });

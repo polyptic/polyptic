@@ -58,6 +58,7 @@ import type {
   CreateContentSourceBody,
   PlaylistEntry,
   PlaylistItem,
+  RefreshPolicy,
   BootOrderPolicy,
   CreateCredentialProfileBody,
   CredentialProfileView,
@@ -433,6 +434,9 @@ type ResolvedSpec =
       /** POL-18 — the placement the SOURCE wants (override, else the framing verdict). Only set for
        *  web/dashboard kinds; capability gating per target machine happens at build time. */
       placement?: "iframe" | "window";
+      /** POL-157 — the reload cadence the SOURCE carries (web/dashboard only); ridden onto the built
+       *  surface so the player fires it. Absent = never reload. */
+      refresh?: RefreshPolicy;
     }
   | { kind: "page"; definition: PageDefinition };
 
@@ -807,6 +811,7 @@ export class ControlPlane {
         definition: cs.definition ?? undefined,
         framing: cs.framing ?? undefined,
         placementMode: cs.placementMode ?? undefined,
+        refresh: cs.refresh ?? undefined,
       });
       if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
     }
@@ -2264,6 +2269,8 @@ export class ControlPlane {
           placement: spec.placement ?? "iframe",
           interactive: false,
           zoom,
+          // POL-157 — the source's reload cadence rides onto the surface the player fires it from.
+          ...(spec.refresh ? { refresh: spec.refresh } : {}),
         });
       case "dashboard":
         return DashboardSurface.parse({
@@ -2272,6 +2279,7 @@ export class ControlPlane {
           url: spec.url,
           placement: spec.placement ?? "iframe",
           zoom,
+          ...(spec.refresh ? { refresh: spec.refresh } : {}),
         });
       case "image":
         return ImageSurface.parse({ ...base, type: "image", src: spec.url, fit: "cover" });
@@ -2756,8 +2764,12 @@ export class ControlPlane {
         kind: source.kind,
         url: source.url ?? "",
         // POL-18 — web/dashboard carry the source's desired placement; media ignores it.
+        // POL-157 — and the source's reload cadence, when it set one (off is left absent).
         ...(source.kind === "web" || source.kind === "dashboard"
-          ? { placement: this.desiredPlacement(source) }
+          ? {
+              placement: this.desiredPlacement(source),
+              ...(source.refresh && source.refresh.mode !== "off" ? { refresh: source.refresh } : {}),
+            }
           : {}),
       };
     }
@@ -3569,6 +3581,7 @@ export class ControlPlane {
       definition: source.definition ?? null,
       framing: source.framing ?? null,
       placementMode: source.placementMode ?? null,
+      refresh: source.refresh ?? null,
     };
   }
 
@@ -3640,8 +3653,9 @@ export class ControlPlane {
       definition: body.definition,
       // POL-18 — the override only means something on frameable kinds; framing arrives later, from
       // the caller's async probe (setSourceFraming).
+      // POL-157 — the reload cadence is a frameable-kind field too (the contract enforces it).
       ...(body.kind === "web" || body.kind === "dashboard"
-        ? { placementMode: body.placementMode }
+        ? { placementMode: body.placementMode, refresh: body.refresh }
         : {}),
     });
     this.contentSources.set(id, source);
@@ -3763,6 +3777,9 @@ export class ControlPlane {
         ? {
             framing: nextUrl === existing.url ? existing.framing : undefined,
             placementMode: patch.placementMode ?? existing.placementMode,
+            // POL-157 — a patch can turn the cadence off (`{ mode: "off" }`) or change it; an absent
+            // `refresh` in the patch keeps whatever the source already had.
+            refresh: patch.refresh ?? existing.refresh,
           }
         : {}),
     });

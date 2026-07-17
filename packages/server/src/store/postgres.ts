@@ -173,6 +173,7 @@ interface ContentSourceRow {
   definition: unknown | null;
   framing: string | null;
   placement_mode: string | null;
+  refresh: unknown | null;
 }
 
 /** Row → DTO for a content source, re-validating at the edge (shared by load + list). Returns []
@@ -193,6 +194,7 @@ function contentSourceFromRow(row: ContentSourceRow): PersistedContentSource[] {
       items: kind.data === "playlist" ? (items.success ? items.data : []) : null,
       framing: row.framing ?? null,
       placementMode: row.placement_mode ?? null,
+      refresh: row.refresh ?? null,
     },
   ];
 }
@@ -436,6 +438,9 @@ export class PostgresStore implements Store {
     // Both nullable on purpose — legacy rows read as "never probed" / "auto".
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS framing text`;
     await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS placement_mode text`;
+    // Per-source refresh cadence (POL-157): the RefreshPolicy as jsonb. Nullable — legacy rows read
+    // as "off" (never reload), the pre-feature behaviour.
+    await sql`ALTER TABLE content_sources ADD COLUMN IF NOT EXISTS refresh jsonb`;
     // Page zoom preferences (POL-57). One row per (screen-or-wall, content) pair, so re-assigning a
     // page to a screen restores the zoom that screen last used FOR THAT PAGE.
     await sql`
@@ -722,7 +727,7 @@ export class PostgresStore implements Store {
       sql<MuralRow[]>`SELECT id, name FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
-      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode FROM content_sources`,
+      sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode, refresh FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot FROM scenes`,
       sql<DaypartRow[]>`SELECT id, name, start_time, end_time FROM dayparts`,
       sql<ScheduleRow[]>`SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules`,
@@ -1159,10 +1164,11 @@ export class PostgresStore implements Store {
   async upsertContentSource(source: PersistedContentSource): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode)
+      INSERT INTO content_sources (id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode, refresh)
       VALUES (${source.id}, ${source.name}, ${source.kind}, ${source.url ?? null}, ${source.credentialProfileId ?? null}, ${source.items ? sql.json(source.items) : null},
         ${source.definition != null ? sql.json(source.definition as Parameters<typeof sql.json>[0]) : null},
-        ${source.framing ?? null}, ${source.placementMode ?? null})
+        ${source.framing ?? null}, ${source.placementMode ?? null},
+        ${source.refresh != null ? sql.json(source.refresh as Parameters<typeof sql.json>[0]) : null})
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         kind = EXCLUDED.kind,
@@ -1171,7 +1177,8 @@ export class PostgresStore implements Store {
         items = EXCLUDED.items,
         definition = EXCLUDED.definition,
         framing = EXCLUDED.framing,
-        placement_mode = EXCLUDED.placement_mode
+        placement_mode = EXCLUDED.placement_mode,
+        refresh = EXCLUDED.refresh
     `;
   }
 
@@ -1186,7 +1193,7 @@ export class PostgresStore implements Store {
 
   async listContentSources(): Promise<PersistedContentSource[]> {
     const sql = this.sql;
-    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode FROM content_sources`;
+    const rows = await sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode, refresh FROM content_sources`;
     return rows.flatMap(contentSourceFromRow);
   }
 

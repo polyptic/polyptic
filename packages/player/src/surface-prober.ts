@@ -290,6 +290,27 @@ export class SurfaceProber {
   }
 
   /**
+   * POL-157 — an operator-scheduled reload for ONE surface (its source's refresh cadence came due).
+   * This is a DELIBERATE reload, so it rides the SAME prove-then-swap path a heal does: re-prove the
+   * URL and only reload the element IN PLACE once it PROVES — the old content stays on the glass until
+   * the new load is known reachable, so a scheduled reload can never black-flash the wall (and a
+   * reload while the source is unreachable degrades to "keep showing the last good content", not a sad
+   * face). A surface already mid-prove is left alone: it will paint the moment it proves, which is the
+   * fresh load the cadence wanted anyway. The reload re-fetches the CURRENT url, so a credentialed
+   * source (POL-24) re-stamps a live token at prove/paint time — exactly when a real reload should.
+   */
+  refreshDue(id: string, reason: string): void {
+    if (this.stopped) return;
+    const state = this.surfaces.get(id);
+    if (!state || state.phase === "proving") return;
+    this.invalidate(state);
+    state.phase = "proving";
+    state.attempts = 0;
+    this.log(`${id}: refresh due (${reason}) — re-proving before reload`);
+    void this.prove(id, `refresh (${reason})`);
+  }
+
+  /**
    * POL-94 — every surface's CURRENT verdict (skipping those with none yet). The player re-sends
    * this whenever its socket (re)opens: the server forgets a screen's health the moment it drops, so
    * without a replay a reconnected wall showing a dead dashboard would read "unknown" in the console

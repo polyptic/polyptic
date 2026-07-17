@@ -24,6 +24,12 @@ import type {
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
+import {
+  defaultRefreshDraft,
+  draftFromPolicy,
+  policyFromDraft,
+  type RefreshDraft,
+} from "../refresh-draft";
 
 const store = useConsoleStore();
 const router = useRouter();
@@ -166,6 +172,22 @@ const draftKind = ref<ContentKind>("web");
 const draftUrl = ref("");
 const draftProfileId = ref(""); // "" = no authentication (POL-24)
 const draftPlacement = ref<PlacementMode>("auto"); // POL-18 — display override (web/dashboard)
+// POL-157 — the reload cadence draft (web/dashboard only). The pure model lives in refresh-draft.ts.
+const deploymentTz = computed(() => store.scheduler?.timezone ?? "UTC");
+const draftRefresh = ref<RefreshDraft>(defaultRefreshDraft(deploymentTz.value));
+const WEEKDAYS: { value: number; label: string }[] = [
+  { value: 1, label: "Mon" },
+  { value: 2, label: "Tue" },
+  { value: 3, label: "Wed" },
+  { value: 4, label: "Thu" },
+  { value: 5, label: "Fri" },
+  { value: 6, label: "Sat" },
+  { value: 0, label: "Sun" },
+];
+function toggleRefreshDay(day: number): void {
+  const days = draftRefresh.value.days;
+  draftRefresh.value.days = days.includes(day) ? days.filter((d) => d !== day) : [...days, day];
+}
 const errorMsg = ref<string | null>(null);
 const saving = ref(false);
 
@@ -196,6 +218,7 @@ function openAdd() {
   draftUrl.value = "";
   draftProfileId.value = "";
   draftPlacement.value = "auto";
+  draftRefresh.value = defaultRefreshDraft(deploymentTz.value);
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -207,6 +230,7 @@ function openEdit(s: ContentSource) {
   draftUrl.value = s.url ?? "";
   draftProfileId.value = s.credentialProfileId ?? "";
   draftPlacement.value = s.placementMode ?? "auto";
+  draftRefresh.value = draftFromPolicy(s.refresh, deploymentTz.value);
   errorMsg.value = null;
   modalOpen.value = true;
 }
@@ -235,6 +259,20 @@ async function save() {
     return;
   }
 
+  // POL-157 — the reload cadence, web/dashboard only. A malformed draft (bad amount / no weekday)
+  // stops the save with a plain message rather than shipping an invalid body.
+  let refresh: ReturnType<typeof policyFromDraft> | undefined;
+  if (authPickable.value) {
+    refresh = policyFromDraft(draftRefresh.value);
+    if (refresh === null) {
+      errorMsg.value =
+        draftRefresh.value.mode === "interval"
+          ? "Set how often to reload — a whole number of minutes, hours, or days."
+          : "Pick at least one day and a valid time to reload.";
+      return;
+    }
+  }
+
   const parsed = CreateContentSourceBody.safeParse({
     name: draftName.value.trim(),
     kind: draftKind.value,
@@ -244,6 +282,9 @@ async function save() {
     // POL-18 — the display override, web/dashboard only. "auto" travels explicitly so an edit back
     // to auto actually clears a previously forced mode.
     ...(authPickable.value ? { placementMode: draftPlacement.value } : {}),
+    // POL-157 — the reload cadence rides the same web/dashboard-only path; off travels explicitly so
+    // an edit that turns it off actually clears a stored cadence.
+    ...(refresh ? { refresh } : {}),
   });
   if (!parsed.success) {
     errorMsg.value = parsed.error.issues[0]?.message ?? "Please check the fields.";
@@ -1000,6 +1041,50 @@ function mediaFacts(s: ContentSource): string {
             <option value="iframe">Always framed (embed in the player)</option>
             <option value="window">Always windowed (placed by the box)</option>
           </select>
+
+          <!-- POL-157 — the reload cadence. Off = the page loads once and stays (the default). Every
+               screen showing this source reloads on the schedule set here; the player swaps the fresh
+               page in only once it proves reachable, so a reload never blanks the wall. -->
+          <label class="field-label">Reload</label>
+          <select v-model="draftRefresh.mode" class="field select">
+            <option value="off">Off — load once, never reload</option>
+            <option value="interval">Every…</option>
+            <option value="scheduled">At a set time…</option>
+          </select>
+
+          <div v-if="draftRefresh.mode === 'interval'" class="refresh-row">
+            <input
+              v-model.number="draftRefresh.every"
+              class="field refresh-amount"
+              type="number"
+              min="1"
+              step="1"
+            />
+            <select v-model="draftRefresh.unit" class="field select refresh-unit">
+              <option value="minutes">minutes</option>
+              <option value="hours">hours</option>
+              <option value="days">days</option>
+            </select>
+          </div>
+
+          <template v-if="draftRefresh.mode === 'scheduled'">
+            <div class="refresh-row">
+              <input v-model="draftRefresh.time" class="field refresh-amount" type="time" />
+              <span class="refresh-tz">{{ draftRefresh.timezone }}</span>
+            </div>
+            <div class="refresh-days">
+              <button
+                v-for="d in WEEKDAYS"
+                :key="d.value"
+                type="button"
+                class="refresh-day"
+                :class="{ active: draftRefresh.days.includes(d.value) }"
+                @click="toggleRefreshDay(d.value)"
+              >
+                {{ d.label }}
+              </button>
+            </div>
+          </template>
         </template>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>
@@ -1448,6 +1533,51 @@ function mediaFacts(s: ContentSource): string {
 .type-glyph {
   font-size: 13px;
   font-weight: 700;
+}
+/* POL-157 — the reload cadence controls. */
+.refresh-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.refresh-amount {
+  width: 96px;
+  flex: 0 0 auto;
+}
+.refresh-unit {
+  flex: 0 0 auto;
+  width: auto;
+}
+.refresh-tz {
+  font-size: 12px;
+  color: var(--fg2);
+  font-variant-numeric: tabular-nums;
+}
+.refresh-days {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.refresh-day {
+  flex: 1;
+  padding: 7px 4px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+}
+.refresh-day:hover {
+  background: var(--muted-bg);
+}
+.refresh-day.active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
 }
 .error {
   font-size: 12.5px;

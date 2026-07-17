@@ -129,6 +129,10 @@ export interface PersistedContentSource {
   /** POL-18 — the operator's placement override ("auto" | "iframe" | "window"). `null`/undefined =
    *  auto (also legacy rows persisted before the column). */
   placementMode?: string | null;
+  /** POL-157 — the opt-in reload cadence (a `RefreshPolicy` as JSON), web/dashboard sources only.
+   *  `null`/undefined = off (also legacy rows persisted before the column). The control plane
+   *  re-validates it against the contract on load. */
+  refresh?: unknown | null;
 }
 
 /**

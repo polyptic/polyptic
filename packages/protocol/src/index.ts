@@ -17,6 +17,7 @@ export * from "./geometry.js";
 import { ImageRings } from "./image-rollout";
 import { MachineTags } from "./selector";
 import { Daypart, Schedule, SchedulerSettings } from "./schedule";
+import { RefreshPolicy } from "./refresh";
 
 /** POL-105 — staged (canary) image roll-outs targeted by a POL-103 selector, and the fleet's
  *  version distribution (who is actually running which build). */
@@ -51,6 +52,10 @@ export type { MachineSelector, ParseSelectorResult } from "./selector";
 // The scene scheduler (POL-89/D93): dayparts, schedules, settings AND the shared resolver — the
 // server's ticker and the console's week strip answer "what plays when" with the same function.
 export * from "./schedule";
+
+// Per-source refresh cadence (POL-157/D149): the RefreshPolicy contract + the shared `isRefreshDue`
+// resolver the player fires from and a console preview reads — one answer, evaluated identically.
+export * from "./refresh";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -411,6 +416,10 @@ export const WebSurface = SurfaceBase.extend({
   placement: z.enum(["iframe", "window"]).default("iframe"),
   interactive: z.boolean().default(false),
   zoom: Zoom.default(1),
+  /** POL-157 — the reload cadence resolved from the library SOURCE this surface renders. Absent =
+   *  never reload (parity). The player fires it locally via `isRefreshDue`, riding POL-86's
+   *  prove-then-swap so a reload never blanks the frame. */
+  refresh: RefreshPolicy.optional(),
 });
 
 export const DashboardSurface = SurfaceBase.extend({
@@ -419,8 +428,11 @@ export const DashboardSurface = SurfaceBase.extend({
   /** POL-18 — same escape hatch as WebSurface: a dashboard that refuses to be framed becomes a
    *  top-level window placed by the agent; the player leaves its region empty. */
   placement: z.enum(["iframe", "window"]).default("iframe"),
-  refreshSeconds: z.number().int().positive().optional(),
   zoom: Zoom.default(1),
+  /** POL-157 — the reload cadence resolved from the library SOURCE (see WebSurface.refresh). This
+   *  SUBSUMES the dead `refreshSeconds` field it replaced — a stored-but-never-fired decoy that
+   *  honoured nothing and was exposed nowhere. */
+  refresh: RefreshPolicy.optional(),
 });
 
 export const ImageSurface = SurfaceBase.extend({
@@ -1981,10 +1993,23 @@ export const ContentSource = z
     framing: FramingVerdict.optional(),
     /** POL-18 — the operator's placement override. Absent = "auto" (follow the probe verdict). */
     placementMode: PlacementMode.optional(),
+    /** POL-157 — the opt-in reload cadence. Meaningful only on FRAMEABLE kinds (web/dashboard); the
+     *  refine below rejects it on media/playlist/page. Absent (or `off`) = never reload. */
+    refresh: RefreshPolicy.optional(),
   })
   .superRefine((s, ctx) => {
     if (s.kind !== "deck" && s.deck !== undefined)
       ctx.addIssue({ code: "custom", message: "a deck is only valid on a deck source" });
+    // POL-157 — a refresh cadence only means something for content the player re-navigates: web and
+    // dashboard iframes. `off` is harmless anywhere, but a real cadence on a non-frameable kind is a
+    // stored decoy the player would never honour — refuse it at the boundary.
+    if (
+      s.refresh !== undefined &&
+      s.refresh.mode !== "off" &&
+      s.kind !== "web" &&
+      s.kind !== "dashboard"
+    )
+      ctx.addIssue({ code: "custom", message: "a refresh cadence needs a web or dashboard source" });
     if (s.kind === "playlist") {
       if (s.url !== undefined) ctx.addIssue({ code: "custom", message: "a playlist has no url" });
       if (s.items === undefined) ctx.addIssue({ code: "custom", message: "a playlist needs items" });
@@ -2638,6 +2663,8 @@ export const CreateContentSourceBody = z
     definition: PageDefinition.optional(),
     /** POL-18 — placement override (web/dashboard kinds). Omitted = "auto". */
     placementMode: PlacementMode.optional(),
+    /** POL-157 — opt-in reload cadence (web/dashboard kinds). Omitted = off. */
+    refresh: RefreshPolicy.optional(),
   })
   .superRefine((b, ctx) => {
     if (b.kind === "playlist") {
@@ -2659,6 +2686,9 @@ export const CreateContentSourceBody = z
     // a deck without converted pages is a library row that cannot render. The route refuses it too.
     if (b.kind === "deck")
       ctx.addIssue({ code: "custom", message: "a deck is created by uploading a document" });
+    // POL-157 — a real cadence only rides web/dashboard (the same rule the stored source enforces).
+    if (b.refresh !== undefined && b.refresh.mode !== "off" && b.kind !== "web" && b.kind !== "dashboard")
+      ctx.addIssue({ code: "custom", message: "a refresh cadence needs a web or dashboard source" });
   });
 export type CreateContentSourceBody = z.infer<typeof CreateContentSourceBody>;
 
@@ -2678,6 +2708,9 @@ export const UpdateContentSourceBody = z.object({
   dwellSeconds: z.number().int().min(1).max(3600).optional(),
   /** POL-18 — change the placement override. `framing` is server-managed and NOT settable here. */
   placementMode: PlacementMode.optional(),
+  /** POL-157 — set/clear the reload cadence. `{ mode: "off" }` turns it off; kind consistency is
+   *  validated against the MERGED source server-side (a partial patch can't judge it alone). */
+  refresh: RefreshPolicy.optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 
