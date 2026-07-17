@@ -214,6 +214,7 @@ describe("the server tells the truth about what it published", () => {
       imageDistDir: join(empty, "image"),
       bootDistDir,
       publicBaseUrl: "",
+      ntpHost: "",
     });
     expect((await provisionBootSummary(cfg(empty))).bootMedium).toBe("none");
 

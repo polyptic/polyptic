@@ -1,12 +1,18 @@
 {{- /*
 POL-148 — chrony.conf for the bundled NTP server.
 
-A SELF-CONTAINED time source for an air-gapped wall fleet: no `server`/`pool` line, so chronyd never
-reaches for the internet. `local stratum <n>` makes it an authoritative reference that serves this
-pod's (node's) own clock, which on any real cluster is itself NTP-disciplined — good enough to pull a
-free-running box off its RTC. `allow` admits clients (the Traefik UDP route is the real boundary; see
-the values note). The Deployment runs `chronyd -x`, so it serves time but never tries to step the
-container's own clock.
+Two modes, by `ntp.upstream`:
+  * EMPTY (default) — a SELF-CONTAINED time source for an air-gapped wall fleet: no `server`/`pool`
+    line, so chronyd never reaches for the internet. `local stratum <n>` makes it an authoritative
+    reference that serves this pod's (node's) own clock, which on any real cluster is itself
+    NTP-disciplined — good enough to pull a free-running box off its RTC. The Deployment runs
+    `chronyd -x`, so it serves time but never touches the container's own clock.
+  * SET — chronyd chains to the real upstream(s), disciplines its own clock to them, and serves THAT
+    (a real stratum-2+). `local stratum <n>` stays as the ORPHAN fallback used only when every
+    upstream is unreachable. The Deployment then drops `-x` and gains CAP_SYS_TIME (see the note in
+    values.yaml: it adjusts the node clock).
+
+`allow` admits clients (the Traefik UDP route is the real boundary; see the values note).
 */ -}}
 {{- if .Values.ntp.enabled }}
 apiVersion: v1
@@ -19,13 +25,21 @@ metadata:
 data:
   chrony.conf: |
     # Managed by the Polyptic chart (POL-148). Do not edit in-cluster; change values.ntp instead.
-    # A LOCAL reference clock — no internet upstream. Serves this node's own clock as authoritative.
+    {{- if .Values.ntp.upstream }}
+    # Real upstream time source(s): chronyd disciplines to these and serves their stratum.
+    {{- range .Values.ntp.upstream }}
+    server {{ . }} iburst
+    {{- end }}
+    # Correct a large initial offset in one step rather than slewing for hours.
+    makestep 1.0 3
+    {{- end }}
+    # A LOCAL reference clock. {{ if .Values.ntp.upstream }}Orphan FALLBACK when the upstream is unreachable.{{ else }}The sole source — serves this node's own clock as authoritative.{{ end }}
     local stratum {{ .Values.ntp.stratum | int }}
     {{- range .Values.ntp.allow }}
     allow {{ . }}
     {{- end }}
-    # Serve on the standard NTP port; -x on the command line keeps chronyd from stepping our own clock.
+    # Confine the command port to the loopback (chronyc from inside the pod only).
     bindcmdaddress 127.0.0.1
-    # No drift/rtc state to keep for a stateless server that never disciplines its own clock.
+    driftfile /var/lib/chrony/drift
     dumpdir /var/lib/chrony
 {{- end }}

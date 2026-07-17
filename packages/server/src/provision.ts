@@ -69,6 +69,14 @@ export interface ProvisionConfig {
   bootDistDir: string;
   /** Last-resort base URL when the request carries no Host/forwarded headers. */
   publicBaseUrl: string;
+  /**
+   * POL-148 — the NTP host stamped into each box's boot cmdline (`polyptic.ntp=<host>`). Empty (the
+   * default) DERIVES the boot host, so the bundled chrony server — reachable at the same host on
+   * UDP/123 via the Traefik UDP route — is what boxes discipline to with nothing to configure. Set it
+   * (chart `ntp.clientHost`) to point the fleet at a site's OWN NTP instead, and you can then run the
+   * bundled server off (`ntp.enabled=false`): the client is decoupled from the server.
+   */
+  ntpHost: string;
 }
 
 /** Resolve provisioning config from the environment, with sensible repo-relative defaults. */
@@ -78,6 +86,7 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
     imageDistDir: env.IMAGE_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/image"),
     bootDistDir: env.BOOT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/boot"),
     publicBaseUrl: (env.PUBLIC_BASE_URL?.trim() || "http://localhost:8080").replace(/\/+$/, ""),
+    ntpHost: env.POLYPTIC_NTP_HOST?.trim() || "",
   };
 }
 
@@ -213,7 +222,7 @@ export function toWsAgentUrl(httpBase: string): string {
 function bootKernelCmdline(
   httpBase: string,
   token: string | undefined,
-  opts: { watch?: boolean } = {},
+  opts: { watch?: boolean; ntpHost?: string } = {},
 ): string {
   const parts = [
     `root=live:${httpBase}/dist/image/$arch/rootfs.squashfs`,
@@ -226,12 +235,14 @@ function bootKernelCmdline(
   ];
   // POL-148 — the NTP endpoint the box's systemd-timesyncd disciplines its clock to. A netboot fleet
   // has no working time source of its own (the live image ships no NTP client until POL-148, so boxes
-  // free-run off the RTC — one an hour ahead silently broke a relative-range dashboard). We bake the
-  // BOOT HOST: the bundled chrony server (helm `ntp.enabled`) is reachable there on UDP/123 via a
-  // Traefik UDP route, no internet needed. The image's timesync-conf helper reads this off the cmdline;
-  // if it is ever absent (older baked media) the helper falls back to the server_url host. Port 123 is
-  // the default, so the host alone is enough.
-  parts.push(`polyptic.ntp=${new URL(httpBase).hostname}`);
+  // free-run off the RTC — one an hour ahead silently broke a relative-range dashboard). By default we
+  // bake the BOOT HOST: the bundled chrony server (helm `ntp.enabled`, ON by default) is reachable
+  // there on UDP/123 via a Traefik UDP route, no internet needed. An explicit `ntpHost` (chart
+  // `ntp.clientHost`) overrides it, so a site with its OWN NTP points the fleet there and can turn the
+  // bundled server off — the client is decoupled from the server. The image's timesync-conf helper
+  // reads this off the cmdline (falling back to the server_url host for older baked media). Port 123
+  // is the default, so the host alone is enough.
+  parts.push(`polyptic.ntp=${opts.ntpHost || new URL(httpBase).hostname}`);
   if (token !== undefined) parts.push(`polyptic.token=${token}`);
   // POL-7/POL-38: boot splash instead of scrolling kernel/systemd text. The live image carries the
   // Polyptic Plymouth theme, and dracut's plymouth module bundles it into the initramfs (the theme
@@ -281,11 +292,11 @@ function bootKernelCmdline(
  * its tty9 detail: it is the one line nobody sees unless they deliberately chose it. `set net=` must
  * precede the preamble, which interpolates `$net` into the theme URL.
  */
-export function buildBootGrubCfg(base: string, token: string | undefined): string {
+export function buildBootGrubCfg(base: string, token: string | undefined, ntpHost = ""): string {
   const hostPort = base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
   const httpBase = `http://${hostPort}`;
-  const cmdline = bootKernelCmdline(httpBase, token);
-  const watchCmdline = bootKernelCmdline(httpBase, token, { watch: true });
+  const cmdline = bootKernelCmdline(httpBase, token, { ntpHost });
+  const watchCmdline = bootKernelCmdline(httpBase, token, { watch: true, ntpHost });
   const lines = [
     "# Polyptic netboot (POL-33/D47), generated for THIS control plane from the request Host.",
     "# Ownership is by KEY: the box belongs to the server whose enrolment token it carries.",
@@ -678,7 +689,7 @@ export function registerProvisionRoutes(
    *  machineId) → no tags → no ring can match → the box follows the fleet's active build. */
   machineTags?: (machineId: string) => readonly string[],
 ): void {
-  const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl } = config;
+  const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl, ntpHost } = config;
 
   // ── GET /dist/agent/:arch — the prebuilt agent binary. 404 when not bundled. ──
   fastify.get("/dist/agent/:arch", async (request, reply) => {
@@ -715,7 +726,7 @@ export function registerProvisionRoutes(
   //    ROOT and probes the per-arch paths first, hence the three aliases (same handler, same body). ──
   const serveBootConfig = async (request: FastifyRequest, reply: FastifyReply): Promise<string> => {
     const base = computeBaseUrl(request, publicBaseUrl);
-    const config = buildBootGrubCfg(base, enrollment.currentToken);
+    const config = buildBootGrubCfg(base, enrollment.currentToken, ntpHost);
     reply.header("Cache-Control", "no-store");
     reply.header("X-Content-Type-Options", "nosniff");
     // A string reply makes Fastify set Content-Length; REQUIRED, firmware/GRUB reject chunked encoding.

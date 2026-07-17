@@ -122,3 +122,37 @@ Store:     {{ .Values.config.store }}
 {{- else }}
      Database supplied out-of-band (secrets.existingSecret / extraEnv DATABASE_URL).
 {{- end }}
+
+7. Fleet clock sync (POL-148):
+{{- if .Values.ntp.enabled }}
+     BUNDLED NTP server is ON — a chrony Deployment ({{ include "polyptic.fullname" . }}-ntp) serves the
+     fleet's clocks{{ if .Values.ntp.upstream }} (chained to upstream {{ join ", " .Values.ntp.upstream }}){{ else }} (local stratum {{ .Values.ntp.stratum }} — the node clock){{ end }}.
+  {{- if eq .Values.ntp.expose "ingressRouteUDP" }}
+
+     ⚠️  NOTHING SYNCS YET. An IngressRouteUDP was rendered, but it is INERT until a
+        Traefik `{{ .Values.ntp.ingressRouteUDP.entryPoint }}` UDP entrypoint (:{{ .Values.ntp.service.port }}/udp) exists AND is exposed on
+        the Traefik LoadBalancer. Traefik ships no UDP entrypoint by default, and
+        this chart does NOT manage Traefik — add the entrypoint yourself:
+          • K3s/RKE2: a HelmChartConfig for the bundled Traefik (README shows it).
+          • vanilla Traefik: an --entryPoints.{{ .Values.ntp.ingressRouteUDP.entryPoint }}.address=:{{ .Values.ntp.service.port }}/udp arg + a Service port.
+        Until then boxes cannot reach the server and keep free-running off the RTC.
+  {{- else }}
+
+     ntp.expose=none — no Traefik route rendered. Publish UDP/{{ .Values.ntp.service.port }} to the wall
+     boxes yourself (a LoadBalancer / NodePort on Service {{ include "polyptic.fullname" . }}-ntp).
+  {{- end }}
+     Boxes sync to {{ if .Values.ntp.clientHost }}ntp.clientHost = {{ .Values.ntp.clientHost }}{{ else }}the boot host (this server), stamped as polyptic.ntp on the cmdline{{ end }}.
+     The Console ▸ Machines card shows each box's clock health.
+     NOTE: the client is BAKED INTO THE LIVE IMAGE — rebuild + reboot boxes for it
+     to take effect on an already-running fleet.
+{{- else }}
+     Bundled NTP server is OFF (ntp.enabled=false).
+  {{- if .Values.ntp.clientHost }}
+     Boxes are pointed at your own NTP: ntp.clientHost = {{ .Values.ntp.clientHost }}.
+     (Baked into the live image — rebuild + reboot boxes to apply.)
+  {{- else }}
+     ⚠️  No NTP at all: no bundled server and ntp.clientHost is empty, so boxes will
+        stamp the boot host but nothing answers on :123/udp there. Set ntp.enabled=true
+        (bundled server) OR ntp.clientHost=<your-ntp>, or the fleet free-runs off the RTC.
+  {{- end }}
+{{- end }}

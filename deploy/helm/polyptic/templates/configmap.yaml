@@ -73,6 +73,12 @@ data:
   # would still bring the listener up by itself (POL-134 default-on).
   AGENT_MTLS: "off"
   {{- end }}
+  {{- if .Values.ntp.clientHost }}
+  # POL-148 — override the NTP host stamped into each box's boot cmdline
+  # (polyptic.ntp=<host>). Empty (default) lets the server derive the boot host,
+  # i.e. the bundled chrony server. Set to point the fleet at a site's own NTP.
+  POLYPTIC_NTP_HOST: {{ .Values.ntp.clientHost | quote }}
+  {{- end }}
   # ── Phase 7 — MEDIA ─────────────────────────────────────────────────────────
   # Uploads (POST /api/v1/media) are streamed to MEDIA_DIR (a mounted volume, see
   # the PVC/volumeMount in deployment.yaml) and served back, ungated, from the

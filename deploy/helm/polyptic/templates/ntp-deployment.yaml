@@ -3,12 +3,17 @@ POL-148 — the bundled NTP server: a single chronyd, configured as a LOCAL stra
 internet upstream) so an air-gapped wall fleet has a time source to discipline its clocks to.
 
 The image's own entrypoint is BYPASSED (`command: [chronyd]`) so any image carrying /usr/sbin/chronyd
-works — the chart owns the config via the mounted ConfigMap. `-x` disciplines nothing locally (it
-only serves), `-d` keeps it in the foreground logging to stderr for the kubelet, `-f` points it at
-our conf. chronyd starts as root to bind UDP/123 and drops to its own user itself.
+works — the chart owns the config via the mounted ConfigMap. `-d` keeps it in the foreground logging
+to stderr for the kubelet, `-f` points it at our conf. chronyd starts as root to bind UDP/123 and
+drops to its own user itself.
+
+With NO `ntp.upstream` (default) it serves the node clock: `-x` (never touch the clock) + only
+CAP_NET_BIND_SERVICE. With an upstream it must DISCIPLINE its own clock to that source, so `-x` is
+dropped and CAP_SYS_TIME is added (a container shares the host kernel clock — see values.yaml).
 */ -}}
 {{- if .Values.ntp.enabled }}
 {{- $name := printf "%s-ntp" (include "polyptic.fullname" .) }}
+{{- $upstream := .Values.ntp.upstream }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,16 +48,25 @@ spec:
           image: {{ printf "%s:%s" .Values.ntp.image.repository (.Values.ntp.image.tag | toString) | quote }}
           imagePullPolicy: {{ .Values.ntp.image.pullPolicy }}
           command: ["chronyd"]
+          {{- if $upstream }}
+          # An upstream is set: chronyd disciplines its own clock to it (no -x).
+          args: ["-d", "-f", "/etc/chrony/chrony.conf"]
+          {{- else }}
+          # No upstream: serve the node clock, never step it (-x).
           args: ["-d", "-x", "-f", "/etc/chrony/chrony.conf"]
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
                 - ALL
               add:
-                # Bind the privileged UDP/123. SYS_TIME is deliberately NOT here: `-x` means chronyd
-                # never sets the clock, so it needs no time-setting capability.
+                # Bind the privileged UDP/123.
                 - NET_BIND_SERVICE
+                {{- if $upstream }}
+                # With an upstream, chronyd steps/slews the clock to it — needs SYS_TIME.
+                - SYS_TIME
+                {{- end }}
           ports:
             - name: ntp
               containerPort: {{ .Values.ntp.service.port | int }}
