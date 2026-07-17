@@ -170,7 +170,11 @@ describe("capability gating (POL-18)", () => {
     expect(placementOf(cp, x11ScreenId!)).toBe("iframe");
   });
 
-  test("a video wall never windows — members frame with the usual span math", async () => {
+  // POL-156 — a wall whose members ALL live on ONE box CAN carry a top-level window: sway floats a
+  // single window across that box's outputs, so a framing-blocked page fills the combined resolution
+  // (the agent unions the outputs). Every member carries the SAME `wall:<id>` window, so the box's
+  // agent collapses them into one spanning placement.
+  test("a single-box video wall keeps the window — every member carries the same spanning window", async () => {
     await cp.registerMachine(hello("sway-box", "wayland-sway", "HDMI-1", "HDMI-2"));
     const [a, b] = cp.getScreens().map((s) => s.id);
     const mural = await cp.createMural("Atrium");
@@ -188,19 +192,19 @@ describe("capability gating (POL-18)", () => {
     if (!created.ok) throw new Error("create failed");
     const result = await cp.setWallContent(combined.wall.id, { sourceId: created.source.id });
     expect(result.ok).toBe(true);
-    expect(placementOf(cp, a!)).toBe("iframe");
-    expect(placementOf(cp, b!)).toBe("iframe");
-    expect(cp.state.slices[a!]!.surfaces[0]!.span).toBeDefined();
-    expect(cp.state.slices[b!]!.surfaces[0]!.span).toBeDefined();
-    // POL-146 — the CRITICAL guarantee for the multi-box wall: the agent is asked to place NO
-    // top-level window on either member. A single box cannot span a window across two physical
-    // panels, so a leaked window here is exactly the field bug (a small unspanned window with black
-    // filling the rest of the wall). Both members must degrade to the spanning iframe instead.
-    expect(cp.windowsForScreen(a!)).toEqual([]);
-    expect(cp.windowsForScreen(b!)).toEqual([]);
-    // And the per-machine apply the agent actually receives carries no `windows` for either output.
+    expect(placementOf(cp, a!)).toBe("window");
+    expect(placementOf(cp, b!)).toBe("window");
+    // Both members carry the SAME window id (`wall:<id>`), so the agent places ONE spanning window.
+    const winA = cp.windowsForScreen(a!);
+    const winB = cp.windowsForScreen(b!);
+    expect(winA).toHaveLength(1);
+    expect(winB).toHaveLength(1);
+    expect(winA[0]!.id).toBe(`wall:${combined.wall.id}`);
+    expect(winB[0]!.id).toBe(winA[0]!.id);
+    // The per-machine apply rides a window on BOTH the box's connectors — the agent collapses them.
     const apply = cp.assignmentsForMachine("sway-box");
-    expect(apply.every((asg) => (asg.windows?.length ?? 0) === 0)).toBe(true);
+    expect(apply.every((asg) => (asg.windows?.length ?? 0) === 1)).toBe(true);
+    expect(new Set(apply.flatMap((a) => a.windows!.map((w) => w.id))).size).toBe(1);
   });
 
   // POL-146 — a wall whose members sit on DIFFERENT boxes is the reported repro (two Dell panels).
@@ -250,7 +254,28 @@ describe("the agent's window payload (POL-18)", () => {
       url: "https://blocks.example/",
       region: { x: 0, y: 0, w: 1920, h: 1080 },
       canvas: { x: 0, y: 0, w: 1920, h: 1080 },
+      zoom: 1, // POL-153 — an unzoomed window rides at 100%
     });
+  });
+
+  // POL-153 — the source's page zoom rides on the window payload, so the agent can scale the placed
+  // Chrome to match the iframe path (which the player scales itself). Parity with the iframe zoom.
+  test("windowsForScreen carries the source's zoom onto the window", async () => {
+    const screenId = await swayScreen();
+    const created = await cp.createContentSource({
+      name: "Windowed",
+      kind: "web",
+      url: "https://blocks.example/",
+      placementMode: "window",
+    });
+    if (!created.ok) throw new Error("create failed");
+    await cp.setScreenContent(screenId, { sourceId: created.source.id });
+    const zoomed = await cp.setScreenZoom(screenId, 1.5);
+    expect(zoomed.ok).toBe(true);
+
+    const windows = cp.windowsForScreen(screenId);
+    expect(windows).toHaveLength(1);
+    expect(windows[0]!.zoom).toBe(1.5);
   });
 
   test("assignmentsForMachine rides the windows on the right connector — and drops them when cleared", async () => {

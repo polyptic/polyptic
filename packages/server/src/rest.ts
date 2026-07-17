@@ -77,6 +77,7 @@ import {
   UpdatePanelPowerBody,
   ServerToAgentReboot,
   ServerToAgentRejected,
+  ServerToAgentIdent,
   ServerToPlayerIdent,
   ServerToPlayerRender,
   ServerToPlayerSettings,
@@ -309,6 +310,21 @@ export function registerRestRoutes(
       { event: "ident.pulse", screenId: screen.id, friendlyName: screen.friendlyName, on, delivered },
       "pushed ident pulse to player(s)",
     );
+    // POL-154 — the ident overlay is drawn by the player, but an OS-level web-window (POL-18) floats
+    // ABOVE the player and hides it. So when this screen hosts a web-window, ALSO tell its AGENT to
+    // raise that connector's player over the window for the flash (`on`) and drop it back after
+    // (`off`). Best-effort and additive: a screen with no window sends nothing, and an agent that
+    // predates the connector field simply ignores it.
+    if (control.windowsForScreen(screen.id).length > 0) {
+      agentHub.send(
+        screen.machineId,
+        ServerToAgentIdent.parse({ t: "server/ident", on, connector: screen.connector }),
+      );
+      fastify.log.info(
+        { event: "ident.window-raise", screenId: screen.id, connector: screen.connector, on },
+        "raised player over web-window for ident",
+      );
+    }
     return delivered;
   }
 

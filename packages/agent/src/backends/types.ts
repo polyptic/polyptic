@@ -38,20 +38,28 @@ export interface DisplayBackend {
   hideScreen(connector: string): Promise<void>;
 
   /**
-   * POL-18 — place (or re-place) ONE top-level browser window over the player on `connector`:
-   * launch a second, supervised kiosk browser window for `window.url` and position it at
-   * `window.region` (slice-canvas pixels, scaled onto the output's mode). Keyed by `window.id`:
-   * calling again with the same id relaunches/moves that window in place. Backends that cannot
-   * place windows throw — but the SERVER already gates on backend capability, so in practice only
+   * POL-18 — place (or re-place) ONE top-level browser window over the player on `connectors`:
+   * launch a second, supervised kiosk browser window for `window.url` and position it. With ONE
+   * connector it is sized to `window.region` (slice-canvas pixels, scaled onto that output's mode);
+   * with SEVERAL (POL-156, a wall the box spans) it is floated across the UNION of those outputs so a
+   * framing-blocked page fills the combined resolution. `window.zoom` scales the page (POL-153). Keyed
+   * by `window.id`: calling again with the same id relaunches/moves that window in place. Backends that
+   * cannot place windows throw — the SERVER already gates on backend capability, so in practice only
    * `wayland-sway` ever receives one (the throw is defence in depth + an honest status note).
    */
-  showWindow(connector: string, window: WindowPlacement): Promise<void>;
+  showWindow(window: WindowPlacement, connectors: string[]): Promise<void>;
 
   /** POL-18 — tear down the placed window keyed `id`. Idempotent; unknown ids are a logged no-op. */
   hideWindow(id: string): Promise<void>;
 
-  /** Toggle an operator "which panel is this?" overlay across the host's outputs. */
-  ident(on: boolean): Promise<void>;
+  /**
+   * Toggle an operator "which panel is this?" overlay. The VISIBLE ident is drawn by the player
+   * (server → player), so this is a no-op on most backends. POL-154: when `connector` is given, the
+   * screen there hosts a web-window (POL-18) that floats above and hides the player's overlay, so the
+   * agent fullscreens THAT output's player over the window for the flash (`on`) and restores the window
+   * after (`off`). Without a connector it is the legacy machine-wide no-op.
+   */
+  ident(on: boolean, connector?: string): Promise<void>;
 
   /**
    * Enable/disable inspection of the page on the panel driven by `connector`. Browser-dependent

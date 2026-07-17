@@ -1,31 +1,50 @@
 /**
- * POL-18 — agent-side web-window helpers: the apply-payload diff that decides which windows to
- * (re)place/tear down, the canvas → output pixel mapping the sway backend positions with, and the
- * Chrome argv a placed window launches with. All pure — no compositor, no browser.
+ * POL-18/POL-152/POL-153/POL-156 — agent-side web-window helpers: the apply-payload diff that decides
+ * which windows to (re)place/tear down, the canvas → output pixel mapping the sway backend positions
+ * with, the single-box span union, the self-verify geometry compare + tree read-back, and the Chrome
+ * argv a placed window launches with. All pure — no compositor, no browser.
  */
 import { describe, expect, test } from "bun:test";
 
 import type { WindowPlacement } from "@polyptic/protocol";
 import {
   diffWindows,
+  findConRect,
+  geometryMatches,
   regionToOutputRect,
+  spanningOutputRect,
   windowPlacementCommand,
   windowSignature,
 } from "../src/windows";
 import type { PlacedWindow } from "../src/windows";
 import { buildChromeWindowArgs, chromeWindowDataDir } from "../src/backends/chrome";
 
-function win(id: string, url: string, x = 0, y = 0, w = 960, h = 540): WindowPlacement {
+function win(
+  id: string,
+  url: string,
+  x = 0,
+  y = 0,
+  w = 960,
+  h = 540,
+  zoom = 1,
+): WindowPlacement {
   return {
     id,
     url,
     region: { x, y, w, h },
     canvas: { x: 0, y: 0, w: 1920, h: 1080 },
+    zoom,
   };
 }
 
+/** A single-connector placed window at the signature the diff would compute for it. */
 function placed(connector: string, w: WindowPlacement): PlacedWindow {
-  return { connector, signature: windowSignature(connector, w) };
+  return {
+    connectors: [connector],
+    signature: windowSignature(w.id, w.url, w.zoom, [
+      { connector, region: w.region, canvas: w.canvas },
+    ]),
+  };
 }
 
 describe("diffWindows", () => {
@@ -34,8 +53,8 @@ describe("diffWindows", () => {
     const { toPlace, toRemove } = diffWindows(new Map(), [
       { connector: "HDMI-1", windows: [w] },
     ]);
-    expect(toPlace.map((p) => p.window.id)).toEqual(["content-web"]);
-    expect(toPlace[0]!.connector).toBe("HDMI-1");
+    expect(toPlace.map((p) => p.id)).toEqual(["content-web"]);
+    expect(toPlace[0]!.connectors).toEqual(["HDMI-1"]);
     expect(toRemove).toEqual([]);
   });
 
@@ -59,7 +78,7 @@ describe("diffWindows", () => {
       { connector: "HDMI-1", windows: [win("content-web", "https://new.example/")] },
       { connector: "HDMI-2", windows: [] },
     ]);
-    expect(toPlace.map((p) => p.window.id)).toEqual(["content-web"]);
+    expect(toPlace.map((p) => p.id)).toEqual(["content-web"]);
     expect(toRemove).toEqual(["stale"]);
   });
 
@@ -72,6 +91,51 @@ describe("diffWindows", () => {
     const gone = diffWindows(current, [{ connector: "HDMI-1", windows: [] }]);
     expect(gone.toPlace).toEqual([]);
     expect(gone.toRemove).toEqual(["content-web"]);
+  });
+
+  // POL-153 — a zoom change re-places the window (Chrome's device scale factor is a launch flag).
+  test("a changed zoom re-places the same id", () => {
+    const before = win("content-web", "https://dash.example/", 0, 0, 960, 540, 1);
+    const current = new Map([["content-web", placed("HDMI-1", before)]]);
+    const zoomed = win("content-web", "https://dash.example/", 0, 0, 960, 540, 1.5);
+    const { toPlace } = diffWindows(current, [{ connector: "HDMI-1", windows: [zoomed] }]);
+    expect(toPlace.map((p) => p.id)).toEqual(["content-web"]);
+  });
+
+  // POL-156 — a wall spanning two of ONE box's outputs stamps the SAME id on every member; the diff
+  // collapses them into ONE placement covering every member connector, sorted.
+  describe("single-box wall span", () => {
+    const spanLeft = { ...win("wall:w1", "https://grafana.example/d/sin"), region: { x: 0, y: 0, w: 1920, h: 1080 } };
+    const spanRight = { ...win("wall:w1", "https://grafana.example/d/sin"), region: { x: 0, y: 0, w: 1920, h: 1080 } };
+
+    test("same window id on two connectors → one placement across both, connectors sorted", () => {
+      const { toPlace } = diffWindows(new Map(), [
+        { connector: "HDMI-A-1", windows: [spanRight] },
+        { connector: "DP-1", windows: [spanLeft] },
+      ]);
+      expect(toPlace).toHaveLength(1);
+      expect(toPlace[0]!.id).toBe("wall:w1");
+      expect(toPlace[0]!.connectors).toEqual(["DP-1", "HDMI-A-1"]);
+    });
+
+    test("the span is stable across a repeat apply (order-insensitive), then re-places if it shrinks", () => {
+      const first = diffWindows(new Map(), [
+        { connector: "DP-1", windows: [spanLeft] },
+        { connector: "HDMI-A-1", windows: [spanRight] },
+      ]);
+      const placedMap = new Map<string, PlacedWindow>([
+        ["wall:w1", { connectors: first.toPlace[0]!.connectors, signature: first.toPlace[0]!.signature }],
+      ]);
+      // Same two members, opposite screen order in the apply → no-op.
+      const repeat = diffWindows(placedMap, [
+        { connector: "HDMI-A-1", windows: [spanRight] },
+        { connector: "DP-1", windows: [spanLeft] },
+      ]);
+      expect(repeat.toPlace).toEqual([]);
+      // The wall loses a member (now single-output) → the span changed, so it re-places.
+      const shrunk = diffWindows(placedMap, [{ connector: "DP-1", windows: [spanLeft] }]);
+      expect(shrunk.toPlace.map((p) => p.connectors)).toEqual([["DP-1"]]);
+    });
   });
 });
 
@@ -147,6 +211,39 @@ describe("regionToOutputRect", () => {
   });
 });
 
+// POL-156 — a single top-level window that fills a single-box wall covers the UNION (bounding box) of
+// its member outputs in sway's global pixel space.
+describe("spanningOutputRect", () => {
+  test("two 1080p outputs side by side → the full 3840×1080, origin at the leftmost", () => {
+    const outputs = new Map([
+      ["DP-1", { x: 0, y: 0, width: 1920, height: 1080 }],
+      ["HDMI-A-1", { x: 1920, y: 0, width: 1920, height: 1080 }],
+    ]);
+    expect(spanningOutputRect(["DP-1", "HDMI-A-1"], outputs)).toEqual({ x: 0, y: 0, w: 3840, h: 1080 });
+  });
+
+  test("a 2×1 wall whose left output is offset — union starts at the leftmost origin", () => {
+    const outputs = new Map([
+      ["DP-2", { x: 1920, y: 0, width: 1920, height: 1080 }],
+      ["DP-3", { x: 3840, y: 0, width: 1920, height: 1080 }],
+    ]);
+    expect(spanningOutputRect(["DP-3", "DP-2"], outputs)).toEqual({ x: 1920, y: 0, w: 3840, h: 1080 });
+  });
+
+  test("a stacked (2 high) wall unions vertically too", () => {
+    const outputs = new Map([
+      ["DP-1", { x: 0, y: 0, width: 1920, height: 1080 }],
+      ["DP-2", { x: 0, y: 1080, width: 1920, height: 1080 }],
+    ]);
+    expect(spanningOutputRect(["DP-1", "DP-2"], outputs)).toEqual({ x: 0, y: 0, w: 1920, h: 2160 });
+  });
+
+  test("throws when a member output has no known rect (cannot place a span it can't measure)", () => {
+    const outputs = new Map([["DP-1", { x: 0, y: 0, width: 1920, height: 1080 }]]);
+    expect(() => spanningOutputRect(["DP-1", "HDMI-A-1"], outputs)).toThrow(/HDMI-A-1/);
+  });
+});
+
 describe("windowPlacementCommand", () => {
   // POL-150 — pin the FULL rect → swaymsg mapping, not just the pixel math: the window is relocated
   // to its target output, floated with no border, sized to the rect, and moved to the rect origin in
@@ -167,11 +264,114 @@ describe("windowPlacementCommand", () => {
     );
   });
 
+  // POL-156 — a UNION rect wider than the output it is parented to: a FLOATING window is not clipped
+  // to that output, so sizing it 3840 wide and moving it to (0,0) spans both.
+  test("a spanning union rect sizes the window across two outputs", () => {
+    const cmd = windowPlacementCommand(9, "DP-1", { x: 0, y: 0, w: 3840, h: 1080 });
+    expect(cmd).toBe(
+      "[con_id=9] move container to output DP-1, floating enable, border none, " +
+        "resize set width 3840 px height 1080 px, move absolute position 0 0",
+    );
+  });
+
   test("relocates to the target output so the float/resize applies in that output's context", () => {
-    // The container is re-parented to its output BEFORE floating — the POL-150 origin-offset fix.
     const cmd = windowPlacementCommand(1, "DP-2", { x: 1920, y: 0, w: 1920, h: 1080 });
     expect(cmd.startsWith("[con_id=1] move container to output DP-2, floating enable")).toBe(true);
     expect(cmd.endsWith("move absolute position 1920 0")).toBe(true);
+  });
+});
+
+// POL-152 — the self-verifying place loop: read the window's ACTUAL geometry back and retry until it
+// matches the target. These pin the two pure pieces that loop is built from.
+describe("geometryMatches", () => {
+  test("exact match", () => {
+    expect(geometryMatches({ x: 0, y: 0, w: 1920, h: 1080 }, { x: 0, y: 0, w: 1920, h: 1080 })).toBe(true);
+  });
+
+  test("within a 2px tolerance is a match (sway rounds a floating window a pixel or two)", () => {
+    expect(geometryMatches({ x: 1, y: 0, w: 1919, h: 1081 }, { x: 0, y: 0, w: 1920, h: 1080 })).toBe(true);
+  });
+
+  test("the reported flake — a half-width window — is NOT a match, so the loop retries", () => {
+    // Landed on the right HALF of a 1920 output instead of covering it: this is exactly the POL-152
+    // symptom the read-back must reject.
+    expect(geometryMatches({ x: 960, y: 0, w: 960, h: 1080 }, { x: 0, y: 0, w: 1920, h: 1080 })).toBe(false);
+  });
+
+  test("a window that landed on the WRONG output is not a match", () => {
+    expect(geometryMatches({ x: 1920, y: 0, w: 1920, h: 1080 }, { x: 0, y: 0, w: 1920, h: 1080 })).toBe(false);
+  });
+
+  test("a custom tolerance is honoured", () => {
+    expect(geometryMatches({ x: 5, y: 0, w: 1920, h: 1080 }, { x: 0, y: 0, w: 1920, h: 1080 }, 5)).toBe(true);
+    expect(geometryMatches({ x: 6, y: 0, w: 1920, h: 1080 }, { x: 0, y: 0, w: 1920, h: 1080 }, 5)).toBe(false);
+  });
+});
+
+describe("findConRect", () => {
+  // A trimmed sway `get_tree`: a workspace with one tiled node (the player) and one floating node
+  // (the web-window we placed) — the shape the read-back walks.
+  const tree = {
+    id: 1,
+    rect: { x: 0, y: 0, width: 3840, height: 1080 },
+    nodes: [
+      {
+        id: 2,
+        rect: { x: 0, y: 0, width: 1920, height: 1080 },
+        nodes: [{ id: 10, rect: { x: 0, y: 0, width: 1920, height: 1080 }, nodes: [] }],
+        floating_nodes: [
+          { id: 42, rect: { x: 0, y: 0, width: 3840, height: 1080 }, nodes: [], floating_nodes: [] },
+        ],
+      },
+    ],
+  };
+
+  test("finds a floating window's rect deep in the tree", () => {
+    expect(findConRect(tree, 42)).toEqual({ x: 0, y: 0, w: 3840, h: 1080 });
+  });
+
+  test("finds a tiled node's rect too", () => {
+    expect(findConRect(tree, 10)).toEqual({ x: 0, y: 0, w: 1920, h: 1080 });
+  });
+
+  test("an id not in the tree (vanished / raced) is null", () => {
+    expect(findConRect(tree, 999)).toBeNull();
+  });
+
+  test("a garbage tree is null, never a throw", () => {
+    expect(findConRect(null, 1)).toBeNull();
+    expect(findConRect("nope", 1)).toBeNull();
+    expect(findConRect({ id: 1 }, 1)).toBeNull(); // present but no usable rect
+  });
+});
+
+describe("windowSignature", () => {
+  test("is order-insensitive across the members of a span", () => {
+    const region = { x: 0, y: 0, w: 1920, h: 1080 };
+    const canvas = { x: 0, y: 0, w: 1920, h: 1080 };
+    const a = windowSignature("wall:w1", "https://x/", 1, [
+      { connector: "DP-1", region, canvas },
+      { connector: "HDMI-A-1", region, canvas },
+    ]);
+    const b = windowSignature("wall:w1", "https://x/", 1, [
+      { connector: "HDMI-A-1", region, canvas },
+      { connector: "DP-1", region, canvas },
+    ]);
+    expect(a).toBe(b);
+  });
+
+  test("changes on url, zoom, or member set", () => {
+    const region = { x: 0, y: 0, w: 1920, h: 1080 };
+    const canvas = { x: 0, y: 0, w: 1920, h: 1080 };
+    const base = windowSignature("w", "https://x/", 1, [{ connector: "DP-1", region, canvas }]);
+    expect(windowSignature("w", "https://y/", 1, [{ connector: "DP-1", region, canvas }])).not.toBe(base);
+    expect(windowSignature("w", "https://x/", 1.5, [{ connector: "DP-1", region, canvas }])).not.toBe(base);
+    expect(
+      windowSignature("w", "https://x/", 1, [
+        { connector: "DP-1", region, canvas },
+        { connector: "DP-2", region, canvas },
+      ]),
+    ).not.toBe(base);
   });
 });
 

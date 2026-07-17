@@ -41,8 +41,14 @@ import {
 } from "./chrome";
 import { browserProbesFrom, SupervisedBrowser, SupervisedProcess, killStaleByToken } from "./supervise";
 import type { LaunchTarget } from "./supervise";
-import { regionToOutputRect, windowPlacementCommand } from "../windows";
-import type { OutputRect } from "../windows";
+import {
+  findConRect,
+  geometryMatches,
+  regionToOutputRect,
+  spanningOutputRect,
+  windowPlacementCommand,
+} from "../windows";
+import type { OutputRect, PixelRect } from "../windows";
 import {
   CAST_PORT_BASE,
   CAST_PORT_STRIDE,
@@ -64,9 +70,34 @@ import type { BrowserProbe } from "../vitals";
 const PLACE_TIMEOUT_MS = 8_000;
 /** Grace before we accept an `app_id`-only match, giving the exact pid match a chance to arrive. */
 const APP_ID_GRACE_MS = 600;
+/** POL-152 — how many times a web-window placement is re-issued until the window's ACTUAL geometry
+ *  matches the target rect. A fresh Wayland window can land on a default output at a default (often
+ *  half-width) size and the compositor settles a beat later, so a single float/resize/move can lose
+ *  the race — we read the geometry back and re-apply until it takes. */
+const PLACE_VERIFY_ATTEMPTS = 5;
+/** POL-152 — pause between a placement command and reading the geometry back (and between retries). */
+const PLACE_VERIFY_DELAY_MS = 120;
 
 function ts(): string {
   return new Date().toISOString();
+}
+
+/** A short awaitable pause (POL-152 placement self-verify). */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Compact rect for a log line. */
+function rectStr(r: { x: number; y: number; w: number; h: number }): string {
+  return `${r.w}x${r.h}+${r.x}+${r.y}`;
+}
+
+/** Do two lists hold the same set of strings (order-insensitive)? Used to detect a web-window's span
+ *  gaining/losing an output (POL-156), which forces a clean relaunch. */
+function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((x) => set.has(x));
 }
 
 /** A candidate `new`-window event observed on the sway IPC stream. */
@@ -266,10 +297,12 @@ export class SwayBackend implements DisplayBackend {
   /** POL-18 — window id → its supervised second browser (the placed web-window). */
   private readonly windows = new Map<string, SupervisedBrowser>();
   /** POL-18 — window id → the LATEST placement spec; the launch fn reads it so a respawn after a
-   *  crash comes back at the current geometry, not the one it was first launched with. */
+   *  crash comes back at the current geometry, not the one it was first launched with. `connectors`
+   *  is one output for an ordinary window and SEVERAL (POL-156) for a wall this box spans — the
+   *  window is then floated across the union of those outputs. */
   private readonly windowSpecs = new Map<
     string,
-    { connector: string; window: WindowPlacement }
+    { connectors: string[]; window: WindowPlacement }
   >();
   /** POL-18 — window id → the sway container id its window was placed as (re-position without a
    *  relaunch when only geometry changed). Cleared on relaunch. */
@@ -484,11 +517,12 @@ export class SwayBackend implements DisplayBackend {
     }
   }
 
-  /** POL-146 — does an output currently host a placed web-window? Its player must then stay OUT of
-   *  workspace-fullscreen, or sway hides the floating window behind it (black glass). */
+  /** POL-146 — does an output currently host a placed web-window (as one of its own outputs, or as a
+   *  member of a wall this box spans)? Its player must then stay OUT of workspace-fullscreen, or sway
+   *  hides the floating window behind it (black glass). */
   private connectorHasWindow(connector: string): boolean {
     for (const spec of this.windowSpecs.values()) {
-      if (spec.connector === connector) return true;
+      if (spec.connectors.includes(connector)) return true;
     }
     return false;
   }
@@ -680,29 +714,92 @@ export class SwayBackend implements DisplayBackend {
     return rects;
   }
 
+  /** POL-152 — read a container's CURRENT on-screen rect from the live sway tree, or `null` if it
+   *  isn't there (vanished, or the read raced its creation). The self-verify loop compares this to
+   *  the target rect to decide whether the float/resize actually took. */
+  private async readWindowRect(conId: number): Promise<PixelRect | null> {
+    const res = await run("swaymsg", ["-r", "-t", "get_tree"]);
+    if (res.code !== 0) return null;
+    let tree: unknown;
+    try {
+      tree = JSON.parse(res.stdout);
+    } catch {
+      return null;
+    }
+    return findConRect(tree, conId);
+  }
+
   /**
-   * Float + size + move a placed web-window's container to its region on `connector` (POL-18).
+   * Float + size + move a placed web-window's container to its target rect (POL-18/POL-150/POL-152),
+   * then VERIFY it landed and re-issue until it does.
+   *
+   * The target rect is deterministic: ONE connector ⇒ its region scaled onto that output's mode
+   * (`regionToOutputRect`); SEVERAL connectors ⇒ the union of those outputs (POL-156), so one window
+   * fills a single-box wall edge-to-edge. Either way sway places a floating window, which is not
+   * clipped to the output it was parented to.
    *
    * POL-150 — the caller MUST drop the underlying player's sway fullscreen BEFORE this runs: sway
-   * constrains geometry ops (resize/move) on a workspace that holds a fullscreen container (the same
-   * reason `moveToOutput` has to disable fullscreen to relocate a container), so positioning a
-   * floating window over a still-fullscreen player left it offset and undersized — the whole POL-150
-   * symptom. The rect → swaymsg mapping itself is the pure, unit-pinned `windowPlacementCommand`.
+   * constrains geometry ops on a workspace that holds a fullscreen container, so positioning over a
+   * still-fullscreen player left it offset/undersized.
+   *
+   * POL-152 — a fresh Wayland window can appear on a DEFAULT output at a DEFAULT (often half-width)
+   * size, and the compositor settles a beat after our command, so a single float/resize/move can lose
+   * the race (the field's "renders on the right, then flips to the left / to full" flake). So after
+   * issuing the command we read the window's ACTUAL geometry back and re-issue until it matches — the
+   * placement becomes self-correcting instead of fire-and-hope.
    */
   private async positionWindow(
     id: string,
     conId: number,
-    connector: string,
+    connectors: string[],
     win: WindowPlacement,
   ): Promise<void> {
-    const output = await this.resolveConnector(connector);
-    const rect = (await this.getOutputRects()).get(output);
-    if (!rect) throw new Error(`no output rect for ${output}`);
-    const r = regionToOutputRect(win.region, win.canvas, rect);
-    const res = await run("swaymsg", [windowPlacementCommand(conId, output, r)]);
-    if (res.code !== 0) {
-      throw new Error(`swaymsg window placement failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+    const rects = await this.getOutputRects();
+    const outputs = await Promise.all(connectors.map((c) => this.resolveConnector(c)));
+    const target = this.windowTargetRect(outputs, rects, win);
+    // Parent to the FIRST resolved output; a floating window then spans the rest via absolute coords.
+    const primary = outputs[0]!;
+    const cmd = windowPlacementCommand(conId, primary, target);
+
+    let lastActual: PixelRect | null = null;
+    for (let attempt = 1; attempt <= PLACE_VERIFY_ATTEMPTS; attempt++) {
+      const res = await run("swaymsg", [cmd]);
+      if (res.code !== 0) {
+        throw new Error(
+          `swaymsg window placement failed: ${res.stderr.trim() || `exit ${res.code}`}`,
+        );
+      }
+      await delay(PLACE_VERIFY_DELAY_MS);
+      lastActual = await this.readWindowRect(conId);
+      if (lastActual && geometryMatches(lastActual, target)) {
+        if (attempt > 1) {
+          this.log(`web-window ${id}: placement settled after ${attempt} attempts`);
+        }
+        return;
+      }
     }
+    // Exhausted the retries — leave the window where it last landed (content on the glass beats none)
+    // but say so loudly: a persistent mismatch is a real bug, not a transient race.
+    this.log(
+      `web-window ${id}: placement did NOT converge after ${PLACE_VERIFY_ATTEMPTS} attempts ` +
+        `(target ${rectStr(target)}, last ${lastActual ? rectStr(lastActual) : "unreadable"})`,
+    );
+  }
+
+  /** The global-pixel rect a web-window must cover: a single output's region-rect, or the union of
+   *  several outputs for a single-box wall span (POL-156). Pure inputs, so the choice is trivial to
+   *  reason about; the math itself is the unit-pinned `regionToOutputRect` / `spanningOutputRect`. */
+  private windowTargetRect(
+    outputs: string[],
+    rects: ReadonlyMap<string, OutputRect>,
+    win: WindowPlacement,
+  ): PixelRect {
+    if (outputs.length === 1) {
+      const rect = rects.get(outputs[0]!);
+      if (!rect) throw new Error(`no output rect for ${outputs[0]}`);
+      return regionToOutputRect(win.region, win.canvas, rect);
+    }
+    return spanningOutputRect(outputs, rects);
   }
 
   /** Launch + float one web-window (POL-18). Placement is best-effort like the player's own: a
@@ -730,6 +827,9 @@ export class SwayBackend implements DisplayBackend {
               url: target.url,
               windowId: id,
               devtoolsPort: this.devtoolsPortFor(`win:${id}`),
+              // POL-153 — carry the source's page zoom onto the placed Chrome (device scale factor),
+              // so a web-window matches the iframe path's zoom.
+              zoom: spec.window.zoom,
             })
           : buildSurfArgs({ url: target.url, inspector: false });
       child = spawnChild(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -743,14 +843,17 @@ export class SwayBackend implements DisplayBackend {
     this.windowConIds.delete(id);
     try {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
-      // POL-146/POL-150 — drop the underlying player's fullscreen FIRST, then position. Un-fullscreen
-      // both reveals the floating window (POL-146: sway hides floaters behind a fullscreen view) AND
-      // frees its geometry: sway constrains resize/move on a workspace with a fullscreen container, so
-      // sizing the window while the player was still fullscreen left it offset+undersized (POL-150).
-      await this.setPlayerFullscreen(spec.connector, false);
-      await this.positionWindow(id, conId, spec.connector, spec.window);
+      // POL-146/POL-150 — drop EVERY underlying player's fullscreen FIRST, then position. Un-fullscreen
+      // reveals the floating window (POL-146: sway hides floaters behind a fullscreen view) AND frees
+      // its geometry: sway constrains resize/move on a workspace with a fullscreen container, so sizing
+      // the window while a player was still fullscreen left it offset+undersized (POL-150). A span
+      // (POL-156) covers several of this box's outputs, so drop the player on each.
+      for (const connector of spec.connectors) {
+        await this.setPlayerFullscreen(connector, false);
+      }
+      await this.positionWindow(id, conId, spec.connectors, spec.window);
       this.windowConIds.set(id, conId);
-      this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connector}`);
+      this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connectors.join("+")}`);
     } catch (err) {
       this.log(`web-window ${id} placement failed: ${(err as Error).message}`);
     } finally {
@@ -759,10 +862,11 @@ export class SwayBackend implements DisplayBackend {
     return child;
   }
 
-  async showWindow(connector: string, win: WindowPlacement): Promise<void> {
+  async showWindow(win: WindowPlacement, connectors: string[]): Promise<void> {
     const bin = await this.ensureBin();
     await requireSwaymsg();
-    this.windowSpecs.set(win.id, { connector, window: win });
+    const prev = this.windowSpecs.get(win.id);
+    this.windowSpecs.set(win.id, { connectors, window: win });
 
     let supervised = this.windows.get(win.id);
     if (!supervised) {
@@ -774,22 +878,34 @@ export class SwayBackend implements DisplayBackend {
       this.windows.set(win.id, supervised);
     }
 
-    // Geometry-only change on a live window: re-position the existing container in place — no
-    // relaunch, no flash (the agent-channel echo of D5). A URL change relaunches via setTarget.
+    // POL-153 — a zoom change is a LAUNCH change: Chrome's device scale factor is a launch flag, so a
+    // new zoom must relaunch (like a url change), not just reposition. The connector set changing (a
+    // wall span gained/lost an output) also needs a relaunch so the window is re-parented cleanly.
+    const zoomChanged = (prev?.window.zoom ?? 1) !== win.zoom;
+    const connectorsChanged = !sameStringSet(prev?.connectors ?? [], connectors);
     const conId = this.windowConIds.get(win.id);
-    if (supervised.running && supervised.url === win.url) {
+
+    // Geometry-only change on a live window: re-position the existing container in place — no
+    // relaunch, no flash (the agent-channel echo of D5).
+    if (supervised.running && supervised.url === win.url && !zoomChanged && !connectorsChanged) {
       if (conId !== undefined) {
-        // POL-146/POL-150 — un-fullscreen the player BEFORE repositioning (idempotent). Ordering
-        // matters: sway constrains a floating window's resize/move while the workspace holds a
+        // POL-146/POL-150 — un-fullscreen each underlying player BEFORE repositioning (idempotent).
+        // Ordering matters: sway constrains a floating window's resize/move while the workspace holds a
         // fullscreen container, so a geometry-only nudge applied over a player that a respawn
         // re-fullscreened would land offset+undersized (POL-150), as well as stay hidden (POL-146).
-        await this.setPlayerFullscreen(connector, false);
-        await this.positionWindow(win.id, conId, connector, win);
-        this.log(`web-window ${win.id}: repositioned over ${connector}`);
+        for (const connector of connectors) {
+          await this.setPlayerFullscreen(connector, false);
+        }
+        await this.positionWindow(win.id, conId, connectors, win);
+        this.log(`web-window ${win.id}: repositioned over ${connectors.join("+")}`);
         return;
       }
       // Same target but we never learned its container id (an earlier placement failure) —
       // setTarget would no-op, so force a clean relaunch to get a placeable window back.
+      await supervised.stop();
+    } else if (supervised.running && (zoomChanged || connectorsChanged)) {
+      // A url change relaunches via setTarget on its own; a zoom/span change with the SAME url would
+      // otherwise be a no-op (SupervisedBrowser keys on the target), so stop first to force it.
       await supervised.stop();
     }
     await supervised.setTarget({ url: win.url, inspector: false });
@@ -797,8 +913,8 @@ export class SwayBackend implements DisplayBackend {
 
   async hideWindow(id: string): Promise<void> {
     const supervised = this.windows.get(id);
-    // Capture the connector BEFORE dropping the spec, so we can restore its player's fullscreen.
-    const connector = this.windowSpecs.get(id)?.connector;
+    // Capture the connectors BEFORE dropping the spec, so we can restore each player's fullscreen.
+    const connectors = this.windowSpecs.get(id)?.connectors ?? [];
     this.windowSpecs.delete(id);
     this.windowConIds.delete(id);
     if (!supervised) {
@@ -807,21 +923,44 @@ export class SwayBackend implements DisplayBackend {
     }
     await supervised.stop();
     this.windows.delete(id);
-    // POL-146 — the window is gone; if it was the LAST one on that output, give the player its
-    // fullscreen back so it reclaims the whole glass (otherwise it stays a tiled window, which still
-    // fills the output but loses the fullscreen guarantees the rest of the backend assumes).
-    if (connector && !this.connectorHasWindow(connector)) {
-      await this.setPlayerFullscreen(connector, true);
+    // POL-146 — the window is gone; for each output it covered, if it was the LAST window there give the
+    // player its fullscreen back so it reclaims the whole glass (otherwise it stays a tiled window,
+    // which still fills the output but loses the fullscreen guarantees the rest of the backend assumes).
+    for (const connector of connectors) {
+      if (!this.connectorHasWindow(connector)) {
+        await this.setPlayerFullscreen(connector, true);
+      }
     }
     this.log(`hideWindow(${id}): torn down`);
   }
 
   /**
-   * Agent-side ident is best-effort and secondary: the VISIBLE "which panel is this?" overlay is
-   * server → player. We only log here (a future enhancement could flash a sway color/border).
+   * POL-154 — make a screen's ident flash visible even when a web-window (POL-18) occupies it. The
+   * visible "which panel is this?" overlay is drawn by the PLAYER (server → player), but an OS-level
+   * web-window floats ABOVE the player and hides it — page z-order loses to the compositor. So for the
+   * flash we fullscreen THAT connector's player over the window (sway hides the floating window behind
+   * a workspace-fullscreen view — the same mechanism POL-146 works around), let the player draw its
+   * ident, then restore the window when the flash ends.
+   *
+   * Restore returns the player to its pre-ident state deterministically: fullscreen only if the output
+   * no longer hosts a window (the backend's standing invariant), else back to windowed so the
+   * web-window composites above again. Without a `connector` (the legacy machine-wide frame) this stays
+   * the no-op it always was — the player overlay covers every other screen with nothing floated above.
    */
-  async ident(on: boolean): Promise<void> {
-    this.log(`ident ${on ? "on" : "off"} — visible ident is server→player; agent no-op`);
+  async ident(on: boolean, connector?: string): Promise<void> {
+    if (!connector) {
+      this.log(`ident ${on ? "on" : "off"} — visible ident is server→player; agent no-op`);
+      return;
+    }
+    if (on) {
+      // Raise the player over any web-window for the duration of the flash.
+      await this.setPlayerFullscreen(connector, true);
+      this.log(`ident on (${connector}) — player raised over web-window for the flash`);
+    } else {
+      // Flash over: restore the window (windowed player) unless nothing is floated there now.
+      await this.setPlayerFullscreen(connector, !this.connectorHasWindow(connector));
+      this.log(`ident off (${connector}) — web-window restored`);
+    }
   }
 
   /**
