@@ -11,12 +11,16 @@ import {
   diffWindows,
   findConRect,
   geometryMatches,
+  isFullCanvasRegion,
   regionToOutputRect,
   spanningOutputRect,
+  visibleSurfaceFor,
+  windowFillsSingleOutput,
+  windowFullscreenCommand,
   windowPlacementCommand,
   windowSignature,
 } from "../src/windows";
-import type { PlacedWindow } from "../src/windows";
+import type { PlacedWindow, SurfaceWindow } from "../src/windows";
 import { buildChromeWindowArgs, chromeWindowDataDir } from "../src/backends/chrome";
 
 function win(
@@ -241,6 +245,111 @@ describe("spanningOutputRect", () => {
   test("throws when a member output has no known rect (cannot place a span it can't measure)", () => {
     const outputs = new Map([["DP-1", { x: 0, y: 0, width: 1920, height: 1080 }]]);
     expect(() => spanningOutputRect(["DP-1", "HDMI-A-1"], outputs)).toThrow(/HDMI-A-1/);
+  });
+});
+
+// POL-162 — the path selection: a full-region single-output web-window is placed EXACTLY like the
+// player (fullscreen), everything else keeps the floating + hand-computed geometry + self-verify path.
+describe("windowFillsSingleOutput (POL-162 path selection)", () => {
+  test("one connector + a full-canvas region → fullscreen path", () => {
+    // A whole-screen window: region covers the entire canvas.
+    expect(windowFillsSingleOutput(["HDMI-1"], win("web", "https://x/", 0, 0, 1920, 1080))).toBe(true);
+  });
+
+  test("one connector + a SUB-region → floating path (not fullscreen)", () => {
+    // Right half of the output — player content lives around it, so it must float.
+    expect(windowFillsSingleOutput(["HDMI-1"], win("web", "https://x/", 960, 0, 960, 1080))).toBe(false);
+    // A full-size but OFFSET region is still a sub-region (does not start at the canvas origin).
+    expect(windowFillsSingleOutput(["HDMI-1"], win("web", "https://x/", 10, 0, 1920, 1080))).toBe(false);
+  });
+
+  test("a multi-output SPAN → floating path even when each member is full-region (POL-156)", () => {
+    // Fullscreen can't cross outputs, so a single-box span must float across the union.
+    const spanning = win("wall:w1", "https://x/", 0, 0, 1920, 1080);
+    expect(windowFillsSingleOutput(["DP-1", "HDMI-A-1"], spanning)).toBe(false);
+  });
+
+  test("isFullCanvasRegion is exact on origin AND size", () => {
+    const canvas = { x: 0, y: 0, w: 1920, h: 1080 };
+    expect(isFullCanvasRegion({ x: 0, y: 0, w: 1920, h: 1080 }, canvas)).toBe(true);
+    expect(isFullCanvasRegion({ x: 0, y: 0, w: 1920, h: 540 }, canvas)).toBe(false);
+    expect(isFullCanvasRegion({ x: 1, y: 0, w: 1920, h: 1080 }, canvas)).toBe(false);
+    // A non-origin canvas (rare, but the compare must track the canvas origin, not assume 0,0).
+    const shifted = { x: 100, y: 50, w: 800, h: 600 };
+    expect(isFullCanvasRegion({ x: 100, y: 50, w: 800, h: 600 }, shifted)).toBe(true);
+    expect(isFullCanvasRegion({ x: 0, y: 0, w: 800, h: 600 }, shifted)).toBe(false);
+  });
+});
+
+// POL-162 — the fullscreen command: place a full-region single-output web-window the SAME way as the
+// player. It must issue `move container to output` + `fullscreen enable` and NOTHING else — no
+// `resize set`, no `move absolute position`, no float/border/geometry math.
+describe("windowFullscreenCommand (POL-162)", () => {
+  test("parks the container on the output and fullscreens it — move + fullscreen only", () => {
+    const cmd = windowFullscreenCommand(42, "DP-3");
+    expect(cmd).toBe("[con_id=42] move container to output DP-3, fullscreen enable");
+  });
+
+  test("issues NO floating-geometry ops (the whole point — sway guarantees edge-to-edge)", () => {
+    const cmd = windowFullscreenCommand(7, "HDMI-A-1");
+    expect(cmd).toContain("move container to output HDMI-A-1");
+    expect(cmd).toContain("fullscreen enable");
+    expect(cmd).not.toContain("resize set");
+    expect(cmd).not.toContain("move absolute position");
+    expect(cmd).not.toContain("floating enable");
+    expect(cmd).not.toContain("border none");
+  });
+});
+
+// POL-162/POL-146/POL-154 — the ONE surface-toggle state machine: which of {player, web-window} owns
+// a connector's glass. Placement, ident restore and teardown all resolve through this, so they agree.
+describe("visibleSurfaceFor (surface state machine)", () => {
+  const surface = (
+    id: string,
+    connectors: string[],
+    region: { x: number; y: number; w: number; h: number },
+  ): SurfaceWindow => ({
+    id,
+    connectors,
+    window: { ...win(id, "https://x/"), region, canvas: { x: 0, y: 0, w: 1920, h: 1080 } },
+  });
+  const full = { x: 0, y: 0, w: 1920, h: 1080 };
+  const half = { x: 960, y: 0, w: 960, h: 1080 };
+
+  test("no window on the connector → the player owns the whole glass (fullscreen)", () => {
+    expect(visibleSurfaceFor("HDMI-1", [])).toEqual({ kind: "player-fullscreen" });
+    // A window on a DIFFERENT connector must not steal this one's surface.
+    expect(visibleSurfaceFor("HDMI-2", [surface("w", ["HDMI-1"], full)])).toEqual({
+      kind: "player-fullscreen",
+    });
+  });
+
+  test("a FULL-region single-output web-window IS the fullscreen surface (POL-162)", () => {
+    expect(visibleSurfaceFor("HDMI-1", [surface("w", ["HDMI-1"], full)])).toEqual({
+      kind: "window-fullscreen",
+      windowId: "w",
+    });
+  });
+
+  test("a SUB-region web-window → the player stays windowed, floater above (POL-146)", () => {
+    expect(visibleSurfaceFor("HDMI-1", [surface("w", ["HDMI-1"], half)])).toEqual({
+      kind: "player-windowed",
+    });
+  });
+
+  test("a multi-output SPAN member → windowed (a span floats, it is not the fullscreen surface)", () => {
+    const span = surface("wall:w1", ["DP-1", "HDMI-A-1"], full);
+    expect(visibleSurfaceFor("DP-1", [span])).toEqual({ kind: "player-windowed" });
+    expect(visibleSurfaceFor("HDMI-A-1", [span])).toEqual({ kind: "player-windowed" });
+  });
+
+  test("the fullscreen web-window wins over a floating one on the same connector", () => {
+    // A degenerate belt-and-braces case: a full-region window present means it owns the glass.
+    const windows = [surface("sub", ["HDMI-1"], half), surface("full", ["HDMI-1"], full)];
+    expect(visibleSurfaceFor("HDMI-1", windows)).toEqual({
+      kind: "window-fullscreen",
+      windowId: "full",
+    });
   });
 });
 

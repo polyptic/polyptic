@@ -46,9 +46,12 @@ import {
   geometryMatches,
   regionToOutputRect,
   spanningOutputRect,
+  visibleSurfaceFor,
+  windowFillsSingleOutput,
+  windowFullscreenCommand,
   windowPlacementCommand,
 } from "../windows";
-import type { OutputRect, PixelRect } from "../windows";
+import type { OutputRect, PixelRect, SurfaceWindow } from "../windows";
 import {
   CAST_PORT_BASE,
   CAST_PORT_STRIDE,
@@ -547,6 +550,97 @@ export class SwayBackend implements DisplayBackend {
   }
 
   /**
+   * POL-162 — (un)fullscreen a placed web-window (the POL-162 full-region path's own visible-surface
+   * toggle, mirroring `setPlayerFullscreen`). Best-effort and keyed on the tracked con_id: if we
+   * never learned it there is nothing to toggle, and a failure only logs — content on the glass beats
+   * a wall stuck on a swaymsg hiccup.
+   */
+  private async setWindowFullscreen(id: string, on: boolean): Promise<void> {
+    const conId = this.windowConIds.get(id);
+    if (conId === undefined) return;
+    const res = await run("swaymsg", [`[con_id=${conId}] fullscreen ${on ? "enable" : "disable"}`]);
+    if (res.code !== 0) {
+      this.log(
+        `web-window ${id} fullscreen ${on ? "enable" : "disable"} failed: ` +
+          `${res.stderr.trim() || `exit ${res.code}`}`,
+      );
+    }
+  }
+
+  /** POL-162 — park a web-window's container on `output` and make it that output's FULLSCREEN surface,
+   *  exactly like the player (`windowFullscreenCommand`): no resize/move/geometry math. Enabling
+   *  fullscreen here takes the workspace's fullscreen from the player automatically. */
+  private async fullscreenWindow(conId: number, output: string): Promise<void> {
+    const res = await run("swaymsg", [windowFullscreenCommand(conId, output)]);
+    if (res.code !== 0) {
+      throw new Error(`swaymsg web-window fullscreen failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+    }
+  }
+
+  /** The web-windows currently placed on this box, as the pure surface resolver reasons about them. */
+  private surfaceWindows(): SurfaceWindow[] {
+    return [...this.windowSpecs.entries()].map(([id, spec]) => ({
+      id,
+      connectors: spec.connectors,
+      window: spec.window,
+    }));
+  }
+
+  /**
+   * POL-162 — place ONE web-window's container to its standing surface state, choosing the path from
+   * its placement spec (the explicit, well-commented branch this ticket is about). This is the single
+   * entry point both the launch and the geometry-only reposition use, so a window switching modes
+   * (full-region ↔ sub-region) is handled the same way everywhere.
+   *
+   *   - FULL single output → FULLSCREEN, like the player. `move container to output` + `fullscreen
+   *     enable`; sway guarantees edge-to-edge, so no rect, no resize/move, no self-verify loop.
+   *   - SUB-region or single-box MULTI-OUTPUT SPAN → the FLOATING + hand-computed geometry +
+   *     self-verify path (POL-150/POL-152/POL-156), which those two cases genuinely need.
+   */
+  private async placeWindowSurface(id: string, conId: number): Promise<void> {
+    const spec = this.windowSpecs.get(id);
+    if (!spec) return;
+    if (windowFillsSingleOutput(spec.connectors, spec.window)) {
+      // FULLSCREEN path (POL-162): the exact primitive that already works flawlessly for the player.
+      const output = await this.resolveConnector(spec.connectors[0]!);
+      await this.fullscreenWindow(conId, output);
+      this.log(`web-window ${id}: fullscreened on ${output} (POL-162 player-style placement)`);
+      return;
+    }
+    // FLOATING path (sub-region / multi-output span): drop any prior fullscreen (a mode switch from
+    // full-region), reveal the floater by un-fullscreening each underlying player (POL-146: sway hides
+    // floaters behind a fullscreen view; POL-150: it also frees the window's geometry), then place +
+    // self-verify the hand-computed rect (POL-152).
+    await this.setWindowFullscreen(id, false);
+    for (const connector of spec.connectors) {
+      await this.setPlayerFullscreen(connector, false);
+    }
+    await this.positionWindow(id, conId, spec.connectors, spec.window);
+    this.log(`web-window ${id}: floated over ${spec.connectors.join("+")}`);
+  }
+
+  /**
+   * POL-162/POL-146/POL-154 — restore a connector to its standing visible surface after ident ends or
+   * a window is torn down: fullscreen the web-window that owns it (POL-162 full-region), else
+   * un-fullscreen the player so a floating window composites above (POL-146), else fullscreen the
+   * player to reclaim the whole glass. The ONE reconciled toggle, resolved by the pure state machine.
+   */
+  private async restoreVisibleSurface(connector: string): Promise<void> {
+    const surface = visibleSurfaceFor(connector, this.surfaceWindows());
+    switch (surface.kind) {
+      case "window-fullscreen":
+        await this.setWindowFullscreen(surface.windowId, true);
+        break;
+      case "player-windowed":
+        await this.setPlayerFullscreen(connector, false);
+        break;
+      case "player-fullscreen":
+        await this.setPlayerFullscreen(connector, true);
+        break;
+    }
+  }
+
+  /**
    * Launch + place the kiosk browser for one (connector, target). `output` is the real sway output
    * the window is moved onto (it may differ from the requested `connector` under the single-output
    * fallback). Returns the live child for supervision.
@@ -843,16 +937,11 @@ export class SwayBackend implements DisplayBackend {
     this.windowConIds.delete(id);
     try {
       const conId = await sub.waitForWindow(child.pid ?? -1, PLACE_TIMEOUT_MS);
-      // POL-146/POL-150 — drop EVERY underlying player's fullscreen FIRST, then position. Un-fullscreen
-      // reveals the floating window (POL-146: sway hides floaters behind a fullscreen view) AND frees
-      // its geometry: sway constrains resize/move on a workspace with a fullscreen container, so sizing
-      // the window while a player was still fullscreen left it offset+undersized (POL-150). A span
-      // (POL-156) covers several of this box's outputs, so drop the player on each.
-      for (const connector of spec.connectors) {
-        await this.setPlayerFullscreen(connector, false);
-      }
-      await this.positionWindow(id, conId, spec.connectors, spec.window);
+      // Record the con_id first so the surface toggles (fullscreen path) can address it, then place
+      // to the standing surface state — FULLSCREEN like the player for a full single output (POL-162),
+      // FLOATING + self-verify for a sub-region / multi-output span (POL-150/POL-152/POL-156).
       this.windowConIds.set(id, conId);
+      await this.placeWindowSurface(id, conId);
       this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connectors.join("+")}`);
     } catch (err) {
       this.log(`web-window ${id} placement failed: ${(err as Error).message}`);
@@ -885,19 +974,14 @@ export class SwayBackend implements DisplayBackend {
     const connectorsChanged = !sameStringSet(prev?.connectors ?? [], connectors);
     const conId = this.windowConIds.get(win.id);
 
-    // Geometry-only change on a live window: re-position the existing container in place — no
-    // relaunch, no flash (the agent-channel echo of D5).
+    // Geometry-only change on a live window: re-place the existing container in place — no relaunch,
+    // no flash (the agent-channel echo of D5). placeWindowSurface re-picks the path from the NEW spec
+    // (already stored above), so a region change that flips full-region ↔ sub-region switches between
+    // the POL-162 fullscreen path and the floating self-verify path cleanly.
     if (supervised.running && supervised.url === win.url && !zoomChanged && !connectorsChanged) {
       if (conId !== undefined) {
-        // POL-146/POL-150 — un-fullscreen each underlying player BEFORE repositioning (idempotent).
-        // Ordering matters: sway constrains a floating window's resize/move while the workspace holds a
-        // fullscreen container, so a geometry-only nudge applied over a player that a respawn
-        // re-fullscreened would land offset+undersized (POL-150), as well as stay hidden (POL-146).
-        for (const connector of connectors) {
-          await this.setPlayerFullscreen(connector, false);
-        }
-        await this.positionWindow(win.id, conId, connectors, win);
-        this.log(`web-window ${win.id}: repositioned over ${connectors.join("+")}`);
+        await this.placeWindowSurface(win.id, conId);
+        this.log(`web-window ${win.id}: re-placed over ${connectors.join("+")}`);
         return;
       }
       // Same target but we never learned its container id (an earlier placement failure) —
@@ -923,13 +1007,12 @@ export class SwayBackend implements DisplayBackend {
     }
     await supervised.stop();
     this.windows.delete(id);
-    // POL-146 — the window is gone; for each output it covered, if it was the LAST window there give the
-    // player its fullscreen back so it reclaims the whole glass (otherwise it stays a tiled window,
-    // which still fills the output but loses the fullscreen guarantees the rest of the backend assumes).
+    // POL-162/POL-146 — the window is gone (its spec already dropped above); restore each output it
+    // covered to its standing surface. Usually that fullscreens the player again (it reclaims the whole
+    // glass), but if another web-window still covers the output the resolver keeps that one visible —
+    // the SAME reconciled toggle POL-154's ident-off uses, so teardown and ident never disagree.
     for (const connector of connectors) {
-      if (!this.connectorHasWindow(connector)) {
-        await this.setPlayerFullscreen(connector, true);
-      }
+      await this.restoreVisibleSurface(connector);
     }
     this.log(`hideWindow(${id}): torn down`);
   }
@@ -953,12 +1036,17 @@ export class SwayBackend implements DisplayBackend {
       return;
     }
     if (on) {
-      // Raise the player over any web-window for the duration of the flash.
+      // Raise the player over any web-window for the duration of the flash. Fullscreening the player
+      // takes the workspace's fullscreen from a full-region web-window (POL-162) or hides a floating
+      // one (POL-146), so the player-drawn ident is visible either way.
       await this.setPlayerFullscreen(connector, true);
       this.log(`ident on (${connector}) — player raised over web-window for the flash`);
     } else {
-      // Flash over: restore the window (windowed player) unless nothing is floated there now.
-      await this.setPlayerFullscreen(connector, !this.connectorHasWindow(connector));
+      // Flash over: restore whichever surface should own this connector — a full-region web-window is
+      // re-fullscreened, a floating one is revealed (player windowed), or the player reclaims the glass.
+      // POL-154 reconciled with POL-162: ONE toggle, so a fullscreen web-window comes back fullscreen
+      // (not left un-fullscreened as an un-reconciled `setPlayerFullscreen(false)` would leave it).
+      await this.restoreVisibleSurface(connector);
       this.log(`ident off (${connector}) — web-window restored`);
     }
   }
