@@ -273,7 +273,49 @@ describe("CastPairingTracker — the PIN lifecycle, from stdout to panel and bac
 
 // ── Review findings (PR #118) ────────────────────────────────────────────────
 
-import { applyCastPinEvent, wrapLineBuffered } from "../src/backends/cast";
+import {
+  GST_VA_DECODER_RANKS,
+  applyCastPinEvent,
+  uxplayChildEnv,
+  wrapLineBuffered,
+} from "../src/backends/cast";
+
+describe("uxplayChildEnv — decodebin must prefer the hardware VA decoders (POL-163)", () => {
+  test("sets GST_PLUGIN_FEATURE_RANK promoting vah264dec/vah265dec/vavp9dec above software", () => {
+    const env = uxplayChildEnv({ PATH: "/usr/bin" });
+    expect(env.GST_PLUGIN_FEATURE_RANK).toBe(GST_VA_DECODER_RANKS);
+    // Each VA decoder is promoted to PRIMARY+1, i.e. just above the software avdec_h264 element.
+    expect(env.GST_PLUGIN_FEATURE_RANK).toContain("vah264dec:PRIMARY+1");
+    expect(env.GST_PLUGIN_FEATURE_RANK).toContain("vah265dec:PRIMARY+1");
+    expect(env.GST_PLUGIN_FEATURE_RANK).toContain("vavp9dec:PRIMARY+1");
+  });
+
+  test("merges OVER the agent's env (passes GST_DEBUG through), without mutating the base", () => {
+    const base = { PATH: "/usr/bin", GST_DEBUG: "2" };
+    const env = uxplayChildEnv(base);
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.GST_DEBUG).toBe("2"); // an operator's GST_DEBUG reaches the child for journal relay
+    expect(base).toEqual({ PATH: "/usr/bin", GST_DEBUG: "2" }); // base is untouched
+    expect("GST_PLUGIN_FEATURE_RANK" in base).toBe(false);
+  });
+
+  test("the rank override always wins even if the base already set one", () => {
+    const env = uxplayChildEnv({ GST_PLUGIN_FEATURE_RANK: "somethingelse:NONE" });
+    expect(env.GST_PLUGIN_FEATURE_RANK).toBe(GST_VA_DECODER_RANKS);
+  });
+});
+
+describe("buildUxplayArgs — the argv is unchanged by the decode-rank fix (POL-163)", () => {
+  test("the receiver's launch argv still carries only the pinned flags, no decoder argv", () => {
+    // The fix is env-only: waylandsink, the MAC, the ports, and -reg all stay exactly as they were.
+    expect(valueOf("-vs")).toBe("waylandsink");
+    expect(valueOf("-m")).toBe("02:aa:bb:cc:dd:ee");
+    expect(valueOf("-p")).toBe(String(CAST_PORT_BASE));
+    expect(valueOf("-reg")).toBe("/home/kiosk/.local/state/polyptic/uxplay-reg-DP-1");
+    expect(ARGS).not.toContain("-vd"); // no explicit decoder override was bolted onto the argv
+    expect(ARGS).not.toContain("--gst");
+  });
+});
 
 describe("wrapLineBuffered — the PIN cannot sit in a libc block buffer (finding 1)", () => {
   const ARGS_IN = ["-n", "Boardroom Left", "-pin"];

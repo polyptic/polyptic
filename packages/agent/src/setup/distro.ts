@@ -169,16 +169,26 @@ const PACKAGES: Record<PkgManager, PkgSet> = {
     // built-in responder); `plugins-bad` carries `waylandsink`, the ONLY sink we allow — POL-67
     // established that Xwayland software paths peg the CPU on real amdgpu boxes.
     //
-    // POL-144/D135 — HARDWARE H.264 DECODE. `plugins-bad` also carries the modern GStreamer `va`
-    // decode plugin (`vah264dec`), but it registers no hardware decoder without a VA DRIVER present:
-    // on a bare image UxPlay's `decodebin` falls back to `avdec_h264` (ffmpeg, software) and on a
-    // busy Intel wall box the mirror came through torn and banded — CPU-bound software decode
-    // repacking frames through waylandsink's SHM stride path (the same "keep the GPU in the path"
-    // trap POL-67 hit for the browser, one layer down in the cast pipeline). `va-driver-all` is the
-    // vendor-NEUTRAL driver set (pulls the Intel-media + i965 + Mesa-Gallium VA backends; the box's
-    // own GPU picks its backend at runtime), so `vah264dec` lights up and hands waylandsink dmabuf
-    // frames it scans out directly. `vainfo` is the operator's one-line proof the driver bound.
-    cast: ["uxplay", "avahi-daemon", "gstreamer1.0-plugins-bad", "va-driver-all", "vainfo"],
+    // POL-144/POL-163/D154 — HARDWARE H.264 DECODE. `plugins-bad` also carries the modern GStreamer
+    // `va` decode plugin (`vah264dec`). `va-driver-all` is the vendor-NEUTRAL VA driver set (Intel-
+    // media + i965 + Mesa-Gallium backends; the box's own GPU picks one at runtime) and `vainfo` is
+    // the operator's one-line proof it bound. BOTH the driver and the `va` plugin ship here — POL-163
+    // proved on a real Intel box that they are present and working, so D135's "missing VA driver"
+    // story was wrong. The banded mirror is a RANK problem: the `va` decoders register at a rank ≤
+    // the software `avdec_h264`, so `decodebin` auto-plugs software H.264 (CPU-bound frames through
+    // waylandsink's SHM stride path — the banding). That fix is agent-side, on the UxPlay child's env
+    // (`GST_PLUGIN_FEATURE_RANK`, see backends/cast.ts `uxplayChildEnv`), NOT a package one — the
+    // hardware decoder was always installed. `gstreamer1.0-tools` (gst-inspect/gst-launch) rides
+    // along purely for on-box debuggability: its absence cost a diagnostic round on POL-163 (rank
+    // couldn't be read on the box). Small size cost, apt-only; the Fedora/Arch sets stay lean.
+    cast: [
+      "uxplay",
+      "avahi-daemon",
+      "gstreamer1.0-plugins-bad",
+      "gstreamer1.0-tools",
+      "va-driver-all",
+      "vainfo",
+    ],
   },
   dnf: {
     base: ["greetd", "ca-certificates", "curl"],

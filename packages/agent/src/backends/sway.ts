@@ -63,6 +63,7 @@ import {
   matchesUxplayWindow,
   resolveUxplay,
   sameCastTarget,
+  uxplayChildEnv,
   wrapLineBuffered,
 } from "./cast";
 import type { CastTarget } from "./cast";
@@ -368,8 +369,13 @@ export class SwayBackend implements DisplayBackend {
    * failure was thrown away, and the only way to read its mind was to open DevTools against it. It is
    * also, pointedly, how surf's `DRI3 error` line — the entire POL-67 finding — stayed invisible.
    */
-  private pipeBrowserOutput(child: ChildProcess, browser: string, connector: string): void {
-    const verbose = process.env.POLYPTIC_BROWSER_LOG?.trim() === "all";
+  private pipeBrowserOutput(
+    child: ChildProcess,
+    browser: string,
+    connector: string,
+    forceVerbose = false,
+  ): void {
+    const verbose = forceVerbose || process.env.POLYPTIC_BROWSER_LOG?.trim() === "all";
     // Worth reading on a wall that is misbehaving: renderer/GPU deaths, the EGL/DRI3 class that
     // started POL-67, aborted loads, sandbox refusals, plain errors.
     const interesting =
@@ -1252,8 +1258,15 @@ export class SwayBackend implements DisplayBackend {
       );
     }
     const { cmd, argv } = wrapLineBuffered(bin, args, hasStdbuf);
-    const child = spawnChild(cmd, argv, { stdio: ["ignore", "pipe", "pipe"] });
-    this.pipeBrowserOutput(child, "uxplay", connector);
+    // POL-163 — hand the child GST_PLUGIN_FEATURE_RANK so decodebin prefers the hardware VA decoders
+    // over software avdec_h264 (the banding fix). Merged over the agent's env, scoped to THIS child.
+    const childEnv = uxplayChildEnv();
+    const child = spawnChild(cmd, argv, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
+    // POL-163 — when an operator sets GST_DEBUG on the agent (it rides childEnv through to uxplay),
+    // relay the receiver's full output so the decoder pick is inspectable from the journal without a
+    // box shell — the exact gap that cost a diagnostic round. Happy path (no GST_DEBUG) is unchanged:
+    // pipeBrowserOutput keeps its interesting-lines-only filter, so no log spam.
+    this.pipeBrowserOutput(child, "uxplay", connector, Boolean(childEnv.GST_DEBUG?.trim()));
     // POL-136 — the PIN pairing lifecycle lives in the receiver's output (see cast.ts): feed every
     // line to this connector's tracker. This is SEPARATE from pipeBrowserOutput above, whose
     // "interesting lines only" journal filter would drop the PIN lines (none of them look like an

@@ -15,12 +15,18 @@
  *   - Video only (`-as 0`): walls are silent by design; the box ships no audio server.
  *   - `waylandsink` natively — never an Xwayland sink (POL-67: Xwayland software paths peg the CPU).
  *
- * POL-144/D135: the sink was never the defect — a real iPhone mirror came through torn and banded.
- * The cause is a layer down, in DECODE, not display: the image shipped the GStreamer `va` plugin but
- * no VA driver, so UxPlay's `decodebin` fell back to software `avdec_h264` and the CPU-bound frames
- * reached waylandsink via its SHM stride path (the banding). The fix is a package one (ship the VA
- * driver so H.264 decodes in hardware to dmabuf — see setup/distro.ts `cast`), NOT an argv one:
- * `-vs waylandsink` stays exactly right, it just needed a hardware decoder feeding it.
+ * POL-144/POL-163/D154: the sink was never the defect — a real iPhone mirror came through torn and
+ * banded. The cause is a layer down, in DECODE, not display: UxPlay's `decodebin` software-decodes
+ * H.264 (`avdec_h264`) and the CPU-bound frames reach waylandsink via its SHM stride path (the
+ * banding). D135 first blamed a MISSING VA DRIVER — that was wrong. Proven on the homelab Intel box
+ * (POL-163, 2026-07-18): `vainfo` shows the iHD driver with HARDWARE H.264 decode
+ * (`VAProfileH264High : VAEntrypointVLD`), the render node is present and permitted, AND
+ * `libgstva.so` is on disk — so both the VA driver and the GStreamer `va` decoder (`vah264dec`) are
+ * present and working. The real defect is DECODER RANK: the `va` plugin ships its decoders at a rank
+ * ≤ the software `avdec_h264`, so `decodebin` never auto-plugs the hardware element. The fix is
+ * neither a driver nor an argv one — it is an ENV one: promote the VA decoders on the UxPlay child
+ * with `GST_PLUGIN_FEATURE_RANK` (see `uxplayChildEnv`) so `decodebin` prefers them → hardware decode
+ * → dmabuf → waylandsink honours the stride → no banding. `-vs waylandsink` stays exactly right.
  */
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -95,6 +101,26 @@ export function buildUxplayArgs(opts: {
     "-vs", "waylandsink", // native Wayland — never an Xwayland sink (POL-67)
     "-fs", // fullscreen hint; sway's move-to-output re-asserts it on the right connector
   ];
+}
+
+/**
+ * Promote the GStreamer VA (hardware) decoders above the software `avdec_h264` so UxPlay's
+ * `decodebin` auto-plugs them (POL-163). The `va` plugin ships `vah264dec`/`vah265dec`/`vavp9dec` at
+ * a rank ≤ the ffmpeg software decoder, so without this nudge decodebin picks software H.264, whose
+ * CPU-bound frames reach waylandsink via its SHM stride path — the torn/banded picture. `PRIMARY+1`
+ * puts each VA decoder just above the software element; hardware decode then hands waylandsink dmabuf
+ * frames it scans out directly, so the stride is honoured. Scoped to the UxPlay child only.
+ */
+export const GST_VA_DECODER_RANKS = "vah264dec:PRIMARY+1,vah265dec:PRIMARY+1,vavp9dec:PRIMARY+1";
+
+/**
+ * The environment for one UxPlay child: the agent's own env with `GST_PLUGIN_FEATURE_RANK` layered
+ * on top to promote the VA decoders (see `GST_VA_DECODER_RANKS`). Merges OVER `base` so an operator
+ * who sets `GST_DEBUG` (or anything else) on the agent still passes it through to the child, while
+ * the rank override is always applied. Pure — pinned by tests; never mutates the agent's own env.
+ */
+export function uxplayChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, GST_PLUGIN_FEATURE_RANK: GST_VA_DECODER_RANKS };
 }
 
 /** Does a compositor window's `app_id` / WM class look like our receiver? UxPlay's GStreamer
