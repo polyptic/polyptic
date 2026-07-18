@@ -432,6 +432,13 @@ export interface PersistedImageRollout {
   lastBuildLog: string | null;
   /** Which cycle the last run was: the daily in-place refresh or the weekly full rebuild. */
   lastBuildKind: "refresh" | "full" | null;
+  /** POL-165 — the agent version baked into the CURRENT published image, stamped by the server on
+   *  every successful FULL rebuild (a full rebuild is the only cycle that re-bakes the agent binary;
+   *  the daily refresh apt-upgrades userspace but leaves the agent). It is the baseline the startup
+   *  auto-rebuild compares the server's own bundled agent against: newer server → rebuild once. Null
+   *  on a depot built before this feature (or by an external Job) — an unknown baseline never fires a
+   *  rebuild, it is simply adopted as the current version so the NEXT real version bump fires. */
+  imageAgentVersion: string | null;
 }
 
 /**

@@ -67,7 +67,6 @@ import {
 } from "@polyptic/protocol";
 import type { KioskBrowser, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
 import { hostname as osHostname } from "node:os";
 import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
@@ -93,20 +92,6 @@ import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { agentVersion } from "./version";
 import { VitalsSampler } from "./vitals";
-import {
-  applyUpdate,
-  clearMarker,
-  decideStartupAction,
-  planUpdate,
-  readMarker,
-  realUpdateIO,
-  resolveUpdateUrl,
-  rollbackToBackup,
-  selfBinaryPath,
-  writeMarker,
-  MAX_UNSTABLE_BOOTS,
-  STABLE_UPTIME_MS,
-} from "./update";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -179,7 +164,6 @@ type ShellDataMsg = Extract<ServerToAgentMessage, { t: "server/shell-data" }>;
 type ShellResizeMsg = Extract<ServerToAgentMessage, { t: "server/shell-resize" }>;
 type ShellCloseMsg = Extract<ServerToAgentMessage, { t: "server/shell-close" }>;
 type DevtoolsRequestMsg = Extract<ServerToAgentMessage, { t: "server/devtools-request" }>;
-type UpdateAvailableMsg = Extract<ServerToAgentMessage, { t: "server/update-available" }>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent
@@ -246,12 +230,6 @@ class Agent {
   /** POL-92 — host vitals, sampled from /proc on each heartbeat. Holds the previous CPU jiffy totals
    *  between samples (busy% is a delta), so it lives for the life of the agent, not the socket. */
   private readonly vitals = new VitalsSampler();
-
-  /** POL-160 — versions we already tried to self-update to this process, so a server that re-offers
-   *  on every hello does not re-download. Reset only by a restart (a fresh process = a fresh chance). */
-  private readonly attemptedUpdates = new Set<string>();
-  /** POL-160 — true while a self-update swap is in flight, so overlapping offers do not race the disk. */
-  private updating = false;
 
   constructor(
     private readonly url: string,
@@ -438,9 +416,6 @@ class Agent {
         break;
       case "server/reboot":
         await this.onReboot(msg);
-        break;
-      case "server/update-available":
-        await this.onUpdateAvailable(msg);
         break;
       case "server/inspect":
         await this.onInspect(msg);
@@ -670,100 +645,6 @@ class Agent {
     });
     if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
     else logError(`refused to reboot: ${outcome.reason}`);
-  }
-
-  /**
-   * POL-160 — the server says a newer agent binary is available for this box. Verify, swap our own
-   * binary, and exit cleanly so systemd (`Restart=always`) relaunches the NEW one — no reboot, no
-   * rebuild. Every step is logged loudly and self-reported over the channel (`agent/update-status`)
-   * so a fix reaching — or NOT reaching — the fleet is never silent again (the v0.2.41 trap). The
-   * version guard, the "updatable binary" guard, and the "already attempted" guard all live in
-   * {@link planUpdate}; the download/verify/swap in {@link applyUpdate}. A failure leaves the box on
-   * its current binary, still rendering.
-   */
-  private async onUpdateAvailable(msg: UpdateAvailableMsg): Promise<void> {
-    const report = (
-      phase: "downloading" | "verifying" | "swapping" | "restarting" | "skipped" | "failed",
-      reason?: string,
-    ): void => {
-      this.send({
-        t: "agent/update-status",
-        machineId: this.machineId,
-        phase,
-        fromVersion: this.agentVersion,
-        toVersion: msg.version,
-        ...(reason ? { reason } : {}),
-      });
-    };
-
-    if (this.updating) {
-      log(`self-update to ${msg.version} already in flight — ignoring duplicate offer`);
-      return;
-    }
-
-    const plan = planUpdate({
-      currentVersion: this.agentVersion,
-      offerVersion: msg.version,
-      binaryPath: selfBinaryPath(),
-      attemptedVersions: this.attemptedUpdates,
-    });
-    if (plan.action === "skip") {
-      log(`self-update to ${msg.version} skipped: ${plan.reason}`);
-      // A "not newer" offer is routine (the server offers on every hello until the box catches up),
-      // so it is not worth a feed line; the server treats `skipped` as log-only.
-      report("skipped", plan.reason);
-      return;
-    }
-
-    this.updating = true;
-    this.attemptedUpdates.add(msg.version);
-    const url = resolveUpdateUrl(this.url, msg.url);
-    log(`self-update: server offers agent ${this.agentVersion} → ${msg.version}; pulling ${url}`);
-    report("downloading");
-
-    try {
-      report("verifying");
-      const result = await applyUpdate(
-        {
-          binaryPath: plan.binaryPath,
-          url,
-          targetVersion: msg.version,
-          ...(msg.sha256 ? { sha256: msg.sha256 } : {}),
-          ...(msg.sizeBytes !== undefined ? { sizeBytes: msg.sizeBytes } : {}),
-        },
-        realUpdateIO(log),
-      );
-      if (!result.ok) {
-        logError(`self-update to ${msg.version} FAILED (staying on ${this.agentVersion}): ${result.reason}`);
-        report("failed", result.reason);
-        this.updating = false;
-        return;
-      }
-
-      // The new binary is on disk and passed its self-check. Record a crash-loop marker so the
-      // relaunched binary can roll itself back if it boots but won't stay up, then exit for systemd.
-      await writeMarker(plan.binaryPath, {
-        targetVersion: msg.version,
-        previousVersion: this.agentVersion,
-        swappedAt: new Date().toISOString(),
-        boots: 0,
-        committed: false,
-      }).catch((err) => logError(`could not write update marker: ${(err as Error).message}`));
-
-      log(`self-update: swapped in agent ${msg.version}; exiting for systemd to relaunch the new binary`);
-      report("restarting");
-      // Give the status frame a moment to flush, then exit cleanly. systemd Restart=always relaunches
-      // the (now newer) binary, which reconnects exactly like any other reconnect. NOTE: the browser
-      // supervision model reaps + relaunches each output's browser on the first apply after a restart,
-      // so the wall briefly reloads (it repaints from the player's cache) — this is the status quo of
-      // any agent restart, not new to self-update. See PR notes.
-      this.stop();
-      setTimeout(() => process.exit(0), 250);
-    } catch (err) {
-      logError(`self-update to ${msg.version} errored (staying on ${this.agentVersion}): ${(err as Error).message}`);
-      report("failed", (err as Error).message);
-      this.updating = false;
-    }
   }
 
   /** Lazily build the shell manager. `canPty` is false on the dev/non-Linux backends so every open
@@ -1135,66 +1016,9 @@ class Agent {
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POL-160 — reconcile a self-update marker at startup, BEFORE dialling the server. Three outcomes:
- *   - the binary we swapped in is what is running now and this is one of its first boots → let it run
- *     and prove itself; a timer marks the update COMMITTED (and drops `<bin>.bak`) once it has stayed
- *     up STABLE_UPTIME_MS. Each boot increments the marker's boot count first.
- *   - it has booted too many times without ever staying up → ROLL BACK to `<bin>.bak` and exit for
- *     systemd to relaunch the binary that worked, so a bad update cannot wedge the box content-less.
- *   - anything else (no marker, already committed, a version we are not running) → clear the marker.
- * Never throws: a box that keeps running its current binary is strictly better than one that doesn't.
- */
-async function reconcileSelfUpdateAtStartup(currentVersion: string): Promise<void> {
-  const binaryPath = selfBinaryPath();
-  if (!binaryPath) return; // dev/source run — nothing self-updates
-  try {
-    const existing = await readMarker(binaryPath);
-    // Count THIS boot before deciding, so the crash-loop budget is measured across relaunches.
-    const marker = existing ? { ...existing, boots: existing.boots + 1 } : null;
-    const action = decideStartupAction(marker, currentVersion);
-    if (action.kind === "rollback") {
-      logError(
-        `self-update to ${action.marker.targetVersion} has booted ${action.marker.boots} times without staying up — rolling back to ${action.marker.previousVersion}`,
-      );
-      const rolledBack = await rollbackToBackup(binaryPath);
-      await clearMarker(binaryPath);
-      if (rolledBack) {
-        log(`rolled back to the previous agent binary; exiting for systemd to relaunch it`);
-        setTimeout(() => process.exit(0), 100);
-        // Block here so we don't go on to dial the server as the doomed binary.
-        await new Promise(() => {});
-      } else {
-        logError(`no ${binaryPath}.bak to roll back to — continuing on the current binary`);
-      }
-      return;
-    }
-    if (action.kind === "commit") {
-      // Persist the incremented boot count now, so a crash before the stable timer still counts.
-      await writeMarker(binaryPath, action.marker).catch(() => {});
-      log(
-        `running freshly self-updated agent ${currentVersion} (boot ${action.marker.boots}/${MAX_UNSTABLE_BOOTS}); will commit after ${Math.round(STABLE_UPTIME_MS / 1000)}s uptime`,
-      );
-      setTimeout(() => {
-        void writeMarker(binaryPath, { ...action.marker, committed: true })
-          .then(() => clearMarker(binaryPath)) // committed: drop the marker AND the backup below
-          .then(() => rm(`${binaryPath}.bak`, { force: true }).catch(() => {}))
-          .then(() => log(`self-update to ${currentVersion} committed — stable for ${Math.round(STABLE_UPTIME_MS / 1000)}s`))
-          .catch(() => {});
-      }, STABLE_UPTIME_MS).unref?.();
-      return;
-    }
-    // kind "none": a stale marker (already committed, or for a version we are not running) — clear it.
-    if (existing) await clearMarker(binaryPath);
-  } catch (err) {
-    logError(`self-update startup reconcile failed (continuing): ${(err as Error).message}`);
-  }
-}
-
 async function main(): Promise<void> {
-  // POL-160 — the self-update self-check runs `<binary> --version`, so answer it before anything else
-  // (no server dial, no backend probe): print just the version and exit 0. A truncated or wrong-arch
-  // binary cannot get here, which is exactly what makes the check a real gate on the swap.
+  // `polyptic-agent --version` prints the compiled-in version and exits — handy for confirming which
+  // agent a baked image or a box on the bench is actually running (no server dial, no backend probe).
   if (process.argv[2] === "--version" || process.argv[2] === "version") {
     process.stdout.write(`${readAgentVersion()}\n`);
     process.exit(0);
@@ -1218,10 +1042,6 @@ async function main(): Promise<void> {
   const machineId = readMachineId();
   const connector = resolveConnector();
   const agentVersion = readAgentVersion();
-  // POL-160 — before dialling: if we are a binary that just self-updated, either let it prove itself
-  // (and commit) or roll back a binary that keeps crashing. Runs first so a doomed binary rolls back
-  // rather than reconnecting and re-triggering the same bad swap.
-  await reconcileSelfUpdateAtStartup(agentVersion);
   const backend = selectBackend();
   // Prefer the compositor's REAL outputs over a guessed default (unless explicitly overridden). A
   // real backend whose compositor isn't up yet advertises ZERO outputs — no phantom screen (POL-9).

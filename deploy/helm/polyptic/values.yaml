@@ -600,6 +600,19 @@ imageUpdates:
   # which rolls the fleet back to it. Each retained build costs ~600MB of root
   # image on the depot volume — raise netboot.persistence.size if you raise this.
   retainBuilds: 3
+  # POL-165 — AUTO FULL REBUILD ON A NEW AGENT VERSION. The agent is baked into
+  # the OS image, so an agent-code fix reaches the fleet only on a full image
+  # rebuild + reboot — a plain `helm upgrade` re-bakes the boot medium, not the
+  # image. With this ON (the default), when the server bundles a NEWER agent than
+  # the depot image baked, it auto-triggers ONE full rebuild at startup — no
+  # operator click — and publishes it urgent, so the update-poll (POL-41) reboots
+  # the boxes onto the new agent. The whole "a shipped fix reaches the fleet with
+  # no manual step" path. HONEST COST: a full rebuild is HEAVY and SLOW (~15 min
+  # native, far longer under emulation). It fires ONLY on an actual agent-version
+  # CHANGE — a pod restart at the same version does nothing — so in practice it
+  # runs once per release. Set false on clusters that would rather rebuild by hand
+  # (Console ▸ Settings ▸ Onboard Screens ▸ Full rebuild).
+  autoRebuildOnVersionChange: true
   # Base ISO used ONLY to source the signed EFI System Partition for the
   # DOWNLOADABLE live ISO — the netboot image is built from ubuntu-base and needs
   # no ISO at all. Empty derives the official Ubuntu live-server URL from

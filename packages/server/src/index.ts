@@ -38,7 +38,6 @@ import { createMediaProber } from "./media-probe";
 import { createDocumentConverter } from "./document-convert";
 import { DocumentJobs } from "./documents";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
-import { AgentUpdateService } from "./agent-update";
 import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
@@ -604,13 +603,9 @@ if (agentMtlsEnv.enabled) {
   }
 }
 
-// POL-160 — the depot config (where the prebuilt agent binaries live) is needed both here, to decide
-// self-updates on the agent channel, and below for the provisioning routes. Built once, ahead of the
-// WS attach, and reused for registerProvisionRoutes.
+// The depot config (where the netboot artifacts live) is built once here and reused below for the
+// provisioning routes and the image-update service.
 const provisionConfig = provisionConfigFromEnv();
-// The runtime agent self-updater: it serves `BUILD_VERSION`'s binary, so a box on an older agent is
-// told to pull `/dist/agent/<arch>` and re-exec — no full image rebuild, no reboot (POL-160).
-const agentUpdate = new AgentUpdateService(provisionConfig.agentDistDir, BUILD_VERSION, fastify.log);
 
 // The WS channels attach first so the remote-shell relay (POL-59) exists before REST — the
 // arm/disarm endpoint closes a box's live sessions the instant it is disarmed.
@@ -633,7 +628,6 @@ const shellRelay = attachWebSockets({
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
   agentMtls: agentMtlsChannel,
-  agentUpdate,
 });
 shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
 registerRestRoutes(
@@ -713,7 +707,7 @@ registerAgentSecurityRoutes(fastify, {
 registerMediaServeRoute(fastify, media);
 // TOP-LEVEL, UNGATED provisioning routes (the netboot depot + GET /dist/agent/:arch) — NOT /api/v1,
 // so a machine with no operator session can boot and enrol entirely from the server.
-// (provisionConfig was built above, ahead of the WS attach, so the agent self-updater could share it.)
+// (provisionConfig was built above, ahead of the WS attach, and is shared by the routes below.)
 
 // POL-92 — cumulative counters for /metrics (depot artifact fetches). Held here, incremented by the
 // routes that serve the artifacts, rendered by the ops exporter.
@@ -741,8 +735,15 @@ const imageUpdates = new ImageUpdates(
     activity.push(severity, text);
     broadcaster.broadcast();
   },
+  // POL-165 — the agent version THIS server bundles (== BUILD_VERSION, the binary it serves at
+  // /dist/agent/<arch>), so the startup auto-rebuild can tell whether the depot image already carries it.
+  BUILD_VERSION,
+  // POL-165 — auto-rebuild the image when the bundled agent is newer than the depot's (default on).
+  // Off (IMAGE_AUTO_REBUILD_ON_VERSION_CHANGE=false) leaves the operator to click Full rebuild.
+  (process.env.IMAGE_AUTO_REBUILD_ON_VERSION_CHANGE?.trim() || "true") !== "false",
 );
-// Starts the schedule ticker AND, on a depot with no image at all, the one-shot first-image build.
+// Starts the schedule ticker AND, on startup: the one-shot first-image build on an empty depot
+// (POL-121), and the auto full rebuild when this server bundles a newer agent than the depot (POL-165).
 imageUpdates.start();
 
 // Pass the live enrollment singleton so GET /boot/grub.cfg (POL-33/D47) bakes the CURRENT token, the

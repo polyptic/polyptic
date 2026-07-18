@@ -671,6 +671,9 @@ export class PostgresStore implements Store {
     // POL-105: the staged roll-out rings (selector → build). jsonb for the same reason as machine
     // tags: a small ordered list, always read whole, only ever replaced whole.
     await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS rings jsonb NOT NULL DEFAULT '[]'::jsonb`;
+    // POL-165: the agent version baked into the current published image, stamped on each successful
+    // full rebuild — the baseline the startup auto-rebuild compares the server's bundled agent to.
+    await sql`ALTER TABLE image_rollout ADD COLUMN IF NOT EXISTS image_agent_version text`;
     // Display settings (POL-6): a single row holding the fleet-wide on-screen badge toggle. Absent
     // until an operator first changes it — the control plane falls back to its env default (prod off,
     // dev on) until then, so the row is written on the first mutation, not on migrate.
@@ -1823,8 +1826,9 @@ export class PostgresStore implements Store {
         last_build_status: string | null;
         last_build_log: string | null;
         last_build_kind: string | null;
+        image_agent_version: string | null;
       }[]
-    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind FROM image_rollout WHERE id = 1 LIMIT 1`;
+    >`SELECT schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind, image_agent_version FROM image_rollout WHERE id = 1 LIMIT 1`;
     const row = rows[0];
     if (!row) return undefined;
     const status = row.last_build_status;
@@ -1845,14 +1849,15 @@ export class PostgresStore implements Store {
       lastBuildStatus: status === "running" || status === "success" || status === "failure" ? status : null,
       lastBuildLog: row.last_build_log,
       lastBuildKind: kind === "refresh" || kind === "full" ? kind : null,
+      imageAgentVersion: row.image_agent_version ?? null,
     };
   }
 
   async setImageRollout(rollout: PersistedImageRollout): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind)
-      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${sql.json(rollout.rings ?? [])}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind})
+      INSERT INTO image_rollout (id, schedule_enabled, schedule_time, full_schedule_enabled, full_schedule_day, full_schedule_time, urgent, first_build_at, rings, last_build_started_at, last_build_finished_at, last_build_status, last_build_log, last_build_kind, image_agent_version)
+      VALUES (1, ${rollout.scheduleEnabled}, ${rollout.scheduleTime}, ${rollout.fullScheduleEnabled}, ${rollout.fullScheduleDay}, ${rollout.fullScheduleTime}, ${rollout.urgent}, ${rollout.firstBuildAt}, ${sql.json(rollout.rings ?? [])}, ${rollout.lastBuildStartedAt}, ${rollout.lastBuildFinishedAt}, ${rollout.lastBuildStatus}, ${rollout.lastBuildLog}, ${rollout.lastBuildKind}, ${rollout.imageAgentVersion ?? null})
       ON CONFLICT (id) DO UPDATE SET
         schedule_enabled = EXCLUDED.schedule_enabled,
         schedule_time = EXCLUDED.schedule_time,
@@ -1868,7 +1873,8 @@ export class PostgresStore implements Store {
         last_build_finished_at = EXCLUDED.last_build_finished_at,
         last_build_status = EXCLUDED.last_build_status,
         last_build_log = EXCLUDED.last_build_log,
-        last_build_kind = EXCLUDED.last_build_kind
+        last_build_kind = EXCLUDED.last_build_kind,
+        image_agent_version = EXCLUDED.image_agent_version
     `;
   }
 

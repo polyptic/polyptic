@@ -33,6 +33,61 @@ import type { ImageRing } from "@polyptic/protocol";
 
 import type { PersistedImageRollout, Store } from "./store/types";
 
+/**
+ * POL-165 — is `candidate` a STRICTLY NEWER version than `current`? A dotted numeric compare
+ * (`0.2.42` > `0.2.41`); any non-numeric segment (a `-rc1` suffix, a git sha) counts as 0, so a
+ * pre-release never reads as newer than its release, and equal versions return false. Server-local:
+ * the only version comparison left in the tree is this one, deciding whether the bundled agent is
+ * ahead of the depot image's baked agent (the runtime self-update that once shared a protocol-level
+ * guard was removed in POL-165).
+ */
+function versionParts(v: string): number[] {
+  return v
+    .trim()
+    .split(/[.\-+]/)
+    .map((s) => {
+      const n = Number.parseInt(s, 10);
+      return Number.isFinite(n) ? n : 0;
+    });
+}
+export function isNewerVersion(candidate: string, current: string): boolean {
+  const a = versionParts(candidate);
+  const b = versionParts(current);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false; // equal — nothing to do
+}
+
+/** A dev/unstamped server bundles no real agent (`0.0.0`, or empty), so the whole auto-rebuild
+ *  feature is inert without a single extra guard at each call site. */
+function isRealVersion(v: string): boolean {
+  const t = v.trim();
+  return t.length > 0 && t !== "0.0.0";
+}
+
+/**
+ * POL-165 — the startup decision: given the agent version the SERVER bundles and the one baked into
+ * the depot's current image, should we auto-rebuild? Pure, so the load-bearing rule ("fire ONLY on a
+ * real version delta — a restart at the SAME version must NOT rebuild") is unit-pinned directly.
+ *
+ *   - `rebuild`  the server's agent is strictly newer than the depot image's → rebuild once.
+ *   - `current`  they match (or the depot is ahead) → do nothing; a plain restart lands here.
+ *   - `baseline` the depot's baked version is unknown (an image built before this feature, or by an
+ *                external Job) → we cannot prove a delta, so we DON'T rebuild; the caller adopts the
+ *                served version as the baseline so the NEXT real bump fires correctly.
+ */
+export function decideVersionRebuild(
+  servedVersion: string,
+  depotAgentVersion: string | null,
+): "rebuild" | "current" | "baseline" {
+  if (depotAgentVersion === null || depotAgentVersion.trim() === "") return "baseline";
+  return isNewerVersion(servedVersion, depotAgentVersion) ? "rebuild" : "current";
+}
+
 /** The hook runs from the REPO ROOT (…/packages/server/src → repo), so `deploy/…` paths in
  *  IMAGE_REBUILD_CMD work regardless of the server process's own cwd (the dev stack runs from
  *  packages/server; found live when the first hook run failed with "No such file or directory"). */
@@ -59,15 +114,18 @@ export const IMAGE_ROLLOUT_DEFAULTS: PersistedImageRollout = {
   lastBuildStatus: null,
   lastBuildLog: null,
   lastBuildKind: null,
+  imageAgentVersion: null,
 };
 
 /** The two update cycles: the daily in-place apt refresh (kernel held, ~2 min) and the weekly full
  *  rebuild from the base ISO (kernel + everything, ~15 min) — the one that rolls kernel CVEs. */
 export type RebuildKind = "refresh" | "full";
 
-/** Who asked for a build: the schedule, the operator's button, or the FIRST-IMAGE bootstrap — the
- *  one-shot full build the server fires at startup when a fresh install's depot is empty (POL-121). */
-export type RebuildTrigger = "schedule" | "manual" | "bootstrap";
+/** Who asked for a build: the schedule, the operator's button, the FIRST-IMAGE bootstrap (the one-shot
+ *  full build the server fires at startup when a fresh install's depot is empty, POL-121), or the
+ *  VERSION auto-rebuild (POL-165: the server bundles a newer agent than the depot image baked, so it
+ *  rebuilds once at startup — no operator click — to get the new agent onto the fleet). */
+export type RebuildTrigger = "schedule" | "manual" | "bootstrap" | "version";
 
 /** How the control plane says something out loud — the Live Activity feed (D25). Optional: an
  *  ImageUpdates without one still builds, it just does so silently. */
@@ -144,6 +202,14 @@ export class ImageUpdates {
      *  operator MUST know about — a fresh install cannot netboot anything until it lands — so it
      *  narrates itself into the console's feed rather than only a Job log. */
     private readonly announce: Announce = () => {},
+    /** POL-165 — the agent version THIS server bundles (== `BUILD_VERSION`, the binary it serves at
+     *  `/dist/agent/<arch>`). Compared against the depot image's baked agent to decide the startup
+     *  auto-rebuild. A dev `0.0.0` makes the feature inert. */
+    private readonly servedVersion: string = "0.0.0",
+    /** POL-165 — auto-rebuild the image at startup when the bundled agent is newer than the depot's
+     *  (default on: "rebuilding after every release should be the default"). Off = the operator must
+     *  click Full rebuild for a new agent to reach the fleet. */
+    private readonly autoRebuildOnVersionChange: boolean = true,
   ) {}
 
   /** The persisted state, with defaults before the first mutation. */
@@ -603,6 +669,18 @@ export class ImageUpdates {
       lastBuildStatus: status,
       lastBuildLog: tail,
       lastBuildKind: kind,
+      // POL-165 — a FULL rebuild re-bakes the agent binary into the image (the daily refresh only
+      // apt-upgrades userspace), so a successful full build stamps the version this server bundled as
+      // the depot image's new baked-agent baseline. That is exactly what the startup auto-rebuild
+      // reads to decide "does the depot already carry my agent?". A dev/unstamped server leaves it be.
+      ...(status === "success" && kind === "full" && isRealVersion(this.servedVersion)
+        ? { imageAgentVersion: this.servedVersion }
+        : {}),
+      // POL-165 — the AUTO version-rebuild publishes URGENT so the existing update-poll (POL-41)
+      // reboots boxes onto the new image within minutes: rebuild + urgent + poll = the new agent
+      // reaches the fleet with zero manual steps, the whole point of the auto path. A manual/scheduled
+      // build leaves the operator's urgency switch untouched.
+      ...(status === "success" && trigger === "version" ? { urgent: true } : {}),
     };
     await this.store.setImageRollout(finished);
     // The hook writes the new artifacts to the arch root and stamps image-id.txt; take a retained
@@ -635,6 +713,22 @@ export class ImageUpdates {
         this.announce(
           "bad",
           "First OS image build failed — screens cannot netboot until an image exists. Retry from Onboard Screens ▸ ⋯ ▸ Full rebuild",
+        );
+      }
+    }
+    // POL-165 — the AUTO version-rebuild also narrates itself: the operator did not click it, so the
+    // feed is where they learn a new release auto-rebuilt the image (and, on success, that boxes are
+    // now rebooting onto the new agent). A failure keeps the fleet on the old agent — say so.
+    if (trigger === "version") {
+      if (status === "success" && manifests.length > 0) {
+        this.announce(
+          "good",
+          `Auto-rebuilt the OS image for agent ${this.servedVersion} — boxes reboot onto the new agent within minutes`,
+        );
+      } else {
+        this.announce(
+          "bad",
+          `Auto-rebuild for agent ${this.servedVersion} failed — the fleet stays on the previous agent until a rebuild succeeds (retry from Onboard Screens ▸ ⋯ ▸ Full rebuild)`,
         );
       }
     }
@@ -699,6 +793,69 @@ export class ImageUpdates {
   }
 
   /**
+   * POL-165 — AUTO-REBUILD ON A NEW AGENT VERSION. The agent binary is baked into the netboot image,
+   * so an agent-code fix reaches a box only on a FULL image rebuild + reboot — but a plain `helm
+   * upgrade` re-bakes the boot medium, not the image, so a shipped fix used to sit on the server and
+   * never reach the fleet (v0.2.41 shipped, every box stayed on 0.2.40). The old answer was a runtime
+   * self-update (POL-160/D151); the operator's call (POL-165) is to drop that and instead REBUILD THE
+   * IMAGE automatically whenever the server bundles a newer agent than the depot image baked, and let
+   * the existing urgent-manifest + update-poll (POL-41) reboot the boxes onto it — one predictable
+   * path, no in-place binary swap.
+   *
+   * A sibling to {@link bootstrapFirstImage}, run right after it in {@link start}'s chain: empty depot
+   * → first build (that one); non-empty depot whose image baked an OLDER agent than this server bundles
+   * → rebuild once (this one). The guardrails matter because a full rebuild is heavy (and slow under
+   * emulation):
+   *  - REAL DELTA ONLY. The decision is {@link decideVersionRebuild} over the served version and the
+   *    depot's stamped baked-agent version; a plain restart at the SAME version lands on `current` and
+   *    does nothing. Never fires on pod churn.
+   *  - UNKNOWN BASELINE IS ADOPTED, NOT REBUILT. An image built before this feature (or by an external
+   *    Job) carries no stamped version; we cannot prove a delta, so we DON'T rebuild — we record the
+   *    served version as the baseline so the NEXT real bump fires. (One-time; the operator can force a
+   *    rebuild by hand if they know the pre-feature image is stale.)
+   *  - EMPTY DEPOT IS NOT OURS. {@link bootstrapFirstImage} owns that; we no-op so the two never race.
+   *  - OPERATOR'S SWITCH + DEV. `autoRebuildOnVersionChange` off, or a dev `0.0.0` server, or no
+   *    `IMAGE_FULL_REBUILD_CMD` → never.
+   */
+  async bootstrapVersionRebuild(): Promise<void> {
+    if (!this.autoRebuildOnVersionChange) return; // operator opted out of auto-rebuild
+    if (!isRealVersion(this.servedVersion)) return; // dev/unstamped server: the feature is inert
+    if (!this.fullRebuildConfigured) return; // nothing to rebuild WITH (laptop/dev server)
+
+    const st = await this.state();
+    if (this.running || st.lastBuildStatus === "running") return; // a build is in flight (e.g. bootstrap)
+    if ((await this.manifests()).length === 0) return; // empty depot — bootstrapFirstImage's job, not ours
+
+    const decision = decideVersionRebuild(this.servedVersion, st.imageAgentVersion);
+    if (decision === "current") return; // depot already carries this agent (or is ahead) — the restart no-op
+
+    if (decision === "baseline") {
+      // An image whose baked agent we cannot know (pre-feature, or an external Job). Adopt the served
+      // version as the baseline WITHOUT rebuilding — we have no proven delta, and a full rebuild on
+      // every unknown depot would be a build storm. The next genuine version bump then fires.
+      await this.store.setImageRollout({ ...st, imageAgentVersion: this.servedVersion });
+      this.log.warn(
+        { event: "image.rebuild.auto.baseline", servedVersion: this.servedVersion },
+        "the depot image has no recorded baked-agent version — adopting the server's version as the baseline without rebuilding; the next agent-version change will auto-rebuild",
+      );
+      return;
+    }
+
+    // decision === "rebuild": the server bundles a newer agent than the depot image baked. Rebuild the
+    // full image once (which re-bakes the agent), publish it URGENT on success, and let the update-poll
+    // reboot the fleet onto it — the whole "a deployed fix reaches the fleet with no click" path.
+    this.log.warn(
+      { event: "image.rebuild.auto", from: st.imageAgentVersion, to: this.servedVersion },
+      `the server bundles agent ${this.servedVersion} but the depot image baked ${st.imageAgentVersion} — auto-rebuilding the OS image so the new agent reaches the fleet (no operator click)`,
+    );
+    this.announce(
+      "warn",
+      `New agent ${this.servedVersion} shipped — auto-rebuilding the OS image (the depot baked ${st.imageAgentVersion}); boxes reboot onto it when it lands`,
+    );
+    await this.trigger("version", "full");
+  }
+
+  /**
    * POL-161 — RECONCILE A STALE BUILD ON STARTUP. `trigger()` persists `lastBuildStatus: "running"`
    * before spawning the hook and only closes the row out in a completion continuation. If the pod
    * restarts while a build is in flight — exactly what a `helm upgrade` does — that continuation
@@ -736,11 +893,15 @@ export class ImageUpdates {
     // Fold a pre-POL-45 depot (artifacts loose at the arch root) into builds/ so history starts
     // with whatever is already published, rather than staying empty until the next rebuild. Then
     // reconcile a build left stuck "running" by a restart mid-build (POL-161) BEFORE bootstrap reads
-    // the status, and finally — on a depot that has NOTHING to fold because nothing was ever built —
-    // fire the one-shot first-image build (POL-121). All async: the server serves while this runs.
+    // the status; then — on a depot that has NOTHING to fold because nothing was ever built — fire the
+    // one-shot first-image build (POL-121); and finally, on a NON-empty depot whose image baked an
+    // older agent than this server bundles, auto-rebuild it once (POL-165). All async: the server
+    // serves while this runs. bootstrapFirstImage claims a build when the depot is empty, so the
+    // version-rebuild that follows sees `running` and stands down — the two never both build.
     void this.retain()
       .then(() => this.reconcileStaleBuild())
       .then(() => this.bootstrapFirstImage())
+      .then(() => this.bootstrapVersionRebuild())
       .catch((err) => {
         this.log.error({ event: "image.bootstrap.error", err: (err as Error).message }, "first-image bootstrap failed");
       });

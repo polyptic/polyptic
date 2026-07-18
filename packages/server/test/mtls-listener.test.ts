@@ -31,7 +31,6 @@ import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 import { attachWebSockets } from "../src/ws";
 import type { AgentMtlsChannel } from "../src/ws";
-import { AgentUpdateService } from "../src/agent-update";
 import type { AuthService } from "../src/auth-local";
 
 const x509 = await import("@peculiar/x509");
@@ -261,7 +260,6 @@ async function buildStack(require_: boolean): Promise<Stack> {
     log: noopLog,
     allowedOrigins: [],
     agentMtls,
-    agentUpdate: new AgentUpdateService("/nonexistent-agent-dist", "0.0.0", noopLog),
   });
 
   return {

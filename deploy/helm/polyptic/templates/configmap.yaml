@@ -108,4 +108,10 @@ data:
   # ACTIVE image from the console, which is how a fleet rolls back. Each costs
   # ~2GB on the depot PVC — size netboot.persistence.size to match.
   IMAGE_RETAIN_BUILDS: {{ .Values.imageUpdates.retainBuilds | quote }}
+  # POL-165 — auto full rebuild on a new agent version. When the server bundles a
+  # newer agent than the depot image baked, it rebuilds the image once at startup
+  # (no operator click) and publishes it urgent, so the update-poll reboots boxes
+  # onto the new agent. Fires ONLY on a real version change, never on a plain
+  # restart. Default on ("rebuild after every release"); false opts out.
+  IMAGE_AUTO_REBUILD_ON_VERSION_CHANGE: {{ .Values.imageUpdates.autoRebuildOnVersionChange | quote }}
   {{- end }}
