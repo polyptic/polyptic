@@ -83,7 +83,7 @@ export interface CompositorLauncherParams {
  *  2. Empirical hardware/software render selection → renders on GPUs with no working 3D (a QEMU/UTM
  *     virtio-gpu without virgl renders one frame then crashes) WITHOUT handicapping real GPUs. We
  *     do NOT force software rendering unconditionally — CPU-only rendering would cripple a real GPU
- *     wall. `auto` probes /sys/class/drm AT BOOT on the box itself (POL-169/D156 — setup may run in
+ *     wall. `auto` probes /sys/class/drm AT BOOT on the box itself (POL-169/D158 — setup may run in
  *     an image-build chroot whose /sys is the build machine's, and a bake-time probe once pinned the
  *     whole fleet to software): a virtual GPU pins software immediately, a real/unknown one starts
  *     on hardware with the crash timer as backstop.
@@ -141,7 +141,7 @@ log() { echo "polyptic-compositor: \$*" >&2; }
 
 # POL-169: \`auto\` probes the GPU HERE, at boot, on the box that owns the pixels — never at setup
 # time. Setup runs inside the image-build chroot, whose /sys is the BUILD machine's (a VM), and a
-# bake-time probe pinned the entire fleet's images to software rendering on real GPUs (D156).
+# bake-time probe pinned the entire fleet's images to software rendering on real GPUs (D158).
 # Mirrors setup's old detectVirtualGpu: any real-GPU driver → hardware-first (the crash-fallback
 # below still guards the truly broken); else a virtual driver/vendor → software immediately (a
 # virtio-gpu's GLES compositor can SURVIVE, so the crash timer alone would miss it); else hardware.

@@ -96,7 +96,7 @@ describe("corePackages — the cast set ships with wayland-sway only (POL-119)",
   });
 });
 
-describe("compositorLauncher — auto probes the GPU at boot, never at bake (POL-169/D156)", () => {
+describe("compositorLauncher — auto probes the GPU at boot, never at bake (POL-169/D158)", () => {
   const script = compositorLauncher({
     backend: "wayland-sway",
     sessionCommand: "sway",

@@ -99,15 +99,20 @@ exit 0
 EOF
 
 # curl stub: records every request; -o writes a fake payload; POSTs are appended to $STUB/posts.
+# GET failure knobs (POL-168): $STUB/curl_fails → every GET fails; $STUB/curl_fails_n → the NEXT n
+# GETs fail then succeed (the boot-time DNS hiccup the pre-flight exists for); $STUB/curl_exit → the
+# exit code those failures carry (default 22, curl's -f HTTP-error code; 6 = could not resolve);
+# $STUB/curl_http_code → what a failing depot answers to a `-w '%{http_code}'` probe.
 cat > "$BIN/curl" <<'EOF'
 #!/bin/sh
-out=""; url=""; post=""; body=""; auth=""
+out=""; url=""; post=""; body=""; auth=""; wantw=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) shift; out="$1" ;;
     -X) shift; [ "$1" = POST ] && post=1 ;;
     --data-binary) shift; body="$1" ;;
     -H) shift; case "$1" in Authorization:*) auth="$1" ;; esac ;;
+    -w) shift; wantw=1 ;;
     -m) shift ;;
     -*) ;;
     *) url="$1" ;;
@@ -115,7 +120,18 @@ while [ $# -gt 0 ]; do
   shift
 done
 if [ -n "$post" ]; then printf '%s\t%s\t%s\n' "$url" "$auth" "$body" >> "$STUB/posts"; exit 0; fi
-[ -f "$STUB/curl_fails" ] && exit 22
+if [ -f "$STUB/curl_fails_n" ]; then
+  n="$(cat "$STUB/curl_fails_n" 2>/dev/null || echo 0)"
+  if [ "$n" -gt 0 ] 2>/dev/null; then
+    printf '%s\n' "$((n - 1))" > "$STUB/curl_fails_n"
+    printf 'MISS %s\n' "$url" >> "$STUB/attempts"
+    exit "$(cat "$STUB/curl_exit" 2>/dev/null || echo 22)"
+  fi
+fi
+if [ -f "$STUB/curl_fails" ]; then
+  if [ -n "$wantw" ] && [ -f "$STUB/curl_http_code" ]; then cat "$STUB/curl_http_code"; exit 0; fi
+  exit "$(cat "$STUB/curl_exit" 2>/dev/null || echo 22)"
+fi
 printf '%s\n' "fake-payload-of $url" >> "$STUB/fetched"
 [ -n "$out" ] && printf 'SIGNED-EFI-BINARY\n' > "$out"
 exit 0
@@ -149,6 +165,19 @@ rm -f "$1" 2>/dev/null; mkdir -p "$1" 2>/dev/null; exit 0
 EOF
 printf '#!/bin/sh\nexit 1\n' > "$BIN/mountpoint"      # never "already mounted"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/plymouth"
+# sleep stub (POL-167/POL-168): every hold and every pre-flight beat lands here, so no test ever
+# waits real time. The FIRST call snapshots whether the status file already existed — the
+# write-status-THEN-hold ordering fail() promises. $STUB/sleep_kills makes the forever-hold
+# observable: instead of sleeping we kill the script, standing in for the operator's power-cycle.
+cat > "$BIN/sleep" <<'EOF'
+#!/bin/sh
+if [ ! -f "$STUB/sleep_probe" ]; then
+  if [ -f "$STUB/run/bootloader-status" ]; then s=yes; else s=no; fi
+  printf 'status_at_hold=%s\n' "$s" > "$STUB/sleep_probe"
+fi
+if [ -f "$STUB/sleep_kills" ]; then kill "$PPID" 2>/dev/null; exit 1; fi
+exit 0
+EOF
 # The POL-63 Wi-Fi payload path: `ip route show default` decides payload-vs-pointer, `df -Pk` is the
 # ESP space check, `blkid` backs find-boot-medium's scan.
 cat > "$BIN/ip" <<'EOF'
@@ -192,7 +221,8 @@ offload() {
   STUB="$d" PATH="$BIN:$PATH" \
   POLYPTIC_CMDLINE_FILE="$d/cmdline" POLYPTIC_EFI_DIR="$d/efi" POLYPTIC_SYS_BLOCK="$d/sysblock" \
   POLYPTIC_RUN_DIR="$d/run" POLYPTIC_OFFLOAD_STAMP="$d/var/offloaded" POLYPTIC_LIB_DIR="$LIB" \
-  POLYPTIC_CONSOLE="$d/console" POLYPTIC_HOLD_SECONDS=0 POLYPTIC_HOLD_SECONDS_OK=0 \
+  POLYPTIC_CONSOLE="$d/console" POLYPTIC_HOLD_SECONDS="${TEST_HOLD-0}" POLYPTIC_HOLD_SECONDS_OK=0 \
+  POLYPTIC_NET_WAIT_SECONDS="${TEST_NET_WAIT:-0}" POLYPTIC_NET_STEP_SECONDS=0 \
   POLYPTIC_BYLABEL_DIR="$d/by-label" POLYPTIC_NET_DIR="$d/netdir" \
   STUB_ARCH="${STUB_ARCH:-x86_64}" \
     sh "$LIB/offload.sh" 2>&1
@@ -326,12 +356,63 @@ eq "no esp: fails"                        "1" "$(exit_of "$out")"
 eq "no esp: code"                         "no-esp" "$(code_of "$d")"
 has "no esp: says nothing was erased"     "Nothing was erased" "$out"
 
-# ─── 11) The depot is unreachable: fail before touching the disk ────────────────────────────────────
-d="$(new_case no-loaders)"; : > "$d/curl_fails"
+# ─── 11) The depot answers an HTTP error: fail before touching the disk, naming the answer ──────────
+d="$(new_case no-loaders)"; : > "$d/curl_fails"; printf '404\n' > "$d/curl_http_code"
 out="$(offload "$d")"
 eq "no loaders: fails"                    "1" "$(exit_of "$out")"
 eq "no loaders: code"                     "no-loaders" "$(code_of "$d")"
 eq "no loaders: ESP untouched"            "" "$(ls "$d/esp")"
+has "no loaders: names the HTTP answer"   "answered HTTP 404" "$out"
+
+# ─── 11b) POL-168: a boot-time DNS hiccup is WAITED OUT, not fatal ──────────────────────────────────
+# The 2026-07-21 field failure: DNS not ready in the seconds after network-online.target, one
+# retry-less curl, install dead with `no-loaders` while the depot was healthy. The pre-flight probes
+# until the depot answers (three misses here, then a clean install).
+d="$(new_case preflight-hiccup)"; printf '3\n' > "$d/curl_fails_n"; printf '6\n' > "$d/curl_exit"
+TEST_NET_WAIT=60
+out="$(offload "$d")"
+TEST_NET_WAIT=""
+eq "preflight: hiccup then success"       "0" "$(exit_of "$out")"
+eq "preflight: install completed"         "installed" "$(code_of "$d")"
+has "preflight: says it is waiting"       "Waiting for the network to reach 10.0.0.10" "$out"
+eq "preflight: retried through the misses" "3" "$(grep -c '^MISS' "$d/attempts")"
+
+# A depot that NEVER answers (DNS/route dead, not an HTTP answer) gets the honest code, not
+# `no-loaders`: "could not reach" and "answered HTTP <code>" are different truck rolls.
+d="$(new_case depot-unreachable)"; : > "$d/curl_fails"; printf '6\n' > "$d/curl_exit"
+out="$(offload "$d")"
+eq "unreachable: fails"                   "1" "$(exit_of "$out")"
+eq "unreachable: code"                    "depot-unreachable" "$(code_of "$d")"
+has "unreachable: names the cause"        "could not reach the depot at 10.0.0.10" "$out"
+has "unreachable: reported to the control plane" '"code":"depot-unreachable"' "$(posted "$d")"
+eq "unreachable: ESP untouched"           "" "$(ls "$d/esp")"
+
+# ─── 11c) POL-167: a failure holds the boot; the hold is bounded ONLY by explicit override ──────────
+# The status file and the control-plane report land BEFORE the hold (the sleep stub snapshots the
+# status file the moment the first hold beat fires), the on-screen text carries code + detail + the
+# power-cycle instruction, and POLYPTIC_HOLD_SECONDS (the tests' 0, an operator's override) bounds
+# what is otherwise an infinite re-announcing loop.
+d="$(new_case hold-ordering)"; printf 'BOOT_IMAGE=/vmlinuz quiet splash polyptic.offload=1\n' > "$d/cmdline"
+TEST_HOLD=1
+out="$(offload "$d")"
+TEST_HOLD=0
+eq "hold: status written before the hold began" "status_at_hold=yes" "$(cat "$d/sleep_probe" 2>/dev/null)"
+has "hold: names the code on screen"      "INSTALL FAILED (no-base)" "$out"
+has "hold: tells the operator the way out" "power-cycle this screen to continue" "$out"
+eq "hold: bounded by the override, so it returned" "1" "$(exit_of "$out")"
+
+# The production default (POLYPTIC_HOLD_SECONDS unset) holds FOREVER: the loop's first sleep is made
+# to kill the script — standing in for the power-cycle — and that kill is the only way it ends.
+d="$(new_case hold-forever)"; printf 'BOOT_IMAGE=/vmlinuz quiet splash polyptic.offload=1\n' > "$d/cmdline"
+: > "$d/sleep_kills"
+TEST_HOLD=
+out="$(offload "$d")"
+TEST_HOLD=0
+case "$(exit_of "$out")" in
+  0|1) bad "forever hold: only a power-cycle ends it" "killed (not exit 0/1)" "$(exit_of "$out")" ;;
+  *)   ok "forever hold: only a power-cycle ends it" ;;
+esac
+has "forever hold: verdict stayed on screen" "power-cycle this screen to continue" "$out"
 
 # ─── 12) A cmdline with no control plane ────────────────────────────────────────────────────────────
 d="$(new_case no-base)"; printf 'BOOT_IMAGE=/vmlinuz quiet splash polyptic.offload=1\n' > "$d/cmdline"

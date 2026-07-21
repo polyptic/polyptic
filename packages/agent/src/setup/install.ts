@@ -90,7 +90,7 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   state.backend = opts.backend;
   state.installedAt = new Date().toISOString();
 
-  // The render mode is NOT resolved here (POL-169/D156). Setup may run inside an image-build
+  // The render mode is NOT resolved here (POL-169/D158). Setup may run inside an image-build
   // chroot whose /sys belongs to the BUILD machine — a bake-time GPU probe once pinned the whole
   // fleet's images to software rendering on real GPUs. An explicit --render is baked verbatim;
   // `auto` is baked as `auto`, and the compositor launcher probes /sys/class/drm at BOOT, on the

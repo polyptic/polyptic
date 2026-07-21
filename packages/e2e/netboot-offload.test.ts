@@ -53,6 +53,13 @@ describe("netboot offload: the unit must not launder a failure into success", ()
     expect(unit).toContain("Before=greetd.service");
     expect(unit).toContain("ConditionKernelCommandLine=polyptic.offload=1");
   });
+
+  test("TimeoutStartSec=infinity: the failure hold outlives systemd's default start timeout (POL-167)", () => {
+    // fail() holds the boot by never returning; without this, systemd kills the oneshot at ~90 s and
+    // greetd paints the kiosk over the verdict — the 2026-07-21 field failure, where `no-esp` looked
+    // exactly like a success once the wall came up.
+    expect(unit).toMatch(/^TimeoutStartSec=infinity$/m);
+  });
 });
 
 describe("netboot offload: the destructive-action contract", () => {
@@ -74,5 +81,15 @@ describe("netboot offload: the destructive-action contract", () => {
   test("the fleet token travels in a header, never in the reported body", () => {
     expect(script).toContain("Authorization: Bearer $token");
     expect(script).not.toMatch(/"token":/);
+  });
+
+  test("fail() records the outcome before the hold that never returns (POL-167)", () => {
+    // The forever-hold blocks the boot on purpose, so the status file and the control-plane report
+    // must already be on record when it starts — order in fail()'s body is the whole guarantee.
+    const failBody = script.slice(script.indexOf("fail() {"));
+    const report = failBody.indexOf("report false");
+    const hold = failBody.indexOf("hold_failure");
+    expect(report).toBeGreaterThan(-1);
+    expect(hold).toBeGreaterThan(report);
   });
 });
