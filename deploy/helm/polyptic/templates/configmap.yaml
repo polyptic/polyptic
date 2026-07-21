@@ -4,6 +4,7 @@ metadata:
   name: {{ include "polyptic.configMapName" . }}
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 data:
   # Non-secret server configuration (mirrors deploy/.env.example).
   PORT: {{ .Values.containerPort | quote }}

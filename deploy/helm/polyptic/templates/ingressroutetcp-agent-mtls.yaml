@@ -24,6 +24,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}-agent-mtls
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   entryPoints:
     - {{ .Values.agentMtls.ingressRouteTCP.entryPoint }}

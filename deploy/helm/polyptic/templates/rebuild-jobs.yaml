@@ -99,6 +99,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}-rebuild-jobs
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 data:
   {{- /* One refresh + full Job spec PER ARCH (POL-75). Per-arch: the depot dir, the build arch, and
          — unless emulating — a kubernetes.io/arch nodeSelector. Under emulation the pin is dropped so

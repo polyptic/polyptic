@@ -14,6 +14,7 @@ metadata:
   name: {{ include "polyptic.depot.pvcName" . }}
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
   annotations:
     helm.sh/resource-policy: keep
 spec:

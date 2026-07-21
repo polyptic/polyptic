@@ -34,6 +34,7 @@ metadata:
   name: letsencrypt
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   acme:
     server: {{ ternary "https://acme-staging-v02.api.letsencrypt.org/directory" "https://acme-v02.api.letsencrypt.org/directory" .Values.letsEncrypt.staging }}
@@ -51,6 +52,7 @@ metadata:
   name: {{ $secretName }}
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   secretName: {{ $secretName }}
   privateKey:

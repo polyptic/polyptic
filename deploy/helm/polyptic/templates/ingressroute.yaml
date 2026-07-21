@@ -20,6 +20,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   entryPoints:
     {{- toYaml .Values.ingressRoute.entryPoints | nindent 4 }}
@@ -51,6 +52,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}-boot
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   entryPoints:
     {{- toYaml .Values.ingressRoute.bootEntryPoints | nindent 4 }}

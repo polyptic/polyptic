@@ -4,6 +4,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}

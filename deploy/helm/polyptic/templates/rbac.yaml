@@ -12,6 +12,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}-image-updates
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
@@ -29,6 +30,7 @@ metadata:
   name: {{ include "polyptic.fullname" . }}-image-updates
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

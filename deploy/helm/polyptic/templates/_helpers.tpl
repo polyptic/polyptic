@@ -40,9 +40,14 @@ helm.sh/chart: {{ include "polyptic.chart" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/component: server
 app.kubernetes.io/part-of: polyptic
 {{- end }}
+{{/*
+NOTE (POL-166): app.kubernetes.io/component is deliberately NOT part of these common labels.
+Each template sets its own `app.kubernetes.io/component:` line next to the include — a component
+here plus a per-resource override produced DUPLICATE keys in the rendered YAML, which plain helm
+tolerates (last key wins) but kustomize/flux's strict parser rejects.
+*/}}
 
 {{/*
 Selector labels.
