@@ -20,6 +20,7 @@ import type {
   Geometry,
   HostIdentity,
   ImageRing,
+  MachineBootPath,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -54,6 +55,12 @@ export interface PersistedMachine {
    *  like the vitals ring) because the box a roll-out stranded is the box that is now offline. */
   imageId?: string;
   imageIdAt?: string;
+  /** POL-171 — the boot chain this box last reported (`wired` | `local-fallback` | `local-wifi`),
+   *  when, and the sentence it composed ("image pinned at …"). Persisted for the same reason
+   *  imageId is: the box on the fallback is exactly the box a rebuild is silently missing. */
+  bootPath?: MachineBootPath;
+  bootPathAt?: string;
+  bootPathDetail?: string;
   /** POL-104 — the box's physical identity as it last reported it (MACs / DMI serial / arch). Kept on
    *  the ROW, not just in presence, so a pending card is informative while the box is offline. */
   hardware?: HostIdentity;
@@ -517,6 +524,8 @@ export interface Store {
   setMachineTags(id: string, tags: string[]): Promise<void>;
   /** POL-105 — record the OS image id a box reported BOOTING, and when. No-op if absent. */
   setMachineImage(id: string, imageId: string, at: string): Promise<void>;
+  /** POL-171 — record the boot chain a box reported coming up through. No-op if absent. */
+  setMachineBootPath(id: string, path: MachineBootPath, at: string, detail: string): Promise<void>;
   /**
    * Permanently forget a machine: delete its row AND cascade its screens, their content, and their
    * placements (defensive — the control plane also removes each in memory + dissolves walls first, so

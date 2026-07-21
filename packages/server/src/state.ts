@@ -46,7 +46,7 @@ import {
   packRects,
   rectsAreAdjacent,
 } from "@polyptic/protocol";
-import type { Rect } from "@polyptic/protocol";
+import type { MachineBootPath, Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
   CreateDaypartBody,
@@ -633,6 +633,9 @@ export class ControlPlane {
       tags: machine.tags ?? [],
       imageId: machine.imageId,
       imageIdAt: machine.imageIdAt,
+      bootPath: machine.bootPath,
+      bootPathAt: machine.bootPathAt,
+      bootPathDetail: machine.bootPathDetail,
       hardware: machine.hardware,
       enrolledTokenId: machine.enrolledTokenId,
       enrolledTokenName: machine.enrolledTokenName,
@@ -668,6 +671,10 @@ export class ControlPlane {
         // POL-105 — the last build this box reported booting (absent until it reports one).
         imageId: m.imageId,
         imageIdAt: m.imageIdAt,
+        // POL-171 — the boot chain this box last reported (absent until it reports one).
+        bootPath: m.bootPath,
+        bootPathAt: m.bootPathAt,
+        bootPathDetail: m.bootPathDetail,
         hardware: m.hardware,
         enrolledTokenId: m.enrolledTokenId,
         enrolledTokenName: m.enrolledTokenName,
@@ -1201,6 +1208,11 @@ export class ControlPlane {
       // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
       imageId: input.imageId ?? existing?.imageId,
       imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
+      // POL-171 — the boot chain is reported by the box's live root over /boot/report, never by the
+      // agent's hello; a re-hello keeps whatever the last boot report said.
+      bootPath: existing?.bootPath,
+      bootPathAt: existing?.bootPathAt,
+      bootPathDetail: existing?.bootPathDetail,
       // POL-104: never blank what we already know. An agent too old to report hardware (or one that
       // could not read its own DMI this boot) must not erase the card an operator relies on. And a
       // machine's enrolment provenance is written ONCE, at first enrolment — a later token re-enrol
@@ -1253,6 +1265,11 @@ export class ControlPlane {
       // older agent) keeps whatever we last knew: absence is silence, never "it booted nothing".
       imageId: input.imageId ?? existing?.imageId,
       imageIdAt: input.imageId ? new Date().toISOString() : existing?.imageIdAt,
+      // POL-171 — the boot chain is reported by the box's live root over /boot/report, never by the
+      // agent's hello; a re-hello keeps whatever the last boot report said.
+      bootPath: existing?.bootPath,
+      bootPathAt: existing?.bootPathAt,
+      bootPathDetail: existing?.bootPathDetail,
       hardware: input.hardware ?? existing?.hardware,
       enrolledTokenId: existing?.enrolledTokenId ?? input.enrolledTokenId,
       enrolledTokenName: existing?.enrolledTokenName ?? input.enrolledTokenName,
@@ -1483,6 +1500,34 @@ export class ControlPlane {
         ? `${machine.label} booted image ${next} (was ${previous})`
         : `${machine.label} is running image ${next}`,
     );
+    return true;
+  }
+
+  /**
+   * POL-171 — record WHICH boot chain a box came up through, from its once-per-boot `/boot/report`.
+   * Persisted, like `noteMachineImage`: a box on the local fallback mis-boots on every power-cycle
+   * until its wired chain is fixed, and the Machines card must wear the state while it is offline.
+   *
+   * The RECOVERY is announced here — the transition `local-fallback` → `wired` is the one event only
+   * the registry can see, and it is the line that closes the story the fallback warning opened. The
+   * fallback itself is announced by the /boot/report route (its line must appear even for a box the
+   * registry does not know yet); healthy wired and Wi-Fi boots are silent (a line per boot per box
+   * is a metronome, not a feed). Returns false for an unknown machine.
+   */
+  async noteBootPath(machineId: string, path: MachineBootPath, detail: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return false;
+
+    const previous = machine.bootPath;
+    const at = new Date().toISOString();
+    machine.bootPath = path;
+    machine.bootPathAt = at;
+    machine.bootPathDetail = detail;
+    await this.store.setMachineBootPath(machineId, path, at, detail);
+
+    if (previous === "local-fallback" && path === "wired") {
+      this.emit("good", `${machine.label} is back on the wired boot chain`);
+    }
     return true;
   }
 

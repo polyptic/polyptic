@@ -107,3 +107,35 @@ describe("boot-order drift, as the operator reads it (POL-115)", () => {
     expect(line.text).toContain("could not install the Polyptic bootloader (no-esp)");
   });
 });
+
+describe("boot-path reports, as the operator reads them (POL-171)", () => {
+  const machineId = "dmi-1a2b3c4d5e6f";
+
+  test("a wired box on the local fallback is a WARNING that names the consequence", () => {
+    const line = bootReportLine({
+      ok: false,
+      code: "local-fallback-boot",
+      detail: "image pinned at 20260721T120000Z-abcd1234",
+      machineId,
+    });
+    expect(line.severity).toBe("warn");
+    expect(line.text).toContain("booted via the local fallback");
+    expect(line.text).toContain("did not get a lease");
+    expect(line.text).toContain("image pinned at 20260721T120000Z-abcd1234");
+    // The consequence is the point: this box looks fine and is quietly going stale.
+    expect(line.text).toContain("Rebuilds are not reaching this box");
+    // It is NOT an install failure — the sentence must not read like one.
+    expect(line.text).not.toContain("could not install");
+  });
+
+  test("a Wi-Fi box on the local chain and a wired boot are calm, informational sentences", () => {
+    // The /boot/report route treats both as state-only (no feed line); these sentences exist so an
+    // unknown-special code still renders honestly if one ever surfaces some other way.
+    const wifi = bootReportLine({ ok: true, code: "local-boot-wifi", detail: "", machineId });
+    expect(wifi.severity).toBe("info");
+    expect(wifi.text).toContain("over Wi-Fi");
+    const wired = bootReportLine({ ok: true, code: "wired-boot", detail: "", machineId });
+    expect(wired.severity).toBe("info");
+    expect(wired.text).toContain("wired chain");
+  });
+});

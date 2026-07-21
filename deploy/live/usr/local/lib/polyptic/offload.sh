@@ -98,12 +98,34 @@ json_escape() {
   printf '%s' "$1" | tr -d '[:cntrl:]' | cut -c1-200 | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# POL-171 — append the offload verdict to THIS boot's forensics log on the medium, so the on-stick
+# trail whoever pulls the drive reads carries the outcome too. boot-path.sh recorded the log's
+# on-medium path in $RUN_DIR/forensics-file earlier this boot (its unit orders Before= this one).
+# Best-effort end to end: a boot with no medium, no log, or a medium already mounted elsewhere
+# (find-boot-medium's mount then fails) loses the appended line, never the install or its report.
+append_forensics() {
+  _ff="$RUN_DIR/forensics-file"
+  [ -r "$_ff" ] || return 0
+  IFS= read -r _rel < "$_ff" || return 0
+  [ -n "$_rel" ] || return 0
+  _fmnt="$(mktemp -d 2>/dev/null)" || return 0
+  _fdev="$(sh "$LIB_DIR/find-boot-medium.sh" "$_fmnt" rw 2>/dev/null || true)"
+  if [ -n "$_fdev" ] && [ -f "$_fmnt/$_rel" ]; then
+    printf '\n--- offload verdict ---\n%s\n' "$1" >> "$_fmnt/$_rel" 2>/dev/null || true
+    sync 2>/dev/null || true
+  fi
+  umount "$_fmnt" 2>/dev/null || true
+  rmdir "$_fmnt" 2>/dev/null || true
+  return 0
+}
+
 # Record the outcome where the box (and, best effort, the control plane) can see it. `ok` is the JSON
 # literal true|false; `code` is the machine-readable reason; `detail` the human sentence.
 report() {
   _ok="$1"; _code="$2"; _detail="$3"
   mkdir -p "$RUN_DIR" 2>/dev/null || true
   printf 'ok=%s\ncode=%s\ndetail=%s\n' "$_ok" "$_code" "$_detail" > "$STATUS_FILE" 2>/dev/null || true
+  append_forensics "ok=$_ok code=$_code detail=$_detail"
 
   [ -n "$base" ] || return 0
   _mid=""
@@ -436,13 +458,29 @@ if [ -e /grub/local.cfg ]; then
   echo "No wired connection - starting Polyptic from this drive ..."
   configfile /grub/local.cfg
 fi
-# Only reached when there is ALSO no local payload — THIS is where the technical detail belongs: nobody
-# reads a boot screen until it stops working. It cannot be conditional: `configfile` reports no
-# testable status, and an `if ! configfile …` never takes its branch (checked under OVMF).
-# The `sleep` is load-bearing: GRUB paints the fallback menu below over the console the instant this
-# script ends, so without a beat to read it the message may as well not have been printed.
+# Only reached when there is ALSO no local payload — TOTAL failure: no wire that leased, nothing on
+# the medium to boot instead. THIS is where the technical detail belongs: nobody reads a boot screen
+# until it stops working. It cannot be conditional: `configfile` reports no testable status, and an
+# `if ! configfile …` never takes its branch (checked under OVMF).
 echo ""
 echo "Could not reach the Polyptic control plane at $net."
+# POL-171: the diagnostics arrive by THEMSELVES. The old flow parked the box on the retry menu and
+# kept the network conversation behind a "verbose" entry — menu-diving nobody at a hot wall did, so
+# every total failure was diagnosed by guesswork. Now one exhaustive all-cards sweep runs with
+# GRUB's own narration on (`debug=net,efinet,http`: every card, DHCP packet and HTTP request) and
+# `pager=1` holding each page for a keypress so it cannot scroll past the operator. A keyboard-less
+# box held at the pager has nothing else it could be doing — this screen cannot boot — and any key
+# releases it into the menu below, whose timeout keeps the old self-healing retry loop. Both are
+# reset before the menu so its entries behave exactly as before. D65 is not in play: this is the
+# failure path, never the happy one.
+echo "Showing this screen's network conversation ..."
+set debug=net,efinet,http
+set pager=1
+net_dhcp
+set debug=
+set pager=0
+# The `sleep` is load-bearing: GRUB paints the fallback menu below over the console the instant this
+# script ends, so without a beat to read it the sweep may as well not have been printed.
 sleep -i 8
 set timeout=10
 set default=retry

@@ -512,6 +512,35 @@ eq "wired: succeeds"                       "0" "$(exit_of "$out")"
 eq "wired: no payload copied"              "no" "$([ -d "$d/esp/polyptic" ] && echo yes || echo no)"
 eq "wired: still pointer-installed"        "installed" "$(code_of "$d")"
 
+# ─── POL-171: the offload verdict is appended to THIS boot's forensics log on the medium ────────────
+# boot-path.sh ran earlier this boot and left the log's on-medium path in $RUN_DIR/forensics-file;
+# report() re-finds the medium and appends. Both outcomes land — the happy install and a hard fail.
+d="$(new_case forensics-append)"
+mkdir -p "$d/vol-sdb1/polyptic/logs"
+printf 'medium-test\n' > "$d/vol-sdb1/polyptic/medium-id"
+printf 'boot log\n' > "$d/vol-sdb1/polyptic/logs/boot-20260721T120001Z-img.txt"
+printf '/dev/sdb1\n' > "$d/vfat_devs"
+printf 'polyptic/logs/boot-20260721T120001Z-img.txt\n' > "$d/run/forensics-file"
+out="$(offload "$d")"
+eq  "forensics append: install still succeeds" "0" "$(exit_of "$out")"
+has "forensics append: verdict on the medium"  "ok=true code=installed" "$(cat "$d/vol-sdb1/polyptic/logs/boot-20260721T120001Z-img.txt")"
+
+d="$(new_case forensics-append-fail)"; : > "$d/nvram_readonly"
+mkdir -p "$d/vol-sdb1/polyptic/logs"
+printf 'medium-test\n' > "$d/vol-sdb1/polyptic/medium-id"
+printf 'boot log\n' > "$d/vol-sdb1/polyptic/logs/boot-20260721T120001Z-img.txt"
+printf '/dev/sdb1\n' > "$d/vfat_devs"
+printf 'polyptic/logs/boot-20260721T120001Z-img.txt\n' > "$d/run/forensics-file"
+out="$(offload "$d")"
+eq  "forensics append (fail): still fails loudly" "1" "$(exit_of "$out")"
+has "forensics append (fail): verdict on the medium" "ok=false code=nvram-write-failed" "$(cat "$d/vol-sdb1/polyptic/logs/boot-20260721T120001Z-img.txt")"
+
+# A recorded path with NO medium present costs nothing (the file simply keeps no verdict line).
+d="$(new_case forensics-append-no-medium)"
+printf 'polyptic/logs/boot-x.txt\n' > "$d/run/forensics-file"
+out="$(offload "$d")"
+eq  "forensics append (no medium): install unaffected" "0" "$(exit_of "$out")"
+
 printf '\n'
 if [ "$fails" -eq 0 ]; then printf 'ALL PASS\n'; exit 0; fi
 printf '%d FAILED\n' "$fails"; exit 1

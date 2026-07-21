@@ -6,7 +6,7 @@
  * deep-cloned on the way in and out so callers can never mutate the store's copy by reference —
  * mirroring the isolation a real database gives you.
  */
-import type { EnrollmentStatus, OperatorRole } from "@polyptic/protocol";
+import type { EnrollmentStatus, MachineBootPath, OperatorRole } from "@polyptic/protocol";
 import type {
   PersistedBootstrap,
   PersistedContent,
@@ -147,6 +147,15 @@ export class MemoryStore implements Store {
     if (machine) {
       machine.imageId = imageId;
       machine.imageIdAt = at;
+    }
+  }
+
+  async setMachineBootPath(id: string, path: MachineBootPath, at: string, detail: string): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) {
+      machine.bootPath = path;
+      machine.bootPathAt = at;
+      machine.bootPathDetail = detail;
     }
   }
 

@@ -485,6 +485,12 @@ export function buildAdminState(
       // and the version-distribution view exists to find it.
       imageId: machine.imageId,
       imageIdAt: machine.imageIdAt,
+      // POL-171 — the boot chain this box last reported. Not gated on online for the same reason:
+      // a box on the local fallback is mis-booting every power-cycle, online or not, and the
+      // warning strip must survive the box going dark.
+      bootPath: machine.bootPath,
+      bootPathAt: machine.bootPathAt,
+      bootPathDetail: machine.bootPathDetail,
 
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,

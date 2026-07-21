@@ -39,7 +39,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from "@polyptic/protocol";
-import type { BootOrderPolicy, BootReportBody as BootReport } from "@polyptic/protocol";
+import type { BootOrderPolicy, BootReportBody as BootReport, BootReportCode, MachineBootPath } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
@@ -119,6 +119,13 @@ const SIGNED_LOADER_FILES = ["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grub
 /** `POST /boot/report` throttle (POL-58): a rack being offloaded posts a handful of lines a minute, so
  *  a burst of 10 with one token back every 6s is generous for real boxes and useless for a flooder. */
 const REPORT_BURST = 10;
+
+/** POL-171 — which boot-path codes carry machine state, and the MachineBootPath each one maps to. */
+const BOOT_PATH_BY_CODE: Partial<Record<BootReportCode, MachineBootPath>> = {
+  "local-fallback-boot": "local-fallback",
+  "local-boot-wifi": "local-wifi",
+  "wired-boot": "wired",
+};
 const REPORT_REFILL_MS = 6_000;
 
 /**
@@ -232,6 +239,12 @@ function bootKernelCmdline(
     // The HTTP base (for the offload flow to fetch the loaders) + the WS agent URL (for the agent).
     `polyptic.base=${httpBase}`,
     `polyptic.server_url=${toWsAgentUrl(httpBase)}`,
+    // POL-171 — WHICH chain produced this boot. This menu is only ever reached over the wired chain
+    // (stage 1 chains /boot/grub.cfg after a DHCP lease), so every entry here is `wired`; the
+    // medium's local menus (render-local-grub.sh) tag `local`. The live root reads the tag once per
+    // boot and reports a wired-capable box that came up on the LOCAL fallback — the 2026-07-21 field
+    // box did exactly that all day, silently rendering the stale image the local menu pins.
+    "polyptic.bootpath=wired",
   ];
   // POL-148 — the NTP endpoint the box's systemd-timesyncd disciplines its clock to. A netboot fleet
   // has no working time source of its own (the live image ships no NTP client until POL-148, so boxes
@@ -380,7 +393,7 @@ function reporterName(machineId: string): string {
  * ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human — and
  * POL-116's `pinned-build-missing`, which is not a bootloader outcome at all.
  */
-export function bootReportLine(report: BootReport): { severity: "good" | "warn" | "bad"; text: string } {
+export function bootReportLine(report: BootReport): { severity: "info" | "good" | "warn" | "bad"; text: string } {
   const who = reporterName(report.machineId);
   const detail = report.detail.trim();
   if (report.ok && report.code === "installed") {
@@ -415,6 +428,28 @@ export function bootReportLine(report: BootReport): { severity: "good" | "warn" 
       severity: "good",
       text: `${who} put itself back at the head of its UEFI boot order${detail ? `: ${detail}` : ""}`,
     };
+  }
+  // POL-171 — boot-path reports. Only `local-fallback-boot` earns a feed line here: it is the
+  // suspicious case (a wired-capable box that came up on the LOCAL chain, whose menu PINS the
+  // image, so rebuilds are silently missing it). `wired-boot` and `local-boot-wifi` are normal
+  // boots — the route treats them as state-only and never calls this line into the feed, but the
+  // sentences exist so an unknown-special code still renders honestly if one ever surfaces.
+  if (report.code === "local-fallback-boot") {
+    return {
+      severity: "warn",
+      text: `${who} booted via the local fallback — its wired boot chain did not get a lease${
+        detail ? `: ${detail}` : ""
+      }. Rebuilds are not reaching this box until the wired chain is fixed`,
+    };
+  }
+  if (report.code === "local-boot-wifi") {
+    return {
+      severity: "info",
+      text: `${who} booted from its local medium over Wi-Fi${detail ? `: ${detail}` : ""}`,
+    };
+  }
+  if (report.code === "wired-boot") {
+    return { severity: "info", text: `${who} booted via the wired chain${detail ? `: ${detail}` : ""}` };
   }
   if (report.code === "boot-order-reassert-failed") {
     return {
@@ -688,6 +723,9 @@ export function registerProvisionRoutes(
   /** POL-105 — the tags a machine carries, for the per-machine manifest. Absent (or an unknown
    *  machineId) → no tags → no ring can match → the box follows the fleet's active build. */
   machineTags?: (machineId: string) => readonly string[],
+  /** POL-171 — record which boot chain a machine came up through (persisted; drives the Machines-tab
+   *  fallback warning). Returns whether `machineId` named a machine the registry knows. */
+  noteBootPath?: (machineId: string, path: MachineBootPath, detail: string) => boolean | Promise<boolean>,
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl, ntpHost } = config;
 
@@ -837,9 +875,20 @@ export function registerProvisionRoutes(
     if (reportBucket.tokens <= 0) return reply.code(429).send({ error: "too many boot reports" });
     reportBucket.tokens -= 1;
 
+    // POL-171 — the boot-path codes also update the MACHINE RECORD, so the Machines tab wears the
+    // state persistently: a feed line scrolls away, but a box on the fallback mis-boots on every
+    // power-cycle until its wired chain is fixed. `wired-boot` and `local-boot-wifi` are normal
+    // boots: state-only, no feed line (a line per healthy boot per box is a metronome). The
+    // registry emits the recovery line itself on the local-fallback → wired transition.
+    const bootPath = BOOT_PATH_BY_CODE[parsed.data.code];
+    if (bootPath && parsed.data.machineId) {
+      await noteBootPath?.(parsed.data.machineId, bootPath, parsed.data.detail);
+    }
+    const stateOnly = parsed.data.code === "wired-boot" || parsed.data.code === "local-boot-wifi";
+
     const { severity, text } = bootReportLine(parsed.data);
     fastify.log.info({ event: "boot.report", code: parsed.data.code, ok: parsed.data.ok }, text);
-    onBootReport?.(severity, text);
+    if (!stateOnly) onBootReport?.(severity, text);
     return reply.code(204).send();
   });
 

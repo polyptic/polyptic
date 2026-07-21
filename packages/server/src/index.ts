@@ -772,6 +772,13 @@ registerProvisionRoutes(
   // POL-105 — the depot's manifest route resolves PER MACHINE: a box appends `?machineId=…`, and its
   // tags decide which roll-out ring (if any) it matches. The registry is the only place tags live.
   (machineId) => control.machineTags(machineId),
+  // POL-171 — a box's once-per-boot boot-path report updates its machine record (the Machines-tab
+  // fallback warning), and the console must see the change live, hence the broadcast.
+  async (machineId, path, detail) => {
+    const known = await control.noteBootPath(machineId, path, detail);
+    if (known) broadcaster.broadcast();
+    return known;
+  },
 );
 
 // TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.

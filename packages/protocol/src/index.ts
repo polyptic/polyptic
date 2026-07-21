@@ -289,6 +289,14 @@ export function isNewerAgentVersion(candidate: string, current: string): boolean
   return false; // equal — nothing to do
 }
 
+/** POL-171 — which boot chain a machine last came up through, as its live root self-reported on
+ *  `POST /boot/report`. `local-fallback` is the loud one: a wired-capable box that booted the
+ *  medium's LOCAL menu because the wired GRUB chain got no lease — that menu PINS the image, so
+ *  rebuilds silently stop reaching the box until the wired chain is fixed. `local-wifi` is a
+ *  wireless box on the local chain, which is its normal path. */
+export const MachineBootPath = z.enum(["wired", "local-fallback", "local-wifi"]);
+export type MachineBootPath = z.infer<typeof MachineBootPath>;
+
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
   id: z.string(), // stable; sourced from /etc/machine-id
@@ -315,6 +323,14 @@ export const Machine = z.object({
   imageId: z.string().optional(),
   /** When that image id was last reported (ISO). */
   imageIdAt: z.string().datetime().optional(),
+  /** POL-171 — the boot chain this box last reported coming up through. PERSISTED, like `imageId`:
+   *  a box on the local fallback mis-boots on EVERY power-cycle until its wired chain is fixed, and
+   *  the Machines card must wear that state while the box is offline too. Cleared only by the box's
+   *  own next `wired-boot` report — never by manual dismissal. */
+  bootPath: MachineBootPath.optional(),
+  bootPathAt: z.string().datetime().optional(),
+  /** The sentence the box composed about that boot ("image pinned at 20260721T…"). */
+  bootPathDetail: z.string().optional(),
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
    *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
@@ -1770,6 +1786,12 @@ export const MachineView = z.object({
    *  dark: the version-distribution view in Settings is built from this. */
   imageId: z.string().optional(),
   imageIdAt: z.string().datetime().optional(),
+  /** POL-171 — the boot chain this box last reported. `local-fallback` puts a persistent warning
+   *  strip on the Machines card: the box's image is PINNED by the local menu, so rebuilds are not
+   *  reaching it. Persisted (not gated on online) for the same reason `imageId` is. */
+  bootPath: MachineBootPath.optional(),
+  bootPathAt: z.string().datetime().optional(),
+  bootPathDetail: z.string().optional(),
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
@@ -2406,6 +2428,19 @@ export const BootReportCode = z.enum([
   // the initramfs and streamed the ACTIVE image instead. It IS up, on a rootfs its on-stick kernel did
   // not ship with, until update-poll re-pins the medium — hence a report rather than a silent swap.
   "pinned-build-missing",
+  // ── POL-171: WHICH boot chain produced this boot, self-reported once per boot by the live root. ──
+  // The 2026-07-21 field failure (amrc-fp): a WIRED box's GRUB DHCP failed on its NIC, stage 1
+  // silently fell through to the stick's local Wi-Fi menu, and the box spent the day rendering the
+  // image that menu PINS — rebuilds appeared to do nothing, and only /proc/cmdline knew why. The
+  // fallback stays (a Wi-Fi box physically needs the local chain: GRUB can never join WPA), but it
+  // must never again be silent on a wired box. `local-fallback-boot` is the suspicious case: the
+  // cmdline says `polyptic.bootpath=local` AND the box's default route is a WIRED link — the wired
+  // chain failed and the fallback caught it. `local-boot-wifi` is a genuinely wireless box on its
+  // normal path (state-only: it updates the machine record, no feed line). `wired-boot` is the
+  // all-clear that lets the server drop a machine's fallback flag with no manual dismissal.
+  "local-fallback-boot",
+  "local-boot-wifi",
+  "wired-boot",
 ]);
 export type BootReportCode = z.infer<typeof BootReportCode>;
 

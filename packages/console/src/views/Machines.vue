@@ -708,6 +708,13 @@ function showToast(message: string): void {
                 <!-- status chips: Shell armed is a passive security indicator, always visible while
                      armed, independent of the console button state (POL-68 §2). -->
                 <span v-if="m.shellEnabled" class="chip-armed" :title="shellArmedHint(m)">Shell armed</span>
+                <!-- POL-171 — a wireless box on the local chain is its NORMAL path: a neutral
+                     marker, never a warning (the warning strip below is for wired boxes only). -->
+                <span
+                  v-if="m.bootPath === 'local-wifi'"
+                  class="chip-localboot"
+                  title="This box boots from its local medium and streams the OS over Wi-Fi — its normal path"
+                >Wi-Fi boot</span>
                 <!-- POL-141 — the id tail, left of the Online pill: uniqueness stays checkable
                      without the full dmi-… UUID (which is on hover). -->
                 <span class="id-tail" :title="m.id">{{ machineIdTail(m.id) }}</span>
@@ -829,6 +836,16 @@ function showToast(message: string): void {
                     </div>
                   </template>
                 </div>
+              </div>
+
+              <!-- POL-171 — a wired-capable box that booted via the LOCAL fallback chain. Loud and
+                   persistent, not a feed line that scrolls away: the local menu PINS the image, so
+                   rebuilds stop reaching this box until its wired chain is fixed. The strip clears
+                   itself on the box's next wired-chain boot — no manual dismissal. -->
+              <div v-if="m.bootPath === 'local-fallback'" class="fallback-strip">
+                <strong>Booted via local fallback</strong> — the wired boot chain failed.
+                {{ m.bootPathDetail || "The image this box renders is pinned by the local menu." }}
+                Rebuilds are not reaching this box.
               </div>
 
               <!-- tags (POL-103): chips that double as a one-click filter into a selector -->
@@ -1216,6 +1233,29 @@ function showToast(message: string): void {
   background: var(--warn-soft);
   white-space: nowrap;
   flex: 0 0 auto;
+}
+.chip-localboot {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  color: var(--muted);
+  background: var(--muted-bg);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* POL-171 — the local-fallback warning strip: a full-width band in the warn palette, matching the
+   pending card's warn accents. Deliberately a strip, not a chip: this state means the box is
+   quietly running a stale image, and it must read at a glance across the room. */
+.fallback-strip {
+  margin-top: 10px;
+  padding: 9px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.45;
 }
 .status-badge {
   font-size: 11px;

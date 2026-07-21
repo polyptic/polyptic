@@ -30,7 +30,11 @@ THEME_DIR="/polyptic/boot/theme"
 tok=""
 [ -z "$TOKEN" ] || tok=" polyptic.token=$TOKEN"
 # bootKernelCmdline's tail, verbatim (multipath=off .. plymouth.ignore-serial-consoles).
-common="rd.overlay=1 ip=dhcp rd.neednet=1 polyptic.base=http://$HOSTPORT polyptic.server_url=ws://$HOSTPORT/agent$tok multipath=off quiet splash plymouth.ignore-serial-consoles"
+# `polyptic.bootpath=local` (POL-171) marks every boot through THIS menu as the LOCAL chain — the
+# server's wired menu tags `wired`. The live root reads the tag once per boot: a wired-capable box
+# on the local chain means the wired GRUB chain failed and this menu's PINNED image is quietly going
+# stale, which is exactly what a whole field day was lost to on 2026-07-21.
+common="rd.overlay=1 ip=dhcp rd.neednet=1 polyptic.base=http://$HOSTPORT polyptic.server_url=ws://$HOSTPORT/agent$tok polyptic.bootpath=local multipath=off quiet splash plymouth.ignore-serial-consoles"
 pinned="root=live:http://$HOSTPORT/dist/image/$ARCH/builds/$IMAGE_ID/rootfs.squashfs $common"
 latest="root=live:http://$HOSTPORT/dist/image/$ARCH/rootfs.squashfs $common"
 

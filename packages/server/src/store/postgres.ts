@@ -25,6 +25,7 @@ import {
   Geometry,
   HostIdentity,
   ImageRings,
+  MachineBootPath,
   MachineTags,
   OperatorRole,
   Output,
@@ -81,6 +82,9 @@ interface MachineRow {
   tags: unknown;
   image_id: string | null;
   image_id_at: Date | null;
+  boot_path: string | null;
+  boot_path_at: Date | null;
+  boot_path_detail: string | null;
   hardware: unknown;
   enrolled_token_id: string | null;
   enrolled_token_name: string | null;
@@ -334,6 +338,10 @@ export class PostgresStore implements Store {
     // precisely the box a roll-out has stranded.
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS image_id text`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS image_id_at timestamptz`;
+    // POL-171 — the boot chain a box last reported coming up through (+ when, + its own sentence).
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_path text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_path_at timestamptz`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_path_detail text`;
     // POL-104: what the box IS (MACs / DMI serial / arch), which token it enrolled on, and whether it
     // matched a pre-registration. All NULL on rows that pre-date POL-104 — a machine enrolled before
     // this change simply says less on its card; it is never re-gated or re-approved because of it.
@@ -720,7 +728,7 @@ export class PostgresStore implements Store {
       zoomPreferenceRows,
       audioPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled, variables FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision, active_scene_id FROM meta WHERE id = 1`,
@@ -760,6 +768,10 @@ export class PostgresStore implements Store {
         // POL-105 — the last image id the box reported booting (NULL until it reports one).
         imageId: row.image_id ?? undefined,
         imageIdAt: row.image_id_at ? row.image_id_at.toISOString() : undefined,
+        // POL-171 — an unrecognised value (a future enum member) is dropped, never fatal.
+        bootPath: MachineBootPath.safeParse(row.boot_path).data,
+        bootPathAt: row.boot_path_at ? row.boot_path_at.toISOString() : undefined,
+        bootPathDetail: row.boot_path_detail ?? undefined,
         hardware: hardware?.success ? hardware.data : undefined,
         enrolledTokenId: row.enrolled_token_id ?? undefined,
         enrolledTokenName: row.enrolled_token_name ?? undefined,
@@ -909,7 +921,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -924,6 +936,9 @@ export class PostgresStore implements Store {
         ${sql.json(machine.tags ?? [])},
         ${machine.imageId ?? null},
         ${machine.imageIdAt ? new Date(machine.imageIdAt) : null},
+        ${machine.bootPath ?? null},
+        ${machine.bootPathAt ? new Date(machine.bootPathAt) : null},
+        ${machine.bootPathDetail ?? null},
         ${machine.hardware ? sql.json(machine.hardware) : null},
         ${machine.enrolledTokenId ?? null},
         ${machine.enrolledTokenName ?? null},
@@ -946,6 +961,10 @@ export class PostgresStore implements Store {
         -- older agent (or a dev box with no live image) must not blank a real box's reported build.
         image_id        = COALESCE(EXCLUDED.image_id, machines.image_id),
         image_id_at     = COALESCE(EXCLUDED.image_id_at, machines.image_id_at),
+        -- POL-171 — same rule as image_id: a hello that carries no boot path must not erase one.
+        boot_path        = COALESCE(EXCLUDED.boot_path, machines.boot_path),
+        boot_path_at     = COALESCE(EXCLUDED.boot_path_at, machines.boot_path_at),
+        boot_path_detail = COALESCE(EXCLUDED.boot_path_detail, machines.boot_path_detail),
         -- POL-104: never blank out what we already know. A pre-POL-104 agent (or an agent that could
         -- not read its own DMI) sends no hardware; a row that HAS hardware must not lose it because
         -- one hello arrived without any, and the token a machine enrolled on is written ONCE, at
@@ -962,6 +981,11 @@ export class PostgresStore implements Store {
   async setMachineImage(id: string, imageId: string, at: string): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE machines SET image_id = ${imageId}, image_id_at = ${new Date(at)} WHERE id = ${id}`;
+  }
+
+  async setMachineBootPath(id: string, path: MachineBootPath, at: string, detail: string): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET boot_path = ${path}, boot_path_at = ${new Date(at)}, boot_path_detail = ${detail} WHERE id = ${id}`;
   }
 
   async setMachineTags(id: string, tags: string[]): Promise<void> {
