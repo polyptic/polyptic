@@ -1,0 +1,24 @@
+# POL-171 — report WHICH boot chain produced this boot + write the per-boot forensics log on the
+# boot medium. The 2026-07-21 field failure: a wired box silently booted the stick's local Wi-Fi
+# fallback all day (its GRUB DHCP fails on that NIC), rendering the stale image the local menu pins,
+# and nothing anywhere said so. The script is best-effort end to end and always exits 0 — it
+# OBSERVES the boot, it is never allowed to cost one.
+[Unit]
+Description=Polyptic, report the boot path (wired vs local fallback) + write on-medium forensics (POL-171)
+Documentation=file:///usr/local/lib/polyptic/boot-path.sh
+# After the network so the report can leave the box and the default route (the wired-vs-Wi-Fi tell)
+# exists. Before the offload so /run/polyptic/forensics-file is in place for offload.sh to append
+# its verdict to this boot's log; before greetd so a fallback warning is on the splash before the
+# kiosk paints over it.
+Wants=network-online.target
+After=network-online.target
+Before=polyptic-offload.service greetd.service
+ConditionPathExists=/usr/local/lib/polyptic/boot-path.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/polyptic/boot-path.sh
+
+[Install]
+WantedBy=multi-user.target

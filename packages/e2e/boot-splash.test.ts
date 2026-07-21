@@ -231,6 +231,23 @@ describe("stage 1 DHCPs ONE CARD AT A TIME, first lease wins (POL-118)", () => {
     expect(DONGLE_TMPL).toContain("menuentry \"Try again\" --id retry { net_dhcp ; configfile");
   });
 
+  test("TOTAL failure auto-dumps the network conversation BEFORE the retry menu (POL-171)", () => {
+    // No wire that leased AND no local payload = this screen has nothing to boot. The old flow kept
+    // the diagnostics behind a "verbose" menu entry nobody at a hot wall dives for — a whole field
+    // day was lost to exactly that. Now the sweep runs by itself, narrated, and the debug/pager
+    // state is RESET before the menu so its entries behave exactly as before.
+    const failure = DONGLE_TMPL.slice(DONGLE_TMPL.indexOf("Could not reach the Polyptic control plane"));
+    const preMenu = failure.slice(0, failure.indexOf("menuentry"));
+    expect(preMenu).toContain("set debug=net,efinet,http");
+    expect(preMenu).toContain("set pager=1");
+    expect(preMenu).toMatch(/^net_dhcp$/m); // the exhaustive all-cards sweep, now automatic
+    expect(preMenu).toContain("set debug=\n"); // …and both are reset before the menu paints
+    expect(preMenu).toContain("set pager=0");
+    // The self-healing retry loop survives: the menu still times out into the retry entry.
+    expect(failure).toContain("set timeout=10");
+    expect(failure).toContain("set default=retry");
+  });
+
   test("carries a verbose entry that shows GRUB's own network conversation", () => {
     // Verified under OVMF against the pinned signed grubnet: `debug=net,efinet,http` printed 78 lines
     // of DHCP/HTTP narration on a single boot. `pager=1` stops it scrolling past the operator.

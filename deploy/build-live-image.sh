@@ -225,7 +225,7 @@ chmod 0600 "$ROOTFS"/etc/netplan/01-polyptic-dhcp.yaml   # netplan refuses/warns
 # Enable the system units OFFLINE via the same .wants symlinks `systemctl enable` would create (which
 # is a no-op/warn inside a chroot).
 mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
-for unit in polyptic-agent-env.service polyptic-offload.service polyptic-wifi.service; do
+for unit in polyptic-agent-env.service polyptic-offload.service polyptic-wifi.service polyptic-boot-path.service; do
   ln -sf "../$unit" "$ROOTFS/etc/systemd/system/multi-user.target.wants/$unit"
 done
 # The update-poll timer (POL-41) is a timer unit, so it enables under timers.target.
