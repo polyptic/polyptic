@@ -447,9 +447,11 @@ has "poll corrupt: says it skipped"  "did not complete" "$out"
 has "poll corrupt: menu untouched"   "slot=a image=old-1" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
 eq "poll corrupt: no reboot"         "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
 
-# 35) no medium: the plain POL-41 flow — reboot, nothing else.
+# 35) no medium: the plain POL-41 flow — reboot, nothing else. The skip is NAMED (POL-172) so field
+#     triage can tell "no medium attached" from "the staging code was never reached".
 d="$(new_poll_case poll-no-medium old-1 new-2)"
 out="$(up "$d")"
+has "poll no-medium: logs the skip"  "no local boot medium" "$out"
 has "poll no-medium: reboots"        "reboot" "$(cat "$d/systemctl.log" 2>/dev/null)"
 
 # 35a) POL-105: the poll asks for the manifest AS THIS MACHINE, so the depot can answer it with a
@@ -474,6 +476,10 @@ rm -rf "$d/modules/6.8.0-test"
 out="$(up "$d")"
 has "poll heal: names the re-pair"   "re-pair the kernel" "$out"
 has "poll heal: reboots"             "reboot" "$(cat "$d/systemctl.log" 2>/dev/null)"
+# POL-172 regression guard: with the staging now ahead of the reboot gate, a caught-up medium
+# (cur_img==SERVED) must fall THROUGH to the reboot, never early-exit the recovery path.
+has "poll heal: caught-up medium is a no-op" "already carries new-2" "$out"
+has "poll heal: menu untouched" "slot=a image=new-2" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
 
 # 37) matched ids + matched kernel: silence (the every-5-minutes common path).
 d="$(new_poll_case poll-quiet new-2 new-2 new-2)"
@@ -481,14 +487,34 @@ out="$(up "$d")"
 eq "poll quiet: no output"           "" "$out"
 eq "poll quiet: no reboot"           "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
 
-# 38) non-urgent outside the window: waits, refreshes nothing, reboots nothing.
+# 38) non-urgent outside the window (POL-172): the medium is staged IMMEDIATELY — only the reboot
+#     waits. The pre-POL-172 shape (staging gated behind the window) left a stick pinned at a stale
+#     image all day, and a wall powered off overnight could never self-refresh.
 d="$(new_poll_case poll-window old-1 new-2 old-1)"
 printf '{"imageId":"new-2","urgent":false}\n' > "$d/manifest"
 printf '14\n' > "$d/hour"
 out="$(up "$d")"
-has "poll window: waits"             "Waiting for the nightly window" "$out"
-has "poll window: medium untouched"  "slot=a image=old-1" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
+has "poll window: medium staged in daytime" "slot=b image=new-2" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
+eq "poll window: new kernel in slot b" "NEW-KERNEL" "$(cat "$d/vol-POLYPTIC-BT/polyptic/boot/arm64/b/vmlinuz" 2>/dev/null)"
+has "poll window: still waits to reboot" "Waiting for the nightly window" "$out"
 eq "poll window: no reboot"          "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
+
+# 38-2) …and the NEXT daytime poll is a cheap no-op on the medium (cur_img==SERVED), still no reboot:
+#       the every-5-minutes retry costs nothing once caught up.
+out="$(up "$d")"
+has "poll window: second poll sees a caught-up medium" "already carries new-2" "$out"
+has "poll window: menu still pins the staged pair" "slot=b image=new-2" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
+eq "poll window: still no reboot" "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
+
+# 38-3) corrupted daytime download: menu untouched (commit point never reached), no reboot, retry.
+d="$(new_poll_case poll-window-corrupt old-1 new-2 old-1)"
+printf '{"imageId":"new-2","urgent":false}\n' > "$d/manifest"
+printf '14\n' > "$d/hour"
+printf 'TAMPERED\n' > "$d/new-initrd"
+out="$(up "$d")"
+has "poll window corrupt: says it skipped" "did not complete" "$out"
+has "poll window corrupt: menu untouched"  "slot=a image=old-1" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/local-arm64.cfg")"
+eq "poll window corrupt: no reboot"        "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
 
 # 38a) offline-splash self-heal (POL-80): a stick flashed from an OLD, theme-less medium gets the
 #      branded splash pulled from the server WITHOUT re-flashing — even when the image is ALREADY

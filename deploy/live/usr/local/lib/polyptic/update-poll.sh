@@ -19,14 +19,16 @@
 # cmdline carries (dracut streams the squashfs from that URL); an ISO boot carries
 # `root=live:CDLABEL=…`, so matching on the scheme is the guard.
 #
-# BOXES WITH A LOCAL BOOT MEDIUM (POL-63) — the universal USB stick or an offloaded ESP — refresh
-# that medium BEFORE rebooting: the new build's vmlinuz + initrd-wifi are fetched into the medium's
-# INACTIVE slot, verified against the depot's SHA256SUMS, and only then is the arch menu rewritten
-# to point at the new slot + pinned image. Power loss mid-refresh leaves the old menu → the old,
-# intact slot: the medium is never half-updated. A refresh that cannot complete (depot flaky, sums
-# mismatch) SKIPS this round's reboot — rebooting would land on the old pinned build anyway, so
-# waiting 5 minutes and retrying is strictly better. Boxes without a medium (server-menu netboot)
-# reboot exactly as before.
+# BOXES WITH A LOCAL BOOT MEDIUM (POL-63) — the universal USB stick or an offloaded ESP — stage the
+# new build onto that medium ON EVERY POLL the moment a newer image is served (POL-172), regardless
+# of the reboot policy: the new build's vmlinuz + initrd-wifi are fetched into the medium's INACTIVE
+# slot, verified against the depot's SHA256SUMS, and only then is the arch menu rewritten to point at
+# the new slot + pinned image. Power loss mid-refresh leaves the old menu → the old, intact slot: the
+# medium is never half-updated. Only the REBOOT waits for urgent/the nightly window — staging bytes
+# is harmless, rebooting a wall is not. A refresh that cannot complete (depot flaky, sums mismatch)
+# SKIPS this round's reboot — rebooting would land on the old pinned build anyway, so waiting 5
+# minutes and retrying is strictly better. Boxes without a medium (server-menu netboot) reboot
+# exactly as before.
 #
 # Stubbable for the off-box tests: POLYPTIC_CMDLINE_FILE, POLYPTIC_IMAGE_ID_FILE, POLYPTIC_ENV_FILE,
 # POLYPTIC_RUN_DIR, POLYPTIC_LIB_DIR; curl/systemctl/sleep/date come from PATH.
@@ -149,15 +151,14 @@ STALE_BOOT=0
 
 if [ "$SERVED" = "$RUNNING" ] && [ "$STALE_BOOT" = 0 ]; then exit 0; fi
 
-URGENT=0
-case "$MANIFEST" in *'"urgent":true'*) URGENT=1 ;; esac
-
-if [ "$URGENT" != "1" ]; then
-  hour="$(date +%H)"
-  case "$hour" in 03|04) : ;; *) echo "update-poll: newer image $SERVED available (running $RUNNING$([ "$STALE_BOOT" = 1 ] && printf ', kernel mismatched')). Waiting for the nightly window"; exit 0 ;; esac
-fi
-
-# ── Refresh the local boot medium first (POL-63): the reboot must land on the NEW image ─────────────
+# ── Stage the new image onto the local boot medium NOW (POL-63; decoupled from the window, POL-172) ─
+# Like the theme heal above, this runs the moment a mismatch is seen, deliberately independent of the
+# reboot policy below: rebooting a wall is disruptive (hence urgent/nightly), but staging bytes into
+# the medium's INACTIVE slot is invisible to a boot until the menu rewrite commits it — harmless at
+# any hour. Gating the staging behind the window (the pre-POL-172 shape) left a stick pinned at a
+# stale image all day, and a wall powered off overnight could NEVER self-refresh: the window is
+# exactly when it is dark. Idempotent: a medium already carrying $SERVED skips straight to the reboot
+# decision, so the every-5-minutes retry costs nothing once caught up.
 # sha256 of one file, compared against the depot build's SHA256SUMS line for <name>.
 sum_ok() { # <file> <name> <sums-file>
   want="$(awk -v n="$2" '$2==n {print $1}' "$3" | head -n1)"
@@ -205,7 +206,19 @@ if [ -n "$mdev" ] && [ -f "$mmnt/grub/local-$arch.cfg" ]; then
     echo "update-poll: medium $mdev now boots $SERVED (slot $new_slot)"
   fi
 else
-  rmdir "$mmnt" 2>/dev/null || true   # no medium (server-menu netboot): nothing to refresh
+  rmdir "$mmnt" 2>/dev/null || true
+  # Named so field triage can tell "skipped: no medium attached" from "never reached this code".
+  echo "update-poll: no local boot medium (server-menu netboot): nothing to stage"
+fi
+
+URGENT=0
+case "$MANIFEST" in *'"urgent":true'*) URGENT=1 ;; esac
+
+# Only the REBOOT is policy-gated: urgent → now (splayed below); otherwise the nightly window. The
+# medium above is already staged either way, so the eventual reboot always lands on the new image.
+if [ "$URGENT" != "1" ]; then
+  hour="$(date +%H)"
+  case "$hour" in 03|04) : ;; *) echo "update-poll: newer image $SERVED available (running $RUNNING$([ "$STALE_BOOT" = 1 ] && printf ', kernel mismatched')). Waiting for the nightly window"; exit 0 ;; esac
 fi
 
 # One reboot request per boot: the marker lives on tmpfs so it cannot outlive the reboot itself.
