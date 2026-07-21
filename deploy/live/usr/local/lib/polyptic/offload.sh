@@ -33,6 +33,7 @@
 #   POLYPTIC_LIB_DIR        (this script's dir)  POLYPTIC_CONSOLE    (/dev/console)
 #   POLYPTIC_HOLD_SECONDS      (bounds the FAILURE hold; unset = hold the boot forever, POL-167)
 #   POLYPTIC_HOLD_SECONDS_OK   (how long the success message stays on screen)
+#   POLYPTIC_NET_WAIT_SECONDS / POLYPTIC_NET_STEP_SECONDS   (depot pre-flight budget/beat, POL-168)
 set -eu
 
 # The ESP GUID that marks an EFI System Partition in a GPT table.
@@ -51,6 +52,8 @@ CONSOLE="${POLYPTIC_CONSOLE:-/dev/console}"
 # hold_failure. Setting it (the off-box tests, or a deliberate operator override) bounds the hold.
 HOLD_BAD="${POLYPTIC_HOLD_SECONDS:-}"
 HOLD_OK="${POLYPTIC_HOLD_SECONDS_OK:-6}"
+NET_WAIT="${POLYPTIC_NET_WAIT_SECONDS:-60}"
+NET_STEP="${POLYPTIC_NET_STEP_SECONDS:-5}"
 STATUS_FILE="$RUN_DIR/bootloader-status"
 
 base=""
@@ -307,11 +310,53 @@ if [ "$wifi_payload" = 1 ]; then
 fi
 
 # ─── Fetch the signed loaders (TOKENLESS, from the ungated depot: the box has no operator session) ───
+# POL-168: this used to be ONE curl, no retries, no timeouts — and the seconds right after
+# network-online.target are exactly when DNS is still settling, so a single boot-time hiccup killed
+# the whole install with `no-loaders` while the depot was provably healthy (the 2026-07-21 bring-up:
+# the same box got a 200 moments later). The operator is standing at the screen, so the fix is to
+# WAIT: probe the depot for up to $NET_WAIT seconds before fetching, then give the real downloads
+# their own retries. The failure names its cause — a depot that never answered (`depot-unreachable`)
+# reads completely differently from one that answered an HTTP error (`no-loaders`).
+
+# One cheap probe of the shim URL: reachable-and-200 is the green light for both downloads.
+depot_probe() {
+  curl -fsS -m 5 -o /dev/null "$base/dist/boot/shim$efiarch.efi" 2>/dev/null
+}
+
+probe_rc=1
+waited=0
+while :; do
+  if depot_probe; then probe_rc=0; break; else probe_rc=$?; fi
+  if [ "$waited" -ge "$NET_WAIT" ]; then break; fi
+  say "Waiting for the network to reach $hostport ..."
+  sleep "$NET_STEP" || true
+  if [ "$NET_STEP" -gt 0 ] 2>/dev/null; then waited=$((waited + NET_STEP)); else waited=$((waited + 1)); fi
+done
+if [ "$probe_rc" != 0 ]; then
+  if [ "$probe_rc" = 22 ]; then
+    # curl 22 = the depot ANSWERED, with an HTTP error. Ask once more, without -f, for the code.
+    http_code="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/dist/boot/shim$efiarch.efi" 2>/dev/null || true)"
+    fail no-loaders "the depot at $hostport answered HTTP ${http_code:-error} for shim$efiarch.efi (nothing was erased)"
+  fi
+  fail depot-unreachable "could not reach the depot at $hostport after ${waited}s (curl exit $probe_rc). Check DNS and the route to the control plane (nothing was erased)"
+fi
 
 tmp_shim="$(mktemp)"; tmp_grub="$(mktemp)"; tmp_cfg="$(mktemp)"
-if ! curl -fsSL "$base/dist/boot/shim$efiarch.efi" -o "$tmp_shim" \
-|| ! curl -fsSL "$base/dist/boot/grub$efiarch.efi" -o "$tmp_grub"; then
-  fail no-loaders "could not download the signed loaders from $base/dist/boot/ (nothing was erased)"
+# The downloads keep their own retries: the pre-flight proved the depot once, but a lease renewal or a
+# flapping switch can still bite mid-transfer, and a retry is free next to a truck roll.
+fetch_loader() {
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 5 -m 120 -o "$2" "$1"
+}
+fetch_rc=0
+if fetch_loader "$base/dist/boot/shim$efiarch.efi" "$tmp_shim"; then :; else fetch_rc=$?; fi
+if [ "$fetch_rc" = 0 ]; then
+  if fetch_loader "$base/dist/boot/grub$efiarch.efi" "$tmp_grub"; then :; else fetch_rc=$?; fi
+fi
+if [ "$fetch_rc" != 0 ]; then
+  if [ "$fetch_rc" = 22 ]; then
+    fail no-loaders "the depot at $hostport answered an HTTP error for the signed loaders under /dist/boot/ (nothing was erased)"
+  fi
+  fail depot-unreachable "could not reach the depot at $hostport to download the signed loaders (curl exit $fetch_rc; nothing was erased)"
 fi
 
 # The stage-1 config, VERBATIM the medium's (deploy/dongle-grub.cfg.tmpl) plus our marker line — the

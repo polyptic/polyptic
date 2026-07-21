@@ -2380,7 +2380,8 @@ export const BootReportCode = z.enum([
   "no-esp", // no EFI System Partition on any internal disk
   "ambiguous-esp", // several ESPs and none is clearly the boot one — needs polyptic.offload_disk=
   "no-partnum",
-  "no-loaders", // the signed shim/GRUB pair could not be downloaded from the depot
+  "no-loaders", // the depot answered, but with an HTTP error for the signed shim/GRUB pair
+  "depot-unreachable", // POL-168: the depot never answered at all (DNS/route/timeout), even after the pre-flight wait
   "mount-failed",
   "foreign-grub-cfg", // a GRUB config we did not write sits at our path; never clobbered
   "nvram-write-failed", // the firmware refused the boot entry (variable storage full?)
