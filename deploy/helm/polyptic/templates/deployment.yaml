@@ -9,6 +9,15 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  # POL-170: Recreate, never RollingUpdate. The media + depot volumes are ReadWriteOnce
+  # PVCs, so on a multi-node cluster a rolling upgrade deadlocks: the new pod schedules on
+  # another node, hits "Multi-Attach error" waiting for volumes the old pod still holds,
+  # and Helm times out and rolls back (observed amrc-fp, 2026-07-21). Recreate stops the
+  # old pod first — the ~1 min control-plane gap is fine, walls keep rendering and
+  # reconnect. Single-node clusters and fresh installs never hit the deadlock, which is
+  # why it survived until the first multi-node upgrade (the POL-127 lesson).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "polyptic.selectorLabels" . | nindent 6 }}
