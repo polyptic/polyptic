@@ -20,6 +20,8 @@
   D66: nothing here animates opacity/transform/filter EXCEPT the ticker's scroll, which is the
   pitch's explicit, documented exception (plain CSS transform loop; primary target is the
   GPU-composited Chrome boxes — on software-rendered fallback boxes a ticker is an operator choice).
+  POL-169 quantizes that scroll to TICKER_FPS compositor frames per second so it stops demanding a
+  frame every vsync — the difference between a readable strip and a pinned core on weak boxes.
   Clock/countdown/feed-ages update text nodes on a shared 1 Hz timer. SVG colouring never uses
   `fill="var(…)"` presentation attributes.
 -->
@@ -176,10 +178,18 @@ const qrModules = computed(() =>
 );
 
 // ── ticker ────────────────────────────────────────────────────────────────────
+/** POL-169 — compositor frames the scroll asks for per second. A vsync-rate scroll makes the box
+ *  produce a frame EVERY refresh; on a wall box that composites in software each produced frame is
+ *  CPU, and on real test hardware that pinned a full core and the strip still stuttered. Quantizing
+ *  the linear scroll with `steps()` keeps the animation compositor-driven (main-thread jank can
+ *  never freeze it) but between steps the transform is constant, so there is no damage and no frame
+ *  — the same economy as the player's `steps(1)` badge blinks, at a cadence still read as smooth. */
+const TICKER_FPS = 30;
 const tickerDuration = computed(() => {
   if (props.element.kind !== "ticker") return 0;
   return Math.max(8, Math.round(1800 / (props.element.props.speed || 60)));
 });
+const tickerSteps = computed(() => tickerDuration.value * TICKER_FPS);
 </script>
 
 <template>
@@ -232,6 +242,7 @@ const tickerDuration = computed(() => {
         color: element.props.fg,
         fontSize: cq(0.42),
         animationDuration: `${tickerDuration}s`,
+        animationTimingFunction: `steps(${tickerSteps}, end)`,
       }"
     >
       <span class="pel-ticker-text">{{ element.props.text || "…" }}</span>
@@ -446,7 +457,7 @@ const tickerDuration = computed(() => {
   align-items: center;
   font-weight: 500;
   animation-name: pel-tickmove;
-  animation-timing-function: linear;
+  /* timing-function is inline: `steps(duration × TICKER_FPS)` — a quantized linear (POL-169) */
   animation-iteration-count: infinite;
   will-change: transform;
 }

@@ -409,6 +409,48 @@ const refreshTargets = computed<RefreshTarget[]>(() =>
 );
 watch(refreshTargets, (targets) => refreshScheduler.sync(targets), { immediate: true });
 
+// ── Ticker smoothness probe (POL-169) ─────────────────────────────────────────
+// The ticker is the ONE thing on a wall that asks the compositor for continuous frames (D66's
+// documented exception), so when a box can't keep up it is the ticker an operator sees stutter —
+// and from the console there is no number to reason from. When a page carrying a ticker lands on
+// the glass, sample requestAnimationFrame once for a short window and put the achieved frame rate
+// in the diag trail. One-shot per page-life: the probe itself forces frame production, so it must
+// never become a resident loop (that would be the exact cost POL-169 removes from the scroll).
+const TICKER_PROBE_DELAY_MS = 5_000; // let the page settle first — measure cruise, not load
+const TICKER_PROBE_WINDOW_MS = 2_000;
+let tickerProbeState: "idle" | "armed" | "done" = "idle";
+const tickerOnGlass = computed(() =>
+  surfaces.value.some(
+    (s) => s.type === "page" && s.definition.elements.some((el) => el.kind === "ticker"),
+  ),
+);
+watch(
+  tickerOnGlass,
+  (present) => {
+    if (!present || tickerProbeState !== "idle") return;
+    tickerProbeState = "armed";
+    setTimeout(() => {
+      let frames = 0;
+      const started = performance.now();
+      const sample = (): void => {
+        frames += 1;
+        if (performance.now() - started < TICKER_PROBE_WINDOW_MS) {
+          requestAnimationFrame(sample);
+          return;
+        }
+        tickerProbeState = "done";
+        const fps = Math.round((frames * 1000) / TICKER_PROBE_WINDOW_MS);
+        diag(
+          `ticker on glass: ~${fps} fps sustained over ${TICKER_PROBE_WINDOW_MS / 1000}s ` +
+            `(${window.innerWidth}×${window.innerHeight} @ dpr ${window.devicePixelRatio})`,
+        );
+      };
+      requestAnimationFrame(sample);
+    }, TICKER_PROBE_DELAY_MS);
+  },
+  { immediate: true },
+);
+
 /** What each on-screen surface will actually fetch — the exact URLs the prober must prove.
  *  Playlist surfaces are EXCLUDED: a rotation has no single URL, and the rotator owns its own
  *  elements + timers (per-entry probing is a noted follow-up) — it renders ungated. Page surfaces
