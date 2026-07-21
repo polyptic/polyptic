@@ -31,7 +31,8 @@
 #   POLYPTIC_SYS_BLOCK      (/sys/class/block)   POLYPTIC_RUN_DIR    (/run/polyptic)
 #   POLYPTIC_OFFLOAD_STAMP  (/var/lib/polyptic/offloaded)
 #   POLYPTIC_LIB_DIR        (this script's dir)  POLYPTIC_CONSOLE    (/dev/console)
-#   POLYPTIC_HOLD_SECONDS / POLYPTIC_HOLD_SECONDS_OK   (how long a message stays on screen)
+#   POLYPTIC_HOLD_SECONDS      (bounds the FAILURE hold; unset = hold the boot forever, POL-167)
+#   POLYPTIC_HOLD_SECONDS_OK   (how long the success message stays on screen)
 set -eu
 
 # The ESP GUID that marks an EFI System Partition in a GPT table.
@@ -46,7 +47,9 @@ SYS_BLOCK="${POLYPTIC_SYS_BLOCK:-/sys/class/block}"
 RUN_DIR="${POLYPTIC_RUN_DIR:-/run/polyptic}"
 LIB_DIR="${POLYPTIC_LIB_DIR:-$(CDPATH= cd "$(dirname "$0")" && pwd)}"
 CONSOLE="${POLYPTIC_CONSOLE:-/dev/console}"
-HOLD_BAD="${POLYPTIC_HOLD_SECONDS:-15}"
+# POL-167: HOLD_BAD unset (the production default) means a failure holds the boot FOREVER — see
+# hold_failure. Setting it (the off-box tests, or a deliberate operator override) bounds the hold.
+HOLD_BAD="${POLYPTIC_HOLD_SECONDS:-}"
 HOLD_OK="${POLYPTIC_HOLD_SECONDS_OK:-6}"
 STATUS_FILE="$RUN_DIR/bootloader-status"
 
@@ -113,12 +116,31 @@ report() {
   return 0
 }
 
-# Abort: announce, report, hold the message on screen, exit non-zero. Nothing partial is left behind
-# that a later boot would mistake for a finished install (the stamp is written only on success).
+# A FAILURE must outlive the boot (POL-167). The unit is Before=greetd with TimeoutStartSec=infinity,
+# so as long as this process lives the kiosk never paints — the 2026-07-21 bring-up watched a `no-esp`
+# abort hold for 15 s and then greetd painted the wall over it, so a failed install looked exactly like
+# a success. The screen is keyboard-less: power-cycling IS the acknowledgment. Re-announce on a beat,
+# because plymouth rotates messages and the operator may walk up minutes later. POLYPTIC_HOLD_SECONDS
+# set (the off-box tests, or an operator override) bounds the hold instead of looping — a loop of many
+# small sleeps rather than one huge one, so the periodic re-announce and the hold are the same thing.
+hold_failure() {
+  say "INSTALL FAILED ($1): $2 - power-cycle this screen to continue"
+  if [ -n "$HOLD_BAD" ]; then hold "$HOLD_BAD"; return 0; fi
+  while :; do
+    sleep 45 || true
+    say "INSTALL FAILED ($1): $2 - power-cycle this screen to continue"
+  done
+}
+
+# Abort: announce, report, then hold the verdict on screen — forever on a real box (hold_failure never
+# returns; the boot stops here rather than falling through to the kiosk). The status file and the
+# control-plane report are both written BEFORE the hold, so the outcome is recorded even though the
+# process never exits. Nothing partial is left behind that a later boot would mistake for a finished
+# install (the stamp is written only on success).
 fail() {
   say "BOOTLOADER INSTALL FAILED: $2"
   report false "$1" "$2"
-  hold "$HOLD_BAD"
+  hold_failure "$1" "$2"
   exit 1
 }
 

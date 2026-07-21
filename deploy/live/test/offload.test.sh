@@ -149,6 +149,19 @@ rm -f "$1" 2>/dev/null; mkdir -p "$1" 2>/dev/null; exit 0
 EOF
 printf '#!/bin/sh\nexit 1\n' > "$BIN/mountpoint"      # never "already mounted"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/plymouth"
+# sleep stub (POL-167): every hold lands here, so no test ever waits real time. The FIRST call
+# snapshots whether the status file already existed — the write-status-THEN-hold ordering fail()
+# promises. $STUB/sleep_kills makes the forever-hold observable: instead of sleeping we kill the
+# script, standing in for the operator's power-cycle.
+cat > "$BIN/sleep" <<'EOF'
+#!/bin/sh
+if [ ! -f "$STUB/sleep_probe" ]; then
+  if [ -f "$STUB/run/bootloader-status" ]; then s=yes; else s=no; fi
+  printf 'status_at_hold=%s\n' "$s" > "$STUB/sleep_probe"
+fi
+if [ -f "$STUB/sleep_kills" ]; then kill "$PPID" 2>/dev/null; exit 1; fi
+exit 0
+EOF
 # The POL-63 Wi-Fi payload path: `ip route show default` decides payload-vs-pointer, `df -Pk` is the
 # ESP space check, `blkid` backs find-boot-medium's scan.
 cat > "$BIN/ip" <<'EOF'
@@ -192,7 +205,7 @@ offload() {
   STUB="$d" PATH="$BIN:$PATH" \
   POLYPTIC_CMDLINE_FILE="$d/cmdline" POLYPTIC_EFI_DIR="$d/efi" POLYPTIC_SYS_BLOCK="$d/sysblock" \
   POLYPTIC_RUN_DIR="$d/run" POLYPTIC_OFFLOAD_STAMP="$d/var/offloaded" POLYPTIC_LIB_DIR="$LIB" \
-  POLYPTIC_CONSOLE="$d/console" POLYPTIC_HOLD_SECONDS=0 POLYPTIC_HOLD_SECONDS_OK=0 \
+  POLYPTIC_CONSOLE="$d/console" POLYPTIC_HOLD_SECONDS="${TEST_HOLD-0}" POLYPTIC_HOLD_SECONDS_OK=0 \
   POLYPTIC_BYLABEL_DIR="$d/by-label" POLYPTIC_NET_DIR="$d/netdir" \
   STUB_ARCH="${STUB_ARCH:-x86_64}" \
     sh "$LIB/offload.sh" 2>&1
@@ -332,6 +345,33 @@ out="$(offload "$d")"
 eq "no loaders: fails"                    "1" "$(exit_of "$out")"
 eq "no loaders: code"                     "no-loaders" "$(code_of "$d")"
 eq "no loaders: ESP untouched"            "" "$(ls "$d/esp")"
+
+# ─── 11c) POL-167: a failure holds the boot; the hold is bounded ONLY by explicit override ──────────
+# The status file and the control-plane report land BEFORE the hold (the sleep stub snapshots the
+# status file the moment the first hold beat fires), the on-screen text carries code + detail + the
+# power-cycle instruction, and POLYPTIC_HOLD_SECONDS (the tests' 0, an operator's override) bounds
+# what is otherwise an infinite re-announcing loop.
+d="$(new_case hold-ordering)"; printf 'BOOT_IMAGE=/vmlinuz quiet splash polyptic.offload=1\n' > "$d/cmdline"
+TEST_HOLD=1
+out="$(offload "$d")"
+TEST_HOLD=0
+eq "hold: status written before the hold began" "status_at_hold=yes" "$(cat "$d/sleep_probe" 2>/dev/null)"
+has "hold: names the code on screen"      "INSTALL FAILED (no-base)" "$out"
+has "hold: tells the operator the way out" "power-cycle this screen to continue" "$out"
+eq "hold: bounded by the override, so it returned" "1" "$(exit_of "$out")"
+
+# The production default (POLYPTIC_HOLD_SECONDS unset) holds FOREVER: the loop's first sleep is made
+# to kill the script — standing in for the power-cycle — and that kill is the only way it ends.
+d="$(new_case hold-forever)"; printf 'BOOT_IMAGE=/vmlinuz quiet splash polyptic.offload=1\n' > "$d/cmdline"
+: > "$d/sleep_kills"
+TEST_HOLD=
+out="$(offload "$d")"
+TEST_HOLD=0
+case "$(exit_of "$out")" in
+  0|1) bad "forever hold: only a power-cycle ends it" "killed (not exit 0/1)" "$(exit_of "$out")" ;;
+  *)   ok "forever hold: only a power-cycle ends it" ;;
+esac
+has "forever hold: verdict stayed on screen" "power-cycle this screen to continue" "$out"
 
 # ─── 12) A cmdline with no control plane ────────────────────────────────────────────────────────────
 d="$(new_case no-base)"; printf 'BOOT_IMAGE=/vmlinuz quiet splash polyptic.offload=1\n' > "$d/cmdline"
