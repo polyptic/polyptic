@@ -1200,6 +1200,27 @@ export const useConsoleStore = defineStore("console", {
     },
 
     /**
+     * Install the OS to one of a box's internal disks (POL-176). Nothing to update optimistically —
+     * the agent streams `agent/install-status` and the admin/state broadcast carries `installing`
+     * onto the card a moment later. Returns an operator-readable error when the server refused
+     * (bad disk, not live-booted, offline), else null.
+     */
+    async installMachine(id: string, device: string): Promise<string | null> {
+      try {
+        await api.installMachine(id, device);
+        return null;
+      } catch (err) {
+        console.error("[console] installMachine failed", err);
+        // Same idiom as rebootMachine: the server's 4xx sentences explain themselves — prefer them.
+        const detail =
+          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
+            ? (err.payload as { error: string }).error
+            : null;
+        return detail ?? "Install failed because the control plane could not reach that machine.";
+      }
+    },
+
+    /**
      * Permanently forget a machine (POL-14): drop it, its screens, and anything derived from them
      * (placements, combined surfaces, selection) optimistically for a snappy feel; the authoritative
      * admin/state broadcast reconciles. Unlike rejectMachine (a remembered "rejected" state), this

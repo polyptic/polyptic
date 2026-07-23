@@ -514,6 +514,12 @@ function handleAgent(
       // POL-105 — the image the box BOOTED, on its very first frame: an operator watching a canary
       // reboot sees the new id land the moment the box is back, not a heartbeat later.
       imageId: msg.imageId,
+      // POL-176 — how the box boots (live vs installed), its disk inventory (what the console's
+      // INSTALL dialog offers), and any image staged to its inactive slot. Absent fields (an older
+      // agent, a dev box) never erase what a newer session already reported — the state.ts rule.
+      bootMode: msg.bootMode,
+      disks: msg.disks,
+      stagedImageId: msg.stagedImageId,
       hardware: msg.hardware,
       enrolledTokenId: decision.tokenId,
       enrolledTokenName: decision.tokenName,
@@ -809,6 +815,24 @@ function handleAgent(
             );
           });
       }
+      // POL-176 — the heartbeat also carries the STAGED image id on an installed box, fresh each
+      // sample because staging happens at runtime: this is what flips the console's "update ready —
+      // reboot to apply" badge the poll after the download lands. Same fire-and-forget +
+      // change-detection contract as the running image id above.
+      if (msg.vitals?.stagedImageId) {
+        const staged = msg.vitals.stagedImageId;
+        void control
+          .noteMachineStagedImage(msg.machineId, staged)
+          .then((changed) => {
+            if (changed) broadcaster.broadcast();
+          })
+          .catch((err: unknown) => {
+            log.warn(
+              { event: "staged-image.report.error", machineId: msg.machineId, err: String(err) },
+              "could not record the staged image id this box reported",
+            );
+          });
+      }
       // Coalesced downstream; the first sample matters most (it fills an empty strip).
       if (msg.vitals || hadVitals) broadcaster.broadcast();
       log.info(
@@ -858,6 +882,56 @@ function handleAgent(
       log.info(
         { event: "agent.update_status", machineId: msg.machineId, phase: msg.phase, from: msg.fromVersion, to: msg.toVersion, reason: msg.reason },
         "agent self-update status",
+      );
+    } else if (msg.t === "agent/install-ack") {
+      // POL-176 — the box's answer to `server/install`, sent before the root installer runs. A
+      // REFUSAL is the loud case: the operator confirmed a wipe and nothing happened, so the feed
+      // says why. An ACCEPT marks the install in flight immediately (the installer's own `starting`
+      // line follows within a poll), so the console's badge appears on the click's round trip.
+      const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+      if (!msg.accepted) {
+        activity.push("bad", `${label} refused to install: ${msg.reason ?? "no reason given"}`);
+      } else {
+        presence.setMachineInstalling(msg.machineId, { phase: "starting" });
+      }
+      broadcaster.broadcast();
+      log.info(
+        { event: "agent.install_ack", machineId: msg.machineId, accepted: msg.accepted, reason: msg.reason },
+        msg.accepted ? "agent accepted install" : "agent refused install",
+      );
+    } else if (msg.t === "agent/install-status") {
+      // POL-176 — the root installer's narration, forwarded line by line by the agent. Every frame
+      // updates the live `installing` state (the broadcaster coalesces the fan-out); only the
+      // terminal edges earn a feed line — `done` is the news the operator armed this for, `failed`
+      // is the news they must act on. The install's durable half (the box now booting `disk`)
+      // arrives separately via /boot/report once it reboots installed.
+      const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+      presence.setMachineInstalling(msg.machineId, {
+        phase: msg.phase,
+        ...(msg.percent !== undefined ? { percent: msg.percent } : {}),
+        ...(msg.detail !== undefined ? { detail: msg.detail } : {}),
+      });
+      if (msg.phase === "done") {
+        activity.push(
+          "good",
+          `${label} installed Polyptic to disk${msg.detail ? `: ${msg.detail}` : ""} — it boots from disk after its next reboot`,
+        );
+      } else if (msg.phase === "failed") {
+        activity.push(
+          "bad",
+          `${label} could not install to disk: ${msg.detail ?? "the installer gave no reason"}`,
+        );
+      }
+      broadcaster.broadcast();
+      log.info(
+        {
+          event: "agent.install_status",
+          machineId: msg.machineId,
+          phase: msg.phase,
+          percent: msg.percent,
+          detail: msg.detail,
+        },
+        "agent install status",
       );
     } else if (msg.t === "agent/shell-opened") {
       shellRelay.openedFromAgent(msg.machineId, msg.sessionId, msg.ok, msg.reason);
@@ -991,6 +1065,9 @@ function handleAgent(
         // "asleep" would strand the console showing a dark wall that is actually showing content. The
         // scheduler re-sleeps it on hello if it is still outside its hours.
         presence.clearScreensPower(screenIds);
+        // POL-176 — the install narration died with the socket. The box may still be installing
+        // (or rebooting into its fresh disk); its /boot/report tells the durable end of the story.
+        presence.clearMachineInstalling(machineId);
       }
       broadcaster.broadcast();
     }

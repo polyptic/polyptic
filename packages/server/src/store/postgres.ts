@@ -19,6 +19,7 @@ import postgres from "postgres";
 import { z } from "zod";
 
 import {
+  BootMode,
   ContentKind,
   DisplayBackend,
   EnrollmentStatus,
@@ -26,6 +27,7 @@ import {
   HostIdentity,
   ImageRings,
   MachineBootPath,
+  MachineDisk,
   MachineTags,
   OperatorRole,
   Output,
@@ -85,6 +87,11 @@ interface MachineRow {
   boot_path: string | null;
   boot_path_at: Date | null;
   boot_path_detail: string | null;
+  boot_mode: string | null;
+  boot_mode_at: Date | null;
+  disks: unknown;
+  staged_image_id: string | null;
+  staged_image_id_at: Date | null;
   hardware: unknown;
   enrolled_token_id: string | null;
   enrolled_token_name: string | null;
@@ -344,6 +351,13 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_path text`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_path_at timestamptz`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_path_detail text`;
+    // POL-176 — install-to-disk: live vs installed (+ when reported), the box's disk inventory
+    // (jsonb, for the console's INSTALL dialog), and the image staged to its inactive slot.
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_mode text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS boot_mode_at timestamptz`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS disks jsonb`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS staged_image_id text`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS staged_image_id_at timestamptz`;
     // POL-104: what the box IS (MACs / DMI serial / arch), which token it enrolled on, and whether it
     // matched a pre-registration. All NULL on rows that pre-date POL-104 — a machine enrolled before
     // this change simply says less on its card; it is never re-gated or re-approved because of it.
@@ -734,7 +748,7 @@ export class PostgresStore implements Store {
       zoomPreferenceRows,
       audioPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, boot_mode, boot_mode_at, disks, staged_image_id, staged_image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled, variables FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision, active_scene_id FROM meta WHERE id = 1`,
@@ -778,6 +792,13 @@ export class PostgresStore implements Store {
         bootPath: MachineBootPath.safeParse(row.boot_path).data,
         bootPathAt: row.boot_path_at ? row.boot_path_at.toISOString() : undefined,
         bootPathDetail: row.boot_path_detail ?? undefined,
+        // POL-176 — same degradation rules: an unrecognised mode / a disks blob that no longer
+        // parses is dropped, never fatal (it is re-reported on the box's next hello anyway).
+        bootMode: BootMode.safeParse(row.boot_mode).data,
+        bootModeAt: row.boot_mode_at ? row.boot_mode_at.toISOString() : undefined,
+        disks: row.disks ? MachineDisk.array().safeParse(row.disks).data : undefined,
+        stagedImageId: row.staged_image_id ?? undefined,
+        stagedImageIdAt: row.staged_image_id_at ? row.staged_image_id_at.toISOString() : undefined,
         hardware: hardware?.success ? hardware.data : undefined,
         enrolledTokenId: row.enrolled_token_id ?? undefined,
         enrolledTokenName: row.enrolled_token_name ?? undefined,
@@ -927,7 +948,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, boot_mode, boot_mode_at, disks, staged_image_id, staged_image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -945,6 +966,11 @@ export class PostgresStore implements Store {
         ${machine.bootPath ?? null},
         ${machine.bootPathAt ? new Date(machine.bootPathAt) : null},
         ${machine.bootPathDetail ?? null},
+        ${machine.bootMode ?? null},
+        ${machine.bootModeAt ? new Date(machine.bootModeAt) : null},
+        ${machine.disks ? sql.json(machine.disks) : null},
+        ${machine.stagedImageId ?? null},
+        ${machine.stagedImageIdAt ? new Date(machine.stagedImageIdAt) : null},
         ${machine.hardware ? sql.json(machine.hardware) : null},
         ${machine.enrolledTokenId ?? null},
         ${machine.enrolledTokenName ?? null},
@@ -971,6 +997,13 @@ export class PostgresStore implements Store {
         boot_path        = COALESCE(EXCLUDED.boot_path, machines.boot_path),
         boot_path_at     = COALESCE(EXCLUDED.boot_path_at, machines.boot_path_at),
         boot_path_detail = COALESCE(EXCLUDED.boot_path_detail, machines.boot_path_detail),
+        -- POL-176 — same rule again: a pre-POL-176 agent (or a probe that failed this boot) must
+        -- not blank the mode/inventory/staged id a newer session already reported.
+        boot_mode          = COALESCE(EXCLUDED.boot_mode, machines.boot_mode),
+        boot_mode_at       = COALESCE(EXCLUDED.boot_mode_at, machines.boot_mode_at),
+        disks              = COALESCE(EXCLUDED.disks, machines.disks),
+        staged_image_id    = COALESCE(EXCLUDED.staged_image_id, machines.staged_image_id),
+        staged_image_id_at = COALESCE(EXCLUDED.staged_image_id_at, machines.staged_image_id_at),
         -- POL-104: never blank out what we already know. A pre-POL-104 agent (or an agent that could
         -- not read its own DMI) sends no hardware; a row that HAS hardware must not lose it because
         -- one hello arrived without any, and the token a machine enrolled on is written ONCE, at
@@ -992,6 +1025,11 @@ export class PostgresStore implements Store {
   async setMachineBootPath(id: string, path: MachineBootPath, at: string, detail: string): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE machines SET boot_path = ${path}, boot_path_at = ${new Date(at)}, boot_path_detail = ${detail} WHERE id = ${id}`;
+  }
+
+  async setMachineStagedImage(id: string, stagedImageId: string, at: string): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET staged_image_id = ${stagedImageId}, staged_image_id_at = ${new Date(at)} WHERE id = ${id}`;
   }
 
   async setMachineTags(id: string, tags: string[]): Promise<void> {

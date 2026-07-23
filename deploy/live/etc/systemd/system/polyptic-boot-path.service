@@ -7,12 +7,12 @@
 Description=Polyptic, report the boot path (wired vs local fallback) + write on-medium forensics (POL-171)
 Documentation=file:///usr/local/lib/polyptic/boot-path.sh
 # After the network so the report can leave the box and the default route (the wired-vs-Wi-Fi tell)
-# exists. Before the offload so /run/polyptic/forensics-file is in place for offload.sh to append
-# its verdict to this boot's log; before greetd so a fallback warning is on the splash before the
-# kiosk paints over it.
+# exists. Before greetd so a fallback warning is on the splash before the kiosk paints over it.
+# /run/polyptic/forensics-file lands here for install-to-disk.sh (POL-176) to append its verdict to
+# this boot's log later — the installer runs mid-session off a path unit, so it is always after us.
 Wants=network-online.target
 After=network-online.target
-Before=polyptic-offload.service greetd.service
+Before=greetd.service
 ConditionPathExists=/usr/local/lib/polyptic/boot-path.sh
 
 [Service]

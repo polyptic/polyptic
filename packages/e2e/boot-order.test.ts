@@ -24,7 +24,7 @@ const libDir = resolve(repoRoot, "deploy", "live", "usr", "local", "lib", "polyp
 const shTestPath = resolve(repoRoot, "deploy", "live", "test", "boot-order.test.sh");
 const scriptPath = resolve(libDir, "boot-order.sh");
 const pollPath = resolve(libDir, "update-poll.sh");
-const offloadPath = resolve(libDir, "offload.sh");
+const installerPath = resolve(libDir, "install-to-disk.sh");
 
 describe("boot-order watch: shell suite", () => {
   test("deploy/live/test/boot-order.test.sh passes", async () => {
@@ -45,7 +45,7 @@ describe("boot-order watch: the destructive-action contract", () => {
     expect(writes.length).toBeGreaterThan(0);
     for (const call of writes) {
       // -c creates a boot entry, -B deletes one. Neither is ever this script's business: it heals an
-      // entry the offload installed, and a box with no such entry is left alone entirely.
+      // entry the installer wrote, and a box with no such entry is left alone entirely.
       expect(call).not.toMatch(/\s-c(\s|$)/);
       expect(call).not.toMatch(/\s-B(\s|$)/);
     }
@@ -79,12 +79,15 @@ describe("boot-order watch: the destructive-action contract", () => {
     expect(script).not.toMatch(/"token":/);
   });
 
-  test("the UEFI label matches the one the offload installs — that is what makes the entry OURS", () => {
-    const label = /^LABEL="([^"]+)"$/m;
-    const ours = label.exec(script)?.[1];
-    const theirs = label.exec(readFileSync(offloadPath, "utf8"))?.[1];
-    expect(ours).toBe("Polyptic Netboot");
-    expect(theirs).toBe(ours);
+  test("the UEFI labels match the ones the installer writes — that is what makes an entry OURS (POL-176)", () => {
+    // The watch heals only entries WE created: `Polyptic` (the POL-176 disk install) and the
+    // retired offload flow's `Polyptic Netboot`, which fielded boxes keep until they install.
+    // The installer's label must be one the watch recognises, or every installed box drifts
+    // unwatched. install-to-disk.sh is the writer of record now that offload.sh is gone.
+    expect(script).toContain('LABEL_DISK="Polyptic"');
+    expect(script).toContain('LABEL_LEGACY="Polyptic Netboot"');
+    const installer = readFileSync(installerPath, "utf8");
+    expect(/^LABEL="([^"]+)"$/m.exec(installer)?.[1]).toBe("Polyptic");
   });
 });
 

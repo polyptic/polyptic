@@ -1,10 +1,10 @@
-# Polyptic netboot (bare box → screen, no OS install, Secure Boot stays ON)
+# Polyptic boot (bare box → screen, Secure Boot stays ON): netboot to provision, install to a disk the box owns
 
-Boot a bare machine straight into Polyptic **over the network, into RAM**, no operating system installed, nothing written to the disk, and **Secure Boot left ON**. Power on → the box streams a live Polyptic image from the control plane → it comes up as a named, placed screen. Swap a dead panel like a lightbulb. The replacement is generic, because nothing unique ever lived on its disk.
+Boot a bare machine straight into Polyptic **over the network, into RAM**, no operating system installed, and **Secure Boot left ON**. Power on → the box streams a live Polyptic image from the control plane → it comes up as a named, placed screen. Then, if the box has an internal disk, press **INSTALL** in the console: the disk is wiped into Polyptic's own layout (A/B image slots, encrypted swap, a per-boot-reset scratch overlay) and every later boot reads the OS **from the disk** — no RAM copy, no network in the boot loop, and netboot stays right behind as the automatic recovery. Swap a dead panel like a lightbulb: the replacement is generic, because nothing unique lives on any box's disk — an installed disk carries an image the depot can re-serve to anything, never identity or state.
 
 This answers two problems at once:
 
-1. **No hidden install step.** Nothing is installed on the box first. It has no OS until it fetches one, and it fetches a *live* one that never touches disk.
+1. **No hidden install step.** Nothing has to be installed on the box first. It has no OS until it fetches a *live* one over the network — that is how a fresh box gets far enough to show INSTALL at all. Netboot is the **provisioning path** (first boot, replacement boxes) and the **recovery path** (a disk boot that fails falls through to it); it is the *only* path for boxes with no usable disk, which keep netbooting exactly as before.
 2. **Who owns a booting box on a shared LAN?** **Ownership is by key, not by who-answered-the-network-first.** A box belongs to the server whose **enrolment token** its boot chain carries. So Polyptic never runs DHCP, and two control planes on one VLAN (staging next to production) coexist for free, because each box carries exactly one server's key.
 
 And it does both **without touching Secure Boot**, because the first boot stage is Ubuntu's already-signed shim + network GRUB, the exact binaries Canonical ships for its own netboot installer. Polyptic signs nothing and manages no keys. See [Secure Boot](#secure-boot) for precisely what is verified and what is not.
@@ -49,11 +49,13 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 
 **5. Make a box boot it**, pick **one**:
 
-- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes, and **Wi-Fi-only boxes too** once you put the network's credentials in `polyptic/wifi.conf` on the flashed stick (wired boxes ignore the file). Plug it in, boot from USB with Secure Boot ON, and take the default (**Polyptic**) or pick **Set up this screen to start without the USB stick** to offload the loader onto the box. See [The boot medium](#the-boot-medium-dongle-or-offload) and [Wi-Fi](#wi-fi-boxes-with-no-wire).
+- **USB dongle (simplest):** Console ▸ Settings ▸ Onboard Screens ▸ **Download bootloader**, then `sudo dd if=polyptic-boot.img of=/dev/sdX bs=4M` to a USB stick. The same stick boots amd64 **and** arm64 boxes, and **Wi-Fi-only boxes too** once you put the network's credentials in `polyptic/wifi.conf` on the flashed stick (wired boxes ignore the file). Plug it in, boot from USB with Secure Boot ON, and take the default (**Polyptic**). See [The boot medium](#the-boot-medium-the-dongle) and [Wi-Fi](#wi-fi-boxes-with-no-wire).
 - **No medium, UEFI HTTP Boot:** point the box's firmware Boot URI at `http://10.0.0.5:8080/dist/boot/shimx64.efi` (arm64: `shimaa64.efi`). See [No medium at all](#no-medium-at-all-uefi-http-boot).
 - **No medium, site DHCP:** add one option-67 rule to the DHCP you already run. See [Site DHCP option 67](#site-dhcp-option-67-one-change-to-the-dhcp-you-already-run).
 
 **6. First boot → approve → done.** The box streams the image into RAM, boots diskless, and dials in. In **gated** mode it appears **PENDING** under **Console ▸ Machines**. Approve it once and it renders its screen. Place it on a mural like any screen. **Every later cold boot re-attaches automatically** (same stable hardware id + token → no re-approval, placement kept). In **open** mode it's admitted immediately.
+
+**7. Boxes with an internal disk: INSTALL.** The machine's card in the console shows **LIVE** while it runs from RAM, with an **Install to disk** action beside it. Pick the disk (the box reports its own inventory), read the confirmation — it names exactly which disk gets wiped — and watch the progress live. When it finishes, restart the box: from then on it boots from its own disk, faster, with a ~1 GB RAM floor instead of ~3.5 GB, and with netboot as its automatic fallback. See [Installing to the disk](#installing-to-the-disk-the-default-for-boxes-with-one). Keep the USB stick for the next new box — an installed box does not need it.
 
 **Troubleshooting quick hits:**
 
@@ -61,7 +63,7 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 - GRUB stops with **`bad shim signature`** → the depot's `vmlinuz` is not Canonical-signed (modified or corrupted). Rebuild the live image, whose signature guard should have refused this at build time.
 - A bare **`grub>` prompt** instead of a menu → GRUB could not find its config. Dongle: check `grub/grub.cfg` exists on the stick. HTTP Boot: check `GET /boot/grub.cfg` **and** `GET /grub/grub.cfg` both return 200.
 - Boots GRUB but stalls fetching → GRUB speaks minimal plain HTTP/1.1: **no TLS, no redirects, no chunked responses**, direct 200s with `Content-Length` only. Also expect the GRUB-stage kernel+initrd fetch to run at a few MB/s (tens of seconds). The big root-image fetch happens later, in Linux, at wire speed.
-- Downloads the root image then dies in the initramfs → **not enough RAM**. dracut pulls the whole squashfs into a RAM tmpfs. Budget roughly **the image size plus the running system's working set** (the initrd raises the tmpfs cap to 90% and warns below the floor).
+- Downloads the root image then dies in the initramfs → **not enough RAM** (netbooted boxes only — an installed box never copies the image into RAM). dracut pulls the whole squashfs into a RAM tmpfs. Budget roughly **the image size plus the running system's working set** (the initrd raises the tmpfs cap to 90% and warns below the floor). The durable fix for a box with a disk is [INSTALL](#installing-to-the-disk-the-default-for-boxes-with-one).
 - Boots the image but never appears in Machines → check the box reaches the control plane, and `journalctl -u polyptic-agent-env` (the identity/cmdline oneshot) on the box.
 - **Need a shell on a box?** Power-cycle and pick **Debug console** at the GRUB menu, which is the normal live boot plus a **passwordless root shell on tty9** (`Ctrl+Alt+F9`, and `Ctrl+Alt+F1` returns to the wall). This is the *only* interactive access the image has. The image ships no passwords and no SSH, so a running box is sealed and a debug boot is always a deliberate power-cycle away. It grants nothing an attacker with keyboard + power didn't already have (GRUB configs are unverified in the shim model, so the cmdline was always editable at the menu). The image carries `procps` (`top`, `ps`, `free`) for diagnosing a hot or struggling box.
 - A box re-appears as a *new* PENDING machine each boot → its firmware reports no stable DMI UUID and the id fell back to a MAC hash that changed (multi-NIC). See [stable identity](#the-life-of-a-box-power-on-to-pixels).
@@ -71,8 +73,10 @@ curl -sI http://10.0.0.5:8080/dist/image/amd64/rootfs.squashfs | grep -i accept-
 
 ## The life of a box, power-on to pixels
 
+This is the **netboot** chain — the provisioning path every box walks at least once, and the only chain for boxes with no usable disk. An [installed box](#installing-to-the-disk-the-default-for-boxes-with-one) replaces the middle of it (kernel, initrd and squashfs come off its own disk, no network) but the enrolment half at the bottom is identical.
+
 ```
-Boot medium (USB dongle)   or   offloaded ESP entry   or   UEFI HTTP Boot / site DHCP option 67
+Boot medium (USB dongle)   or   legacy offloaded ESP entry   or   UEFI HTTP Boot / site DHCP option 67
         │  firmware db (Microsoft UEFI CA 2011) verifies + runs…
         ▼
 shim (Microsoft-signed) → verifies + loads → network GRUB "grubnet" (Canonical-signed)
@@ -105,19 +109,116 @@ The **stable machine-id is the whole trick.** A diskless live image regenerates 
 
 ---
 
+## Installing to the disk (the default for boxes with one)
+
+A netbooted box pays for its disklessness in RAM and in network dependence: the whole root image sits in a RAM tmpfs all session, and a power cycle cannot end in pixels unless the control plane answers. A box that **has** an internal disk should not pay either price. INSTALL gives the disk to Polyptic — wholly, always wiped — and keeps everything the diskless contract was actually for: **stateless per boot, generic boxes, updates by image id**, now by construction instead of by never writing anything.
+
+### The console flow
+
+All operator intent lives in the console — there are **no install entries in any GRUB menu**, ever. A machine running from RAM wears a **LIVE** chip and an **Install to disk** action. The dialog lists the disks **the box itself reported** (device, size, model, what's currently on it); the confirmation names exactly which disk gets wiped; and once confirmed, the install streams its progress back live (fetching → verifying → writing → boot entry → done), because the operator who clicked is watching.
+
+Mechanically: the agent stays unprivileged — it drops one line (`device=/dev/sdX`) at `/run/polyptic/requests/install`, and a root-owned path unit (`polyptic-install.path`, the same request-file pattern as the reboot flow) runs `install-to-disk.sh`. The installer appends progress lines to `/run/polyptic/install-status`, which the agent relays over the agent WS channel to the console dialog. The outcome also lands in **Console ▸ Activity** (`POST /boot/report`) and in the boot medium's [forensics log](#the-wired-wait-one-card-at-a-time-and-it-talks).
+
+A failure never punishes the room: the box runs from RAM, the wall keeps rendering, the next boot is the same netboot as before. The failure is reported, marked in the progress file, and that is all.
+
+### What lands on the disk
+
+The installer **preflights everything before the first destructive write** — and it fetches + SHA256-verifies a **fresh** build from the depot (per-machine, so roll-out rings are honoured) *before* the wipe. It never copies the image it is running: an install always lands a depot-known build. Then, GPT over the whole disk:
+
+| # | Size | Format | Label / partlabel | Holds |
+| --- | --- | --- | --- | --- |
+| 1 | 1536 MiB | FAT32 | `POLYPTIC-BT` / `POLYPTIC-ESP` | Signed shim + GRUB at `EFI/polyptic/` **and** the `EFI/BOOT/` fallback (unconditional — this disk is entirely ours); each slot's kernel + LEAN initrd at `/polyptic/boot/<arch>/{a,b}/`; the GRUB config; `wifi.conf`/certs/splash theme copied off the booted medium; the `polyptic/medium-id` marker |
+| 2 | 4 GiB | ext4 | `POLYPTIC-A` | Slot A: `rootfs.squashfs` at `/LiveOS/squashfs.img` (the freshly installed build) |
+| 3 | 4 GiB | ext4 | `POLYPTIC-B` | Slot B: empty at install — updates stage into whichever slot is inactive |
+| 4 | 4 GiB | swap | `POLYPTIC-SWAP` | dm-crypt swap, **re-keyed with a fresh random key every boot** (see below) |
+| 5 | rest | ext4 | `POLYPTIC-SCRATCH` | The writable overlay, **wiped by dracut on every boot** |
+
+Disks under ~16 GiB are refused, loudly, before anything is written.
+
+The ESP carries `polyptic/medium-id` (`disk-esp-<timestamp>`) — from that moment **the ESP *is* the box's boot medium**. `find-boot-medium.sh` proves identity by that file's content, so the forensics trail, the splash-theme heal and the A/B kernel staging all work on an installed box unchanged, no special cases.
+
+Finally the installer registers a `Polyptic` UEFI boot entry pointing at the ESP's shim and makes it **first** — then **proves it** rather than assuming it (the POL-58 discipline): NVRAM is re-read from scratch and `BootOrder` is asserted to actually lead with the new entry before anything is called installed. Stale entries of ours — a previous `Polyptic`, or the retired offload flow's `Polyptic Netboot` — are pruned first: an install supersedes an offload.
+
+### Booting from the disk
+
+```
+firmware → `Polyptic` UEFI entry → shim + GRUB on the box's OWN ESP (same signed pair, Secure Boot ON)
+        │  menuless: timeout_style=hidden, timeout=1 — a healthy box paints the splash, never a menu
+        ▼
+kernel + LEAN initrd from the ESP  (set fallback=netboot: if the slot's kernel fails to LOAD,
+        │                           GRUB falls through to the stage-1 wired walk → the server's menu,
+        │                           and the box streams the OS like an uninstalled box)
+        ▼
+dracut `root=live:LABEL=POLYPTIC-A` (or -B) loop-mounts the squashfs FROM the slot — no RAM copy,
+        │  no network. `rd.live.overlay=LABEL=POLYPTIC-SCRATCH` + `rd.live.overlay.reset=1`:
+        │  the writable overlay lives on the scratch partition and dracut wipes it every boot
+        ▼
+the same live Polyptic image boots — polyptic-agent-env, greetd, sway, agent, enrolment: unchanged
+```
+
+The kernel cmdline carries `polyptic.bootpath=disk`, which the box self-reports once per boot (`disk-boot`, state-only — like `wired-boot` it clears a lingering local-fallback flag and never makes a feed line). The hidden menu still honours a keypress during the 1-second window; behind it sit **the other slot** (the previous image, for a keyboard operator after a bad update), **netboot**, and **Debug console**. The automatic fallback deliberately goes to netboot, not to the other slot: GRUB cannot tell a stale slot from a good one, but the control plane always serves a known-good image.
+
+**Swap, privately.** An installed box finally has swap — the pressure-relief valve the diskless box lacked — but swapped pages can carry wall pixels and enrolment tokens, so `POLYPTIC-SWAP` comes up as **dm-crypt with a fresh random key from `/dev/urandom` every boot** (`/etc/crypttab`). The key is never stored; at power-off everything on that partition is permanently unreadable. `nofail` keeps netbooted/live boxes clean — for them the partition simply never appears.
+
+**Statelessness by construction.** The squashfs is read-only; the overlay is reset by dracut itself every boot; the swap is unreadable after power-off. Every boot starts from the pristine image — exactly the diskless contract, without re-downloading a gigabyte to get it.
+
+### Updates: stage always, apply operator-first
+
+The 5-minute update poll (plus a **2-minutes-after-boot** check, so a box powered off overnight catches up immediately) extends the proven A/B medium pattern to the whole OS. The moment the depot serves a newer build for this machine:
+
+1. Kernel + LEAN initrd are fetched into the ESP's **inactive** slot directory; the squashfs is fetched onto the **inactive slot partition** as `.new` and renamed only after its SHA256 check.
+2. Everything is verified against the build's `SHA256SUMS`.
+3. The GRUB config rewrite is the **last** step — the commit point. Power loss anywhere before it leaves the old config pointing at the old, intact slot. The disk is never half-updated.
+
+The **reboot** — the only disruptive part — is **operator-first**: the poll writes `/run/polyptic/update-state` (`running=` / `staged=`), the agent reports both ids in its heartbeat, and the console wears an **"update ready — reboot to apply"** badge whose reboot rides the existing lifecycle command. The nightly window (03:00–04:59, splayed) remains the backstop so a fleet can never drift indefinitely, and **urgent** still reboots within minutes. A staging that cannot complete skips that round's reboot and retries next poll — the box never reboots onto a half-staged disk.
+
+### Recovery is netboot
+
+There is deliberately **no automatic health-gated rollback between slots**. The recovery story is the one already proven fleet-wide: `set fallback=netboot` in the disk's GRUB config means a slot whose kernel fails to load falls straight through to the same stage-1 wired walk the dongle runs, chains the server's menu, and streams the active image from the control plane — the box comes back as a wall, and the operator fixes the disk at leisure (or just reinstalls). A keyboard operator can also boot the previous image from the hidden menu's other-slot entry.
+
+Firmware fights are watched, not assumed away: `boot-order.sh` runs on every poll and watches whichever entry the box owns — `Polyptic` (installed) or the legacy `Polyptic Netboot` (fielded offloaded boxes, which keep netbooting exactly as before) — reporting drift and, when the operator has opted in, reasserting first place.
+
+### What the installer refuses, and the codes it reports
+
+Nothing is wiped until every check below passes, and every outcome is one code in **Console ▸ Activity** (and the console dialog, and the on-medium forensics log). `installed` is the only success.
+
+| Reported code | What happened | Nothing erased? |
+| --- | --- | --- |
+| `install-bad-target` | The named device is missing, a partition rather than a whole disk, **removable media**, the very disk the box booted from, or currently mounted — or the request itself was malformed. | yes |
+| `install-disk-too-small` | The disk cannot hold the ESP + two 4 GiB slots + swap (< ~16 GiB). | yes |
+| `not-uefi` / `no-efibootmgr` / `no-efivars` | Legacy BIOS boot, or the boot-entry tooling/variables are unavailable — probed **before** the wipe, so a doomed install never destroys anything. | yes |
+| `depot-unreachable` / `no-loaders` | The depot never answered (after a bounded wait), or answered with an HTTP error for the signed loaders. The image is fetched *before* the wipe, so a network wobble can never leave a wiped, OS-less disk. | yes |
+| `install-no-image` | The depot serves no image manifest for this arch — nothing to install. | yes |
+| `install-no-tools` | The partitioning toolchain is missing from the image. | yes |
+| `install-write-failed` | The wipe, partitioning, formatting, download or verification failed **after** the point of no return. The disk may be part-written; the box itself is untouched (it runs from RAM) and next boot is the same netboot as before. Fix the cause and install again. | no |
+| `nvram-write-failed` / `nvram-entry-missing` / `nvram-not-persisted` | The firmware refused, dropped, or forgot the `Polyptic` boot entry. The install **is** on the disk — add an entry for `\EFI\polyptic\shim<arch>.efi` in firmware setup, or clear unused entries and install again. | disk written |
+| `boot-order-not-first` | The firmware kept the entry but still boots something else first. Move **Polyptic** to the top of the boot order in firmware setup. | disk written |
+
+### What stays true
+
+- **Stateless per boot** — read-only squashfs, dracut-reset overlay, ephemeral-key swap. Nothing a session writes survives a power cycle.
+- **Identity and enrolment unchanged** — `POLYPTIC_MACHINE_ID` still derives from hardware, the credential still lives with the agent, nothing identity-shaped is written to the disk. An installed box that dies is replaced by netbooting a blank one.
+- **Secure Boot unchanged** — the same pinned, signed shim + GRUB pair, now reading a local config instead of a fetched one; the kernel is verified by `shim_lock` identically (the check was always transport-agnostic).
+- **Updates by image id** — the same manifest, the same rings, the same urgency switch; only the mechanics moved from "reboot re-pulls" to "stage, then reboot applies".
+- **Netboot unchanged** — the whole chain this document describes still exists and still works; it is simply no longer the *steady state* for boxes that own a disk.
+
+> **Not yet booted on real hardware.** The install flow is pinned off-box (`deploy/live/test/install.test.sh` drives the whole decision tree against stubs), but the first installed boot — in particular the dracut scratch-overlay reset and the encrypted-swap bring-up — calibrates on the existing real-hardware pass.
+
+---
+
 ## The boot depot (server routes)
 
 All in [`packages/server/src/provision.ts`](../packages/server/src/provision.ts), alongside `/dist/agent`:
 
 | Route | Gate | What |
 |---|---|---|
-| `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu: `Polyptic` / `Set up this screen to start without the USB stick` / `Debug console`, three flat entries (addressed by `--id live|offload|debug`). Bakes the control-plane base from the request `Host` and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
-| `POST /boot/report` | **token** | How a box's bootloader install went → one line in the Live Activity feed. The reporter is mid-boot with no agent session, hence not under `/api/v1`. In gated mode it must present the fleet enrolment token it netbooted with, and in open mode it is ungated like the rest of the depot. Read-only against the registry, throttled, and the body can only produce one bounded line. |
+| `GET /boot/grub.cfg` | **ungated** | The generated GRUB menu: `Polyptic` / `Debug console` / `Watch this screen boot (verbose)`, flat entries (addressed by `--id live|debug|verbose`; the old `offload` entry is retired — [installing](#installing-to-the-disk-the-default-for-boxes-with-one) is a console action now, never a GRUB one). Bakes the control-plane base from the request `Host` and, in gated mode, the current enrolment token into the kernel cmdline. The box has no operator session at boot, so this is ungated. |
+| `POST /boot/report` | **token** | How a boot or an install went (boot-path tags, install verdicts, boot-order drift) → one line in the Live Activity feed, or a state-only update on the machine record. The reporter may be mid-boot with no agent session, hence not under `/api/v1`. In gated mode it must present the fleet enrolment token it booted with, and in open mode it is ungated like the rest of the depot. Read-only against the registry, throttled, and the body can only produce one bounded line. |
 | `GET /grub/grub.cfg` (+ `/grub/x86_64-efi/grub.cfg`, `/grub/arm64-efi/grub.cfg`) | **ungated** | **Aliases of the same menu**, at the paths an HTTP-booted GRUB actually asks for: grubnet's baked-in prefix is `/grub`, resolved against the **server root** of the host it was fetched from. See [the appendix](#no-medium-at-all-uefi-http-boot). |
 | `GET /boot/theme.txt`, `GET /boot/logo.png` | **ungated** | The GRUB theme that makes the menu the [Polyptic boot splash](#the-boot-splash) rather than a text console. Secret-free, and if either fails GRUB shows its plain menu and the box still boots. |
 | `GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs}` | **ungated** | The **active** live-image artifacts, streamed with real HTTP **Range** (206/416). The root image is hundreds of MB and streamed into RAM. |
 | `GET /dist/image/:arch/builds/:imageId/:file` | **ungated** | The same artifacts for any **retained** build ([Build history](#build-history-and-rollback)). Same Range streaming, same secret-free content. `:imageId` is whitelisted so it cannot walk out of the depot. |
-| `GET /dist/boot/:file` | **ungated** | The universal boot medium `polyptic-boot.img`, plus the four signed loaders `shim{x64,aa64}.efi` / `grub{x64,aa64}.efi` (fetched by the offload flow and UEFI HTTP Boot). All **tokenless**, so ungated like `/dist/agent`. |
+| `GET /dist/boot/:file` | **ungated** | The universal boot medium `polyptic-boot.img`, plus the four signed loaders `shim{x64,aa64}.efi` / `grub{x64,aa64}.efi` (fetched by the disk installer and by UEFI HTTP Boot). All **tokenless**, so ungated like `/dist/agent`. |
 | `GET /api/v1/settings/netboot` | **gated** | Operator-facing, secret-free `NetbootInfo{baseUrl, mode, bootConfigUrl, bootMediumUrl}` that drives the Console ▸ Settings ▸ Onboard Screens card. |
 | `POST /api/v1/settings/image/activate` | **gated** | Make a retained build the active one, the fleet **rollback** ([Build history](#build-history-and-rollback)). |
 
@@ -265,9 +366,11 @@ fails to parse, or a `logo.png` that 404s, degrades to GRUB's plain menu. None o
 
 Two places to keep in step, because neither can import the other and both end up on a wall:
 
-- `deploy/dongle-grub.cfg.tmpl` and the heredoc inside
-  [`offload.sh`](../deploy/live/usr/local/lib/polyptic/offload.sh) carry the stage-1 half verbatim
-  (the boot medium has no network yet, so it gets the background but not the themed menu).
+- `deploy/dongle-grub.cfg.tmpl` carries the stage-1 half (the boot medium has no network yet, so it
+  gets the background but not the themed menu), and
+  [`render-disk-grub.sh`](../deploy/live/usr/local/lib/polyptic/render-disk-grub.sh) replays the
+  template's wired walk verbatim inside an installed box's netboot-fallback entry — kept lockstep by
+  `deploy/live/test/render-disk-grub.test.sh`.
 - `packages/server/assets/boot-logo.png` is rendered from the **same** `logoSvg()` the Plymouth theme
   uses, because GRUB has no SVG renderer and there is nowhere to rasterise on a box with no OS.
   Rebuild it with `bun deploy/render-boot-logo.ts` whenever the logo or the palette changes.
@@ -318,15 +421,17 @@ never the default. An unattended wall boots the same silent-and-branded path it 
 
 ---
 
-## The boot medium: dongle or offload
+## The boot medium: the dongle
 
 Download it from **Console ▸ Settings ▸ Onboard Screens ▸ Download bootloader** (`polyptic-boot.img`), then `dd` it to a USB stick. It is **identical for the whole fleet and for both arches** (the per-box identity is derived from each box's own hardware at runtime), so flash one, clone it, and there is nothing unique to prepare per box beyond, optionally, [dropping the site's Wi-Fi credentials](#wi-fi-boxes-with-no-wire) onto the FAT partition. Besides the signed loaders the medium carries a **local boot payload** (kernel + `initrd-wifi` per built arch, in A/B slots the booted box refreshes itself), which is only touched when the wired chain is unreachable. A wired box reads the stick for a few seconds at power-on, exactly as before.
 
-Plug it in and the server-side menu offers three flat entries (default after 5 s: the first):
+Plug it in and the server-side menu offers flat entries (default after 5 s: the first):
 
-- **`Polyptic`** (`--id live`): boot now, leave the USB in. The box is fully **diskless**, and nothing whatsoever is written locally. Best for disposable / hot-swap panels.
-- **`Set up this screen to start without the USB stick`** (`--id offload`) writes *just the signed shim + GRUB pair* (the pointer, not the OS) into the box's **existing EFI System Partition** under `EFI/polyptic/`, drops the same stage-1 config at the ESP's `/grub/<arch>-efi/grub.cfg` (and `/grub/grub.cfg` when that path is free), and makes a UEFI boot entry (`efibootmgr`, "Polyptic Netboot") the firmware's **first** boot option. Pull the USB and the box self-boots the identical HTTP flow forever, **Secure Boot still ON** (the installed loaders are the same signed binaries). One USB can walk a rack, installing on each box.
+- **`Polyptic`** (`--id live`): boot now, leave the USB in. The box runs fully from RAM and nothing whatsoever is written locally. From here a box with a disk gets [INSTALLED from the console](#installing-to-the-disk-the-default-for-boxes-with-one) and stops needing the stick; a diskless box keeps it in (or keeps netbooting by HTTP Boot/DHCP).
 - **`Debug console`** (`--id debug`): the live boot plus a passwordless root shell on tty9 (Ctrl+Alt+F9). The only interactive way into a sealed kiosk image. Never the default.
+- **`Watch this screen boot (verbose)`** (`--id verbose`): the live boot with GRUB's own network narration on, for an operator standing at a box (see [the wired wait](#the-wired-wait-one-card-at-a-time-and-it-talks)).
+
+> **The offload entry is retired.** Earlier versions offered **Set up this screen to start without the USB stick**, which copied just the signed loader pair onto the box's *existing* ESP so it could self-boot the netboot chain. [INSTALL](#installing-to-the-disk-the-default-for-boxes-with-one) supersedes it entirely — it ends in a box that needs neither the stick *nor* the network to boot. Boxes offloaded in the field are unaffected: their ESPs still work, they keep netbooting, and `boot-order.sh` still watches their `Polyptic Netboot` entry. Installing on one prunes that entry and takes over.
 
 > **The dongle depends on the firmware bringing the NIC up.** GRUB carries no NIC
 > drivers of its own, so `efinet` can only use a card the firmware has already initialised. Most
@@ -336,23 +441,6 @@ Plug it in and the server-side menu offers three flat entries (default after 5 s
 > firmware never touched the NIC. Enable network boot in firmware setup, or prefer
 > [UEFI HTTP Boot / DHCP option 67](#no-medium-at-all-uefi-http-boot), where the firmware fetches
 > the loader itself and the NIC is up by construction.
-
-**Installing the bootloader never repartitions, formats, or wipes.** It only adds files to the ESP that's already there plus one boot entry. The box's previous OS stays on its disk and stays bootable. Pick it from the firmware's boot menu, or delete the "Polyptic Netboot" entry in firmware setup to hand the machine back. The install **refuses to overwrite any GRUB config it didn't write itself** (its own file carries a `# polyptic-offload` marker, and a foreign file aborts it loudly), and it claims the removable-media fallback path `EFI/BOOT/BOOT<arch>.EFI` **only when that path is empty**, so another vendor's default loader is never displaced. The full live OS still streams from the control plane into RAM on every boot. What lands on disk is the few-MB signed loader pair, never an OS, identity, or state. (Mechanically: the confirmation entry adds `polyptic.offload=1` to the kernel cmdline, and the live image's `polyptic-offload.service` does the ESP install once, from Linux userland where `efibootmgr` exists, fetching the loaders tokenlessly from `/dist/boot/`.)
-
-### When the install doesn't take
-
-Nothing is called installed until it has been **verified**. The script re-reads the UEFI boot variables after writing them and asserts that "Polyptic Netboot" exists *and leads* `BootOrder`. If the firmware disagrees, the install fails, says why on the screen you are standing in front of, and posts the reason to **Console ▸ Activity** (`POST /boot/report`). No success stamp, no silent half-install. The `polyptic-offload.service` unit fails too, so `systemctl status polyptic-offload` tells the truth.
-
-| Reported code | What happened | What to do |
-| --- | --- | --- |
-| `boot-order-not-first` | The firmware stored the entry but keeps booting something else first. | Move **Polyptic Netboot** to the top of the boot order in firmware setup. |
-| `nvram-write-failed` / `nvram-entry-missing` | The firmware refused the boot variable, or accepted and dropped it (often full variable storage). | Clear unused boot entries in firmware setup, then install again. The loaders are already on the ESP, so a manual entry for `\EFI\polyptic\shim<arch>.efi` also works. |
-| `not-uefi` | The box booted in legacy BIOS/CSM mode, which has no UEFI boot entries. | Enable UEFI boot in firmware setup (this is also why a legacy-installed Ubuntu has no ESP to chain from). |
-| `no-esp` | No EFI System Partition on any **internal** disk. An ESP on removable media is deliberately ignored, because pointing the boot entry at the stick you are about to pull is exactly how a box "installs" and then boots its old OS. | Boot the box's existing OS in UEFI mode once, or create an ESP, then install again. |
-| `ambiguous-esp` | Several internal ESPs and none is clearly the one the firmware boots. | Re-run with `polyptic.offload_disk=/dev/<disk>` appended to the kernel command line (press `e` at the GRUB menu). |
-| `foreign-grub-cfg` | A GRUB config Polyptic didn't write already sits at its path. | Nothing was changed. Move or remove that file if the ESP is genuinely yours to use. |
-
-On a multi-ESP box the install picks the ESP the **firmware already boots from** (matched by `PARTUUID` against the existing UEFI boot entries) and says which one it chose. It aborts rather than guess when that is still a tie.
 
 ---
 
@@ -401,8 +489,8 @@ The offline menu also **paints the branded boot splash**, even with no server to
 theme from. `deploy/build-boot-medium.sh` bakes `theme.txt` + `logo.png` onto the medium (fetched
 from `GET /boot/theme.txt` at build time, and the theme carries no baked URL, so a local copy renders
 identically), and the local menu points `set theme=` at that copy, guarded, so a `LEAN` or
-theme-less medium still boots to a plain menu on the correct dark background. An offloaded ESP
-carries the theme too.
+theme-less medium still boots to a plain menu on the correct dark background. An installed box's ESP
+(and a legacy offloaded ESP) carries the theme too.
 
 ### The credentials file: `polyptic/wifi.conf`
 
@@ -443,15 +531,16 @@ open-enrolment control plane). The trust model matches the live ISO's, because a
 still only lands new boxes as PENDING. The EAP identity is fleet-wide per medium, because per-box
 enterprise identities would need per-box media, which is out of scope today.
 
-### Offload for Wi-Fi boxes
+### Installed Wi-Fi boxes
 
-**Set up this screen to start without the USB stick** on a box that came up over Wi-Fi copies the
-loaders **and** the local payload + credentials onto the internal ESP, so the box self-boots the
-whole Wi-Fi chain with no stick in. The ESP must fit **two** payload slots (live + update spare),
-roughly 2× the kernel + initrd-wifi, checked **before anything is written**. A too-small ESP fails
-with `esp-too-small` in **Console ▸ Activity** and the box keeps booting from the stick. A wired
-boot keeps the pointer-only install. `polyptic.offload_wifi=1/0` on the cmdline (press `e` at the
-menu) forces either behaviour.
+[INSTALL](#installing-to-the-disk-the-default-for-boxes-with-one) copies `polyptic/wifi.conf` (and
+`polyptic/certs/`) from the booted medium onto the box's new ESP, so an installed Wi-Fi box carries
+its credentials exactly where the stick did and the rootfs `polyptic-wifi.service` reads them
+unchanged. Better still, an installed box needs **no network at all to boot** — kernel, initrd and
+squashfs all come off the disk (the LEAN initrd, deliberately: the initramfs never has to associate)
+— so Wi-Fi only has to come up in the running system, for the agent, the browser and the update
+poll. The stick stays the provisioning tool: it is how the box got far enough to be installed, and
+how its replacement will.
 
 ### What Wi-Fi costs, honestly
 
@@ -468,7 +557,9 @@ menu) forces either behaviour.
   at a few MB/s and is on every wired power-on's critical path), and `initrd-wifi` only ever loads
   from fast local media. Both come from the same dracut run against the same kernel.
 - **No zero-media option.** UEFI HTTP Boot / PXE / DHCP option 67 remain wired-only, forever. See
-  the table above. A Wi-Fi box needs the stick (kept in, or offloaded once to its ESP).
+  the table above. A Wi-Fi box needs the stick — kept in until it is
+  [installed to its disk](#installing-to-the-disk-the-default-for-boxes-with-one), after which it
+  needs neither the stick nor the network to boot.
 - **First association is only VM-testable in plumbing** (QEMU emulates no Wi-Fi NIC, and the helpers
   are fully covered by `deploy/live/test/wifi.test.sh` and a `mac80211_hwsim` pass). Real radios,
   real APs and the curated firmware set are only exercised on real hardware.
@@ -525,8 +616,9 @@ Three things make this work: the firmware announces vendor class `HTTPClient` wi
 ## Keeping the image updated
 
 A baked image is convenient and immutable, and immediately starts ageing. The update loop closes
-that gap with **zero per-box work**, because a diskless box re-pulls its whole OS at every boot.
-**An update is just a rebuilt image plus a reboot.**
+that gap with **zero per-box work**. For a netbooted box, a reboot *is* the re-pull, so **an update
+is just a rebuilt image plus a reboot**; an [installed box](#updates-stage-always-apply-operator-first)
+stages the new build onto its inactive disk slot first, and the reboot then applies it.
 
 **Server side: two scheduled cycles.** Console ▸ Settings ▸ **Image updates** runs rebuild hooks
 on two schedules (plus **Refresh now** / **Full rebuild now** buttons). Each hook is a command by
@@ -556,15 +648,19 @@ depot lives on a PVC shared between the server and the Jobs. Day-0 bootstrap is 
 **Full rebuild now** (the Job pulls `ubuntu-base` straight onto the volume). See the chart README
 for the full story, including the dev workflow against a local OrbStack/kind cluster.
 
-**Box side: the 5-minute poll.** Every netbooted box carries its identity at
+**Box side: the poll.** Every netbooted or installed box carries its identity at
 `/etc/polyptic/image-id` and compares it against `GET /dist/image/<arch>/manifest.json`
-(`{imageId, builtAt, sha256, urgent}`, ungated, secret-free) every 5 minutes
-(`polyptic-update-poll.timer`). On a mismatch:
+(`{imageId, builtAt, sha256, urgent}`, ungated, secret-free) every 5 minutes — plus a first check
+**2 minutes after boot**, so an installed box powered off through the nightly window catches up the
+moment it comes back (`polyptic-update-poll.timer`). On a mismatch, a **netbooted** box reboots to
+re-pull; an **installed** box [stages first, then waits for the operator](#updates-stage-always-apply-operator-first),
+with the same window as its backstop:
 
 - **urgent on** (the Settings switch): reboot **now**, splayed 0–4 min per box (derived from the
   stable machine id) so a wall never hits the depot in unison.
-- **urgent off**: reboot only inside the nightly window (03:00–04:59 local), so a 01:00 scheduled
-  refresh rolls across the fleet the same night, invisibly.
+- **urgent off**: netbooted boxes reboot only inside the nightly window (03:00–04:59 local), so a
+  01:00 scheduled refresh rolls across the fleet the same night, invisibly. Installed boxes show
+  "update ready — reboot to apply" in the console and take the window as the backstop.
 
 Boxes booted from the **live ISO / USB stick never auto-reboot**, because they would re-boot the same
 stale medium. The poll guards on `root=live:http…`, which only a netboot cmdline carries (an ISO boot
@@ -638,24 +734,32 @@ streams the whole root image into a RAM tmpfs.)
   to wall content takes ~60 s.
 - **Dongle flow:** attach `polyptic-boot.img` as a USB **disk** drive. The firmware boots it ahead
   of PXE, and the boot-order NIC is still initialised, so dongle-GRUB is online. ~30 s to content.
-- **Offload flow:** attach an additional VirtIO disk that has a GPT + FAT32 ESP, boot the dongle and
-  pick **Set up this screen to start without the USB stick**. The live boot writes the signed loaders + boot entry on the
-  disk, after which the box boots the same chain with the dongle removed.
-  A VM's blank ESP exercises none of the firmware states that broke this on real hardware, which is
-  what `deploy/live/test/offload.test.sh` is for. It drives the whole decision tree (removable media,
-  several ESPs, a firmware that keeps the entry but refuses to reorder, one that forgets it, a
-  foreign default loader) against stubs, on any host.
+- **Install flow:** attach an additional blank VirtIO disk (≥16 GiB), boot the dongle, and press
+  **Install to disk** on the machine's card in the console. The installer wipes the disk into the
+  [Polyptic layout](#what-lands-on-the-disk), after which the box boots from the disk with the
+  dongle removed. A VM exercises none of the firmware states that historically broke boot-entry
+  writes on real hardware, which is what `deploy/live/test/install.test.sh` is for: it drives the
+  whole decision tree (bad targets, removable media, the booted medium, mounted partitions, small
+  disks, an unreachable depot, a firmware that keeps the entry but refuses to reorder, one that
+  forgets it) against stubs, on any host.
 
 ---
 
-## RAM: netboot needs ~3.5 GB, the live ISO needs ~1 GB
+## RAM: netboot needs ~3.5 GB; installed boxes and the live ISO need ~1 GB
 
-The two media differ in *where the operating system lives*, and that decides the memory floor:
+The boot paths differ in *where the operating system lives*, and that decides the memory floor:
 
-| Medium | Where the OS runs from | RAM needed |
+| Boot path | Where the OS runs from | RAM needed |
 | --- | --- | --- |
 | Boot medium / netboot (`polyptic-boot.img`) | the whole `rootfs.squashfs` (~1.0–1.1 GiB) is streamed into a **RAM tmpfs** and stays there, alongside the unpacked initrd | **~3.5 GB** |
+| **Installed disk** ([INSTALL](#installing-to-the-disk-the-default-for-boxes-with-one)) | the squashfs is loop-mounted **from the slot partition** — it never enters RAM — and the box has 4 GiB of encrypted swap besides | **~1 GB** |
 | Live ISO (`polyptic-live.iso`) | the squashfs is read **straight off the USB stick** | **~1 GB** |
+
+The netboot figure is why boxes that own a disk should be installed: the RAM copy is a **permanent
+~1 GiB tax for the whole session**, on top of a tmpfs overlay and a multi-process Chrome, with no
+swap to relieve any of it — the profile that sat a production box at alarming memory usage
+(POL-176/D162). The netboot numbers below still matter, because netboot remains the provisioning and
+recovery path every box must be able to walk.
 
 > **The netboot figures above are ESTIMATES pending the first post-Chrome build.** Adding Google
 > Chrome (~300–400 MB) to the root image is what took the squashfs from ~700 MiB
@@ -663,7 +767,7 @@ The two media differ in *where the operating system lives*, and that decides the
 > full rebuild and correct **both** this section and the floor in
 > `deploy/live/usr/lib/dracut/modules.d/50polyptic-live/polyptic-ram.sh`, which quotes the same numbers.
 > The **boot medium itself is unaffected**, because it carries only `vmlinuz` + `initrd-wifi`. The
-> squashfs is streamed, never written to the stick or the offloaded ESP. The **live ISO** does carry
+> squashfs is streamed, never written to the stick (an installed box's disk, of course, carries it — that is the point). The **live ISO** does carry
 > the squashfs, so that file grows by the same ~300–400 MB (still comfortably on a 2 GB stick), but
 > its RAM floor does not, because it mounts the image from the medium instead of RAM.
 
@@ -686,8 +790,10 @@ so the naive ceiling would be twice the image. The initrd's `polyptic-live` drac
 fetches anything, and below ~3 GB of RAM it prints a plain-English message naming the live ISO as
 the fix, rather than failing minutes later with a bare `No space left on device`.
 
-If you see that message, the box is out of RAM. Nothing is wrong with the network or the image. Use
-the live ISO for that box, or fit more memory.
+If you see that message, the box is out of RAM. Nothing is wrong with the network or the image. If
+the box has an internal disk, netboot it once with enough headroom (or on a temporarily lighter
+image) and [INSTALL](#installing-to-the-disk-the-default-for-boxes-with-one) — an installed boot
+never pays the RAM copy. Otherwise use the live ISO for that box, or fit more memory.
 
 > **Never pass `rd.live.ram=1`.** It makes dmsquash-live `dd` a *second* full copy of the image into
 > RAM on top of the one livenet already downloaded. The generated `/boot/grub.cfg` never emits it, and
@@ -702,14 +808,18 @@ Know the symptoms:
 
 | Medium | Symptom when the baked address is dead |
 | --- | --- |
-| Dongle / offloaded disk | GRUB says **`Could not reach the Polyptic control plane at …`** and drops to the fallback menu (`Try again / Restart this screen / Firmware setup`), because `configfile $net/boot/grub.cfg` can't fetch the server menu. |
+| Dongle / legacy offloaded disk | GRUB says **`Could not reach the Polyptic control plane at …`** and drops to the fallback menu (`Try again / Restart this screen / Firmware setup`), because `configfile $net/boot/grub.cfg` can't fetch the server menu. |
+| Installed disk | The box **boots fine** (nothing network is in the boot loop) but sits at **"Starting up"** — the agent can't reach the `polyptic.server_url` baked into the disk GRUB's cmdline — and updates stop (the poll's manifest URL is baked the same way). The netboot *fallback* entry carries the same stale address. |
 | Downloadable live ISO | Boots normally all the way to the splash, then sits at **"Starting up"** forever, because the agent can't reach `polyptic.server_url` on its cmdline. The box never appears in the console. |
 | Server env `PLAYER_BASE_URL` | The sneakiest one: the box boots, **enrols, and shows Online in the console**, but the screen shows a white page reading **"Operation was cancelled"** (WebKit's error page). The agent reached the server fine, but the *browser* couldn't load the player from the stale `PLAYER_BASE_URL` the server advertises. The agent's own capture thumbnail (Machines view) shows the same white page, which is how you tell it's the guest's browser, not the display. Restart the server with the corrected `PLAYER_BASE_URL`, and agents re-apply on reconnect. |
 
 What carries a baked address (goes stale when the server moves):
 
 - the **dongle**'s stage-1 `grub/<arch>-efi/grub.cfg` (`set net=(http,HOST:PORT)`),
-- an **offloaded disk's ESP** (the same stage-1, copied at offload time),
+- a **legacy offloaded disk's ESP** (the same stage-1, copied at offload time),
+- an **installed disk's ESP** (`render-disk-grub.sh` bakes `polyptic.base`/`polyptic.server_url` into
+  the cmdline and the netboot-fallback entry's `set net=` — regenerated from the *same baked address*
+  at every staged update, so it heals on rename only if the old name still resolves),
 - the **live ISO**'s kernel cmdline (`polyptic.base` / `polyptic.server_url` / token).
 
 What does **not** (server-derived per request, immune to moves): the netboot payload
@@ -767,7 +877,7 @@ Polyptic signs **nothing** and manages **no keys**. Every verified stage is a by
 
 The unverified rows are **not a Polyptic shortcut but the standard shim model**, the same boundary every stock Ubuntu machine boots with (Ubuntu's own security documentation states that initrd images aren't validated). Building the initrd with dracut changes nothing here, because an unsigned dracut initramfs is exactly as legitimate to shim as the unsigned casper initrd it replaced. Secure Boot's job is to guarantee the machine only executes signed early-boot code: firmware, loaders, kernel. The initrd and root image are trusted the way the rest of Polyptic is. They come from **your** control plane over **your** LAN, addressed by the boot config, and a box that boots them still cannot self-admit, because it lands PENDING until an operator approves it. Extending signature coverage to the initrd and cmdline is possible via a **UKI** (a unified kernel image: kernel + initrd + cmdline sealed in one signed PE), at the cost of signing every image build, exactly the key management this design avoids.
 
-**SBAT: why the loader versions are pinned.** Beyond signatures, shim enforces **SBAT**, a generation-based revocation scheme: firmware carries a minimum-generation list (advanced over time by Ubuntu updates, and even by Windows on dual-boot hardware), and a loader below the minimum is refused *even though its signature is valid*. This is why `deploy/build-boot-medium.sh` pins **exact package versions with SHA-256 hashes** instead of fetching "latest". The GA noble GRUB build carries an SBAT generation that is **already revoked** on up-to-date firmware, and the shim packages also contain a `.signed.previous` binary (shim 15.4) that is revoked everywhere. Both are one careless download away. The pinned pair (shim 15.8, GRUB 2.12 from noble-updates) survives every SbatLevel published as of 2026-07. When Ubuntu ships new signed loaders (a security notice against `shim-signed` / `grub2-signed`), **bump the pins deliberately**: update the deb URLs + hashes in the script, rebuild the medium, reflash / re-offload. Never ship the `.previous` binaries, and never relax the pin to "whatever is newest".
+**SBAT: why the loader versions are pinned.** Beyond signatures, shim enforces **SBAT**, a generation-based revocation scheme: firmware carries a minimum-generation list (advanced over time by Ubuntu updates, and even by Windows on dual-boot hardware), and a loader below the minimum is refused *even though its signature is valid*. This is why `deploy/build-boot-medium.sh` pins **exact package versions with SHA-256 hashes** instead of fetching "latest". The GA noble GRUB build carries an SBAT generation that is **already revoked** on up-to-date firmware, and the shim packages also contain a `.signed.previous` binary (shim 15.4) that is revoked everywhere. Both are one careless download away. The pinned pair (shim 15.8, GRUB 2.12 from noble-updates) survives every SbatLevel published as of 2026-07. When Ubuntu ships new signed loaders (a security notice against `shim-signed` / `grub2-signed`), **bump the pins deliberately**: update the deb URLs + hashes in the script, rebuild the medium, then reflash sticks and reinstall installed boxes (the disk installer fetches the loaders from the depot, so a reinstall picks up the new pair). Never ship the `.previous` binaries, and never relax the pin to "whatever is newest".
 
 **Firmware caveats.** A minority of x86 boards ship a "Windows only" Secure Boot policy whose `db` lacks the Microsoft **third-party** CA that signs shim, so they refuse the medium at power-on with a security violation. The fix is a firmware toggle (usually named like "Allow Microsoft 3rd Party UEFI CA"), not disabling Secure Boot. Very new machines that enrol only Microsoft's 2023 UEFI CA may likewise refuse the 2011-signed shim. If you hit one, check for a newer `shim-signed` to pin.
 
@@ -777,6 +887,6 @@ The unverified rows are **not a Polyptic shortcut but the standard shim model**,
 
 ## Ownership, keys, and rotation
 
-- **Ownership = the boot key.** Whoever can make a box chain `<base>/boot/grub.cfg`, via dongle, offloaded entry, UEFI HTTP Boot, or site DHCP, enrols it against that server. Multiple Polyptic instances on one network = different keys, zero collision.
-- **The netboot key is a standing fleet secret, by design.** It lives in the boot chain (USB / offloaded ESP / DHCP), not on a wiped disk. **Regenerate** the enrolment token (Console ▸ Settings ▸ Enrolment token) to re-key the fleet. The change is live on the next `agent/hello` *and* the next `GET /boot/grub.cfg`, so boxes re-pend until re-keyed. The **wired** path stays tokenless on the media (the token arrives with the server's menu), so wired sticks never need reflashing on rotation. A medium built with a **local Wi-Fi payload** bakes the token into its local menu. After a rotation, rebuild those media (`deploy/build-boot-medium.sh`, and on Kubernetes a `helm upgrade` re-runs the boot-medium Job, which lifts the current token from `/boot/grub.cfg` automatically) or edit the `polyptic.token=` value in `/grub/local-<arch>.cfg` on the FAT. Offloaded Wi-Fi ESPs likewise carry the token and want the same edit.
+- **Ownership = the boot key.** Whoever can make a box chain `<base>/boot/grub.cfg` (via dongle, UEFI HTTP Boot, or site DHCP) — or whoever installed the box's disk — enrols it against that server. Multiple Polyptic instances on one network = different keys, zero collision.
+- **The enrolment key is a standing fleet secret, by design.** It lives in the boot chain (USB / a legacy offloaded ESP / DHCP), and on an installed box it is baked into the disk GRUB's cmdline (the token authenticated the fleet the box was installed into; the ESP is protected by the box being a sealed kiosk, and a leaked token still only lands new boxes as PENDING). **Regenerate** the enrolment token (Console ▸ Settings ▸ Enrolment token) to re-key the fleet. The change is live on the next `agent/hello` *and* the next `GET /boot/grub.cfg`, so boxes re-pend until re-keyed. The **wired** netboot path stays tokenless on the media (the token arrives with the server's menu), so wired sticks never need reflashing on rotation. A medium built with a **local Wi-Fi payload** bakes the token into its local menu. After a rotation, rebuild those media (`deploy/build-boot-medium.sh`, and on Kubernetes a `helm upgrade` re-runs the boot-medium Job, which lifts the current token from `/boot/grub.cfg` automatically) or edit the `polyptic.token=` value in `/grub/local-<arch>.cfg` on the FAT. Legacy offloaded Wi-Fi ESPs likewise carry the token and want the same edit. An installed box's ESP config carries the token too (the update poll regenerates the config, but from the *booted* cmdline's token, so a rotation does not propagate by itself) — the enforcement point for installed boxes is the server: they re-pend on the next hello until re-keyed, and a reinstall or an ESP edit refreshes the baked copy.
 - **Token exposure is bounded and matches the trust model.** `GET /boot/grub.cfg` serves the token ungated, and it appears in `/proc/cmdline` on the booted kiosk. It is only a *coarse* filter, because a valid token on a **new** box lands it **PENDING**, and an operator still approves it under Machines before it renders anything. Keep the provisioning network operator-only. A LEAN (wired-only) medium is tokenless, so possession of one grants nothing beyond "reach `/boot/grub.cfg`". A medium carrying the Wi-Fi local payload bakes the token and is a credential, so treat the downloaded `.img` like one on gated fleets.

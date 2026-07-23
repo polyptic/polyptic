@@ -14,6 +14,7 @@
  * explicitly to keep storage decoupled from the message layer.
  */
 import type {
+  BootMode,
   ContentKind,
   DisplayBackend,
   EnrollmentStatus,
@@ -21,6 +22,7 @@ import type {
   HostIdentity,
   ImageRing,
   MachineBootPath,
+  MachineDisk,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -55,12 +57,23 @@ export interface PersistedMachine {
    *  like the vitals ring) because the box a roll-out stranded is the box that is now offline. */
   imageId?: string;
   imageIdAt?: string;
-  /** POL-171 — the boot chain this box last reported (`wired` | `local-fallback` | `local-wifi`),
+  /** POL-171 — the boot chain this box last reported (`wired` | `local-fallback` | `local-wifi` |
+   *  `disk`, the last from POL-176's installed boxes),
    *  when, and the sentence it composed ("image pinned at …"). Persisted for the same reason
    *  imageId is: the box on the fallback is exactly the box a rebuild is silently missing. */
   bootPath?: MachineBootPath;
   bootPathAt?: string;
   bootPathDetail?: string;
+  /** POL-176 — live vs installed, as the agent last reported it from the kernel cmdline. Persisted
+   *  like `imageId`: whether a dark box needs a truck roll or just power depends on it. */
+  bootMode?: BootMode;
+  bootModeAt?: string;
+  /** POL-176 — the disk inventory the box last reported (`lsblk`), for the INSTALL dialog. */
+  disks?: MachineDisk[];
+  /** POL-176 — the image id staged to the box's inactive slot, verbatim, and when it was reported.
+   *  `staged !== imageId` is the console's "update ready — reboot to apply" badge. */
+  stagedImageId?: string;
+  stagedImageIdAt?: string;
   /** POL-104 — the box's physical identity as it last reported it (MACs / DMI serial / arch). Kept on
    *  the ROW, not just in presence, so a pending card is informative while the box is offline. */
   hardware?: HostIdentity;
@@ -528,6 +541,8 @@ export interface Store {
   setMachineTags(id: string, tags: string[]): Promise<void>;
   /** POL-105 — record the OS image id a box reported BOOTING, and when. No-op if absent. */
   setMachineImage(id: string, imageId: string, at: string): Promise<void>;
+  /** POL-176 — record the image id a box's update poll STAGED to its inactive slot. No-op if absent. */
+  setMachineStagedImage(id: string, stagedImageId: string, at: string): Promise<void>;
   /** POL-171 — record the boot chain a box reported coming up through. No-op if absent. */
   setMachineBootPath(id: string, path: MachineBootPath, at: string, detail: string): Promise<void>;
   /**

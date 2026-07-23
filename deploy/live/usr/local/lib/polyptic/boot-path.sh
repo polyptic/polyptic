@@ -1,6 +1,6 @@
 #!/bin/sh
 # WHICH boot chain produced this boot — say so where the operator looks, once per boot (POL-171).
-# Runs from polyptic-boot-path.service (after network-online, before offload + greetd).
+# Runs from polyptic-boot-path.service (after network-online, before greetd).
 #
 # THE FAILURE THIS EXISTS FOR (2026-07-21, real hardware): a WIRED box's GRUB DHCP failed on its
 # NIC, stage 1 silently fell through to the stick's LOCAL Wi-Fi menu, and the box spent the whole
@@ -18,14 +18,17 @@
 #        local + wireless route → `local-boot-wifi` — this box's NORMAL path. State-only (the
 #                                 console shows a neutral marker), no splash noise, no feed line.
 #        wired                  → `wired-boot` — the all-clear that self-clears a fallback flag.
+#        disk                   → `disk-boot` (POL-176) — an INSTALLED box booting its own disk,
+#                                 the new normal. State-only, self-clears a fallback flag exactly
+#                                 like wired-boot; no splash noise, no feed line.
 #        no default route       → nothing to report AND no way to deliver it; the forensics log
 #                                 still records the state for whoever pulls the stick.
 #      No marker at all = a pre-POL-171 medium: report nothing (absence is silence, not "wired").
-#   2. FORENSICS: find the boot medium (USB stick or offloaded ESP — find-boot-medium proves
-#      identity by content), mount it RW, and have boot-forensics.sh write this boot's log. The
-#      log's on-medium path lands in $RUN_DIR/forensics-file so offload.sh can append its verdict
-#      to the SAME file later this boot. Pointer-only offloaded boots have no medium: skipped,
-#      silently — that is the documented cost of a pointer-only install, not an error.
+#   2. FORENSICS: find the boot medium (USB stick or an installed box's ESP — find-boot-medium
+#      proves identity by content), mount it RW, and have boot-forensics.sh write this boot's log.
+#      The log's on-medium path lands in $RUN_DIR/forensics-file so install-to-disk.sh can append
+#      its verdict to the SAME file later this boot (POL-176). Boxes with no medium: skipped,
+#      silently — not an error.
 #
 # BEST-EFFORT THROUGHOUT: every step is guarded, exit is always 0, and nothing here may cost the
 # boot — this script observes the boot, it is not part of it.
@@ -57,7 +60,7 @@ say() {
   return 0
 }
 
-# Same /boot/report contract as offload.sh and boot-order.sh: the code is the machine-readable half,
+# Same /boot/report contract as install-to-disk.sh and boot-order.sh: the code is the machine-readable half,
 # `detail` a sentence this box composed; the enrolment token authenticates and never reaches a log.
 json_escape() {
   printf '%s' "$1" | tr -d '[:cntrl:]' | cut -c1-200 | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -112,6 +115,11 @@ if [ -n "$bootpath" ] && [ ! -e "$stamp" ]; then
   case "$bootpath" in
     wired)
       report true wired-boot ""
+      ;;
+    disk)
+      # An installed box (POL-176) booting from its own disk. The all-clear: state-only, and it
+      # self-clears a fallback flag on the machine record exactly as wired-boot does.
+      report true disk-boot ""
       ;;
     local)
       if [ -z "$dev" ]; then

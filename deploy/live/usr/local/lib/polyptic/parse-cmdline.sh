@@ -5,7 +5,7 @@
 # Namespaced keys (so they can't clash with kernel/casper options), baked by GET /boot/grub.cfg:
 #   polyptic.server_url=<ws(s) agent URL, e.g. ws://10.0.0.10:8080/agent> → POLYPTIC_SERVER_URL
 #   polyptic.token=<one bootstrap enrolment token>                        → POLYPTIC_BOOTSTRAP_TOKEN
-# Other polyptic.* keys (polyptic.base=, polyptic.offload=1) are read elsewhere and ignored here.
+# Other polyptic.* keys (polyptic.base=, polyptic.bootpath=) are read elsewhere and ignored here.
 #
 # /proc/cmdline is one whitespace-separated line; URLs/tokens contain no spaces. First occurrence wins.
 # An absent key emits NOTHING (the agent keeps its agent.toml / built-in default). Never eval's a value.

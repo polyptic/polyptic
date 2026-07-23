@@ -181,10 +181,21 @@ echo "    kernel package: \$kernel"
 # drifted a real box an hour ahead and broke a relative-range dashboard. It runs as a system service
 # with CAP_SYS_TIME, so it sets the clock without the unprivileged kiosk user; step 5 enables it +
 # our polyptic-timesync-conf.service (which points it at the baked NTP host) under sysinit.target.
+# gdisk/dosfstools/e2fsprogs are install-to-disk.sh's partitioner + mkfs set (POL-176: a live box
+# can now wipe its own disk and lay down A/B slots); cryptsetup backs the ephemeral encrypted swap
+# on installed boxes (/etc/crypttab, dm-crypt with a per-boot random key).
 apt-get install -y --no-install-recommends \
   systemd-sysv systemd-resolved systemd-timesyncd libpam-systemd udev dbus kmod dmsetup \
   iproute2 netplan.io ca-certificates curl efibootmgr procps \
+  gdisk dosfstools e2fsprogs cryptsetup \
   "\$kernel" dracut-core dracut-network
+# systemd-cryptsetup split out of the systemd package on newer suites; install it where the archive
+# has it (elsewhere the generator already ships inside systemd) — guarded, not fatal (POL-176).
+if apt-cache policy systemd-cryptsetup 2>/dev/null | grep -qE 'Candidate: [0-9]'; then
+  apt-get install -y --no-install-recommends systemd-cryptsetup
+else
+  echo "    no systemd-cryptsetup package on this suite (assuming systemd ships the generator)"
+fi
 # The curated firmware set. \`apt-cache policy\` guards each name so a package that does not exist for
 # this arch (the intel/amd graphics blobs on arm64) is skipped rather than failing the build.
 want=""
@@ -216,7 +227,7 @@ chroot "$ROOTFS" /usr/local/bin/polyptic-agent setup \
   --backend wayland-sway --user kiosk --render auto
 chroot "$ROOTFS" /bin/sh -c 'apt-get clean'
 
-echo '==> [5/8] overlay diskless identity + offload layer'
+echo '==> [5/8] overlay diskless identity + install layer'
 rsync -a "$OVERLAY"/ "$ROOTFS"/ --exclude test
 chmod 0755 "$ROOTFS"/usr/local/lib/polyptic/*.sh
 chmod 0755 "$ROOTFS"/usr/lib/dracut/modules.d/50polyptic-live/*.sh
@@ -225,7 +236,9 @@ chmod 0600 "$ROOTFS"/etc/netplan/01-polyptic-dhcp.yaml   # netplan refuses/warns
 # Enable the system units OFFLINE via the same .wants symlinks `systemctl enable` would create (which
 # is a no-op/warn inside a chroot).
 mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
-for unit in polyptic-agent-env.service polyptic-offload.service polyptic-wifi.service polyptic-boot-path.service; do
+# polyptic-install.path (POL-176) replaces the retired polyptic-offload.service: the console's
+# INSTALL request lands as a file, and the path unit escalates it to the root installer.
+for unit in polyptic-agent-env.service polyptic-wifi.service polyptic-boot-path.service polyptic-install.path; do
   ln -sf "../$unit" "$ROOTFS/etc/systemd/system/multi-user.target.wants/$unit"
 done
 # The update-poll timer (POL-41) is a timer unit, so it enables under timers.target.
@@ -257,6 +270,12 @@ chmod 0644 "$ROOTFS/etc/polyptic/image-id"
 # NEWER than /usr (we are past every apt operation here) marks the image up to date.
 touch "$ROOTFS/etc/.updated" "$ROOTFS/var/.updated"
 
+# ext4/vfat/fat + the FAT codepage modules (nls_cp437/nls_iso8859-1) in BOTH driver lists below are
+# the POL-176 disk boot: an installed box's initramfs mounts the ext4 slot (root=live:LABEL=…), the
+# ext4 scratch overlay (rd.live.overlay=LABEL=…) and — for staging/forensics — the FAT ESP, with NO
+# network in the loop. They are usually built-in or auto-pulled, but "usually" bricked a boot once
+# already (POL-35's resolved lesson): list them explicitly so a kernel packaging change cannot
+# silently drop disk boots.
 echo '==> [6/8] chroot: dracut initramfs ×2 (--no-hostonly), matched to this kernel'
 # dmsquash-live + livenet are the `root=live:<url>` pair; polyptic-live (deploy/live/) is our own
 # module and carries the netboot RAM pre-flight, the bounded wait-online, and the splash narration.
@@ -292,7 +311,7 @@ export DEBIAN_FRONTEND=noninteractive
 dracut --force --no-hostonly --no-hostonly-cmdline \
   --add "dmsquash-live livenet polyptic-live plymouth systemd-resolved" \
   --omit "multipath lvm mdraid crypt btrfs iscsi nfs nbd" \
-  --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop" \
+  --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop ext4 vfat fat nls_cp437 nls_iso8859-1" \
   --kver "$KVER" "/boot/initrd.img-$KVER"
 # The Wi-Fi stack (POL-63): supplicant + regulatory db + every major vendor's wlan firmware. The
 # same apt-cache guard as the step-3 firmware: a package absent for this arch is skipped, loudly.
@@ -305,7 +324,7 @@ apt-get clean
 dracut --force --no-hostonly --no-hostonly-cmdline \
   --add "dmsquash-live livenet polyptic-live polyptic-wifi plymouth systemd-resolved" \
   --omit "multipath lvm mdraid crypt btrfs iscsi nfs nbd" \
-  --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop" \
+  --add-drivers "virtio_net virtio_pci virtio_blk virtio_mmio squashfs overlay loop ext4 vfat fat nls_cp437 nls_iso8859-1" \
   --kver "$KVER" "/boot/initrd-wifi.img-$KVER"
 CHROOT
 

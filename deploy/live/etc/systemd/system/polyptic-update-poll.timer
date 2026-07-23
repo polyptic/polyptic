@@ -1,10 +1,13 @@
-# Polyptic update poll (POL-41): fire the image-id comparison every 5 minutes, first check 5
-# minutes after boot (a box that JUST booted is by definition fresh, or about to learn otherwise).
+# Polyptic update poll (POL-41): fire the image-id comparison every 5 minutes. The FIRST check runs
+# 2 minutes after boot (POL-176's "check at every boot"): an installed box boots its DISK, so a box
+# powered off through the nightly window would otherwise render a stale image for up to 5 minutes —
+# and, staged-but-unrebooted, until someone noticed. Two minutes is late enough for the network and
+# the agent to be up, early enough to count as "at boot".
 [Unit]
 Description=Polyptic - poll the control plane for live-image updates every 5 minutes
 
 [Timer]
-OnBootSec=5min
+OnBootSec=2min
 OnUnitActiveSec=5min
 RandomizedDelaySec=30
 Unit=polyptic-update-poll.service

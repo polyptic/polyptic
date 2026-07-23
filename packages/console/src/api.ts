@@ -23,6 +23,7 @@ import {
   CreateScheduleBody,
   IdentBody,
   ImportPreRegistrationsBody,
+  InstallMachineBody,
   RenameMachineBody,
   InspectBody,
   MoveTargetsBody,
@@ -341,6 +342,19 @@ export function renameMachine(machineId: string, label: string): Promise<unknown
  */
 export function rebootMachine(machineId: string): Promise<unknown> {
   return send("POST", `/machines/${encodeURIComponent(machineId)}/reboot`);
+}
+
+/**
+ * POST /api/v1/machines/:machineId/install { device } — install the OS to the named internal disk
+ * (POL-176). 400 = unknown or removable device; 409 = not approved, not live-booted, or offline.
+ * The ApiError payload carries the server's own sentence, so the caller can show the operator why.
+ */
+export function installMachine(machineId: string, device: string): Promise<unknown> {
+  return send(
+    "POST",
+    `/machines/${encodeURIComponent(machineId)}/install`,
+    InstallMachineBody.parse({ device }),
+  );
 }
 
 /** Arm or disarm a box for the remote shell (POL-59). */

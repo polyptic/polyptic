@@ -6,8 +6,9 @@
 #
 #   usage: render-local-grub.sh <arch> <slot> <hostport> <imageId> [token]
 #
-# Written by THREE writers, one renderer: build-boot-medium.sh (at build), update-poll.sh (slot
-# switches on image updates), offload.sh (copying the payload to an ESP). Everything is baked
+# Written by TWO writers, one renderer: build-boot-medium.sh (at build) and update-poll.sh (slot
+# switches on image updates). (The retired offload flow was a third — its ESP copies in the field
+# still carry this menu until those boxes INSTALL, POL-176.) Everything is baked
 # static — arch, slot, image id — because GRUB variables cost context bugs (D61) and the file is
 # regenerated wholesale whenever any of it changes. The current slot/image are PARSEABLE back out
 # of the header line, which is how update-poll knows what a medium is running.
@@ -24,7 +25,7 @@ IMAGE_ID="${4:?missing imageId}"
 TOKEN="${5:-}"
 
 BOOT="/polyptic/boot/$ARCH/$SLOT"
-# Where build-boot-medium.sh / offload.sh bake the POL-47 theme (theme.txt + logo.png + bg.png) so
+# Where build-boot-medium.sh bakes the POL-47 theme (theme.txt + logo.png + bg.png) so
 # the offline menu can paint the branded splash with no network to fetch it from (POL-74).
 THEME_DIR="/polyptic/boot/theme"
 tok=""
@@ -79,11 +80,6 @@ menuentry "Polyptic" --id live {
 menuentry "Polyptic (newest image - use after a long time offline)" --id live-latest {
   echo "Starting Polyptic with the newest image ..."
   linux  $BOOT/vmlinuz $latest
-  initrd $BOOT/initrd
-}
-menuentry "Set up this screen to start without the USB stick" --id offload {
-  echo "Setting up this screen ..."
-  linux  $BOOT/vmlinuz $pinned polyptic.offload=1
   initrd $BOOT/initrd
 }
 menuentry "Debug console" --id debug {

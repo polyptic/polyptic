@@ -365,6 +365,10 @@ case "$url" in
   */manifest.json|*/manifest.json\?*) cat "$STUB/manifest" 2>/dev/null || exit 22 ;;
   */builds/*/vmlinuz)     [ -f "$STUB/curl_fail_kernel" ] && exit 22; cp "$STUB/new-vmlinuz" "$out" ;;
   */builds/*/initrd-wifi) [ -f "$STUB/curl_fail_initrd" ] && exit 22; cp "$STUB/new-initrd" "$out" ;;
+  # The LEAN initrd + the squashfs are what a DISK box stages (POL-176). Order matters: the
+  # initrd-wifi pattern above must stay first or it would match here.
+  */builds/*/initrd)          [ -f "$STUB/curl_fail_initrd" ] && exit 22; cp "$STUB/new-initrd-lean" "$out" ;;
+  */builds/*/rootfs.squashfs) [ -f "$STUB/curl_fail_squashfs" ] && exit 22; cp "$STUB/new-squashfs" "$out" ;;
   */builds/*/SHA256SUMS)  cp "$STUB/new-sums" "$out" ;;
   */boot/theme.txt) [ -f "$STUB/served-theme" ] || exit 22; cp "$STUB/served-theme" "$out" ;;
   */boot/logo.png)  [ -f "$STUB/served-logo" ]  || exit 22; cp "$STUB/served-logo"  "$out" ;;
@@ -639,6 +643,93 @@ mk_png "$d/served-logo" logo-v1
 out2="$(up "$d")"
 has  "bad-png heal: recovers once the served png is decodable" "healed the offline boot splash" "$out2"
 same "bad-png heal: bg.png committed after recovery" "$d/served-bg" "$tdir/bg.png"
+
+# ─── update-poll.sh on an INSTALLED box (POL-176): disk staging + operator-first reboot ─────────────
+# The box boots its own disk (`polyptic.bootpath=disk`, no root=live:http), the ESP is the medium
+# (marker + `# polyptic-disk` cfg), and the inactive slot partition mounts by label. What is pinned:
+# staging lands kernel + LEAN initrd on the ESP and the squashfs on the slot partition with the cfg
+# rewrite LAST; /run/polyptic/update-state is written on EVERY poll (running= + staged=); a corrupt
+# download commits nothing and reboots nothing; and a staged non-urgent box WAITS for the operator
+# outside the nightly window instead of rebooting a live wall.
+
+# new_disk_case <name> <running-id> <served-id> <esp-image-id> [urgent]
+new_disk_case() {
+  d="$ROOT/$1"; mkdir -p "$d/run" "$d/by-label" "$d/modules/6.8.0-test"
+  printf 'BOOT_IMAGE=/vmlinuz root=live:LABEL=POLYPTIC-A rd.live.overlay=LABEL=POLYPTIC-SCRATCH rd.live.overlay.overlayfs=1 rd.live.overlay.reset=1 polyptic.base=http://10.0.0.10:8080 polyptic.token=tok polyptic.bootpath=disk quiet\n' > "$d/cmdline"
+  printf '%s\n' "$2" > "$d/image-id"
+  printf 'POLYPTIC_MACHINE_ID=dmi-test\n' > "$d/agent.env"
+  printf '{"imageId":"%s","urgent":%s}\n' "$3" "${5:-true}" > "$d/manifest"
+  printf 'NEW-KERNEL\n' > "$d/new-vmlinuz"
+  printf 'NEW-LEAN-INITRD\n' > "$d/new-initrd-lean"
+  printf 'NEW-SQUASHFS\n' > "$d/new-squashfs"
+  { printf '%s  vmlinuz\n' "$(shahex "$d/new-vmlinuz")"
+    printf '%s  initrd\n' "$(shahex "$d/new-initrd-lean")"
+    printf '%s  rootfs.squashfs\n' "$(shahex "$d/new-squashfs")"; } > "$d/new-sums"
+  # The installed ESP: marker (the ESP IS the medium), a-slot kernel pair, disk cfg at both paths.
+  m="$d/vol-POLYPTIC-BT"; mkdir -p "$m/grub/arm64-efi" "$m/polyptic/boot/arm64/a"
+  : > "$d/by-label/POLYPTIC-BT"
+  printf 'disk-esp-x\n' > "$m/polyptic/medium-id"
+  printf 'OLD-KERNEL\n' > "$m/polyptic/boot/arm64/a/vmlinuz"
+  printf 'OLD-INITRD\n' > "$m/polyptic/boot/arm64/a/initrd"
+  sh "$LIB/render-disk-grub.sh" arm64 a 10.0.0.10:8080 "$4" tok > "$m/grub/arm64-efi/grub.cfg"
+  cp "$m/grub/arm64-efi/grub.cfg" "$m/grub/grub.cfg"
+  # The slot partitions, as mountable fixture volumes.
+  mkdir -p "$d/vol-POLYPTIC-A/LiveOS" "$d/vol-POLYPTIC-B"
+  printf '%s' "$d"
+}
+dcfg_head()  { head -n1 "$1/vol-POLYPTIC-BT/grub/arm64-efi/grub.cfg" 2>/dev/null; }
+ustate()     { cat "$1/run/update-state" 2>/dev/null; }
+
+# 42) urgent staging: ESP slot b + slot B partition written, cfg rewritten LAST, state file, reboot.
+d="$(new_disk_case disk-happy old-1 new-2 old-1)"
+out="$(up "$d")"
+eq  "disk: new kernel on the ESP slot b"   "NEW-KERNEL" "$(cat "$d/vol-POLYPTIC-BT/polyptic/boot/arm64/b/vmlinuz" 2>/dev/null)"
+eq  "disk: LEAN initrd on the ESP slot b"  "NEW-LEAN-INITRD" "$(cat "$d/vol-POLYPTIC-BT/polyptic/boot/arm64/b/initrd" 2>/dev/null)"
+eq  "disk: squashfs on the B partition"    "NEW-SQUASHFS" "$(cat "$d/vol-POLYPTIC-B/LiveOS/squashfs.img" 2>/dev/null)"
+eq  "disk: no .new left behind"            "" "$(ls "$d/vol-POLYPTIC-B/LiveOS" 2>/dev/null | grep '\.new$' || true)"
+has "disk: cfg commits the new pair"       "slot=b image=new-2" "$(dcfg_head "$d")"
+has "disk: plain grub.cfg follows (ours)"  "slot=b image=new-2" "$(head -n1 "$d/vol-POLYPTIC-BT/grub/grub.cfg")"
+eq  "disk: old slot a kept as rollback"    "OLD-KERNEL" "$(cat "$d/vol-POLYPTIC-BT/polyptic/boot/arm64/a/vmlinuz")"
+has "disk: update-state running"           "running=old-1" "$(ustate "$d")"
+has "disk: update-state staged"            "staged=new-2" "$(ustate "$d")"
+has "disk: urgent → reboots"               "reboot" "$(cat "$d/systemctl.log" 2>/dev/null)"
+
+# 43) OPERATOR-FIRST: non-urgent, daytime → staged NOW, reboot WAITS for the operator/console.
+d="$(new_disk_case disk-wait old-1 new-2 old-1 false)"
+printf '14\n' > "$d/hour"
+out="$(up "$d")"
+has "disk wait: staged in daytime"         "slot=b image=new-2" "$(dcfg_head "$d")"
+has "disk wait: the exact waiting line"    "update-poll: image new-2 staged (running old-1). Waiting for the operator or the nightly window" "$out"
+eq  "disk wait: no reboot"                 "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
+has "disk wait: state says staged"         "staged=new-2" "$(ustate "$d")"
+# …and the NEXT poll is a cheap no-op on the disk (cfg already carries new-2), still waiting.
+out2="$(up "$d")"
+has "disk wait: second poll still waits"   "Waiting for the operator" "$out2"
+eq  "disk wait: still no reboot"           "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
+
+# 44) nightly window backstop: same staged box, 03:00 → reboots even though nobody clicked.
+d="$(new_disk_case disk-window old-1 new-2 old-1 false)"
+printf '03\n' > "$d/hour"
+out="$(up "$d")"
+has "disk window: reboots in the window"   "reboot" "$(cat "$d/systemctl.log" 2>/dev/null)"
+
+# 45) corrupt squashfs: NOTHING commits (cfg still slot=a), no reboot even though urgent, retry.
+d="$(new_disk_case disk-corrupt old-1 new-2 old-1)"
+printf 'TAMPERED\n' > "$d/new-squashfs"   # sums still carry the good hash
+out="$(up "$d")"
+has "disk corrupt: says it skipped"        "did not complete" "$out"
+has "disk corrupt: cfg untouched"          "slot=a image=old-1" "$(dcfg_head "$d")"
+eq  "disk corrupt: image not committed"    "" "$(ls "$d/vol-POLYPTIC-B/LiveOS" 2>/dev/null || true)"
+eq  "disk corrupt: no reboot"              "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
+has "disk corrupt: state keeps the truth"  "staged=old-1" "$(ustate "$d")"
+
+# 46) up to date: silent steady state, but the state file is STILL written (the contract).
+d="$(new_disk_case disk-quiet new-2 new-2 new-2)"
+out="$(up "$d")"
+eq  "disk quiet: no output"                "" "$out"
+eq  "disk quiet: no reboot"                "" "$(cat "$d/systemctl.log" 2>/dev/null || true)"
+has "disk quiet: state running"            "running=new-2" "$(ustate "$d")"
+has "disk quiet: state staged=running"     "staged=new-2" "$(ustate "$d")"
 
 # ─── wifi-diagnostics.sh: the keyboard-less failure report (POL-77) ──────────────────────────────────
 # When association can't start the hook writes this report to the medium so a screen with no keyboard

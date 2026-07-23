@@ -1,0 +1,17 @@
+# Polyptic install-to-disk trigger (POL-176). The console's INSTALL button reaches the box over the
+# agent WS; the agent (kiosk user, deliberately unprivileged) writes ONE line `device=/dev/sdX` to
+# /run/polyptic/requests/install, and THIS root-owned path unit is what escalates it — the same
+# request-file pattern as the reboot flow. The /run/polyptic/requests dir and its permissions come
+# from the agent-setup tmpfiles helper; this unit only watches.
+[Unit]
+Description=Polyptic - watch for an install-to-disk request from the console (POL-176)
+ConditionPathExists=/usr/local/lib/polyptic/install-to-disk.sh
+
+[Path]
+# PathExists (not PathChanged): the request file is created whole by the agent and deleted by the
+# installer up front, so existence IS the request. A request written while the service is already
+# running is picked up when it finishes (systemd re-checks on unit deactivation).
+PathExists=/run/polyptic/requests/install
+
+[Install]
+WantedBy=multi-user.target

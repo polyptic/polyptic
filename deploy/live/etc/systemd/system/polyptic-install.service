@@ -1,0 +1,20 @@
+[Unit]
+Description=Polyptic, one-shot install to disk: wipe the chosen disk, lay down A/B slots, boot from disk (POL-176)
+Documentation=file:///usr/local/lib/polyptic/install-to-disk.sh
+# Started by polyptic-install.path when the agent drops /run/polyptic/requests/install. Unlike the
+# retired offload (which ran at boot, before greetd), this runs MID-SESSION: the wall keeps
+# rendering while the disk is prepared, and the operator follows progress in the console (the
+# installer streams phase lines to /run/polyptic/install-status, which the agent relays).
+ConditionPathExists=/usr/local/lib/polyptic/install-to-disk.sh
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# A failed install is a FAILED unit (the POL-58 lesson, kept): the installer exits 1 and its last
+# status line is `failed|-|<reason>`, so the console and `systemctl status polyptic-install` agree.
+# Nothing Requires= this unit, so failing is loud without being fatal — the box still runs from RAM
+# and the wall never blinks. No TimeoutStartSec=infinity here: the squashfs download is bounded by
+# the installer's own curl --max-time, and holding the unit forever would only wedge the path unit.
+TimeoutStartSec=45min
+ExecStart=/usr/local/lib/polyptic/install-to-disk.sh

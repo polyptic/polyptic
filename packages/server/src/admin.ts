@@ -19,6 +19,7 @@ import { ServerToAdminState } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
 import type {
   DocumentJob,
+  InstallPhase,
   MachineView,
   MachineVitals,
   PanelPowerMethod,
@@ -109,6 +110,14 @@ export class Presence {
    *  machine reconnects, and expired after REBOOTING_TTL_MS so a box that dies mid-reboot doesn't
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
+  /** POL-176 — machineId → the latest install-status the box's agent forwarded (+ when we received
+   *  it, ms epoch). Live-only, the `rebooting` idiom: bounded on read (a box that dies mid-install
+   *  must not read "installing…" forever; a done/failed sticks only for a short grace so the
+   *  operator sees the outcome land) and cleared when the machine drops. */
+  private readonly installing = new Map<
+    string,
+    { phase: InstallPhase; percent?: number; detail?: string; atMs: number }
+  >();
 
   /** POL-101 — screenIds whose panel is ASLEEP, with the rungs that got it there. Ephemeral by
    *  design: a box that drops comes back with its panels LIT (the compositor re-asserts `dpms on` at
@@ -133,6 +142,12 @@ export class Presence {
 
   /** How long an accepted reboot may read as "rebooting…" before it degrades to plain offline. */
   private static readonly REBOOTING_TTL_MS = 3 * 60_000;
+
+  /** POL-176 — how long a NON-terminal install phase may read as "installing…" with no newer line
+   *  (mirrors the agent's own 30-minute tail timeout), and how long a terminal `done`/`failed`
+   *  lingers so the operator watches the outcome land before the badge clears. */
+  private static readonly INSTALLING_TTL_MS = 30 * 60_000;
+  private static readonly INSTALL_OUTCOME_GRACE_MS = 60_000;
 
   /** POL-136 — how long a stored pairing PIN stays replayable; mirrors the agent's pin TTL. */
   private static readonly CAST_PIN_TTL_MS = 120_000;
@@ -283,6 +298,46 @@ export class Presence {
     return wasRebooting;
   }
 
+  // ── Install to disk (POL-176) ──────────────────────────────────────────────
+
+  /** Record the latest install-status the box's agent forwarded. Written only from the agent's own
+   *  frames — the operator's click is a request; the installer's narration is the truth. */
+  setMachineInstalling(
+    machineId: string,
+    status: { phase: InstallPhase; percent?: number; detail?: string },
+    nowMs: number = Date.now(),
+  ): void {
+    this.installing.set(machineId, { ...status, atMs: nowMs });
+  }
+
+  /** The live install state, TTL-bounded on read: a stalled install expires after the agent's own
+   *  tail timeout, and a terminal outcome lingers only for a short grace. Undefined = no install. */
+  machineInstalling(
+    machineId: string,
+    nowMs: number = Date.now(),
+  ): { phase: InstallPhase; percent?: number; detail?: string; at: string } | undefined {
+    const held = this.installing.get(machineId);
+    if (!held) return undefined;
+    const terminal = held.phase === "done" || held.phase === "failed";
+    const ttl = terminal ? Presence.INSTALL_OUTCOME_GRACE_MS : Presence.INSTALLING_TTL_MS;
+    if (nowMs - held.atMs > ttl) {
+      this.installing.delete(machineId);
+      return undefined;
+    }
+    return {
+      phase: held.phase,
+      ...(held.percent !== undefined ? { percent: held.percent } : {}),
+      ...(held.detail !== undefined ? { detail: held.detail } : {}),
+      at: new Date(held.atMs).toISOString(),
+    };
+  }
+
+  /** The machine dropped (or was removed) — whatever install narration it was mid-way through is
+   *  over; the box's own /boot/report tells the rest of the story after it reboots installed. */
+  clearMachineInstalling(machineId: string): void {
+    this.installing.delete(machineId);
+  }
+
   /**
    * Forget the inspector state for these screens — their machine dropped, so whatever was on those
    * panels is gone. Without this a box that reboots while being inspected comes back showing a stale
@@ -403,6 +458,7 @@ export class Presence {
     this.clockOffset.delete(machineId);
     this.lastHeartbeat.delete(machineId);
     this.rebootingSince.delete(machineId);
+    this.installing.delete(machineId);
     this.agentConns.delete(machineId);
     this.addresses.delete(machineId);
   }
@@ -491,6 +547,14 @@ export function buildAdminState(
       bootPath: machine.bootPath,
       bootPathAt: machine.bootPathAt,
       bootPathDetail: machine.bootPathDetail,
+      // POL-176 — live vs installed + the disk inventory + the staged image. NOT gated on online,
+      // like imageId: whether a dark box needs a truck roll or just power depends on its boot mode,
+      // and the INSTALL dialog must be able to name a disk while the box blinks offline.
+      bootMode: machine.bootMode,
+      disks: machine.disks,
+      stagedImageId: machine.stagedImageId,
+      // POL-176 — an install in flight RIGHT NOW: live-only + TTL-bounded, the `rebooting` idiom.
+      installing: presence.machineInstalling(machine.id),
 
       // Outputs the agent reported — shown for pending machines that have no screens yet.
       outputCount: machine.outputs.length,

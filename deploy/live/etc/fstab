@@ -1,0 +1,8 @@
+# Polyptic live/installed fstab (POL-176). The root is dracut's dmsquash-live overlay (assembled in
+# the initramfs, never from here); the ONLY entry is the ephemeral encrypted swap that
+# /etc/crypttab assembles on installed boxes (dm-crypt over the POLYPTIC-SWAP partition with a
+# per-boot random key — see crypttab for the privacy reasoning). `nofail` + `sw` keep netboot/live
+# boxes clean: on a box with no such partition the mapper device never appears and the boot carries
+# on without a murmur. This file OVERWRITES ubuntu-base's placeholder fstab via the deploy/live
+# overlay rsync in build-live-image.sh.
+/dev/mapper/polyptic-swap none swap sw,nofail 0 0

@@ -215,6 +215,36 @@ watch "$d" >/dev/null
 eq  "boot order unchanged"          "0000,000a,0002,0001,0003" "$(order_of "$d")"
 has "reported as a failed re-assert" '"code":"boot-order-reassert-failed"' "$(posts "$d")"
 
+printf '\n── POL-176: an INSTALLED box (`Polyptic` entry) is watched under its own label ──\n'
+d="$(new_case installed)"
+printf 'BootCurrent: 0000\nTimeout: 0 seconds\nBootOrder: 0000,0004\nBoot0000* ubuntu\nBoot0004* Polyptic\n' > "$d/nvram"
+out="$(watch "$d")"
+has "finds the disk entry by its exact label"  "'Polyptic' is entry 0004" "$out"
+has "reports the drift"                        '"code":"boot-order-drift"' "$(posts "$d")"
+eq  "report-only: untouched"                   "0000,0004" "$(order_of "$d")"
+# …and with re-assert ON, the disk entry is put back in front like the legacy one always was.
+d="$(new_case installed-reassert)"
+printf 'BootCurrent: 0000\nTimeout: 0 seconds\nBootOrder: 0000,0004\nBoot0000* ubuntu\nBoot0004* Polyptic\n' > "$d/nvram"
+printf '{"reassert":true}\n' > "$d/policy"
+watch "$d" >/dev/null
+eq  "re-assert: disk entry leads"              "0004,0000" "$(order_of "$d")"
+
+printf '\n── POL-176: `Polyptic` never label-matches `Polyptic Netboot` (and disk wins when both exist) ──\n'
+# A box mid-transition can carry BOTH (install prunes the old entry, but firmware NVRAM has lied
+# before — D60): the disk entry is the newer intent and is the one kept healthy.
+d="$(new_case both-labels)"
+printf 'BootCurrent: 0000\nTimeout: 0 seconds\nBootOrder: 0000,0005,0004\nBoot0000* ubuntu\nBoot0004* Polyptic Netboot\nBoot0005* Polyptic\n' > "$d/nvram"
+out="$(watch "$d")"
+has "the drift sentence names the DISK entry"  "'Polyptic' is entry 0005" "$out"
+hasnt "…not the legacy one"                    "'Polyptic Netboot' is entry" "$out"
+# A legacy-only box (the fielded offloaded fleet) is still watched, exactly as before POL-176 —
+# the `parse` case at the top of this file pins that; here we pin only that a `Polyptic`-labelled
+# FOREIGN-looking prefix does not confuse the exact match.
+d="$(new_case prefix-no-confusion)"
+printf 'BootCurrent: 0000\nTimeout: 0 seconds\nBootOrder: 0000,0004\nBoot0000* ubuntu\nBoot0004* Polyptic Netboot\n' > "$d/nvram"
+out="$(watch "$d")"
+has "legacy-only box matches the legacy label" "'Polyptic Netboot' is entry 0004" "$out"
+
 printf '\n── the feed is not a metronome: one report per drift state per boot ──\n'
 d="$(new_case once)"
 watch "$d" >/dev/null; watch "$d" >/dev/null; watch "$d" >/dev/null

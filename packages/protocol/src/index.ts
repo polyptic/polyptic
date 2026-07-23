@@ -298,9 +298,35 @@ export function isNewerAgentVersion(candidate: string, current: string): boolean
  *  `POST /boot/report`. `local-fallback` is the loud one: a wired-capable box that booted the
  *  medium's LOCAL menu because the wired GRUB chain got no lease — that menu PINS the image, so
  *  rebuilds silently stop reaching the box until the wired chain is fixed. `local-wifi` is a
- *  wireless box on the local chain, which is its normal path. */
-export const MachineBootPath = z.enum(["wired", "local-fallback", "local-wifi"]);
+ *  wireless box on the local chain, which is its normal path. `disk` (POL-176) is an INSTALLED box
+ *  booting its own internal disk — its normal path, and the one that retires the fallback worry. */
+export const MachineBootPath = z.enum(["wired", "local-fallback", "local-wifi", "disk"]);
 export type MachineBootPath = z.infer<typeof MachineBootPath>;
+
+/** POL-176 — HOW this box is running its OS. `live` = the netboot/live-medium path (the whole image
+ *  sits in RAM and every power-cycle re-fetches it); `installed` = the OS is on the internal disk
+ *  (A/B slots, updates staged by the root update poll and applied on reboot). Reported by the agent
+ *  from the kernel cmdline (`polyptic.bootpath=disk` ⇒ installed). A dev/non-Polyptic box reports
+ *  NOTHING — an absent mode is "not a fleet box", never a guess. */
+export const BootMode = z.enum(["live", "installed"]);
+export type BootMode = z.infer<typeof BootMode>;
+
+/** POL-176 — one physical disk, as the box inventoried it (`lsblk`). This is what the console's
+ *  INSTALL dialog names before the operator confirms wiping it, so it carries what a human needs to
+ *  recognise the right disk: size, model, and a short summary of what is on it today. */
+export const MachineDisk = z.object({
+  /** The kernel device path, e.g. `/dev/sda` or `/dev/nvme0n1` — what the install request targets. */
+  device: z.string(),
+  sizeBytes: z.number().nonnegative(),
+  /** The hardware model string, when the kernel exposes one. */
+  model: z.string().optional(),
+  /** True for hot-pluggable media (USB sticks, SD cards) — never a valid install target. */
+  removable: z.boolean(),
+  /** A short human summary of the disk's current contents, composed by the agent from the
+   *  partitions' fstype/label (e.g. `"ext4 (Ubuntu 24.04), ntfs"`), or `"empty"`. */
+  contents: z.string().optional(),
+});
+export type MachineDisk = z.infer<typeof MachineDisk>;
 
 /** A client machine. Plumbing — users address screens, not machines. */
 export const Machine = z.object({
@@ -336,6 +362,19 @@ export const Machine = z.object({
   bootPathAt: z.string().datetime().optional(),
   /** The sentence the box composed about that boot ("image pinned at 20260721T…"). */
   bootPathDetail: z.string().optional(),
+  /** POL-176 — live vs installed, as the agent last reported it (from the kernel cmdline). PERSISTED
+   *  like `imageId`: whether a dark box needs a truck roll or just power depends on it. Absent for
+   *  a dev box / pre-POL-176 agent. */
+  bootMode: BootMode.optional(),
+  bootModeAt: z.string().datetime().optional(),
+  /** POL-176 — the box's disk inventory as it last reported it (what the INSTALL dialog offers).
+   *  Persisted so the dialog can name the disk of a box that is momentarily offline too. */
+  disks: z.array(MachineDisk).optional(),
+  /** POL-176 — the image id the box's root update poll has STAGED to its inactive slot
+   *  (`/run/polyptic/update-state`), reported verbatim. `staged !== running` is the console's
+   *  "update ready — reboot to apply" badge; the server never interprets it. */
+  stagedImageId: z.string().optional(),
+  stagedImageIdAt: z.string().datetime().optional(),
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — whether an operator has ARMED this box for a remote shell. Default false: a console
    *  compromise must not silently reach a terminal on every box. Disarming kills any live session. */
@@ -953,6 +992,16 @@ export const AgentHello = z.object({
    *  heartbeat later — a reboot into a canary build is exactly the moment an operator is watching.
    *  Optional: a dev box (no live image) and any pre-POL-105 agent simply omit it. */
   imageId: z.string().optional(),
+  /** POL-176 — HOW this box is running its OS: `installed` when the kernel cmdline carries
+   *  `polyptic.bootpath=disk`, else `live` on any box with a Polyptic identity (a polyptic.* cmdline
+   *  or /etc/polyptic/image-id). OMITTED on dev/non-fleet boxes — an absent mode is never a guess. */
+  bootMode: BootMode.optional(),
+  /** POL-176 — the box's disk inventory (`lsblk`), for the console's INSTALL dialog. Omitted when
+   *  the box cannot inventory (non-Linux, no lsblk) — an empty array means "no disks", not "unknown". */
+  disks: z.array(MachineDisk).optional(),
+  /** POL-176 — the image id staged to the inactive slot (`/run/polyptic/update-state`), verbatim.
+   *  Omitted when the state file is absent (a live box, or one that has never polled). */
+  stagedImageId: z.string().optional(),
   /** POL-104 — the box's physical identity (MACs / DMI serial / arch). Optional: a pre-POL-104 agent
    *  sends none, and a pending card then simply says less. */
   hardware: HostIdentity.optional(),
@@ -1043,6 +1092,11 @@ export const MachineVitals = z.object({
   /** The live image this box is RUNNING (`/etc/polyptic/image-id`), which is how an operator learns
    *  a box never took the last roll-out. */
   imageId: z.string().optional(),
+  /** POL-176 — the image id the root update poll has STAGED to the inactive slot on an installed box
+   *  (`/run/polyptic/update-state`), re-read each heartbeat so "update ready — reboot to apply"
+   *  appears the poll after the download lands, not on the next reconnect. Reported verbatim; the
+   *  console compares it against `imageId`. Omitted when the state file is absent. */
+  stagedImageId: z.string().optional(),
   /**
    * POL-148 — the box's NTP client (systemd-timesyncd) reports whether the clock is synchronised to
    * a time source, read from `/run/systemd/timesync/synchronized`. `true` = synced, `false` = a time
@@ -1141,6 +1195,55 @@ export const AgentUpdateStatus = z.object({
   /** The version the server offered. */
   toVersion: z.string(),
   reason: z.string().optional(),
+});
+
+// ── Install to disk (POL-176) ────────────────────────────────────────────────
+//
+// A production box that netboots holds its whole ~1 GiB image in RAM, forever. `server/install`
+// turns ONE live box into an installed one: the agent (unprivileged) writes a request file under
+// /run/polyptic/requests — the POL-55 reboot escalation pattern, nothing to smuggle — and a
+// root-owned installer wipes the named disk, lays down A/B slots, and reports `installed` over
+// /boot/report. The agent's job here is to VALIDATE (a named, non-removable, inventoried disk on a
+// box that is actually live), hand over, and then NARRATE: it tails /run/polyptic/install-status and
+// forwards each phase line, so the operator watches the wipe they authorised instead of a spinner.
+
+/** Where the installer is. Mirrors the phases the root installer writes to install-status. */
+export const InstallPhase = z.enum([
+  "starting",
+  "wiping",
+  "partitioning",
+  "fetching",
+  "verifying",
+  "writing-loader",
+  "boot-entry",
+  "done",
+  "failed",
+]);
+export type InstallPhase = z.infer<typeof InstallPhase>;
+
+/** POL-176 — the agent's answer to `server/install`, sent BEFORE the installer runs. `accepted:
+ *  false` means nothing was touched and `reason` says why (not live, unknown disk, removable disk,
+ *  no request directory). The agent validates, but the TRUST decision was the operator's explicit
+ *  confirm in the console, and the root installer re-validates the target before writing a byte. */
+export const AgentInstallAck = z.object({
+  t: z.literal("agent/install-ack"),
+  machineId: z.string(),
+  accepted: z.boolean(),
+  /** Why the agent declined, when `accepted` is false. */
+  reason: z.string().optional(),
+});
+
+/** POL-176 — one line of the root installer's progress (`/run/polyptic/install-status`), forwarded
+ *  by the agent as it appears. Terminal phases are `done` and `failed`; everything else is progress.
+ *  The frames drive the console's MachineView.installing state and the activity feed's outcome line. */
+export const AgentInstallStatus = z.object({
+  t: z.literal("agent/install-status"),
+  machineId: z.string(),
+  phase: InstallPhase,
+  /** 0–100, when the installer knows (it writes `-` when it doesn't). */
+  percent: z.number().min(0).max(100).optional(),
+  /** The installer's own sentence about this step. */
+  detail: z.string().optional(),
 });
 
 // ── Remote shell (POL-59) ─────────────────────────────────────────────────────
@@ -1258,6 +1361,8 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentThumbnail,
   AgentRebootAck,
   AgentUpdateStatus,
+  AgentInstallAck,
+  AgentInstallStatus,
   AgentPowerAck,
   AgentShellOpened,
   AgentShellData,
@@ -1326,6 +1431,20 @@ export const ServerToAgentReboot = z.object({
   t: z.literal("server/reboot"),
   /** Advisory, logged on the box (e.g. "requested by an operator from the console"). */
   reason: z.string().optional(),
+});
+
+/**
+ * POL-176 — install the OS to this box's internal disk, on an operator's EXPLICIT say-so. This is
+ * the one destructive command on the agent channel: the named disk is wiped. The trust model is
+ * layered exactly like the reboot: the console modal names the disk and demands a typed confirm, the
+ * REST route re-checks the target against the box's own inventory, the agent refuses anything that
+ * is not a known non-removable disk on a LIVE box, and the root installer re-validates the device
+ * before it writes a byte. The agent answers `agent/install-ack`, then streams `agent/install-status`.
+ */
+export const ServerToAgentInstall = z.object({
+  t: z.literal("server/install"),
+  /** The target disk, e.g. `/dev/sda` — must be one the box itself reported in `disks`. */
+  device: z.string().min(1),
 });
 
 /**
@@ -1534,6 +1653,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentIdent,
   ServerToAgentCapture,
   ServerToAgentReboot,
+  ServerToAgentInstall,
   ServerToAgentUpdateAvailable,
   ServerToAgentInspect,
   ServerToAgentDisplayPower,
@@ -1797,6 +1917,27 @@ export const MachineView = z.object({
   bootPath: MachineBootPath.optional(),
   bootPathAt: z.string().datetime().optional(),
   bootPathDetail: z.string().optional(),
+  /** POL-176 — live vs installed, as the box last reported it. `live` drives the LIVE badge + the
+   *  INSTALL affordance; `installed` retires both. Persisted like `imageId`, so an offline box still
+   *  says how it boots. Absent = not a fleet box (or a pre-POL-176 agent) — the console shows nothing. */
+  bootMode: BootMode.optional(),
+  /** POL-176 — the box's disk inventory, for the INSTALL dialog (which must NAME the disk it wipes). */
+  disks: z.array(MachineDisk).optional(),
+  /** POL-176 — the image staged to the inactive slot. `stagedImageId !== imageId` is the console's
+   *  "update ready — reboot to apply" badge (the reboot rides the existing lifecycle command). */
+  stagedImageId: z.string().optional(),
+  /** POL-176 — an install is in flight on this box RIGHT NOW: the latest phase line the agent
+   *  forwarded from the root installer. Live-only (never persisted) and bounded server-side, the
+   *  `rebooting` idiom — a box that dies mid-install must not read "installing…" forever. */
+  installing: z
+    .object({
+      phase: InstallPhase,
+      percent: z.number().min(0).max(100).optional(),
+      detail: z.string().optional(),
+      /** When the server received this phase (ISO). */
+      at: z.string(),
+    })
+    .optional(),
   outputCount: z.number().int().nonnegative(), // outputs the agent reported (shown for pending machines with no screens yet)
   lastSeen: z.string().datetime().optional(),
   /** POL-59 — operator has armed this box for a remote shell (drives the Machines-view terminal). */
@@ -2463,6 +2604,15 @@ export const BootReportCode = z.enum([
   "local-fallback-boot",
   "local-boot-wifi",
   "wired-boot",
+  // ── POL-176: install-to-disk. `disk-boot` is the state-only per-boot report of an INSTALLED box
+  // (like `wired-boot` it clears a lingering `local-fallback` flag and never makes a feed line).
+  // The install-* codes are the root installer's failure verdicts; success reuses `installed`.
+  "disk-boot",
+  "install-bad-target", // the requested device is missing, removable, or not a disk — nothing wiped
+  "install-disk-too-small", // the disk cannot hold both A/B slots + the ESP — nothing wiped
+  "install-write-failed", // the wipe/partition/copy itself failed; the disk may be part-written
+  "install-no-tools", // sgdisk/mkfs/mkswap missing from this image — nothing wiped, rebuild the image
+  "install-no-image", // the depot serves no image for this arch, so there is nothing to install
 ]);
 export type BootReportCode = z.infer<typeof BootReportCode>;
 
@@ -2559,6 +2709,13 @@ export type RebootBody = z.infer<typeof RebootBody>;
 /** POST /api/v1/machines/:id/shell — arm or disarm a box for the remote shell (POL-59). */
 export const ShellArmBody = z.object({ enabled: z.boolean() });
 export type ShellArmBody = z.infer<typeof ShellArmBody>;
+
+/** POST /api/v1/machines/:id/install — install the OS to the named internal disk (POL-176). The
+ *  DESTRUCTIVE action: the console modal names this exact device and demands an explicit confirm
+ *  before the request is ever made. The server re-validates the device against the box's own
+ *  reported inventory (non-removable, known) and that the box currently boots `live`. */
+export const InstallMachineBody = z.object({ device: z.string().min(1).max(128) });
+export type InstallMachineBody = z.infer<typeof InstallMachineBody>;
 
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });

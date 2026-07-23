@@ -1753,15 +1753,15 @@ async function onSignOut(): Promise<void> {
             <li class="step">
               <div class="step-gutter"><span class="step-num">5</span></div>
               <div class="step-body">
-                <div class="step-title">Optional: install the bootloader, then take the USB back</div>
+                <div class="step-title">Optional: install Polyptic to the screen's disk</div>
                 <div class="step-text">
-                  At the boot menu choose <b>Set up this screen to start without the USB stick</b>. The screen then boots Polyptic on its
-                  own, and the same stick can walk down the rack.
+                  Once the screen is approved, open <b>Machines</b> — a screen booted from the stick wears a
+                  <b>Live boot</b> chip. Choose <b>Install</b> on its card to put Polyptic on the internal disk.
+                  The screen then boots on its own, and the same stick can walk down the rack.
                 </div>
                 <div class="step-aside">
-                  <b>Nothing is erased.</b> Installing copies a signed 4 MB loader (plus, on Wi-Fi screens, the local
-                  boot files and Wi-Fi credentials) to the EFI partition and puts Polyptic first in the UEFI boot
-                  order. Disks, partitions and any OS already installed are left exactly as they are.
+                  <b>Installing erases the disk you pick.</b> The dialog names the disk and asks you to confirm it.
+                  An installed screen stages updates in the background and applies them on reboot.
                 </div>
               </div>
             </li>

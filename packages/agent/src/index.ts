@@ -86,6 +86,8 @@ import {
 } from "./mtls";
 import type { MtlsBundleFile } from "./mtls";
 import { rebootHost } from "./host";
+import { installRefusal, isTerminalPhase, readBootFacts, requestInstall, tailInstallStatus } from "./install";
+import type { BootFacts } from "./install";
 import { ShellManager } from "./shell";
 import { diffWindows } from "./windows";
 import type { PlacedWindow } from "./windows";
@@ -169,6 +171,7 @@ type ApplyMsg = Extract<ServerToAgentMessage, { t: "server/apply" }>;
 type IdentMsg = Extract<ServerToAgentMessage, { t: "server/ident" }>;
 type CaptureMsg = Extract<ServerToAgentMessage, { t: "server/capture" }>;
 type RebootMsg = Extract<ServerToAgentMessage, { t: "server/reboot" }>;
+type InstallMsg = Extract<ServerToAgentMessage, { t: "server/install" }>;
 type InspectMsg = Extract<ServerToAgentMessage, { t: "server/inspect" }>;
 type DisplayPowerMsg = Extract<ServerToAgentMessage, { t: "server/display-power" }>;
 type EnrolledMsg = Extract<ServerToAgentMessage, { t: "server/enrolled" }>;
@@ -252,6 +255,14 @@ class Agent {
   private readonly attemptedUpdates = new Set<string>();
   /** POL-160 — true while a self-update swap is in flight, so overlapping offers do not race the disk. */
   private updating = false;
+
+  /** POL-176 — the boot/disk facts last gathered for a hello (bootMode + disk inventory + staged
+   *  image id). Refreshed on every connect — cheap (one lsblk + two file reads) — and the inventory
+   *  the install handler validates a requested device against. */
+  private bootFacts: BootFacts = {};
+  /** POL-176 — the live install-status tail, while an install is in flight. One at a time: a second
+   *  `server/install` during a wipe is refused rather than racing the root installer. */
+  private installTail: { stop(): void } | null = null;
 
   constructor(
     private readonly url: string,
@@ -438,6 +449,9 @@ class Agent {
         break;
       case "server/reboot":
         await this.onReboot(msg);
+        break;
+      case "server/install":
+        this.onInstall(msg);
         break;
       case "server/update-available":
         await this.onUpdateAvailable(msg);
@@ -670,6 +684,74 @@ class Agent {
     });
     if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
     else logError(`refused to reboot: ${outcome.reason}`);
+  }
+
+  /**
+   * `server/install` — install the OS to this box's internal disk (POL-176), the one DESTRUCTIVE
+   * command on this channel. TRUST MODEL: the operator armed this via an explicit console confirm
+   * that named the disk; the server re-checked the device against our reported inventory; here we
+   * validate again (a LIVE box, a known non-removable disk — an INSTALLED box must never wipe the
+   * disk it is running from); and the root install unit re-validates the device before writing a
+   * byte. The escalation is the POL-55 pattern: one request file in the kiosk-writable /run
+   * directory, `device=<dev>`, nothing else to smuggle.
+   *
+   * After the hand-over the agent NARRATES: it tails /run/polyptic/install-status (written by the
+   * root installer) and forwards each new `<phase>|<percent>|<detail>` line as
+   * `agent/install-status`, until `done`/`failed` or a 30-minute timeout.
+   */
+  private onInstall(msg: InstallMsg): void {
+    log(`server/install received (device=${msg.device})`);
+    const ack = (accepted: boolean, reason?: string): void => {
+      this.send({ t: "agent/install-ack", machineId: this.machineId, accepted, reason });
+    };
+
+    if (this.installTail) {
+      ack(false, "an install is already in flight on this box");
+      logError("refused install: one is already in flight");
+      return;
+    }
+    const refusal = installRefusal(msg.device, this.bootFacts.bootMode, this.bootFacts.disks);
+    if (refusal) {
+      ack(false, refusal);
+      logError(`refused install to ${msg.device}: ${refusal}`);
+      return;
+    }
+    const outcome = requestInstall(msg.device);
+    ack(outcome.accepted, outcome.reason);
+    if (!outcome.accepted) {
+      logError(`could not request install to ${msg.device}: ${outcome.reason}`);
+      return;
+    }
+    log(`install to ${msg.device} handed to the root installer (${outcome.reason}) — tailing its progress`);
+
+    this.installTail = tailInstallStatus(
+      (line) => {
+        this.send({
+          t: "agent/install-status",
+          machineId: this.machineId,
+          phase: line.phase,
+          ...(line.percent !== undefined ? { percent: line.percent } : {}),
+          ...(line.detail !== undefined ? { detail: line.detail } : {}),
+        });
+        if (isTerminalPhase(line.phase)) {
+          (line.phase === "done" ? log : logError)(
+            `install to ${msg.device} ${line.phase}${line.detail ? `: ${line.detail}` : ""}`,
+          );
+        }
+      },
+      (why) => {
+        this.installTail = null;
+        if (why === "timeout") {
+          logError(`install to ${msg.device}: no terminal status after the timeout — abandoning the tail`);
+          this.send({
+            t: "agent/install-status",
+            machineId: this.machineId,
+            phase: "failed",
+            detail: "the installer reported no outcome within 30 minutes",
+          });
+        }
+      },
+    );
   }
 
   /**
@@ -1031,6 +1113,16 @@ class Agent {
         logError(`could not generate an mTLS keypair/CSR: ${(err as Error).message}`);
       }
     }
+    // POL-176 — how this box boots (live vs installed), what disks it holds, and any staged image.
+    // Re-gathered on every connect (cheap: one lsblk + two /run reads), so a reconnect after an
+    // install/reboot reports the NEW truth; the inventory is also what `server/install` validates
+    // its device against. Never blocks the hello: a failed probe simply reports nothing.
+    try {
+      this.bootFacts = await readBootFacts();
+    } catch (err) {
+      logError(`could not gather boot/disk facts (hello continues without them): ${(err as Error).message}`);
+      this.bootFacts = {};
+    }
     // Both `bootstrapToken` and `credential` are optional. The server ignores them in OPEN mode
     // (Phase 2a behaviour) and uses them to enrol in GATED mode. `undefined` values are dropped by
     // JSON.stringify, so an agent with neither sends a plain Phase-2a hello.
@@ -1047,6 +1139,11 @@ class Agent {
       // POL-105 — the OS image this box actually BOOTED (`/etc/polyptic/image-id`). Undefined on a
       // dev box with no live image, and dropped by JSON.stringify, so an old server ignores it.
       imageId: await this.vitals.bootedImageId().catch(() => undefined),
+      // POL-176 — live vs installed + the disk inventory + any staged image, gathered above. All
+      // undefined on a dev/non-fleet box, and dropped by JSON.stringify like everything else here.
+      bootMode: this.bootFacts.bootMode,
+      disks: this.bootFacts.disks,
+      stagedImageId: this.bootFacts.stagedImageId,
       // POL-104 — what this box IS (MACs / DMI serial / arch). Descriptive, never a credential: the
       // server uses it to match a pre-registration (after the token gate) and to make a pending
       // approval card readable. Sampled per hello so a re-cabled box re-reports honestly.

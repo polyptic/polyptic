@@ -91,6 +91,8 @@ function sampler(): VitalsSampler {
     // Points at a path that does NOT exist by default, so the general tests see clockSynced omitted
     // (no time client to ask); the dedicated tests below create the fixture dir/file.
     timesyncRunDir: join(root, "timesync"),
+    // POL-176 — absent by default (a live box); the staged-image tests below create it.
+    updateStatePath: join(root, "update-state"),
     statfs: () => ({ totalBytes: 100 * 1024 ** 3, usedBytes: 22 * 1024 ** 3 }),
     coreCount: () => 4,
   });
@@ -244,5 +246,26 @@ describe("VitalsSampler", () => {
     await writeFile(join(root, "timesync", "synchronized"), "");
     const v = await sampler().sample([]);
     expect(v?.clockSynced).toBe(true);
+  });
+
+  // POL-176 — the staged (inactive-slot) image id rides every sample on an installed box, RE-READ
+  // each heartbeat (staging happens at runtime, unlike the immutable booted id). Absent file =
+  // absent field: a live box's heartbeat is byte-for-byte what it was before POL-176.
+  test("stagedImageId is OMITTED when there is no update-state file (a live box)", async () => {
+    const v = await sampler().sample([]);
+    expect(v?.stagedImageId).toBeUndefined();
+  });
+
+  test("stagedImageId reports the staged= line verbatim — even when it equals running", async () => {
+    await writeFile(join(root, "update-state"), "running=20260714T101500Z-abcd\nstaged=20260714T101500Z-abcd\n");
+    const v = await sampler().sample([]);
+    expect(v?.stagedImageId).toBe("20260714T101500Z-abcd");
+  });
+
+  test("a NEWLY staged id shows up on the next sample, not the next process", async () => {
+    const s = sampler();
+    expect((await s.sample([]))?.stagedImageId).toBeUndefined();
+    await writeFile(join(root, "update-state"), "running=A\nstaged=B\n");
+    expect((await s.sample([]))?.stagedImageId).toBe("B");
   });
 });

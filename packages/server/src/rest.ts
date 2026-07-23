@@ -57,6 +57,8 @@ import {
   IdentBody,
   ImportPreRegistrationsBody,
   InspectBody,
+  InstallMachineBody,
+  ServerToAgentInstall,
   machineHasName,
   MoveTargetsBody,
   PanelHoursBody,
@@ -678,6 +680,86 @@ export function registerRestRoutes(
       "pushed reboot to agent",
     );
     return { ok: true, machineId: machine.id, delivered };
+  });
+
+  // POST /api/v1/machines/:machineId/install  { device }  -> install the OS to that disk (POL-176)
+  //
+  // THE destructive action on this surface: the named disk is WIPED and Polyptic installed with A/B
+  // slots. TRUST MODEL: this route sits behind the same operator-session gate as the reboot, and the
+  // console only calls it after an explicit confirm that NAMES the disk (model + size + contents);
+  // the checks here re-validate the request against the box's OWN reported facts (it must currently
+  // boot `live`, and the device must be in its reported inventory and non-removable); the agent
+  // validates again on the box; and the root install unit re-validates the device before it writes
+  // a byte. Each layer assumes the one above it lied.
+  //
+  // 409s follow the reboot route's grammar: an install that was never delivered must not look like
+  // one that was. The agent answers `agent/install-ack` and then narrates `agent/install-status`
+  // (handled in ws.ts) — which is where a refusal or a mid-wipe failure surfaces.
+  fastify.post("/api/v1/machines/:machineId/install", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = InstallMachineBody.safeParse(request.body ?? {});
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+
+    const machine = control.getMachine(params.data.machineId);
+    if (!machine) {
+      return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+    }
+    if (machine.status !== "approved") {
+      return reply
+        .code(409)
+        .send({ error: `machine ${machine.id} is ${machine.status}, not approved, so it cannot be installed` });
+    }
+    if (machine.bootMode !== "live") {
+      return reply.code(409).send({
+        error:
+          machine.bootMode === "installed"
+            ? `machine ${machine.id} already runs from its internal disk — there is nothing to install`
+            : `machine ${machine.id} has not reported a live boot, so its boot mode is unknown — refusing to wipe a disk`,
+      });
+    }
+    // One install at a time: the button stays clickable in a laggy console, and a second
+    // `server/install` mid-wipe would race the root unit over the same request file. The presence
+    // state is TTL-bounded, so a died-mid-install box frees itself.
+    const installing = presence.machineInstalling(machine.id);
+    if (installing && installing.phase !== "done" && installing.phase !== "failed") {
+      return reply.code(409).send({
+        error: `machine ${machine.id} is already installing (${installing.phase}) — wait for it to finish`,
+      });
+    }
+    const disk = machine.disks?.find((d) => d.device === body.data.device);
+    if (!disk) {
+      return reply.code(400).send({
+        error: `${body.data.device} is not a disk machine ${machine.id} reported — refusing to touch it`,
+      });
+    }
+    if (disk.removable) {
+      return reply.code(400).send({
+        error: `${body.data.device} is removable media — the OS installs to an internal disk only`,
+      });
+    }
+
+    const delivered = agentHub.send(
+      machine.id,
+      ServerToAgentInstall.parse({ t: "server/install", device: body.data.device }),
+    );
+    if (delivered === 0) {
+      return reply.code(409).send({ error: `machine ${machine.id} is offline, so there is nothing to install to` });
+    }
+
+    // Same reasoning as the reboot route: the click must leave a trace NOW, not when the first
+    // install-status frame lands. The line names the disk — this is the feed's record of consent.
+    activity.push("accent", `Installing Polyptic to ${disk.device} on ${machine.label}`);
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.install", machineId: machine.id, device: disk.device, delivered },
+      "pushed install to agent",
+    );
+    return { ok: true, machineId: machine.id, device: disk.device, delivered };
   });
 
   // POST /api/v1/machines/:machineId/shell  { enabled }  -> arm/disarm the remote shell (POL-59)

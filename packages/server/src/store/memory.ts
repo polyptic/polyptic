@@ -150,6 +150,14 @@ export class MemoryStore implements Store {
     }
   }
 
+  async setMachineStagedImage(id: string, stagedImageId: string, at: string): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) {
+      machine.stagedImageId = stagedImageId;
+      machine.stagedImageIdAt = at;
+    }
+  }
+
   async setMachineBootPath(id: string, path: MachineBootPath, at: string, detail: string): Promise<void> {
     const machine = this.machines.get(id);
     if (machine) {

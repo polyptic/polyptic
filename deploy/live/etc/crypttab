@@ -1,0 +1,10 @@
+# Polyptic ephemeral encrypted swap (POL-176). An installed box (install-to-disk.sh) carries a
+# plain 4 GiB partition partlabelled POLYPTIC-SWAP; every boot, systemd-cryptsetup keys it with a
+# FRESH random key from /dev/urandom, formats it as swap (the `swap` option), and discards the key
+# at power-off. PRIVACY IS THE POINT: swapped pages can carry wall pixels and enrolment tokens, and
+# with an ephemeral key nothing that hits this disk is ever readable again — the installed box stays
+# as stateless as the diskless one it replaces.
+#
+# `nofail` keeps every OTHER boot clean: netboot/live boxes and pre-POL-176 installs have no such
+# partition, and the by-partlabel path simply never appears — no degraded boot, no console noise.
+polyptic-swap /dev/disk/by-partlabel/POLYPTIC-SWAP /dev/urandom swap,cipher=aes-xts-plain64,size=512,nofail

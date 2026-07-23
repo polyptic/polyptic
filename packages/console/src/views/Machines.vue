@@ -56,6 +56,14 @@ import MachineName from "../components/MachineName.vue";
 import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
 import { machineCardName, machineDisplayName, machineIdTail } from "../machine-name";
+import {
+  activeInstall,
+  formatDiskSize,
+  formatImageId,
+  installProgressText,
+  installTargets,
+  updateReady,
+} from "../install";
 
 const store = useConsoleStore();
 
@@ -401,6 +409,67 @@ function allAsleep(m: MachineView): boolean {
   return m.screens.length > 0 && m.screens.every((s) => s.asleep === true);
 }
 
+// ── Install to disk (POL-176) ────────────────────────────────────────────────
+// A live-booted box re-streams its whole OS into RAM at every power-cycle. INSTALL puts the OS on
+// an internal disk instead — a destructive verb, so the confirm lives INSIDE the dialog: the
+// primary button stays disabled until the operator ticks a line that NAMES the disk and the box.
+const installFor = ref<MachineView | null>(null);
+const installDevice = ref<string | null>(null);
+const installAck = ref(false);
+const installBusy = ref(false);
+
+const installDisks = computed(() => installTargets(installFor.value?.disks));
+const installDisk = computed(
+  () => installDisks.value.find((d) => d.device === installDevice.value) ?? null,
+);
+
+function openInstall(m: MachineView): void {
+  installFor.value = m;
+  const targets = installTargets(m.disks);
+  // One suitable disk = preselected; several = the operator picks.
+  installDevice.value = targets.length === 1 ? targets[0]!.device : null;
+  installAck.value = false;
+  installBusy.value = false;
+}
+
+/** Picking a different disk voids the acknowledgement — it named the OLD disk. */
+function pickInstallDisk(device: string): void {
+  installDevice.value = device;
+  installAck.value = false;
+}
+
+function closeInstall(): void {
+  installFor.value = null;
+}
+
+async function confirmInstall(): Promise<void> {
+  const m = installFor.value;
+  const disk = installDisk.value;
+  if (!m || !disk || !installAck.value || installBusy.value) return;
+  installBusy.value = true;
+  const error = await store.installMachine(m.id, disk.device);
+  installBusy.value = false;
+  if (error) {
+    showToast(error);
+    return;
+  }
+  installFor.value = null;
+  showToast("Installing — progress shows on the machine card");
+}
+
+/** Reboot into the STAGED image (POL-176). The reboot itself is the ordinary lifecycle reboot —
+ *  the box's loader boots the freshly staged slot — so only the confirm differs from `reboot()`. */
+async function applyStaged(m: MachineView): Promise<void> {
+  const staged = m.stagedImageId;
+  if (!staged) return;
+  const yes = window.confirm(
+    `Reboot "${machineDisplayName(m)}" into the staged image ${formatImageId(staged)}?`,
+  );
+  if (!yes) return;
+  const error = await store.rebootMachine(m.id);
+  showToast(error ?? `Rebooting ${machineDisplayName(m)} into ${formatImageId(staged)}…`);
+}
+
 // ── Console lifecycle (POL-59 arm/disarm, POL-68 UI) ─────────────────────────
 // A box's console must be ENABLED before an operator can launch a terminal; it is off by default so
 // a console compromise can't silently reach a shell on the fleet. The terminal is a full-screen view.
@@ -715,6 +784,19 @@ function showToast(message: string): void {
                   class="chip-localboot"
                   title="This box boots from its local medium and streams the OS over Wi-Fi — its normal path"
                 >Wi-Fi boot</span>
+                <!-- POL-176 — HOW the box runs its OS. `live` wears an amber chip (the state the
+                     Install button retires); `installed` a quiet neutral one. A box that reports
+                     neither (a dev box, an older agent) wears nothing. -->
+                <span
+                  v-if="m.bootMode === 'live'"
+                  class="chip-live"
+                  title="This box streams its OS into RAM at every boot. Install to move it onto the internal disk"
+                >Live boot</span>
+                <span
+                  v-else-if="m.bootMode === 'installed'"
+                  class="chip-localboot"
+                  title="This box boots Polyptic from its internal disk"
+                >Installed</span>
                 <!-- POL-141 — the id tail, left of the Online pill: uniqueness stays checkable
                      without the full dmi-… UUID (which is on hover). -->
                 <span class="id-tail" :title="m.id">{{ machineIdTail(m.id) }}</span>
@@ -726,6 +808,20 @@ function showToast(message: string): void {
                 <!-- cluster 1: Ident all — an operator may flash panels; a viewer may not. -->
                 <button v-if="m.screens.length && store.canAuthor" class="btn-ghost-sm" @click="identAll(m)">
                   <span class="ident-dot"></span>Ident all
+                </button>
+
+                <!-- POL-176 — the INSTALL affordance: only on a live-booted box that is online and
+                     has inventoried its disks, and admin-only like the rest of the lifecycle verbs.
+                     The destructive confirm lives inside the dialog, not here. Hidden while an
+                     install is in flight (the strip below owns the card; the server also 409s a
+                     second install, but the button must not invite one). -->
+                <button
+                  v-if="store.isAdmin && m.bootMode === 'live' && m.online && m.disks?.length && !activeInstall(m)"
+                  class="btn-ghost-sm"
+                  title="Install Polyptic to this box's internal disk"
+                  @click="openInstall(m)"
+                >
+                  Install
                 </button>
 
                 <!-- cluster 2: the stateful console button (POL-68 §3). ADMIN-only (POL-107): a root
@@ -848,6 +944,42 @@ function showToast(message: string): void {
                 Rebuilds are not reaching this box.
               </div>
 
+              <!-- POL-176 — an install running RIGHT NOW: the latest phase line the agent forwarded
+                   from the root installer, plus a bar when the phase carries a percentage. `failed`
+                   and `done` get their own strips; the server drops the state after ~a minute. -->
+              <div v-if="activeInstall(m)" class="install-strip">
+                <div>
+                  <strong>{{ installProgressText(m.installing!) }}</strong>
+                  <span v-if="m.installing!.detail" class="install-detail">{{ m.installing!.detail }}</span>
+                </div>
+                <div v-if="m.installing!.percent != null" class="install-bar">
+                  <div class="install-bar-fill" :style="{ width: `${m.installing!.percent}%` }" />
+                </div>
+              </div>
+              <div v-else-if="m.installing?.phase === 'failed'" class="install-strip failed">
+                <strong>Install failed</strong><template v-if="m.installing.detail"> — {{ m.installing.detail }}</template>
+              </div>
+              <div v-else-if="m.installing?.phase === 'done'" class="install-strip done">
+                <strong>Installed</strong> — reboot begins the disk boot.
+              </div>
+
+              <!-- POL-176 — the box's own poll staged an image to its inactive slot. Applying it is
+                   the ordinary reboot; only the confirm names the staged image. -->
+              <div v-if="updateReady(m)" class="install-strip update">
+                <span class="update-text">
+                  Update ready — image {{ formatImageId(m.stagedImageId!) }} is staged.
+                </span>
+                <button
+                  v-if="store.isAdmin"
+                  class="btn-ghost-sm"
+                  :disabled="!m.online"
+                  :title="m.online ? 'Reboot this box into the staged image' : `${machineDisplayName(m)} is offline. Nothing to reboot`"
+                  @click="applyStaged(m)"
+                >
+                  Reboot to apply
+                </button>
+              </div>
+
               <!-- tags (POL-103): chips that double as a one-click filter into a selector -->
               <div v-if="m.tags.length" class="tags">
                 <button
@@ -935,6 +1067,61 @@ function showToast(message: string): void {
         <button v-if="picked.size" class="bulk-clear" @click="clearPicks">Clear selection</button>
       </div>
     </Transition>
+
+    <!-- install-to-disk dialog (POL-176) — the disk picker + the in-dialog destructive confirm -->
+    <div v-if="installFor" class="scrim" @mousedown.self="closeInstall">
+      <div class="modal install-modal" role="dialog" aria-modal="true">
+        <div class="modal-title">Install Polyptic to disk</div>
+        <p class="install-sub">
+          "{{ machineDisplayName(installFor) }}" streams its OS into RAM at every boot. Installing
+          puts the OS on the disk picked below; every boot after that starts from the disk, and
+          updates are staged in the background and applied on reboot.
+        </p>
+
+        <div v-if="installDisks.length" class="disk-list">
+          <label
+            v-for="d in installDisks"
+            :key="d.device"
+            class="disk-row"
+            :class="{ on: installDevice === d.device }"
+          >
+            <input
+              type="radio"
+              name="install-disk"
+              :value="d.device"
+              :checked="installDevice === d.device"
+              @change="pickInstallDisk(d.device)"
+            />
+            <span class="disk-main">
+              <span class="disk-device">{{ d.device }}</span>
+              <span class="disk-size">{{ formatDiskSize(d.sizeBytes) }}</span>
+              <span v-if="d.model" class="disk-model">{{ d.model }}</span>
+            </span>
+            <span v-if="d.contents" class="disk-contents">{{ d.contents }}</span>
+          </label>
+        </div>
+        <div v-else class="disk-empty">This box reported no internal disk to install to.</div>
+
+        <label v-if="installDisk" class="install-ack">
+          <input v-model="installAck" type="checkbox" />
+          <span>
+            Erase {{ installDisk.device }} ({{ formatDiskSize(installDisk.sizeBytes) }}) completely
+            and install Polyptic on "{{ machineDisplayName(installFor) }}"
+          </span>
+        </label>
+
+        <div class="modal-actions">
+          <button class="btn-secondary" @click="closeInstall">Cancel</button>
+          <button
+            class="btn-danger"
+            :disabled="!installDisk || !installAck || installBusy"
+            @click="confirmInstall"
+          >
+            {{ installBusy ? "Starting…" : "Erase disk and install" }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <!-- cold-start wizard overlay -->
     <ColdStartWizard :open="wizardOpen" :now="now" @close="wizardOpen = false" />
@@ -1257,6 +1444,69 @@ function showToast(message: string): void {
   font-size: 12.5px;
   line-height: 1.45;
 }
+/* POL-176 — the amber "Live boot" chip: attention, not alarm. Same warn palette as Shell armed,
+   because both mark a state the operator may want to retire (there, disarm; here, Install). The
+   "Installed" chip reuses .chip-localboot's neutral look. */
+.chip-live {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* POL-176 — the install strips: neutral while running, bad on failure, ok when done, and the
+   accent-tinted "update ready" band. Strips (not chips) for the same reason the fallback strip is
+   one: this state must read at a glance across the room. */
+.install-strip {
+  margin-top: 10px;
+  padding: 9px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--muted-bg);
+  color: var(--fg2);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.install-strip.failed {
+  border-color: var(--bad);
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+.install-strip.done {
+  border-color: var(--ok);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.install-strip.update {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.update-text {
+  flex: 1;
+  min-width: 0;
+}
+.install-detail {
+  color: var(--muted);
+  margin-left: 8px;
+}
+.install-bar {
+  margin-top: 7px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+.install-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+
 .status-badge {
   font-size: 11px;
   font-weight: 600;
@@ -1796,6 +2046,158 @@ function showToast(message: string): void {
   opacity: 0;
 }
 
+/* ── POL-176: the install-to-disk dialog ────────────────────────────────────── */
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(2px);
+}
+.modal {
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  max-height: 88vh;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  padding: 24px;
+  box-shadow: var(--shadow-lg);
+}
+.modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-bottom: 18px;
+}
+.install-modal {
+  width: 480px;
+}
+.install-sub {
+  margin: -10px 0 16px;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+.disk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.disk-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 10px;
+  row-gap: 3px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.disk-row.on {
+  border-color: var(--primary);
+}
+.disk-row input {
+  grid-row: 1 / span 2;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.disk-main {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+.disk-device {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.disk-size {
+  font-size: 12px;
+  color: var(--fg2);
+  white-space: nowrap;
+}
+.disk-model {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.disk-contents {
+  grid-column: 2;
+  font-size: 11.5px;
+  color: var(--muted2);
+  overflow-wrap: anywhere;
+}
+.disk-empty {
+  font-size: 12.5px;
+  color: var(--muted2);
+  margin-bottom: 16px;
+}
+/* The in-dialog destructive confirm: ticking it is what arms the primary button. */
+.install-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg2);
+  line-height: 1.5;
+  margin-bottom: 18px;
+  cursor: pointer;
+}
+.install-ack input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+  accent-color: var(--bad);
+  cursor: pointer;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.btn-secondary {
+  padding: 9px 15px;
+  border-radius: 9px;
+  border: 1px solid var(--line2);
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg2);
+  cursor: pointer;
+  font-family: inherit;
+}
+.btn-secondary:hover {
+  background: var(--muted-bg);
+}
+.btn-danger {
+  padding: 9px 17px;
+  border-radius: 9px;
+  border: none;
+  background: var(--bad);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+.btn-danger:hover:not(:disabled) {
+  opacity: 0.92;
+}
+.btn-danger:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* toast (reboot feedback) */
 .toast {
   position: fixed;
@@ -1809,7 +2211,8 @@ function showToast(message: string): void {
   padding: 10px 16px;
   border-radius: 9px;
   box-shadow: var(--shadow-lg);
-  z-index: 70;
+  /* Above the install dialog's scrim (300): the dialog's error toasts must be readable over it. */
+  z-index: 400;
 }
 .toast-enter-active,
 .toast-leave-active {

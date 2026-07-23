@@ -208,9 +208,10 @@ describe("netboot: GET /boot/grub.cfg", () => {
 
       // The GRUB net device is the exact host the box fetched from (Host header), like /install.
       expect(body).toContain(`set net=(http,${OPEN_HOST})`);
-      // Both menu entries by --id; dracut fetches the BARE squashfs; WS agent URL baked.
+      // The menu entries by --id; dracut fetches the BARE squashfs; WS agent URL baked. The offload
+      // entry is GONE (POL-176): installing to disk is a console action now, never a boot-menu one.
       expect(body).toContain("--id live");
-      expect(body).toContain("--id offload");
+      expect(body).not.toContain("--id offload");
       expect(body).toContain("--id debug");
       expect(body).toContain("--id verbose");
       expect(body).toContain(`root=live:http://${OPEN_HOST}/dist/image/$arch/rootfs.squashfs`);
@@ -254,16 +255,15 @@ describe("netboot: GET /boot/grub.cfg", () => {
     async () => {
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
       const echoes = body.split("\n").filter((l) => l.trim().startsWith("echo "));
-      expect(echoes.length).toBe(4);
+      expect(echoes.length).toBe(3); // live + debug + verbose (POL-176 retired the offload entry)
       expect(echoes[0]).toContain("Starting Polyptic");
       // …and it says what the silent minute after it IS (POL-118): the kernel + initrd fetch. Progress
       // in plain English is not the diagnostics D65 threw off this screen.
       expect(echoes[0]).toContain("downloading the operating system");
-      expect(echoes[1]).toContain("Setting up this screen");
       // The POL-47 complaint, verbatim: no RAM, no arch, no "offload", no "image" on a public panel.
       // The debug and verbose entries are exempt: nobody sees their lines unless they deliberately
       // chose them, and by then `tty9` is the fact they walked to the box for.
-      for (const line of echoes.slice(0, 2)) {
+      for (const line of echoes.slice(0, 1)) {
         expect(line).not.toContain("RAM");
         expect(line).not.toContain("$arch");
         expect(line).not.toContain("offload");
@@ -319,14 +319,15 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
-    "the menu is four flat entries, addressed by --id, and no submenu",
+    "the menu is three flat entries, addressed by --id, and no submenu",
     async () => {
       // The names are POL-47's (D65 supersedes D61's on the signage argument); the `--id`s are the
       // stable handle, and the flatness is D61's — a submenu opens a fresh GRUB environment context,
-      // which is what broke `$net`/`$arch` below.
+      // which is what broke `$net`/`$arch` below. The offload entry died with POL-176: installing
+      // is an operator's console action (an explicit confirm naming the disk), never a menu pick.
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
       expect(body).toContain('menuentry "Polyptic" --id live');
-      expect(body).toContain('menuentry "Set up this screen to start without the USB stick" --id offload');
+      expect(body).not.toContain("--id offload");
       expect(body).toContain('menuentry "Debug console" --id debug');
       expect(body).toContain('menuentry "Watch this screen boot" --id verbose');
       expect(body).not.toContain("submenu ");
@@ -382,17 +383,12 @@ describe("netboot: GET /boot/grub.cfg", () => {
   );
 
   test(
-    "only the offload entry tags the cmdline with polyptic.offload=1",
+    "no entry tags polyptic.offload=1 any more — the offload flow is retired (POL-176)",
     async () => {
+      // A stray tag would re-arm the deleted box-side flow on any image that still carried the
+      // unit. Install-to-disk replaced it, armed from the console, never from the boot chain.
       const body = await (await fetch(`${OPEN_BASE}/boot/grub.cfg`)).text();
-      const liveStart = body.indexOf("--id live");
-      const offloadStart = body.indexOf("--id offload");
-      expect(liveStart).toBeGreaterThan(-1);
-      expect(offloadStart).toBeGreaterThan(liveStart);
-      const liveEntry = body.slice(liveStart, offloadStart);
-      const offloadEntry = body.slice(offloadStart);
-      expect(liveEntry).not.toContain("polyptic.offload=1");
-      expect(offloadEntry).toContain("polyptic.offload=1");
+      expect(body).not.toContain("polyptic.offload=1");
     },
     TEST_TIMEOUT,
   );
@@ -405,7 +401,7 @@ describe("netboot: GET /boot/grub.cfg", () => {
       expect(debugStart).toBeGreaterThan(-1);
       const beforeDebug = body.slice(0, debugStart);
       const debugEntry = body.slice(debugStart);
-      // The root-shell arg must not leak into the live/offload entries a wall boots unattended.
+      // The root-shell arg must not leak into the live entry a wall boots unattended.
       expect(beforeDebug).not.toContain("systemd.debug-shell=1");
       expect(debugEntry).toContain("systemd.debug-shell=1");
       // A debug boot is an operator CHOICE at the menu: the default entry stays the live boot.
@@ -421,10 +417,9 @@ describe("netboot: GET /boot/grub.cfg", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain(`set net=(http,${GATED_HOST})`);
-      // The splash args (POL-7/POL-38) trail the token; the offload tag trails those.
+      // The splash args (POL-7/POL-38) trail the token.
       const SPLASH = "multipath=off quiet splash plymouth\\.ignore-serial-consoles";
       expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} ${SPLASH}$`, "m"));
-      expect(body).toMatch(new RegExp(`polyptic\\.token=${FLEET_TOKEN} ${SPLASH} polyptic\\.offload=1$`, "m"));
     },
     TEST_TIMEOUT,
   );
@@ -473,10 +468,12 @@ async function readAdminActivity(base: string): Promise<{ severity: string; text
   }
 }
 
+// POL-176 — `installed` is the root installer's success verdict (the box's own sentence names the
+// disk and the slot layout); pre-POL-176 offload media reported the same code for a loader install.
 const goodReport = {
   ok: true,
   code: "installed",
-  detail: "installed the signed loaders on /dev/nvme0n1 (partition 1)",
+  detail: "installed to /dev/nvme0n1 (A/B slots, loader on partition 1)",
   machineId: "dmi-4c4c4544-0031",
 };
 
@@ -492,7 +489,7 @@ describe("netboot: POST /boot/report", () => {
       expect(res.status).toBe(204);
 
       const activity = await readAdminActivity(OPEN_BASE);
-      const line = activity.find((e) => e.text.includes("installed the Polyptic bootloader"));
+      const line = activity.find((e) => e.text.includes("installed Polyptic to disk"));
       expect(line).toBeDefined();
       expect(line?.severity).toBe("good");
       expect(line?.text).toContain("dmi-4c4c4544-0031");

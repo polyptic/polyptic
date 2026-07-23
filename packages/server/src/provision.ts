@@ -23,7 +23,7 @@
  *   GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
  *                                                   the four signed loaders (shim + GRUB .efi), TOKENLESS
- *                                                   so ungated (UEFI HTTP Boot / offload).
+ *                                                   so ungated (UEFI HTTP Boot / the disk installer).
  *   GET /api/v1/settings/netboot                  → operator-facing netboot info for the console (GATED,
  *                                                   under /api/v1; secret-free, points at the URLs above).
  *
@@ -109,14 +109,14 @@ const IMAGE_FILE_RE = /^(vmlinuz|initrd|initrd-wifi|rootfs\.squashfs|polyptic-li
 const IMAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** The boot-depot files (POL-33/D47): `polyptic-boot.img` is the universal `dd`-able FAT32 dongle (both
  *  arches on one stick); the four `.efi` files are the SIGNED loaders (shim + network GRUB per arch) for
- *  UEFI HTTP Boot and the offload flow; `polyptic-boot.json` is the medium's self-description (POL-122,
+ *  UEFI HTTP Boot and the disk installer (POL-176); `polyptic-boot.json` is the medium's self-description (POL-122,
  *  secret-free: it says WHETHER a token is baked, never what it is). All TOKENLESS (they only chain
  *  `/boot/grub.cfg`), so this route is ungated like `/dist/agent`. */
 const BOOT_FILE_RE =
   /^(polyptic-boot\.img|polyptic-boot\.json|shimx64\.efi|shimaa64\.efi|grubx64\.efi|grubaa64\.efi)$/;
-/** The four signed loaders the depot serves and the offload flow installs (for the boot summary). */
+/** The four signed loaders the depot serves and the disk installer writes (for the boot summary). */
 const SIGNED_LOADER_FILES = ["shimx64.efi", "shimaa64.efi", "grubx64.efi", "grubaa64.efi"] as const;
-/** `POST /boot/report` throttle (POL-58): a rack being offloaded posts a handful of lines a minute, so
+/** `POST /boot/report` throttle (POL-58): a rack being installed posts a handful of lines a minute, so
  *  a burst of 10 with one token back every 6s is generous for real boxes and useless for a flooder. */
 const REPORT_BURST = 10;
 
@@ -125,6 +125,9 @@ const BOOT_PATH_BY_CODE: Partial<Record<BootReportCode, MachineBootPath>> = {
   "local-fallback-boot": "local-fallback",
   "local-boot-wifi": "local-wifi",
   "wired-boot": "wired",
+  // POL-176 — an installed box's once-per-boot self-report. State-only like `wired-boot`: it clears
+  // a lingering `local-fallback` flag (the registry emits the recovery line) and makes no feed line.
+  "disk-boot": "disk",
 };
 const REPORT_REFILL_MS = 6_000;
 
@@ -223,8 +226,7 @@ export function toWsAgentUrl(httpBase: string): string {
  *   - `polyptic.server_url=` / `polyptic.token=` are picked out of /proc/cmdline by the image's
  *     parse-cmdline helper and become the agent's POLYPTIC_SERVER_URL / POLYPTIC_BOOTSTRAP_TOKEN.
  * `$arch` is a GRUB runtime variable expanded at boot; the http URLs are literals (GRUB has no TLS,
- * the boot depot is plain http by contract) and the token (when gated) is a baked literal. The caller
- * appends `polyptic.offload=1` on the offload entry only.
+ * the boot depot is plain http by contract) and the token (when gated) is a baked literal.
  */
 function bootKernelCmdline(
   httpBase: string,
@@ -236,7 +238,7 @@ function bootKernelCmdline(
     "rd.overlay=1",
     "ip=dhcp",
     "rd.neednet=1",
-    // The HTTP base (for the offload flow to fetch the loaders) + the WS agent URL (for the agent).
+    // The HTTP base (for the box's own depot fetches — installer, update poll) + the WS agent URL.
     `polyptic.base=${httpBase}`,
     `polyptic.server_url=${toWsAgentUrl(httpBase)}`,
     // POL-171 — WHICH chain produced this boot. This menu is only ever reached over the wired chain
@@ -280,8 +282,7 @@ function bootKernelCmdline(
  * `base`, baking in the WS agent URL and, in GATED mode, the current enrolment token (POL-33/D47). The
  * box has no operator session at boot, so the route is ungated; a leaked token cannot self-admit (a NEW
  * machine still lands PENDING for an operator to approve, see enroll.ts case 1). `$grub_cpu` selects
- * amd64/arm64 at boot so one menu serves both arches. The `--id offload` entry tags the cmdline so the
- * live image writes the signed loaders to the box's ESP once, then boots the same flow forever. The
+ * amd64/arm64 at boot so one menu serves both arches. The
  * `--id debug` entry is the live boot plus `systemd.debug-shell=1` — a passwordless root shell on tty9
  * (Ctrl+Alt+F9), the ONLY interactive access a sealed kiosk image has (no passwords, no SSH). A menu
  * item because hand-appending it in GRUB's editor (a wrapped multi-line `linux` line, a 5-second
@@ -292,11 +293,14 @@ function bootKernelCmdline(
  * commands are plain `linux`/`initrd` (noble's signed GRUB has no linuxefi). When the computed base is
  * https, http is emitted anyway: GRUB has no TLS, the boot depot is plain-HTTP by contract.
  *
- * The menu is FLAT: three sibling entries, no submenu. A confirmation submenu was tried (POL-58) and
+ * The menu is FLAT: sibling entries, no submenu. A confirmation submenu was tried (POL-58) and
  * reverted — it broke the very entry it guarded (see the `export` note below), and the reassurance it
  * carried belongs in the console, where the operator reads it before walking to the box, not in a GRUB
- * menu they are trying to get past. Offload is non-destructive by construction; nothing here needs a
- * safety interlock.
+ * menu they are trying to get past.
+ *
+ * POL-176 retired the OFFLOAD entry (the bootloader-to-ESP flow): the way a box stops needing the
+ * network at boot is now a full install to its internal disk, armed from the CONSOLE (an explicit
+ * destructive confirm that names the disk), never from a boot menu a passer-by can drive.
  *
  * The menu is also GRAPHICAL (POL-47/D65): see ./boot-theme.ts. Titles and the one line each entry
  * echoes are written for whoever walks past the wall, not for whoever built the boot chain — this
@@ -342,11 +346,6 @@ export function buildBootGrubCfg(base: string, token: string | undefined, ntpHos
     'menuentry "Polyptic" --id live {',
     '  echo "Starting Polyptic - downloading the operating system ..."',
     `  linux  $net/dist/image/$arch/vmlinuz ${cmdline}`,
-    "  initrd $net/dist/image/$arch/initrd",
-    "}",
-    'menuentry "Set up this screen to start without the USB stick" --id offload {',
-    '  echo "Setting up this screen ..."',
-    `  linux  $net/dist/image/$arch/vmlinuz ${cmdline} polyptic.offload=1`,
     "  initrd $net/dist/image/$arch/initrd",
     "}",
     // The one entry whose line may stay technical: nobody reads it unless they chose it deliberately,
@@ -396,8 +395,31 @@ function reporterName(machineId: string): string {
 export function bootReportLine(report: BootReport): { severity: "info" | "good" | "warn" | "bad"; text: string } {
   const who = reporterName(report.machineId);
   const detail = report.detail.trim();
+  // POL-176 — `installed` is the root installer's success verdict: the OS is on the internal disk
+  // (A/B slots + loader + boot entry, verified). Pre-POL-176 offload media reported the same code
+  // for a bootloader-only install; the box's own `detail` sentence carries the specifics either way.
   if (report.ok && report.code === "installed") {
-    return { severity: "good", text: `${who} installed the Polyptic bootloader${detail ? `: ${detail}` : ""}` };
+    return { severity: "good", text: `${who} installed Polyptic to disk${detail ? `: ${detail}` : ""}` };
+  }
+  // POL-176 — a disk boot is an installed box's normal path. The route treats it as state-only and
+  // never feeds this line; the sentence exists so an unexpected arrival still renders honestly.
+  if (report.code === "disk-boot") {
+    return { severity: "info", text: `${who} booted from its internal disk${detail ? `: ${detail}` : ""}` };
+  }
+  // POL-176 — the installer's failure verdicts. `install-write-failed` may leave a part-written
+  // disk; the other two wrote nothing. All are `bad`: the operator explicitly armed this install
+  // and it did not happen, so the feed must say so in install-to-disk words, not bootloader ones.
+  if (
+    report.code === "install-bad-target" ||
+    report.code === "install-disk-too-small" ||
+    report.code === "install-write-failed" ||
+    report.code === "install-no-tools" ||
+    report.code === "install-no-image"
+  ) {
+    return {
+      severity: "bad",
+      text: `${who} could not install Polyptic to disk (${report.code})${detail ? `: ${detail}` : ""}`,
+    };
   }
   // POL-116: the box IS up — it just healed a pin retention had pruned and streamed the ACTIVE image
   // instead of the one its medium named. `warn`, not `bad`: nothing is broken, but the operator must
@@ -532,7 +554,7 @@ const GRUB_FETCHED_IMAGE_FILES = new Set(["vmlinuz", "initrd"]);
 /** The boot-depot files the FIRMWARE fetches (UEFI HTTP Boot: shim by Boot URI, then GRUB by name
  *  via shim) — 1–2 MB each, and that fetcher needs a real Content-Length, so they buffer. The
  *  dongle `polyptic-boot.img` is deliberately NOT here: nothing in the boot chain ever fetches it
- *  (it IS the boot chain) — only browsers (the console download) and the offload's curl do, both
+ *  (it IS the boot chain) — only browsers (the console download) and box-side curl do, both
  *  chunked-capable — and POL-63's local payload grew it from 64 MiB to ~490 MB, so buffering it
  *  OOM-killed a 512Mi pod the first time an operator clicked "Download bootloader" (fpd-ago,
  *  2026-07-11, POL-73). */
@@ -884,7 +906,11 @@ export function registerProvisionRoutes(
     if (bootPath && parsed.data.machineId) {
       await noteBootPath?.(parsed.data.machineId, bootPath, parsed.data.detail);
     }
-    const stateOnly = parsed.data.code === "wired-boot" || parsed.data.code === "local-boot-wifi";
+    const stateOnly =
+      parsed.data.code === "wired-boot" ||
+      parsed.data.code === "local-boot-wifi" ||
+      // POL-176 — a disk boot is an installed box's NORMAL path: state-only, no feed metronome.
+      parsed.data.code === "disk-boot";
 
     const { severity, text } = bootReportLine(parsed.data);
     fastify.log.info({ event: "boot.report", code: parsed.data.code, ok: parsed.data.ok }, text);
@@ -975,7 +1001,7 @@ export function registerProvisionRoutes(
   // ── GET /dist/boot/:file, UNGATED download of the boot depot: the universal dd-able dongle
   //    (polyptic-boot.img) + the four signed loaders (shim*/grub*.efi). Tokenless (they only chain
   //    /boot/grub.cfg), so, like /dist/agent, it's ungated: UEFI HTTP Boot, DHCP option-67 and the
-  //    offload flow all fetch with no session. 404 when not bundled. ──
+  //    disk installer all fetch with no session. 404 when not bundled. ──
   fastify.get("/dist/boot/:file", async (request, reply) => {
     const file = (request.params as { file?: string }).file ?? "";
     if (!BOOT_FILE_RE.test(file)) return reply.code(404).send({ error: "unknown boot file" });
@@ -1081,7 +1107,7 @@ export async function provisionBootSummary(config: ProvisionConfig): Promise<{
       resolveBootMedium(config.bootDistDir).then((m): "none" | "lean" | "full" =>
         m === null ? "none" : m.lean ? "lean" : "full",
       ),
-      // Serving UEFI HTTP Boot / offload needs ALL FOUR loaders (shim + network GRUB, both arches).
+      // Serving UEFI HTTP Boot / the disk installer needs ALL FOUR loaders (shim + GRUB, both arches).
       Promise.all(
         SIGNED_LOADER_FILES.map((f) => isFile(resolve(config.bootDistDir, f))),
       ).then((present) => present.every(Boolean)),

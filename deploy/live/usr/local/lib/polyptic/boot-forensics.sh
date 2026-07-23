@@ -3,7 +3,7 @@
 # (POL-171). The 2026-07-21 field failure was invisible for a day because the only record of WHICH
 # chain booted the box was /proc/cmdline on a box nobody could reach; this file is the record anyone
 # holding the stick can read: boot path, redacted cmdline, image id, which interface got the default
-# route, and (appended later by offload.sh) the offload verdict.
+# route, and (appended later by install-to-disk.sh, POL-176) the install verdict.
 #
 #   usage: boot-forensics.sh <medium-mount-dir>
 #

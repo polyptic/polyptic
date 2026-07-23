@@ -31,6 +31,8 @@ import { join } from "node:path";
 
 import type { BrowserVitals, MachineVitals } from "@polyptic/protocol";
 
+import { UPDATE_STATE_PATH, readStagedImageId } from "./install";
+
 /** What one supervised browser looks like to the sampler (see SupervisedBrowser). */
 export interface BrowserProbe {
   connector: string;
@@ -46,6 +48,10 @@ export interface VitalsSamplerOptions {
   sysRoot?: string;
   /** Where the live image stamps the id it booted (`build-live-image.sh`). */
   imageIdPath?: string;
+  /** POL-176 — where the root update poll records running vs staged image ids on an installed box.
+   *  Re-read EVERY sample (unlike the immutable booted id): staging happens at runtime, and the
+   *  "update ready — reboot to apply" badge should appear the heartbeat after the download lands. */
+  updateStatePath?: string;
   /** POL-148 — systemd-timesyncd's runtime directory. It exists whenever timesyncd has run this
    *  boot (RuntimeDirectory=systemd/timesync), and gains a `synchronized` file on first sync. We use
    *  the pair to distinguish "no time client to ask" (dir absent → omit) from "running, not yet
@@ -202,6 +208,7 @@ export class VitalsSampler {
   private readonly procRoot: string;
   private readonly sysRoot: string;
   private readonly imageIdPath: string;
+  private readonly updateStatePath: string;
   private readonly timesyncRunDir: string;
   private readonly rootPath: string;
   private readonly statfs: (path: string) => { totalBytes: number; usedBytes: number } | null;
@@ -216,6 +223,7 @@ export class VitalsSampler {
     this.procRoot = opts.procRoot ?? "/proc";
     this.sysRoot = opts.sysRoot ?? "/sys";
     this.imageIdPath = opts.imageIdPath ?? "/etc/polyptic/image-id";
+    this.updateStatePath = opts.updateStatePath ?? UPDATE_STATE_PATH;
     this.timesyncRunDir = opts.timesyncRunDir ?? "/run/systemd/timesync";
     this.rootPath = opts.rootPath ?? "/";
     this.statfs = opts.statfs ?? defaultStatfs;
@@ -282,6 +290,11 @@ export class VitalsSampler {
 
     const imageId = await this.readImageId();
     if (imageId) vitals.imageId = imageId;
+
+    // POL-176 — the staged (inactive-slot) image id, reported verbatim beside the running one so
+    // the console can wear "update ready — reboot to apply". Absent file → absent field.
+    const staged = await readStagedImageId(this.updateStatePath);
+    if (staged !== undefined) vitals.stagedImageId = staged;
 
     const clockSynced = await this.clockSynced();
     if (clockSynced !== undefined) vitals.clockSynced = clockSynced;

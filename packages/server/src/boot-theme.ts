@@ -185,10 +185,10 @@ export function buildBootThemeTxt(): string {
   // a fourth before GRUB would need a scrollbar.
   //
   // GRUB left-aligns menu items inside their box and CLIPS what overflows, so the box has to fit the
-  // longest title — measured, not computed: 400px cut "…without the USB st|ick" off, so Unifont's
-  // effective advance here is ~9px, not the 8px a half-width cell suggests. 448px clears the 48-char
-  // offload title with headroom. Wider than that and the (left-aligned) menu visibly drifts left of
-  // the lockup it sits under.
+  // longest title — measured, not computed: 400px cut the retired 48-char offload title off, so
+  // Unifont's effective advance here is ~9px, not the 8px a half-width cell suggests. 448px cleared
+  // it with headroom and stays (POL-176 removed that entry; the width is harmless and re-measuring
+  // buys nothing). Wider than that and the (left-aligned) menu visibly drifts left of the lockup.
   const menuWidth = 448;
   return `# Polyptic boot theme (POL-47), served by the control plane at /boot/theme.txt.
 # GRUB draws this while it fetches the kernel; the Plymouth splash takes over from the same dark.

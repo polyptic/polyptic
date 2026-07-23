@@ -30,7 +30,6 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const read = (...p: string[]): string => readFileSync(resolve(repoRoot, ...p), "utf8");
 
 const DONGLE_TMPL = read("deploy", "dongle-grub.cfg.tmpl");
-const OFFLOAD_SH = read("deploy", "live", "usr", "local", "lib", "polyptic", "offload.sh");
 
 describe("buildBootThemeTxt — the theme GRUB draws", () => {
   const theme = buildBootThemeTxt();
@@ -173,13 +172,24 @@ describe("the stage-1 config (boot medium + offloaded ESP)", () => {
     expect(DONGLE_TMPL).toContain(bootGfxPreamble().join("\n"));
   });
 
-  test("offload.sh writes the SAME stage-1 config, plus only its ownership marker", () => {
-    // The offloaded box boots the identical chain; it just carries the loaders itself. A box has no
-    // copy of the repo, so offload.sh embeds the template as a heredoc — which can rot silently.
-    const heredoc = OFFLOAD_SH.split("<<'EOF'\n")[1]?.split("\nEOF\n")[0];
-    expect(heredoc).toBeDefined();
-    const withoutMarker = `${heredoc as string}\n`.replace(/^# polyptic-offload\n/, "");
-    expect(withoutMarker).toBe(DONGLE_TMPL);
+  test("render-disk-grub.sh's netboot recovery entry carries the template's wired walk verbatim (POL-176)", () => {
+    // The offload heredoc copy is retired with the offload itself (POL-176); the one remaining
+    // duplicate of the stage-1 wired walk lives in the installed box's disk GRUB config, where the
+    // `netboot` fallback entry replays it before chaining the server's menu. Same rot risk, same
+    // seam: the span from `set nic_ip=` through the chain must match the template byte for byte.
+    // (The fuller off-box suite is deploy/live/test/render-disk-grub.test.sh.)
+    const render = spawnSync(
+      "sh",
+      [resolve(repoRoot, "deploy/live/usr/local/lib/polyptic/render-disk-grub.sh"),
+        "amd64", "a", "10.0.0.5:8080", "20260101T000000Z-abcd1234", "tok"],
+      { encoding: "utf8" },
+    );
+    expect(render.status).toBe(0);
+    const walkStart = DONGLE_TMPL.indexOf("set nic_ip=");
+    const walkEnd = DONGLE_TMPL.indexOf("configfile $net/boot/grub.cfg");
+    expect(walkStart).toBeGreaterThan(-1);
+    const walk = DONGLE_TMPL.slice(walkStart, walkEnd + "configfile $net/boot/grub.cfg".length);
+    expect(render.stdout).toContain(walk);
   });
 
   test("speaks plain English up front and keeps the diagnostics for the failure path", () => {

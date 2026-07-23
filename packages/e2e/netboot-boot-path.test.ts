@@ -54,18 +54,21 @@ describe("every boot is tagged with the chain that produced it", () => {
 
   test("the codes and the machine states are the same closed sets", () => {
     // The shell script, the protocol enum and the server's code→path map must agree; the protocol
-    // is the source of truth, so the script's literals are pinned against it.
-    for (const code of ["local-fallback-boot", "local-boot-wifi", "wired-boot"] as const) {
+    // is the source of truth, so the script's literals are pinned against it. `disk-boot` is
+    // POL-176's addition: an installed box tagging its own normal path.
+    for (const code of ["local-fallback-boot", "local-boot-wifi", "wired-boot", "disk-boot"] as const) {
       expect(BootReportCode.options).toContain(code);
       expect(liveLib("boot-path.sh")).toContain(code);
     }
-    expect(MachineBootPath.options).toEqual(["wired", "local-fallback", "local-wifi"]);
+    expect(MachineBootPath.options).toEqual(["wired", "local-fallback", "local-wifi", "disk"]);
   });
 
-  test("the boot-path unit runs after the network, before offload and the kiosk", () => {
+  test("the boot-path unit runs after the network, before the kiosk", () => {
     const unit = read("deploy", "live", "etc", "systemd", "system", "polyptic-boot-path.service");
     expect(unit).toContain("After=network-online.target");
-    expect(unit).toContain("Before=polyptic-offload.service greetd.service");
+    // POL-176 retired the offload unit; the installer runs off a path unit mid-session, so the
+    // only ordering that still matters here is beating the kiosk to the glass.
+    expect(unit).toContain("Before=greetd.service");
     expect(unit).toContain("ExecStart=/usr/local/lib/polyptic/boot-path.sh");
     // …and the image build enables it, or none of this exists on a real box.
     expect(read("deploy", "build-live-image.sh")).toContain("polyptic-boot-path.service");
@@ -81,12 +84,12 @@ describe("the forensics writer never leaks a secret", () => {
     expect(forensics).not.toMatch(/(cat|sed|grep|head|tail|cp|<)[^\n]*wifi\.conf/);
   });
 
-  test("offload.sh appends its verdict to THIS boot's log via the recorded path", () => {
-    const offload = liveLib("offload.sh");
-    expect(offload).toContain("append_forensics");
-    expect(offload).toContain('_ff="$RUN_DIR/forensics-file"');
-    // The append rides report(), so every outcome — success and every fail() — lands on the medium.
-    const reportFn = offload.slice(offload.indexOf("report() {"), offload.indexOf("hold_failure()"));
-    expect(reportFn).toContain("append_forensics");
+  test("install-to-disk.sh appends its verdict to THIS boot's log via the recorded path (POL-176)", () => {
+    const installer = liveLib("install-to-disk.sh");
+    expect(installer).toContain("append_forensics");
+    expect(installer).toContain('_ff="$RUN_DIR/forensics-file"');
+    // The append rides report(), so every outcome — success and every failure — lands on the medium.
+    const reportFn = installer.slice(installer.indexOf("report() {"));
+    expect(reportFn.slice(0, reportFn.indexOf("}"))).toContain("append_forensics");
   });
 });

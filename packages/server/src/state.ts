@@ -49,7 +49,7 @@ import {
   packRects,
   rectsAreAdjacent,
 } from "@polyptic/protocol";
-import type { MachineBootPath, Rect } from "@polyptic/protocol";
+import type { BootMode, MachineBootPath, MachineDisk, Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
   CreateDaypartBody,
@@ -296,6 +296,13 @@ export interface RegisterMachineInput {
   /** POL-105 — the OS image the box BOOTED (`/etc/polyptic/image-id`). Absent on a dev box (no live
    *  image) and on any pre-POL-105 agent; an absent value never ERASES the id we already knew. */
   imageId?: string;
+  /** POL-176 — live vs installed, as the agent read its own kernel cmdline. Absent on a dev box and
+   *  any pre-POL-176 agent; an absent value never erases the mode we already knew. */
+  bootMode?: BootMode;
+  /** POL-176 — the disk inventory the box reported (`lsblk`), for the console's INSTALL dialog. */
+  disks?: MachineDisk[];
+  /** POL-176 — the image id staged to the box's inactive slot, verbatim. */
+  stagedImageId?: string;
   /** POL-104 — what the box IS (MACs / DMI serial / arch). Persisted, so a pending card is informative
    *  even while the box is offline. A hello that carries none NEVER blanks what we already know. */
   hardware?: HostIdentity;
@@ -639,6 +646,11 @@ export class ControlPlane {
       bootPath: machine.bootPath,
       bootPathAt: machine.bootPathAt,
       bootPathDetail: machine.bootPathDetail,
+      bootMode: machine.bootMode,
+      bootModeAt: machine.bootModeAt,
+      disks: machine.disks,
+      stagedImageId: machine.stagedImageId,
+      stagedImageIdAt: machine.stagedImageIdAt,
       hardware: machine.hardware,
       enrolledTokenId: machine.enrolledTokenId,
       enrolledTokenName: machine.enrolledTokenName,
@@ -678,6 +690,12 @@ export class ControlPlane {
         bootPath: m.bootPath,
         bootPathAt: m.bootPathAt,
         bootPathDetail: m.bootPathDetail,
+        // POL-176 — live vs installed, the disk inventory, and any staged image.
+        bootMode: m.bootMode,
+        bootModeAt: m.bootModeAt,
+        disks: m.disks,
+        stagedImageId: m.stagedImageId,
+        stagedImageIdAt: m.stagedImageIdAt,
         hardware: m.hardware,
         enrolledTokenId: m.enrolledTokenId,
         enrolledTokenName: m.enrolledTokenName,
@@ -1221,6 +1239,14 @@ export class ControlPlane {
       bootPath: existing?.bootPath,
       bootPathAt: existing?.bootPathAt,
       bootPathDetail: existing?.bootPathDetail,
+      // POL-176 — live vs installed + the disk inventory + the staged image, as the agent reported
+      // on THIS hello. Same absence rule as imageId: a hello that carries none (dev box, older
+      // agent, a probe that failed this boot) keeps whatever we last knew.
+      bootMode: input.bootMode ?? existing?.bootMode,
+      bootModeAt: input.bootMode ? new Date().toISOString() : existing?.bootModeAt,
+      disks: input.disks ?? existing?.disks,
+      stagedImageId: input.stagedImageId ?? existing?.stagedImageId,
+      stagedImageIdAt: input.stagedImageId ? new Date().toISOString() : existing?.stagedImageIdAt,
       // POL-104: never blank what we already know. An agent too old to report hardware (or one that
       // could not read its own DMI this boot) must not erase the card an operator relies on. And a
       // machine's enrolment provenance is written ONCE, at first enrolment — a later token re-enrol
@@ -1278,6 +1304,14 @@ export class ControlPlane {
       bootPath: existing?.bootPath,
       bootPathAt: existing?.bootPathAt,
       bootPathDetail: existing?.bootPathDetail,
+      // POL-176 — live vs installed + the disk inventory + the staged image, as the agent reported
+      // on THIS hello. Same absence rule as imageId: a hello that carries none (dev box, older
+      // agent, a probe that failed this boot) keeps whatever we last knew.
+      bootMode: input.bootMode ?? existing?.bootMode,
+      bootModeAt: input.bootMode ? new Date().toISOString() : existing?.bootModeAt,
+      disks: input.disks ?? existing?.disks,
+      stagedImageId: input.stagedImageId ?? existing?.stagedImageId,
+      stagedImageIdAt: input.stagedImageId ? new Date().toISOString() : existing?.stagedImageIdAt,
       hardware: input.hardware ?? existing?.hardware,
       enrolledTokenId: existing?.enrolledTokenId ?? input.enrolledTokenId,
       enrolledTokenName: existing?.enrolledTokenName ?? input.enrolledTokenName,
@@ -1512,6 +1546,31 @@ export class ControlPlane {
   }
 
   /**
+   * POL-176 — record the image a box's root update poll has STAGED to its inactive slot, carried in
+   * every heartbeat's vitals (staging happens at runtime, so the hello alone would miss it). Same
+   * change-detection contract as {@link noteMachineImage}: an unchanged id (which arrives every few
+   * seconds) is silent and never churns the store; a CHANGE that differs from the RUNNING image is
+   * the "update ready — reboot to apply" moment, and worth one feed line. Returns true on change.
+   */
+  async noteMachineStagedImage(machineId: string, stagedImageId: string): Promise<boolean> {
+    const machine = this.machines.get(machineId);
+    if (!machine || stagedImageId.trim() === "") return false;
+    const next = stagedImageId.trim();
+    if (machine.stagedImageId === next) return false;
+
+    const at = new Date().toISOString();
+    machine.stagedImageId = next;
+    machine.stagedImageIdAt = at;
+    await this.store.setMachineStagedImage(machineId, next, at);
+
+    // Staged == running is the steady state after a reboot applied the update — not news.
+    if (machine.imageId !== next) {
+      this.emit("info", `${machine.label} staged image ${next} — it applies on the next reboot`);
+    }
+    return true;
+  }
+
+  /**
    * POL-171 — record WHICH boot chain a box came up through, from its once-per-boot `/boot/report`.
    * Persisted, like `noteMachineImage`: a box on the local fallback mis-boots on every power-cycle
    * until its wired chain is fixed, and the Machines card must wear the state while it is offline.
@@ -1535,6 +1594,11 @@ export class ControlPlane {
 
     if (previous === "local-fallback" && path === "wired") {
       this.emit("good", `${machine.label} is back on the wired boot chain`);
+    }
+    // POL-176 — a disk boot closes the fallback story just as decisively: an installed box never
+    // touches the wired chain again, so the "rebuilds are not reaching this box" warning is over.
+    if (previous === "local-fallback" && path === "disk") {
+      this.emit("good", `${machine.label} now boots from its internal disk`);
     }
     return true;
   }

@@ -6,8 +6,10 @@
 # time its firmware is touched.
 #
 # The box that is UP is the only thing in a position to notice, because it can read its own NVRAM. So
-# on every update poll (5 minutes) this script compares the firmware's BootOrder against the entry the
-# offload (POL-33/D47/POL-58) installed, and:
+# on every update poll (5 minutes) this script compares the firmware's BootOrder against the entry
+# WE installed — `Polyptic` from install-to-disk.sh (POL-176), or `Polyptic Netboot` from the
+# retired offload flow, which fielded boxes keep until they install (both labels watched, disk
+# preferred) — and:
 #
 #   in the DEFAULT posture (report-only)     — writes NOTHING, and reports the drift, so the operator
 #                                              sees "this box will boot something else next time" in
@@ -24,8 +26,8 @@
 #   * NOTHING is written unless the control plane says the operator opted in. Unreachable server,
 #     401, malformed answer, no answer → report-only. Firmware writes cannot happen by default,
 #     by omission, or by a control plane going away.
-#   * We only ever act on an entry WE created (exact label match). A box that was never offloaded has
-#     no such entry, so this script does nothing at all on it.
+#   * We only ever act on an entry WE created (exact label match). A box that was never installed or
+#     offloaded has no such entry, so this script does nothing at all on it.
 #   * We never CREATE and never DELETE a boot entry. The only writes are `-o` (reorder) and `-a`
 #     (activate OUR entry). Entries we did not add are never removed and never reordered relative to
 #     each other — they keep their existing sequence, behind ours.
@@ -44,10 +46,15 @@
 # POLYPTIC_LIB_DIR, POLYPTIC_BOOT_ORDER_STATE; efibootmgr + curl come from PATH.
 set -u
 
-# The UEFI entry the offload installs. MUST stay identical to offload.sh's LABEL — it is the only
-# thing that tells our entry apart from the firmware's own, and it is what we match to know that this
-# box's boot path is ours to keep healthy.
-LABEL="Polyptic Netboot"
+# The UEFI entries we own — TWO labels since POL-176. `Polyptic` is what install-to-disk.sh
+# registers on an installed box (MUST stay identical to its LABEL); `Polyptic Netboot` is the
+# retired offload flow's entry, which fielded offloaded boxes keep until they install. The label is
+# the only thing that tells our entries apart from the firmware's own, and a box carrying BOTH (an
+# install pruned the old entry, but firmware NVRAM has lied before — D60) is watched by the disk
+# entry: the install is the newer intent. $LABEL is resolved below to whichever entry this box has.
+LABEL_DISK="Polyptic"
+LABEL_LEGACY="Polyptic Netboot"
+LABEL="$LABEL_DISK"
 
 CMDLINE_FILE="${POLYPTIC_CMDLINE_FILE:-/proc/cmdline}"
 EFI_DIR="${POLYPTIC_EFI_DIR:-/sys/firmware/efi}"
@@ -76,10 +83,18 @@ token=""
 
 nvram() { efibootmgr 2>/dev/null; }
 
-# The boot numbers whose label is exactly ours (there should be one; a re-offloaded box can briefly
-# have more, and we lead with the first).
+# The boot numbers whose label is exactly $1 (there should be one; a re-installed box can briefly
+# have more, and we lead with the first). The end anchor is what keeps `Polyptic` from matching
+# `Polyptic Netboot`: only trailing whitespace may follow the label.
+entries_for() {
+  nvram | sed -n "s/^Boot\([0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]\)[* ] $1[	 ]*\$/\1/p"
+}
+# Ours = the disk entry when the box has one (installed, the newer intent), else the legacy netboot
+# entry (the fielded offloaded fleet). $LABEL follows the choice so every sentence below names the
+# entry this box actually has.
 our_entries() {
-  nvram | sed -n "s/^Boot\([0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]\)[* ] $LABEL[	 ]*\$/\1/p"
+  _disk="$(entries_for "$LABEL_DISK")"
+  if [ -n "$_disk" ]; then printf '%s\n' "$_disk"; else entries_for "$LABEL_LEGACY"; fi
 }
 
 # The comma-separated BootOrder, exactly as the firmware holds it.
@@ -138,10 +153,12 @@ command -v efibootmgr >/dev/null 2>&1 || exit 0          # nothing to read NVRAM
 nvram >/dev/null 2>&1 || exit 0                          # efivars unreadable (locked-down firmware)
 
 entry="$(our_entries | head -n1)"
-# No entry of ours == this box was never offloaded (it boots from the USB medium, or from the server's
-# menu). There is no boot path of ours to keep healthy, and inventing one is exactly the kind of write
-# that could strand a box. Do nothing, say nothing.
+# No entry of ours == this box was never installed or offloaded (it boots from the USB medium, or
+# from the server's menu). There is no boot path of ours to keep healthy, and inventing one is
+# exactly the kind of write that could strand a box. Do nothing, say nothing.
 [ -n "$entry" ] || exit 0
+# Which label did we actually match? Every reported sentence names it.
+if [ -n "$(entries_for "$LABEL_DISK" | head -n1)" ]; then LABEL="$LABEL_DISK"; else LABEL="$LABEL_LEGACY"; fi
 
 order="$(boot_order)"
 first="$(printf '%s' "$order" | cut -d, -f1)"

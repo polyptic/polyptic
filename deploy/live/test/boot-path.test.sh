@@ -159,6 +159,21 @@ run_boot_path "$d" >/dev/null
 has "wired: posts wired-boot"              '"code":"wired-boot"' "$(posted "$d")"
 has "wired: reports ok"                    '"ok":true' "$(posted "$d")"
 
+# ─── 3b) An INSTALLED box (POL-176): disk-boot is the quiet all-clear ───────────────────────────────
+# `polyptic.bootpath=disk` comes off render-disk-grub's cmdline. State-only: ok:true, empty detail,
+# nothing on the console — the new normal must be as silent as a clean wired boot.
+d="$(new_case disk-clean disk)"; : > "$d/console"
+sed 's|root=live:http://10.0.0.10/dist/image/amd64/builds/20260721T120000Z-abcd1234/rootfs.squashfs|root=live:LABEL=POLYPTIC-A|' "$d/cmdline" > "$d/cmdline.new"
+mv "$d/cmdline.new" "$d/cmdline"
+run_boot_path "$d" >/dev/null
+has "disk: posts disk-boot"                '"code":"disk-boot"' "$(posted "$d")"
+has "disk: reports ok (self-clears a fallback flag)" '"ok":true' "$(posted "$d")"
+has "disk: detail is empty"                '"detail":""' "$(posted "$d")"
+hasnt "disk: never the fallback code"      'local-fallback-boot' "$(posted "$d")"
+hasnt "disk: nothing alarming on the console" 'fallback' "$(cat "$d/console" 2>/dev/null)"
+# …and the forensics log still lands on the medium (the ESP, on an installed box).
+has "disk: forensics records the path"     'boot path:   disk' "$(logtext "$d")"
+
 # ─── 4) No marker = a pre-POL-171 medium: report nothing, forensics still written ───────────────────
 d="$(new_case unmarked -)"
 run_boot_path "$d" >/dev/null
