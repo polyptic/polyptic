@@ -86,6 +86,7 @@ import {
 } from "./mtls";
 import type { MtlsBundleFile } from "./mtls";
 import { rebootHost } from "./host";
+import { applySshArm } from "./ssh";
 import { ShellManager } from "./shell";
 import { diffWindows } from "./windows";
 import type { PlacedWindow } from "./windows";
@@ -178,6 +179,7 @@ type ShellOpenMsg = Extract<ServerToAgentMessage, { t: "server/shell-open" }>;
 type ShellDataMsg = Extract<ServerToAgentMessage, { t: "server/shell-data" }>;
 type ShellResizeMsg = Extract<ServerToAgentMessage, { t: "server/shell-resize" }>;
 type ShellCloseMsg = Extract<ServerToAgentMessage, { t: "server/shell-close" }>;
+type SshArmMsg = Extract<ServerToAgentMessage, { t: "server/ssh-arm" }>;
 type DevtoolsRequestMsg = Extract<ServerToAgentMessage, { t: "server/devtools-request" }>;
 type UpdateAvailableMsg = Extract<ServerToAgentMessage, { t: "server/update-available" }>;
 
@@ -469,6 +471,9 @@ class Agent {
       case "server/shell-close":
         this.shellMgr().close(msg.sessionId, msg.reason);
         break;
+      case "server/ssh-arm":
+        await this.onSshArm(msg);
+        break;
       case "server/devtools-request":
         await this.onDevtoolsRequest(msg);
         break;
@@ -670,6 +675,33 @@ class Agent {
     });
     if (outcome.accepted) log(`rebooting: ${outcome.reason}`);
     else logError(`refused to reboot: ${outcome.reason}`);
+  }
+
+  /**
+   * `server/ssh-arm` — arm or disarm operator SSH on this box (POL-81). Like reboot, the agent is
+   * unprivileged: it hands the request to a root-owned helper (see ./ssh.ts) and reports what actually
+   * happened back over `agent/ssh-status` — the box's own truth about whether sshd came up, so the
+   * console shows real connection details and a refusal (dev backend, no helper) is never silent.
+   */
+  private async onSshArm(msg: SshArmMsg): Promise<void> {
+    log(`server/ssh-arm received — ${msg.enabled ? "arm" : "disarm"}`);
+    const status = await applySshArm(this.backend.id, {
+      enabled: msg.enabled,
+      publicKey: msg.publicKey,
+      debugUser: msg.debugUser,
+      port: msg.port,
+      ttlMs: msg.ttlMs,
+    });
+    this.send({ t: "agent/ssh-status", machineId: this.machineId, ...status });
+    if (status.armed && status.listening) {
+      log(`ssh armed: ${status.user}@${status.host ?? "?"}:${status.port ?? "?"}`);
+    } else if (status.armed) {
+      logError(`ssh arm did not open sshd: ${status.reason ?? "unknown"}`);
+    } else if (msg.enabled) {
+      logError(`ssh arm refused: ${status.reason ?? "unknown"}`);
+    } else {
+      log("ssh disarmed");
+    }
   }
 
   /**
