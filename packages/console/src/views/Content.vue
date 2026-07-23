@@ -14,16 +14,28 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
 import { useRouter } from "vue-router";
-import { CreateContentSourceBody, CreateCredentialProfileBody } from "@polyptic/protocol";
+import {
+  CreateContentSourceBody,
+  CreateCredentialProfileBody,
+  composeSourceUrl,
+  extractGrafanaFlags,
+  gfDefaults,
+  parseAddress,
+} from "@polyptic/protocol";
 import type {
   ContentKind,
   ContentSource,
   CredentialProfileView,
+  GrafanaDisplay,
   PlacementMode,
+  SourceAuthMode,
+  SourceComposition,
+  SourceProto,
   UpdateCredentialProfileBody,
 } from "@polyptic/protocol";
 import { useConsoleStore } from "../stores/console";
 import { CONTENT_KINDS, kindGlyph, kindLabel, kindColorVar } from "../content";
+import { kindIcon } from "../kind-icons";
 import {
   defaultRefreshDraft,
   draftFromPolicy,
@@ -162,8 +174,21 @@ const modalOpen = ref(false);
 const editingId = ref<string | null>(null); // null = creating
 const draftName = ref("");
 const draftKind = ref<ContentKind>("web");
-const draftUrl = ref("");
-const draftProfileId = ref(""); // "" = no authentication (POL-24)
+// POL-175 — the structured address the dialog edits (the server composes the canonical url from
+// it). The operator never types a scheme: it lives in the protocol dropdown, and a pasted one is
+// stripped into it. `draftKeep` is the passthrough query fragment a paste carried — never edited,
+// never dropped.
+const draftProto = ref<SourceProto>("https");
+const draftAddress = ref("");
+const draftKeep = ref("");
+// POL-175 — the Grafana display controls (dashboard kind only); they compose Grafana's
+// kiosk/from/to/refresh/theme query flags.
+const draftGf = ref<GrafanaDisplay>(gfDefaults());
+// POL-175 — the simplified auth picker. `kiosk` is the one mode that stores a credential profile
+// (POL-24, token stamped at send time); the other two store none — `forward-auth` is recorded so
+// the dialog reopens saying what actually authenticates the content.
+const draftAuth = ref<SourceAuthMode>("none");
+const draftProfileId = ref(""); // "" = no profile picked yet (POL-24)
 const draftPlacement = ref<PlacementMode>("auto"); // POL-18 — display override (web/dashboard)
 // POL-157 — the reload cadence draft (web/dashboard only). The pure model lives in refresh-draft.ts.
 const deploymentTz = computed(() => store.scheduler?.timezone ?? "UTC");
@@ -194,21 +219,86 @@ const editingDeck = computed(() => editingId.value !== null && draftKind.value =
 /** POL-108 — a live stream is addressed by its HLS playlist. The placeholder says so, and the hint
  *  below the field names the RTSP seam explicitly (a restreamer sits OUTSIDE Polyptic, by design)
  *  without naming any product: the operator picks their own. */
-const urlPlaceholder = computed(() =>
-  draftKind.value === "stream" ? "https://…/stream.m3u8" : "https://…",
-);
+const addressPlaceholder = computed(() => {
+  if (draftKind.value === "stream") return "cameras.example.com/stream.m3u8";
+  if (draftKind.value === "dashboard") return "grafana.example.com/d/abc123/factory-overview";
+  return "example.com/page";
+});
 const isStream = computed(() => draftKind.value === "stream");
+const isDashboard = computed(() => draftKind.value === "dashboard");
 
 const modalTitle = computed(() =>
-  editingDeck.value ? "Rename deck" : editingId.value ? "Edit source" : "Add content source",
+  editingDeck.value ? "Rename deck" : editingId.value ? "Edit content source" : "Add content source",
 );
 const saveLabel = computed(() => (editingId.value ? "Save changes" : "Add source"));
+
+/**
+ * POL-175 — paste-to-import. Fold a pasted (or typed) address into the structured controls: the
+ * scheme moves into the protocol dropdown, the query splits into the Grafana controls (dashboard
+ * kind) plus a verbatim passthrough remainder, and — when ADDING — a URL that reads as a Grafana
+ * dashboard switches the type and suggests a name from the dashboard slug.
+ */
+function importAddress(raw: string): void {
+  const parsed = parseAddress(raw);
+  draftProto.value = parsed.proto;
+  if (editingId.value === null && parsed.grafana && draftKind.value !== "dashboard") {
+    draftKind.value = "dashboard";
+    if (!draftName.value.trim() && parsed.suggestedName) draftName.value = parsed.suggestedName;
+  }
+  if (parsed.pairs.length > 0) {
+    if (draftKind.value === "dashboard") {
+      const { gf, keep } = extractGrafanaFlags(parsed.pairs);
+      draftGf.value = gf;
+      draftKeep.value = keep;
+    } else {
+      draftKeep.value = parsed.pairs.join("&");
+    }
+  }
+  draftAddress.value = parsed.address;
+}
+
+/** A paste lands after the event — read the field on the next tick, then import the whole value. */
+function onAddressPaste(ev: ClipboardEvent): void {
+  const input = ev.target as HTMLInputElement;
+  setTimeout(() => importAddress(input.value), 0);
+}
+
+/** Typing rarely carries a scheme or query; when it does (a paste via context menu, a hand-typed
+ *  full URL), blur folds it into the controls the same way a paste does. */
+function onAddressBlur(): void {
+  const raw = draftAddress.value;
+  if (raw.includes("://") || raw.includes("?")) importAddress(raw);
+}
+
+/** The composition the current draft describes (what the server will compose + store the url from). */
+function draftComposition(): SourceComposition {
+  return {
+    proto: draftProto.value,
+    address: draftAddress.value.trim(),
+    ...(draftKeep.value ? { keep: draftKeep.value } : {}),
+    ...(isDashboard.value ? { gf: { ...draftGf.value } } : {}),
+    ...(authPickable.value ? { auth: draftAuth.value } : {}),
+  };
+}
+
+/** What each auth option actually does — shown under the picker. */
+const authHint = computed(() => {
+  if (draftAuth.value === "kiosk")
+    return "The server stamps a short-lived token from a credential profile into the address each time it is sent to a screen.";
+  if (draftAuth.value === "forward-auth")
+    return "A proxy in front of the content signs every request. Polyptic sends nothing.";
+  return "The page loads with no credentials.";
+});
 
 function openAdd() {
   editingId.value = null;
   draftName.value = "";
   draftKind.value = "web";
-  draftUrl.value = "";
+  draftProto.value = "https";
+  draftAddress.value = "";
+  draftKeep.value = "";
+  draftGf.value = gfDefaults();
+  draftAuth.value = "none";
   draftProfileId.value = "";
   draftPlacement.value = "auto";
   draftRefresh.value = defaultRefreshDraft(deploymentTz.value);
@@ -220,7 +310,29 @@ function openEdit(s: ContentSource) {
   editingId.value = s.id;
   draftName.value = s.name;
   draftKind.value = s.kind;
-  draftUrl.value = s.url ?? "";
+  if (s.composition) {
+    draftProto.value = s.composition.proto;
+    draftAddress.value = s.composition.address;
+    draftKeep.value = s.composition.keep ?? "";
+    draftGf.value = s.composition.gf ? { ...s.composition.gf } : gfDefaults();
+    draftAuth.value = s.composition.auth ?? (s.credentialProfileId ? "kiosk" : "none");
+  } else {
+    // A row from before POL-175 stores only the composed url — parse it back into the controls.
+    // Its query splits exactly like a paste, so saving recomposes the same address (the Grafana
+    // flags may re-order after the passthrough params; Grafana reads them positionlessly).
+    const parsed = parseAddress(s.url ?? "");
+    draftProto.value = parsed.proto;
+    draftAddress.value = parsed.address;
+    if (s.kind === "dashboard") {
+      const { gf, keep } = extractGrafanaFlags(parsed.pairs);
+      draftGf.value = gf;
+      draftKeep.value = keep;
+    } else {
+      draftGf.value = gfDefaults();
+      draftKeep.value = parsed.pairs.join("&");
+    }
+    draftAuth.value = s.credentialProfileId ? "kiosk" : "none";
+  }
   draftProfileId.value = s.credentialProfileId ?? "";
   draftPlacement.value = s.placementMode ?? "auto";
   draftRefresh.value = draftFromPolicy(s.refresh, deploymentTz.value);
@@ -266,12 +378,35 @@ async function save() {
     }
   }
 
+  // POL-175 — normalise once more before composing: a typed-but-never-blurred full URL still folds
+  // into the controls (scheme → dropdown, query → controls/keep) instead of shipping doubled.
+  if (draftAddress.value.includes("://") || draftAddress.value.includes("?")) {
+    importAddress(draftAddress.value);
+  }
+  if (!draftAddress.value.trim()) {
+    errorMsg.value = "Enter the address to load.";
+    return;
+  }
+  if (authPickable.value && draftAuth.value === "kiosk" && !draftProfileId.value) {
+    errorMsg.value =
+      "Kiosk sign-in needs a credential profile. Pick one, or add one under Access credentials below.";
+    return;
+  }
+  const composition = draftComposition();
+  try {
+    new URL(composeSourceUrl(composition));
+  } catch {
+    errorMsg.value = "The address does not form a valid URL.";
+    return;
+  }
+
   const parsed = CreateContentSourceBody.safeParse({
     name: draftName.value.trim(),
     kind: draftKind.value,
-    url: draftUrl.value.trim(),
-    // Auth only rides on browser-loaded kinds; "" (None) and a non-authable kind both mean detach.
-    credentialProfileId: authPickable.value && draftProfileId.value ? draftProfileId.value : null,
+    composition,
+    // Only kiosk sign-in stores a profile; None/forward-auth (and non-authable kinds) detach.
+    credentialProfileId:
+      authPickable.value && draftAuth.value === "kiosk" ? draftProfileId.value : null,
     // POL-18 — the display override, web/dashboard only. "auto" travels explicitly so an edit back
     // to auto actually clears a previously forced mode.
     ...(authPickable.value ? { placementMode: draftPlacement.value } : {}),
@@ -961,11 +1096,14 @@ function mediaFacts(s: ContentSource): string {
       </div>
     </div>
 
-    <!-- ── add / edit modal ─────────────────────────────────────────────────── -->
+    <!-- ── add / edit modal (POL-175: structured address + Grafana display controls) ──────────── -->
     <div v-if="modalOpen" class="scrim" @mousedown.self="closeModal">
-      <div class="modal" role="dialog" aria-modal="true">
-        <div class="modal-title">{{ modalTitle }}</div>
+      <div class="modal wide" role="dialog" aria-modal="true">
+        <div class="modal-head">
+          <div class="modal-title">{{ modalTitle }}</div>
+        </div>
 
+        <div class="modal-body">
         <label class="field-label">Name</label>
         <input
           v-model="draftName"
@@ -978,26 +1116,38 @@ function mediaFacts(s: ContentSource): string {
              Only its name (and, on the row, its per-page dwell) is the operator's. -->
         <template v-if="!editingDeck">
         <label class="field-label">Type</label>
-        <div class="type-row">
-          <button
-            v-for="k in CONTENT_KINDS"
-            :key="k"
-            class="type-btn"
-            :class="{ active: draftKind === k }"
-            @click="draftKind = k"
-          >
-            <span class="type-glyph" :style="{ color: `var(${kindColorVar(k)})` }">{{ kindGlyph(k) }}</span>
-            {{ kindLabel(k) }}
-          </button>
+        <div class="type-pick">
+          <span
+            class="icon-well"
+            :style="{ color: `var(${kindColorVar(draftKind)})` }"
+            v-html="kindIcon(draftKind) ?? ''"
+          ></span>
+          <select v-model="draftKind" class="field select type-select">
+            <option v-for="k in CONTENT_KINDS" :key="k" :value="k">{{ kindLabel(k) }}</option>
+          </select>
         </div>
 
+        <!-- POL-175 — protocol dropdown + scheme-less address. Pasting a full URL folds the scheme
+             into the dropdown and (for a Grafana dashboard) the query flags into the controls. -->
         <label class="field-label">Address</label>
-        <input
-          v-model="draftUrl"
-          class="field mono"
-          :placeholder="urlPlaceholder"
-          @keyup.enter="save"
-        />
+        <div class="addr-row">
+          <select v-model="draftProto" class="field select proto-select" aria-label="Protocol">
+            <option value="https">https://</option>
+            <option value="http">http://</option>
+          </select>
+          <input
+            v-model="draftAddress"
+            class="field mono addr-input"
+            :placeholder="addressPlaceholder"
+            @paste="onAddressPaste"
+            @blur="onAddressBlur"
+            @keyup.enter="save"
+          />
+        </div>
+        <p v-if="isDashboard" class="field-hint">
+          Paste the dashboard's full URL — the kiosk, time-range, refresh and theme flags land in
+          the controls below.
+        </p>
 
         <!-- POL-108 — the live-stream seam, stated plainly to the operator: HLS in, RTSP restreamed
              outside Polyptic. No product is named; any restreamer works. -->
@@ -1006,19 +1156,86 @@ function mediaFacts(s: ContentSource): string {
           source drops. RTSP cameras need an RTSP-to-HLS restreamer in front.
         </p>
 
+        <!-- POL-175 — the Grafana display card. These controls compose the query-string flags the
+             dashboard reads (kiosk / from+to / refresh / theme); anything else a paste carried
+             rides along verbatim. -->
+        <div v-if="isDashboard" class="gf-card">
+          <div class="gf-card-title">Grafana display</div>
+
+          <label class="gf-toggle">
+            <input v-model="draftGf.kiosk" type="checkbox" />
+            <span class="gf-toggle-name">Kiosk mode</span>
+            <span class="gf-toggle-note">hides Grafana's chrome — the wall shows only the panels</span>
+          </label>
+          <label class="gf-toggle" :class="{ off: !draftGf.kiosk }">
+            <input v-model="draftGf.picker" type="checkbox" :disabled="!draftGf.kiosk" />
+            <span class="gf-toggle-name">Date/time picker</span>
+            <span class="gf-toggle-note">keeps the time-range picker on screen</span>
+          </label>
+
+          <label class="field-label">Time range</label>
+          <select v-model="draftGf.range" class="field select">
+            <option value="inherit">Dashboard default</option>
+            <option value="custom">Custom range</option>
+          </select>
+          <template v-if="draftGf.range === 'custom'">
+            <div class="gf-range-row">
+              <input v-model="draftGf.from" class="field mono gf-range" placeholder="now-7d" />
+              <span class="gf-range-sep">to</span>
+              <input v-model="draftGf.to" class="field mono gf-range" placeholder="now" />
+            </div>
+            <p class="field-hint">
+              Grafana time syntax: <code>now-24h</code>, <code>now-7d</code>, or an absolute time.
+            </p>
+          </template>
+
+          <label class="field-label">Auto-refresh</label>
+          <select v-model="draftGf.refresh" class="field select">
+            <option value="default">Dashboard default</option>
+            <option value="30s">Every 30 seconds</option>
+            <option value="1m">Every minute</option>
+            <option value="5m">Every 5 minutes</option>
+            <option value="15m">Every 15 minutes</option>
+            <option value="1h">Every hour</option>
+          </select>
+
+          <label class="field-label">Theme</label>
+          <select v-model="draftGf.theme" class="field select">
+            <option value="default">Dashboard default</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+
+          <p v-if="draftKeep" class="field-hint gf-keep">
+            Other URL parameters ride along unchanged: <code>{{ draftKeep }}</code>
+          </p>
+        </div>
+
         </template>
 
-        <!-- POL-24 — the design's deferred "Authentication" picker. Web/dashboard only: images and
+        <!-- POL-24/POL-175 — authentication, simplified to what each choice actually does. Only
+             kiosk sign-in stores a credential profile; web/dashboard only, because images and
              videos are fetched directly by the player, not loaded as an authenticated page. -->
         <template v-if="authPickable && !editingDeck">
           <label class="field-label">Authentication</label>
-          <select v-model="draftProfileId" class="field select">
-            <option value="">None (public or anonymous access)</option>
-            <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+          <select v-model="draftAuth" class="field select">
+            <option value="none">None</option>
+            <option value="forward-auth">
+              {{ isDashboard ? "Grafana service account (forward-auth)" : "Forward-auth proxy" }}
+            </option>
+            <option value="kiosk">Kiosk sign-in</option>
           </select>
-          <p v-if="!profiles.length" class="field-hint">
-            Add a credential profile under Access credentials below, then pick it here.
-          </p>
+          <p class="field-hint">{{ authHint }}</p>
+
+          <template v-if="draftAuth === 'kiosk'">
+            <select v-model="draftProfileId" class="field select" aria-label="Credential profile">
+              <option value="" disabled>Pick a credential profile…</option>
+              <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+            </select>
+            <p v-if="!profiles.length" class="field-hint">
+              Add a credential profile under Access credentials below, then pick it here.
+            </p>
+          </template>
 
           <!-- POL-18 — the display override. Auto probes the address's framing headers and falls
                back to an agent-placed window when the site refuses to be framed; the forced modes
@@ -1039,6 +1256,10 @@ function mediaFacts(s: ContentSource): string {
             <option value="interval">Every…</option>
             <option value="scheduled">At a set time…</option>
           </select>
+          <p v-if="isDashboard" class="field-hint">
+            Grafana's auto-refresh above re-queries the panels in place — with it on, a full reload
+            is usually unnecessary.
+          </p>
 
           <div v-if="draftRefresh.mode === 'interval'" class="refresh-row">
             <input
@@ -1076,8 +1297,9 @@ function mediaFacts(s: ContentSource): string {
         </template>
 
         <div v-if="errorMsg" class="error">⚠ {{ errorMsg }}</div>
+        </div>
 
-        <div class="modal-actions">
+        <div class="modal-foot modal-actions">
           <button class="btn-secondary" @click="closeModal">Cancel</button>
           <button class="btn-primary" :disabled="saving" @click="save">{{ saveLabel }}</button>
         </div>
@@ -1488,38 +1710,145 @@ function mediaFacts(s: ContentSource): string {
 .field:focus {
   border-color: var(--accent);
 }
-.type-row {
+/* POL-175 — the wider source dialog: fixed header + footer, scrollable body. */
+.modal.wide {
+  width: 640px;
+  padding: 0;
   display: flex;
-  gap: 6px;
+  flex-direction: column;
+  overflow-y: hidden;
+}
+.modal.wide .modal-head {
+  flex: 0 0 auto;
+  padding: 20px 24px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.modal.wide .modal-head .modal-title {
+  margin-bottom: 0;
+}
+.modal.wide .modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 24px 6px;
+}
+.modal.wide .modal-foot {
+  flex: 0 0 auto;
+  padding: 14px 24px 18px;
+  border-top: 1px solid var(--line);
+}
+
+/* POL-175 — type dropdown with its icon well. */
+.type-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin-bottom: 16px;
 }
-.type-btn {
-  flex: 1;
+.icon-well {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 9px 6px;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 1px solid var(--line);
-  background: var(--surface);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--fg2);
-  cursor: pointer;
-  font-family: inherit;
-}
-.type-btn:hover {
   background: var(--muted-bg);
 }
-.type-btn.active {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-  color: var(--accent-fg);
+.icon-well :deep(svg) {
+  width: 20px;
+  height: 20px;
+  display: block;
 }
-.type-glyph {
-  font-size: 13px;
-  font-weight: 700;
+.type-select {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+/* POL-175 — protocol dropdown in front of the scheme-less address. */
+.addr-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.proto-select {
+  flex: 0 0 auto;
+  width: auto;
+  margin-bottom: 0;
+}
+.addr-input {
+  flex: 1;
+  margin-bottom: 0;
+}
+.addr-row + .field-hint {
+  margin-top: -10px;
+}
+
+/* POL-175 — the Grafana display card. */
+.gf-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 14px 16px 4px;
+  margin-bottom: 16px;
+}
+.gf-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg2);
+  margin-bottom: 12px;
+}
+.gf-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg);
+  margin-bottom: 10px;
+  cursor: pointer;
+}
+.gf-toggle input {
+  flex: 0 0 auto;
+  transform: translateY(1px);
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.gf-toggle-name {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.gf-toggle-note {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.gf-toggle.off {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.gf-toggle.off input {
+  cursor: not-allowed;
+}
+.gf-range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.gf-range {
+  flex: 1;
+  margin-bottom: 0;
+}
+.gf-range-sep {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+.gf-range-row + .field-hint {
+  margin-top: -6px;
+}
+.gf-keep code {
+  word-break: break-all;
 }
 /* POL-157 — the reload cadence controls. */
 .refresh-row {

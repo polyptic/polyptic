@@ -15,7 +15,8 @@ export const CONTENT_KINDS: ContentKind[] = ["web", "dashboard", "image", "video
 
 const LABELS: Record<ContentKind, string> = {
   web: "Web page",
-  dashboard: "Dashboard",
+  // POL-175 — the wire value stays "dashboard"; only the label names what it actually is.
+  dashboard: "Grafana dashboard",
   image: "Image",
   video: "Video",
   stream: "Live stream",
@@ -26,7 +27,7 @@ const LABELS: Record<ContentKind, string> = {
 
 const SHORT_LABELS: Record<ContentKind, string> = {
   web: "Web",
-  dashboard: "Dashboard",
+  dashboard: "Grafana",
   image: "Image",
   video: "Video",
   stream: "Live",

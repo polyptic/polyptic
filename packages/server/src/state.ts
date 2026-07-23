@@ -41,6 +41,9 @@ import {
   VideoWall,
   WebSurface,
   Zoom,
+  SourceComposition,
+  composeSourceUrl,
+  normalizeComposition,
   isValidTimeZone,
   meaningfulHostname,
   packRects,
@@ -819,6 +822,11 @@ export class ControlPlane {
         framing: cs.framing ?? undefined,
         placementMode: cs.placementMode ?? undefined,
         refresh: cs.refresh ?? undefined,
+        // POL-175 — a malformed composition jsonb degrades to "no breakdown" (the console re-parses
+        // the url on edit-open) rather than dropping the whole row.
+        composition: SourceComposition.safeParse(cs.composition).success
+          ? cs.composition
+          : undefined,
       });
       if (parsed.success) this.contentSources.set(parsed.data.id, parsed.data);
     }
@@ -3627,6 +3635,7 @@ export class ControlPlane {
       framing: source.framing ?? null,
       placementMode: source.placementMode ?? null,
       refresh: source.refresh ?? null,
+      composition: source.composition ?? null,
     };
   }
 
@@ -3672,6 +3681,7 @@ export class ControlPlane {
         ok: false;
         error:
           | "unknown-profile"
+          | "invalid-address"
           | "unknown-item-source"
           | "nested-playlist"
           | "live-stream-step"
@@ -3687,12 +3697,17 @@ export class ControlPlane {
       const valid = this.validatePlaylistItems(body.items ?? []);
       if (!valid.ok) return { ok: false, error: valid.error, itemSourceId: valid.itemSourceId };
     }
+    // POL-175 — a structured address composes the canonical url the row stores (and everything
+    // downstream — probe, stamping, players — keeps consuming). The contract already refused a body
+    // carrying both, so `composition ? composed : body.url` loses nothing.
+    const composition = normalizeComposition(body.kind, body.composition);
     const id = this.nextSourceId();
-    const source = ContentSource.parse({
+    const parsed = ContentSource.safeParse({
       id,
       name: body.name,
       kind: body.kind,
-      url: body.url,
+      url: composition ? composeSourceUrl(composition) : body.url,
+      composition,
       credentialProfileId,
       items: body.items,
       definition: body.definition,
@@ -3703,6 +3718,10 @@ export class ControlPlane {
         ? { placementMode: body.placementMode, refresh: body.refresh }
         : {}),
     });
+    // A composed address can still fail the url validation ("https://not a host") — the operator's
+    // to fix, never a crash.
+    if (!parsed.success) return { ok: false, error: "invalid-address" };
+    const source = parsed.data;
     this.contentSources.set(id, source);
     await this.store.upsertContentSource(this.toPersistedSource(source));
     return { ok: true, source };
@@ -3800,8 +3819,23 @@ export class ControlPlane {
     // POL-42 — a partial patch must not produce a source the resolver can't render: a page needs
     // its definition, everything else (bar a playlist) needs a url.
     const definition = kind === "page" ? (patch.definition ?? existing.definition) : undefined;
+    // POL-175 — precedence in a patch: a new composition recomposes the url; an explicit raw url
+    // DROPS the stored composition (the breakdown would no longer describe it); neither keeps both
+    // as they were. `normalizeComposition` sheds what the (possibly changed) kind cannot carry.
+    const composition = normalizeComposition(
+      kind,
+      patch.composition !== undefined
+        ? patch.composition
+        : patch.url !== undefined
+          ? undefined
+          : existing.composition,
+    );
     const nextUrl =
-      kind === "playlist" || kind === "page" ? undefined : (patch.url ?? existing.url ?? undefined);
+      kind === "playlist" || kind === "page"
+        ? undefined
+        : composition
+          ? composeSourceUrl(composition)
+          : (patch.url ?? existing.url ?? undefined);
     if (kind === "page" ? definition === undefined : kind !== "playlist" && nextUrl === undefined) {
       return { ok: false, error: "invalid-shape" };
     }
@@ -3812,6 +3846,7 @@ export class ControlPlane {
       kind,
       // A kind change across the playlist/page boundary sheds the field the new kind cannot carry.
       url: nextUrl,
+      composition,
       credentialProfileId,
       items,
       definition,

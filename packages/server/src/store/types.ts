@@ -140,6 +140,10 @@ export interface PersistedContentSource {
    *  `null`/undefined = off (also legacy rows persisted before the column). The control plane
    *  re-validates it against the contract on load. */
   refresh?: unknown | null;
+  /** POL-175 — the structured address breakdown (a `SourceComposition` as JSON) the dialog edits;
+   *  `url` above stays the canonical composed URL. `null`/undefined on legacy rows (the console
+   *  re-parses the url on edit-open). The control plane re-validates it on load. */
+  composition?: unknown | null;
 }
 
 /**
