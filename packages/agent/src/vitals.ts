@@ -115,10 +115,22 @@ export interface MemInfo {
   totalBytes: number;
   usedBytes: number;
   percent: number;
+  /** POL-185 — how much of `usedBytes` is tmpfs / shared memory (`Shmem`). Absent when the kernel
+   *  does not publish the line; never zeroed to mean "we couldn't tell". */
+  shmemBytes?: number;
 }
 
-/** Parse /proc/meminfo. "Used" is total − MemAvailable — what the kernel says is actually reclaimable,
- *  not the free-memory-is-wasted-memory number that makes every Linux box look full. */
+/**
+ * Parse /proc/meminfo. "Used" is total − MemAvailable — what the kernel says is actually reclaimable,
+ * not the free-memory-is-wasted-memory number that makes every Linux box look full.
+ *
+ * `Shmem` is broken out because "used" alone cannot answer the question an operator actually has
+ * (POL-185). A box pinned at 90% reads identically whether the browsers are fat or a RAM disk is
+ * quietly filling, and those have opposite remedies — it took a photograph of a wall to tell the two
+ * apart once (POL-184: Chrome's profile on the `/run/user` tmpfs, growing until Chrome painted "Free
+ * up space to continue" over a Grafana dashboard). tmpfs pages are unreclaimable, so they already sit
+ * inside `usedBytes` by definition; this only says how much of it they are.
+ */
 export function parseMeminfo(text: string): MemInfo | null {
   const kb = (key: string): number | null => {
     const m = new RegExp(`^${key}:\\s+(\\d+) kB`, "m").exec(text);
@@ -130,7 +142,15 @@ export function parseMeminfo(text: string): MemInfo | null {
   if (available === null) return null;
   const totalBytes = total * 1024;
   const usedBytes = Math.max(0, (total - available) * 1024);
-  return { totalBytes, usedBytes, percent: clampPercent((usedBytes / totalBytes) * 100) };
+  const shmem = kb("Shmem");
+  const info: MemInfo = {
+    totalBytes,
+    usedBytes,
+    percent: clampPercent((usedBytes / totalBytes) * 100),
+  };
+  // Clamped to what the box actually has: a nonsense line is worth dropping, not forwarding.
+  if (shmem !== null && shmem >= 0) info.shmemBytes = Math.min(shmem * 1024, totalBytes);
+  return info;
 }
 
 /** The three load averages from /proc/loadavg. */
@@ -268,6 +288,7 @@ export class VitalsSampler {
       vitals.memTotalBytes = mem.totalBytes;
       vitals.memUsedBytes = mem.usedBytes;
       vitals.memPercent = mem.percent;
+      if (mem.shmemBytes !== undefined) vitals.shmemBytes = mem.shmemBytes;
     }
 
     const loadText = await readOrNull(join(this.procRoot, "loadavg"));

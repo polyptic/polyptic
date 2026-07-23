@@ -122,6 +122,30 @@ describe("parsers", () => {
     expect(mem?.percent).toBe(75);
   });
 
+  // POL-185 — tmpfs pages are unreclaimable, so they are already inside usedBytes; breaking them out
+  // is what tells "the browsers are fat" apart from "a RAM disk is filling" (POL-184's bug, which
+  // took a photograph of a wall to diagnose).
+  test("parseMeminfo breaks out Shmem as a subset of what is in use", () => {
+    const mem = parseMeminfo(
+      "MemTotal:       8000000 kB\nMemAvailable:   2000000 kB\nShmem:          1500000 kB\n",
+    );
+    expect(mem?.shmemBytes).toBe(1_500_000 * 1024);
+    expect(mem?.shmemBytes).toBeLessThan(mem?.usedBytes as number);
+  });
+
+  test("a kernel that publishes no Shmem line OMITS the field — never a zero", () => {
+    const mem = parseMeminfo("MemTotal:       8000000 kB\nMemAvailable:   2000000 kB\n");
+    expect(mem?.usedBytes).toBe(6_000_000 * 1024);
+    expect(mem?.shmemBytes).toBeUndefined();
+  });
+
+  test("a nonsense Shmem larger than the box is clamped, not forwarded", () => {
+    const mem = parseMeminfo(
+      "MemTotal:       8000000 kB\nMemAvailable:   2000000 kB\nShmem:         99999999 kB\n",
+    );
+    expect(mem?.shmemBytes).toBe(8_000_000 * 1024);
+  });
+
   test("parseLoadavg / parseUptime", () => {
     expect(parseLoadavg("1.25 0.90 0.70 2/415 9999")).toEqual([1.25, 0.9, 0.7]);
     expect(parseUptime("86400.42 400000.00")).toBe(86400);

@@ -1094,6 +1094,12 @@ export const MachineVitals = z.object({
   memUsedBytes: z.number().nonnegative().optional(),
   memTotalBytes: z.number().nonnegative().optional(),
   memPercent: z.number().min(0).max(100).optional(),
+  /** POL-185 — how much of `memUsedBytes` is held by tmpfs / shared memory (`Shmem` in
+   *  /proc/meminfo). A RAM disk filling and a browser leaking look identical on the memory meter
+   *  and have opposite remedies; this is the one line that tells them apart. Unreclaimable, so it
+   *  is a SUBSET of `memUsedBytes`, never an addition to it. Omitted when the kernel has no such
+   *  line (and by every pre-POL-185 agent). */
+  shmemBytes: z.number().nonnegative().optional(),
   /** The root filesystem — on a netbooted box that is the RAM-backed image (tmpfs/overlay), so a
    *  full "disk" means a full box. */
   diskUsedBytes: z.number().nonnegative().optional(),

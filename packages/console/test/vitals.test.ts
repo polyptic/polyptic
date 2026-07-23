@@ -117,6 +117,24 @@ describe("tooltips (the design's detail strings)", () => {
     expect(diskTooltip(v)).toBe("92 GB free of 100 GB");
   });
 
+  // POL-185 — the meter that said "90%" without saying WHAT. A RAM disk filling (POL-184's Chrome
+  // profile on tmpfs) and a leaking browser draw the identical bar and want opposite remedies.
+  test("the memory tooltip names the tmpfs share when the box reports one", () => {
+    expect(
+      memoryTooltip({
+        memUsedBytes: 3.3 * 1024 ** 3,
+        memTotalBytes: 8 * 1024 ** 3,
+        shmemBytes: 1.2 * 1024 ** 3,
+      }),
+    ).toBe("3.3 GB / 8 GB · 1.2 GB tmpfs");
+  });
+
+  test("a pre-POL-185 agent reports no Shmem, so the tooltip keeps the old two-number line", () => {
+    expect(memoryTooltip({ memUsedBytes: 3.3 * 1024 ** 3, memTotalBytes: 8 * 1024 ** 3 })).toBe(
+      "3.3 GB / 8 GB",
+    );
+  });
+
   test("formatBytes", () => {
     expect(formatBytes(512)).toBe("512 B");
     expect(formatBytes(1536)).toBe("1.5 KB");
