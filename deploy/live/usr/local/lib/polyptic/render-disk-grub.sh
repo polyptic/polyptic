@@ -46,7 +46,17 @@ tok=""
 # exactly the diskless contract D55 promised, just without re-downloading a gigabyte to get it.
 # `polyptic.bootpath=disk` marks the boot for boot-path.sh (state-only all-clear) and update-poll.sh
 # (the disk staging flow keys on it).
-common="rd.live.overlay=LABEL=POLYPTIC-SCRATCH rd.live.overlay.overlayfs=1 rd.live.overlay.reset=1 polyptic.base=http://$HOSTPORT polyptic.server_url=ws://$HOSTPORT/agent$tok polyptic.bootpath=disk multipath=off quiet splash plymouth.ignore-serial-consoles"
+#
+# The `:/overlayfs` pathspec is load-bearing (POL-179). Without it, dmsquash-live looks for the
+# overlay at its default path `/LiveOS/overlay-<label>-<uuid>` of the LIVE device — a name that
+# changes with the booted slot — never finds it, prints "Unable to find a persistent overlay" ACROSS
+# THE WALL (D65 violation, first real installed boot 2026-07-23) and falls back to a RAM overlay.
+# With the pathspec pinned, dmsquash-live (dracut-ng 110) checks exactly `overlayfs/` + `ovlwork/` at
+# the scratch fs root — which install-to-disk.sh seeds at install and the initramfs hook
+# (50polyptic-live/polyptic-scratch-prep.sh) re-creates if they ever go missing. reset=1 is safe with
+# this layout: dracut-ng 110's reset removes the overlay dir's CONTENTS, never the dir itself
+# (70overlayfs/prepare-overlayfs.sh: `rm -r -- "$dir"/* "$dir"/.*`), so no boot can strand the next.
+common="rd.live.overlay=LABEL=POLYPTIC-SCRATCH:/overlayfs rd.live.overlay.overlayfs=1 rd.live.overlay.reset=1 polyptic.base=http://$HOSTPORT polyptic.server_url=ws://$HOSTPORT/agent$tok polyptic.bootpath=disk multipath=off quiet splash plymouth.ignore-serial-consoles"
 this_root="root=live:LABEL=POLYPTIC-$SLOT_UC $common"
 other_root="root=live:LABEL=POLYPTIC-$OTHER_UC $common"
 

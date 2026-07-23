@@ -2,7 +2,7 @@
 # Polyptic's dracut module (POL-35). Pulled in by `dracut --add polyptic-live` when
 # deploy/build-live-image.sh builds the initramfs inside the image chroot.
 #
-# Four jobs, each earned by a real boot failure:
+# Five jobs, each earned by a real boot failure:
 #
 #   1. polyptic-ram.sh — livenet downloads the WHOLE rootfs.squashfs into the initramfs root, a
 #      tmpfs the kernel caps at 50% of RAM. Raise the cap, and speak English on a box that truly
@@ -27,6 +27,12 @@
 #      and, when the depot no longer has it, re-points livenet at the ACTIVE build (or the unpinned
 #      arch root) — loudly. It is a `netroot` hook because that is the one place dracut sources our
 #      code into the shell that owns $netroot, right before it hands that URL to livenetroot.
+#   5. polyptic-scratch-prep.sh — disk boots only (POL-176/POL-179): dmsquash-live treats the
+#      scratch partition as a persistent overlay only when `overlayfs/` + `ovlwork/` exist on it;
+#      a box installed before the installer seeded them (the first real installed boot, 2026-07-23)
+#      or a corrupted scratch fs falls back to a RAM overlay WITH a technical warning across the
+#      wall. The hook creates the pair (mkfs-ing the partition back to life if it won't mount)
+#      before dmsquash-live looks.
 #
 # `check()` returns 0 unconditionally: the module is never auto-detected, only `--add`ed.
 
@@ -43,6 +49,11 @@ install() {
     # `cmdline` is the earliest hook that runs with a writable / and a parsed cmdline, well before
     # the initqueue where livenet's download happens.
     inst_hook cmdline 00 "$moddir/polyptic-ram.sh"
+    # Scratch-overlay prep MUST sort before dmsquash-live's own settled job (POL-179): dmsquash's
+    # udev rule queues `dmsquash-live-root.sh` into the SAME settled dir at runtime, and settled
+    # hooks run in filename order — `04…` beats `dmsquash…` (digits before letters), so in the very
+    # settle pass where the disk's partitions appear, the overlay dirs exist before dmsquash looks.
+    inst_hook initqueue/settled 04 "$moddir/polyptic-scratch-prep.sh"
     # Progress narration: `settled` fires while udev/DHCP are still converging (say "waiting for
     # network"), `online` fires when an interface is up (say "downloading"), `timeout` only fires
     # when the boot has genuinely stalled (say what to check).
@@ -67,6 +78,7 @@ install() {
     # external is how POL-78 spent a week rejecting every Wi-Fi config (no `dirname` in the initrd).
     # curl comes in with url-lib and sed/awk/sleep with the hooks above; naming them is the contract.
     # `tr` is the only soft one — the script guards it with `command -v` and just reports no machine
-    # id without it.
-    inst_multiple awk mount sleep sed curl tr
+    # id without it. mkdir/umount/mkfs.ext4/udevadm/blkid are polyptic-scratch-prep.sh's (POL-179):
+    # mkfs.ext4 is the self-heal, and it is NOT otherwise in a dracut initramfs.
+    inst_multiple awk mount sleep sed curl tr mkdir umount mkfs.ext4 udevadm blkid
 }

@@ -271,6 +271,7 @@ has "happy: ESP labelled POLYPTIC-BT (find-boot-medium's fast path)" "-n POLYPTI
 has "happy: slot A ext4 label"             "-L POLYPTIC-A" "$(cat "$d/mkfs.log")"
 has "happy: slot B ext4 label"             "-L POLYPTIC-B" "$(cat "$d/mkfs.log")"
 has "happy: scratch ext4 label (16 chars, the ext4 max)" "-L POLYPTIC-SCRATCH" "$(cat "$d/mkfs.log")"
+eq  "happy: scratch seeded with dracut's persistent-overlay pair (POL-179)" "yes" "$([ -d "$d/vol-sdb5/overlayfs" ] && [ -d "$d/vol-sdb5/ovlwork" ] && echo yes || echo no)"
 eq  "happy: squashfs committed at dmsquash-live's path" "FAKE-SQUASHFS" "$(cat "$d/vol-sdb2/LiveOS/squashfs.img" 2>/dev/null)"
 eq  "happy: no .new left behind"           "no" "$([ -f "$d/vol-sdb2/LiveOS/squashfs.img.new" ] && echo yes || echo no)"
 eq  "happy: kernel on the ESP, slot a"     "FAKE-KERNEL" "$(cat "$d/vol-sdb1/polyptic/boot/amd64/a/vmlinuz" 2>/dev/null)"

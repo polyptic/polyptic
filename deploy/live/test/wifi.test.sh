@@ -655,7 +655,7 @@ same "bad-png heal: bg.png committed after recovery" "$d/served-bg" "$tdir/bg.pn
 # new_disk_case <name> <running-id> <served-id> <esp-image-id> [urgent]
 new_disk_case() {
   d="$ROOT/$1"; mkdir -p "$d/run" "$d/by-label" "$d/modules/6.8.0-test"
-  printf 'BOOT_IMAGE=/vmlinuz root=live:LABEL=POLYPTIC-A rd.live.overlay=LABEL=POLYPTIC-SCRATCH rd.live.overlay.overlayfs=1 rd.live.overlay.reset=1 polyptic.base=http://10.0.0.10:8080 polyptic.token=tok polyptic.bootpath=disk quiet\n' > "$d/cmdline"
+  printf 'BOOT_IMAGE=/vmlinuz root=live:LABEL=POLYPTIC-A rd.live.overlay=LABEL=POLYPTIC-SCRATCH:/overlayfs rd.live.overlay.overlayfs=1 rd.live.overlay.reset=1 polyptic.base=http://10.0.0.10:8080 polyptic.token=tok polyptic.bootpath=disk quiet\n' > "$d/cmdline"
   printf '%s\n' "$2" > "$d/image-id"
   printf 'POLYPTIC_MACHINE_ID=dmi-test\n' > "$d/agent.env"
   printf '{"imageId":"%s","urgent":%s}\n' "$3" "${5:-true}" > "$d/manifest"

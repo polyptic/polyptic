@@ -15,7 +15,9 @@
 #   4  swap        4 GiB  plain partition, partlabel POLYPTIC-SWAP — dm-crypt with an EPHEMERAL
 #                  random key each boot via /etc/crypttab, so wall pixels/tokens never hit disk in
 #                  the clear and nothing on it survives a power cycle
-#   5  scratch  rest      ext4   label POLYPTIC-SCRATCH — dracut's rd.live.overlay, wiped every
+#   5  scratch  rest      ext4   label POLYPTIC-SCRATCH — dracut's rd.live.overlay, seeded with the
+#                  `overlayfs/` + `ovlwork/` pair dmsquash-live needs to treat it as persistent
+#                  (POL-179; bare ext4 = RAM-overlay fallback + a warning on the wall), wiped every
 #                  boot by rd.live.overlay.reset=1 (statelessness by construction)
 # Minimum disk ~= 16 GiB; smaller is refused, loudly, before anything is written.
 #
@@ -79,6 +81,7 @@ token=""
 mnt_esp=""
 mnt_slot=""
 mnt_medium=""
+mnt_scratch=""
 tmpd=""
 
 # ─── Telling the operator what happened ─────────────────────────────────────────────────────────────
@@ -160,7 +163,7 @@ fail() {
 }
 
 cleanup() {
-  for m in "$mnt_esp" "$mnt_slot" "$mnt_medium"; do
+  for m in "$mnt_esp" "$mnt_slot" "$mnt_medium" "$mnt_scratch"; do
     [ -n "$m" ] || continue
     umount "$m" 2>/dev/null || true
     rmdir "$m" 2>/dev/null || true
@@ -401,6 +404,20 @@ mkswap "$(part_node 4)" >/dev/null 2>&1 \
   || fail install-write-failed "could not format the swap partition on $target"
 mkfs.ext4 -q -F -L POLYPTIC-SCRATCH "$(part_node 5)" >/dev/null 2>&1 \
   || fail install-write-failed "could not format the scratch partition on $target"
+
+# POL-179 — seed dracut's persistent-overlay layout on the fresh scratch fs. dmsquash-live only
+# treats the overlay device as persistent when the `overlayfs/` + `ovlwork/` pair exists ON it (the
+# cmdline pins the pathspec to /overlayfs — render-disk-grub.sh); a bare ext4 reads as "no overlay",
+# falls back to a RAM overlay, and prints a technical warning across the wall on every boot (the
+# first real installed boot, 2026-07-23). The initramfs hook (polyptic-scratch-prep.sh) re-creates
+# the pair if it ever goes missing; seeding it here makes the FIRST boot clean too.
+mnt_scratch="$(mktemp -d)"
+mount "$(part_node 5)" "$mnt_scratch" \
+  || fail install-write-failed "could not mount the scratch partition on $target"
+mkdir -p "$mnt_scratch/overlayfs" "$mnt_scratch/ovlwork" \
+  || fail install-write-failed "could not create the overlay directories on the scratch partition"
+sync 2>/dev/null || true
+umount "$mnt_scratch"; rmdir "$mnt_scratch" 2>/dev/null || true; mnt_scratch=""
 
 # ─── Slot A: the squashfs, streamed straight onto the disk ──────────────────────────────────────────
 # ~1 GiB, fetched AFTER the mkfs so it can stream to disk instead of doubling up in RAM (this box's

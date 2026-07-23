@@ -36,7 +36,7 @@ has "netboot is the automatic fallback" "set fallback=netboot" "$OUT"
 # ─── 3) The disk cmdline, exactly ───────────────────────────────────────────────────────────────────
 live_line="$(printf '%s\n' "$OUT" | sed -n '/--id live {/,/^}/p' | grep '  linux ')"
 has "root is the slot's fs label"    "root=live:LABEL=POLYPTIC-A" "$live_line"
-has "overlay on the scratch label"   "rd.live.overlay=LABEL=POLYPTIC-SCRATCH" "$live_line"
+has "overlay on the scratch label, pathspec pinned to /overlayfs (POL-179: without it dmsquash-live never finds the persistent overlay and warns on the wall)" "rd.live.overlay=LABEL=POLYPTIC-SCRATCH:/overlayfs" "$live_line"
 has "overlayfs mode"                 "rd.live.overlay.overlayfs=1" "$live_line"
 has "per-boot overlay reset (statelessness by construction)" "rd.live.overlay.reset=1" "$live_line"
 has "base for the agent"             "polyptic.base=http://10.0.0.10:8080" "$live_line"

@@ -131,7 +131,7 @@ The installer **preflights everything before the first destructive write** — a
 | 2 | 4 GiB | ext4 | `POLYPTIC-A` | Slot A: `rootfs.squashfs` at `/LiveOS/squashfs.img` (the freshly installed build) |
 | 3 | 4 GiB | ext4 | `POLYPTIC-B` | Slot B: empty at install — updates stage into whichever slot is inactive |
 | 4 | 4 GiB | swap | `POLYPTIC-SWAP` | dm-crypt swap, **re-keyed with a fresh random key every boot** (see below) |
-| 5 | rest | ext4 | `POLYPTIC-SCRATCH` | The writable overlay, **wiped by dracut on every boot** |
+| 5 | rest | ext4 | `POLYPTIC-SCRATCH` | The writable overlay — seeded with the `overlayfs/` + `ovlwork/` pair dmsquash-live requires (a bare fs reads as "no overlay" and falls back to RAM, with a warning on the wall), **wiped by dracut on every boot** |
 
 Disks under ~16 GiB are refused, loudly, before anything is written.
 
@@ -150,8 +150,11 @@ kernel + LEAN initrd from the ESP  (set fallback=netboot: if the slot's kernel f
         │                           and the box streams the OS like an uninstalled box)
         ▼
 dracut `root=live:LABEL=POLYPTIC-A` (or -B) loop-mounts the squashfs FROM the slot — no RAM copy,
-        │  no network. `rd.live.overlay=LABEL=POLYPTIC-SCRATCH` + `rd.live.overlay.reset=1`:
-        │  the writable overlay lives on the scratch partition and dracut wipes it every boot
+        │  no network. `rd.live.overlay=LABEL=POLYPTIC-SCRATCH:/overlayfs` + `rd.live.overlay.reset=1`:
+        │  the writable overlay lives in `overlayfs/` on the scratch partition (the `:/overlayfs`
+        │  pathspec is load-bearing — without it dmsquash-live never finds the overlay, warns on the
+        │  wall and falls back to RAM) and dracut wipes its contents every boot; an initramfs hook
+        │  re-creates the layout first, re-formatting a scratch fs that will not even mount
         ▼
 the same live Polyptic image boots — polyptic-agent-env, greetd, sway, agent, enrolment: unchanged
 ```
