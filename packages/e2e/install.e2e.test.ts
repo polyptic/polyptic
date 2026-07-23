@@ -438,7 +438,12 @@ describe("POL-176 — install narration folds into the view; the outcome lands i
       const line = (done.activity as any[]).find((e) => String(e.text).includes("installed Polyptic to disk"));
       expect(line).toBeDefined();
       expect(line.severity).toBe("good");
-      expect(line.text).toContain("reboot");
+      expect(line.text).toContain("restarting");
+
+      // POL-177 — the control plane finishes the job: a successful install earns an immediate
+      // server/reboot to THAT box, so it restarts into the installed system without a click.
+      const reboot = await liveAgent.waitFor((m) => m.t === "server/reboot", "server/reboot after done");
+      expect(String(reboot.reason)).toContain("install finished");
       admin.close();
     },
     TEST_TIMEOUT,
