@@ -17,7 +17,9 @@
  * e.g. arm64, whose index Google's apt repo does not publish yet; see setup/browser.ts, which probes
  * the repo rather than hardcoding the arch, so those boxes adopt Chrome the moment it ships).
  */
-import type { KioskBrowser } from "@polyptic/protocol";
+import { mkdirSync, readFileSync } from "node:fs";
+
+import type { BootMode, KioskBrowser } from "@polyptic/protocol";
 import { which } from "./proc";
 import { killStaleByToken, sanitizeConnector } from "./supervise";
 import { SURF_CANDIDATES } from "./surf";
@@ -61,10 +63,88 @@ export async function resolveChrome(env: NodeJS.ProcessEnv = process.env): Promi
   );
 }
 
+/**
+ * How much disk cache ONE Chrome instance may hold (POL-184). Chrome's default is a fraction of the
+ * free space it sees, which on a roomy scratch partition is enormous and on a tmpfs is a promise the
+ * box cannot keep. A wall shows a handful of origins forever, so a small cache costs nothing after
+ * the first paint. The RAM figure is deliberately the tighter one — see browserStateRoot.
+ */
+export const DISK_CACHE_BYTES_ON_DISK = 256 * 1024 * 1024;
+export const DISK_CACHE_BYTES_IN_RAM = 64 * 1024 * 1024;
+
+/** Cached answer of "did this box boot from its disk?" — /proc/cmdline cannot change under us. */
+let cachedBootMode: BootMode | undefined | null = null;
+
+/**
+ * This box's boot path, read straight from /proc/cmdline (POL-176's `polyptic.bootpath=disk`).
+ * Sync and cached because the browser launchers below are sync, pure and called per launch; a
+ * non-Linux host (a dev laptop) has no /proc, reads null, and is treated as not-installed — which
+ * is the pre-POL-184 behaviour, so `dev-open` is byte-identical to before.
+ */
+function detectBootMode(): BootMode | undefined {
+  if (cachedBootMode !== null) return cachedBootMode;
+  let cmdline: string | null = null;
+  try {
+    cmdline = readFileSync("/proc/cmdline", "utf8");
+  } catch {
+    cmdline = null;
+  }
+  cachedBootMode = cmdline?.split(/\s+/).includes("polyptic.bootpath=disk") ? "installed" : undefined;
+  return cachedBootMode;
+}
+
+/**
+ * WHERE the browser profiles live — the POL-184 fix, and the reason this is not just `XDG_RUNTIME_DIR`.
+ *
+ * A Chrome profile is not a scratch file: it holds the HTTP disk cache, the origin's IndexedDB and
+ * localStorage, the service-worker storage and the GPU shader cache, and it only grows. Parked on
+ * `/run/user/<uid>` — a tmpfs systemd sizes at 10% of RAM — a Grafana wall fills it in a matter of
+ * weeks, Chrome's quota system declares the device full, and the browser paints its own white
+ * "Free up space to continue" interstitial ACROSS THE WALL (photographed at AMRC, 2026-07-23). Every
+ * byte of that is unreclaimable RAM, which is what "boxes sitting at huge memory usage" (POL-176) was.
+ *
+ * So an INSTALLED box puts its profiles in the kiosk user's home, which lives in the root overlay —
+ * pinned to the POLYPTIC-SCRATCH partition by POL-179/D164, i.e. on the disk the box now owns. It
+ * stays as stateless as before: `rd.live.overlay.reset=1` wipes that overlay every boot, so the
+ * profile is bounded by the boot, not merely by the cache cap.
+ *
+ * A LIVE/netboot box deliberately keeps `XDG_RUNTIME_DIR`. Its root overlay IS RAM, so "moving to
+ * home" would only trade a tmpfs capped at 10% of memory for the box's entire memory budget — a
+ * worse failure, not a better one. It gets the tighter cache cap instead.
+ *
+ * `POLYPTIC_BROWSER_STATE_DIR` overrides both (dev, and a field escape hatch).
+ */
+export function browserStateRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  bootMode: BootMode | undefined = detectBootMode(),
+): string {
+  const override = env.POLYPTIC_BROWSER_STATE_DIR?.trim();
+  if (override) return override;
+  const home = env.HOME?.trim();
+  if (bootMode === "installed" && home) return `${home}/.cache/polyptic/browser`;
+  return env.XDG_RUNTIME_DIR?.trim() || "/tmp";
+}
+
+/** True when the profiles are on real disk — picks the cache cap, and nothing else. */
+function stateRootIsDisk(env: NodeJS.ProcessEnv, bootMode = detectBootMode()): boolean {
+  if (env.POLYPTIC_BROWSER_STATE_DIR?.trim()) return true;
+  return bootMode === "installed" && Boolean(env.HOME?.trim());
+}
+
 /** Per-connector Chrome profile dir — the process-isolation key AND the stale-reap token. */
 export function chromeDataDir(connector: string, env: NodeJS.ProcessEnv = process.env): string {
-  const base = env.XDG_RUNTIME_DIR?.trim() || "/tmp";
-  return `${base}/polyptic-chrome-${sanitizeConnector(connector)}`;
+  return `${browserStateRoot(env)}/polyptic-chrome-${sanitizeConnector(connector)}`;
+}
+
+/** Create the profile root if it is missing. Chrome creates its own `--user-data-dir`, but not the
+ *  `~/.cache/polyptic/browser` chain above it on a box whose overlay was just wiped. Best-effort:
+ *  a failure here is not worth refusing to paint a wall over — Chrome reports it far better. */
+function ensureStateRoot(env: NodeJS.ProcessEnv): void {
+  try {
+    mkdirSync(browserStateRoot(env), { recursive: true });
+  } catch {
+    /* Chrome will say so, loudly and specifically, if this actually mattered. */
+  }
 }
 
 /**
@@ -82,6 +162,7 @@ function chromeBaseArgs(
   dataDir: string,
   devtoolsPort: number,
   hideScrollbars: boolean,
+  diskCacheBytes: number,
 ): string[] {
   const args = [
     // The whole point (POL-67): native Wayland — EGL/GBM straight to the GPU, no Xwayland, no DRI3.
@@ -89,6 +170,10 @@ function chromeBaseArgs(
     `--app=${url}`,
     // One profile per instance: separate processes (no dedupe), and the reaper's unique token.
     `--user-data-dir=${dataDir}`,
+    // POL-184 — bound the HTTP cache explicitly. Chrome's default is a share of the free space it
+    // sees, which is unbounded-in-practice on the scratch partition and a lie on a tmpfs. A wall
+    // revisits one origin forever, so this is only ever the first paint's worth of assets.
+    `--disk-cache-size=${diskCacheBytes}`,
     // Loopback-only DevTools endpoint for the POL-67 tunnel. Never exposed on the network; the
     // agent only proxies to it for a connector an operator ARMED (server/inspect on).
     `--remote-debugging-port=${devtoolsPort}`,
@@ -124,6 +209,7 @@ export function buildChromeArgs(
     chromeDataDir(spec.connector, env),
     spec.devtoolsPort,
     spec.hideScrollbars ?? true,
+    stateRootIsDisk(env) ? DISK_CACHE_BYTES_ON_DISK : DISK_CACHE_BYTES_IN_RAM,
   );
   // The player fullscreens; splice `--kiosk` in right after the ozone flag (order is cosmetic).
   const args = [base[0]!, "--kiosk", ...base.slice(1)];
@@ -135,7 +221,8 @@ export function buildChromeArgs(
   // with the whole wall; NOT a general browsing flag — which is why it is scoped to exactly this
   // origin, and only for http (an https deploy needs — and gets — no carve-out). Storage stays in
   // the per-connector profile above, so the registration survives an agent browser respawn (a
-  // REBOOT wipes XDG_RUNTIME_DIR, which is fine: reboot survival is out of POL-132's scope).
+  // REBOOT wipes the profile either way — the tmpfs on a live box, the reset=1 scratch overlay on an
+  // installed one (POL-184) — which is fine: reboot survival is out of POL-132's scope).
   const playerOrigin = insecurePlayerOrigin(spec.url);
   if (playerOrigin) args.push(`--unsafely-treat-insecure-origin-as-secure=${playerOrigin}`);
   if (spec.extra && spec.extra.length > 0) args.push(...spec.extra);
@@ -167,8 +254,7 @@ export function chromeWindowDataDir(
   windowId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const base = env.XDG_RUNTIME_DIR?.trim() || "/tmp";
-  return `${base}/polyptic-chrome-win-${sanitizeConnector(windowId)}`;
+  return `${browserStateRoot(env)}/polyptic-chrome-win-${sanitizeConnector(windowId)}`;
 }
 
 /**
@@ -188,6 +274,7 @@ export function buildChromeWindowArgs(
     chromeWindowDataDir(spec.windowId, env),
     spec.devtoolsPort,
     spec.hideScrollbars ?? true,
+    stateRootIsDisk(env) ? DISK_CACHE_BYTES_ON_DISK : DISK_CACHE_BYTES_IN_RAM,
   );
   // POL-153 — a web-window is the agent's to zoom (the player only scales its own iframes). Chrome's
   // device scale factor is the closest analogue to browser zoom that a `--app` window honours from
@@ -207,6 +294,7 @@ export async function prelaunchChromeWindow(
   log: (m: string) => void,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
+  ensureStateRoot(env);
   await killStaleByToken(chromeWindowDataDir(windowId, env), log);
 }
 
@@ -238,6 +326,7 @@ export async function prelaunchChrome(
   log: (m: string) => void,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
+  ensureStateRoot(env);
   await killStaleByToken(chromeDataDir(connector, env), log);
 }
 
