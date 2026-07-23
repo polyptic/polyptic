@@ -123,11 +123,13 @@ The kiosk browser is **Google Chrome, native Wayland**, with **surf** as the fal
 
 ```
 google-chrome-stable --ozone-platform=wayland --kiosk --app=<player-url?screen=ID> \
-  --user-data-dir=<runtime-dir>/polyptic-chrome-<connector> --remote-debugging-port=<9222+n> …
+  --user-data-dir=<profile-root>/polyptic-chrome-<connector> --disk-cache-size=<cap> \
+  --remote-debugging-port=<9222+n> …
 ```
 
 - **`--ozone-platform=wayland` is the whole point.** It takes EGL/GBM straight to the GPU like sway, with no XWayland and no DRI3 (the path that software-rendered and CPU-pegged every surf on real amdgpu hardware).
 - **One `--user-data-dir` per connector is mandatory** because with a shared dir Chrome dedupes the second launch into the first process (the second output never gets a browser), and since Chrome 136 the default dir refuses the debugging port outright. The dir doubles as the stale-orphan reap token.
+- **The profile root follows the boot path** (POL-184). An **installed** box keeps its profiles at `$HOME/.cache/polyptic/browser` — the root overlay, so the POLYPTIC-SCRATCH partition, i.e. the disk the box owns; a **live/netboot** box stays on `XDG_RUNTIME_DIR`. The distinction matters because a Chrome profile holds the HTTP cache, IndexedDB, localStorage and the shader cache and only grows, and `/run/user/<uid>` is a tmpfs sized at 10% of RAM: a Grafana wall filled one and Chrome painted its "Free up space to continue" page over the screen. A live box is left on the tmpfs on purpose — its root overlay is RAM too, so moving there would risk the whole box instead of one tile. `--disk-cache-size` caps the cache on both paths, and `POLYPTIC_BROWSER_STATE_DIR` overrides the root (dev, or a field escape hatch). The profile is wiped every boot either way, so nothing persists across a reboot.
 - **The remote-debugging port binds loopback only** and is reachable solely through the armed, operator-authenticated DevTools tunnel (below).
 
 **surf** (the fallback for arm64, where Google ships no Linux Chrome, or when `POLYPTIC_BROWSER=surf`):

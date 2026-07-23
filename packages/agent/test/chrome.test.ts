@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  browserStateRoot,
   buildChromeArgs,
   buildChromeWindowArgs,
   chromeDataDir,
@@ -61,6 +62,41 @@ describe("buildChromeArgs", () => {
 
   test("chromeDataDir sanitises hostile connector names and falls back to /tmp", () => {
     expect(chromeDataDir("DP 1/../x", {})).toBe("/tmp/polyptic-chrome-DP_1_.._x");
+  });
+
+  // POL-184 — a profile on /run/user/<uid> is a profile in RAM: the HTTP cache, IndexedDB,
+  // localStorage and shader cache of a wall that never navigates away, on a tmpfs sized at 10% of
+  // memory. A Grafana wall filled it and Chrome painted "Free up space to continue" over the screen.
+  test("the cache is bounded — Chrome's free-space-share default is unbounded in practice", () => {
+    expect(args).toContain("--disk-cache-size=67108864");
+  });
+
+  test("a box that booted from disk keeps its profiles on the disk it owns", () => {
+    const env = { ...ENV, HOME: "/home/kiosk" };
+    expect(browserStateRoot(env, "installed")).toBe("/home/kiosk/.cache/polyptic/browser");
+  });
+
+  // Deliberate, not an oversight: a live box's root overlay IS RAM, so moving the profile into
+  // $HOME would trade a tmpfs capped at 10% of memory for the box's whole memory budget.
+  test("a live box stays on XDG_RUNTIME_DIR even when it has a home", () => {
+    const env = { ...ENV, HOME: "/home/kiosk" };
+    expect(browserStateRoot(env, "live")).toBe("/run/user/1000");
+    expect(browserStateRoot(env, undefined)).toBe("/run/user/1000");
+  });
+
+  test("an installed box with no HOME falls back rather than guessing a path", () => {
+    expect(browserStateRoot({ XDG_RUNTIME_DIR: "/run/user/1000" }, "installed")).toBe(
+      "/run/user/1000",
+    );
+  });
+
+  test("POLYPTIC_BROWSER_STATE_DIR overrides everything, and earns the disk cache cap", () => {
+    const env = { ...ENV, HOME: "/home/kiosk", POLYPTIC_BROWSER_STATE_DIR: "/var/tmp/lab" };
+    expect(browserStateRoot(env, "installed")).toBe("/var/tmp/lab");
+    expect(browserStateRoot(env, undefined)).toBe("/var/tmp/lab");
+    const overridden = buildChromeArgs({ url: URL, connector: "DP-1", devtoolsPort: 9222 }, env);
+    expect(overridden).toContain("--user-data-dir=/var/tmp/lab/polyptic-chrome-DP-1");
+    expect(overridden).toContain("--disk-cache-size=268435456");
   });
 
   // POL-132 — the shell service worker (reload-survives-outage) needs a secure context, and netboot
