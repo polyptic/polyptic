@@ -57,6 +57,11 @@ export * from "./schedule";
 // resolver the player fires from and a console preview reads — one answer, evaluated identically.
 export * from "./refresh";
 
+// Structured source addresses (POL-175): proto + address + passthrough query + Grafana display
+// controls, with the compose/parse pair the console's dialog and the server share.
+export * from "./grafana-url";
+import { SourceComposition } from "./grafana-url";
+
 export const PROTOCOL_VERSION = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2098,6 +2103,12 @@ export const ContentSource = z
     /** POL-157 — the opt-in reload cadence. Meaningful only on FRAMEABLE kinds (web/dashboard); the
      *  refine below rejects it on media/playlist/page. Absent (or `off`) = never reload. */
     refresh: RefreshPolicy.optional(),
+    /** POL-175 — the structured breakdown of `url` (proto + address + passthrough query + Grafana
+     *  display controls) the dialog edits. `url` stays canonical: the server composes it FROM this
+     *  on every write, and everything downstream keeps consuming `url`. Absent on rows created
+     *  before POL-175 (the console parses `url` back into the controls on edit-open) and on the
+     *  url-less kinds (playlist/page). */
+    composition: SourceComposition.optional(),
   })
   .superRefine((s, ctx) => {
     if (s.kind !== "deck" && s.deck !== undefined)
@@ -2126,6 +2137,17 @@ export const ContentSource = z
       ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
     if (s.kind !== "page" && s.definition !== undefined)
       ctx.addIssue({ code: "custom", message: "a definition is only valid on a page" });
+    // POL-175 — a composition breaks a URL down, so only URL-backed kinds carry one; the Grafana
+    // display controls ride the dashboard kind only.
+    if (s.composition !== undefined) {
+      if (s.kind === "playlist" || s.kind === "page")
+        ctx.addIssue({ code: "custom", message: "only a URL-backed source has a composition" });
+      if (s.kind !== "dashboard" && s.composition.gf !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message: "Grafana display controls need a Grafana dashboard source",
+        });
+    }
   });
 export type ContentSource = z.infer<typeof ContentSource>;
 
@@ -2781,6 +2803,9 @@ export const CreateContentSourceBody = z
     placementMode: PlacementMode.optional(),
     /** POL-157 — opt-in reload cadence (web/dashboard kinds). Omitted = off. */
     refresh: RefreshPolicy.optional(),
+    /** POL-175 — the structured address. URL-backed kinds take EITHER this (the server composes and
+     *  stores the canonical `url` from it) or a plain `url` (legacy clients / scripts) — never both. */
+    composition: SourceComposition.optional(),
   })
   .superRefine((b, ctx) => {
     if (b.kind === "playlist") {
@@ -2792,7 +2817,19 @@ export const CreateContentSourceBody = z
       if (b.definition === undefined)
         ctx.addIssue({ code: "custom", message: "a page needs a definition" });
     } else {
-      if (b.url === undefined) ctx.addIssue({ code: "custom", message: "url is required" });
+      if (b.url === undefined && b.composition === undefined)
+        ctx.addIssue({ code: "custom", message: "url is required" });
+      if (b.url !== undefined && b.composition !== undefined)
+        ctx.addIssue({ code: "custom", message: "send a url or a composition, not both" });
+    }
+    if (b.composition !== undefined) {
+      if (b.kind === "playlist" || b.kind === "page")
+        ctx.addIssue({ code: "custom", message: "only a URL-backed source has a composition" });
+      if (b.kind !== "dashboard" && b.composition.gf !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message: "Grafana display controls need a Grafana dashboard source",
+        });
     }
     if (b.kind !== "playlist" && b.items !== undefined)
       ctx.addIssue({ code: "custom", message: "items are only valid on a playlist" });
@@ -2827,6 +2864,11 @@ export const UpdateContentSourceBody = z.object({
   /** POL-157 — set/clear the reload cadence. `{ mode: "off" }` turns it off; kind consistency is
    *  validated against the MERGED source server-side (a partial patch can't judge it alone). */
   refresh: RefreshPolicy.optional(),
+  /** POL-175 — replace the structured address; the server recomposes the canonical `url` from it.
+   *  A patch carrying a plain `url` instead DROPS any stored composition (the raw url wins — the
+   *  breakdown would no longer describe it). Kind consistency is validated against the MERGED
+   *  source server-side. */
+  composition: SourceComposition.optional(),
 });
 export type UpdateContentSourceBody = z.infer<typeof UpdateContentSourceBody>;
 

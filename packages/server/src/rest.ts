@@ -2372,6 +2372,10 @@ export function registerRestRoutes(
       if (result.error === "unknown-profile") {
         return reply.code(404).send({ error: `unknown credential profile: ${body.data.credentialProfileId}` });
       }
+      // POL-175 — a structured address that composes to something that is not a URL.
+      if (result.error === "invalid-address") {
+        return reply.code(400).send({ error: "the address does not form a valid URL" });
+      }
       // POL-34 — playlist authoring errors are the operator's to fix: 400 with a plain sentence.
       return reply.code(400).send({ error: playlistItemErrorDetail(result.error, result.itemSourceId) });
     }
