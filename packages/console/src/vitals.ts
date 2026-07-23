@@ -92,12 +92,23 @@ export function cpuTooltip(vitals: MachineVitals | undefined): string {
   return parts.join(" · ") || "CPU busy across all cores";
 }
 
-/** Detail line for the memory meter's tooltip: "3.3 / 8 GB". */
+/**
+ * Detail line for the memory meter's tooltip: "3.3 / 8 GB · 1.2 GB tmpfs".
+ *
+ * The tmpfs clause (POL-185) is what makes the meter actionable. A box pinned at 90% reads the same
+ * whether the browsers are fat or a RAM disk is filling, and those have opposite remedies — so when
+ * the box reports `Shmem` it is named here, inside the used figure it is already a part of. A box
+ * that doesn't report it (a pre-POL-185 agent) gets the old two-number line; the clause is never
+ * synthesised from a number we don't have.
+ */
 export function memoryTooltip(vitals: MachineVitals | undefined): string {
   if (vitals?.memUsedBytes === undefined || vitals.memTotalBytes === undefined) {
     return "Memory in use";
   }
-  return `${formatBytes(vitals.memUsedBytes)} / ${formatBytes(vitals.memTotalBytes)}`;
+  const line = `${formatBytes(vitals.memUsedBytes)} / ${formatBytes(vitals.memTotalBytes)}`;
+  return vitals.shmemBytes === undefined
+    ? line
+    : `${line} · ${formatBytes(vitals.shmemBytes)} tmpfs`;
 }
 
 /** Detail line for the disk meter's tooltip: "92 GB free". On a netbooted box that is the RAM image. */
