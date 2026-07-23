@@ -338,6 +338,16 @@ export const Machine = z.object({
   /** POL-59 — when the shell was armed / last used. A sweep auto-disarms a box idle past the TTL
    *  (SHELL_ARM_TTL_MS) so a forgotten armed box is not a standing shell-openable target. */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-81 — whether an operator has ARMED this box for SSH (a dedicated debug user + sshd). Off by
+   *  default per box, exactly like `shellEnabled`; disarming stops sshd and removes the key. */
+  sshEnabled: z.boolean().default(false),
+  /** POL-81 — when SSH was armed, for the auto-disarm TTL sweep (SSH_ARM_TTL_MS), mirroring
+   *  `shellArmedAt`. Cleared on disarm. */
+  sshArmedAt: z.string().datetime().optional(),
+  /** POL-81 — the operator's PUBLIC key installed on the box while armed. Public, never a secret, so
+   *  it is safe to persist: the server re-pushes the arm (key included) when the agent reconnects and
+   *  across a server restart, so a reconciled box re-installs the same key. Cleared on disarm. */
+  sshPublicKey: z.string().optional(),
   /** POL-104 — what the box IS (MACs / DMI serial / arch), as it last reported. Descriptive, never a
    *  credential; kept so a PENDING card is informative even while the box is offline. */
   hardware: HostIdentity.optional(),
@@ -1180,6 +1190,68 @@ export const AgentShellClosed = z.object({
   reason: z.string().optional(),
 });
 
+// ── Operator SSH access (POL-81) ───────────────────────────────────────────────
+//
+// The COMPLEMENT to the POL-59 remote shell. That shell is unprivileged (the kiosk user) and tunnels
+// over the agent WS; it is enough to poke around but not to `dmesg`, `mount`, `modprobe`, or read the
+// boot journal — the friction the AMRC bring-up week hit repeatedly. SSH-when-armed gives an operator
+// a real, ENCRYPTED, root-capable session on the box, on the SAME per-box arming gate.
+//
+// Security posture, enforced end to end: DISARMED by default (`Machine.sshEnabled`); KEY-AUTH ONLY
+// (password auth off, the operator's public key injected only while armed, removed on disarm); a
+// DEDICATED debug user, never the kiosk (browser) user, with passwordless sudo — root CAPABILITY
+// without a standing root CREDENTIAL (the root account/password stays locked, `PermitRootLogin no`);
+// and a TTL that auto-disarms a forgotten box (the same mechanism as the shell's, plus a box-side
+// systemd timer so a box whose control plane vanished still closes itself). Reboot comes up closed
+// (sshd is not enabled at boot; a boot-time reset removes the key).
+
+/** The dedicated, separate-from-kiosk debug user the operator SSHes in as (POL-81). */
+export const SSH_DEBUG_USER = "polyptic-debug";
+/** The port sshd listens on while armed (POL-81). */
+export const SSH_DEFAULT_PORT = 22;
+
+/** A single-line SSH public key. Validated shallowly at the edge — the box's root helper re-validates
+ *  before it ever reaches `authorized_keys`, so this is a friendly-error gate, not the trust boundary. */
+export const SshPublicKey = z
+  .string()
+  .trim()
+  .min(1)
+  .max(16 * 1024)
+  .refine((s) => !/[\r\n]/.test(s), { message: "an SSH public key must be a single line" })
+  .refine(
+    (s) =>
+      /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-\S+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-\S+@openssh\.com)\s+\S+/.test(
+        s,
+      ),
+    { message: "not a recognised SSH public key (expected e.g. `ssh-ed25519 AAAA...`)" },
+  );
+
+/** What the box actually did after an arm/disarm, reported by the agent (the TRUTH, like power-ack —
+ *  only the box knows whether sshd came up and the key landed). Reused inside `MachineView`. */
+export const SshStatus = z.object({
+  /** The box's own armed state (key installed + sshd meant to be up). */
+  armed: z.boolean(),
+  /** sshd is actually accepting connections, as probed on the box. `armed && !listening` = a helper
+   *  that failed to start sshd — surfaced to the operator rather than shown as ready. */
+  listening: z.boolean().default(false),
+  /** The box's best-guess reachable address for the operator to `ssh` to (its primary LAN IPv4). */
+  host: z.string().optional(),
+  port: z.number().int().positive().optional(),
+  /** The debug user to log in as. */
+  user: z.string().optional(),
+  /** When the box-side TTL will auto-disarm (ISO), so the console can count down. */
+  expiresAt: z.string().datetime().optional(),
+  /** Why the box could not arm: a dev backend, a non-Linux host, or no privileged helper installed. */
+  reason: z.string().optional(),
+});
+export type SshStatus = z.infer<typeof SshStatus>;
+
+/** Agent → server: the box's SSH status after an arm/disarm (or a reconcile re-push). */
+export const AgentSshStatus = SshStatus.extend({
+  t: z.literal("agent/ssh-status"),
+  machineId: z.string(),
+});
+
 /** POL-50 — the agent's answer to `server/inspect`: whether the wall's Web Inspector is now open.
  *  This ack, not the operator's click, is what the console displays — only the box knows whether
  *  surf relaunched and took the keystroke. `ok: false` means the screen is un-inspected and carries
@@ -1257,6 +1329,7 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentShellOpened,
   AgentShellData,
   AgentShellClosed,
+  AgentSshStatus,
   AgentInspectAck,
   AgentDevtoolsResponse,
   AgentDevtoolsOpened,
@@ -1492,6 +1565,25 @@ export const ServerToAgentShellClose = z.object({
   reason: z.string().optional(),
 });
 
+/**
+ * Server → agent: arm or disarm SSH on this box (POL-81). The agent is unprivileged, so it does not
+ * touch sshd or `authorized_keys` itself — it hands this to a root-owned systemd helper (the POL-55
+ * escalation pattern: write a request file, a `.path`/`.service` acts). On ARM the helper installs
+ * `publicKey` for `debugUser`, starts sshd, and schedules a box-side TTL disarm at `ttlMs`; on DISARM
+ * it stops sshd and removes the key. Re-sent verbatim on reconnect so a box reconciles to the armed
+ * state (the key rides along because it is public, never a secret).
+ */
+export const ServerToAgentSshArm = z.object({
+  t: z.literal("server/ssh-arm"),
+  enabled: z.boolean(),
+  /** Required when `enabled`; the operator's public key to install. */
+  publicKey: SshPublicKey.optional(),
+  debugUser: z.string().default(SSH_DEBUG_USER),
+  port: z.number().int().positive().default(SSH_DEFAULT_PORT),
+  /** Box-side auto-disarm horizon in ms (0 disables the box-side timer; the server sweep still runs). */
+  ttlMs: z.number().int().nonnegative().default(60 * 60 * 1000),
+});
+
 /** Server → agent: proxy ONE HTTP GET to the armed connector's DevTools port (POL-67). The agent
  *  answers `agent/devtools-response` with the same `reqId`, and REFUSES unless that connector's
  *  DevTools are armed (`server/inspect on`) — defense in depth under the server's own gate. */
@@ -1539,6 +1631,7 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentShellData,
   ServerToAgentShellResize,
   ServerToAgentShellClose,
+  ServerToAgentSshArm,
   ServerToAgentDevtoolsRequest,
   ServerToAgentDevtoolsOpen,
   ServerToAgentDevtoolsData,
@@ -1802,6 +1895,13 @@ export const MachineView = z.object({
   rebooting: z.boolean().optional(),
   /** POL-59 — when the arming was set / last refreshed (for the "auto-disarms in N min" hint). */
   shellArmedAt: z.string().datetime().optional(),
+  /** POL-81 — operator has armed this box for SSH. Drives the Machines-view SSH toggle + chip. */
+  sshEnabled: z.boolean().default(false),
+  /** POL-81 — when SSH was armed (for the server-side TTL hint, mirroring `shellArmedAt`). */
+  sshArmedAt: z.string().datetime().optional(),
+  /** POL-81 — the box's live SSH status (the agent's report): whether sshd is up, the host/port/user
+   *  to connect to, and when it auto-disarms. Live-only, absent until the box reports (or offline). */
+  sshStatus: SshStatus.optional(),
   /** POL-101 — what this box can do about panel power (probed on the box, reported on hello). Absent
    *  for a pre-POL-101 agent, in which case the console offers no wake/sleep for it. */
   power: PowerCapabilities.optional(),
@@ -2537,6 +2637,16 @@ export type RebootBody = z.infer<typeof RebootBody>;
 /** POST /api/v1/machines/:id/shell — arm or disarm a box for the remote shell (POL-59). */
 export const ShellArmBody = z.object({ enabled: z.boolean() });
 export type ShellArmBody = z.infer<typeof ShellArmBody>;
+
+/** POST /api/v1/machines/:id/ssh — arm or disarm a box for operator SSH (POL-81). Arming requires the
+ *  operator's public key; disarming needs nothing (locking down never needs a key). */
+export const SshArmBody = z
+  .object({ enabled: z.boolean(), publicKey: SshPublicKey.optional() })
+  .refine((b) => !b.enabled || !!b.publicKey, {
+    message: "a public key is required to arm SSH",
+    path: ["publicKey"],
+  });
+export type SshArmBody = z.infer<typeof SshArmBody>;
 
 /** Show/hide the Web Inspector on one screen's panel (POL-50). Relaunches that output's browser. */
 export const InspectBody = z.object({ on: z.boolean() });
