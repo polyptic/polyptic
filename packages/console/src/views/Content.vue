@@ -342,6 +342,36 @@ const pickerDesc = computed(() =>
     ? "Keep the range and refresh controls visible in kiosk mode (kiosk=tv)."
     : "Always shown while kiosk mode is off — the full Grafana UI includes it.",
 );
+/**
+ * POL-180 — the formed URL, shown (and editable) under the Grafana display card. The read side is
+ * the canonical composition (exactly what the server will store and the screens will load); while
+ * the field has focus the operator's text is shown verbatim and folded live back into the
+ * controls — proto, address, display flags, passthrough — the same split a paste goes through. On
+ * blur the field snaps back to the canonical form.
+ */
+const urlFieldFocused = ref(false);
+const urlFieldText = ref("");
+const formedUrl = computed(() =>
+  draftAddress.value.trim() ? composeSourceUrl(draftComposition()) : "",
+);
+const shownUrl = computed(() => (urlFieldFocused.value ? urlFieldText.value : formedUrl.value));
+function onUrlFocus(): void {
+  urlFieldFocused.value = true;
+  urlFieldText.value = formedUrl.value;
+}
+function onUrlInput(raw: string): void {
+  urlFieldText.value = raw;
+  const parsed = parseAddress(raw);
+  draftProto.value = parsed.proto;
+  draftAddress.value = parsed.address;
+  const { gf, keep } = extractGrafanaFlags(parsed.pairs);
+  draftGf.value = gf;
+  draftKeep.value = keep;
+}
+function onUrlBlur(): void {
+  urlFieldFocused.value = false;
+}
+
 const reloadNote = computed(() =>
   isDashboard.value
     ? "Grafana auto-refresh already updates the data — a full reload is rarely needed."
@@ -1340,6 +1370,25 @@ function mediaFacts(s: ContentSource): string {
             </div>
           </div>
         </div>
+
+        <!-- POL-180 — the formed URL: exactly what the server stores and the screens load. Editable;
+             an edit folds back into the address and the controls above, like a paste. -->
+        <template v-if="isDashboard">
+          <label class="field-label">Formed URL</label>
+          <input
+            :value="shownUrl"
+            class="field mono"
+            spellcheck="false"
+            aria-label="Formed URL"
+            @focus="onUrlFocus"
+            @input="onUrlInput(($event.target as HTMLInputElement).value)"
+            @blur="onUrlBlur"
+            @keyup.enter="save"
+          />
+          <p class="field-hint">
+            Exactly what the screens load. Edit it and the address and options above follow.
+          </p>
+        </template>
 
         </template>
 
