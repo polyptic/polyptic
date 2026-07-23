@@ -389,8 +389,9 @@ function reporterName(machineId: string): string {
  * are the machine-readable half of the contract, and they are what tests pin.
  *
  * `installed` is `good`. Everything else is `bad` except the "the operator has to decide" cases — an
- * ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human — and
- * POL-116's `pinned-build-missing`, which is not a bootloader outcome at all.
+ * ambiguous ESP and a legacy-BIOS box are `warn`: nothing broke, the install just needs a human —
+ * POL-178's `installed-no-nvram-entry` (the install SUCCEEDED; only the firmware's bookkeeping did
+ * not), and POL-116's `pinned-build-missing`, which is not a bootloader outcome at all.
  */
 export function bootReportLine(report: BootReport): { severity: "info" | "good" | "warn" | "bad"; text: string } {
   const who = reporterName(report.machineId);
@@ -400,6 +401,18 @@ export function bootReportLine(report: BootReport): { severity: "info" | "good" 
   // for a bootloader-only install; the box's own `detail` sentence carries the specifics either way.
   if (report.ok && report.code === "installed") {
     return { severity: "good", text: `${who} installed Polyptic to disk${detail ? `: ${detail}` : ""}` };
+  }
+  // POL-178 — the installer's success-with-warning: the disk is fully written and verified, but the
+  // firmware would not keep the `Polyptic` NVRAM entry. The box still boots — the installer always
+  // writes the EFI/BOOT fallback loader — so this is `warn`, not `bad`: nothing broke, but if the
+  // next boot does not come up, the remedy is one firmware-setup entry away and this line names it.
+  if (report.code === "installed-no-nvram-entry") {
+    return {
+      severity: "warn",
+      text: `${who} installed Polyptic to disk, but the firmware would not keep the boot entry — the box boots via its default loader path; if it does not come up, add \\EFI\\polyptic\\shimx64.efi in firmware setup${
+        detail ? `: ${detail}` : ""
+      }`,
+    };
   }
   // POL-176 — a disk boot is an installed box's normal path. The route treats it as state-only and
   // never feeds this line; the sentence exists so an unexpected arrival still renders honestly.

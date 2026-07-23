@@ -101,6 +101,24 @@ describe("boot-order drift, as the operator reads it (POL-115)", () => {
     expect(line.text.startsWith(`Machine ${machineId}`)).toBe(true);
   });
 
+  test("POL-178: an install the firmware would not bookmark is a WARNING that names the remedy", () => {
+    const line = bootReportLine({
+      ok: true,
+      code: "installed-no-nvram-entry",
+      detail: "installed image new-1 on /dev/sda, but the firmware dropped the 'Polyptic' boot entry",
+      machineId,
+    });
+    expect(line.severity).toBe("warn");
+    // The install SUCCEEDED — the sentence must open with that, not with firmware trouble.
+    expect(line.text).toContain("installed Polyptic to disk");
+    expect(line.text).toContain("would not keep the boot entry");
+    expect(line.text).toContain("boots via its default loader path");
+    expect(line.text).toContain("\\EFI\\polyptic\\shimx64.efi in firmware setup");
+    expect(line.text).toContain("installed image new-1 on /dev/sda");
+    // It is NOT a failure — the sentence must not read like one.
+    expect(line.text).not.toContain("could not install");
+  });
+
   test("a bootloader install failure still reads as one — the new codes did not swallow it", () => {
     const line = bootReportLine({ ok: false, code: "no-esp", detail: "", machineId });
     expect(line.severity).toBe("bad");

@@ -2613,6 +2613,12 @@ export const BootReportCode = z.enum([
   "install-write-failed", // the wipe/partition/copy itself failed; the disk may be part-written
   "install-no-tools", // sgdisk/mkfs/mkswap missing from this image — nothing wiped, rebuild the image
   "install-no-image", // the depot serves no image for this arch, so there is nothing to install
+  // POL-178: the installer's success-WITH-warning. The disk is fully written and verified, but the
+  // firmware refused/dropped the `Polyptic` NVRAM entry — the box still boots via the EFI/BOOT
+  // fallback loader the installer always writes, so this is ok=true and a `warn` feed line, never a
+  // failure. (The installer no longer emits nvram-write-failed/nvram-entry-missing/
+  // nvram-not-persisted/boot-order-not-first; those stay for legacy offload-era reports.)
+  "installed-no-nvram-entry",
 ]);
 export type BootReportCode = z.infer<typeof BootReportCode>;
 

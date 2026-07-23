@@ -137,7 +137,7 @@ Disks under ~16 GiB are refused, loudly, before anything is written.
 
 The ESP carries `polyptic/medium-id` (`disk-esp-<timestamp>`) — from that moment **the ESP *is* the box's boot medium**. `find-boot-medium.sh` proves identity by that file's content, so the forensics trail, the splash-theme heal and the A/B kernel staging all work on an installed box unchanged, no special cases.
 
-Finally the installer registers a `Polyptic` UEFI boot entry pointing at the ESP's shim and makes it **first** — then **proves it** rather than assuming it (the POL-58 discipline): NVRAM is re-read from scratch and `BootOrder` is asserted to actually lead with the new entry before anything is called installed. Stale entries of ours — a previous `Polyptic`, or the retired offload flow's `Polyptic Netboot` — are pruned first: an install supersedes an offload.
+Finally the installer registers a `Polyptic` UEFI boot entry pointing at the ESP's shim, puts it **first** best-effort, and re-reads NVRAM to check the entry actually exists (the POL-58 verify-don't-assume discipline). Stale entries of ours — a previous `Polyptic`, or the retired offload flow's `Polyptic Netboot` — are pruned first: an install supersedes an offload. But firmware that refuses, drops, or forgets the entry does **not** fail the install: the installer always writes the removable-media fallback loader at `EFI/BOOT/BOOT<arch>.EFI`, post-wipe there is no competing OS on the disk for NVRAM to prefer, and `boot-order.sh` re-asserts any later drift — so a missing entry is reported as the success-with-warning `installed-no-nvram-entry` and the box boots via its default loader path.
 
 ### Booting from the disk
 
@@ -180,7 +180,7 @@ Firmware fights are watched, not assumed away: `boot-order.sh` runs on every pol
 
 ### What the installer refuses, and the codes it reports
 
-Nothing is wiped until every check below passes, and every outcome is one code in **Console ▸ Activity** (and the console dialog, and the on-medium forensics log). `installed` is the only success.
+Nothing is wiped until every check below passes, and every outcome is one code in **Console ▸ Activity** (and the console dialog, and the on-medium forensics log). `installed` is the clean success; `installed-no-nvram-entry` is a success too — with a warning about the firmware's bookkeeping.
 
 | Reported code | What happened | Nothing erased? |
 | --- | --- | --- |
@@ -191,8 +191,7 @@ Nothing is wiped until every check below passes, and every outcome is one code i
 | `install-no-image` | The depot serves no image manifest for this arch — nothing to install. | yes |
 | `install-no-tools` | The partitioning toolchain is missing from the image. | yes |
 | `install-write-failed` | The wipe, partitioning, formatting, download or verification failed **after** the point of no return. The disk may be part-written; the box itself is untouched (it runs from RAM) and next boot is the same netboot as before. Fix the cause and install again. | no |
-| `nvram-write-failed` / `nvram-entry-missing` / `nvram-not-persisted` | The firmware refused, dropped, or forgot the `Polyptic` boot entry. The install **is** on the disk — add an entry for `\EFI\polyptic\shim<arch>.efi` in firmware setup, or clear unused entries and install again. | disk written |
-| `boot-order-not-first` | The firmware kept the entry but still boots something else first. Move **Polyptic** to the top of the boot order in firmware setup. | disk written |
+| `installed-no-nvram-entry` | **A warning, not a failure.** The install succeeded, but the firmware refused, dropped, or forgot the `Polyptic` boot entry. The box boots via its default loader path (`EFI/BOOT/BOOT<arch>.EFI`, which the installer always writes); if the next boot does not come up, add an entry for `\EFI\polyptic\shim<arch>.efi` in firmware setup, named exactly `Polyptic`. (The installer no longer emits `nvram-*` / `boot-order-not-first` failures — and BootOrder placement was never worth failing on: post-wipe nothing else on the disk competes, and `boot-order.sh` re-asserts later drift.) | disk written, **bootable** |
 
 ### What stays true
 

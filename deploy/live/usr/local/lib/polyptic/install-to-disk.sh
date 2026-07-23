@@ -26,8 +26,9 @@
 # NEVER copies its running image: the squashfs/kernel/initrd are fetched fresh from the depot and
 # sha256-verified against that build's SHA256SUMS, so an install always lands a depot-known build.
 #
-# POL-58's discipline carries over wholesale: NOTHING is claimed that was not verified — the UEFI
-# entry is read BACK and BootOrder is asserted to lead with it — and every outcome is reported to
+# POL-58's discipline carries over: NOTHING is claimed that was not verified — the UEFI entry is
+# read BACK from NVRAM — but per POL-178 firmware that refuses/drops the entry only WARNS (the
+# unconditional EFI/BOOT fallback loader keeps the disk bootable); every outcome is reported to
 # the control plane (POST /boot/report) AND to the on-box progress file the console tails. UNLIKE
 # offload, a failure does NOT hold the boot: the box is mid-session, the wall is rendering, and the
 # operator is watching the console — report, mark `failed`, exit 1.
@@ -480,10 +481,20 @@ cp "$mnt_esp/grub/$grubdir/grub.cfg" "$mnt_esp/grub/grub.cfg"
 sync 2>/dev/null || true
 umount "$mnt_esp"; rmdir "$mnt_esp" 2>/dev/null || true; mnt_esp=""
 
-# ─── Own the boot order, then PROVE it (offload.sh's POL-58 machinery, verbatim discipline) ─────────
+# ─── Own the boot order — attempt, verify, REPORT, but never fail on it (POL-178) ───────────────────
 # Prune stale entries of OURS (both labels — an install supersedes an offload), create the `Polyptic`
-# entry fresh against the disk we actually wrote, put it FIRST keeping every other entry behind in
-# its existing order, then re-read NVRAM and refuse to claim success unless the firmware agrees.
+# entry fresh against the disk we actually wrote, put it first best-effort, then re-read NVRAM.
+#
+# POL-178 — post-write NVRAM misbehaviour DOWNGRADES to a warning; it no longer fails the install.
+# A field Dell accepted the entry and then dropped it on re-read, and a fully written, verified disk
+# was declared FAILED — yet that box would have booted anyway: this installer writes the
+# removable-media fallback pair at EFI/BOOT/BOOT<arch>.EFI unconditionally (the disk is entirely
+# ours), which is the path firmware walks when NVRAM names nothing bootable. Post-wipe there is no
+# competing OS on this disk — stale entries point at nothing and the firmware falls through — and
+# boot-order.sh (POL-115) re-asserts any later drift. D60's never-claim-silently survives: NVRAM is
+# still re-read and the outcome is REPORTED truthfully; it just no longer blocks a bootable install.
+# (The PRE-WIPE not-uefi/no-efibootmgr/no-efivars preflights stay hard failures on purpose: aborting
+# before the wipe costs nothing, and a box whose NVRAM cannot be read at all is worth stopping on.)
 progress boot-entry 90 "registering the UEFI boot entry"
 
 entries_for() { # <label> → entry numbers whose label is exactly <label>
@@ -496,27 +507,40 @@ for old in $(entries_for "$LABEL"); do efibootmgr -q -B -b "$old" >/dev/null 2>&
 # reached through the disk GRUB's fallback entry, not through a second NVRAM entry.
 for old in $(entries_for "$LABEL_LEGACY"); do efibootmgr -q -B -b "$old" >/dev/null 2>&1 || true; done
 
-efibootmgr -q -c -d "$target" -p 1 -L "$LABEL" -l "\\EFI\\polyptic\\shim$efiarch.efi" >/dev/null 2>&1 \
-  || fail nvram-write-failed "the firmware refused to store a new UEFI boot entry (its boot-variable storage may be full). The install is on $target; add a boot entry for \\EFI\\polyptic\\shim$efiarch.efi in firmware setup, or clear unused entries and install again"
+# When the firmware misbehaves, this holds the reason sentence; empty means the entry verifiably exists.
+nvram_warn=""
+if efibootmgr -q -c -d "$target" -p 1 -L "$LABEL" -l "\\EFI\\polyptic\\shim$efiarch.efi" >/dev/null 2>&1; then
+  entry="$(entries_for "$LABEL" | head -n1)"
+  if [ -n "$entry" ]; then
+    # Best-effort: put our entry first, keeping every other entry behind in its existing order. The
+    # RESULT is deliberately not asserted (POL-178): the old boot-order-not-first gate is gone —
+    # post-wipe nothing else on this disk competes, and boot-order.sh handles later drift.
+    order="$(boot_order)"
+    rest="$(printf '%s' "$order" | tr ',' '\n' | awk -v n="$entry" 'NF && toupper($0) != toupper(n)' | tr '\n' ',' | sed 's/,$//')"
+    if [ -n "$rest" ]; then efibootmgr -q -o "$entry,$rest" >/dev/null 2>&1 || true
+    else efibootmgr -q -o "$entry" >/dev/null 2>&1 || true; fi
+    # The final re-read asserts EXISTENCE only — nothing is claimed that was not verified.
+    [ -n "$(entries_for "$LABEL" | head -n1)" ] \
+      || nvram_warn="the firmware did not keep the '$LABEL' boot entry"
+  else
+    nvram_warn="the firmware accepted the '$LABEL' boot entry, then dropped it"
+  fi
+else
+  nvram_warn="the firmware refused the '$LABEL' boot entry"
+fi
 
-entry="$(entries_for "$LABEL" | head -n1)"
-[ -n "$entry" ] || fail nvram-entry-missing "the firmware accepted the new UEFI boot entry and then dropped it. The install is on $target; add a boot entry for \\EFI\\polyptic\\shim$efiarch.efi in firmware setup"
+if [ -n "$nvram_warn" ]; then
+  # Success WITH a warning, never a failure: the disk is fully written and verified, and the
+  # unconditional EFI/BOOT fallback loader makes it bootable without any NVRAM entry. The server
+  # renders `installed-no-nvram-entry` as a warn line; ok=true because the install itself succeeded.
+  detail="installed image $imgid on $target, but $nvram_warn — the box boots via its default loader path (EFI/BOOT/$fbname); if it does not come up, add \\EFI\\polyptic\\shim$efiarch.efi in firmware setup, named exactly '$LABEL'"
+  report true installed-no-nvram-entry "$detail"
+  progress done 100 "$detail"
+  say "installed image $imgid on $target ($nvram_warn — the EFI/BOOT fallback loader carries the boot)."
+  exit 0
+fi
 
-order="$(boot_order)"
-rest="$(printf '%s' "$order" | tr ',' '\n' | awk -v n="$entry" 'NF && toupper($0) != toupper(n)' | tr '\n' ',' | sed 's/,$//')"
-if [ -n "$rest" ]; then efibootmgr -q -o "$entry,$rest" >/dev/null 2>&1 || true
-else efibootmgr -q -o "$entry" >/dev/null 2>&1 || true; fi
-
-# The proof. Everything above can succeed and still leave the box booting something else; nothing is
-# called an install until the firmware, re-read from scratch, agrees that we lead.
-final="$(boot_order)"
-first="${final%%,*}"
-[ -n "$(entries_for "$LABEL" | head -n1)" ] \
-  || fail nvram-not-persisted "the UEFI boot entry did not survive being written. The install is on $target; add a boot entry for \\EFI\\polyptic\\shim$efiarch.efi in firmware setup"
-[ "$(printf '%s' "$first" | tr 'a-f' 'A-F')" = "$(printf '%s' "$entry" | tr 'a-f' 'A-F')" ] \
-  || fail boot-order-not-first "the firmware kept '$LABEL' but would not make it the first boot option (it still boots ${first:-something else} first). Move '$LABEL' to the top of the boot order in firmware setup"
-
-detail="installed image $imgid on $target (ESP + A/B slots + encrypted swap + scratch) and made '$LABEL' the first UEFI boot option. Netboot remains the recovery path"
+detail="installed image $imgid on $target (ESP + A/B slots + encrypted swap + scratch) and registered the '$LABEL' UEFI boot entry. Netboot remains the recovery path"
 report true installed "$detail"
 progress done 100 "$detail"
 say "installed image $imgid on $target. This screen boots from its own disk after the next restart."

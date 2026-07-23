@@ -7,8 +7,10 @@
 #
 # What this pins: a WIPE may only ever hit the disk the operator named, and only after every
 # refusal (bad target, removable, too small, the booted medium, mounted, unreachable depot) has had
-# its chance — with "nothing was erased" PROVEN by an empty sgdisk log, not claimed. And the POL-58
-# law carries over: nothing is called an install until the firmware, re-read, boots us first.
+# its chance — with "nothing was erased" PROVEN by an empty sgdisk log, not claimed. The POL-58
+# verify-don't-assume law survives POL-178 amended: the entry is still re-read from NVRAM, but
+# firmware that refuses/drops it now WARNS (`installed-no-nvram-entry`, done|100) instead of
+# failing — the unconditional EFI/BOOT fallback loader keeps the disk bootable without an entry.
 set -u
 HERE="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 LIB="$HERE/../usr/local/lib/polyptic"
@@ -180,6 +182,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 src="$STUB/vol-$(basename "$dev")"
+[ -f "$STUB/mount_fails_$(basename "$dev")" ] && exit 32   # knob: this device refuses to mount
 [ -d "$src" ] || exit 32
 rmdir "$dir" 2>/dev/null || true
 ln -s "$src" "$dir"
@@ -362,18 +365,46 @@ has "squashfs mismatch: failed status"     "failed|-|" "$(last_status "$d")"
 eq  "squashfs mismatch: image not committed" "no" "$([ -f "$d/vol-sdb2/LiveOS/squashfs.img" ] && echo yes || echo no)"
 eq  "squashfs mismatch: no Polyptic entry"  "0" "$(grep -c '^Boot[0-9A-F]* Polyptic$' "$d/nvram")"
 
-# ─── 5) THE POL-58 LAW: firmware that will not boot us first is a FAILURE, reported as one ──────────
+# ─── 5) POL-178: post-write NVRAM misbehaviour WARNS, never fails — the disk is bootable anyway ─────
+# The installer writes EFI/BOOT/BOOT<arch>.EFI unconditionally, so a firmware that will not keep the
+# entry still boots the disk via the fallback path. The verify-don't-assume half of POL-58 survives:
+# the entry is still re-read, the outcome is still reported — it just no longer blocks.
+
+# Sticky order: the entry EXISTS on re-read (existence is all that is asserted now) → plain success.
 d="$(new_case sticky-order)"; : > "$d/nvram_sticky_order"; : > "$d/nvram_appends"
 out="$(install "$d")"
-eq  "sticky order: fails (never claims success)" "1" "$(exit_of "$out")"
-has "sticky order: reported code"          '"code":"boot-order-not-first"' "$(posted "$d")"
-has "sticky order: failed status line"     "failed|-|" "$(last_status "$d")"
-has "sticky order: tells the operator where to fix it" "firmware setup" "$out"
+eq  "sticky order: succeeds (entry exists; order-first is no longer a gate)" "0" "$(exit_of "$out")"
+has "sticky order: reported code"          '"code":"installed"' "$(posted "$d")"
+has "sticky order: done status line"       "done|100|" "$(last_status "$d")"
 
+# Amnesia (the field Dell): entry accepted then dropped → success WITH the warning code, and the
+# detail names the fallback loader path and the manual firmware-setup remedy.
 d="$(new_case amnesia)"; : > "$d/nvram_amnesia"
 out="$(install "$d")"
-eq  "amnesia: fails"                       "1" "$(exit_of "$out")"
-has "amnesia: reported code"               '"code":"nvram-entry-missing"' "$(posted "$d")"
+eq  "amnesia: succeeds with a warning"     "0" "$(exit_of "$out")"
+has "amnesia: reported code"               '"code":"installed-no-nvram-entry"' "$(posted "$d")"
+has "amnesia: reported ok=true"            '"ok":true' "$(posted "$d")"
+has "amnesia: done status line"            "done|100|" "$(last_status "$d")"
+has "amnesia: names the fallback loader path" "EFI/BOOT/BOOTX64.EFI" "$(last_status "$d")"
+has "amnesia: names the manual remedy"     "firmware setup" "$(last_status "$d")"
+eq  "amnesia: image still committed"       "FAKE-SQUASHFS" "$(cat "$d/vol-sdb2/LiveOS/squashfs.img" 2>/dev/null)"
+eq  "amnesia: fallback loader on the ESP"  "SIGNED-SHIM" "$(cat "$d/vol-sdb1/EFI/BOOT/BOOTX64.EFI" 2>/dev/null)"
+
+# Read-only NVRAM: the create itself refused → the same warning, not a failure.
+d="$(new_case nvram-readonly)"; : > "$d/nvram_readonly"
+out="$(install "$d")"
+eq  "readonly nvram: succeeds with a warning" "0" "$(exit_of "$out")"
+has "readonly nvram: reported code"        '"code":"installed-no-nvram-entry"' "$(posted "$d")"
+has "readonly nvram: done status line"     "done|100|" "$(last_status "$d")"
+
+# But a WRITE failure that genuinely blocks booting still hard-fails: the warning posture is for
+# NVRAM only, never for the disk's own contents.
+d="$(new_case loader-write-fails)"
+: > "$d/mount_fails_sdb1"   # the new ESP refuses to mount → the loaders can never be written
+out="$(install "$d")"
+eq  "loader write blocked: still fails"    "1" "$(exit_of "$out")"
+has "loader write blocked: reported code"  '"code":"install-write-failed"' "$(posted "$d")"
+has "loader write blocked: failed status"  "failed|-|" "$(last_status "$d")"
 
 # ─── 6) The token never leaks into a report body ────────────────────────────────────────────────────
 d="$(new_case token-hygiene)"; out="$(install "$d")"
