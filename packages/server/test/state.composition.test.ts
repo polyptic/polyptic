@@ -21,7 +21,8 @@ const COMPOSITION: SourceComposition = {
   gf: { ...gfDefaults(), kiosk: true, picker: true, refresh: "5m" },
   auth: "none",
 };
-const COMPOSED = "https://grafana.example.com/d/abc123/factory-overview?orgId=1&kiosk=tv&refresh=5m";
+const COMPOSED =
+  "https://grafana.example.com/d/abc123/factory-overview?orgId=1&kiosk=tv&hideLogo=1&_dash.hideTimePicker=true&refresh=5m";
 
 let store: MemoryStore;
 let cp: ControlPlane;
@@ -85,7 +86,7 @@ describe("update", () => {
     expect(patched.ok).toBe(true);
     if (!patched.ok) return;
     expect(patched.source.url).toBe(
-      "https://grafana.example.com/d/abc123/factory-overview?orgId=1&kiosk=true",
+      "https://grafana.example.com/d/abc123/factory-overview?orgId=1&kiosk=1&hideLogo=1&_dash.hideTimePicker=true",
     );
     // The verdict described the old address — it must not survive the recomposition.
     expect(patched.source.framing).toBeUndefined();
