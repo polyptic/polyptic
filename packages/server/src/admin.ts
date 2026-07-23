@@ -25,6 +25,7 @@ import type {
   ScreenView,
   ServerCapabilities,
   ServerToAdminMessage,
+  SshStatus,
 } from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
@@ -109,6 +110,10 @@ export class Presence {
    *  machine reconnects, and expired after REBOOTING_TTL_MS so a box that dies mid-reboot doesn't
    *  read "rebooting…" in the console forever. */
   private readonly rebootingSince = new Map<string, number>();
+  /** POL-81 — machineId → the box's last-reported SSH status (armed/listening/host/port/user/TTL).
+   *  Live-only, like the rest of Presence: an armed box that is offline has no reachable host, so the
+   *  connection details are a lie the operator can't act on; cleared when the box goes fully offline. */
+  private readonly sshStatuses = new Map<string, SshStatus>();
 
   /** POL-101 — screenIds whose panel is ASLEEP, with the rungs that got it there. Ephemeral by
    *  design: a box that drops comes back with its panels LIT (the compositor re-asserts `dpms on` at
@@ -157,6 +162,8 @@ export class Presence {
       this.agentChannel.delete(machineId);
       // A fully-offline box's dial error describes a session that no longer exists.
       this.mtlsDialErrors.delete(machineId);
+      // POL-81 — the box is gone; its SSH connection details (host/port) no longer describe anything.
+      this.sshStatuses.delete(machineId);
     } else this.agentConns.set(machineId, n);
   }
 
@@ -206,6 +213,17 @@ export class Presence {
 
   isScreenInspecting(screenId: string): boolean {
     return this.inspecting.has(screenId);
+  }
+
+  /** POL-81 — record the box's own SSH status, from `agent/ssh-status`. The operator's arm click is a
+   *  request; this ack (like power-ack) is the truth about whether sshd actually came up. */
+  setSshStatus(machineId: string, status: SshStatus): void {
+    this.sshStatuses.set(machineId, status);
+  }
+
+  /** POL-81 — the box's last-reported SSH status (undefined while offline or before it reports). */
+  sshStatus(machineId: string): SshStatus | undefined {
+    return this.sshStatuses.get(machineId);
   }
 
   /** POL-119 — record whether a cast session is live on a screen, per the agent's status report
@@ -498,6 +516,12 @@ export function buildAdminState(
       shellEnabled: machine.shellEnabled ?? false,
       rebooting: presence.isMachineRebooting(machine.id),
       shellArmedAt: machine.shellArmedAt,
+      // POL-81 — SSH arming intent (registry) + the box's live SSH status (agent-reported). The status
+      // is live-only, like vitals: an armed box that is offline shows the intent but no connection
+      // details (the host/port are only true while the box is up and reporting).
+      sshEnabled: machine.sshEnabled ?? false,
+      sshArmedAt: machine.sshArmedAt,
+      sshStatus: presence.isMachineOnline(machine.id) ? presence.sshStatus(machine.id) : undefined,
       power: machine.power, // POL-101 — dpms / cec, as the box itself reported it
       // POL-92 — the latest host-vitals sample, but ONLY while the box is online. A CPU reading from
       // a machine that has since gone dark is not health data, it is an epitaph; the console says

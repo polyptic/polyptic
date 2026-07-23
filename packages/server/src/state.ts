@@ -630,6 +630,9 @@ export class ControlPlane {
       lastSeen: machine.lastSeen,
       shellEnabled: machine.shellEnabled ?? false,
       shellArmedAt: machine.shellArmedAt,
+      sshEnabled: machine.sshEnabled ?? false,
+      sshArmedAt: machine.sshArmedAt,
+      sshPublicKey: machine.sshPublicKey,
       tags: machine.tags ?? [],
       imageId: machine.imageId,
       imageIdAt: machine.imageIdAt,
@@ -666,6 +669,10 @@ export class ControlPlane {
         lastSeen: m.lastSeen,
         shellEnabled: m.shellEnabled ?? false,
         shellArmedAt: m.shellArmedAt,
+        // POL-81 — SSH arming, off on legacy rows; the public key rides along for reconcile.
+        sshEnabled: m.sshEnabled ?? false,
+        sshArmedAt: m.sshArmedAt,
+        sshPublicKey: m.sshPublicKey,
         // POL-103 — legacy rows have no tags column value; they load untagged.
         tags: m.tags ?? [],
         // POL-105 — the last build this box reported booting (absent until it reports one).
@@ -1201,6 +1208,11 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      // POL-81 — SSH arming is registry state, not anything the box reports; a re-hello preserves it
+      // (and the server reconciles the arm to the reconnecting box — see ws.ts onHello).
+      sshEnabled: existing?.sshEnabled ?? false,
+      sshArmedAt: existing?.sshArmedAt,
+      sshPublicKey: existing?.sshPublicKey,
       // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
       // anything the box reports about itself.
       tags: existing?.tags ?? [],
@@ -1258,6 +1270,9 @@ export class ControlPlane {
       lastSeen: new Date().toISOString(),
       shellEnabled: existing?.shellEnabled ?? false,
       shellArmedAt: existing?.shellArmedAt,
+      sshEnabled: existing?.sshEnabled ?? false,
+      sshArmedAt: existing?.sshArmedAt,
+      sshPublicKey: existing?.sshPublicKey,
       // POL-103 — a re-hello must never wipe the operator's tags: they are registry state, not
       // anything the box reports about itself.
       tags: existing?.tags ?? [],
@@ -1588,6 +1603,73 @@ export class ControlPlane {
   /** Whether a machine is currently armed for the remote shell (the WS relay's gate). */
   isShellEnabled(machineId: string): boolean {
     return this.machines.get(machineId)?.shellEnabled === true;
+  }
+
+  // ── Operator SSH access (POL-81) ────────────────────────────────────────────
+  // Mirrors the remote-shell arming above (arm stamps a time; a sweep auto-disarms past the TTL), so
+  // there is ONE auto-disarm mechanism for both surfaces. The differences are deliberate: SSH stores
+  // the operator's PUBLIC key (needed to reconcile the arm to the box on reconnect), and its sweep is
+  // purely time-since-arm — an SSH session is box↔operator and INVISIBLE to the control plane, so
+  // there is no "activity" to refresh on, and the armed window is a fixed bound rather than an idle
+  // one. The box also runs its own TTL timer, so a box whose control plane vanished still closes.
+
+  /**
+   * Arm/disarm a machine for SSH (POL-81). On arm, `publicKey` is stored (public, not a secret) so the
+   * arm is reconciled to the box on reconnect. Returns the machine so the caller can push to the agent
+   * + broadcast, else null. The WS-relay-style "close on disarm" is the agent stopping sshd; here we
+   * only own the registry intent.
+   */
+  async setSshEnabled(machineId: string, enabled: boolean, publicKey?: string): Promise<Machine | null> {
+    const machine = this.machines.get(machineId);
+    if (!machine) return null;
+    machine.sshEnabled = enabled;
+    machine.sshArmedAt = enabled ? new Date().toISOString() : undefined;
+    machine.sshPublicKey = enabled ? publicKey : undefined;
+    await this.store.setMachineSshEnabled(
+      machineId,
+      enabled,
+      machine.sshArmedAt ?? null,
+      machine.sshPublicKey ?? null,
+    );
+    this.emit(
+      enabled ? "bad" : "good",
+      `SSH ${enabled ? "armed" : "disarmed"} on ${machine.label}`,
+    );
+    return machine;
+  }
+
+  /**
+   * Auto-disarm boxes armed past `ttlMs` (POL-81) — the SSH twin of {@link disarmExpiredShells},
+   * driven by the SAME sweep tick. Purely time-since-arm (no `keepArmed`: an SSH session is invisible
+   * to us). `ttlMs <= 0` disables the sweep. Returns the disarmed machines so the caller can push the
+   * disarm to each agent + broadcast. `nowMs` is injected so the clock is deterministic in tests.
+   */
+  async disarmExpiredSshAccess(ttlMs: number, nowMs: number): Promise<Machine[]> {
+    if (ttlMs <= 0) return [];
+    const disarmed: Machine[] = [];
+    for (const machine of this.machines.values()) {
+      if (!machine.sshEnabled) continue;
+      const armedAt = machine.sshArmedAt ? Date.parse(machine.sshArmedAt) : 0;
+      if (!armedAt || nowMs - armedAt < ttlMs) continue;
+      machine.sshEnabled = false;
+      machine.sshArmedAt = undefined;
+      machine.sshPublicKey = undefined;
+      await this.store.setMachineSshEnabled(machine.id, false, null, null);
+      this.emit("good", `SSH auto-disarmed on ${machine.label} (past the TTL)`);
+      disarmed.push(machine);
+    }
+    return disarmed;
+  }
+
+  /** Whether a machine is currently armed for SSH. */
+  isSshEnabled(machineId: string): boolean {
+    return this.machines.get(machineId)?.sshEnabled === true;
+  }
+
+  /** The armed operator public key for a machine (for reconcile on reconnect), or undefined. */
+  sshPublicKey(machineId: string): string | undefined {
+    const machine = this.machines.get(machineId);
+    return machine?.sshEnabled ? machine.sshPublicKey : undefined;
   }
 
   /**

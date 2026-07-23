@@ -45,6 +45,10 @@ export class ShellRelay {
 
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
+  /** POL-81 — extra arming sweeps to run on the SAME 60s tick (so there is ONE auto-disarm timer for
+   *  both the shell and SSH, not two). Each is called with `nowMs`; failures are logged, not fatal. */
+  private readonly extraSweeps: Array<(nowMs: number) => Promise<unknown>> = [];
+
   constructor(
     private readonly agentHub: AgentHub,
     private readonly control: ControlPlane,
@@ -65,9 +69,17 @@ export class ShellRelay {
    * session is spared (its arm time is also refreshed on open). `ttlMs <= 0` disables the sweep.
    */
   startArmingSweep(ttlMs: number): void {
-    if (this.sweepTimer || ttlMs <= 0) return;
+    // Even when the shell TTL is disabled, an extra sweep (e.g. SSH) may need the tick. Start the
+    // timer if EITHER has work to do.
+    if (this.sweepTimer) return;
+    if (ttlMs <= 0 && this.extraSweeps.length === 0) return;
     this.sweepTimer = setInterval(() => void this.sweepArming(ttlMs), 60_000);
     if (typeof this.sweepTimer.unref === "function") this.sweepTimer.unref();
+  }
+
+  /** POL-81 — register another arming sweep on the shared tick (see {@link extraSweeps}). */
+  registerExtraSweep(sweep: (nowMs: number) => Promise<unknown>): void {
+    this.extraSweeps.push(sweep);
   }
 
   stopArmingSweep(): void {
@@ -76,13 +88,26 @@ export class ShellRelay {
   }
 
   private async sweepArming(ttlMs: number): Promise<void> {
+    const now = Date.now();
     try {
-      const disarmed = await this.control.disarmExpiredShells(ttlMs, Date.now(), (id) => this.hasSession(id));
-      if (disarmed.length === 0) return;
-      for (const m of disarmed) this.closeMachineSessions(m.id, "remote shell auto-disarmed (idle)");
-      this.broadcaster.broadcast();
+      if (ttlMs > 0) {
+        const disarmed = await this.control.disarmExpiredShells(ttlMs, now, (id) => this.hasSession(id));
+        if (disarmed.length > 0) {
+          for (const m of disarmed) this.closeMachineSessions(m.id, "remote shell auto-disarmed (idle)");
+          this.broadcaster.broadcast();
+        }
+      }
     } catch (err) {
       this.log.error({ event: "shell.sweep_error", err: String(err) }, "arming sweep failed");
+    }
+    // POL-81 — SSH (and any future) arming sweeps share this tick. Each is independently guarded so one
+    // failing sweep never starves the others.
+    for (const sweep of this.extraSweeps) {
+      try {
+        await sweep(now);
+      } catch (err) {
+        this.log.error({ event: "shell.extra_sweep_error", err: String(err) }, "extra arming sweep failed");
+      }
     }
   }
 

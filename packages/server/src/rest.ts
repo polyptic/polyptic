@@ -36,6 +36,7 @@
 import { z } from "zod";
 
 import type { ShellRelay } from "./shell-relay";
+import type { SshAccessManager } from "./ssh-access";
 import type { DevtoolsRelay } from "./devtools-relay";
 import { probeFraming } from "./framing";
 import type { PanelPowerScheduler } from "./panel-power";
@@ -66,6 +67,7 @@ import {
   PreRegistration,
   RebootBody,
   ShellArmBody,
+  SshArmBody,
   RenameMachineBody,
   RenameMuralBody,
   RenameScreenBody,
@@ -181,6 +183,8 @@ export function registerRestRoutes(
   activity: ActivityLog,
   presence: Presence,
   shellRelay: ShellRelay,
+  /** POL-81 — operator SSH access: the arm/disarm endpoint pushes to the box's sshd via this. */
+  sshManager: SshAccessManager,
   devtoolsRelay: DevtoolsRelay,
   /** POL-94 — per-source content health; a deleted source's reports are dropped with it. */
   health: SourceHealthTracker,
@@ -714,6 +718,50 @@ export function registerRestRoutes(
       body.data.enabled ? "remote shell armed" : "remote shell disarmed",
     );
     return { ok: true, machineId: machine.id, shellEnabled: machine.shellEnabled ?? false };
+  });
+
+  // POST /api/v1/machines/:machineId/ssh  { enabled, publicKey? }  -> arm/disarm SSH (POL-81)
+  //
+  // GATED (under /api/v1) and, in the console, ADMIN-only (a root-capable session on a wall box). OFF
+  // by default per box, exactly like the remote shell. Arming installs the operator's PUBLIC key for a
+  // dedicated debug user, starts sshd on the box, and auto-disarms after the TTL. The security posture
+  // is enforced on the box (key-only, no root login, root account locked, box-side TTL); this endpoint
+  // is the registry intent + the push to the box's sshd via the agent WS.
+  fastify.post("/api/v1/machines/:machineId/ssh", async (request, reply) => {
+    const params = MachineParams.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    const body = SshArmBody.safeParse(request.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+
+    // Same trust boundary as the shell (POL-117): an unapproved box must not be armable — approval is
+    // the boundary, and SSH would reach a real login on hardware nobody admitted. Disarming is always
+    // allowed (locking down never needs approval).
+    const target = control.getMachine(params.data.machineId);
+    if (target && target.status !== "approved" && body.data.enabled) {
+      return reply.code(409).send({
+        error: `machine ${target.id} is ${target.status}, not approved, so SSH cannot be armed on it`,
+      });
+    }
+
+    const machine = await control.setSshEnabled(
+      params.data.machineId,
+      body.data.enabled,
+      body.data.publicKey,
+    );
+    if (!machine) return reply.code(404).send({ error: `unknown machine: ${params.data.machineId}` });
+
+    // Push to the box's sshd. On arm the box installs the key + starts sshd; on disarm it stops sshd +
+    // removes the key. An OFFLINE box reconciles on its next connect (arm) or comes up closed anyway
+    // (disarm) — sshd is not enabled at boot and the box-side TTL still fires.
+    if (body.data.enabled && body.data.publicKey) sshManager.arm(machine.id, body.data.publicKey);
+    else if (!body.data.enabled) sshManager.disarm(machine.id);
+
+    broadcaster.broadcast();
+    fastify.log.info(
+      { event: "machine.ssh", machineId: machine.id, enabled: body.data.enabled },
+      body.data.enabled ? "ssh armed" : "ssh disarmed",
+    );
+    return { ok: true, machineId: machine.id, sshEnabled: machine.sshEnabled ?? false };
   });
 
   // ── Tags + selector-targeted bulk operations (POL-103) ──────────────────────

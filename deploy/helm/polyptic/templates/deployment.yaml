@@ -123,6 +123,12 @@ spec:
             - name: SHELL_ARM_TTL_MS
               value: {{ mul (int .Values.remoteShell.armTtlSeconds) 1000 | quote }}
             {{- end }}
+            {{- if .Values.operatorSsh.armTtlSeconds }}
+            # POL-81 — auto-disarm operator SSH left armed this long. 0 disables the server sweep (the
+            # box-side TTL still fires). Shares the one arming-sweep tick with the shell.
+            - name: SSH_ARM_TTL_MS
+              value: {{ mul (int .Values.operatorSsh.armTtlSeconds) 1000 | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

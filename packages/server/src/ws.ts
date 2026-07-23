@@ -62,6 +62,7 @@ import type { AgentHub, PlayerHub } from "./hub";
 import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import { ShellRelay } from "./shell-relay";
+import type { SshAccessManager } from "./ssh-access";
 import type { DevtoolsRelay } from "./devtools-relay";
 import type { SourceHealthTracker } from "./source-health";
 import { powerAckLine } from "./panel-power";
@@ -93,6 +94,8 @@ interface WsDeps {
   devtoolsRelay: DevtoolsRelay;
   /** POL-101 — panel-hours scheduler; reconciles a box's panels to their window when it says hello. */
   panelPower: PanelPowerScheduler;
+  /** POL-81 — operator SSH access: drives the box's sshd (arm/disarm/reconcile) + handles ssh-status. */
+  sshManager: SshAccessManager;
   log: FastifyBaseLogger;
   /** Allowed browser origins for the /admin WS upgrade (anti-CSWSH); from CORS_ORIGIN. */
   allowedOrigins: string[];
@@ -167,7 +170,7 @@ function peerAddress(req: IncomingMessage): string | undefined {
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls, agentUpdate } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, sshManager, log, allowedOrigins, agentMtls, agentUpdate } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -296,7 +299,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   });
 
   agentWss.on("connection", (ws: WebSocket, channel: AgentChannel, remoteAddress?: string) =>
-    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, agentUpdate, log),
+    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, sshManager, devtoolsRelay, panelPower, agentUpdate, log),
   );
 
   // POL-25 — the mTLS agent channel: a second listener whose TLS handshake already rejected any
@@ -346,6 +349,7 @@ function handleAgent(
   activity: ActivityLog,
   capture: CaptureCoordinator,
   shellRelay: ShellRelay,
+  sshManager: SshAccessManager,
   devtoolsRelay: DevtoolsRelay,
   panelPower: PanelPowerScheduler,
   agentUpdate: AgentUpdateService,
@@ -555,6 +559,10 @@ function handleAgent(
           // startup). If a screen is outside its panel hours right now, sleep it again; in hours,
           // this does nothing at all — a wall that should be showing content is never blanked.
           panelPower.reconcileMachine(msg.machineId);
+          // POL-81 — a box that was ARMED for SSH and then dropped comes back with sshd stopped (it is
+          // not enabled at boot — default-closed). Re-push the arm so it reconciles to the operator's
+          // intent: re-install the key + restart sshd. No-op when the box is not armed.
+          sshManager.reconcile(msg.machineId);
           log.info(
             {
               event: "agent.hello",
@@ -865,6 +873,11 @@ function handleAgent(
       shellRelay.dataFromAgent(msg.machineId, msg.sessionId, msg.dataBase64);
     } else if (msg.t === "agent/shell-closed") {
       shellRelay.closedFromAgent(msg.machineId, msg.sessionId, msg.reason);
+    } else if (msg.t === "agent/ssh-status") {
+      // POL-81 — the box's own report of whether sshd came up + the connection details. Like power-ack,
+      // this ack (not the operator's click) is the truth the console shows.
+      const { t: _t, machineId: _m, ...status } = msg;
+      sshManager.onStatusFromAgent(msg.machineId, status);
     } else if (msg.t === "agent/devtools-response") {
       devtoolsRelay.responseFromAgent(msg.machineId, msg.reqId, msg.ok, msg.status, msg.contentType, msg.bodyBase64, msg.error);
     } else if (msg.t === "agent/devtools-opened") {

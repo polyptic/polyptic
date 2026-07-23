@@ -49,6 +49,13 @@ export interface PersistedMachine {
   shellEnabled?: boolean;
   /** POL-59 — ISO time the shell was armed / last used, for the auto-disarm TTL sweep. */
   shellArmedAt?: string;
+  /** POL-81 — operator armed this box for SSH. Undefined on legacy rows → false. */
+  sshEnabled?: boolean;
+  /** POL-81 — ISO time SSH was armed, for the auto-disarm TTL sweep (mirrors shellArmedAt). */
+  sshArmedAt?: string;
+  /** POL-81 — the operator's PUBLIC key installed while armed (public, not a secret): kept so the arm
+   *  is reconciled to the box on reconnect and across a server restart. Cleared on disarm. */
+  sshPublicKey?: string;
   /** POL-103 — operator tags ("atrium", "floor:2"). Undefined on legacy rows → no tags. */
   tags?: string[];
   /** POL-105 — the OS image id this box last reported booting, and when. Persisted (not live-only
@@ -520,6 +527,14 @@ export interface Store {
   setMachineStatus(id: string, status: EnrollmentStatus): Promise<void>;
   /** Arm/disarm a machine for the remote shell (POL-59), stamping the arm time. No-op if absent. */
   setMachineShellEnabled(id: string, enabled: boolean, armedAt: string | null): Promise<void>;
+  /** POL-81 — arm/disarm a machine for SSH, stamping the arm time and the operator's public key
+   *  (both null on disarm). The key is public, not a secret. No-op if the row is absent. */
+  setMachineSshEnabled(
+    id: string,
+    enabled: boolean,
+    armedAt: string | null,
+    publicKey: string | null,
+  ): Promise<void>;
   /** POL-103 — replace a machine's whole tag set (add + remove are the same call). No-op if absent. */
   setMachineTags(id: string, tags: string[]): Promise<void>;
   /** POL-105 — record the OS image id a box reported BOOTING, and when. No-op if absent. */

@@ -79,6 +79,9 @@ interface MachineRow {
   last_seen: Date | null;
   shell_enabled: boolean | null;
   shell_armed_at: Date | null;
+  ssh_enabled: boolean | null;
+  ssh_armed_at: Date | null;
+  ssh_public_key: string | null;
   tags: unknown;
   image_id: string | null;
   image_id_at: Date | null;
@@ -330,6 +333,9 @@ export class PostgresStore implements Store {
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS credential_hash text`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_enabled boolean NOT NULL DEFAULT false`;
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS shell_armed_at timestamptz`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS ssh_enabled boolean NOT NULL DEFAULT false`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS ssh_armed_at timestamptz`;
+    await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS ssh_public_key text`;
     // POL-103 — operator tags. jsonb, not a join table: a tag set is small, always read whole, and
     // only ever replaced whole; a `machine_tags` table would buy nothing but a second write path.
     await sql`ALTER TABLE machines ADD COLUMN IF NOT EXISTS tags jsonb NOT NULL DEFAULT '[]'::jsonb`;
@@ -728,7 +734,7 @@ export class PostgresStore implements Store {
       zoomPreferenceRows,
       audioPreferenceRows,
     ] = await Promise.all([
-      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
+      sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, ssh_enabled, ssh_armed_at, ssh_public_key, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled, variables FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
       sql<MetaRow[]>`SELECT revision, active_scene_id FROM meta WHERE id = 1`,
@@ -763,6 +769,9 @@ export class PostgresStore implements Store {
         lastSeen: row.last_seen ? row.last_seen.toISOString() : undefined,
         shellEnabled: row.shell_enabled ?? false,
         shellArmedAt: row.shell_armed_at ? row.shell_armed_at.toISOString() : undefined,
+        sshEnabled: row.ssh_enabled ?? false,
+        sshArmedAt: row.ssh_armed_at ? row.ssh_armed_at.toISOString() : undefined,
+        sshPublicKey: row.ssh_public_key ?? undefined,
         // POL-103 — legacy rows (NULL) and anything unrecognised load as untagged.
         tags: MachineTags.safeParse(row.tags).data ?? [],
         // POL-105 — the last image id the box reported booting (NULL until it reports one).
@@ -921,7 +930,7 @@ export class PostgresStore implements Store {
   async upsertMachine(machine: PersistedMachine): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
+      INSERT INTO machines (id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, ssh_enabled, ssh_armed_at, ssh_public_key, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at)
       VALUES (
         ${machine.id},
         ${machine.label},
@@ -933,6 +942,9 @@ export class PostgresStore implements Store {
         ${machine.lastSeen ? new Date(machine.lastSeen) : null},
         ${machine.shellEnabled ?? false},
         ${machine.shellArmedAt ? new Date(machine.shellArmedAt) : null},
+        ${machine.sshEnabled ?? false},
+        ${machine.sshArmedAt ? new Date(machine.sshArmedAt) : null},
+        ${machine.sshPublicKey ?? null},
         ${sql.json(machine.tags ?? [])},
         ${machine.imageId ?? null},
         ${machine.imageIdAt ? new Date(machine.imageIdAt) : null},
@@ -956,6 +968,9 @@ export class PostgresStore implements Store {
         last_seen       = EXCLUDED.last_seen,
         shell_enabled   = EXCLUDED.shell_enabled,
         shell_armed_at  = EXCLUDED.shell_armed_at,
+        ssh_enabled     = EXCLUDED.ssh_enabled,
+        ssh_armed_at    = EXCLUDED.ssh_armed_at,
+        ssh_public_key  = EXCLUDED.ssh_public_key,
         tags            = EXCLUDED.tags,
         -- POL-105 — never let a re-hello that carries no image id ERASE the one we already know: an
         -- older agent (or a dev box with no live image) must not blank a real box's reported build.
@@ -1001,6 +1016,16 @@ export class PostgresStore implements Store {
   async setMachineShellEnabled(id: string, enabled: boolean, armedAt: string | null): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE machines SET shell_enabled = ${enabled}, shell_armed_at = ${armedAt ? new Date(armedAt) : null} WHERE id = ${id}`;
+  }
+
+  async setMachineSshEnabled(
+    id: string,
+    enabled: boolean,
+    armedAt: string | null,
+    publicKey: string | null,
+  ): Promise<void> {
+    const sql = this.sql;
+    await sql`UPDATE machines SET ssh_enabled = ${enabled}, ssh_armed_at = ${armedAt ? new Date(armedAt) : null}, ssh_public_key = ${publicKey} WHERE id = ${id}`;
   }
 
   async deleteMachine(id: string): Promise<void> {

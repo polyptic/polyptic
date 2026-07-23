@@ -287,6 +287,15 @@ extraEnv: []
 remoteShell:
   armTtlSeconds: 3600
 
+# Operator SSH (POL-81) — an admin can ARM SSH on a box from Console ▸ Machines: sshd starts, the
+# operator's public key is installed for a dedicated debug user (passwordless sudo, key-auth only, no
+# root login, root account locked). Off by default per box. This bounds how long a forgotten armed box
+# stays SSH-open: the server auto-disarms it after this many seconds (the box also runs its OWN timer,
+# so it closes even if the control plane is unreachable). 0 disables the SERVER sweep; the box-side TTL
+# and default-closed-on-reboot still apply.
+operatorSsh:
+  armTtlSeconds: 3600
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Application configuration (mirrors deploy/.env.example).
 # Non-secret values land in a ConfigMap; secret values land in a Secret.

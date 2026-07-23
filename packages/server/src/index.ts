@@ -54,6 +54,7 @@ import { registerDevtoolsRoutes } from "./devtools-routes";
 import { registerSpaHosting, spaConfigFromEnv } from "./spa";
 import { ControlPlane } from "./state";
 import { createStore } from "./store";
+import { SshAccessManager, DEFAULT_SSH_CONFIG } from "./ssh-access";
 import { TokenService } from "./tokens";
 import { attachWebSockets } from "./ws";
 
@@ -81,6 +82,9 @@ const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS ?? 4000);
 // POL-59 — auto-disarm a remote shell left armed-and-idle this long (default 60 min). 0 disables the
 // sweep (arming stays sticky until a manual disarm). Guards against a forgotten armed box.
 const SHELL_ARM_TTL_MS = Number(process.env.SHELL_ARM_TTL_MS ?? 60 * 60 * 1000);
+// POL-81 — auto-disarm SSH left armed this long (default 60 min). 0 disables the server sweep (the
+// box-side TTL still applies). Shared with the shell's one arming-sweep tick.
+const SSH_ARM_TTL_MS = Number(process.env.SSH_ARM_TTL_MS ?? 60 * 60 * 1000);
 // Max thumbnails held in memory at once (LRU cap).
 const THUMBNAIL_CAPACITY = Number(process.env.CAPTURE_THUMBNAIL_CAP ?? 300);
 // POL-89 — how often the scene scheduler re-resolves "what should be on the wall right now". A
@@ -612,6 +616,19 @@ const provisionConfig = provisionConfigFromEnv();
 // told to pull `/dist/agent/<arch>` and re-exec — no full image rebuild, no reboot (POL-160).
 const agentUpdate = new AgentUpdateService(provisionConfig.agentDistDir, BUILD_VERSION, fastify.log);
 
+// POL-81 — operator SSH access: drives the box's sshd over the agent WS (arm/disarm/reconcile) and
+// auto-disarms past the TTL on the SAME sweep tick as the shell (registered below). Built before the
+// WS attach so `agent/ssh-status` + hello-reconcile can reach it.
+const sshManager = new SshAccessManager(
+  agentHub,
+  control,
+  activity,
+  presence,
+  broadcaster,
+  fastify.log,
+  { ...DEFAULT_SSH_CONFIG, ttlMs: SSH_ARM_TTL_MS },
+);
+
 // The WS channels attach first so the remote-shell relay (POL-59) exists before REST — the
 // arm/disarm endpoint closes a box's live sessions the instant it is disarmed.
 const shellRelay = attachWebSockets({
@@ -630,11 +647,14 @@ const shellRelay = attachWebSockets({
   health: sourceHealth,
   devtoolsRelay,
   panelPower,
+  sshManager,
   log: fastify.log,
   allowedOrigins: CORS_ORIGIN,
   agentMtls: agentMtlsChannel,
   agentUpdate,
 });
+// POL-81 — one arming-sweep timer drives BOTH surfaces: register the SSH sweep, then start the tick.
+shellRelay.registerExtraSweep((now) => sshManager.sweepExpired(now));
 shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
 registerRestRoutes(
   fastify,
@@ -655,6 +675,7 @@ registerRestRoutes(
   activity,
   presence,
   shellRelay,
+  sshManager,
   devtoolsRelay,
   sourceHealth,
   panelPower,

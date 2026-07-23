@@ -137,6 +137,20 @@ export class MemoryStore implements Store {
     }
   }
 
+  async setMachineSshEnabled(
+    id: string,
+    enabled: boolean,
+    armedAt: string | null,
+    publicKey: string | null,
+  ): Promise<void> {
+    const machine = this.machines.get(id);
+    if (machine) {
+      machine.sshEnabled = enabled;
+      machine.sshArmedAt = armedAt ?? undefined;
+      machine.sshPublicKey = publicKey ?? undefined;
+    }
+  }
+
   async setMachineTags(id: string, tags: string[]): Promise<void> {
     const machine = this.machines.get(id);
     if (machine) machine.tags = [...tags];
