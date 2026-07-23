@@ -27,7 +27,7 @@ export type GfRefresh = z.infer<typeof GfRefresh>;
 
 /** The Grafana display controls (dashboard kind only). These compose to query-string flags:
  *
- *    kiosk ON, picker OFF   →  `kiosk`
+ *    kiosk ON, picker OFF   →  `kiosk=true` (POL-180: some Grafana builds ignore a bare `kiosk`)
  *    kiosk ON, picker ON    →  `kiosk=tv`
  *    kiosk OFF              →  (no kiosk param)
  *    range "custom"         →  `from=…&to=…` (Grafana time syntax, e.g. `now-7d`, `now`)
@@ -94,7 +94,8 @@ export function gfDefaults(): GrafanaDisplay {
 /** The `k=v` (or bare-`k`) pairs a GrafanaDisplay composes, in stable order. */
 export function gfPairs(gf: GrafanaDisplay): string[] {
   const pairs: string[] = [];
-  if (gf.kiosk) pairs.push(gf.picker ? "kiosk=tv" : "kiosk");
+  // POL-180: always `kiosk=true`, never bare `kiosk` — some Grafana builds ignore a valueless flag.
+  if (gf.kiosk) pairs.push(gf.picker ? "kiosk=tv" : "kiosk=true");
   if (gf.range === "custom") {
     pairs.push(`from=${encodeURIComponent(gf.from)}`, `to=${encodeURIComponent(gf.to)}`);
   }

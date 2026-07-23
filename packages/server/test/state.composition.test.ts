@@ -85,7 +85,7 @@ describe("update", () => {
     expect(patched.ok).toBe(true);
     if (!patched.ok) return;
     expect(patched.source.url).toBe(
-      "https://grafana.example.com/d/abc123/factory-overview?orgId=1&kiosk",
+      "https://grafana.example.com/d/abc123/factory-overview?orgId=1&kiosk=true",
     );
     // The verdict described the old address — it must not survive the recomposition.
     expect(patched.source.framing).toBeUndefined();

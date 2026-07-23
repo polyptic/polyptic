@@ -24,8 +24,8 @@ import {
 const gf = (over: Partial<GrafanaDisplay> = {}): GrafanaDisplay => ({ ...gfDefaults(), ...over });
 
 describe("flag composition (controls → query)", () => {
-  test("kiosk on, picker off → bare `kiosk`", () => {
-    expect(composeQuery(undefined, gf({ kiosk: true, picker: false }))).toBe("?kiosk");
+  test("kiosk on, picker off → `kiosk=true` (POL-180: never bare `kiosk`)", () => {
+    expect(composeQuery(undefined, gf({ kiosk: true, picker: false }))).toBe("?kiosk=true");
   });
 
   test("kiosk on, picker on → `kiosk=tv`", () => {
@@ -54,7 +54,7 @@ describe("flag composition (controls → query)", () => {
 
   test("keep rides first, verbatim, then the flags", () => {
     expect(composeQuery("orgId=1&var-line=A", gf({ kiosk: true, refresh: "30s" }))).toBe(
-      "?orgId=1&var-line=A&kiosk&refresh=30s",
+      "?orgId=1&var-line=A&kiosk=true&refresh=30s",
     );
   });
 
