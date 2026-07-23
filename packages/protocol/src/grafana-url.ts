@@ -20,35 +20,68 @@ import { z } from "zod";
 export const SourceProto = z.enum(["https", "http"]);
 export type SourceProto = z.infer<typeof SourceProto>;
 
-/** The auto-refresh cadences the dialog offers. `default` = no `refresh` param — the dashboard's
- *  own saved refresh applies. */
-export const GfRefresh = z.enum(["default", "30s", "1m", "5m", "15m", "1h"]);
-export type GfRefresh = z.infer<typeof GfRefresh>;
-
-/** The Grafana display controls (dashboard kind only). These compose to query-string flags:
+/** The Grafana display controls (dashboard kind only). These compose to query-string flags
+ *  (grafana-kiosk's dialect — POL-182):
  *
- *    kiosk ON, picker OFF   →  `kiosk=true` (POL-180: some Grafana builds ignore a bare `kiosk`)
+ *    kiosk ON, picker OFF   →  `kiosk=1` + `_dash.hideTimePicker=true` (POL-180: never bare
+ *                              `kiosk` — some builds ignore it)
  *    kiosk ON, picker ON    →  `kiosk=tv`
  *    kiosk OFF              →  (no kiosk param)
- *    range "custom"         →  `from=…&to=…` (Grafana time syntax, e.g. `now-7d`, `now`)
- *    range "inherit"        →  (nothing — the dashboard's saved default applies)
- *    refresh ≠ "default"    →  `refresh=…`
+ *    (always)               →  `hideLogo=1` — Grafana's "Powered by" logo has no place on a wall
+ *    from / to non-empty    →  `from=…` / `to=…` (Grafana's grammar — `now-24h`, epoch ms; empty
+ *                              = omitted, the dashboard's saved default applies)
+ *    refresh non-empty      →  `refresh=…` (`30s`, `1m`, …; empty = omitted)
+ *    autofit ON             →  `autofitpanels` (bare, grafana-kiosk's documented form)
  *    theme ≠ "default"      →  `theme=light` | `theme=dark`
+ *
+ *  ONE control decides the time picker, not two. `_dash.hideTimePicker=true` is DERIVED from
+ *  "kiosk on, picker off" rather than being its own toggle: the two would otherwise contradict
+ *  each other on screen (picker ON + hide ON = no picker, which is exactly the confusion POL-180
+ *  was reported for). It rides alongside `kiosk=1` as belt-and-braces because Grafana 11.2.x left
+ *  the picker visible in full kiosk (grafana/grafana#96595) — grafana-kiosk sends both too.
+ *
+ *  Schema evolution (POL-182): parse DEFAULTS reproduce what an already-stored composition
+ *  composes today — `autofit` defaults OFF and absent `from`/`to`/`refresh` default empty, so an
+ *  old row's URL only changes when the operator re-saves it. A pre-POL-182 stored shape (the
+ *  `range: inherit|custom` enum, `refresh: "default"`) is upgraded in a preprocess step to the
+ *  same effect.
  */
-export const GrafanaDisplay = z.object({
+const GrafanaDisplayShape = z.object({
   /** Kiosk mode — hides Grafana's chrome so the wall shows only the dashboard. */
   kiosk: z.boolean(),
-  /** Keep the date/time picker on screen (`kiosk=tv`). Only meaningful while kiosk is on. */
+  /** Keep the date/time picker on screen (`kiosk=tv`). Only meaningful while kiosk is on, and the
+   *  single source of truth for the picker: OFF also emits `_dash.hideTimePicker=true`. */
   picker: z.boolean(),
-  /** `inherit` = the dashboard's saved time range; `custom` = the `from`/`to` below. */
-  range: z.enum(["inherit", "custom"]),
-  /** Grafana time syntax (`now-7d`, `2026-01-01T00:00:00Z`, …). Composed only when range is custom. */
-  from: z.string().min(1).max(64),
-  to: z.string().min(1).max(64),
-  refresh: GfRefresh,
+  /** Grafana time syntax (`now-24h`, epoch ms, …). Empty = omitted — the dashboard's default. */
+  from: z.string().max(64).default(""),
+  to: z.string().max(64).default(""),
+  /** Auto-refresh interval (`30s`, `1m`, …). Empty = omitted — Grafana owns the grammar. */
+  refresh: z.string().max(32).default(""),
+  /** `autofitpanels` — grafana-kiosk's panel-fitting flag. */
+  autofit: z.boolean().default(false),
   theme: z.enum(["default", "light", "dark"]),
 });
-export type GrafanaDisplay = z.infer<typeof GrafanaDisplay>;
+
+/** Upgrade a pre-POL-182 stored shape: the `range` enum gated whether `from`/`to` composed, and
+ *  `refresh: "default"` meant no param — map both onto the empty-string form so the parsed
+ *  composition composes the same URL the row already stores. */
+function upgradeGf(v: unknown): unknown {
+  if (v === null || typeof v !== "object") return v;
+  const o = v as Record<string, unknown>;
+  // `hideTimePicker` was briefly its own field before the picker became the single control; drop it
+  // wherever it shows up so a row written by that shape parses cleanly.
+  const { range, hideTimePicker: _dropped, ...rest } = o;
+  if (!("range" in o)) return rest;
+  return {
+    ...rest,
+    from: range === "custom" ? o["from"] : "",
+    to: range === "custom" ? o["to"] : "",
+    refresh: o["refresh"] === "default" ? "" : o["refresh"],
+  };
+}
+
+export const GrafanaDisplay = z.preprocess(upgradeGf, GrafanaDisplayShape);
+export type GrafanaDisplay = z.infer<typeof GrafanaDisplayShape>;
 
 /** How the dialog's simplified auth picker maps onto what the server does:
  *
@@ -78,15 +111,16 @@ export const SourceComposition = z.object({
 export type SourceComposition = z.infer<typeof SourceComposition>;
 
 /** The dialog's starting point for a new Grafana dashboard source: kiosk on (a wall wants no
- *  chrome), picker off, everything else the dashboard's own defaults. */
+ *  chrome), picker off — which also hides the time picker the second way (see
+ *  grafana/grafana#96595) — everything else the dashboard's own defaults. */
 export function gfDefaults(): GrafanaDisplay {
   return {
     kiosk: true,
     picker: false,
-    range: "inherit",
-    from: "now-6h",
-    to: "now",
-    refresh: "default",
+    from: "",
+    to: "",
+    refresh: "",
+    autofit: false,
     theme: "default",
   };
 }
@@ -94,12 +128,22 @@ export function gfDefaults(): GrafanaDisplay {
 /** The `k=v` (or bare-`k`) pairs a GrafanaDisplay composes, in stable order. */
 export function gfPairs(gf: GrafanaDisplay): string[] {
   const pairs: string[] = [];
-  // POL-180: always `kiosk=true`, never bare `kiosk` — some Grafana builds ignore a valueless flag.
-  if (gf.kiosk) pairs.push(gf.picker ? "kiosk=tv" : "kiosk=true");
-  if (gf.range === "custom") {
-    pairs.push(`from=${encodeURIComponent(gf.from)}`, `to=${encodeURIComponent(gf.to)}`);
-  }
-  if (gf.refresh !== "default") pairs.push(`refresh=${gf.refresh}`);
+  // POL-182: `kiosk=1`, never bare `kiosk` — some Grafana builds ignore a valueless kiosk flag
+  // (POL-180), and grafana-kiosk sends the `1` form.
+  if (gf.kiosk) pairs.push(gf.picker ? "kiosk=tv" : "kiosk=1");
+  // Always: Grafana's "Powered by" logo has no place on a wall.
+  pairs.push("hideLogo=1");
+  // DERIVED from the picker control, never a second toggle (see the header): belt-and-braces with
+  // kiosk, because Grafana 11.2.x left the picker visible in full kiosk (grafana/grafana#96595).
+  if (gf.kiosk && !gf.picker) pairs.push("_dash.hideTimePicker=true");
+  const from = gf.from.trim();
+  const to = gf.to.trim();
+  if (from) pairs.push(`from=${encodeURIComponent(from)}`);
+  if (to) pairs.push(`to=${encodeURIComponent(to)}`);
+  const refresh = gf.refresh.trim();
+  if (refresh) pairs.push(`refresh=${encodeURIComponent(refresh)}`);
+  // Bare `autofitpanels` — grafana-kiosk's documented form.
+  if (gf.autofit) pairs.push("autofitpanels");
   if (gf.theme !== "default") pairs.push(`theme=${gf.theme}`);
   return pairs;
 }
@@ -198,17 +242,18 @@ export function slugName(addr: string): string {
 
 /**
  * Read the Grafana flags out of parsed query pairs and split them from the passthrough remainder.
- * Recognised (and captured into the controls): `kiosk` / `kiosk=true` (kiosk on, picker off),
- * `kiosk=tv` (kiosk on, picker on), `from`+`to` as a pair (custom range), `refresh` when it is one
- * of the dialog's cadences, `theme=light|dark`. Everything else — including a `refresh` or `theme`
- * value the controls can't represent, or a `from` without a `to` — stays in `keep` verbatim.
+ * Recognised (and captured into the controls): `kiosk` / `kiosk=true` / `kiosk=1` (kiosk on,
+ * picker off), `kiosk=tv` (kiosk on, picker on), `hideLogo` (absorbed — it is always re-emitted),
+ * `_dash.hideTimePicker=true`, `from` / `to` (each on its own), any non-empty `refresh`,
+ * `autofitpanels`, `theme=light|dark`. Everything else — including a `theme` value the controls
+ * can't represent — stays in `keep` verbatim.
  */
 export function extractGrafanaFlags(pairs: string[]): { gf: GrafanaDisplay; keep: string } {
   const gf = gfDefaults();
+  // The extractor reads what the pairs SAY, so its baseline is everything-off — `gfDefaults()`
+  // seeds NEW sources, not parsed ones.
   gf.kiosk = false;
   const keep: string[] = [];
-  let from: string | undefined;
-  let to: string | undefined;
 
   const decode = (v: string): string => {
     try {
@@ -222,8 +267,9 @@ export function extractGrafanaFlags(pairs: string[]): { gf: GrafanaDisplay; keep
     const eq = pair.indexOf("=");
     const key = eq >= 0 ? pair.slice(0, eq) : pair;
     const value = eq >= 0 ? pair.slice(eq + 1) : "";
+    const truthy = value === "" || value === "true" || value === "1";
     if (key === "kiosk") {
-      if (value === "" || value === "true" || value === "1") {
+      if (truthy) {
         gf.kiosk = true;
         gf.picker = false;
       } else if (value === "tv") {
@@ -232,12 +278,18 @@ export function extractGrafanaFlags(pairs: string[]): { gf: GrafanaDisplay; keep
       } else {
         keep.push(pair); // a kiosk mode the controls don't model rides through verbatim
       }
-    } else if (key === "from") {
-      from = decode(value);
-    } else if (key === "to") {
-      to = decode(value);
-    } else if (key === "refresh" && GfRefresh.options.includes(value as GfRefresh)) {
-      gf.refresh = value as GfRefresh;
+    } else if (key === "hideLogo" && truthy) {
+      // Absorbed: composition always emits `hideLogo=1`.
+    } else if (key === "_dash.hideTimePicker" && truthy) {
+      // Absorbed: derived from the picker control, and re-emitted whenever kiosk is on without it.
+    } else if (key === "autofitpanels" && truthy) {
+      gf.autofit = true;
+    } else if (key === "from" && value.length > 0) {
+      gf.from = decode(value);
+    } else if (key === "to" && value.length > 0) {
+      gf.to = decode(value);
+    } else if (key === "refresh" && value.length > 0) {
+      gf.refresh = decode(value);
     } else if (key === "theme" && (value === "light" || value === "dark")) {
       gf.theme = value;
     } else {
@@ -245,27 +297,23 @@ export function extractGrafanaFlags(pairs: string[]): { gf: GrafanaDisplay; keep
     }
   }
 
-  if (from !== undefined && to !== undefined && from.length > 0 && to.length > 0) {
-    gf.range = "custom";
-    gf.from = from;
-    gf.to = to;
-  } else {
-    // An incomplete pair can't drive the range controls — carry it through untouched.
-    if (from !== undefined) keep.push(`from=${encodeURIComponent(from)}`);
-    if (to !== undefined) keep.push(`to=${encodeURIComponent(to)}`);
-  }
-
   return { gf, keep: keep.join("&") };
 }
 
 /** One line naming what the controls change — the library row's read-out. Only the non-default
  *  choices speak ("kiosk · time picker", "now-7d → now", "refresh 5m", "dark theme"); a dashboard
- *  left entirely on its own defaults reads as nothing at all. */
+ *  left entirely on its own defaults reads as nothing at all. `hideTimePicker` and the always-on
+ *  `hideLogo` stay quiet — they are the wall's baseline, not a choice worth a row. */
 export function gfSummary(gf: GrafanaDisplay): string {
   const bits: string[] = [];
   if (gf.kiosk) bits.push(gf.picker ? "kiosk · time picker" : "kiosk");
-  if (gf.range === "custom") bits.push(`${gf.from} → ${gf.to}`);
-  if (gf.refresh !== "default") bits.push(`refresh ${gf.refresh}`);
+  const from = gf.from.trim();
+  const to = gf.to.trim();
+  if (from && to) bits.push(`${from} → ${to}`);
+  else if (from) bits.push(`from ${from}`);
+  else if (to) bits.push(`to ${to}`);
+  if (gf.refresh.trim()) bits.push(`refresh ${gf.refresh.trim()}`);
+  if (gf.autofit) bits.push("fit panels");
   if (gf.theme !== "default") bits.push(`${gf.theme} theme`);
   return bits.join(" · ");
 }

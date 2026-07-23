@@ -17,6 +17,7 @@ import { useRouter } from "vue-router";
 import {
   CreateContentSourceBody,
   CreateCredentialProfileBody,
+  GrafanaDisplay,
   composeSourceUrl,
   extractGrafanaFlags,
   gfDefaults,
@@ -28,7 +29,6 @@ import type {
   ContentKind,
   ContentSource,
   CredentialProfileView,
-  GrafanaDisplay,
   PlacementMode,
   SourceAuthMode,
   SourceComposition,
@@ -330,11 +330,15 @@ const authHint = computed(() => {
   return "Anyone on the network can load this address — nothing is injected.";
 });
 
-/** The custom-range presets (the design's gfPresetBtns): `now-1h` labels as "Last 1h". */
+/** Quick-fill presets for the free-text range fields (the design's gfPresetBtns): `now-1h` labels
+ *  as "Last 1h". They WRITE into from/to rather than gating them, so anything Grafana's grammar
+ *  accepts stays typeable (POL-182). */
 const GF_PRESETS = ["now-1h", "now-6h", "now-24h", "now-7d", "now-30d", "now-90d"];
 function presetLabel(v: string): string {
   return `Last ${v.slice(4)}`;
 }
+/** The same idea for the refresh field's common cadences. */
+const GF_CADENCES = ["30s", "1m", "5m", "15m", "1h"];
 /** The picker toggle READS on while kiosk is off — the full Grafana UI includes it (mock's pickOn). */
 const pickerOn = computed(() => (draftGf.value.kiosk ? draftGf.value.picker : true));
 const pickerDesc = computed(() =>
@@ -406,7 +410,10 @@ function openEdit(s: ContentSource) {
     draftProto.value = s.composition.proto;
     draftAddress.value = s.composition.address;
     draftKeep.value = s.composition.keep ?? "";
-    draftGf.value = s.composition.gf ? { ...s.composition.gf } : gfDefaults();
+    // POL-182 — parse, don't spread: a pre-POL-182 stored shape (the range enum) upgrades to the
+    // current controls with the new toggles off, so reopening never changes what the wall loads.
+    const storedGf = s.composition.gf ? GrafanaDisplay.safeParse(s.composition.gf) : null;
+    draftGf.value = storedGf?.success ? storedGf.data : gfDefaults();
     draftAuth.value = s.composition.auth ?? (s.credentialProfileId ? "forward-auth" : "none");
   } else {
     // A row from before POL-175 stores only the composed url — parse it back into the controls.
@@ -1294,26 +1301,13 @@ function mediaFacts(s: ContentSource): string {
               ><span class="tog-knob"></span></button>
             </div>
 
+            <!-- POL-182 — free-text from/to (Grafana owns the grammar); empty = the dashboard's
+                 saved default. The presets fill the fields rather than replacing them, so the
+                 common ranges stay one click away and anything Grafana accepts is still typeable. -->
             <div class="gf-row col">
               <div class="gf-row-line">
                 <div class="gf-row-name">Time range</div>
-                <div class="chips">
-                  <button
-                    type="button"
-                    class="chip"
-                    :class="{ on: draftGf.range === 'inherit' }"
-                    @click="draftGf.range = 'inherit'"
-                  >Dashboard default</button>
-                  <button
-                    type="button"
-                    class="chip"
-                    :class="{ on: draftGf.range === 'custom' }"
-                    @click="draftGf.range = 'custom'"
-                  >Custom</button>
-                </div>
-              </div>
-              <template v-if="draftGf.range === 'custom'">
-                <div class="chips wrap">
+                <div class="chips wrap right">
                   <button
                     v-for="v in GF_PRESETS"
                     :key="v"
@@ -1322,33 +1316,65 @@ function mediaFacts(s: ContentSource): string {
                     :class="{ on: draftGf.from === v && draftGf.to === 'now' }"
                     @click="draftGf.from = v; draftGf.to = 'now'"
                   >{{ presetLabel(v) }}</button>
+                  <button
+                    type="button"
+                    class="chip"
+                    :class="{ on: !draftGf.from.trim() && !draftGf.to.trim() }"
+                    @click="draftGf.from = ''; draftGf.to = ''"
+                  >Dashboard default</button>
                 </div>
-                <div class="gf-range-grid">
-                  <div>
-                    <div class="gf-range-label">From</div>
-                    <input v-model="draftGf.from" class="field mono gf-range" placeholder="now-7d" />
-                  </div>
-                  <div>
-                    <div class="gf-range-label">To</div>
-                    <input v-model="draftGf.to" class="field mono gf-range" placeholder="now" />
-                  </div>
+              </div>
+              <div class="gf-range-grid">
+                <div>
+                  <div class="gf-range-label">From</div>
+                  <input v-model="draftGf.from" class="field mono gf-range" placeholder="now-24h" />
                 </div>
-                <div class="gf-syntax">Grafana syntax — relative like now-7d, or absolute timestamps.</div>
-              </template>
+                <div>
+                  <div class="gf-range-label">To</div>
+                  <input v-model="draftGf.to" class="field mono gf-range" placeholder="now" />
+                </div>
+              </div>
+              <div class="gf-syntax">Grafana syntax — relative like now-24h, or absolute timestamps.</div>
             </div>
 
-            <div class="gf-row">
-              <div class="gf-row-name">Auto-refresh</div>
-              <div class="chips wrap right">
-                <button
-                  v-for="v in (['default', '30s', '1m', '5m', '15m', '1h'] as const)"
-                  :key="v"
-                  type="button"
-                  class="chip"
-                  :class="{ on: draftGf.refresh === v }"
-                  @click="draftGf.refresh = v"
-                >{{ v === "default" ? "Default" : v }}</button>
+            <div class="gf-row col">
+              <div class="gf-row-line">
+                <div class="gf-row-name">Auto-refresh</div>
+                <div class="chips wrap right">
+                  <button
+                    v-for="v in GF_CADENCES"
+                    :key="v"
+                    type="button"
+                    class="chip"
+                    :class="{ on: draftGf.refresh.trim() === v }"
+                    @click="draftGf.refresh = v"
+                  >{{ v }}</button>
+                  <button
+                    type="button"
+                    class="chip"
+                    :class="{ on: !draftGf.refresh.trim() }"
+                    @click="draftGf.refresh = ''"
+                  >Dashboard default</button>
+                </div>
               </div>
+              <input
+                v-model="draftGf.refresh"
+                class="field mono gf-range gf-refresh"
+                placeholder="30s"
+                aria-label="Auto-refresh"
+              />
+            </div>
+
+            <!-- POL-182 — grafana-kiosk's bare `autofitpanels`. -->
+            <div class="gf-row">
+              <div class="gf-row-name">Fit panels to screen</div>
+              <button
+                type="button"
+                class="tog"
+                :class="{ on: draftGf.autofit }"
+                aria-label="Fit panels to screen"
+                @click="draftGf.autofit = !draftGf.autofit"
+              ><span class="tog-knob"></span></button>
             </div>
 
             <div class="gf-row last">
@@ -2187,6 +2213,10 @@ function mediaFacts(s: ContentSource): string {
   font-size: 11px;
   color: var(--muted2);
   margin-top: 6px;
+}
+.gf-refresh {
+  width: 110px;
+  flex: 0 0 auto;
 }
 /* POL-157 — the reload cadence controls. */
 .refresh-row {
