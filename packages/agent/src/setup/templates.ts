@@ -497,6 +497,10 @@ Restart=always
 RestartSec=2
 # Config (control-plane URL + bootstrap token + backend) lives in agent.toml, written by setup.
 Environment=POLYPTIC_CONFIG=${p.configPath}
+# NOTE (POL-177): no OOMScoreAdjust= here on purpose. A negative value would OOM-protect the agent,
+# but this is an unprivileged USER unit — lowering oom_score_adj needs CAP_SYS_RESOURCE, so systemd
+# would fail the exec outright and the agent would never start. The agent instead RAISES its browser
+# children's oom_score_adj at spawn (same relative ordering: the kernel eats Chrome first).
 
 [Install]
 WantedBy=${SESSION_TARGET}

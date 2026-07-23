@@ -202,6 +202,51 @@ export function isTerminalPhase(phase: InstallPhase): boolean {
   return phase === "done" || phase === "failed";
 }
 
+/** POL-177 — a status file older than this is history, not news: resume nothing from it. */
+export const INSTALL_RESUME_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * POL-177 — what a freshly (re)connected agent should do about an install-status file it did not
+ * write this process. The first field install ran INVISIBLE: the OOM killer ate the agent mid-wipe,
+ * the restarted process had no tail, and the ten lines already in `/run/polyptic/install-status`
+ * were never forwarded — the operator learned the outcome from /boot/report alone.
+ */
+export type InstallResumeDecision =
+  | { action: "none" }
+  /** An install is (or may be) still running: start the tail, which forwards every line from the
+   *  top — re-narrating what the dead process never sent — then follows live ones. */
+  | { action: "tail"; lastLine: InstallStatusLine | null }
+  /** The installer already said its last word while no agent was listening: send that one line so
+   *  the console's strip and feed reflect the outcome. */
+  | { action: "replay"; line: InstallStatusLine };
+
+/**
+ * Decide how to resume the install narration from the status file's content + mtime. Pure, like
+ * every other decision in this file. The recency gate applies to BOTH actions: /run survives an
+ * agent restart (it clears only on reboot), so without it every restart for the rest of the boot
+ * would re-tell a long-finished story. A file whose complete lines parse to nothing yet is treated
+ * as an install that just started (`tail` — the tailer's own 30-minute timeout is the backstop).
+ */
+export function decideInstallResume(
+  text: string | null,
+  mtimeMs: number | null,
+  nowMs: number,
+  maxAgeMs: number = INSTALL_RESUME_MAX_AGE_MS,
+): InstallResumeDecision {
+  if (text === null) return { action: "none" };
+  if (mtimeMs === null || nowMs - mtimeMs > maxAgeMs) return { action: "none" };
+  // Same complete-lines rule as the tailer: the last element is either empty (trailing "\n") or a
+  // torn mid-write line — never forwardable yet.
+  const complete = text.split("\n").slice(0, -1);
+  let last: InstallStatusLine | null = null;
+  for (const raw of complete) {
+    const parsed = parseInstallStatusLine(raw);
+    if (parsed) last = parsed;
+  }
+  if (last !== null && isTerminalPhase(last.phase)) return { action: "replay", line: last };
+  return { action: "tail", lastLine: last };
+}
+
 /**
  * Why this agent may not hand `device` to the installer, or `null` when it may. Pure, like
  * host.ts's `rebootRefusal`: every gate is a legible sentence the console can show verbatim.

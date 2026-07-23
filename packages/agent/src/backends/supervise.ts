@@ -11,6 +11,7 @@
  * browser. See ./inspector.ts.
  */
 import type { ChildProcess } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { escapeRegex, run, which } from "./proc";
 import type { BrowserProbe } from "../vitals";
 
@@ -18,6 +19,36 @@ import type { BrowserProbe } from "../vitals";
 const RESTART_BASE_MS = 750;
 const RESTART_CAP_MS = 15_000;
 const KILL_GRACE_MS = 4_000;
+
+/** POL-177 — the oom_score_adj every supervised child gets. On a swapless live box the kernel's OOM
+ *  killer once ate the AGENT while Chrome kept its gigabytes — and a dead agent blinds the box (no
+ *  narration, no reconcile, no shell), while a dead browser is a two-second respawn. An unprivileged
+ *  user unit cannot take the agent NEGATIVE (lowering oom_score_adj needs CAP_SYS_RESOURCE, so an
+ *  `OOMScoreAdjust=-600` in polyptic-agent.service would fail at exec time); RAISING our children is
+ *  the unprivileged way to buy the same relative ordering: the kernel eats Chrome first. */
+export const CHILD_OOM_SCORE_ADJ = 300;
+
+/** Log the (permanent, per-kernel-config) failure once, not once per respawn. */
+let oomAdjustFailureLogged = false;
+
+/**
+ * POL-177 — best-effort: mark a freshly spawned child as the OOM killer's preferred meal (see
+ * {@link CHILD_OOM_SCORE_ADJ}). Same-UID raises are always allowed, and Chrome's later-forked
+ * renderers inherit the value. A no-op off Linux; a failure never touches the launch.
+ */
+export function deprioritiseChildForOom(
+  pid: number | null | undefined,
+  log: (msg: string) => void = () => {},
+): void {
+  if (process.platform !== "linux" || !pid) return;
+  try {
+    writeFileSync(`/proc/${pid}/oom_score_adj`, `${CHILD_OOM_SCORE_ADJ}\n`);
+  } catch (err) {
+    if (oomAdjustFailureLogged) return;
+    oomAdjustFailureLogged = true;
+    log(`could not raise oom_score_adj for pid ${pid} (children keep the default): ${(err as Error).message}`);
+  }
+}
 
 /** What one output should be showing, and how. A change to either field forces a relaunch. */
 export interface LaunchTarget {
@@ -175,6 +206,8 @@ export class SupervisedProcess<T> {
       return;
     }
     this.child = child;
+    // POL-177 — the kernel must eat this child before it eats the agent supervising it.
+    deprioritiseChildForOom(child.pid, this.log);
     this.restartAttempt = 0;
     child.once("exit", (code, signal) => {
       if (myGen !== this.currentGen) return; // intentional kill / superseded

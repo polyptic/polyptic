@@ -9,7 +9,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  INSTALL_RESUME_MAX_AGE_MS,
   bootModeFromCmdline,
+  decideInstallResume,
   installRefusal,
   isTerminalPhase,
   parseInstallStatusLine,
@@ -301,5 +303,77 @@ describe("tailInstallStatus (POL-176)", () => {
   test("an installer that never concludes is abandoned at the timeout", async () => {
     const { end } = await drain(["starting|0|\n"], { timeoutMs: 15 });
     expect(end).toBe("timeout");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// decideInstallResume — POL-177, the restarted agent picking the story back up
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("decideInstallResume (POL-177)", () => {
+  const NOW = 1_000_000_000;
+  const FRESH = NOW - 60_000; // a minute old
+
+  test("no status file → nothing to resume (the overwhelmingly common boot)", () => {
+    expect(decideInstallResume(null, null, NOW)).toEqual({ action: "none" });
+  });
+
+  test("a stale file is history, not news — /run outlives an agent restart", () => {
+    const old = NOW - INSTALL_RESUME_MAX_AGE_MS - 1;
+    expect(decideInstallResume("done|100|installed\n", old, NOW)).toEqual({ action: "none" });
+    // ... whether it ended terminal or died mid-run
+    expect(decideInstallResume("fetching|10|x\n", old, NOW)).toEqual({ action: "none" });
+  });
+
+  test("an unknown mtime never resumes — absence of a claim, never a guess", () => {
+    expect(decideInstallResume("done|100|installed\n", null, NOW)).toEqual({ action: "none" });
+  });
+
+  test("a recent non-terminal tail resumes the tail, naming the last phase reached", () => {
+    const text = "starting|0|\nwiping|-|zap\nfetching|10|pulling image\n";
+    expect(decideInstallResume(text, FRESH, NOW)).toEqual({
+      action: "tail",
+      lastLine: { phase: "fetching", percent: 10, detail: "pulling image" },
+    });
+  });
+
+  test("a recent terminal outcome is replayed once — the invisible-install fix", () => {
+    const text = "starting|0|\nboot-entry|90|\nfailed|-|nvram-entry-missing\n";
+    expect(decideInstallResume(text, FRESH, NOW)).toEqual({
+      action: "replay",
+      line: { phase: "failed", detail: "nvram-entry-missing" },
+    });
+  });
+
+  test("done replays just like failed", () => {
+    expect(decideInstallResume("done|100|installed\n", FRESH, NOW)).toEqual({
+      action: "replay",
+      line: { phase: "done", percent: 100, detail: "installed" },
+    });
+  });
+
+  test("a torn terminal line (no trailing newline) is not a word yet — keep tailing", () => {
+    expect(decideInstallResume("starting|0|\ndone|100|instal", FRESH, NOW)).toEqual({
+      action: "tail",
+      lastLine: { phase: "starting", percent: 0 },
+    });
+  });
+
+  test("a fresh file with nothing parseable yet is an install that just started", () => {
+    expect(decideInstallResume("", FRESH, NOW)).toEqual({ action: "tail", lastLine: null });
+    expect(decideInstallResume("garbage\n", FRESH, NOW)).toEqual({ action: "tail", lastLine: null });
+  });
+
+  test("unparseable lines after the terminal one do not unsay it", () => {
+    expect(decideInstallResume("failed|-|boom\nnot a line\n", FRESH, NOW)).toEqual({
+      action: "replay",
+      line: { phase: "failed", detail: "boom" },
+    });
+  });
+
+  test("exactly at the age limit still counts as recent", () => {
+    expect(
+      decideInstallResume("done|100|ok\n", NOW - INSTALL_RESUME_MAX_AGE_MS, NOW).action,
+    ).toBe("replay");
   });
 });

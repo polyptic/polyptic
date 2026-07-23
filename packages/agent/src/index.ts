@@ -67,7 +67,7 @@ import {
 } from "@polyptic/protocol";
 import type { KioskBrowser, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { hostname as osHostname } from "node:os";
 import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
@@ -86,8 +86,16 @@ import {
 } from "./mtls";
 import type { MtlsBundleFile } from "./mtls";
 import { rebootHost } from "./host";
-import { installRefusal, isTerminalPhase, readBootFacts, requestInstall, tailInstallStatus } from "./install";
-import type { BootFacts } from "./install";
+import {
+  INSTALL_STATUS_PATH,
+  decideInstallResume,
+  installRefusal,
+  isTerminalPhase,
+  readBootFacts,
+  requestInstall,
+  tailInstallStatus,
+} from "./install";
+import type { BootFacts, InstallStatusLine } from "./install";
 import { ShellManager } from "./shell";
 import { diffWindows } from "./windows";
 import type { PlacedWindow } from "./windows";
@@ -263,6 +271,10 @@ class Agent {
   /** POL-176 — the live install-status tail, while an install is in flight. One at a time: a second
    *  `server/install` during a wipe is refused rather than racing the root installer. */
   private installTail: { stop(): void } | null = null;
+  /** POL-177 — true once THIS process has sent a terminal install line (live or replayed), so an
+   *  in-process reconnect never re-replays a finished outcome into a duplicate feed line. A process
+   *  restart resets it — exactly the case (the OOM-killed agent) the replay exists for. */
+  private installOutcomeReported = false;
 
   constructor(
     private readonly url: string,
@@ -373,7 +385,10 @@ class Agent {
       // re-sets the flag before close, so the long backoff persists across rejection cycles.
       this.rejected = false;
       log(`agent channel open${this.connectedViaMtls ? " (mTLS)" : ""} — enrolling`);
-      void this.sendHello();
+      // POL-177 — after the hello (never before it: the hello is the channel's first frame), if an
+      // installer narrated (or is narrating) into /run/polyptic/install-status while no agent was
+      // listening — the OOM-killed-mid-install case — pick the story back up.
+      void this.sendHello().then(() => this.resumeInstallNarration());
       this.startHeartbeat();
     });
 
@@ -723,35 +738,86 @@ class Agent {
       return;
     }
     log(`install to ${msg.device} handed to the root installer (${outcome.reason}) — tailing its progress`);
+    this.installOutcomeReported = false;
+    this.startInstallTail(`install to ${msg.device}`);
+  }
 
+  /** Forward one install-status line on the wire (POL-176's frame, also used by the POL-177 replay). */
+  private sendInstallStatus(line: InstallStatusLine): void {
+    this.send({
+      t: "agent/install-status",
+      machineId: this.machineId,
+      phase: line.phase,
+      ...(line.percent !== undefined ? { percent: line.percent } : {}),
+      ...(line.detail !== undefined ? { detail: line.detail } : {}),
+    });
+  }
+
+  /** Start the install-status tail, forwarding each new line until `done`/`failed` or the 30-minute
+   *  timeout. `subject` names the run in the logs ("install to /dev/sda" / "resumed install"). */
+  private startInstallTail(subject: string): void {
     this.installTail = tailInstallStatus(
       (line) => {
-        this.send({
-          t: "agent/install-status",
-          machineId: this.machineId,
-          phase: line.phase,
-          ...(line.percent !== undefined ? { percent: line.percent } : {}),
-          ...(line.detail !== undefined ? { detail: line.detail } : {}),
-        });
+        this.sendInstallStatus(line);
         if (isTerminalPhase(line.phase)) {
+          this.installOutcomeReported = true;
           (line.phase === "done" ? log : logError)(
-            `install to ${msg.device} ${line.phase}${line.detail ? `: ${line.detail}` : ""}`,
+            `${subject} ${line.phase}${line.detail ? `: ${line.detail}` : ""}`,
           );
         }
       },
       (why) => {
         this.installTail = null;
         if (why === "timeout") {
-          logError(`install to ${msg.device}: no terminal status after the timeout — abandoning the tail`);
-          this.send({
-            t: "agent/install-status",
-            machineId: this.machineId,
+          logError(`${subject}: no terminal status after the timeout — abandoning the tail`);
+          this.installOutcomeReported = true;
+          this.sendInstallStatus({
             phase: "failed",
             detail: "the installer reported no outcome within 30 minutes",
           });
         }
       },
     );
+  }
+
+  /**
+   * POL-177 — resume the install narration after a restart or reconnect. The first field install ran
+   * INVISIBLE: the swapless box hit OOM, the kernel killed the agent mid-install, and the restarted
+   * process had no tail — none of the lines already in /run/polyptic/install-status were ever
+   * forwarded, and the server had cleared the live `installing` state on the disconnect. So on every
+   * fresh connection: if the status file exists and is recent (< 1 h), either resume the tail (the
+   * installer may still be running — the tail re-forwards every line from the top, which re-sets the
+   * server's presence state) or, when its last word is already terminal, send that one line once so
+   * the console's strip and feed reflect the outcome even though the agent died mid-run. The
+   * decision itself is pure ({@link decideInstallResume}); this method just does the I/O.
+   */
+  private async resumeInstallNarration(): Promise<void> {
+    if (this.installTail) return; // a live tail already narrates over the new socket
+    let text: string | null;
+    let mtimeMs: number | null;
+    try {
+      text = await readFile(INSTALL_STATUS_PATH, "utf8");
+      mtimeMs = (await stat(INSTALL_STATUS_PATH)).mtimeMs;
+    } catch {
+      return; // no status file — nothing ever installed this boot (the overwhelmingly common case)
+    }
+    // Re-check after the awaits: a `server/install` may have started a tail while we were reading.
+    if (this.installTail) return;
+    const decision = decideInstallResume(text, mtimeMs, Date.now());
+    if (decision.action === "none") return;
+    if (decision.action === "replay") {
+      if (this.installOutcomeReported) return; // this process already told the server
+      this.installOutcomeReported = true;
+      log(
+        `install-status file ends in "${decision.line.phase}" from before a restart — replaying the outcome`,
+      );
+      this.sendInstallStatus(decision.line);
+      return;
+    }
+    log(
+      `install-status file shows an install in flight (last phase: ${decision.lastLine?.phase ?? "none yet"}) — resuming the narration`,
+    );
+    this.startInstallTail("resumed install");
   }
 
   /**
