@@ -305,7 +305,6 @@ interface BootOrderPolicyRow {
   reassert: boolean;
 }
 
-
 interface CountRow {
   count: string; // count(*) comes back as a bigint string
 }
@@ -1174,15 +1173,6 @@ export class PostgresStore implements Store {
     await sql`UPDATE murals SET active_scene_id = ${sceneId} WHERE id = ${muralId}`;
   }
 
-  async listActiveScenes(): Promise<Record<string, string>> {
-    const sql = this.sql;
-    const rows = await sql<{ id: string; active_scene_id: string }[]>`
-      SELECT id, active_scene_id FROM murals WHERE active_scene_id IS NOT NULL
-    `;
-    const out: Record<string, string> = {};
-    for (const row of rows) out[row.id] = row.active_scene_id;
-    return out;
-  }
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────
 

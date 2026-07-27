@@ -488,7 +488,6 @@ export interface PersistedBootOrderPolicy {
   reassert: boolean;
 }
 
-
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -566,8 +565,6 @@ export interface Store {
   /** POL-95/POL-186 — persist the ACTIVE scene for ONE mural (`null` clears it — none / diverged).
    *  Which scene a mural is on is desired state, and must survive a restart. */
   setActiveSceneId(muralId: string, sceneId: string | null): Promise<void>;
-  /** POL-186 — mural id → its active scene id. Murals with no active scene are absent from the map. */
-  listActiveScenes(): Promise<Record<string, string>>;
 
   // ── Murals & placement (Phase 3) ──────────────────────────────────────────
   /** Insert-or-update a mural row (id + name). */

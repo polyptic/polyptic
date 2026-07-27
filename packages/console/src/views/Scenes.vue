@@ -12,8 +12,9 @@
     · a "WHAT PLAYS WHEN" WEEK STRIP — the resolved schedule, priority conflicts marked, painted by
       the SAME resolver the server's ticker fires from (@polyptic/protocol), so the strip cannot
       promise the operator something the wall will not do;
-    · the DEFAULT SCENE — the always-on floor that fills every gap — and the deployment's ONE
-      timezone, both explicit, both here.
+    · the DEFAULT SCENE — the floor under the gaps on the mural it was saved from (POL-186 scoped
+      resolution to one mural at a time, so a default scene floors its own mural and no other) — and
+      the deployment's ONE timezone, both explicit, both here.
 
   All reads/writes go through the Pinia store; the server owns resolution and applies scenes through
   the ordinary apply path (instant WS fan-out, no reload).
@@ -56,9 +57,12 @@ const sceneName = (id: string | null): string =>
   id ? (store.scenes.find((s) => s.id === id)?.name ?? "(deleted scene)") : "";
 const daypartName = (id: string): string =>
   dayparts.value.find((d) => d.id === id)?.name ?? "(deleted daypart)";
+/** One mural by name — the wall a scene snapshots, spelled out wherever a scene from another mural
+ *  can appear in a list (the default-scene picker lists the whole deployment). */
+const muralName = (id: string): string =>
+  store.murals.find((m) => m.id === id)?.name ?? "(deleted mural)";
 /** A power-only window's target: one mural by name, or every mural in the deployment. */
-const muralTargetName = (id: string | null): string =>
-  id ? (store.murals.find((m) => m.id === id)?.name ?? "(deleted mural)") : "Every mural";
+const muralTargetName = (id: string | null): string => (id ? muralName(id) : "Every mural");
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
@@ -342,7 +346,14 @@ async function remove(id: string) {
             <span v-if="activeMural" class="mural-tag">· {{ activeMural.name }}</span>
           </p>
         </div>
-        <button v-if="store.canAuthor" class="save-btn ghost inline" @click="openEditor(null)">
+        <!-- A power window opens on THIS mural, so with no mural there is nothing to open it on: it
+             would save a window governing "every mural", which is none of them. -->
+        <button
+          v-if="store.canAuthor"
+          class="save-btn ghost inline"
+          :disabled="!store.activeMuralId"
+          @click="openEditor(null)"
+        >
           + Power window
         </button>
         <button v-if="store.canAuthor" class="save-btn" :disabled="!store.activeMuralId" @click="openSave">
@@ -377,9 +388,15 @@ async function remove(id: string) {
             <span class="field-label">Default scene</span>
             <select class="input" :value="scheduler.defaultSceneId ?? ''" @change="setDefaultScene">
               <option value="">None (leave the wall alone)</option>
-              <option v-for="s in store.scenes" :key="s.id" :value="s.id">{{ s.name }}</option>
+              <!-- Every scene in the deployment is selectable, so each one names its mural: the
+                   default scene floors THAT mural's gaps and no other wall's. -->
+              <option v-for="s in store.scenes" :key="s.id" :value="s.id">
+                {{ s.name }} · {{ muralName(s.muralId) }}
+              </option>
             </select>
-            <span class="hint">The always-on floor that fills every gap no window covers.</span>
+            <span class="hint">
+              Fills the gaps no window covers on its own mural. Other murals keep whatever is on them.
+            </span>
           </label>
         </div>
         <div v-if="tzError" class="error">{{ tzError }}</div>
@@ -494,7 +511,16 @@ async function remove(id: string) {
               <span class="prio-value" title="Higher priority wins an overlap">p{{ sc.priority }}</span>
               <button class="prio-btn" title="Raise priority" @click="bumpPriority(sc, 1)">+</button>
             </span>
-            <button class="sched-toggle" @click="toggleSchedule(sc)">{{ sc.enabled ? "On" : "Off" }}</button>
+            <!-- POL-186 — "Enabled", not "On": it sits next to "Panels off", and two adjacent
+                 on/offs meaning different things is one word doing two jobs. Panels off is the
+                 feature's own vocabulary, so this is the one that moves. -->
+            <button
+              class="sched-toggle"
+              :title="sc.enabled ? 'Take this window off air' : 'Put this window back on air'"
+              @click="toggleSchedule(sc)"
+            >
+              {{ sc.enabled ? "Enabled" : "Disabled" }}
+            </button>
             <button class="del-btn small" title="Delete power window" @click="removeSchedule(sc.id)">✕</button>
           </div>
         </div>
@@ -550,7 +576,15 @@ async function remove(id: string) {
                 <span class="prio-value" title="Higher priority wins an overlap">p{{ sc.priority }}</span>
                 <button class="prio-btn" title="Raise priority" @click="bumpPriority(sc, 1)">+</button>
               </span>
-              <button class="sched-toggle" @click="toggleSchedule(sc)">{{ sc.enabled ? "On" : "Off" }}</button>
+              <!-- "Enabled", not "On" — the same word the power-window rows use, for the same
+                   reason: "Panels off" is next to it. -->
+              <button
+                class="sched-toggle"
+                :title="sc.enabled ? 'Take this window off air' : 'Put this window back on air'"
+                @click="toggleSchedule(sc)"
+              >
+                {{ sc.enabled ? "Enabled" : "Disabled" }}
+              </button>
               <button class="del-btn small" title="Delete schedule" @click="removeSchedule(sc.id)">✕</button>
             </div>
           </div>
@@ -600,7 +634,7 @@ async function remove(id: string) {
             </option>
             <option value="">Every mural</option>
           </select>
-          <span class="hint">Every mural holds this window on murals the console is not showing.</span>
+          <span class="hint">Every mural also covers the walls this page is not showing.</span>
         </label>
 
         <label class="field-row">
@@ -665,7 +699,10 @@ async function remove(id: string) {
         <div v-if="edError" class="error">{{ edError }}</div>
         <div class="modal-actions">
           <button class="btn-secondary" @click="closeEditor">Cancel</button>
-          <button class="btn-primary" :disabled="edBusy" @click="saveSchedule">Save schedule</button>
+          <!-- One dialog, two things it saves: name the one in front of the operator. -->
+          <button class="btn-primary" :disabled="edBusy" @click="saveSchedule">
+            {{ edSceneId ? "Save schedule" : "Save power window" }}
+          </button>
         </div>
       </div>
     </div>

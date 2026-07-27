@@ -1501,8 +1501,8 @@ export const ServerToAgentInspect = z.object({
 
 /**
  * POL-101 — put ONE panel to sleep, or wake it. Sent on an explicit operator action or when a
- * schedule window's panel boundary passes; NEVER on idleness, and never as a side effect of anything else. The
- * agent drives its display backend (`swaymsg output <connector> dpms off|on`, `xset dpms force off`
+ * schedule window's panel boundary passes; NEVER on idleness, and never as a side effect of anything
+ * else. The agent drives its display backend (`swaymsg output <connector> dpms off|on`, `xset dpms force off`
  * on the x11-i3 fallback) and, if the box has a CEC adapter, also tells the display itself to stand
  * by — the only rung that actually powers a TV down.
  *

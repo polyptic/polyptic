@@ -23,11 +23,13 @@ describe("store round-trips POL-186 schedule fields", () => {
     expect(row?.panels).toBe("off");
   });
 
+  // Read back through `load()` — the snapshot the control plane actually rebuilds from on boot, and
+  // the only reader of these rows there has ever been.
   test("the active scene is per mural", async () => {
     const store = new MemoryStore();
     await store.setActiveSceneId("mural-1", "scene-1");
     await store.setActiveSceneId("mural-2", "scene-9");
     await store.setActiveSceneId("mural-1", null);
-    expect(await store.listActiveScenes()).toEqual({ "mural-2": "scene-9" });
+    expect((await store.load()).activeScenes).toEqual({ "mural-2": "scene-9" });
   });
 });

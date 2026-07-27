@@ -206,9 +206,6 @@ export class MemoryStore implements Store {
     else this.activeScenes.set(muralId, sceneId);
   }
 
-  async listActiveScenes(): Promise<Record<string, string>> {
-    return Object.fromEntries(this.activeScenes);
-  }
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────
 

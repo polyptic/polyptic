@@ -12,7 +12,10 @@
  *     past midnight ("After hours", 18:00–08:00); `start == end` is an all-day (24h) window.
  *   - a SCHEDULE binds a scene to a daypart on a recurrence (weekdays + an optional date range),
  *     with an integer PRIORITY.
- *   - the DEFAULT SCENE is the always-on floor: whatever no window covers, it fills.
+ *   - the DEFAULT SCENE is the floor under the gaps ON ITS OWN MURAL: whatever no window covers on
+ *     the mural the scene snapshots, it fills. Resolution runs per mural (POL-186), and a scene
+ *     belongs to one wall, so it cannot be a fleet-wide floor — other murals' gaps resolve to
+ *     nothing and are left exactly as they are.
  *
  * RESOLUTION (total order — no coin-flips, ever). Every window covering the instant is a candidate;
  * the winner is the first by:
@@ -109,7 +112,8 @@ export const SchedulerSettings = z.object({
   enabled: z.boolean(),
   /** IANA zone, e.g. "Europe/London". Every window is evaluated in this zone's wall-clock. */
   timezone: z.string().min(1).max(64),
-  /** The always-on floor: what plays when no window covers the moment. Null = leave the wall alone. */
+  /** The floor on the scene's OWN mural: what plays there when no window covers the moment. Other
+   *  murals are left alone, and so is every mural when this is null. */
   defaultSceneId: z.string().nullable(),
 });
 export type SchedulerSettings = z.infer<typeof SchedulerSettings>;
