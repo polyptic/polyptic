@@ -266,14 +266,16 @@ describe("the ticker drives panel power per mural", () => {
   /** A scheduler wired for panel-power tests: power-only windows (no scenes involved), so the tests
    *  isolate the power hand-off from the content path proven above. */
   async function makeSchedulerFixture(
-    opts: { twoMurals?: boolean; panelPower?: SceneSchedulerDeps["panelPower"] } = {},
+    opts: { twoMurals?: boolean; ungoverned?: boolean; panelPower?: SceneSchedulerDeps["panelPower"] } = {},
   ): Promise<{ scheduler: SceneScheduler; cp: ControlPlane }> {
     const fixtureStore = new MemoryStore();
     const fixtureCp = new ControlPlane(fixtureStore);
     await fixtureCp.init(); // seeds the default mural, "mural-1"
     await fixtureCp.updateSchedulerSettings({ enabled: true, timezone: "UTC" });
 
-    if (opts.twoMurals) {
+    if (opts.ungoverned) {
+      // No schedule targets "mural-1" at all — resolveMuralAt must answer `panels: null`, not "on".
+    } else if (opts.twoMurals) {
       const second = await fixtureCp.createMural("Second"); // "mural-2"
       const allDay = await fixtureCp.createDaypart({ name: "All day", start: "00:00", end: "00:00" });
       await fixtureCp.createSchedule({
@@ -338,15 +340,19 @@ describe("the ticker drives panel power per mural", () => {
     return { scheduler: fixtureScheduler, cp: fixtureCp };
   }
 
-  test("crossing into an off window hands 'off' to the panel-power seam once", async () => {
-    const calls: Array<[string, string | null]> = [];
+  test("the seam is called EVERY tick, unconditionally — edge-triggering is its job, not the ticker's", async () => {
+    const calls: Array<[string, string | null, string]> = [];
     const { scheduler: fixtureScheduler } = await makeSchedulerFixture({
-      panelPower: { applyMuralPower: (m, p) => { calls.push([m, p]); } },
+      panelPower: { applyMuralPower: (m, p, d) => { calls.push([m, p, d]); } },
     });
     await fixtureScheduler.tick(AT("18:30")); // in hours
     await fixtureScheduler.tick(AT("19:30")); // crossed the boundary
-    await fixtureScheduler.tick(AT("19:40")); // no boundary — must say nothing new
-    expect(calls).toEqual([["mural-1", "on"], ["mural-1", "off"]]);
+    await fixtureScheduler.tick(AT("19:40")); // no boundary, but STILL called — same verdict, third call
+    expect(calls).toEqual([
+      ["mural-1", "on", "Day"],
+      ["mural-1", "off", "Night"],
+      ["mural-1", "off", "Night"],
+    ]);
   });
 
   test("two murals resolve independently", async () => {
@@ -358,5 +364,18 @@ describe("the ticker drives panel power per mural", () => {
     await fixtureScheduler.tick(AT("21:00"));
     expect(calls).toContainEqual(["mural-1", "off"]);
     expect(calls).toContainEqual(["mural-2", "on"]);
+  });
+
+  test("a mural with no enabled window hands 'null' — leave it exactly as it is", async () => {
+    const calls: Array<[string, string | null]> = [];
+    const { scheduler: fixtureScheduler } = await makeSchedulerFixture({
+      ungoverned: true,
+      panelPower: { applyMuralPower: (m, p) => { calls.push([m, p]); } },
+    });
+    await fixtureScheduler.tick(AT("12:00"));
+    // Exactly one call, for the one mural that exists, and it is `null` — not "on", not "off". A
+    // screen an operator slept by hand on this mural must stay asleep: `null` is the only verdict
+    // that says "send nothing," and it must never be silently coerced to "on".
+    expect(calls).toEqual([["mural-1", null]]);
   });
 });

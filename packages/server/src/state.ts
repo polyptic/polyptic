@@ -27,6 +27,7 @@ import {
   AudioIntent,
   ContentSource,
   DashboardSurface,
+  CreateScheduleBody,
   Daypart,
   ImageSurface,
   normalizeTag,
@@ -53,7 +54,6 @@ import type { BootMode, MachineBootPath, MachineDisk, Rect } from "@polyptic/pro
 import type {
   ContentKind,
   CreateDaypartBody,
-  CreateScheduleBody,
   ScheduleSet,
   UpdateDaypartBody,
   UpdateScheduleBody,
@@ -5414,11 +5414,18 @@ export class ControlPlane {
   }
 
   async createSchedule(
-    body: CreateScheduleBody,
+    rawBody: CreateScheduleBody,
   ): Promise<
     | { ok: true; schedule: Schedule }
     | { ok: false; error: "unknown-scene" | "unknown-mural" | "unknown-daypart" }
   > {
+    // PARSE FIRST. `rawBody`'s TS type is the zod OUTPUT type (defaults applied, nothing optional),
+    // but nothing enforces that at a call site — a caller (test or otherwise) that omits `muralId`
+    // sends `undefined`, which is not `null` and is not caught by the `!== null` guards below, and
+    // which `stampMuralId` would then hand a power-only window straight into `Schedule.parse` (whose
+    // `muralId` is `.nullable()`, not `.optional()`) — a throw, not a clean error. Parsing here is the
+    // one line that makes every caller, present and future, go through the same defaults REST does.
+    const body = CreateScheduleBody.parse(rawBody);
     // A window either carries a scene (and takes that scene's mural) or is POWER-ONLY and targets a
     // mural the operator names — or every mural, with null.
     if (body.sceneId !== null && !this.scenes.has(body.sceneId)) return { ok: false, error: "unknown-scene" };

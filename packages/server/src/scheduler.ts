@@ -7,8 +7,8 @@
  * now?" — and the answer has two parts, content and power. That is the whole design:
  *
  *   - RESOLUTION IS PER MURAL. A deployment is a fleet of walls, not one wall; each mural keeps its
- *     own remembered verdict (`lastVerdicts`, `lastPower` — both keyed by mural id), so a schedule on
- *     one wall never fires, skips, or double-applies because of what another wall is doing.
+ *     own remembered CONTENT verdict (`lastVerdicts`, keyed by mural id), so a schedule on one wall
+ *     never fires, skips, or double-applies because of what another wall is doing.
  *   - CONTENT fan-out is unchanged. `apply` is the same code the operator's Apply button runs, so a
  *     scene reaches the glass over the ordinary `server/render` WS push, in the ordinary <150ms, with
  *     no reload. Agents and players learn nothing new; nothing in either package changed for this.
@@ -24,12 +24,16 @@
  *           on at all, and correctly does not run that day.)
  *   - POWER is the new half (POL-186): the same per-mural resolution also carries `panels` — `"on"`,
  *     `"off"`, or `null` when no enabled window governs the mural (leave it exactly as it is). The
- *     ticker hands that verdict to the OPTIONAL `panelPower` seam, edge-triggered per mural just like
- *     content — a mural whose power verdict hasn't changed gets nothing new to say. Task 7's real
- *     seam is idempotent on its own side too (it never sends a redundant SLEEP/WAKE), so the two
- *     layers of edge-triggering are belt and braces, not a coordination requirement. In hours, the
- *     only command this can ever produce is WAKE — nothing here infers power from idleness, load, or
- *     connectivity; that inference does not exist.
+ *     ticker hands that verdict to the OPTIONAL `panelPower` seam UNCONDITIONALLY, every mural, every
+ *     tick — there is no gate here. Edge-triggering for power lives entirely in the seam itself
+ *     (`panel-power.ts`'s `lastDesired`), which is keyed PER SCREEN, not per mural: a mural's verdict
+ *     is a poor place to dedupe from, because a screen can join or leave a mural (an operator drags it
+ *     onto a different wall) without the mural's own verdict ever changing, and a mural-level gate
+ *     would leave that screen unrecorded and unactioned until the next boundary. Calling
+ *     `applyMuralPower` every ~10s per mural is one cheap in-memory sweep; the seam already does a
+ *     sweep of this shape across the whole fleet every 30s. In hours, the only command this can ever
+ *     produce is WAKE — nothing here infers power from idleness, load, or connectivity; that
+ *     inference does not exist.
  *   - on BOOT it asserts every mural's schedule once: the first tick applies what the schedule says
  *     for each mural (content) and sends each mural's power verdict (power), unless the right scene
  *     is already live. A control plane that restarts at 09:05 puts the morning wall back up by
@@ -92,8 +96,6 @@ export class SceneScheduler {
   private running = false;
   /** The last CONTENT verdict the ticker acted on, per mural. Unset = never resolved (boot). */
   private readonly lastVerdicts = new Map<string, string | null>();
-  /** The last POWER verdict handed to `panelPower`, per mural. Unset = never resolved (boot). */
-  private readonly lastPower = new Map<string, PanelState | null>();
 
   private readonly now: () => number;
   private readonly tickMs: number;
@@ -163,10 +165,10 @@ export class SceneScheduler {
     const reasons: Record<string, TickReason> = {};
 
     if (!set.settings.enabled) {
-      // A disabled scheduler forgets every mural's verdict — content AND power — so switching it
-      // back on re-asserts the schedule on every wall instead of trusting stale memory.
+      // A disabled scheduler forgets every mural's CONTENT verdict, so switching it back on
+      // re-asserts the schedule on every wall instead of trusting stale memory. Power has no
+      // scheduler-side memory to forget — see below.
       this.lastVerdicts.clear();
-      this.lastPower.clear();
       return { resolutions, applied, reasons };
     }
 
@@ -174,17 +176,14 @@ export class SceneScheduler {
       const resolution = resolveMuralAt(nowMs, set, muralId);
       resolutions.push(resolution);
 
-      // POWER, resolved and handed off independently of content — an off-hours mural with no scene
-      // to play can still need its panels turned off. Edge-triggered per mural: a verdict repeated
-      // tick over tick has nothing new to say.
-      if (this.deps.panelPower && this.lastPower.get(muralId) !== resolution.panels) {
-        this.lastPower.set(muralId, resolution.panels);
-        this.deps.panelPower.applyMuralPower(
-          muralId,
-          resolution.panels,
-          resolution.candidates[0]?.daypartName ?? "a scheduled window",
-        );
-      }
+      // POWER, resolved and handed off independently of content, UNCONDITIONALLY — no gate here.
+      // Edge-triggering for power belongs to the seam, keyed per SCREEN (a mural-level gate would
+      // miss a screen that joins or moves onto this mural without the mural's own verdict changing).
+      this.deps.panelPower?.applyMuralPower(
+        muralId,
+        resolution.panels,
+        resolution.candidates[0]?.daypartName ?? "a scheduled window",
+      );
 
       // CONTENT.
       const target = resolution.sceneId;
