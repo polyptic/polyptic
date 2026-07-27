@@ -435,3 +435,65 @@ describe("per-mural power resolution", () => {
     expect(r.sceneId).toBeNull();
   });
 });
+
+describe("week strip segments carry the panel state", () => {
+  test("the off window is its own segment and is marked off", () => {
+    const set = setOf([
+      { ...base, id: "s-night", sceneId: null, muralId: "mural-1", daypartId: "dp-night", priority: 0, panels: "off" as const },
+      { ...base, id: "s-day", sceneId: "scene-1", muralId: "mural-1", daypartId: "dp-day", priority: 0, panels: "on" as const },
+    ]);
+    const day = resolveDay("2026-07-28", set, "mural-1");
+    const dark = day.segments.filter((s) => s.panels === "off");
+    expect(dark.length).toBe(2); // 00:00-07:00 and 19:00-24:00
+    expect(dark[0]?.startMinutes).toBe(0);
+    expect(dark[0]?.endMinutes).toBe(420);
+    expect(dark[1]?.startMinutes).toBe(1140);
+    const lit = day.segments.find((s) => s.startMinutes === 420);
+    expect(lit?.panels).toBe("on");
+    expect(lit?.sceneId).toBe("scene-1");
+  });
+
+  test("segments do not coalesce across a change in panel state alone", () => {
+    const set = setOf([
+      { ...base, id: "s-a", sceneId: "scene-1", muralId: "mural-1", daypartId: "dp-day", priority: 0, panels: "on" as const },
+      { ...base, id: "s-b", sceneId: null, muralId: "mural-1", daypartId: "dp-night", priority: 0, panels: "off" as const },
+    ]);
+    const day = resolveDay("2026-07-28", set, "mural-1");
+    for (let i = 1; i < day.segments.length; i += 1) {
+      const prev = day.segments[i - 1];
+      const cur = day.segments[i];
+      expect(prev?.panels === cur?.panels && prev?.sceneId === cur?.sceneId).toBe(false);
+    }
+  });
+
+  // POL-186 gap-fixture gap check — every OTHER fixture in this file has contiguous windows
+  // (dp-night 19:00–07:00 butts straight up against dp-day 07:00–19:00), so nothing else proves the
+  // panels actually flip off→on at the exact boundary minute when the next window is NOT adjacent.
+  // Get this wrong and a wall that slept at 19:00 never wakes at the far edge of its own off window.
+  test("panels flip off -> on at the exact minute the off window ends, even across a true gap", () => {
+    const dayLate: Daypart = { id: "dp-day-late", name: "Late opening", start: "09:00", end: "19:00" };
+    const set = setOf([
+      { ...base, id: "s-night", sceneId: null, muralId: "mural-1", daypartId: "dp-night", priority: 0, panels: "off" as const },
+      { ...base, id: "s-day-late", sceneId: "scene-1", muralId: "mural-1", daypartId: dayLate.id, priority: 0, panels: "on" as const },
+    ]);
+    set.dayparts.push(dayLate); // dp-night ends 07:00; dp-day-late starts 09:00 — a genuine two-hour gap
+    const day = resolveDay("2026-07-28", set, "mural-1");
+
+    // The off window (00:00–07:00, wrapped from last night) ends exactly at minute 420.
+    const off = day.segments.find((s) => s.panels === "off" && s.startMinutes === 0);
+    expect(off?.endMinutes).toBe(420);
+
+    // The TRUE gap: 07:00–09:00, ungoverned by any window's coverage but still "on" — a governed
+    // mural's gap is on, full stop. This is the segment the brief's own fixtures never exercise.
+    const gap = day.segments.find((s) => s.startMinutes === 420);
+    expect(gap?.endMinutes).toBe(540);
+    expect(gap?.panels).toBe("on"); // flips the INSTANT the off window's minute ends — no lag
+    expect(gap?.sceneId).toBeNull(); // still ungoverned by content — nothing airs in the gap
+
+    // And the wall stays lit straight on into the next scene-bearing window.
+    const lateOpen = day.segments.find((s) => s.startMinutes === 540);
+    expect(lateOpen?.endMinutes).toBe(1140); // 19:00, where tonight's off window starts
+    expect(lateOpen?.panels).toBe("on");
+    expect(lateOpen?.sceneId).toBe("scene-1");
+  });
+});
