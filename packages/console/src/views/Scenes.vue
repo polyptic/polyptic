@@ -128,7 +128,7 @@ const HOUR_TICKS = [0, 6, 12, 18];
 
 const segmentTitle = (seg: ScheduleSegment): string => {
   const window = `${timeOfDay(seg.startMinutes)}–${timeOfDay(seg.endMinutes)}`;
-  // POL-186 — a dark stretch is the headline of its segment, so it leads the title.
+  // POL-186 — what the panels do closes the title, after what plays and what it outranks.
   const power = seg.panels === "off" ? " · panels off" : "";
   if (seg.source === "none") return `${window} · nothing scheduled${power}`;
   const who = seg.source === "default" ? `${sceneName(seg.sceneId)} (default scene)` : sceneName(seg.sceneId);
@@ -927,13 +927,20 @@ async function remove(id: string) {
   border-top-color: transparent;
 }
 /* POL-186 — a scheduled OFF window. The strip's promise is that it cannot show the operator
-   something the wall will not do, so a dark window has to read as dark. It is a fixed night ink in
-   BOTH themes — a token that inverts (`--fg`) would paint the sleeping stretch WHITE in the dark
-   theme — with a hairline ring so it still separates from the dark theme's near-black surface. */
+   something the wall will not do, so a dark window has to read as dark. `--seg-off-bg` is fixed in
+   both themes (see styles.css); the HATCH is what carries it, because in the dark theme the fill
+   lands two hex points from `--surface` and a 60-minute band is under the label threshold, so
+   neither fill nor label can be the tell. It leans the opposite way to `.conflict` so the two
+   readings never collapse into one. */
 .seg.dark {
-  background: #0b0b0e;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
-  border-top-color: rgba(255, 255, 255, 0.28);
+  background: var(--seg-off-bg);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.07) 0 3px,
+    transparent 3px 6px
+  );
+  box-shadow: inset 0 0 0 1px var(--seg-off-line);
+  border-top-color: var(--seg-off-line);
 }
 .seg.dark .seg-label {
   color: #e4e4e7;
@@ -945,6 +952,13 @@ async function remove(id: string) {
     rgba(0, 0, 0, 0.22) 0 4px,
     rgba(0, 0, 0, 0) 4px 8px
   );
+}
+/* A dark band that outranks something: the black conflict stripe is invisible on `--seg-off-bg`, so
+   the stripe inverts and rides over the off hatch. Both facts, one band. */
+.seg.dark.conflict {
+  background-image:
+    repeating-linear-gradient(45deg, var(--seg-off-conflict) 0 4px, transparent 4px 8px),
+    repeating-linear-gradient(-45deg, rgba(255, 255, 255, 0.07) 0 3px, transparent 3px 6px);
 }
 .seg-label {
   font-size: 10px;
@@ -979,8 +993,13 @@ async function remove(id: string) {
   background: var(--muted2);
 }
 .dark-swatch {
-  background: #0b0b0e;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+  background: var(--seg-off-bg);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.07) 0 3px,
+    transparent 3px 6px
+  );
+  box-shadow: inset 0 0 0 1px var(--seg-off-line);
 }
 .conflict-swatch {
   background-image: repeating-linear-gradient(
