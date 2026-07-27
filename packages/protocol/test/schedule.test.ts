@@ -1,20 +1,19 @@
 /**
- * POL-89 — the SHARED schedule resolver (`@polyptic/protocol`), the single answer to "what plays
- * when". The server's ticker fires from it and the console's week strip is painted from it, so every
- * rule below is a promise made in two places at once.
- *
- * Pinned here: recurrence (weekdays + inclusive date ranges), daypart windows (normal, wrapping past
- * midnight, all-day), priority, the four-step tie-break, gaps falling through to the default scene,
- * a disabled scheduler resolving nothing — and the DST boundaries, in a zone that actually has them
- * (Europe/London): a window spanning the spring-forward gap must NOT be skipped, a window that
- * starts INSIDE the gap must not fire, and the repeated fall-back hour must resolve to the SAME
- * scene both times round (the ticker only fires on a change of verdict, so that is what "no
- * double-fire" means).
+ * POL-186 — the resolver, per mural. The DST / recurrence / tie-break behaviours below used to be
+ * pinned against the single-mural `resolveAt` (formerly exercised from `packages/server`); they now
+ * live here, against `resolveMuralAt`, because the resolver itself moved per-mural and this is where
+ * it's defined. Every assertion is unchanged in substance — only the entry point and the `murals` /
+ * `sceneMurals` bookkeeping `ScheduleSet` now requires are new.
  */
 import { describe, expect, test } from "bun:test";
 
-import { resolveAt, resolveDay, resolveWeek, startOfWeek } from "@polyptic/protocol";
-import type { Daypart, Schedule, ScheduleSet, SchedulerSettings } from "@polyptic/protocol";
+import {
+  resolveDay,
+  resolveMuralAt,
+  resolveWeek,
+  startOfWeek,
+} from "../src/schedule";
+import type { Daypart, Schedule, ScheduleSet, SchedulerSettings } from "../src/schedule";
 
 const OPENING: Daypart = { id: "daypart-1", name: "Opening hours", start: "08:00", end: "18:00" };
 const LUNCH: Daypart = { id: "daypart-2", name: "Lunch", start: "12:00", end: "13:00" };
@@ -24,10 +23,31 @@ const ALL_DAY: Daypart = { id: "daypart-4", name: "All day", start: "00:00", end
 const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6];
 const WEEKDAYS = [1, 2, 3, 4, 5];
 
-function schedule(over: Partial<Schedule> & Pick<Schedule, "id" | "sceneId" | "daypartId">): Schedule {
+const MURAL = "mural-1";
+
+/** Every scene id these tests use, all on `MURAL` — a single-mural deployment is the common case. */
+const SCENE_MURALS: Record<string, string> = {
+  "scene-open": MURAL,
+  "scene-lunch": MURAL,
+  "scene-night": MURAL,
+  "scene-branding": MURAL,
+  "scene-summer": MURAL,
+  "scene-standup": MURAL,
+  "scene-first": MURAL,
+  "scene-second": MURAL,
+  "scene-always": MURAL,
+  "scene-ghost": MURAL,
+  "scene-morning": MURAL,
+};
+
+function schedule(
+  over: Partial<Schedule> & Pick<Schedule, "id" | "sceneId" | "daypartId">,
+): Schedule {
   return {
+    muralId: MURAL,
     days: EVERY_DAY,
     priority: 0,
+    panels: "on",
     enabled: true,
     from: null,
     until: null,
@@ -40,12 +60,24 @@ function settings(over: Partial<SchedulerSettings> = {}): SchedulerSettings {
   return { enabled: true, timezone: "UTC", defaultSceneId: null, ...over };
 }
 
-function set(schedules: Schedule[], over: Partial<SchedulerSettings> = {}, dayparts = [OPENING, LUNCH, AFTER_HOURS, ALL_DAY]): ScheduleSet {
-  return { dayparts, schedules, settings: settings(over) };
+function set(
+  schedules: Schedule[],
+  over: Partial<SchedulerSettings> = {},
+  dayparts = [OPENING, LUNCH, AFTER_HOURS, ALL_DAY],
+): ScheduleSet {
+  return {
+    dayparts,
+    schedules,
+    settings: settings(over),
+    murals: [MURAL],
+    sceneMurals: SCENE_MURALS,
+  };
 }
 
 /** An instant, spelled as UTC (the default test zone) — `at("2026-07-15T09:30")` is Wednesday. */
 const at = (iso: string): number => Date.parse(`${iso}:00Z`);
+
+const resolveAt = (atMs: number, s: ScheduleSet, muralId = MURAL) => resolveMuralAt(atMs, s, muralId);
 
 describe("schedule resolution — windows + recurrence", () => {
   test("a scene plays inside its daypart and not outside it", () => {
@@ -114,6 +146,7 @@ describe("schedule resolution — windows + recurrence", () => {
     const r = resolveAt(at("2026-07-15T10:00"), masterOff);
     expect(r.sceneId).toBeNull();
     expect(r.source).toBe("none");
+    expect(r.panels).toBeNull();
   });
 
   test("a schedule whose daypart was deleted covers nothing", () => {
@@ -121,6 +154,8 @@ describe("schedule resolution — windows + recurrence", () => {
       dayparts: [], // the library was emptied out from under it
       schedules: [schedule({ id: "schedule-1", sceneId: "scene-open", daypartId: OPENING.id })],
       settings: settings(),
+      murals: [MURAL],
+      sceneMurals: SCENE_MURALS,
     };
     expect(resolveAt(at("2026-07-15T10:00"), s).sceneId).toBeNull();
   });
@@ -275,7 +310,7 @@ describe("the week strip resolves from the same rules", () => {
       ],
       { defaultSceneId: "scene-branding" },
     );
-    const day = resolveDay("2026-07-15", s);
+    const day = resolveDay("2026-07-15", s, MURAL);
 
     // 00:00 branding · 08:00 open · 12:00 lunch (outranking open) · 13:00 open · 18:00 branding
     expect(day.segments.map((seg) => [seg.startMinutes, seg.sceneId])).toEqual([
@@ -290,16 +325,113 @@ describe("the week strip resolves from the same rules", () => {
     expect(day.segments[1]?.overriddenScheduleIds).toEqual([]);
     // Segments tile the whole 24h with no holes.
     expect(day.segments[day.segments.length - 1]?.endMinutes).toBe(1440);
+    // Every segment is governed (both windows target MURAL), so panels are never null here.
+    expect(day.segments.every((seg) => seg.panels === "on")).toBe(true);
   });
 
   test("resolveWeek returns seven consecutive days from the week's start", () => {
     const s = set([schedule({ id: "schedule-1", sceneId: "scene-open", daypartId: OPENING.id, days: WEEKDAYS })]);
-    const week = resolveWeek(startOfWeek("2026-07-15"), s); // Monday 2026-07-13
+    const week = resolveWeek(startOfWeek("2026-07-15"), s, MURAL); // Monday 2026-07-13
     expect(week).toHaveLength(7);
     expect(week[0]?.date).toBe("2026-07-13");
     expect(week[6]?.date).toBe("2026-07-19");
     // Saturday is unscheduled end to end; Monday has the window.
     expect(week[5]?.segments.every((seg) => seg.sceneId === null)).toBe(true);
     expect(week[0]?.segments.some((seg) => seg.sceneId === "scene-open")).toBe(true);
+  });
+
+  test("a mural no window governs sees an ungoverned week — panels stay null throughout", () => {
+    const s = set([schedule({ id: "schedule-1", sceneId: "scene-open", daypartId: OPENING.id })]);
+    const day = resolveDay("2026-07-15", s, "mural-other");
+    expect(day.segments).toHaveLength(1); // no window governs this mural — a single uncut 24h stretch
+    expect(day.segments[0]?.panels).toBeNull();
+    expect(day.segments[0]?.sceneId).toBeNull();
+  });
+});
+
+// ── POL-186 — per-mural power resolution ──────────────────────────────────────────────────────────
+
+const AT = (hhmm: string): number => Date.parse(`2026-07-28T${hhmm}:00.000Z`); // a Tuesday, UTC
+
+function setOf(schedules: ScheduleSet["schedules"]): ScheduleSet {
+  return {
+    dayparts: [
+      { id: "dp-night", name: "After hours", start: "19:00", end: "07:00" },
+      { id: "dp-day", name: "Opening hours", start: "07:00", end: "19:00" },
+      { id: "dp-all", name: "All day", start: "00:00", end: "00:00" },
+    ],
+    schedules,
+    settings: { enabled: true, timezone: "UTC", defaultSceneId: null },
+    murals: ["mural-1", "mural-2"],
+    sceneMurals: { "scene-1": "mural-1", "scene-2": "mural-2" },
+  };
+}
+
+const base = {
+  days: [0, 1, 2, 3, 4, 5, 6],
+  enabled: true,
+  from: null,
+  until: null,
+  createdAt: "2026-07-01T00:00:00.000Z",
+};
+
+describe("per-mural power resolution", () => {
+  const nightOff = { ...base, id: "s-night", sceneId: null, muralId: "mural-1", daypartId: "dp-night", priority: 0, panels: "off" as const };
+  const dayScene = { ...base, id: "s-day", sceneId: "scene-1", muralId: "mural-1", daypartId: "dp-day", priority: 0, panels: "on" as const };
+
+  test("inside the off window the panels are off and content is untouched", () => {
+    const r = resolveMuralAt(AT("21:00"), setOf([nightOff, dayScene]), "mural-1");
+    expect(r.panels).toBe("off");
+    expect(r.powerScheduleId).toBe("s-night");
+    expect(r.sceneId).toBeNull(); // no scene-bearing window covers 21:00
+  });
+
+  test("the gap between windows resolves to on — this is what wakes the wall at 07:00", () => {
+    const r = resolveMuralAt(AT("07:30"), setOf([nightOff, dayScene]), "mural-1");
+    expect(r.panels).toBe("on");
+    expect(r.sceneId).toBe("scene-1");
+  });
+
+  test("a higher-priority window keeps the screens lit straight through the off window", () => {
+    const openDay = { ...base, id: "s-open", sceneId: "scene-1", muralId: "mural-1", daypartId: "dp-all", priority: 10, panels: "on" as const };
+    const r = resolveMuralAt(AT("21:00"), setOf([nightOff, dayScene, openDay]), "mural-1");
+    expect(r.panels).toBe("on");
+    expect(r.powerScheduleId).toBe("s-open");
+    expect(r.sceneId).toBe("scene-1");
+  });
+
+  test("content comes from the best SCENE-BEARING window even when a power-only window wins overall", () => {
+    const allDayScene = { ...base, id: "s-bg", sceneId: "scene-1", muralId: "mural-1", daypartId: "dp-all", priority: 0, panels: "on" as const };
+    const r = resolveMuralAt(AT("21:00"), setOf([nightOff, allDayScene]), "mural-1");
+    expect(r.powerScheduleId).toBe("s-night"); // the shorter window wins the order
+    expect(r.panels).toBe("off");
+    expect(r.sceneId).toBe("scene-1"); // and the wall keeps its scene underneath
+  });
+
+  test("a mural no window governs is ungoverned — leave the wall exactly as it is", () => {
+    const r = resolveMuralAt(AT("21:00"), setOf([nightOff, dayScene]), "mural-2");
+    expect(r.panels).toBeNull();
+    expect(r.sceneId).toBeNull();
+  });
+
+  test("a null muralId governs every mural", () => {
+    const fleetOff = { ...nightOff, id: "s-fleet", muralId: null };
+    expect(resolveMuralAt(AT("21:00"), setOf([fleetOff]), "mural-1").panels).toBe("off");
+    expect(resolveMuralAt(AT("21:00"), setOf([fleetOff]), "mural-2").panels).toBe("off");
+  });
+
+  test("the default scene floors only the mural that owns it", () => {
+    const s = setOf([]);
+    s.settings.defaultSceneId = "scene-1";
+    expect(resolveMuralAt(AT("12:00"), s, "mural-1").sceneId).toBe("scene-1");
+    expect(resolveMuralAt(AT("12:00"), s, "mural-2").sceneId).toBeNull();
+  });
+
+  test("a disabled scheduler governs nothing at all", () => {
+    const s = setOf([nightOff]);
+    s.settings.enabled = false;
+    const r = resolveMuralAt(AT("21:00"), s, "mural-1");
+    expect(r.panels).toBeNull();
+    expect(r.sceneId).toBeNull();
   });
 });

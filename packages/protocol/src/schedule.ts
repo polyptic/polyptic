@@ -246,7 +246,10 @@ export function localInstant(atMs: number, timezone: string): LocalInstant {
 /** One window covering the instant under test — a candidate for the glass. */
 export interface ScheduleCandidate {
   scheduleId: string;
-  sceneId: string;
+  /** `null` on a power-only window. */
+  sceneId: string | null;
+  /** What this window says the panels do while it is on air. */
+  panels: PanelState;
   daypartId: string;
   daypartName: string;
   priority: number;
@@ -261,14 +264,9 @@ export interface ScheduleCandidate {
   runningForMinutes: number;
 }
 
-/** What plays at an instant, and what lost to it. */
-export interface ScheduleResolution {
-  sceneId: string | null;
-  /** The winning schedule, or null when the default scene (or nothing) is on. */
-  scheduleId: string | null;
-  source: "schedule" | "default" | "none";
-  /** Every covering window, best-first. `[0]` is the winner; the rest are the priority conflicts. */
-  candidates: ScheduleCandidate[];
+/** Does this window govern `muralId`? A `null` target governs every mural. */
+function governs(schedule: Schedule, muralId: string): boolean {
+  return schedule.muralId === null || schedule.muralId === muralId;
 }
 
 /** Total order over covering windows. See the module header — this is THE rule, in one place. */
@@ -289,21 +287,61 @@ function inDateRange(schedule: Schedule, date: CalendarDate): boolean {
 }
 
 /**
- * Resolve what plays at a LOCAL moment. This is the whole scheduler: the ticker calls it every few
- * seconds with "now", and the console's week strip calls it across a week — the same function, so the
- * strip cannot lie about what the wall will do.
+ * What ONE mural is doing at an instant: what it plays, and what its panels do.
+ *
+ * Both answers come from the SAME sorted candidate list, read twice — content from the best window
+ * that carries a scene, power from the overall winner. That is why an "Open day" window at a higher
+ * priority keeps the screens lit straight through a nightly off window with no special-casing: it
+ * simply sorts first.
  */
-export function resolveAtLocal(at: LocalInstant, set: ScheduleSet): ScheduleResolution {
-  const none: ScheduleResolution = { sceneId: null, scheduleId: null, source: "none", candidates: [] };
+export interface MuralResolution {
+  muralId: string;
+  sceneId: string | null;
+  /** The winning CONTENT schedule, or null when the default scene (or nothing) is on. */
+  scheduleId: string | null;
+  source: "schedule" | "default" | "none";
+  /** The panel state, or `null` when NO enabled window governs this mural — ungoverned, so the wall
+   *  is left exactly as it is (a screen an operator slept by hand stays asleep). */
+  panels: PanelState | null;
+  /** The window the panel state came from, or null when nothing covers the instant. */
+  powerScheduleId: string | null;
+  /** Every covering window, best-first. */
+  candidates: ScheduleCandidate[];
+}
+
+/**
+ * Resolve ONE mural at a LOCAL moment. This is the whole scheduler: the ticker calls it per mural
+ * every few seconds with "now", and the console's week strip calls it across a week — the same
+ * function, so the strip cannot lie about what the wall will do.
+ */
+export function resolveMuralAtLocal(
+  at: LocalInstant,
+  set: ScheduleSet,
+  muralId: string,
+): MuralResolution {
+  const none: MuralResolution = {
+    muralId,
+    sceneId: null,
+    scheduleId: null,
+    source: "none",
+    panels: null,
+    powerScheduleId: null,
+    candidates: [],
+  };
   if (!set.settings.enabled) return none;
 
   const dayparts = new Map(set.dayparts.map((d) => [d.id, d]));
   const candidates: ScheduleCandidate[] = [];
+  let governed = false;
 
   for (const schedule of set.schedules) {
     if (!schedule.enabled) continue;
+    if (!governs(schedule, muralId)) continue;
     const daypart = dayparts.get(schedule.daypartId);
     if (!daypart) continue; // a schedule whose daypart was deleted covers nothing
+    // This mural HAS an enabled window, so its gaps are "on" rather than ungoverned — that is what
+    // wakes the wall at the far edge of a nightly off window.
+    governed = true;
 
     const start = minutesOfDay(daypart.start);
     const end = minutesOfDay(daypart.end);
@@ -321,6 +359,7 @@ export function resolveAtLocal(at: LocalInstant, set: ScheduleSet): ScheduleReso
       candidates.push({
         scheduleId: schedule.id,
         sceneId: schedule.sceneId,
+        panels: schedule.panels,
         daypartId: daypart.id,
         daypartName: daypart.name,
         priority: schedule.priority,
@@ -333,29 +372,49 @@ export function resolveAtLocal(at: LocalInstant, set: ScheduleSet): ScheduleReso
     }
   }
 
-  if (candidates.length === 0) {
-    return set.settings.defaultSceneId
-      ? { sceneId: set.settings.defaultSceneId, scheduleId: null, source: "default", candidates: [] }
-      : none;
-  }
-
   // Tie-break of last resort: creation order, then id — a stable, total order over the set.
-  const order = new Map(set.schedules.map((s) => [s.id, `${s.createdAt} ${s.id}`]));
+  const order = new Map(set.schedules.map((s) => [s.id, `${s.createdAt} ${s.id}`]));
   const orderOf = (id: string): string => order.get(id) ?? id;
   candidates.sort((a, b) => better(a, b, orderOf));
 
-  const winner = candidates[0] as ScheduleCandidate;
+  // POWER: the overall winner, power-only windows included. No covering window = the gap, which on a
+  // governed mural is "on" — the only power command a gap can produce is WAKE. On an UNGOVERNED mural
+  // (no enabled window targets it at all) power is `null` regardless of content — CONTENT still
+  // resolves normally below, including the default-scene floor, because that floor is a property of
+  // the mural (via `sceneMurals`), not of whether anything governs its panels.
+  const powerWinner = candidates[0];
+  const panels: PanelState | null = !governed ? null : powerWinner ? powerWinner.panels : "on";
+
+  // CONTENT: the best window that actually carries a scene, then the default floor for THIS mural.
+  const contentWinner = candidates.find((c) => c.sceneId !== null);
+  if (contentWinner) {
+    return {
+      muralId,
+      sceneId: contentWinner.sceneId,
+      scheduleId: contentWinner.scheduleId,
+      source: "schedule",
+      panels,
+      powerScheduleId: powerWinner?.scheduleId ?? null,
+      candidates,
+    };
+  }
+
+  const fallback = set.settings.defaultSceneId;
+  const fallbackOnThisMural = fallback !== null && set.sceneMurals[fallback] === muralId;
   return {
-    sceneId: winner.sceneId,
-    scheduleId: winner.scheduleId,
-    source: "schedule",
+    muralId,
+    sceneId: fallbackOnThisMural ? fallback : null,
+    scheduleId: null,
+    source: fallbackOnThisMural ? "default" : "none",
+    panels,
+    powerScheduleId: powerWinner?.scheduleId ?? null,
     candidates,
   };
 }
 
-/** Resolve what plays at an absolute instant, in the deployment's zone. What the ticker calls. */
-export function resolveAt(atMs: number, set: ScheduleSet): ScheduleResolution {
-  return resolveAtLocal(localInstant(atMs, set.settings.timezone), set);
+/** Resolve one mural at an absolute instant, in the deployment's zone. What the ticker calls. */
+export function resolveMuralAt(atMs: number, set: ScheduleSet, muralId: string): MuralResolution {
+  return resolveMuralAtLocal(localInstant(atMs, set.settings.timezone), set, muralId);
 }
 
 /** One contiguous stretch of a day on which the resolution does not change — a week-strip block. */
@@ -366,6 +425,9 @@ export interface ScheduleSegment {
   sceneId: string | null;
   scheduleId: string | null;
   source: "schedule" | "default" | "none";
+  /** POL-186 — what the panels do across this stretch. `null` = ungoverned. The strip PAINTS this:
+   *  it must never show a lit window the wall will run dark. */
+  panels: PanelState | null;
   /** The losing candidates over this stretch — the priority conflicts the strip marks. */
   overriddenScheduleIds: string[];
 }
@@ -382,10 +444,11 @@ export interface ScheduleDay {
  * inherited from yesterday's wrapped windows), resolves the midpoint of each slice with the SAME
  * resolver the ticker uses, then coalesces neighbours that resolve identically.
  */
-export function resolveDay(date: CalendarDate, set: ScheduleSet): ScheduleDay {
+export function resolveDay(date: CalendarDate, set: ScheduleSet, muralId: string): ScheduleDay {
   const dayparts = new Map(set.dayparts.map((d) => [d.id, d]));
   const cuts = new Set<number>([0, 1440]);
   for (const schedule of set.schedules) {
+    if (!governs(schedule, muralId)) continue;
     const daypart = dayparts.get(schedule.daypartId);
     if (!daypart) continue;
     const start = minutesOfDay(daypart.start);
@@ -403,13 +466,14 @@ export function resolveDay(date: CalendarDate, set: ScheduleSet): ScheduleDay {
     const endMinutes = edges[i + 1] as number;
     const mid = Math.floor((startMinutes + endMinutes) / 2);
     const at: LocalInstant = { date, minutes: mid, weekday: weekdayOf(date) };
-    const res = resolveAtLocal(at, set);
+    const res = resolveMuralAtLocal(at, set, muralId);
     const overridden = res.candidates.slice(1).map((c) => c.scheduleId);
     const previous = segments[segments.length - 1];
     if (
       previous &&
       previous.sceneId === res.sceneId &&
       previous.scheduleId === res.scheduleId &&
+      previous.panels === res.panels &&
       previous.overriddenScheduleIds.join(",") === overridden.join(",")
     ) {
       previous.endMinutes = endMinutes; // same verdict — coalesce
@@ -421,16 +485,17 @@ export function resolveDay(date: CalendarDate, set: ScheduleSet): ScheduleDay {
       sceneId: res.sceneId,
       scheduleId: res.scheduleId,
       source: res.source,
+      panels: res.panels,
       overriddenScheduleIds: overridden,
     });
   }
   return { date, weekday: weekdayOf(date), segments };
 }
 
-/** Seven resolved days from `startDate` — the console's "what plays when" week strip. */
-export function resolveWeek(startDate: CalendarDate, set: ScheduleSet): ScheduleDay[] {
+/** Seven resolved days from `startDate` for ONE mural — the console's "what plays when" week strip. */
+export function resolveWeek(startDate: CalendarDate, set: ScheduleSet, muralId: string): ScheduleDay[] {
   const out: ScheduleDay[] = [];
-  for (let i = 0; i < 7; i += 1) out.push(resolveDay(shiftDate(startDate, i), set));
+  for (let i = 0; i < 7; i += 1) out.push(resolveDay(shiftDate(startDate, i), set, muralId));
   return out;
 }
 
