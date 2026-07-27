@@ -48,6 +48,14 @@
  *   - `null` PANELS MEAN UNGOVERNED. No enabled window targets that mural: leave the wall exactly as
  *     it is (a screen an operator slept by hand stays asleep), and FORGET the remembered state so
  *     re-enabling a window later starts fresh rather than firing off a stale edge.
+ *   - THE MEMORY REMEMBERS WHICH WALL SPOKE. Because the window belongs to the wall, a screen dragged
+ *     from one mural to another has had the schedule's opinion OF IT changed even though neither
+ *     mural's verdict moved — so `lastDesired` records the mural alongside the verdict, and a screen
+ *     asleep by a wall that no longer holds it is woken on the next tick. Without that, the one thing
+ *     per-screen panel hours got right (a screen carried its own window, so it woke at its own 07:00)
+ *     would be a regression: nothing else re-asserts, and the panel would stay dark until an operator
+ *     pressed Wake by hand. See `applyMuralPower` for the line that draws it, and why it cannot be a
+ *     blanket "wake on `null`".
  */
 import type { PanelPowerMethod, PanelState } from "@polyptic/protocol";
 import { ServerToAgentDisplayPower, resolveMuralAt } from "@polyptic/protocol";
@@ -75,9 +83,9 @@ export interface PanelPowerDeps {
  */
 export class PanelPowerScheduler {
   /**
-   * screenId → what the SCHEDULE wanted at the previous evaluation. This is the memory that makes the
-   * scheduler edge-triggered, and it deliberately records the SCHEDULE's opinion, never the panel's
-   * actual state and never an operator's manual action:
+   * screenId → what the SCHEDULE wanted at the previous evaluation, and WHICH MURAL said so. This is
+   * the memory that makes the scheduler edge-triggered, and it deliberately records the SCHEDULE's
+   * opinion, never the panel's actual state and never an operator's manual action:
    *
    *   - an operator's wake/sleep does NOT touch it. That is precisely what lets a manual override
    *     hold: the schedule's opinion has not changed, so no edge exists, so the next tick says nothing
@@ -87,8 +95,11 @@ export class PanelPowerScheduler {
    *   - absent = we have not evaluated this screen yet, so the first evaluation RECORDS without
    *     sending. A box coming online is reconciled by `reconcileMachine` on its hello, which is the
    *     bootstrap path that matters; a server restart therefore cannot spray the fleet with frames.
+   *   - the MURAL is here because power hangs on the wall, not the screen: it is the only way to tell
+   *     "this wall's window slept you" from "another wall's window slept you, and you have since been
+   *     dragged off it" — which is a real edge for the screen even though no mural's verdict changed.
    */
-  private readonly lastDesired = new Map<string, boolean>();
+  private readonly lastDesired = new Map<string, { muralId: string; desired: boolean }>();
   private readonly now: () => Date;
 
   constructor(private readonly deps: PanelPowerDeps) {
@@ -126,7 +137,14 @@ export class PanelPowerScheduler {
    *     manual wake/sleep never touches — that is what lets an override hold to the next boundary;
    *   - `panels === null` (nothing governs this mural) leaves the wall exactly as it is and FORGETS
    *     the remembered state, so re-enabling a window later starts fresh instead of firing a stale
-   *     edge at a wall nobody asked to change.
+   *     edge at a wall nobody asked to change. With ONE exception, below.
+   *   - a screen that ARRIVED FROM ANOTHER MURAL asleep is woken. Power hangs on the wall, so moving
+   *     the screen changed the schedule's opinion of it, and the memory (keyed per screen, and now
+   *     carrying the mural that spoke) is where that edge is visible. It cannot be a blanket "wake on
+   *     `null`": `null` also covers the operator who slept a screen by hand and the window they just
+   *     disabled, and both of those must be left exactly as they are. What separates them is the
+   *     RECORDED MURAL — a manual sleep writes nothing here at all, and a window switched off on the
+   *     screen's own wall recorded that same wall.
    *
    * In hours the only command this can ever produce is WAKE. Nothing here infers power from
    * idleness, load or connectivity; that inference does not exist.
@@ -134,15 +152,23 @@ export class PanelPowerScheduler {
   applyMuralPower(muralId: string, panels: PanelState | null, daypartName: string): void {
     for (const screen of this.deps.control.getScreens()) {
       if (this.deps.control.getPlacementMuralId(screen.id) !== muralId) continue;
+      const previous = this.lastDesired.get(screen.id);
       if (panels === null) {
+        // Ungoverned: leave the wall alone and forget — UNLESS the screen is asleep on a verdict from
+        // a mural it is no longer on. Then the wall that darkened it does not govern it any more, and
+        // a screen with nothing at all saying "sleep" must not sit dark.
+        if (previous && !previous.desired && previous.muralId !== muralId) {
+          this.wake(screen.id, screen.friendlyName, "the wall that slept it no longer holds it");
+        }
         this.lastDesired.delete(screen.id);
         continue;
       }
       const desired = panels === "on";
-      const previous = this.lastDesired.get(screen.id);
-      this.lastDesired.set(screen.id, desired);
+      this.lastDesired.set(screen.id, { muralId, desired });
       if (previous === undefined) continue; // first sight of this screen — record, don't act
-      if (previous === desired) continue; // no boundary crossed; the schedule has nothing to say
+      // A screen that moved murals compares against the verdict that put it where it is, whichever
+      // wall said so: same state, nothing to say; different state, a genuine boundary for this screen.
+      if (previous.desired === desired) continue; // no boundary crossed; the schedule has nothing to say
       this.send(screen.id, desired, `schedule: ${daypartName}`);
       this.deps.activity.push(
         "info",
@@ -151,6 +177,13 @@ export class PanelPowerScheduler {
           : `${screen.friendlyName} is sleeping — ${daypartName}`,
       );
     }
+  }
+
+  /** One WAKE with its activity line — the sleep half always has a daypart to name, this half
+   *  sometimes has only a reason (a screen that outlived the window that slept it). */
+  private wake(screenId: string, friendlyName: string, reason: string): void {
+    this.send(screenId, true, `schedule: ${reason}`);
+    this.deps.activity.push("info", `${friendlyName} woke — ${reason}`);
   }
 
   /**
@@ -166,7 +199,11 @@ export class PanelPowerScheduler {
     for (const screen of screens) {
       const desired = this.desiredFor(screen.id);
       if (desired === null) continue;
-      this.lastDesired.set(screen.id, desired);
+      // `desiredFor` only answers non-null for a PLACED screen, so the mural is there to record — and
+      // it must be, or the next tick would read this as "a verdict from another wall" and wake it.
+      const muralId = this.deps.control.getPlacementMuralId(screen.id);
+      if (muralId === null) continue;
+      this.lastDesired.set(screen.id, { muralId, desired });
       // Only ever SEND the sleep half here. A box that just booted is already awake (the compositor
       // asserts `dpms on` at startup), so re-asserting "on" would be a wasted frame on every reconnect
       // of every box in the fleet — but a box that booted OUT of hours genuinely needs the sleep.

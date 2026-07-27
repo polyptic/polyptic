@@ -8,6 +8,9 @@
  *     re-asserted, the wall an operator just woke would go back to sleep ten seconds later, which is
  *     the bug that makes people disable the feature;
  *   - an UNGOVERNED mural (`panels === null`) is left exactly as it is — not woken, not slept;
+ *   - a screen DRAGGED OFF the wall that slept it wakes. Power hangs on the wall, so the move changed
+ *     the schedule's opinion of that screen without either mural's verdict moving, and nothing else
+ *     re-asserts — miss it and the panel is dark until someone presses Wake;
  *   - a box that reboots inside an off window is re-slept when it says hello (it comes back LIT —
  *     the compositor asserts `dpms on` at startup);
  *   - reconcile never sends a redundant WAKE: a booting box is already lit, and a wasted frame on
@@ -209,6 +212,83 @@ describe("scheduled panel power", () => {
     // The verdict is addressed to a mural this screen is not on, so nothing may leave the building.
     panelPower.applyMuralPower(other.id, "on", "Opening hours");
     panelPower.applyMuralPower(other.id, "off", "After hours");
+    expect(sent).toEqual([]);
+  });
+
+  /**
+   * A SCREEN MOVED BETWEEN MURALS WHILE ASLEEP. This is the regression per-screen panel hours could
+   * not have: a screen carried its own window and woke at its own 07:00. Now the window belongs to
+   * the WALL, so dragging a sleeping screen onto another wall changes the schedule's opinion FOR THAT
+   * SCREEN without either mural's own verdict changing — and the memory, which is keyed per screen,
+   * has to see that edge. Nothing re-asserts otherwise: the ticker is the only caller on the hot
+   * path, `reconcileMachine` only ever sends the SLEEP half, and no placement route touches power.
+   * So a miss here is a panel dark until an operator finds the Wake button.
+   */
+  test("a screen asleep by A's window wakes when it is dragged onto an UNGOVERNED mural", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // first sight: record "awake"
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // 19:00 — the wall sleeps
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
+
+    // 20:00: the operator drags the screen onto a wall no window governs.
+    const other = await control.createMural("Atrium");
+    await control.placeScreen("screen-1", other.id, 0, 0);
+
+    // The next tick, in the order the ticker runs it: A no longer holds the screen, and B is
+    // ungoverned. Under a plain "null = leave it alone" the screen would stay dark forever.
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    panelPower.applyMuralPower(other.id, null, "outside its scheduled windows");
+    expect(sent).toEqual([["screen-1", true]]);
+  });
+
+  test("a screen asleep by A's window wakes when it is dragged onto a mural that is ON", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
+
+    const other = await control.createMural("Atrium");
+    await control.placeScreen("screen-1", other.id, 0, 0);
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    panelPower.applyMuralPower(other.id, "on", "Open day"); // B's own window keeps its wall lit
+    expect(sent).toEqual([["screen-1", true]]);
+  });
+
+  test("a screen still asleep by ITS OWN mural's window is not woken by the move-wake", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    sent.length = 0;
+
+    const other = await control.createMural("Atrium");
+    await control.placeScreen("screen-1", other.id, 0, 0);
+    panelPower.applyMuralPower(other.id, "off", "After hours"); // B says off too — it stays asleep
+    expect(sent).toEqual([]);
+  });
+
+  /**
+   * The tension the move-wake must not break: `panels === null` means "leave the wall exactly as it
+   * is", so a screen an operator slept BY HAND stays asleep. A manual sleep never writes the memory,
+   * so there is nothing recorded to wake from — and an ungoverned tick on the screen's OWN mural (a
+   * window the operator just disabled) is "leave it alone" too, not a wake.
+   */
+  test("an ungoverned mural leaves a hand-slept screen asleep", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 12 * 60 });
+    panelPower.send("screen-1", false, "requested by an operator");
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, "outside its scheduled windows");
+    panelPower.applyMuralPower(muralId, null, "outside its scheduled windows");
+    expect(sent).toEqual([]);
+  });
+
+  test("disabling the window that slept a wall leaves it asleep — it has not moved", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, ""); // the operator switched the window off
     expect(sent).toEqual([]);
   });
 

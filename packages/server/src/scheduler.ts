@@ -29,7 +29,9 @@
  *     (`panel-power.ts`'s `lastDesired`), which is keyed PER SCREEN, not per mural: a mural's verdict
  *     is a poor place to dedupe from, because a screen can join or leave a mural (an operator drags it
  *     onto a different wall) without the mural's own verdict ever changing, and a mural-level gate
- *     would leave that screen unrecorded and unactioned until the next boundary. Calling
+ *     would leave that screen unrecorded and unactioned until the next boundary — and the seam's
+ *     memory records WHICH mural spoke, so a screen dragged off the wall that slept it is woken here
+ *     rather than left dark. Calling
  *     `applyMuralPower` every ~10s per mural is one cheap in-memory sweep; the seam already does a
  *     sweep of this shape across the whole fleet every 30s. In hours, the only command this can ever
  *     produce is WAKE — nothing here infers power from idleness, load, or connectivity; that
