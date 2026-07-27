@@ -1,5 +1,6 @@
 /**
- * Panel power (POL-101) — manual wake/sleep, and the daily panel-hours schedule that drives it.
+ * Panel power (POL-101, re-sourced onto the scene schedule at POL-186) — manual wake/sleep, and the
+ * scheduled windows that drive it.
  *
  * The rule this file exists to keep, and must never be read as weakening:
  *
@@ -15,7 +16,7 @@
  *
  * The obvious implementation re-asserts the desired state on every tick ("out of hours → sleep"). It
  * is also wrong, in the way an operator finds out about at 19:05 on the evening of a visit: they wake
- * a wall by hand, and thirty seconds later the scheduler puts it back to sleep, forever, because it
+ * a wall by hand, and ten seconds later the scheduler puts it back to sleep, forever, because it
  * cannot tell an operator's decision from a box that drifted. So we act on TRANSITIONS — a boundary
  * crossing (in-hours ⇄ out-of-hours) — and remember what we last asserted per screen. A manual
  * wake/sleep simply overwrites that memory, and therefore HOLDS until the next boundary, which is
@@ -26,74 +27,36 @@
  * machine's screens to their desired state. That is what re-sleeps a panel whose box rebooted at 3am
  * (the compositor comes back asserting `dpms on`, so the panel is lit again and, out of hours, wrong).
  *
- * ── Convergence with the scene scheduler ─────────────────────────────────────────────────────────
+ * ── Convergence with the scene scheduler: DONE (POL-186) ─────────────────────────────────────────
  *
- * A separate ticket brings full recurrence (weekdays, exceptions, holidays) to SCENES. Panel hours
- * deliberately stay a single daily window per screen until it lands: two half-built calendars is the
- * worst of both worlds. The two are meant to converge on one recurrence engine — see D100.
+ * This file used to own a second calendar — one enabled `{on, off}` window PER SCREEN, evaluated by
+ * its own 30s `setInterval` against its own timezone setting. That was always meant to be temporary
+ * (D100): full recurrence — weekdays, date ranges, priorities, DST — lives in the SCENE schedule, and
+ * two half-built calendars is the worst of both worlds. The convergence has now happened:
+ *
+ *   - THE WINDOW IS THE SCENE SCHEDULE'S. A schedule window carries `panels` ("on" | "off") and
+ *     targets a MURAL, so power is a property of a wall, not of a screen an operator has to find in
+ *     a list. `desiredFor` resolves the screen's mural through the shared resolver in
+ *     `@polyptic/protocol` — the same function the console's week strip paints with, so the strip
+ *     cannot lie about when a wall goes dark. The deployment's timezone and DST handling come with
+ *     it; this file no longer reads a clock zone of its own.
+ *   - THERE IS ONE CLOCK. The scene ticker (~10s) calls `applyMuralPower` once per mural per tick,
+ *     UNCONDITIONALLY — it does not gate on its own verdict changing, because a screen dragged onto
+ *     a mural mid-window would then never be recorded and would sit lit all night. So the seam below
+ *     is the ONLY edge-trigger, keyed per SCREEN, and it must stay cheap enough to run every 10s and
+ *     silent whenever the verdict is unchanged.
+ *   - `null` PANELS MEAN UNGOVERNED. No enabled window targets that mural: leave the wall exactly as
+ *     it is (a screen an operator slept by hand stays asleep), and FORGET the remembered state so
+ *     re-enabling a window later starts fresh rather than firing off a stale edge.
  */
-import type { PanelHours, PanelPowerMethod } from "@polyptic/protocol";
-import { ServerToAgentDisplayPower } from "@polyptic/protocol";
+import type { PanelPowerMethod, PanelState } from "@polyptic/protocol";
+import { ServerToAgentDisplayPower, resolveMuralAt } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
 
 import type { AdminBroadcaster, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import type { AgentHub } from "./hub";
 import type { ControlPlane } from "./state";
-
-/** How often the scheduler looks at the clock. A minute's granularity is what "HH:MM" promises; we
- *  tick at 30s so a boundary is never missed by rounding, and idempotence makes the extra tick free. */
-export const PANEL_TICK_MS = 30_000;
-
-/** Minutes since local midnight for an "HH:MM" string. */
-export function minutesOfDay(hhmm: string): number {
-  const [h, m] = hhmm.split(":");
-  return Number(h) * 60 + Number(m);
-}
-
-/**
- * What time it is, in minutes since midnight, in `timezone` — NOT in the server's zone. A control
- * plane in eu-west-1 must sleep a wall in Sheffield on Sheffield's clock, and it must keep doing so
- * across a DST change, which is precisely why this reads the zone through `Intl` on every call rather
- * than caching an offset.
- *
- * An invalid zone throws in the formatter; we fall back to UTC and say so, because a bad zone must
- * never take the scheduler (or the server) down.
- */
-export function minutesInZone(now: Date, timezone: string, onError?: (msg: string) => void): number {
-  let parts: Intl.DateTimeFormatPart[];
-  try {
-    parts = new Intl.DateTimeFormat("en-GB", {
-      timeZone: timezone,
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(now);
-  } catch {
-    onError?.(`unknown timezone "${timezone}" — falling back to UTC for panel hours`);
-    return now.getUTCHours() * 60 + now.getUTCMinutes();
-  }
-  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
-  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
-  // "24" is a legal en-GB h23/h24 rendering of midnight in some runtimes; normalise it to 0.
-  return (hour % 24) * 60 + minute;
-}
-
-/**
- * Should this panel be ON at `nowMinutes`? The window may WRAP midnight (on 20:00 / off 06:00 is a
- * perfectly good overnight window for a 24-hour operations wall), so a naive `on <= t < off` is not
- * enough. Inclusive of the ON minute and exclusive of the OFF minute, so a wall wakes AT 07:00 and
- * sleeps AT 19:00, which is what an operator typing those numbers means.
- *
- * A DISABLED window means "the schedule does not govern this screen" — it is left exactly as it is,
- * which is not the same as "keep it awake": a screen an operator slept by hand stays asleep.
- */
-export function panelShouldBeOn(hours: PanelHours, nowMinutes: number): boolean {
-  const on = minutesOfDay(hours.on);
-  const off = minutesOfDay(hours.off);
-  if (on < off) return nowMinutes >= on && nowMinutes < off; // a normal daytime window
-  return nowMinutes >= on || nowMinutes < off; // a window that wraps midnight
-}
 
 export interface PanelPowerDeps {
   control: ControlPlane;
@@ -104,12 +67,11 @@ export interface PanelPowerDeps {
   log: FastifyBaseLogger;
   /** Injected so schedule evaluation is testable without waiting for a wall clock to reach 19:00. */
   now?: () => Date;
-  tickMs?: number;
 }
 
 /**
- * Evaluates panel hours and drives `server/display-power`. Owns the desired-state memory that makes
- * a manual override hold until the next boundary (see the header).
+ * Turns the scene schedule's panel verdicts into `server/display-power`. Owns the desired-state
+ * memory that makes a manual override hold until the next boundary (see the header).
  */
 export class PanelPowerScheduler {
   /**
@@ -120,65 +82,74 @@ export class PanelPowerScheduler {
    *   - an operator's wake/sleep does NOT touch it. That is precisely what lets a manual override
    *     hold: the schedule's opinion has not changed, so no edge exists, so the next tick says nothing
    *     at all. (Recording the manual value here instead was the first thing I wrote, and it puts the
-   *     wall an operator just woke straight back to sleep thirty seconds later — the exact behaviour
+   *     wall an operator just woke straight back to sleep ten seconds later — the exact behaviour
    *     that gets a scheduling feature switched off.)
    *   - absent = we have not evaluated this screen yet, so the first evaluation RECORDS without
    *     sending. A box coming online is reconciled by `reconcileMachine` on its hello, which is the
    *     bootstrap path that matters; a server restart therefore cannot spray the fleet with frames.
    */
   private readonly lastDesired = new Map<string, boolean>();
-  private timer: ReturnType<typeof setInterval> | null = null;
   private readonly now: () => Date;
-  private readonly tickMs: number;
 
   constructor(private readonly deps: PanelPowerDeps) {
     this.now = deps.now ?? (() => new Date());
-    this.tickMs = deps.tickMs ?? PANEL_TICK_MS;
-  }
-
-  start(): void {
-    if (this.timer) return;
-    // An immediate first pass would fight a fleet that is still connecting (no agent sockets yet), so
-    // the schedule's real entry point for a box is its hello (`reconcileMachine`); the interval then
-    // carries the boundaries from there.
-    this.timer = setInterval(() => this.tick(), this.tickMs);
-    // Never hold the process open for a timer whose whole job is to wait (matters to tests + shutdown).
-    this.timer.unref?.();
-  }
-
-  stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  /** The desired power for one screen right now, or `null` when no ENABLED window governs it. */
-  desiredFor(screenId: string): boolean | null {
-    const hours = this.deps.control.getPanelHours(screenId);
-    if (!hours || !hours.enabled) return null;
-    const { timezone } = this.deps.control.getPanelPowerConfig();
-    const nowMinutes = minutesInZone(this.now(), timezone, (msg) =>
-      this.deps.log.warn({ event: "panel.timezone.invalid", timezone }, msg),
-    );
-    return panelShouldBeOn(hours, nowMinutes);
   }
 
   /**
-   * One pass over every screen with an enabled window. Sends a power command ONLY on a transition —
-   * see the header for why level-triggering would trample an operator's manual override.
+   * The desired power for one screen right now, or `null` when no enabled window governs its mural.
+   *
+   * A screen's power belongs to the WALL it is part of, so this resolves the mural it is placed on
+   * and asks the shared resolver — the deployment's timezone, DST, weekdays and date ranges all come
+   * with that, because it is the same function the console's week strip paints with.
    */
-  tick(): void {
-    for (const { screenId } of this.deps.control.listPanelHours()) {
-      const desired = this.desiredFor(screenId);
-      if (desired === null) {
-        // The window was disabled/removed: forget it, so re-enabling it later starts fresh.
-        this.lastDesired.delete(screenId);
+  desiredFor(screenId: string): boolean | null {
+    const muralId = this.deps.control.getPlacementMuralId(screenId);
+    if (muralId === null) return null; // an unplaced screen belongs to no mural, so no window governs it
+    const { panels } = resolveMuralAt(
+      this.now().getTime(),
+      this.deps.control.getScheduleSet(),
+      muralId,
+    );
+    return panels === null ? null : panels === "on";
+  }
+
+  /**
+   * The scene ticker's per-mural verdict, handed over on EVERY tick (~10s) for EVERY mural — the
+   * ticker deliberately does not gate on its own verdict changing, because a screen dragged onto a
+   * mural mid-window would then never be recorded and would sit lit all night. So this method is the
+   * only edge-trigger in the system, and everything about it follows from that:
+   *
+   *   - it is one in-memory sweep of the screen list, cheap enough to run every 10s per mural;
+   *   - it sends NOTHING when the verdict is unchanged. Re-asserting here would put the wall an
+   *     operator just woke back to sleep ten seconds later, over and over;
+   *   - the memory it consults is the SCHEDULE's opinion (see `lastDesired`), which an operator's
+   *     manual wake/sleep never touches — that is what lets an override hold to the next boundary;
+   *   - `panels === null` (nothing governs this mural) leaves the wall exactly as it is and FORGETS
+   *     the remembered state, so re-enabling a window later starts fresh instead of firing a stale
+   *     edge at a wall nobody asked to change.
+   *
+   * In hours the only command this can ever produce is WAKE. Nothing here infers power from
+   * idleness, load or connectivity; that inference does not exist.
+   */
+  applyMuralPower(muralId: string, panels: PanelState | null, daypartName: string): void {
+    for (const screen of this.deps.control.getScreens()) {
+      if (this.deps.control.getPlacementMuralId(screen.id) !== muralId) continue;
+      if (panels === null) {
+        this.lastDesired.delete(screen.id);
         continue;
       }
-      const previous = this.lastDesired.get(screenId);
-      this.lastDesired.set(screenId, desired);
+      const desired = panels === "on";
+      const previous = this.lastDesired.get(screen.id);
+      this.lastDesired.set(screen.id, desired);
       if (previous === undefined) continue; // first sight of this screen — record, don't act
       if (previous === desired) continue; // no boundary crossed; the schedule has nothing to say
-      this.send(screenId, desired, "panel hours");
+      this.send(screen.id, desired, `schedule: ${daypartName}`);
+      this.deps.activity.push(
+        "info",
+        desired
+          ? `${screen.friendlyName} woke — ${daypartName}`
+          : `${screen.friendlyName} is sleeping — ${daypartName}`,
+      );
     }
   }
 
@@ -199,7 +170,7 @@ export class PanelPowerScheduler {
       // Only ever SEND the sleep half here. A box that just booted is already awake (the compositor
       // asserts `dpms on` at startup), so re-asserting "on" would be a wasted frame on every reconnect
       // of every box in the fleet — but a box that booted OUT of hours genuinely needs the sleep.
-      if (!desired) this.send(screen.id, false, "panel hours (box came back outside its hours)");
+      if (!desired) this.send(screen.id, false, "schedule (the box came back inside an off window)");
     }
   }
 

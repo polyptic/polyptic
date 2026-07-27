@@ -2068,6 +2068,12 @@ export class ControlPlane {
     return this.placements.get(screenId);
   }
 
+  /** The mural a screen is placed on, or `null` if it is unplaced (POL-186 — panel power is a
+   *  property of a WALL, so an unplaced screen is governed by no window at all). */
+  getPlacementMuralId(screenId: string): string | null {
+    return this.placements.get(screenId)?.muralId ?? null;
+  }
+
   /** Create a new mural with a server-assigned id. Write-through. */
   async createMural(name: string): Promise<Mural> {
     const id = this.nextMuralId();
