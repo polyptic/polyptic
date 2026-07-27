@@ -608,9 +608,10 @@ export function buildAdminState(
     videoWalls: control.getVideoWalls(),
     contentSources: control.getContentSources(),
     scenes: control.getScenes(),
-    // POL-95 — the ACTIVE scene, straight from desired state. The console used to invent this
-    // client-side (optimistic on apply), so a reload or a second operator saw a wrong/absent badge.
-    activeSceneId: control.state.activeSceneId,
+    // POL-95/POL-186 — the ACTIVE scene of each mural, straight from desired state. The console used
+    // to invent this client-side (optimistic on apply), so a reload or a second operator saw a
+    // wrong/absent badge. Per mural since POL-186: murals are on different scenes at the same moment.
+    activeScenes: control.state.activeScenes,
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     panelPower: control.getPanelPowerConfig(), // POL-101 — the panel-hours timezone

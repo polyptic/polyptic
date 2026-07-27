@@ -973,7 +973,10 @@ export type ScreenSlice = z.infer<typeof ScreenSlice>;
  *  (The full Scene snapshot model lives below, near the other Phase-3 console types.) */
 export const DesiredState = z.object({
   revision: z.number().int().nonnegative(),
-  activeSceneId: z.string().nullable(),
+  /** POL-95/POL-186 — muralId → the scene that mural is currently on. A mural absent from the map is
+   *  on no scene (never applied, or diverged since). One entry per mural rather than one global value:
+   *  the scheduler resolves each mural independently, so each is on its own scene. */
+  activeScenes: z.record(z.string(), z.string()),
   screens: z.array(Screen),
   /** screenId → slice to render right now. */
   slices: z.record(z.string(), ScreenSlice),
@@ -2687,11 +2690,12 @@ export const ServerToAdminState = z.object({
   videoWalls: z.array(VideoWall), // Phase 3b — combined surfaces
   contentSources: z.array(ContentSource), // Phase 3c — the content library
   scenes: z.array(Scene), // Phase 3d — saved wall snapshots
-  /** POL-95 — the scene the wall is CURRENTLY on, straight from the server's desired state (null once
-   *  a manual change diverges the wall from it). Authoritative: every console — a reload, a second
-   *  operator — agrees on the Active badge because it is told, never because it guessed. Optional on
-   *  the wire = back-compat with an older server (the console then simply shows no badge). */
-  activeSceneId: z.string().nullable().optional(),
+  /** POL-95/POL-186 — muralId → the scene that mural is CURRENTLY on, straight from the server's
+   *  desired state (the mural drops out of the map once a manual change diverges it). Authoritative:
+   *  every console — a reload, a second operator — agrees on the Active badge because it is told,
+   *  never because it guessed. Per mural since POL-186, because scheduling resolves per mural.
+   *  Optional on the wire = back-compat with an older server (the console then shows no badge). */
+  activeScenes: z.record(z.string(), z.string()).optional(),
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   panelPower: PanelPowerConfig.optional(), // POL-101 — the deployment's panel-hours timezone
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat

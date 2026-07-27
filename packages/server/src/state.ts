@@ -503,7 +503,7 @@ export class ControlPlane {
   /** The single global desired state. Held by reference; mutated in place, revision-bumped on change. */
   readonly state: DesiredState = {
     revision: 0,
-    activeSceneId: null,
+    activeScenes: {},
     screens: [],
     slices: {},
   };
@@ -897,12 +897,14 @@ export class ControlPlane {
     this.sceneCounter = maxScene;
 
     // POL-95 — the ACTIVE scene is server-authoritative and persisted: a control-plane restart must
-    // not lose which scene the wall is on (a console reconnecting after one would otherwise show no
-    // badge at all). A pointer at a scene that no longer exists degrades to "none".
-    this.state.activeSceneId =
-      persisted.activeSceneId && this.scenes.has(persisted.activeSceneId)
-        ? persisted.activeSceneId
-        : null;
+    // not lose which scene each mural is on (a console reconnecting after one would otherwise show no
+    // badge at all). POL-186 made it one entry per mural. A pointer at a scene — or a mural — that no
+    // longer exists is simply dropped: the mural degrades to "on no scene" rather than to a lie.
+    for (const [muralId, sceneId] of Object.entries(persisted.activeScenes)) {
+      if (!this.murals.has(muralId)) continue;
+      if (!this.scenes.has(sceneId)) continue;
+      this.state.activeScenes[muralId] = sceneId;
+    }
 
     // ── Scene scheduler (POL-89) ──────────────────────────────────────────────
     for (const pd of persisted.dayparts) {
@@ -2113,6 +2115,10 @@ export class ControlPlane {
       this.placements.delete(p.screenId);
       await this.store.deletePlacement(p.screenId);
     }
+
+    // POL-186 — clear the mural's badge BEFORE its row goes: the write-through is `WHERE id = mural`,
+    // so once the row is deleted the clearance has nowhere to land.
+    await this.setActiveScene(id, null);
 
     this.murals.delete(id);
     await this.store.deleteMural(id);
@@ -4823,44 +4829,61 @@ export class ControlPlane {
     return null;
   }
 
-  // ── The ACTIVE scene, server-authoritative (POL-95) ──────────────────────────
+  // ── The ACTIVE scene, server-authoritative and PER MURAL (POL-95 / POL-186) ──
   //
-  // `DesiredState.activeSceneId` is the control plane's answer to "which scene is the wall on?" — it
-  // is persisted, broadcast in `admin/state`, and CLEARED the moment a manual change makes the live
-  // wall stop being that scene. Consoles never guess it; they are told. (Before POL-95 the badge was
-  // set optimistically in the console's own store, so a reload or a second operator saw a wrong or
-  // absent badge — a control plane that is the brain cannot let a client invent its state.)
+  // `DesiredState.activeScenes` is the control plane's answer to "which scene is this mural on?" — it
+  // is persisted, broadcast in `admin/state`, and CLEARED the moment a manual change makes that
+  // mural's live wall stop being that scene. Consoles never guess it; they are told. (Before POL-95
+  // the badge was set optimistically in the console's own store, so a reload or a second operator saw
+  // a wrong or absent badge — a control plane that is the brain cannot let a client invent its state.)
+  //
+  // POL-186 split the one global answer into one per mural, because the scheduler now resolves each
+  // mural independently and they are genuinely on different scenes at the same moment. The badge's
+  // guarantee is unchanged, just narrowed: each mural's badge stands or falls on ITS OWN wall.
 
-  /** Set (or clear) the active scene, write-through. No-op when it already holds that value. */
-  private async setActiveScene(sceneId: string | null): Promise<void> {
-    if (this.state.activeSceneId === sceneId) return;
-    this.state.activeSceneId = sceneId;
-    await this.store.setActiveSceneId(sceneId);
+  /** What scene a mural is currently on, or null when it is on none (never applied, or diverged). */
+  getActiveSceneId(muralId: string): string | null {
+    return this.state.activeScenes[muralId] ?? null;
+  }
+
+  /** Set (or clear) one mural's active scene, write-through. No-op when it already holds that value.
+   *  The caller must have PERSISTED the mural first — the store's write is `WHERE id = muralId`, so a
+   *  mural that is not yet a row would take the value in memory and silently lose it on restart. */
+  private async setActiveScene(muralId: string, sceneId: string | null): Promise<void> {
+    if (this.getActiveSceneId(muralId) === sceneId) return;
+    if (sceneId === null) delete this.state.activeScenes[muralId];
+    else this.state.activeScenes[muralId] = sceneId;
+    await this.store.setActiveSceneId(muralId, sceneId);
   }
 
   /**
-   * Re-check the Active badge after any MANUAL change to the wall. The badge claims "the wall IS this
-   * scene", so we judge it the only way that can't lie: re-diff the live wall against the scene and
-   * clear the badge unless nothing would change. (Every mutator that can move the wall calls this;
-   * the apply's own primitives are fenced off by `applyingScene`.)
+   * Re-check the Active badges after any MANUAL change to the wall. A badge claims "this mural IS this
+   * scene", so we judge it the only way that can't lie: re-diff the mural's live wall against the
+   * scene and clear the badge unless nothing would change. (Every mutator that can move the wall calls
+   * this; the apply's own primitives are fenced off by `applyingScene`.)
+   *
+   * Every mural carrying a badge is re-judged, not just one: a mutator has no single mural to name (a
+   * move takes a screen OFF one mural and ON to another; a lost machine can strip screens from
+   * several). Each verdict is still purely per mural — `diffScene` only ever looks at that scene's own
+   * mural — so a change on one wall can never clear another's badge.
    */
   private async reconcileActiveScene(): Promise<void> {
     if (this.applyingScene) return;
-    const activeId = this.state.activeSceneId;
-    if (activeId === null) return;
 
-    const scene = this.scenes.get(activeId);
-    if (scene === undefined) {
-      await this.setActiveScene(null);
-      return;
+    for (const [muralId, activeId] of Object.entries(this.state.activeScenes)) {
+      const scene = this.scenes.get(activeId);
+      if (scene === undefined) {
+        await this.setActiveScene(muralId, null);
+        continue;
+      }
+      // A null diff means the scene's mural has been deleted out from under it — the wall it described
+      // no longer exists, so the badge cannot stand either.
+      const diff = this.diffScene(activeId);
+      if (diff !== null && diff.identical) continue;
+
+      await this.setActiveScene(muralId, null);
+      this.emit("info", `The wall no longer matches scene ${scene.name}`);
     }
-    // A null diff means the scene's mural has been deleted out from under it — the wall it described
-    // no longer exists, so the badge cannot stand either.
-    const diff = this.diffScene(activeId);
-    if (diff !== null && diff.identical) return;
-
-    await this.setActiveScene(null);
-    this.emit("info", `The wall no longer matches scene ${scene.name}`);
   }
 
   /** Turn a captured SceneContent into a ContentAssignment to feed setScreenContent/setWallContent. */
@@ -4925,7 +4948,7 @@ export class ControlPlane {
    *   4. assign content — each wall's via setWallContent, each non-walled screen's via setScreenContent
    *      (a `{sourceId}` whose source was deleted resolves to nothing → leave that target EMPTY rather
    *      than crash); a captured `null` clears the target so apply is deterministic;
-   *   5. set DesiredState.activeSceneId = scene.id.
+   *   5. mark the scene active on its mural (`DesiredState.activeScenes[scene.muralId]`).
    * Returns the scene + the affected screen slices for the caller to push `server/render` to. Idempotent:
    * re-applying the active scene is a no-op-ish refresh (content rides the stable-id paths, so unchanged
    * tiles patch in place). Returns null if the scene — or its mural — is unknown.
@@ -5018,9 +5041,10 @@ export class ControlPlane {
       }
     }
 
-    // 5. Mark the scene active — SERVER-AUTHORITATIVE (POL-95): persisted here, broadcast in
-    //    admin/state, cleared by the divergence guard. Every console is told; none guesses.
-    await this.setActiveScene(scene.id);
+    // 5. Mark the scene active ON ITS MURAL — SERVER-AUTHORITATIVE (POL-95/POL-186): persisted here,
+    //    broadcast in admin/state, cleared by the divergence guard. Every console is told; none
+    //    guesses. Other murals' badges are untouched — this apply says nothing about their walls.
+    await this.setActiveScene(muralId, scene.id);
 
     // One summary line for the whole apply. Pushed straight to the log (the per-op guard is on).
     this.activity?.push("good", `Applied scene ${scene.name}`);
@@ -5045,15 +5069,17 @@ export class ControlPlane {
   }
 
   /**
-   * Delete a saved scene. If it was the active scene, clears DesiredState.activeSceneId; any SCHEDULE
-   * bound to it (and its standing as the default scene) goes with it — a schedule pointing at a scene
-   * that no longer exists would resolve to nothing every tick. Write-through. Does NOT touch the live
-   * wall (a scene is just a saved snapshot). Returns false if unknown.
+   * Delete a saved scene. Clears the badge off any mural that was on it; any SCHEDULE bound to it (and
+   * its standing as the default scene) goes with it — a schedule pointing at a scene that no longer
+   * exists would resolve to nothing every tick. Write-through. Does NOT touch the live wall (a scene
+   * is just a saved snapshot). Returns false if unknown.
    */
   async deleteScene(id: string): Promise<boolean> {
     if (!this.scenes.has(id)) return false;
     this.scenes.delete(id);
-    if (this.state.activeSceneId === id) await this.setActiveScene(null);
+    for (const [muralId, activeId] of Object.entries(this.state.activeScenes)) {
+      if (activeId === id) await this.setActiveScene(muralId, null);
+    }
     await this.store.deleteScene(id);
 
     for (const schedule of [...this.schedules.values()].filter((s) => s.sceneId === id)) {
@@ -5310,12 +5336,18 @@ export class ControlPlane {
     return { ...this.schedulerSettings };
   }
 
-  /** Everything the shared resolver needs — the same set the console gets in `admin/state`. */
+  /** Everything the shared resolver needs — the same set the console gets in `admin/state`. Since
+   *  POL-186 that includes the MURAL CONTEXT: resolution runs once per mural, and the default-scene
+   *  floor only applies to the mural its scene belongs to, so both come along. */
   getScheduleSet(): ScheduleSet {
+    const sceneMurals: Record<string, string> = {};
+    for (const scene of this.scenes.values()) sceneMurals[scene.id] = scene.muralId;
     return {
       dayparts: this.getDayparts(),
       schedules: this.getSchedules(),
       settings: this.getSchedulerSettings(),
+      murals: [...this.murals.keys()],
+      sceneMurals,
     };
   }
 
@@ -5358,18 +5390,36 @@ export class ControlPlane {
     return { ok: true };
   }
 
+  /**
+   * The mural a window governs, decided at WRITE time so the resolver never has to chase it: a
+   * scene-bearing window takes its scene's mural (a scene cannot move mural, so the stamp is stable),
+   * a POWER-ONLY window keeps the mural the operator aimed at — or null, meaning every mural.
+   */
+  private stampMuralId(sceneId: string | null, muralId: string | null): string | null {
+    if (sceneId === null) return muralId;
+    return this.scenes.get(sceneId)?.muralId ?? null;
+  }
+
   async createSchedule(
     body: CreateScheduleBody,
-  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown-scene" | "unknown-daypart" }> {
-    if (!this.scenes.has(body.sceneId)) return { ok: false, error: "unknown-scene" };
+  ): Promise<
+    | { ok: true; schedule: Schedule }
+    | { ok: false; error: "unknown-scene" | "unknown-mural" | "unknown-daypart" }
+  > {
+    // A window either carries a scene (and takes that scene's mural) or is POWER-ONLY and targets a
+    // mural the operator names — or every mural, with null.
+    if (body.sceneId !== null && !this.scenes.has(body.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (body.muralId !== null && !this.murals.has(body.muralId)) return { ok: false, error: "unknown-mural" };
     if (!this.dayparts.has(body.daypartId)) return { ok: false, error: "unknown-daypart" };
     this.scheduleCounter += 1;
     const schedule = Schedule.parse({
       id: `schedule-${this.scheduleCounter}`,
       sceneId: body.sceneId,
+      muralId: this.stampMuralId(body.sceneId, body.muralId),
       daypartId: body.daypartId,
       days: [...new Set(body.days)].sort((a, b) => a - b),
       priority: body.priority,
+      panels: body.panels,
       enabled: body.enabled,
       from: body.from,
       until: body.until,
@@ -5377,9 +5427,12 @@ export class ControlPlane {
     });
     this.schedules.set(schedule.id, schedule);
     await this.store.upsertSchedule(schedule);
+    const daypartName = this.dayparts.get(schedule.daypartId)?.name ?? schedule.daypartId;
     this.emit(
       "info",
-      `Scheduled ${this.scenes.get(schedule.sceneId)?.name ?? schedule.sceneId} in ${this.dayparts.get(schedule.daypartId)?.name ?? schedule.daypartId}`,
+      schedule.sceneId === null
+        ? `Scheduled panels ${schedule.panels} in ${daypartName}`
+        : `Scheduled ${this.scenes.get(schedule.sceneId)?.name ?? schedule.sceneId} in ${daypartName}`,
     );
     return { ok: true, schedule };
   }
@@ -5387,16 +5440,26 @@ export class ControlPlane {
   async updateSchedule(
     id: string,
     patch: UpdateScheduleBody,
-  ): Promise<{ ok: true; schedule: Schedule } | { ok: false; error: "unknown" | "unknown-scene" | "unknown-daypart" }> {
+  ): Promise<
+    | { ok: true; schedule: Schedule }
+    | { ok: false; error: "unknown" | "unknown-scene" | "unknown-mural" | "unknown-daypart" }
+  > {
     const existing = this.schedules.get(id);
     if (existing === undefined) return { ok: false, error: "unknown" };
-    if (patch.sceneId !== undefined && !this.scenes.has(patch.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (patch.sceneId != null && !this.scenes.has(patch.sceneId)) return { ok: false, error: "unknown-scene" };
+    if (patch.muralId != null && !this.murals.has(patch.muralId)) return { ok: false, error: "unknown-mural" };
     if (patch.daypartId !== undefined && !this.dayparts.has(patch.daypartId)) {
       return { ok: false, error: "unknown-daypart" };
     }
+    // The mural is RE-STAMPED on every edit, not carried: dropping a window's scene turns it
+    // power-only over the mural it already governed, and moving it onto another scene moves it onto
+    // that scene's mural. Either way the stamp is derived, never stale.
+    const nextSceneId = patch.sceneId !== undefined ? patch.sceneId : existing.sceneId;
+    const nextTarget = patch.muralId !== undefined ? patch.muralId : existing.muralId;
     const schedule = Schedule.parse({
       ...existing,
       ...patch,
+      muralId: this.stampMuralId(nextSceneId, nextTarget),
       ...(patch.days ? { days: [...new Set(patch.days)].sort((a, b) => a - b) } : {}),
     });
     this.schedules.set(id, schedule);

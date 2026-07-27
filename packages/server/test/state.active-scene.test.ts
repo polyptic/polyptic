@@ -4,6 +4,9 @@
  * These drive `ControlPlane` directly against the `MemoryStore` (no server/WS). They pin the two
  * claims the console's Active badge and its apply-preview card make to an operator:
  *
+ * (POL-186 narrowed the badge from one global value to one per mural — `getActiveSceneId(muralId)`.
+ * Both claims are unchanged; they are simply made about each mural's own wall.)
+ *
  *   1. The badge is the CONTROL PLANE's answer, not a console's memory of its own last click. It is
  *      set by apply, PERSISTED (it survives a restart), and CLEARED the moment a manual change makes
  *      the wall stop being that scene — because a console that lies about which scene is live corrodes
@@ -54,7 +57,7 @@ describe("the active scene is server-authoritative (POL-95)", () => {
     const scene = await cp.snapshotScene("Opening", muralId);
     expect(scene).not.toBeNull();
     // Saving a scene does NOT make it active — the wall was not applied, it was photographed.
-    expect(cp.state.activeSceneId).toBeNull();
+    expect(cp.getActiveSceneId(muralId)).toBeNull();
   });
 
   test("applying a scene sets the active scene, and it SURVIVES a restart", async () => {
@@ -62,12 +65,12 @@ describe("the active scene is server-authoritative (POL-95)", () => {
     await cp.setScreenContent(a, { url: "https://example.test/one" });
     const scene = await cp.snapshotScene("Opening", muralId);
     await cp.applyScene(scene!.id);
-    expect(cp.state.activeSceneId).toBe(scene!.id);
+    expect(cp.getActiveSceneId(muralId)).toBe(scene!.id);
 
     // A control-plane restart against the same store: the badge is desired state, so it comes back.
     const revived = new ControlPlane(store);
     await revived.init();
-    expect(revived.state.activeSceneId).toBe(scene!.id);
+    expect(revived.getActiveSceneId(muralId)).toBe(scene!.id);
   });
 
   test("a manual content change CLEARS the badge (the wall is no longer that scene)", async () => {
@@ -75,10 +78,10 @@ describe("the active scene is server-authoritative (POL-95)", () => {
     await cp.setScreenContent(a, { url: "https://example.test/one" });
     const scene = await cp.snapshotScene("Opening", muralId);
     await cp.applyScene(scene!.id);
-    expect(cp.state.activeSceneId).toBe(scene!.id);
+    expect(cp.getActiveSceneId(muralId)).toBe(scene!.id);
 
     await cp.setScreenContent(a, { url: "https://example.test/two" });
-    expect(cp.state.activeSceneId).toBeNull();
+    expect(cp.getActiveSceneId(muralId)).toBeNull();
   });
 
   test("a manual MOVE clears it; a no-op re-place of the same geometry does not", async () => {
@@ -88,10 +91,10 @@ describe("the active scene is server-authoritative (POL-95)", () => {
 
     // Placing A exactly where it already is changes nothing on the wall — the badge stands.
     await cp.placeScreen(a, muralId, 0, 0, 1920, 1080);
-    expect(cp.state.activeSceneId).toBe(scene!.id);
+    expect(cp.getActiveSceneId(muralId)).toBe(scene!.id);
 
     await cp.placeScreen(a, muralId, 500, 500, 1920, 1080);
-    expect(cp.state.activeSceneId).toBeNull();
+    expect(cp.getActiveSceneId(muralId)).toBeNull();
   });
 
   test("combining and splitting clear it (grouping is part of the scene)", async () => {
@@ -101,11 +104,11 @@ describe("the active scene is server-authoritative (POL-95)", () => {
 
     const combined = await cp.combineScreens(muralId, [a, b]);
     expect(combined.ok).toBe(true);
-    expect(cp.state.activeSceneId).toBeNull();
+    expect(cp.getActiveSceneId(muralId)).toBeNull();
 
     // Apply again (the scene has no walls) → the wall is split back and the badge returns.
     await cp.applyScene(scene!.id);
-    expect(cp.state.activeSceneId).toBe(scene!.id);
+    expect(cp.getActiveSceneId(muralId)).toBe(scene!.id);
     expect(cp.getVideoWalls().length).toBe(0);
   });
 
@@ -115,11 +118,11 @@ describe("the active scene is server-authoritative (POL-95)", () => {
     await cp.applyScene(scene!.id);
 
     expect(await cp.deleteScene(scene!.id)).toBe(true);
-    expect(cp.state.activeSceneId).toBeNull();
+    expect(cp.getActiveSceneId(muralId)).toBeNull();
 
     const revived = new ControlPlane(store);
     await revived.init();
-    expect(revived.state.activeSceneId).toBeNull();
+    expect(revived.getActiveSceneId(muralId)).toBeNull();
   });
 
   test("applying a scene is IDEMPOTENT — re-applying the active one keeps the badge", async () => {
@@ -130,9 +133,9 @@ describe("the active scene is server-authoritative (POL-95)", () => {
     const scene = await cp.snapshotScene("Opening", muralId);
 
     await cp.applyScene(scene!.id);
-    expect(cp.state.activeSceneId).toBe(scene!.id);
+    expect(cp.getActiveSceneId(muralId)).toBe(scene!.id);
     await cp.applyScene(scene!.id);
-    expect(cp.state.activeSceneId).toBe(scene!.id);
+    expect(cp.getActiveSceneId(muralId)).toBe(scene!.id);
     expect(cp.diffScene(scene!.id)?.identical).toBe(true);
   });
 });
