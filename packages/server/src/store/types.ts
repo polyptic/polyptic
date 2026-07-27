@@ -272,14 +272,19 @@ export interface PersistedDaypart {
   end: string;
 }
 
-/** POL-89 — a scene bound to a daypart on a recurrence, at a priority. The scheduler's unit. */
+/** POL-89 — a scene bound to a daypart on a recurrence, at a priority. The scheduler's unit.
+ *  POL-186 — `sceneId` is nullable (a POWER-ONLY window: don't change what plays, only set the
+ *  panels) and `muralId` names which mural the window governs (`null` = every mural). */
 export interface PersistedSchedule {
   id: string;
-  sceneId: string;
+  sceneId: string | null;
+  muralId: string | null;
   daypartId: string;
   /** Weekdays the window is armed on (0=Sun…6=Sat). */
   days: number[];
   priority: number;
+  /** POL-186 — what the panels do while this window is on air. */
+  panels: "on" | "off";
   enabled: boolean;
   /** Inclusive date range (`YYYY-MM-DD`), tested against the window's START date. */
   from: string | null;
@@ -502,10 +507,11 @@ export interface PersistedPanelPower {
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
-  /** POL-95 — the scene the wall is currently on (null = none / diverged). Persisted with the
-   *  revision in the single-row `meta` table: the active scene is desired state, not a UI hint, so a
-   *  server restart must not lose it. */
-  activeSceneId: string | null;
+  /** POL-95/POL-186 — the scene each mural is currently on: muralId → sceneId. A mural absent from
+   *  this map has none (diverged). Which scene a mural is on is desired state, not a UI hint, so a
+   *  server restart must not lose it — POL-186 moved this from one global value to one per mural,
+   *  since scheduling now resolves per mural. */
+  activeScenes: Record<string, string>;
   machines: PersistedMachine[];
   screens: PersistedScreen[];
   content: PersistedContent[];
@@ -572,9 +578,11 @@ export interface Store {
   deleteContent(screenId: string): Promise<void>;
   /** Persist the global revision counter. */
   setRevision(revision: number): Promise<void>;
-  /** POL-95 — persist the ACTIVE scene (null = none / the wall has diverged). Single-row, alongside
-   *  the revision: which scene the wall is on is desired state, and must survive a restart. */
-  setActiveSceneId(sceneId: string | null): Promise<void>;
+  /** POL-95/POL-186 — persist the ACTIVE scene for ONE mural (`null` clears it — none / diverged).
+   *  Which scene a mural is on is desired state, and must survive a restart. */
+  setActiveSceneId(muralId: string, sceneId: string | null): Promise<void>;
+  /** POL-186 — mural id → its active scene id. Murals with no active scene are absent from the map. */
+  listActiveScenes(): Promise<Record<string, string>>;
 
   // ── Murals & placement (Phase 3) ──────────────────────────────────────────
   /** Insert-or-update a mural row (id + name). */
