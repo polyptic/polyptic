@@ -29,9 +29,7 @@ import {
   InspectBody,
   InteractiveBody,
   MoveTargetsBody,
-  PanelHoursBody,
   PanelPowerBody,
-  PanelPowerConfig,
   PlaceScreenBody,
   UnplaceScreensBody,
   PreRegistration,
@@ -47,7 +45,6 @@ import {
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
   UpdateDaypartBody,
-  UpdatePanelPowerBody,
   UpdateSceneBody,
   UpdateScheduleBody,
   UpdateSchedulerSettingsBody,
@@ -62,7 +59,6 @@ import type {
   CredentialProfileView,
   Daypart,
   DocumentJob,
-  PanelHours,
   Scene,
   SceneDiff,
   Schedule,
@@ -490,21 +486,9 @@ export function setMachinePower(machineId: string, body: PanelPowerBody): Promis
   return send("POST", `/machines/${encodeURIComponent(machineId)}/power`, PanelPowerBody.parse(body));
 }
 
-/** PUT /api/v1/screens/:screenId/panel-hours { hours | null } — set/clear a screen's daily on/off
- *  window (POL-101). `null` clears it: the screen then runs 24/7 and the scheduler never touches it. */
-export function setScreenPanelHours(screenId: string, hours: PanelHours | null): Promise<unknown> {
-  return send(
-    "PUT",
-    `/screens/${encodeURIComponent(screenId)}/panel-hours`,
-    PanelHoursBody.parse({ hours }),
-  );
-}
-
-/** PUT /api/v1/settings/panel-power { timezone } — the deployment's panel-hours timezone (POL-101). */
-export async function setPanelPowerTimezone(timezone: string): Promise<PanelPowerConfig> {
-  const res = await send("PUT", "/settings/panel-power", UpdatePanelPowerBody.parse({ timezone }));
-  return PanelPowerConfig.parse(res);
-}
+// POL-186 — the per-screen panel-hours PUT and the deployment's second timezone setting are gone.
+// A wall's waking hours are a schedule window (`createSchedule`/`updateSchedule` above) on the
+// scheduler's one clock (`updateSchedulerSettings`).
 
 /**
  * DELETE /api/v1/screens/:screenId — permanently forget a single screen (POL-14). Dissolves any

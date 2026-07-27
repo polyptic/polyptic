@@ -1,0 +1,505 @@
+---
+title: "Panel power moves into the schedule window (POL-186)"
+slug: pol-186-panel-power-in-schedules
+kind: plan
+localOnly: true
+---
+
+### Objective
+
+Setting a nightly shutdown across a wall is the most laborious thing in Polyptic. Panel power is per-screen today: one `PUT /api/v1/screens/:screenId/panel-hours` per screen, one control per screen row, and no bulk path — `bulkAction` covers reboot, arm, disarm, ident and approve, and nothing else. A wall where every screen keeps the same hours is the normal case and the worst-served one.
+
+The scenes view already owns the machinery panel hours never got: named dayparts, weekday and date-range recurrence, integer priority, one deployment timezone, and a resolver in `@polyptic/protocol` shared by the server's ticker and the console's week strip. Panel power moves onto that engine, as a property of the schedule window.
+
+**Done means:** an operator opens Scenes, adds one window that says *these days, this daypart, panels off*, and every screen on that mural sleeps and wakes on it — with a manual wake at 19:05 still holding until the next boundary, and a box that reboots at 3am still coming back dark.
+
+### The load-bearing choice: power hangs on the window, not the scene
+
+A scene is a snapshot of what plays. If a scene carried a power state, every scene would acquire a hidden power dimension, and the rule `panel-power.ts` is built around — *a screen that should be showing content must never blank* — would stop being structural and become something each scene has to not get wrong. Hung on the window, "off" is only ever what an operator explicitly scheduled.
+
+<Callout id="decision-window" tone="decision">
+
+`panels` lives on `Schedule`, defaulting to `"on"`, so every stored schedule keeps today's behaviour. A window is the only thing that can darken a wall.
+
+</Callout>
+
+### Resolution becomes per-mural, and reads the same candidate list twice
+
+`resolveAt` today runs one total order over every schedule in the deployment and returns exactly one winning scene; `applyScene` then touches only that scene's mural. Schedules on different murals genuinely compete, so a second mural's window can lose forever and never take the wall. For content that is a latent wart. For power it is fatal: a `panels` flag on a schedule could only ever speak for whichever single window won globally, so "the fleet sleeps at 19:00" would not be expressible on a deployment with more than one mural.
+
+Resolution therefore runs per mural. The candidate list for a mural is sorted by the existing total order — priority, then most-recently-started, then shorter, then older — and read twice:
+
+- **content** is the best candidate carrying a `sceneId`, falling through to the default scene and then to nothing, exactly as today;
+- **power** is the `panels` value of the *overall* winner, power-only windows included.
+
+<Diagram id="resolution-diagram" caption="One sorted candidate list per mural, read twice.">
+
+```html
+<div class="diagram-panel">
+  <div class="diagram-box">
+    <div class="diagram-muted">Mural &ldquo;Lobby&rdquo; &mdash; windows covering 19:30 Tue</div>
+    <div class="diagram-card"><span class="diagram-pill">p10</span> Open day &middot; scene &ldquo;Visitors&rdquo; &middot; panels on</div>
+    <div class="diagram-card"><span class="diagram-pill">p0</span> After hours &middot; no scene &middot; panels off</div>
+    <div class="diagram-card"><span class="diagram-pill">p0</span> Daytime &middot; scene &ldquo;Standard&rdquo; &middot; panels on</div>
+  </div>
+  <div class="diagram-box">
+    <div class="diagram-muted">Two readings of the same order</div>
+    <div class="diagram-node">content &rarr; best window WITH a scene &rarr; &ldquo;Visitors&rdquo;</div>
+    <div class="diagram-node">power &rarr; the overall winner &rarr; panels ON</div>
+    <div class="diagram-muted">The p10 open day outranks the nightly off window. No special case.</div>
+  </div>
+</div>
+```
+
+```css
+.diagram-panel { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.diagram-box { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
+.diagram-card { display: flex; align-items: center; gap: 10px; padding: 8px 10px; }
+.diagram-node { padding: 10px 12px; }
+```
+
+</Diagram>
+
+A power-only window is one with no `sceneId`: *don't change what plays, only set the panels*. It is what makes a nightly shutdown expressible without inventing a scene to bind it to, and it is why an off window never disturbs the content underneath — the wall wakes onto the scene that was already resolved for it.
+
+When **no enabled window governs a mural at all**, power resolves to `null`: ungoverned, leave the wall exactly as it is. That preserves POL-101's rule that a disabled window means "the schedule does not govern this screen", which is not the same as "keep it awake". Once a mural has any window, the gaps between windows resolve to `"on"` — and that is what wakes the wall at 07:00 when the nightly off window ends.
+
+<Callout id="risk-wake" tone="risk">
+
+The gap-resolves-to-on rule is the single most behaviour-changing line in the plan. Get it wrong in the other direction and a wall that slept at 19:00 never wakes. It needs a resolver test that walks a full 24h and asserts the `on` edge at the exact end of the off window.
+
+</Callout>
+
+DST stays a non-event for the same reason it already is: containment is pure wall-clock in the deployment's one IANA zone, and the ticker fires only on a change of verdict, so a repeated fall-back hour re-resolves identically and a window spanning the spring-forward gap stays covered.
+
+The default scene stays a single deployment-wide setting, scoped to the mural it belongs to: it fills the gaps on that mural and no other. A second mural is simply ungoverned until it gets a window of its own, and the Settings copy says so rather than implying a fleet-wide floor it does not provide. A default scene per mural is the eventual end state, but it is another settings surface and another migration in a change that already carries four.
+
+### Data model
+
+<DataModel
+  id="schedule-model"
+  entities={[
+    {
+      id: "schedules",
+      name: "schedules",
+      fields: [
+        { name: "id", type: "text", pk: true },
+        { name: "scene_id", type: "text", fk: "scenes.id", nullable: true },
+        { name: "mural_id", type: "text", fk: "murals.id", nullable: true },
+        { name: "daypart_id", type: "text", fk: "dayparts.id" },
+        { name: "panels", type: "text" },
+        { name: "days", type: "jsonb" },
+        { name: "priority", type: "int" },
+        { name: "enabled", type: "boolean" },
+        { name: "from_date", type: "text", nullable: true },
+        { name: "until_date", type: "text", nullable: true },
+        { name: "created_at", type: "timestamptz" },
+      ],
+    },
+    {
+      id: "scenes",
+      name: "scenes",
+      fields: [
+        { name: "id", type: "text", pk: true },
+        { name: "mural_id", type: "text", fk: "murals.id" },
+      ],
+    },
+    {
+      id: "murals",
+      name: "murals",
+      fields: [
+        { name: "id", type: "text", pk: true },
+        { name: "name", type: "text" },
+        { name: "active_scene_id", type: "text", fk: "scenes.id", nullable: true },
+      ],
+    },
+    {
+      id: "dayparts",
+      name: "dayparts",
+      fields: [
+        { name: "id", type: "text", pk: true },
+        { name: "start_time", type: "text" },
+        { name: "end_time", type: "text" },
+      ],
+    },
+  ]}
+  relations={[
+    { from: "schedules", to: "scenes", kind: "n-1" },
+    { from: "schedules", to: "murals", kind: "n-1" },
+    { from: "schedules", to: "dayparts", kind: "n-1" },
+    { from: "scenes", to: "murals", kind: "n-1" },
+  ]}
+/>
+
+Three columns are new. `panels` is `'on' | 'off'`, defaulting to `'on'`. `scene_id` becomes nullable — a null is a power-only window. `mural_id` is denormalised: it is copied from the scene at create time for scene-bearing windows and never edited afterwards (a scene cannot move mural), and it is the operator's explicit target for a power-only window, where a null means every mural. `murals.active_scene_id` replaces the single global `meta.active_scene_id`, because per-mural resolution means each mural is on its own scene. All four are additive `ADD COLUMN IF NOT EXISTS` migrations plus a one-row backfill of the old `meta.active_scene_id` into whichever mural owned that scene.
+
+<Callout id="decision-muralid" tone="decision">
+
+`mural_id` is stored on the schedule rather than looked up through the scene, so the resolver in `@polyptic/protocol` stays a pure function of `ScheduleSet` and the console never needs a scene→mural join to paint the strip.
+
+</Callout>
+
+<Callout id="decision-active-scene" tone="decision">
+
+`DesiredState.activeSceneId` is replaced outright rather than kept alongside the per-mural map. Two fields that can disagree — one of them meaning "whichever mural most recently changed" — is the kind of thing that reads fine now and misleads later. It is a breaking protocol change across five call sites, which is cheap while nothing outside the console consumes it.
+
+</Callout>
+
+### Per-screen panel hours are removed
+
+Nothing in the fleet currently has panel hours set, so there is no migration to get honest — the feature is deleted rather than converted. `PanelHours`, `PUT /api/v1/screens/:screenId/panel-hours`, the `panel_power.hours` blob and the per-screen control in `ScreenRow.vue` all go. `PanelPowerConfig.timezone` collapses into `SchedulerSettings.timezone`, leaving the deployment with one timezone instead of two that could disagree.
+
+Manual wake and sleep is untouched: `POST /api/v1/screens/:screenId/display-power`, the agent's `agent/power-ack`, the sleeping chip, and `powerAckLine`'s honesty about DPMS-only boxes leaving panels lit-but-black all stay exactly as they are.
+
+### What must survive, and where it lives
+
+<Checklist
+  id="preserved"
+  items={[
+    {
+      id: "edge",
+      label: "Edge-triggered, so a manual override holds until the next boundary",
+      note: "`PanelPowerScheduler.lastDesired` keeps recording the SCHEDULE's opinion, never the panel's actual state and never an operator's action. Only `desiredFor()` changes source.",
+    },
+    {
+      id: "hello",
+      label: "Reconcile on hello",
+      note: "`reconcileMachine(machineId)` stays on the agent hello path — it is what re-sleeps a box that rebooted at 3am and came back with the compositor asserting `dpms on`.",
+    },
+    {
+      id: "wake-only",
+      label: "In hours, the only power command sent is WAKE",
+      note: "Nothing is inferred from idleness, load or connectivity. A gap between windows resolves to `on`; nothing else can produce a sleep.",
+    },
+    {
+      id: "rung",
+      label: "Honesty about the rung",
+      note: "`powerAckLine` keeps saying a DPMS-only box leaves the panel itself possibly lit.",
+    },
+  ]}
+/>
+
+The 30s `PANEL_TICK_MS` interval retires: the 10s scene ticker already re-resolves on the cadence panel power needs, and driving both from one clock removes the two-schedulers-one-panel trap that `panel-power.ts` warns about in its header.
+
+### Console
+
+The recurrence editor gains a Panels control beside daypart, days and priority. The week strip must paint the off windows — the strip's promise is that it cannot show the operator something the wall will not do, and that has to stay true once windows can be dark.
+
+<Columns id="strip-compare">
+<Column id="strip-before" label="Before">
+
+<WireframeBlock id="strip-before-wf">
+  <Screen
+    surface="panel"
+    frame="show"
+    caption="Every segment is a scene. Nothing on the strip can be dark."
+    html={`<div style="display:flex;flex-direction:column;gap:12px;padding:16px;height:100%;box-sizing:border-box">
+  <div style="display:flex;align-items:center;width:100%;white-space:nowrap">
+    <strong>What plays when</strong>
+    <div style="flex:1"></div>
+    <small class="wf-muted">2026-07-27 &rarr; 08-02</small>
+  </div>
+  <div style="display:flex;gap:4px;flex:1;min-height:0">
+    <div style="display:flex;flex-direction:column;justify-content:space-between;width:34px;padding:14px 0 0">
+      <small class="wf-muted">00:00</small>
+      <small class="wf-muted">12:00</small>
+      <small class="wf-muted">23:59</small>
+    </div>
+    <div style="display:flex;gap:4px;flex:1;min-width:0">
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <small class="wf-muted" style="text-align:center">Mon</small>
+        <div style="flex:1;display:flex;flex-direction:column;border:1.4px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden">
+          <div style="flex:7;background:var(--wf-accent-soft)"></div>
+          <div style="flex:5;background:var(--wf-accent);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-accent-fg)">Morning</small></div>
+          <div style="flex:12;background:var(--wf-accent-soft)"></div>
+        </div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <small class="wf-muted" style="text-align:center">Tue</small>
+        <div style="flex:1;display:flex;flex-direction:column;border:1.4px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden">
+          <div style="flex:7;background:var(--wf-accent-soft)"></div>
+          <div style="flex:5;background:var(--wf-accent);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-accent-fg)">Morning</small></div>
+          <div style="flex:12;background:var(--wf-accent-soft)"></div>
+        </div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <small class="wf-muted" style="text-align:center">Wed</small>
+        <div style="flex:1;display:flex;flex-direction:column;border:1.4px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden">
+          <div style="flex:7;background:var(--wf-accent-soft)"></div>
+          <div style="flex:5;background:var(--wf-accent);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-accent-fg)">Morning</small></div>
+          <div style="flex:12;background:var(--wf-accent-soft)"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <small class="wf-muted">striped = a lower-priority window is being outranked here</small>
+</div>`}
+  />
+</WireframeBlock>
+
+</Column>
+
+<Column id="strip-after" label="After">
+
+<WireframeBlock id="strip-after-wf">
+  <Screen
+    surface="panel"
+    frame="show"
+    caption="The nightly off window is painted dark, so the strip still cannot promise something the wall will not do."
+    html={`<div style="display:flex;flex-direction:column;gap:12px;padding:16px;height:100%;box-sizing:border-box">
+  <div style="display:flex;align-items:center;width:100%;white-space:nowrap">
+    <strong>What plays when</strong>
+    <div style="flex:1"></div>
+    <small class="wf-muted">2026-07-27 &rarr; 08-02</small>
+  </div>
+  <div style="display:flex;gap:4px;flex:1;min-height:0">
+    <div style="display:flex;flex-direction:column;justify-content:space-between;width:34px;padding:14px 0 0">
+      <small class="wf-muted">00:00</small>
+      <small class="wf-muted">12:00</small>
+      <small class="wf-muted">23:59</small>
+    </div>
+    <div style="display:flex;gap:4px;flex:1;min-width:0">
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <small class="wf-muted" style="text-align:center">Mon</small>
+        <div style="flex:1;display:flex;flex-direction:column;border:1.4px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden">
+          <div style="flex:7;background:var(--wf-ink);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-paper)">Off</small></div>
+          <div style="flex:5;background:var(--wf-accent);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-accent-fg)">Morning</small></div>
+          <div style="flex:7;background:var(--wf-accent-soft)"></div>
+          <div style="flex:5;background:var(--wf-ink);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-paper)">Off</small></div>
+        </div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <small class="wf-muted" style="text-align:center">Tue</small>
+        <div style="flex:1;display:flex;flex-direction:column;border:1.4px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden">
+          <div style="flex:7;background:var(--wf-ink);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-paper)">Off</small></div>
+          <div style="flex:5;background:var(--wf-accent);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-accent-fg)">Morning</small></div>
+          <div style="flex:7;background:var(--wf-accent-soft)"></div>
+          <div style="flex:5;background:var(--wf-ink);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-paper)">Off</small></div>
+        </div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <small class="wf-muted" style="text-align:center">Wed</small>
+        <div style="flex:1;display:flex;flex-direction:column;border:1.4px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden">
+          <div style="flex:24;background:var(--wf-accent);display:flex;align-items:center;justify-content:center"><small style="color:var(--wf-accent-fg)">Open day</small></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <small class="wf-muted">dark = panels off &middot; Wed is an Open day window at p10, lit straight through</small>
+</div>`}
+  />
+</WireframeBlock>
+
+</Column>
+</Columns>
+
+The Wednesday column is the priority case made visible: a p10 Open day window outranks the p0 nightly off window, so the screens stay lit right through the night with no special-casing anywhere in the resolver.
+
+<WireframeBlock id="editor-wf">
+  <Screen
+    surface="panel"
+    frame="show"
+    caption="The recurrence editor with the new Panels control. Choosing Off greys the daypart's content meaning &mdash; the window still resolves, it just resolves dark."
+    html={`<div style="display:flex;flex-direction:column;gap:14px;padding:18px;height:100%;box-sizing:border-box">
+  <div>
+    <strong>Schedule &ldquo;After hours&rdquo;</strong>
+    <div><small class="wf-muted">The scene plays inside a daypart, on the days you pick. Where two windows overlap, the higher priority wins.</small></div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:5px">
+    <small><strong>Daypart</strong></small>
+    <div class="wf-card" style="display:flex;align-items:center;padding:8px 10px">
+      <span>After hours (19:00&ndash;07:00)</span>
+      <div style="flex:1"></div>
+      <span data-icon="chevronDown" aria-label="Open"></span>
+    </div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:5px">
+    <small><strong>Days</strong></small>
+    <div style="display:flex;gap:5px;white-space:nowrap">
+      <span class="wf-pill">Sun</span>
+      <span class="wf-pill accent">Mon</span>
+      <span class="wf-pill accent">Tue</span>
+      <span class="wf-pill accent">Wed</span>
+      <span class="wf-pill accent">Thu</span>
+      <span class="wf-pill accent">Fri</span>
+      <span class="wf-pill">Sat</span>
+    </div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:5px">
+    <small><strong>Panels</strong></small>
+    <div style="display:flex;gap:6px">
+      <span class="wf-pill">On</span>
+      <span class="wf-pill accent">Off</span>
+    </div>
+    <small class="wf-muted">While this window is on air the screens sleep. A higher-priority window keeps them lit.</small>
+  </div>
+  <div style="display:flex;gap:14px">
+    <div style="display:flex;flex-direction:column;gap:5px;flex:1;min-width:0">
+      <small><strong>Priority</strong></small>
+      <div class="wf-card" style="padding:8px 10px">0</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:5px;flex:1;min-width:0">
+      <small><strong>Scene</strong></small>
+      <div class="wf-card" style="padding:8px 10px"><span class="wf-muted">None &mdash; power only</span></div>
+    </div>
+  </div>
+  <div style="margin-top:auto;display:flex;gap:9px;justify-content:flex-end">
+    <button>Cancel</button>
+    <button class="primary">Save schedule</button>
+  </div>
+</div>`}
+  />
+</WireframeBlock>
+
+### File map
+
+<TabsBlock
+  id="file-map"
+  orientation="vertical"
+  tabs={[
+    {
+      id: "tab-protocol",
+      label: "protocol/src/schedule.ts",
+      blocks: [
+        {
+          id: "tab-protocol-note",
+          type: "rich-text",
+          data: {
+            markdown:
+              "The keystone. `Schedule` gains `panels`, a nullable `sceneId` and a nullable `muralId`; `ScheduleSet` gains the mural list. `resolveAtLocal` keeps its candidate-gathering loop and total order verbatim and grows a mural filter plus the second reading of the same sorted list. `resolveDay` / `resolveWeek` take a `muralId`, and `ScheduleSegment` gains `panels` so the strip can paint it.",
+          },
+        },
+      ],
+    },
+    {
+      id: "tab-panel-power",
+      label: "server/src/panel-power.ts",
+      blocks: [
+        {
+          id: "tab-panel-power-note",
+          type: "rich-text",
+          data: {
+            markdown:
+              "Keeps `lastDesired`, `send`, `noteScheduleApplied` and `reconcileMachine` unchanged. `desiredFor(screenId)` swaps its source from `getPanelHours(screenId)` to *resolve the mural this screen is placed on*, returning `null` when the mural is ungoverned. `tick()` and `PANEL_TICK_MS` retire; the scene ticker calls in.",
+          },
+        },
+      ],
+    },
+    {
+      id: "tab-scheduler",
+      label: "server/src/scheduler.ts",
+      blocks: [
+        {
+          id: "tab-scheduler-note",
+          type: "rich-text",
+          data: {
+            markdown:
+              "`lastVerdict` becomes a map keyed by mural. Each tick loops the murals, applies each mural's content winner on a change of that mural's verdict, and hands each mural's power verdict to the panel-power seam. The already-live check reads `murals.active_scene_id` rather than the single global field.",
+          },
+        },
+      ],
+    },
+    {
+      id: "tab-state",
+      label: "server/src/state.ts",
+      blocks: [
+        {
+          id: "tab-state-note",
+          type: "rich-text",
+          data: {
+            markdown:
+              "The bulk of the ripple. `activeSceneId` becomes per-mural, `getScheduleSet()` carries the mural list, `createSchedule` stamps `muralId` from the scene, and `getPanelHours` / `setPanelHours` / `listPanelHours` / `forgetPanelHours` are deleted along with their two call sites in the screen and machine delete cascades.",
+          },
+        },
+      ],
+    },
+    {
+      id: "tab-scenes",
+      label: "console/src/views/Scenes.vue",
+      blocks: [
+        {
+          id: "tab-scenes-note",
+          type: "rich-text",
+          data: {
+            markdown:
+              "The Panels control in the recurrence editor, a power-only entry point that leaves `sceneId` null, and the week strip painting `seg.panels === 'off'` dark. `resolveWeek` is called with the active mural id, so the strip finally shows one mural rather than a global mixture.",
+          },
+        },
+      ],
+    },
+  ]}
+/>
+
+### Steps
+
+<Checklist
+  id="steps"
+  items={[
+    {
+      id: "s1",
+      label: "Protocol first: `panels`, nullable `sceneId`, `muralId`, and the per-mural resolver",
+      note: "Contract before callers, per the repo rule. Land the resolver tests in the same commit — the 24h walk asserting the wake edge, the priority-override case, and a DST pair.",
+    },
+    {
+      id: "s2",
+      label: "Persistence: four additive columns and the active-scene backfill",
+      note: "`schedules.panels` / `.mural_id`, `schedules.scene_id` made nullable, `murals.active_scene_id`. Backfill the old `meta.active_scene_id` into its owning mural, then stop writing it.",
+    },
+    {
+      id: "s3",
+      label: "Control plane: per-mural active scene, mural list on the ScheduleSet, `muralId` stamped on create",
+      note: "Deleting the panel-hours accessors falls out of this step.",
+    },
+    {
+      id: "s4",
+      label: "Ticker and panel-power seam",
+      note: "Per-mural `lastVerdict`; `desiredFor` re-sourced; the 30s interval retired; activity lines for a scheduled sleep and wake in POL-101's phrasing.",
+    },
+    {
+      id: "s5",
+      label: "Remove per-screen panel hours end to end",
+      note: "Protocol schema, REST route, store blob, `ScreenRow.vue` control and chip, `Inspector.vue` and store references. Manual wake/sleep stays.",
+    },
+    {
+      id: "s6",
+      label: "Console: the Panels control, power-only windows, and the dark week strip",
+      note: "Then screenshot the strip in light and dark for the PR.",
+    },
+  ]}
+/>
+
+### Verification
+
+Unit and contract tests are necessary but not sufficient here — the failure this feature can cause is a wall that stays dark all day, and that only shows up end to end.
+
+<Checklist
+  id="verify"
+  items={[
+    {
+      id: "v1",
+      label: "`bun test` across protocol, server and e2e",
+      note: "Including the existing `panel-power.test.ts` and `panel-power.e2e.test.ts`, rewritten onto the schedule path rather than deleted.",
+    },
+    {
+      id: "v2",
+      label: "Drive the clock across a full off window against a fake agent",
+      note: "Assert exactly one sleep frame at the boundary, no re-assertion on the ticks in between, and exactly one wake frame at the far edge.",
+    },
+    {
+      id: "v3",
+      label: "Manual override holds",
+      note: "Sleep the wall by schedule, wake one screen by hand mid-window, then tick repeatedly: no further frames until the next boundary.",
+    },
+    {
+      id: "v4",
+      label: "Hello reconcile re-sleeps a rebooted box",
+      note: "Disconnect and reconnect an agent inside an off window; the box must receive the sleep on its hello.",
+    },
+    {
+      id: "v5",
+      label: "Isolated verify stack, week strip screenshotted in both themes",
+      note: "Alt ports with `STORE=memory` so the running dev stack is undisturbed.",
+    },
+  ]}
+/>
+

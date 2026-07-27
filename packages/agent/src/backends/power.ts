@@ -6,7 +6,7 @@
  * startup, there is still no swayidle, and no timeout of any kind can blank a panel (the x11 rung
  * below is careful to keep every DPMS timeout at zero, precisely so enabling the extension cannot
  * reintroduce auto-blanking). A panel goes dark ONLY when the control plane says so — an operator's
- * click, or a panel-hours boundary the operator set. Idleness is never a reason.
+ * click, or a schedule window's boundary. Idleness is never a reason.
  *
  * Rung 1 — DPMS (always, on a real compositor):
  *   sway: `swaymsg output <name> dpms off` stops driving the output. Cheap, instant, and it survives

@@ -38,8 +38,6 @@ import type {
   Mural,
   NetbootInfo,
   OperatorRole,
-  PanelHours,
-  PanelPowerConfig,
   Placement,
   PreRegistration,
   Scene,
@@ -163,9 +161,6 @@ export interface ConsoleState {
   /** The fleet's UEFI boot-order policy (POL-115) — may a box put its own entry back at the head of
    *  BootOrder when firmware displaces it? Null until Settings fetches it; the safe read is `false`. */
   bootOrder: BootOrderPolicy | null;
-  /** POL-101 — the deployment's panel-hours timezone, mirrored from admin/state.panelPower. Optional
-   *  on the wire (an older server omits it) → null until the first snapshot that carries it. */
-  panelPower: PanelPowerConfig | null;
   connected: boolean;
   /** True once the FIRST admin/state snapshot has been folded in — the difference between "the
    *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
@@ -205,11 +200,12 @@ export interface ConsoleState {
    *  admin/state.activity. The field is OPTIONAL on the wire (back-compat), so it defaults to []
    *  when a server omits it. */
   activity: ActivityEvent[];
-  /** The scene the WALL IS ON, mirrored from admin/state (POL-95). Server-authoritative: the control
-   *  plane persists it, sets it on apply and clears it the moment a manual change diverges the wall,
-   *  so a reload and a second operator always agree. The console never sets it itself — it used to
-   *  (optimistically, on apply), which is exactly why the badge could lie. */
-  activeSceneId: string | null;
+  /** muralId → the scene THAT MURAL IS ON, mirrored from admin/state (POL-95, per-mural since
+   *  POL-186). Server-authoritative: the control plane persists it, sets it on apply and drops the
+   *  mural from the map the moment a manual change diverges that wall, so a reload and a second
+   *  operator always agree. The console never sets it itself — it used to (optimistically, on
+   *  apply), which is exactly why the badge could lie. A mural absent from the map is on no scene. */
+  activeScenes: Record<string, string>;
   activeMuralId: string | null;
   selectedScreenIds: string[];
   /** A combined surface selected on the canvas (mutually exclusive with selectedScreenIds). */
@@ -237,7 +233,6 @@ export const useConsoleStore = defineStore("console", {
     imageUpdates: null,
     settings: null,
     bootOrder: null,
-    panelPower: null,
     connected: false,
     stateReceived: false,
     revision: 0,
@@ -255,7 +250,7 @@ export const useConsoleStore = defineStore("console", {
     schedules: [],
     scheduler: null,
     activity: [],
-    activeSceneId: null,
+    activeScenes: {},
     activeMuralId: null,
     selectedScreenIds: [],
     selectedWallId: null,
@@ -583,11 +578,16 @@ export const useConsoleStore = defineStore("console", {
       return (id: string) => this.scenes.find((sc) => sc.id === id);
     },
 
-    /** The scene the wall is currently on, per the SERVER (POL-95), if it still exists. */
+    /** Whether a scene is the one ITS OWN mural is currently on — what the Active badge reads. A
+     *  scene can only be active on the mural it snapshots, so the badge is per mural, not global. */
+    isSceneActive(state): (scene: Scene) => boolean {
+      return (scene: Scene) => state.activeScenes[scene.muralId] === scene.id;
+    },
+
+    /** The scene the currently switched-to mural is on, per the SERVER, if it still exists. */
     activeScene(state): Scene | undefined {
-      return state.activeSceneId
-        ? state.scenes.find((sc) => sc.id === state.activeSceneId)
-        : undefined;
+      const sceneId = state.activeMuralId ? state.activeScenes[state.activeMuralId] : undefined;
+      return sceneId ? state.scenes.find((sc) => sc.id === sceneId) : undefined;
     },
 
     /** A short "N screens · M walls" summary of what a scene captures, for the list rows. */
@@ -970,9 +970,9 @@ export const useConsoleStore = defineStore("console", {
         // POL-114 — document conversions + what this server can convert. Both optional on the wire.
         this.documentJobs = msg.documentJobs ?? [];
         if (msg.capabilities) this.capabilities = msg.capabilities;
-        // POL-95 — the ACTIVE scene comes from the server's desired state. Optional on the wire
-        // (an older server omits it) → no badge rather than a guessed one.
-        this.activeSceneId = msg.activeSceneId ?? null;
+        // POL-95/POL-186 — the ACTIVE scene per mural comes from the server's desired state.
+        // Optional on the wire (an older server omits it) → no badge rather than a guessed one.
+        this.activeScenes = msg.activeScenes ?? {};
         // POL-89 — the scene scheduler. Optional on the wire (back-compat): an older server simply
         // has no scheduler, and the Scenes view says so rather than painting an empty week.
         this.dayparts = msg.dayparts ?? [];
@@ -984,8 +984,6 @@ export const useConsoleStore = defineStore("console", {
         // POL-6 — fleet-wide display settings (badge toggle). Optional on the wire (back-compat); keep
         // the last known value when a snapshot omits it rather than clobbering the toggle to null.
         if (msg.settings) this.settings = msg.settings;
-        // POL-101 — the panel-hours timezone; same back-compat rule as settings above.
-        if (msg.panelPower) this.panelPower = msg.panelPower;
 
         // Disarm a click-to-assign pick whose source the server no longer knows (e.g. deleted).
         if (this.pickedSourceId && !this.contentSources.some((s) => s.id === this.pickedSourceId)) {
@@ -1574,35 +1572,8 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** POL-101 — set (or clear, with `null`) a screen's daily panel-hours window. */
-    async setScreenPanelHours(screenId: string, hours: PanelHours | null): Promise<string | null> {
-      try {
-        await api.setScreenPanelHours(screenId, hours);
-        return null;
-      } catch (err) {
-        console.error("[console] setScreenPanelHours failed", err);
-        const detail =
-          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
-            ? (err.payload as { error: string }).error
-            : null;
-        return detail ?? "Could not save those panel hours.";
-      }
-    },
-
-    /** POL-101 — the deployment's panel-hours timezone (Settings). */
-    async setPanelTimezone(timezone: string): Promise<string | null> {
-      try {
-        this.panelPower = await api.setPanelPowerTimezone(timezone);
-        return null;
-      } catch (err) {
-        console.error("[console] setPanelTimezone failed", err);
-        const detail =
-          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
-            ? (err.payload as { error: string }).error
-            : null;
-        return detail ?? "Could not save that timezone.";
-      }
-    },
+    // POL-186 — `setScreenPanelHours` and `setPanelTimezone` are gone with the per-screen calendar.
+    // Waking hours are a schedule window on a mural; the one timezone is the scheduler's.
 
     /**
      * Permanently forget a single screen (POL-14): drop it from its machine, plus its placement, any
@@ -2186,7 +2157,9 @@ export const useConsoleStore = defineStore("console", {
     async deleteScene(id: string): Promise<void> {
       this.scenes = this.scenes.filter((sc) => sc.id !== id); // optimistic
       this.schedules = this.schedules.filter((s) => s.sceneId !== id);
-      if (this.activeSceneId === id) this.activeSceneId = null;
+      this.activeScenes = Object.fromEntries(
+        Object.entries(this.activeScenes).filter(([, sceneId]) => sceneId !== id),
+      );
       try {
         await api.deleteScene(id);
       } catch (err) {

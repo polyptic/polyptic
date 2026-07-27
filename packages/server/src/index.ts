@@ -441,11 +441,12 @@ registerAuthRoutes(fastify, auth, enrollment);
 // and handed to REST so disarming a screen closes its live sessions instantly.
 const devtoolsRelay = new DevtoolsRelay(agentHub, control, presence, activity, fastify.log);
 
-// POL-101 — panel power. The scheduler owns the daily on/off windows and is the only thing in the
-// server that can darken a wall; the WS layer reconciles a box's panels to their window when it says
-// hello (a box that reboots at 3am comes back LIT and must be re-slept), and REST drives the manual
-// wake/sleep. In hours, the only command it ever sends is WAKE: a screen that should be showing
-// content is never blanked.
+// POL-101/POL-186 — panel power. The only thing in the server that can darken a wall. It no longer
+// keeps a clock of its own: the SCENE scheduler (below) hands it each mural's resolved panel verdict
+// on every tick, and this seam decides — edge-triggered, per screen — whether that is worth a frame.
+// The WS layer reconciles a box's panels when it says hello (a box that reboots at 3am comes back
+// LIT and must be re-slept), and REST drives the manual wake/sleep. In hours, the only command it
+// ever sends is WAKE: a screen that should be showing content is never blanked.
 const panelPower = new PanelPowerScheduler({
   control,
   agentHub,
@@ -454,7 +455,6 @@ const panelPower = new PanelPowerScheduler({
   broadcaster,
   log: fastify.log,
 });
-panelPower.start();
 
 // ── mTLS agent channel (POL-25/POL-134): CA + dedicated TLS listener + the boot self-test. ──
 // The self-test is load-bearing, not paranoia: Bun ≤ 1.2 implemented `requestCert` as PRESENCE-only
@@ -670,6 +670,10 @@ const scheduler = new SceneScheduler({
   control,
   log: fastify.log,
   activity,
+  // POL-186 — the ticker is now the only clock behind panel power too: it hands each mural's
+  // resolved `panels` verdict straight through (`null` = ungoverned, leave that wall alone), and the
+  // seam does the edge-triggering per screen.
+  panelPower,
   tickMs: Number.isFinite(SCHEDULER_TICK_MS) && SCHEDULER_TICK_MS > 0 ? SCHEDULER_TICK_MS : DEFAULT_TICK_MS,
   now: () => Date.now() + (Number.isFinite(SCHEDULER_CLOCK_OFFSET_MS) ? SCHEDULER_CLOCK_OFFSET_MS : 0),
   apply: async (sceneId) => {

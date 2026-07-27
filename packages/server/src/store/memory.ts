@@ -15,7 +15,6 @@ import type {
   PersistedBootOrderPolicy,
   PersistedDaypart,
   PersistedDisplaySettings,
-  PersistedPanelPower,
   PersistedSchedule,
   PersistedSchedulerSettings,
   PersistedImageRollout,
@@ -93,8 +92,9 @@ export class MemoryStore implements Store {
   private displaySettings: PersistedDisplaySettings | undefined;
   private bootOrderPolicy: PersistedBootOrderPolicy | undefined;
   private revision = 0;
-  /** POL-95 — the scene the wall is on (null = none / diverged). */
-  private activeSceneId: string | null = null;
+  /** POL-95/POL-186 — the scene each mural is on, keyed by mural id. A mural absent from the map has
+   *  none (diverged). */
+  private readonly activeScenes = new Map<string, string>();
 
   async migrate(): Promise<void> {
     // Nothing to set up for the in-memory store.
@@ -103,7 +103,7 @@ export class MemoryStore implements Store {
   async load(): Promise<PersistedState> {
     return {
       revision: this.revision,
-      activeSceneId: this.activeSceneId,
+      activeScenes: Object.fromEntries(this.activeScenes),
       machines: [...this.machines.values()].map(clone),
       screens: [...this.screens.values()].map(clone),
       content: [...this.content.values()].map(clone),
@@ -201,9 +201,11 @@ export class MemoryStore implements Store {
     this.revision = revision;
   }
 
-  async setActiveSceneId(sceneId: string | null): Promise<void> {
-    this.activeSceneId = sceneId;
+  async setActiveSceneId(muralId: string, sceneId: string | null): Promise<void> {
+    if (sceneId === null) this.activeScenes.delete(muralId);
+    else this.activeScenes.set(muralId, sceneId);
   }
+
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────
 
@@ -563,18 +565,6 @@ export class MemoryStore implements Store {
 
   async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
     this.bootOrderPolicy = clone(policy);
-  }
-
-  // ── Panel power (POL-101) ────────────────────────────────────────────────────
-
-  private panelPower: PersistedPanelPower | undefined;
-
-  async getPanelPower(): Promise<PersistedPanelPower | undefined> {
-    return this.panelPower ? clone(this.panelPower) : undefined;
-  }
-
-  async setPanelPower(power: PersistedPanelPower): Promise<void> {
-    this.panelPower = clone(power);
   }
 
   async close(): Promise<void> {

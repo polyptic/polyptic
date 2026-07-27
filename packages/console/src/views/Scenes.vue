@@ -12,8 +12,9 @@
     · a "WHAT PLAYS WHEN" WEEK STRIP — the resolved schedule, priority conflicts marked, painted by
       the SAME resolver the server's ticker fires from (@polyptic/protocol), so the strip cannot
       promise the operator something the wall will not do;
-    · the DEFAULT SCENE — the always-on floor that fills every gap — and the deployment's ONE
-      timezone, both explicit, both here.
+    · the DEFAULT SCENE — the floor under the gaps on the mural it was saved from (POL-186 scoped
+      resolution to one mural at a time, so a default scene floors its own mural and no other) — and
+      the deployment's ONE timezone, both explicit, both here.
 
   All reads/writes go through the Pinia store; the server owns resolution and applies scenes through
   the ordinary apply path (instant WS fan-out, no reload).
@@ -38,10 +39,17 @@ const scenes = computed(() => store.activeMuralScenes);
 const dayparts = computed(() => store.dayparts);
 const scheduler = computed(() => store.scheduler);
 
-/** The exact set the server's ticker resolves from — it rides `admin/state`. */
+/** The exact set the server's ticker resolves from — it rides `admin/state`. Resolution runs once
+ *  per mural (POL-186), so the set carries the mural ids and which mural each scene snapshots. */
 const scheduleSet = computed<ScheduleSet | null>(() =>
   scheduler.value
-    ? { dayparts: store.dayparts, schedules: store.schedules, settings: scheduler.value }
+    ? {
+        dayparts: store.dayparts,
+        schedules: store.schedules,
+        settings: scheduler.value,
+        murals: store.murals.map((m) => m.id),
+        sceneMurals: Object.fromEntries(store.scenes.map((s) => [s.id, s.muralId])),
+      }
     : null,
 );
 
@@ -49,6 +57,12 @@ const sceneName = (id: string | null): string =>
   id ? (store.scenes.find((s) => s.id === id)?.name ?? "(deleted scene)") : "";
 const daypartName = (id: string): string =>
   dayparts.value.find((d) => d.id === id)?.name ?? "(deleted daypart)";
+/** One mural by name — the wall a scene snapshots, spelled out wherever a scene from another mural
+ *  can appear in a list (the default-scene picker lists the whole deployment). */
+const muralName = (id: string): string =>
+  store.murals.find((m) => m.id === id)?.name ?? "(deleted mural)";
+/** A power-only window's target: one mural by name, or every mural in the deployment. */
+const muralTargetName = (id: string | null): string => (id ? muralName(id) : "Every mural");
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
@@ -72,6 +86,17 @@ const schedulesForScene = (sceneId: string): Schedule[] =>
   store.schedules
     .filter((s) => s.sceneId === sceneId)
     .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
+
+/** POWER-ONLY windows (POL-186) — a schedule with no scene: it sets the panels and leaves what
+ *  plays alone. They belong to no scene row, so they get their own list. Scoped to the mural on
+ *  screen, like everything else on this page: a window governing only mural B is mural B's to
+ *  re-prioritise and delete. A fleet-wide window (`muralId === null`) governs this mural too, so it
+ *  shows on every one. */
+const powerWindows = computed<Schedule[]>(() =>
+  store.schedules
+    .filter((s) => s.sceneId === null && (s.muralId === null || s.muralId === store.activeMuralId))
+    .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id)),
+);
 
 // A stable colour per scene, so the week strip and the scene rows agree at a glance.
 function sceneHue(sceneId: string): number {
@@ -97,14 +122,19 @@ const todayInZone = computed<string>(() => {
 
 const weekOffset = ref(0);
 const weekStart = computed(() => shiftDate(startOfWeek(todayInZone.value), weekOffset.value * 7));
+/** Resolution is per mural (POL-186), so the strip resolves for the mural on screen. */
 const week = computed(() =>
-  scheduleSet.value ? resolveWeek(weekStart.value, scheduleSet.value) : [],
+  scheduleSet.value && store.activeMuralId
+    ? resolveWeek(weekStart.value, scheduleSet.value, store.activeMuralId)
+    : [],
 );
 const HOUR_TICKS = [0, 6, 12, 18];
 
 const segmentTitle = (seg: ScheduleSegment): string => {
   const window = `${timeOfDay(seg.startMinutes)}–${timeOfDay(seg.endMinutes)}`;
-  if (seg.source === "none") return `${window} · nothing scheduled`;
+  // POL-186 — what the panels do closes the title, after what plays and what it outranks.
+  const power = seg.panels === "off" ? " · panels off" : "";
+  if (seg.source === "none") return `${window} · nothing scheduled${power}`;
   const who = seg.source === "default" ? `${sceneName(seg.sceneId)} (default scene)` : sceneName(seg.sceneId);
   const beaten = seg.overriddenScheduleIds.length
     ? ` · outranks ${seg.overriddenScheduleIds
@@ -114,7 +144,7 @@ const segmentTitle = (seg: ScheduleSegment): string => {
         })
         .join(", ")}`
     : "";
-  return `${window} · ${who}${beaten}`;
+  return `${window} · ${who}${beaten}${power}`;
 };
 
 // ── scheduler settings ────────────────────────────────────────────────────────
@@ -169,7 +199,13 @@ async function removeDaypart(id: string) {
 
 // ── the per-scene recurrence editor ───────────────────────────────────────────
 
-const editorSceneId = ref<string | null>(null);
+const editorOpen = ref(false);
+/** The scene the window carries, or null for a POWER-ONLY window (POL-186). */
+const edSceneId = ref<string | null>(null);
+/** The mural a power-only window governs; null = every mural. A scene-bearing window sends null and
+ *  the server stamps the mural from the scene, so the operator never picks it. */
+const edMuralId = ref<string | null>(null);
+const edPanels = ref<"on" | "off">("on");
 const edDaypartId = ref("");
 const edDays = ref<number[]>([...ALL_DAYS]);
 const edPriority = ref(0);
@@ -178,8 +214,13 @@ const edUntil = ref("");
 const edError = ref("");
 const edBusy = ref(false);
 
-function openEditor(sceneId: string) {
-  editorSceneId.value = sceneId;
+function openEditor(sceneId: string | null) {
+  editorOpen.value = true;
+  edSceneId.value = sceneId;
+  edMuralId.value = sceneId ? null : (store.activeMuralId ?? null);
+  // A scene window shows something, so its panels start on. A power window is opened to turn
+  // something off — starting it on would save a window whose only effect is keeping lit screens lit.
+  edPanels.value = sceneId ? "on" : "off";
   edDaypartId.value = dayparts.value[0]?.id ?? "";
   edDays.value = [...ALL_DAYS];
   edPriority.value = 0;
@@ -188,7 +229,7 @@ function openEditor(sceneId: string) {
   edError.value = "";
 }
 function closeEditor() {
-  editorSceneId.value = null;
+  editorOpen.value = false;
   edBusy.value = false;
 }
 function toggleDay(day: number) {
@@ -197,8 +238,7 @@ function toggleDay(day: number) {
     : [...edDays.value, day].sort((a, b) => a - b);
 }
 async function saveSchedule() {
-  const sceneId = editorSceneId.value;
-  if (!sceneId || edBusy.value) return;
+  if (edBusy.value) return;
   if (!edDaypartId.value) {
     edError.value = "add a daypart first";
     return;
@@ -210,10 +250,12 @@ async function saveSchedule() {
   edBusy.value = true;
   edError.value =
     (await store.createSchedule({
-      sceneId,
+      sceneId: edSceneId.value,
+      muralId: edMuralId.value,
       daypartId: edDaypartId.value,
       days: edDays.value,
       priority: edPriority.value,
+      panels: edPanels.value,
       enabled: true,
       from: edFrom.value || null,
       until: edUntil.value || null,
@@ -304,6 +346,16 @@ async function remove(id: string) {
             <span v-if="activeMural" class="mural-tag">· {{ activeMural.name }}</span>
           </p>
         </div>
+        <!-- A power window opens on THIS mural, so with no mural there is nothing to open it on: it
+             would save a window governing "every mural", which is none of them. -->
+        <button
+          v-if="store.canAuthor"
+          class="save-btn ghost inline"
+          :disabled="!store.activeMuralId"
+          @click="openEditor(null)"
+        >
+          + Power window
+        </button>
         <button v-if="store.canAuthor" class="save-btn" :disabled="!store.activeMuralId" @click="openSave">
           + Save current wall
         </button>
@@ -336,9 +388,15 @@ async function remove(id: string) {
             <span class="field-label">Default scene</span>
             <select class="input" :value="scheduler.defaultSceneId ?? ''" @change="setDefaultScene">
               <option value="">None (leave the wall alone)</option>
-              <option v-for="s in store.scenes" :key="s.id" :value="s.id">{{ s.name }}</option>
+              <!-- Every scene in the deployment is selectable, so each one names its mural: the
+                   default scene floors THAT mural's gaps and no other wall's. -->
+              <option v-for="s in store.scenes" :key="s.id" :value="s.id">
+                {{ s.name }} · {{ muralName(s.muralId) }}
+              </option>
             </select>
-            <span class="hint">The always-on floor that fills every gap no window covers.</span>
+            <span class="hint">
+              Fills the gaps no window covers on its own mural. Other murals keep whatever is on them.
+            </span>
           </label>
         </div>
         <div v-if="tzError" class="error">{{ tzError }}</div>
@@ -372,16 +430,21 @@ async function remove(id: string) {
                 v-for="seg in day.segments"
                 :key="`${day.date}-${seg.startMinutes}`"
                 class="seg"
-                :class="{ empty: seg.source === 'none', conflict: seg.overriddenScheduleIds.length > 0 }"
+                :class="{
+                  empty: seg.source === 'none' && seg.panels !== 'off',
+                  dark: seg.panels === 'off',
+                  conflict: seg.overriddenScheduleIds.length > 0,
+                }"
                 :style="{
                   top: `${(seg.startMinutes / 1440) * 100}%`,
                   height: `${((seg.endMinutes - seg.startMinutes) / 1440) * 100}%`,
-                  background: seg.sceneId ? sceneColor(seg.sceneId) : undefined,
+                  background:
+                    seg.panels === 'off' ? undefined : seg.sceneId ? sceneColor(seg.sceneId) : undefined,
                 }"
                 :title="segmentTitle(seg)"
               >
                 <span v-if="seg.endMinutes - seg.startMinutes >= 75" class="seg-label">
-                  {{ seg.source === "none" ? "—" : sceneName(seg.sceneId) }}
+                  {{ seg.panels === "off" ? "Off" : seg.source === "none" ? "—" : sceneName(seg.sceneId) }}
                 </span>
               </div>
             </div>
@@ -389,6 +452,7 @@ async function remove(id: string) {
         </div>
         <div class="legend">
           <span class="legend-item"><span class="swatch conflict-swatch"></span> striped = a lower-priority window is being outranked here</span>
+          <span class="legend-item"><span class="swatch dark-swatch"></span> dark = the screens are asleep</span>
           <span v-if="!scheduler?.enabled" class="legend-item warn">The scheduler is OFF. This strip shows what it would play.</span>
         </div>
       </section>
@@ -419,6 +483,49 @@ async function remove(id: string) {
         <div v-if="dpError" class="error">{{ dpError }}</div>
       </section>
 
+      <!-- ── power windows (POL-186) ───────────────────────────────────────────── -->
+      <section v-if="powerWindows.length" class="card">
+        <div class="card-head">
+          <h2 class="card-title">Power windows</h2>
+          <span class="card-sub">Windows that carry no scene: they set the panels and leave what plays alone.</span>
+        </div>
+        <div class="sched-list flush">
+          <div v-for="sc in powerWindows" :key="sc.id" class="sched-row" :class="{ off: !sc.enabled }">
+            <span class="sched-daypart">{{ daypartName(sc.daypartId) }}</span>
+            <span class="sched-rec">
+              {{ recurrenceLabel(sc) }} · {{ muralTargetName(sc.muralId) }}
+            </span>
+            <span
+              class="sched-panels"
+              :class="{ lit: sc.panels === 'on' }"
+              :title="
+                sc.panels === 'off'
+                  ? 'The screens sleep while this window is on air'
+                  : 'The screens stay lit while this window is on air'
+              "
+            >
+              {{ sc.panels === "off" ? "Panels off" : "Panels on" }}
+            </span>
+            <span class="prio">
+              <button class="prio-btn" title="Lower priority" @click="bumpPriority(sc, -1)">−</button>
+              <span class="prio-value" title="Higher priority wins an overlap">p{{ sc.priority }}</span>
+              <button class="prio-btn" title="Raise priority" @click="bumpPriority(sc, 1)">+</button>
+            </span>
+            <!-- POL-186 — "Enabled", not "On": it sits next to "Panels off", and two adjacent
+                 on/offs meaning different things is one word doing two jobs. Panels off is the
+                 feature's own vocabulary, so this is the one that moves. -->
+            <button
+              class="sched-toggle"
+              :title="sc.enabled ? 'Take this window off air' : 'Put this window back on air'"
+              @click="toggleSchedule(sc)"
+            >
+              {{ sc.enabled ? "Enabled" : "Disabled" }}
+            </button>
+            <button class="del-btn small" title="Delete power window" @click="removeSchedule(sc.id)">✕</button>
+          </div>
+        </div>
+      </section>
+
       <!-- ── scenes ────────────────────────────────────────────────────────────── -->
       <div v-if="scenes.length" class="list">
         <div v-for="s in scenes" :key="s.id" class="row">
@@ -431,7 +538,7 @@ async function remove(id: string) {
               @keyup.enter="($event.target as HTMLInputElement).blur()"
             />
             <span class="summary">{{ store.sceneSummary(s.id) }}</span>
-            <span v-if="s.id === store.activeSceneId" class="active-badge">Active</span>
+            <span v-if="store.isSceneActive(s)" class="active-badge">Active</span>
             <span v-if="s.id === scheduler?.defaultSceneId" class="default-badge">Default</span>
             <button v-if="store.canAuthor" class="apply-btn" @click="openEditor(s.id)">+ Schedule</button>
             <!-- POL-107: Apply is the ONE mutation a viewer holds — recalling a layout someone else
@@ -457,12 +564,27 @@ async function remove(id: string) {
             <div v-for="sc in schedulesForScene(s.id)" :key="sc.id" class="sched-row" :class="{ off: !sc.enabled }">
               <span class="sched-daypart">{{ daypartName(sc.daypartId) }}</span>
               <span class="sched-rec">{{ recurrenceLabel(sc) }}</span>
+              <span
+                v-if="sc.panels === 'off'"
+                class="sched-panels"
+                title="The screens sleep while this window is on air"
+              >
+                Panels off
+              </span>
               <span class="prio">
                 <button class="prio-btn" title="Lower priority" @click="bumpPriority(sc, -1)">−</button>
                 <span class="prio-value" title="Higher priority wins an overlap">p{{ sc.priority }}</span>
                 <button class="prio-btn" title="Raise priority" @click="bumpPriority(sc, 1)">+</button>
               </span>
-              <button class="sched-toggle" @click="toggleSchedule(sc)">{{ sc.enabled ? "On" : "Off" }}</button>
+              <!-- "Enabled", not "On" — the same word the power-window rows use, for the same
+                   reason: "Panels off" is next to it. -->
+              <button
+                class="sched-toggle"
+                :title="sc.enabled ? 'Take this window off air' : 'Put this window back on air'"
+                @click="toggleSchedule(sc)"
+              >
+                {{ sc.enabled ? "Enabled" : "Disabled" }}
+              </button>
               <button class="del-btn small" title="Delete schedule" @click="removeSchedule(sc.id)">✕</button>
             </div>
           </div>
@@ -484,13 +606,36 @@ async function remove(id: string) {
     </div>
 
     <!-- ── recurrence editor ───────────────────────────────────────────────────── -->
-    <div v-if="editorSceneId" class="scrim" @mousedown.self="closeEditor">
+    <div v-if="editorOpen" class="scrim" @mousedown.self="closeEditor">
       <div class="modal wide" role="dialog" aria-modal="true">
-        <div class="modal-title">Schedule “{{ sceneName(editorSceneId) }}”</div>
-        <div class="modal-sub">
-          The scene plays inside a daypart, on the days you pick. Where two windows overlap, the
-          higher priority wins.
+        <div class="modal-title">
+          {{ edSceneId ? `Schedule “${sceneName(edSceneId)}”` : "Power window" }}
         </div>
+        <div class="modal-sub">
+          <template v-if="edSceneId">
+            The scene plays inside a daypart, on the days you pick. Where two windows overlap, the
+            higher priority wins.
+          </template>
+          <template v-else>
+            This window carries no scene: it sets the panels inside a daypart and leaves what plays
+            alone. Where two windows overlap, the higher priority wins.
+          </template>
+        </div>
+
+        <label v-if="!edSceneId" class="field-row">
+          <span class="field-label">Mural</span>
+          <select
+            class="input"
+            :value="edMuralId ?? ''"
+            @change="edMuralId = ($event.target as HTMLSelectElement).value || null"
+          >
+            <option v-if="store.activeMuralId" :value="store.activeMuralId">
+              This mural ({{ activeMural?.name }})
+            </option>
+            <option value="">Every mural</option>
+          </select>
+          <span class="hint">Every mural also covers the walls this page is not showing.</span>
+        </label>
 
         <label class="field-row">
           <span class="field-label">Daypart</span>
@@ -518,6 +663,24 @@ async function remove(id: string) {
           </div>
         </div>
 
+        <!-- POL-186 — panel power is a property of the window, on the same clock as everything else
+             on this dialog: this scene, in that daypart, on these days, at this priority, panels
+             on or off. -->
+        <div class="field-row">
+          <span class="field-label">Panels</span>
+          <div class="days">
+            <button class="day-btn" :class="{ on: edPanels === 'on' }" @click="edPanels = 'on'">On</button>
+            <button class="day-btn" :class="{ on: edPanels === 'off' }" @click="edPanels = 'off'">Off</button>
+          </div>
+          <span class="hint">
+            {{
+              edPanels === "off"
+                ? "While this window is on air the screens sleep. A higher-priority window keeps them lit."
+                : "While this window is on air the screens stay lit. A higher-priority Off window puts them to sleep."
+            }}
+          </span>
+        </div>
+
         <label class="field-row">
           <span class="field-label">Priority</span>
           <input v-model.number="edPriority" type="number" min="0" max="999" class="input narrow" />
@@ -536,7 +699,10 @@ async function remove(id: string) {
         <div v-if="edError" class="error">{{ edError }}</div>
         <div class="modal-actions">
           <button class="btn-secondary" @click="closeEditor">Cancel</button>
-          <button class="btn-primary" :disabled="edBusy" @click="saveSchedule">Save schedule</button>
+          <!-- One dialog, two things it saves: name the one in front of the operator. -->
+          <button class="btn-primary" :disabled="edBusy" @click="saveSchedule">
+            {{ edSceneId ? "Save schedule" : "Save power window" }}
+          </button>
         </div>
       </div>
     </div>
@@ -625,6 +791,9 @@ async function remove(id: string) {
   border: 1px solid var(--line2);
   color: var(--fg2);
   margin-top: 4px;
+}
+.save-btn.ghost.inline {
+  margin-top: 0;
 }
 
 /* cards */
@@ -794,12 +963,39 @@ async function remove(id: string) {
   background: transparent;
   border-top-color: transparent;
 }
+/* POL-186 — a scheduled OFF window. The strip's promise is that it cannot show the operator
+   something the wall will not do, so a dark window has to read as dark. `--seg-off-bg` is fixed in
+   both themes (see styles.css); the HATCH is what carries it, because in the dark theme the fill
+   lands two hex points from `--surface` and a 60-minute band is under the label threshold, so
+   neither fill nor label can be the tell. It leans the opposite way to `.conflict` so the two
+   readings never collapse into one. */
+.seg.dark {
+  background: var(--seg-off-bg);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.07) 0 3px,
+    transparent 3px 6px
+  );
+  box-shadow: inset 0 0 0 1px var(--seg-off-line);
+  border-top-color: var(--seg-off-line);
+}
+.seg.dark .seg-label {
+  color: #e4e4e7;
+  text-shadow: none;
+}
 .seg.conflict {
   background-image: repeating-linear-gradient(
     45deg,
     rgba(0, 0, 0, 0.22) 0 4px,
     rgba(0, 0, 0, 0) 4px 8px
   );
+}
+/* A dark band that outranks something: the black conflict stripe is invisible on `--seg-off-bg`, so
+   the stripe inverts and rides over the off hatch. Both facts, one band. */
+.seg.dark.conflict {
+  background-image:
+    repeating-linear-gradient(45deg, var(--seg-off-conflict) 0 4px, transparent 4px 8px),
+    repeating-linear-gradient(-45deg, rgba(255, 255, 255, 0.07) 0 3px, transparent 3px 6px);
 }
 .seg-label {
   font-size: 10px;
@@ -832,6 +1028,15 @@ async function remove(id: string) {
   height: 10px;
   border-radius: 3px;
   background: var(--muted2);
+}
+.dark-swatch {
+  background: var(--seg-off-bg);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.07) 0 3px,
+    transparent 3px 6px
+  );
+  box-shadow: inset 0 0 0 1px var(--seg-off-line);
 }
 .conflict-swatch {
   background-image: repeating-linear-gradient(
@@ -1020,8 +1225,27 @@ async function remove(id: string) {
   align-items: center;
   gap: 10px;
 }
+.sched-list.flush {
+  margin: 0;
+  padding-left: 0;
+  border-left: none;
+}
 .sched-row.off {
   opacity: 0.55;
+}
+.sched-panels {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 20px;
+  white-space: nowrap;
+  background: var(--muted-bg);
+  color: var(--fg2);
+}
+.sched-panels.lit {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
 }
 .sched-daypart {
   font-size: 12.5px;

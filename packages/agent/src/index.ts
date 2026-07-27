@@ -1038,7 +1038,7 @@ class Agent {
    * `server/display-power` — sleep or wake ONE panel (POL-101).
    *
    * This is the ONLY thing in the agent that darkens a wall, and it fires only when the control plane
-   * says so — an operator's click, or a panel-hours boundary an operator set. Nothing here is driven
+   * says so — an operator's click, or a schedule window's boundary. Nothing here is driven
    * by idleness; the compositor's no-blank discipline (`output * dpms on`, no swayidle) is untouched.
    *
    * The browser is deliberately NOT torn down: the player keeps its socket and its slice, so waking is

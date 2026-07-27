@@ -46,7 +46,6 @@ import type {
   PersistedDaypart,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
-  PersistedPanelPower,
   PersistedImageRollout,
   PersistedMachine,
   PersistedSchedule,
@@ -151,12 +150,16 @@ interface ContentRow {
 
 interface MetaRow {
   revision: string; // bigint comes back as a string to avoid precision loss
-  active_scene_id: string | null; // POL-95 — the scene the wall is on (null = none / diverged)
+  // POL-186 — `active_scene_id` moved onto `murals` (scheduling now resolves per mural). The column
+  // stays on `meta` (never dropped — a rolled-back deploy still reads it) but is no longer surfaced
+  // here; it is read only by the one-time backfill migration in `migrate()`.
 }
 
 interface MuralRow {
   id: string;
   name: string;
+  /** POL-186 — the active scene for THIS mural (null = none / diverged). */
+  active_scene_id: string | null;
 }
 
 interface PlacementRow {
@@ -255,10 +258,12 @@ interface DaypartRow {
 
 interface ScheduleRow {
   id: string;
-  scene_id: string;
+  scene_id: string | null;
+  mural_id: string | null;
   daypart_id: string;
   days: unknown;
   priority: number;
+  panels: string;
   enabled: boolean;
   from_date: string | null;
   until_date: string | null;
@@ -298,12 +303,6 @@ interface DisplaySettingsRow {
 
 interface BootOrderPolicyRow {
   reassert: boolean;
-}
-
-/** POL-101 — panel power: the deployment timezone + a jsonb map of screenId → daily window. */
-interface PanelPowerRow {
-  timezone: string;
-  hours: Record<string, { enabled: boolean; on: string; off: string }>;
 }
 
 interface CountRow {
@@ -555,6 +554,33 @@ export class PostgresStore implements Store {
         created_at  timestamptz NOT NULL DEFAULT now()
       )
     `;
+    // POL-186 — panel power moved onto the schedule window, and scheduling now resolves per mural
+    // rather than once globally. All additive: a schedule written before this keeps `panels = 'on'`
+    // (the default) and gets a mural derived from its scene, so a live wall behaves identically after
+    // the upgrade.
+    await sql`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS panels text NOT NULL DEFAULT 'on'`;
+    await sql`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS mural_id text`;
+    // `scene_id` is no longer NOT NULL: a POWER-ONLY window (POL-186) carries no scene at all.
+    await sql`ALTER TABLE schedules ALTER COLUMN scene_id DROP NOT NULL`;
+    await sql`UPDATE schedules s SET mural_id = sc.mural_id
+                FROM scenes sc WHERE sc.id = s.scene_id AND s.mural_id IS NULL`;
+    // The single global "active scene" (meta.active_scene_id) becomes per-mural, since the ticker now
+    // resolves each mural independently. `meta.active_scene_id` is left in place, UNTOUCHED (never
+    // cleared, never dropped) as a fallback read path for a rolled-back deploy.
+    await sql`ALTER TABLE murals ADD COLUMN IF NOT EXISTS active_scene_id text`;
+    // The backfill below must run EXACTLY ONCE, on a dedicated marker — not on `active_scene_id IS
+    // NULL`. `migrate()` runs unconditionally on every boot, and `meta.active_scene_id` is never
+    // updated after this point (the write path moved to `murals`), so a NULL-guarded backfill would
+    // silently resurrect a scene an operator (or the ticker) deliberately cleared at runtime, on the
+    // very next restart. The marker makes "already backfilled" its own fact, independent of whatever
+    // value `active_scene_id` holds right now.
+    await sql`ALTER TABLE meta ADD COLUMN IF NOT EXISTS active_scene_backfilled boolean NOT NULL DEFAULT false`;
+    // Carry the single global active scene onto whichever mural owned it, then stop writing meta.
+    await sql`UPDATE murals m SET active_scene_id = meta.active_scene_id
+                FROM meta, scenes sc
+                WHERE meta.id = 1 AND meta.active_scene_backfilled = false
+                  AND sc.id = meta.active_scene_id AND sc.mural_id = m.id`;
+    await sql`UPDATE meta SET active_scene_backfilled = true WHERE id = 1`;
     // Deployment-wide scheduler settings (one row): master switch, the ONE timezone every window is
     // evaluated in, and the default scene (the always-on floor). Absent until first changed — the
     // control plane defaults to the server's own zone.
@@ -726,10 +752,10 @@ export class PostgresStore implements Store {
         reassert boolean NOT NULL
       )
     `;
-    // Panel power (POL-101): a single row — the deployment's timezone plus every screen's daily
-    // on/off window as jsonb. One row rather than a table per screen because that is all the shape
-    // this has, and because the whole thing is read on every scheduler tick. Absent until an operator
-    // first sets panel hours, at which point walls that have no window keep running 24/7.
+    // Panel power (POL-101), VESTIGIAL since POL-186: a wall's waking hours are a schedule window
+    // now, so nothing reads or writes this row any more. The table is created and left alone rather
+    // than dropped — this migration path only ever adds, and an operator who rolls a deployment back
+    // one release must find their data where they left it.
     await sql`
       CREATE TABLE IF NOT EXISTS panel_power (
         id       int PRIMARY KEY DEFAULT 1,
@@ -760,14 +786,14 @@ export class PostgresStore implements Store {
       sql<MachineRow[]>`SELECT id, label, agent_version, backend, outputs, status, credential_hash, last_seen, shell_enabled, shell_armed_at, tags, image_id, image_id_at, boot_path, boot_path_at, boot_path_detail, boot_mode, boot_mode_at, disks, staged_image_id, staged_image_id_at, hardware, enrolled_token_id, enrolled_token_name, pre_registered, mtls_cert_issued_at, mtls_seen_at FROM machines`,
       sql<ScreenRow[]>`SELECT id, friendly_name, machine_id, connector, cast_enabled, interactive, hide_scrollbars, variables FROM screens`,
       sql<ContentRow[]>`SELECT screen_id, canvas, surfaces, source_id FROM screen_content`,
-      sql<MetaRow[]>`SELECT revision, active_scene_id FROM meta WHERE id = 1`,
-      sql<MuralRow[]>`SELECT id, name FROM murals`,
+      sql<MetaRow[]>`SELECT revision FROM meta WHERE id = 1`,
+      sql<MuralRow[]>`SELECT id, name, active_scene_id FROM murals`,
       sql<PlacementRow[]>`SELECT mural_id, screen_id, x, y, w, h FROM placements`,
       sql<VideoWallRow[]>`SELECT id, mural_id, member_screen_ids, name, content_source_id FROM video_walls`,
       sql<ContentSourceRow[]>`SELECT id, name, kind, url, credential_profile_id, items, definition, framing, placement_mode, refresh, composition FROM content_sources`,
       sql<SceneRow[]>`SELECT id, name, mural_id, snapshot FROM scenes`,
       sql<DaypartRow[]>`SELECT id, name, start_time, end_time FROM dayparts`,
-      sql<ScheduleRow[]>`SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules`,
+      sql<ScheduleRow[]>`SELECT id, scene_id, mural_id, daypart_id, days, priority, panels, enabled, from_date, until_date, created_at FROM schedules`,
       sql<CredentialProfileRow[]>`SELECT id, name, strategy, token_endpoint, client_id, client_secret, scope, audience, token_param FROM credential_profiles`,
       sql<ZoomPreferenceRow[]>`SELECT target_id, source_key, zoom FROM zoom_preferences`,
       sql<AudioPreferenceRow[]>`SELECT target_id, source_key, muted, volume FROM audio_preferences`,
@@ -850,6 +876,13 @@ export class PostgresStore implements Store {
       name: row.name,
     }));
 
+    // POL-186 — mural id → its active scene, read off the SAME rows (murals.active_scene_id is where
+    // this now lives, one per mural rather than one global value).
+    const activeScenes: Record<string, string> = {};
+    for (const row of muralRows) {
+      if (row.active_scene_id) activeScenes[row.id] = row.active_scene_id;
+    }
+
     const placements: PersistedPlacement[] = placementRows.map((row) => ({
       muralId: row.mural_id,
       screenId: row.screen_id,
@@ -924,11 +957,15 @@ export class PostgresStore implements Store {
 
     const schedules: PersistedSchedule[] = scheduleRows.map((row) => ({
       id: row.id,
-      sceneId: row.scene_id,
+      sceneId: row.scene_id ?? null,
+      muralId: row.mural_id ?? null,
       daypartId: row.daypart_id,
       // jsonb comes back parsed; keep only the weekday numbers (the control plane re-validates).
       days: Array.isArray(row.days) ? (row.days as unknown[]).map(Number).filter(Number.isInteger) : [],
       priority: Number(row.priority),
+      // A legacy row (written before POL-186) has no panels value written yet — the column default
+      // ('on') covers it, but degrade defensively here too in case of a stray unrecognised value.
+      panels: row.panels === "off" ? "off" : "on",
       enabled: row.enabled,
       from: row.from_date ?? null,
       until: row.until_date ?? null,
@@ -936,11 +973,10 @@ export class PostgresStore implements Store {
     }));
 
     const revision = metaRows[0] ? Number(metaRows[0].revision) : 0;
-    const activeSceneId = metaRows[0]?.active_scene_id ?? null;
 
     return {
       revision,
-      activeSceneId,
+      activeScenes,
       machines,
       screens,
       content,
@@ -1131,13 +1167,12 @@ export class PostgresStore implements Store {
     `;
   }
 
-  async setActiveSceneId(sceneId: string | null): Promise<void> {
+  async setActiveSceneId(muralId: string, sceneId: string | null): Promise<void> {
     const sql = this.sql;
-    await sql`
-      INSERT INTO meta (id, revision, active_scene_id) VALUES (1, 0, ${sceneId})
-      ON CONFLICT (id) DO UPDATE SET active_scene_id = EXCLUDED.active_scene_id
-    `;
+    // POL-186 — this now lives on the mural row, one per mural, not the single `meta` row.
+    await sql`UPDATE murals SET active_scene_id = ${sceneId} WHERE id = ${muralId}`;
   }
+
 
   // ── Murals & placement (Phase 3) ────────────────────────────────────────────
 
@@ -1461,13 +1496,15 @@ export class PostgresStore implements Store {
   async upsertSchedule(schedule: PersistedSchedule): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO schedules (id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at)
+      INSERT INTO schedules (id, scene_id, mural_id, daypart_id, days, priority, panels, enabled, from_date, until_date, created_at)
       VALUES (
         ${schedule.id},
         ${schedule.sceneId},
+        ${schedule.muralId},
         ${schedule.daypartId},
         ${sql.json(schedule.days)},
         ${schedule.priority},
+        ${schedule.panels},
         ${schedule.enabled},
         ${schedule.from},
         ${schedule.until},
@@ -1475,9 +1512,11 @@ export class PostgresStore implements Store {
       )
       ON CONFLICT (id) DO UPDATE SET
         scene_id   = EXCLUDED.scene_id,
+        mural_id   = EXCLUDED.mural_id,
         daypart_id = EXCLUDED.daypart_id,
         days       = EXCLUDED.days,
         priority   = EXCLUDED.priority,
+        panels     = EXCLUDED.panels,
         enabled    = EXCLUDED.enabled,
         from_date  = EXCLUDED.from_date,
         until_date = EXCLUDED.until_date
@@ -1492,14 +1531,16 @@ export class PostgresStore implements Store {
   async listSchedules(): Promise<PersistedSchedule[]> {
     const sql = this.sql;
     const rows = await sql<ScheduleRow[]>`
-      SELECT id, scene_id, daypart_id, days, priority, enabled, from_date, until_date, created_at FROM schedules
+      SELECT id, scene_id, mural_id, daypart_id, days, priority, panels, enabled, from_date, until_date, created_at FROM schedules
     `;
     return rows.map((row) => ({
       id: row.id,
-      sceneId: row.scene_id,
+      sceneId: row.scene_id ?? null,
+      muralId: row.mural_id ?? null,
       daypartId: row.daypart_id,
       days: Array.isArray(row.days) ? (row.days as unknown[]).map(Number).filter(Number.isInteger) : [],
       priority: Number(row.priority),
+      panels: row.panels === "off" ? "off" : "on",
       enabled: row.enabled,
       from: row.from_date ?? null,
       until: row.until_date ?? null,
@@ -1991,27 +2032,6 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO boot_order_policy (id, reassert) VALUES (1, ${policy.reassert})
       ON CONFLICT (id) DO UPDATE SET reassert = EXCLUDED.reassert
-    `;
-  }
-
-  // ── Panel power (POL-101) ──────────────────────────────────────────────────
-
-  async getPanelPower(): Promise<PersistedPanelPower | undefined> {
-    const sql = this.sql;
-    const rows = await sql<PanelPowerRow[]>`
-      SELECT timezone, hours FROM panel_power WHERE id = 1 LIMIT 1
-    `;
-    const row = rows[0];
-    if (!row) return undefined;
-    return { timezone: row.timezone, hours: row.hours ?? {} };
-  }
-
-  async setPanelPower(power: PersistedPanelPower): Promise<void> {
-    const sql = this.sql;
-    await sql`
-      INSERT INTO panel_power (id, timezone, hours)
-      VALUES (1, ${power.timezone}, ${sql.json(power.hours)})
-      ON CONFLICT (id) DO UPDATE SET timezone = EXCLUDED.timezone, hours = EXCLUDED.hours
     `;
   }
 

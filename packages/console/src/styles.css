@@ -37,6 +37,16 @@
   --scr-empty-bg: #fafafa;
   --scr-empty-line: #d4d4d8;
   --scr-off-bg: #f1f1f2;
+  /* POL-186 — the scene scheduler's week strip, where a stretch the wall runs DARK is painted.
+   * These three are DELIBERATELY IDENTICAL in both themes: "off" here means dark in the room, not
+   * dark relative to the page, and a theme-following token (--fg, --scr-off-bg) paints the sleeping
+   * band WHITE or pale-grey in one of the two. This is a SECOND off-vocabulary — the murals canvas
+   * says "off" with --scr-off-bg on a screen node (ScreenNode.vue) — because that one marks a box
+   * in a diagram while this one has to read as night inside a coloured timeline. Keep them apart. */
+  --seg-off-bg: #0b0b0e;
+  --seg-off-line: rgba(255, 255, 255, 0.28);
+  /* The conflict hatch over a dark band: the ordinary black stripe is invisible on --seg-off-bg. */
+  --seg-off-conflict: rgba(255, 255, 255, 0.3);
   --seam: rgba(2, 6, 23, 0.14);
   --label-bg: rgba(255, 255, 255, 0.9);
   --dot: #e4e4e7;
@@ -79,6 +89,10 @@
   --scr-empty-bg: #111114;
   --scr-empty-line: #3f3f46;
   --scr-off-bg: #141417;
+  /* Same values as :root, on purpose — see the note there. */
+  --seg-off-bg: #0b0b0e;
+  --seg-off-line: rgba(255, 255, 255, 0.28);
+  --seg-off-conflict: rgba(255, 255, 255, 0.3);
   --seam: rgba(0, 0, 0, 0.5);
   --label-bg: rgba(9, 9, 11, 0.6);
   --dot: #1d1d21;

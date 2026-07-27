@@ -30,7 +30,6 @@ import { machineDisplayName } from "../../machine-name";
 import { devtoolsUrl } from "../../api";
 import { useScreenInspect, type InspectTarget } from "../useInspect";
 import { useScreenPower, powerMethodLabel, type PowerTarget } from "../usePanelPower";
-import type { PanelHours } from "@polyptic/protocol";
 import Toggle from "../Toggle.vue";
 import ZoomControl from "./ZoomControl.vue";
 import AudioControl from "./AudioControl.vue";
@@ -419,11 +418,9 @@ const inspectItemLabel = computed(() => {
   return inspecting.value ? "Close on-panel inspector" : "Inspect on panel";
 });
 
-// ── Panel power + panel hours (POL-101) ──────────────────────────────────────
-// Wake/sleep rides the same ack-driven composable as the Machines view, so the Inspector can never
-// claim a panel is dark before the box has said so. The hours editor below it is the whole schedule
-// UI: ONE daily window per screen, in the deployment's timezone. That is a deliberate floor, not an
-// oversight — full recurrence belongs to the scene scheduler, and the two are meant to converge.
+// ── Panel power (POL-101) ────────────────────────────────────────────────────
+// MANUAL wake/sleep, and only that. It rides the same ack-driven composable as the Machines view, so
+// the Inspector can never claim a panel is dark before the box has said so.
 const powerTarget = computed<PowerTarget | undefined>(() => {
   const s = single.value;
   if (!s) return undefined;
@@ -454,54 +451,10 @@ const powerDetail = computed(() =>
   asleep.value ? powerMethodLabel(single.value?.powerMethods) : "",
 );
 
-/** The deployment's zone, shown next to the times so "19:00" is never ambiguous. */
-const panelTimezone = computed(() => store.panelPower?.timezone ?? "");
+// POL-186 — the per-screen panel-hours editor stood here. A wall's waking hours are a SCHEDULE
+// WINDOW now (Scenes → the schedule dialog), aimed at a mural and read on the scheduler's one
+// timezone. What is left on this panel is manual wake/sleep, which was always a separate thing.
 
-// The hours draft. Re-synced from the authoritative snapshot whenever the selection moves or the
-// server's value changes — but never while the operator is mid-edit, exactly like the rename field.
-const hoursEnabled = ref(false);
-const onDraft = ref("08:00");
-const offDraft = ref("18:00");
-const hoursEditing = ref(false);
-const hoursError = ref("");
-
-function syncHours(h: PanelHours | undefined): void {
-  hoursEnabled.value = h?.enabled ?? false;
-  onDraft.value = h?.on ?? "08:00";
-  offDraft.value = h?.off ?? "18:00";
-}
-watch(
-  () => [single.value?.id, single.value?.panelHours] as const,
-  ([, h]) => {
-    if (!hoursEditing.value) syncHours(h as PanelHours | undefined);
-  },
-  { immediate: true },
-);
-
-/** Save (or clear) the window. Clearing = the screen runs 24/7 and the scheduler never touches it. */
-async function saveHours(): Promise<void> {
-  const s = single.value;
-  if (!s) return;
-  hoursError.value = "";
-  if (hoursEnabled.value && onDraft.value === offDraft.value) {
-    hoursError.value = "The on and off times must differ.";
-    return;
-  }
-  const hours: PanelHours | null = hoursEnabled.value
-    ? { enabled: true, on: onDraft.value, off: offDraft.value }
-    : null;
-  const error = await store.setScreenPanelHours(s.id, hours);
-  hoursEditing.value = false;
-  if (error) {
-    hoursError.value = error;
-    return;
-  }
-  showNotice(
-    hours
-      ? `Panel hours saved, ${hours.on}–${hours.off} (${panelTimezone.value})`
-      : "Panel hours cleared. This screen runs 24/7.",
-  );
-}
 function launchInspect(): void {
   menuOpen.value = false;
   void toggleInspect();
@@ -749,9 +702,10 @@ function selectOne(id: string) {
         {{ identingSingle ? "Flashing on wall…" : "Ident (flash on wall)" }}
       </button>
 
-      <!-- Panel power (POL-101). Only for a box that reported it can drive DPMS — a dev backend has
-           no panel, and a pre-POL-101 agent has told us nothing, so we offer nothing rather than a
-           button that will fail. -->
+      <!-- Panel power (POL-101) — manual wake/sleep. Only for a box that reported it can drive DPMS:
+           a dev backend has no panel, and a pre-POL-101 agent has told us nothing, so we offer
+           nothing rather than a button that will fail. The SCHEDULED hours are a window on the
+           mural's schedule (Scenes), not a per-screen setting (POL-186). -->
       <template v-if="powerSupported">
         <div class="section-label gap-top">Panel</div>
         <button
@@ -769,41 +723,6 @@ function selectOne(id: string) {
              in front of one should know that is expected, not a fault. -->
         <p v-if="asleep" class="power-detail">{{ powerDetail }}</p>
 
-        <div class="hours">
-          <label class="hours-toggle">
-            <input
-              v-model="hoursEnabled"
-              type="checkbox"
-              @change="hoursEditing = true"
-            />
-            <span>Panel hours</span>
-          </label>
-          <div v-if="hoursEnabled" class="hours-row">
-            <input
-              v-model="onDraft"
-              class="time-input"
-              type="time"
-              aria-label="Wake at"
-              @focus="hoursEditing = true"
-            />
-            <span class="hours-dash">→</span>
-            <input
-              v-model="offDraft"
-              class="time-input"
-              type="time"
-              aria-label="Sleep at"
-              @focus="hoursEditing = true"
-            />
-          </div>
-          <p class="hours-caption">
-            <template v-if="hoursEnabled">
-              Wakes and sleeps daily, in {{ panelTimezone || "the deployment timezone" }}.
-            </template>
-            <template v-else> No schedule. This screen runs 24/7. </template>
-          </p>
-          <p v-if="hoursError" class="hours-error">{{ hoursError }}</p>
-          <button class="hours-save" @click="saveHours">Save panel hours</button>
-        </div>
       </template>
 
       <!-- Casting (POL-119): persistent AirPlay-receiver toggle + live session state. -->
@@ -1262,71 +1181,6 @@ function selectOne(id: string) {
   font-size: 11px;
   line-height: 1.45;
   color: var(--muted2);
-}
-.hours {
-  margin-top: 10px;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--muted-bg);
-}
-.hours-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--fg2);
-  cursor: pointer;
-}
-.hours-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-}
-.time-input {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 8px;
-  border-radius: 7px;
-  border: 1px solid var(--line2);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: 12.5px;
-  font-family: inherit;
-  font-variant-numeric: tabular-nums;
-}
-.hours-dash {
-  color: var(--muted2);
-  font-size: 12px;
-}
-.hours-caption {
-  margin: 8px 0 0;
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--muted2);
-}
-.hours-error {
-  margin: 6px 0 0;
-  font-size: 11px;
-  color: var(--bad);
-}
-.hours-save {
-  margin-top: 8px;
-  width: 100%;
-  padding: 7px;
-  border-radius: 7px;
-  border: 1px solid var(--line2);
-  background: var(--surface);
-  color: var(--fg2);
-  font-size: 12px;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-}
-.hours-save:hover {
-  background: var(--muted-bg);
 }
 /* casting (POL-119) — receiver toggle + live session state */
 .cast-card {

@@ -104,7 +104,9 @@ export function registerScheduleRoutes(
       return reply.code(404).send({
         error: result.error === "unknown-scene"
           ? `unknown scene: ${body.data.sceneId}`
-          : `unknown daypart: ${body.data.daypartId}`,
+          : result.error === "unknown-mural"
+            ? `unknown mural: ${body.data.muralId}`
+            : `unknown daypart: ${body.data.daypartId}`,
       });
     }
     fastify.log.info(
@@ -134,7 +136,9 @@ export function registerScheduleRoutes(
           ? `unknown schedule: ${params.data.id}`
           : result.error === "unknown-scene"
             ? `unknown scene: ${body.data.sceneId}`
-            : `unknown daypart: ${body.data.daypartId}`;
+            : result.error === "unknown-mural"
+              ? `unknown mural: ${body.data.muralId}`
+              : `unknown daypart: ${body.data.daypartId}`;
       return reply.code(404).send({ error: message });
     }
     fastify.log.info({ event: "schedule.update", scheduleId: result.schedule.id }, "schedule updated");

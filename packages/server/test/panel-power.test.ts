@@ -1,125 +1,113 @@
 /**
- * Panel hours (POL-101) — schedule evaluation and the scheduler's edge-triggered behaviour, on an
- * INJECTED clock (a test that has to wait until 19:00 is not a test).
+ * Panel power (POL-101, re-sourced onto the scene schedule at POL-186) — the seam the scene ticker
+ * drives, on an INJECTED clock (a test that has to wait until 19:00 is not a test).
  *
  * The properties worth pinning are the ones a wall is judged by:
- *   - in hours, the scheduler NEVER sends a sleep — the non-negotiable, asserted rather than asserted-
- *     about;
- *   - a window that wraps midnight is a legal overnight window;
- *   - a manual override HOLDS until the next boundary (a level-triggered scheduler would put the wall
- *     an operator just woke straight back to sleep, which is the bug that makes people disable the
- *     feature);
- *   - a box that reboots outside its hours is re-slept when it says hello (it comes back LIT — the
- *     compositor asserts `dpms on` at startup);
- *   - the deployment's timezone decides, not the server's.
+ *   - a manual override HOLDS until the next boundary. The ticker now calls `applyMuralPower`
+ *     UNCONDITIONALLY, every mural, every ~10s, so this seam is the ONLY edge-trigger left: if it
+ *     re-asserted, the wall an operator just woke would go back to sleep ten seconds later, which is
+ *     the bug that makes people disable the feature;
+ *   - an UNGOVERNED mural (`panels === null`) is left exactly as it is — not woken, not slept;
+ *   - a screen DRAGGED OFF the wall that slept it wakes. Power hangs on the wall, so the move changed
+ *     the schedule's opinion of that screen without either mural's verdict moving, and nothing else
+ *     re-asserts — miss it and the panel is dark until someone presses Wake;
+ *   - a box that reboots inside an off window is re-slept when it says hello (it comes back LIT —
+ *     the compositor asserts `dpms on` at startup);
+ *   - reconcile never sends a redundant WAKE: a booting box is already lit, and a wasted frame on
+ *     every reconnect of every box in the fleet is a real cost.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import { AdminBroadcaster, AdminHub, Presence } from "../src/admin";
 import { ActivityLog } from "../src/activity";
 import { AgentHub, PlayerHub } from "../src/hub";
-import { PanelPowerScheduler, minutesInZone, panelShouldBeOn } from "../src/panel-power";
+import { PanelPowerScheduler } from "../src/panel-power";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 
-const OFFICE = { enabled: true, on: "08:00", off: "18:00" } as const;
+import type { FastifyBaseLogger } from "fastify";
 
-// ── pure evaluation ───────────────────────────────────────────────────────────
+const log = {
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+  debug: () => {},
+  trace: () => {},
+  fatal: () => {},
+} as unknown as FastifyBaseLogger;
 
-describe("POL-101 panelShouldBeOn", () => {
-  const at = (hhmm: string): number => {
-    const [h, m] = hhmm.split(":");
-    return Number(h) * 60 + Number(m);
-  };
-
-  test("a daytime window: awake from the ON minute, asleep from the OFF minute", () => {
-    expect(panelShouldBeOn(OFFICE, at("07:59"))).toBe(false);
-    expect(panelShouldBeOn(OFFICE, at("08:00"))).toBe(true); // inclusive: it wakes AT 08:00
-    expect(panelShouldBeOn(OFFICE, at("13:00"))).toBe(true);
-    expect(panelShouldBeOn(OFFICE, at("17:59"))).toBe(true);
-    expect(panelShouldBeOn(OFFICE, at("18:00"))).toBe(false); // exclusive: it sleeps AT 18:00
-    expect(panelShouldBeOn(OFFICE, at("23:30"))).toBe(false);
-  });
-
-  test("a window that WRAPS midnight is a legal overnight window (a 24h ops wall)", () => {
-    const overnight = { enabled: true, on: "20:00", off: "06:00" };
-    expect(panelShouldBeOn(overnight, at("19:59"))).toBe(false);
-    expect(panelShouldBeOn(overnight, at("20:00"))).toBe(true);
-    expect(panelShouldBeOn(overnight, at("03:00"))).toBe(true);
-    expect(panelShouldBeOn(overnight, at("05:59"))).toBe(true);
-    expect(panelShouldBeOn(overnight, at("06:00"))).toBe(false);
-  });
-});
-
-describe("POL-101 minutesInZone", () => {
-  test("reads the DEPLOYMENT's clock, not the server's", () => {
-    // 2026-07-14T09:30:00Z — the same instant is a different hour in each building.
-    const instant = new Date("2026-07-14T09:30:00Z");
-    expect(minutesInZone(instant, "UTC")).toBe(9 * 60 + 30);
-    expect(minutesInZone(instant, "Europe/London")).toBe(10 * 60 + 30); // BST, +1
-    expect(minutesInZone(instant, "America/New_York")).toBe(5 * 60 + 30); // EDT, −4
-  });
-
-  test("DST is handled by the zone, not by an offset we cached", () => {
-    const winter = new Date("2026-01-14T09:30:00Z"); // GMT
-    const summer = new Date("2026-07-14T09:30:00Z"); // BST
-    expect(minutesInZone(winter, "Europe/London")).toBe(9 * 60 + 30);
-    expect(minutesInZone(summer, "Europe/London")).toBe(10 * 60 + 30);
-  });
-
-  test("an unknown zone degrades to UTC and SAYS so — it never takes the scheduler down", () => {
-    const warnings: string[] = [];
-    const t = minutesInZone(new Date("2026-07-14T09:30:00Z"), "Mars/Olympus", (m) => warnings.push(m));
-    expect(t).toBe(9 * 60 + 30);
-    expect(warnings[0]).toContain("Mars/Olympus");
-  });
-});
-
-// ── the scheduler ─────────────────────────────────────────────────────────────
-
-interface Harness {
+interface PanelFixture {
   control: ControlPlane;
-  agentHub: AgentHub;
-  presence: Presence;
-  scheduler: PanelPowerScheduler;
-  sent: Array<{ machineId: string; connector: string; on: boolean }>;
-  screenId: string;
-  setNow: (iso: string) => void;
+  panelPower: PanelPowerScheduler;
+  /** The mural the screen is placed on. Returned rather than assumed: two of the tests below are
+   *  NEGATIVE (nothing is sent), so a hardcoded id that stopped matching the seeded mural would make
+   *  them pass for the wrong reason — the loudest failure mode a deletion test has. */
+  muralId: string;
+  /** What went down the wire, as `[screenId, on]` — the only thing that can darken a panel. */
+  sent: Array<[string, boolean]>;
+  activity: ActivityLog;
+  setNowMinutes: (minutes: number) => void;
 }
 
-async function harness(hours = OFFICE, timezone = "Europe/London"): Promise<Harness> {
+/**
+ * One machine (`machine-1`) with one screen (`screen-1`), placed on the deployment's seeded mural,
+ * governed by a single POWER-ONLY window: 19:00–07:00, panels off ("After hours"). The mural is
+ * therefore GOVERNED, so the daytime gap resolves to "on" — which is what wakes the wall at 07:00.
+ * The mural's id is RETURNED, never assumed: the negative tests below assert that nothing was sent,
+ * and an id that quietly stopped matching would make them pass without exercising anything.
+ *
+ * `nowMinutes` is minutes since local midnight on a fixed Wednesday, in UTC, so the injected clock
+ * reads plainly against the window above.
+ */
+async function makePanelFixture(opts: { nowMinutes?: number } = {}): Promise<PanelFixture> {
   const control = new ControlPlane(new MemoryStore());
   await control.init();
   await control.registerMachine({
-    machineId: "wall-1",
+    machineId: "machine-1",
     agentVersion: "test",
     backend: "wayland-sway",
     power: { dpms: true, cec: false },
     outputs: [{ connector: "DP-1", width: 1920, height: 1080 }],
   });
   const screenId = control.getScreens()[0]!.id;
-  await control.setPanelTimezone(timezone);
-  await control.setPanelHours(screenId, { ...hours });
+  // `init` seeds the default mural every deployment boots with — the wall this screen lives on, and
+  // the one the tests below address, by the id the fixture hands back.
+  const mural = control.getMurals()[0]!;
+  await control.placeScreen(screenId, mural.id, 0, 0);
 
-  const sent: Harness["sent"] = [];
+  await control.updateSchedulerSettings({ enabled: true, timezone: "UTC" });
+  const afterHours = await control.createDaypart({ name: "After hours", start: "19:00", end: "07:00" });
+  const created = await control.createSchedule({
+    sceneId: null, // POWER-ONLY: it says nothing about what plays, only what the panels do
+    muralId: mural.id,
+    daypartId: afterHours.id,
+    days: [0, 1, 2, 3, 4, 5, 6],
+    priority: 0,
+    panels: "off",
+    enabled: true,
+    from: null,
+    until: null,
+  });
+  if (!created.ok) throw new Error(`failed to create the schedule: ${created.error}`);
+
+  const sent: PanelFixture["sent"] = [];
   const agentHub = new AgentHub();
-  // Stand in for a live agent socket: record what would have gone down the wire.
+  // Stand in for a live agent socket: record what would have gone down the wire, by SCREEN (the
+  // wire carries a connector, and a connector on a machine is exactly one screen).
   agentHub.send = ((machineId: string, msg: { connector: string; on: boolean }) => {
-    sent.push({ machineId, connector: msg.connector, on: msg.on });
+    const screen = control
+      .getScreens()
+      .find((s) => s.machineId === machineId && s.connector === msg.connector);
+    sent.push([screen?.id ?? `${machineId}/${msg.connector}`, msg.on]);
     return 1;
   }) as unknown as AgentHub["send"];
 
   const presence = new Presence();
   const activity = new ActivityLog();
-  const log = {
-    info: () => {},
-    warn: () => {},
-    error: () => {},
-    debug: () => {},
-  } as unknown as Parameters<typeof PanelPowerScheduler.prototype.constructor>[0]["log"];
+  // A fixed Wednesday; only the time of day matters to the window above.
+  let now = new Date(Date.UTC(2026, 6, 15, 0, 0, 0) + (opts.nowMinutes ?? 12 * 60) * 60_000);
 
-  let now = new Date("2026-07-14T09:00:00Z");
-  const scheduler = new PanelPowerScheduler({
+  const panelPower = new PanelPowerScheduler({
     control,
     agentHub,
     presence,
@@ -138,164 +126,200 @@ async function harness(hours = OFFICE, timezone = "Europe/London"): Promise<Harn
 
   return {
     control,
-    agentHub,
-    presence,
-    scheduler,
+    panelPower,
+    muralId: mural.id,
     sent,
-    screenId,
-    setNow: (iso: string) => {
-      now = new Date(iso);
+    activity,
+    setNowMinutes: (minutes: number) => {
+      now = new Date(Date.UTC(2026, 6, 15, 0, 0, 0) + minutes * 60_000);
     },
   };
 }
 
-describe("POL-101 PanelPowerScheduler", () => {
-  let h: Harness;
-  beforeEach(async () => {
-    h = await harness();
+describe("scheduled panel power", () => {
+  test("a manual wake mid-window holds until the next boundary", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture(); // a 19:00-07:00 off window
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
+    panelPower.send("screen-1", true, "requested by an operator"); // the operator's 19:05 wake
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // ticks keep arriving
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([]); // the schedule's opinion has not changed, so it says nothing
   });
 
-  test("IN HOURS the scheduler never sends a sleep — the whole non-negotiable, asserted", () => {
-    // Walk the entire working day, tick by tick. Not one sleep may leave the building.
-    for (const hhmm of ["08:00", "09:30", "12:00", "15:45", "17:59"]) {
-      h.setNow(`2026-07-14T${hhmm}:00+01:00`);
-      h.scheduler.tick();
-    }
-    expect(h.sent.filter((s) => !s.on)).toEqual([]);
+  test("an ungoverned mural is left exactly as it is", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture();
+    panelPower.applyMuralPower(muralId, null, "");
+    panelPower.applyMuralPower(muralId, null, "");
+    expect(sent).toEqual([]);
   });
 
-  test("the FIRST evaluation records without sending — a server restart never sprays the fleet", () => {
-    h.setNow("2026-07-14T10:00:00+01:00");
-    h.scheduler.tick();
-    expect(h.sent).toEqual([]); // in hours, already awake: there is nothing to say
+  test("hello reconcile re-sleeps a box that rebooted inside an off window", async () => {
+    const { panelPower, sent } = await makePanelFixture({ nowMinutes: 21 * 60 });
+    panelPower.reconcileMachine("machine-1");
+    expect(sent).toEqual([["screen-1", false]]);
   });
 
-  test("crossing the OFF boundary sleeps the panel; crossing ON wakes it", () => {
-    h.setNow("2026-07-14T10:00:00+01:00");
-    h.scheduler.tick(); // first sight: records "should be awake"
-
-    h.setNow("2026-07-14T18:00:00+01:00"); // the boundary
-    h.scheduler.tick();
-    expect(h.sent).toEqual([{ machineId: "wall-1", connector: "DP-1", on: false }]);
-
-    h.setNow("2026-07-14T22:00:00+01:00"); // still out of hours — no repeat
-    h.scheduler.tick();
-    expect(h.sent).toHaveLength(1);
-
-    h.setNow("2026-07-15T08:00:00+01:00"); // next morning
-    h.scheduler.tick();
-    expect(h.sent[1]).toEqual({ machineId: "wall-1", connector: "DP-1", on: true });
+  test("reconcile never sends a redundant wake — a booting box is already lit", async () => {
+    const { panelPower, sent } = await makePanelFixture({ nowMinutes: 12 * 60 });
+    panelPower.reconcileMachine("machine-1");
+    expect(sent).toEqual([]);
   });
 
-  test("a MANUAL wake out of hours HOLDS until the next boundary (no fighting the operator)", () => {
-    h.setNow("2026-07-14T17:59:00+01:00");
-    h.scheduler.tick(); // first sight, in hours
-    h.setNow("2026-07-14T18:00:00+01:00");
-    h.scheduler.tick(); // the boundary → sleep
-    expect(h.sent).toEqual([{ machineId: "wall-1", connector: "DP-1", on: false }]);
-
-    // The operator wakes it by hand for an evening visit. This is the REST path: it sends, and it
-    // deliberately does NOT touch the scheduler's memory.
-    h.scheduler.send(h.screenId, true, "requested by an operator from the console");
-    expect(h.sent.at(-1)?.on).toBe(true);
-
-    // Thirty seconds later — and for the rest of the evening — the scheduler leaves it alone. Recording
-    // the manual value in the schedule's memory instead would put this wall back to sleep right here,
-    // which is the bug that gets a scheduling feature switched off for good.
-    h.setNow("2026-07-14T19:00:30+01:00");
-    h.scheduler.tick();
-    h.setNow("2026-07-14T23:30:00+01:00");
-    h.scheduler.tick();
-    expect(h.sent.filter((s) => !s.on)).toHaveLength(1); // still only the 18:00 sleep
-
-    // …and the schedule resumes at the next boundary, as promised.
-    h.setNow("2026-07-15T08:00:00+01:00");
-    h.scheduler.tick();
-    expect(h.sent.at(-1)).toEqual({ machineId: "wall-1", connector: "DP-1", on: true });
+  test("the FIRST verdict records without sending — a server restart never sprays the fleet", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture();
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([]); // absent memory = first sight of this screen: record, don't act
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([]); // …and still nothing, because nothing changed
   });
 
-  test("a box that reboots OUT of hours is re-slept when it says hello (it comes back lit)", () => {
-    h.setNow("2026-07-14T23:00:00+01:00");
-    h.scheduler.reconcileMachine("wall-1");
-    expect(h.sent).toEqual([{ machineId: "wall-1", connector: "DP-1", on: false }]);
+  test("crossing OFF sleeps the wall; crossing back ON wakes it, once each", async () => {
+    const { panelPower, sent, activity, muralId } = await makePanelFixture();
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // first sight: record "awake"
+    expect(sent).toEqual([]);
+
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // the 19:00 boundary
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // …and every tick after it
+    expect(sent).toEqual([["screen-1", false]]);
+
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // 07:00 the next morning
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    expect(sent).toEqual([
+      ["screen-1", false],
+      ["screen-1", true],
+    ]);
+
+    const lines = activity.recent().map((e) => e.text);
+    expect(lines.some((m) => m.includes("is sleeping — After hours"))).toBe(true);
+    expect(lines.some((m) => m.includes("woke — Opening hours"))).toBe(true);
   });
 
-  test("a box that reboots IN hours is left alone on hello — no wake frame, and never a sleep", () => {
-    h.setNow("2026-07-14T10:00:00+01:00");
-    h.scheduler.reconcileMachine("wall-1");
-    expect(h.sent).toEqual([]); // it booted awake; there is nothing to do
+  test("an ungoverned tick FORGETS the memory, so re-enabling a window starts fresh", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture();
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // records "awake"
+    panelPower.applyMuralPower(muralId, null, ""); // the window was disabled: forget it
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // first sight again: record only
+    expect(sent).toEqual([]);
   });
 
-  test("a screen with NO window is never touched — every pre-POL-101 wall keeps running 24/7", async () => {
-    await h.control.setPanelHours(h.screenId, null);
-    for (const hour of ["03:00", "10:00", "19:00", "23:59"]) {
-      h.setNow(`2026-07-14T${hour}:00+01:00`);
-      h.scheduler.tick();
-    }
-    h.scheduler.reconcileMachine("wall-1");
-    expect(h.sent).toEqual([]);
+  test("a mural's verdict never touches a screen placed on ANOTHER mural", async () => {
+    const { control, panelPower, sent } = await makePanelFixture();
+    const other = await control.createMural("Other wall");
+    // The verdict is addressed to a mural this screen is not on, so nothing may leave the building.
+    panelPower.applyMuralPower(other.id, "on", "Opening hours");
+    panelPower.applyMuralPower(other.id, "off", "After hours");
+    expect(sent).toEqual([]);
   });
 
-  test("a DISABLED window governs nothing (and does not silently force a wake)", async () => {
-    await h.control.setPanelHours(h.screenId, { enabled: false, on: "08:00", off: "18:00" });
-    h.setNow("2026-07-14T23:00:00+01:00");
-    h.scheduler.tick();
-    expect(h.sent).toEqual([]);
-    expect(h.scheduler.desiredFor(h.screenId)).toBeNull();
+  /**
+   * A SCREEN MOVED BETWEEN MURALS WHILE ASLEEP. This is the regression per-screen panel hours could
+   * not have: a screen carried its own window and woke at its own 07:00. Now the window belongs to
+   * the WALL, so dragging a sleeping screen onto another wall changes the schedule's opinion FOR THAT
+   * SCREEN without either mural's own verdict changing — and the memory, which is keyed per screen,
+   * has to see that edge. Nothing re-asserts otherwise: the ticker is the only caller on the hot
+   * path, `reconcileMachine` only ever sends the SLEEP half, and no placement route touches power.
+   * So a miss here is a panel dark until an operator finds the Wake button.
+   */
+  test("a screen asleep by A's window wakes when it is dragged onto an UNGOVERNED mural", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // first sight: record "awake"
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // 19:00 — the wall sleeps
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
+
+    // 20:00: the operator drags the screen onto a wall no window governs.
+    const other = await control.createMural("Atrium");
+    await control.placeScreen("screen-1", other.id, 0, 0);
+
+    // The next tick, in the order the ticker runs it: A no longer holds the screen, and B is
+    // ungoverned. Under a plain "null = leave it alone" the screen would stay dark forever.
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    panelPower.applyMuralPower(other.id, null, "outside its scheduled windows");
+    expect(sent).toEqual([["screen-1", true]]);
   });
 
-  test("the DEPLOYMENT's timezone decides, not the server's", async () => {
-    // The SAME instant, 20:00 UTC, judged by two buildings' clocks against the same 08:00–18:00 window.
-    // In New York it is 16:00 — the wall is in hours and must NOT be slept. In London it is 21:00 —
-    // out of hours, and the box comes back to a sleep. Same server, same code, different building.
-    const ny = await harness(OFFICE, "America/New_York");
-    ny.setNow("2026-07-14T20:00:00Z");
-    ny.scheduler.reconcileMachine("wall-1");
-    expect(ny.sent).toEqual([]);
+  test("a screen asleep by A's window wakes when it is dragged onto a mural that is ON", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
 
-    const london = await harness(OFFICE, "Europe/London");
-    london.setNow("2026-07-14T20:00:00Z");
-    london.scheduler.reconcileMachine("wall-1");
-    expect(london.sent).toEqual([{ machineId: "wall-1", connector: "DP-1", on: false }]);
-  });
-});
-
-describe("POL-101 panel hours persistence", () => {
-  test("hours + timezone survive a control-plane restart on the same store", async () => {
-    const store = new MemoryStore();
-    const first = new ControlPlane(store);
-    await first.init();
-    await first.registerMachine({
-      machineId: "wall-1",
-      agentVersion: "test",
-      backend: "wayland-sway",
-      outputs: [{ connector: "DP-1", width: 1920, height: 1080 }],
-    });
-    const screenId = first.getScreens()[0]!.id;
-    await first.setPanelTimezone("America/New_York");
-    await first.setPanelHours(screenId, { enabled: true, on: "07:30", off: "19:15" });
-
-    const second = new ControlPlane(store);
-    await second.init();
-    expect(second.getPanelPowerConfig()).toEqual({ timezone: "America/New_York" });
-    expect(second.getPanelHours(screenId)).toEqual({ enabled: true, on: "07:30", off: "19:15" });
+    const other = await control.createMural("Atrium");
+    await control.placeScreen("screen-1", other.id, 0, 0);
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    panelPower.applyMuralPower(other.id, "on", "Open day"); // B's own window keeps its wall lit
+    expect(sent).toEqual([["screen-1", true]]);
   });
 
-  test("removing a screen forgets its schedule — no ghost window on a re-created screen", async () => {
-    const store = new MemoryStore();
-    const control = new ControlPlane(store);
-    await control.init();
-    await control.registerMachine({
-      machineId: "wall-1",
-      agentVersion: "test",
-      backend: "wayland-sway",
-      outputs: [{ connector: "DP-1", width: 1920, height: 1080 }],
-    });
-    const screenId = control.getScreens()[0]!.id;
-    await control.setPanelHours(screenId, { enabled: true, on: "08:00", off: "18:00" });
+  test("a screen still asleep by ITS OWN mural's window is not woken by the move-wake", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    sent.length = 0;
 
-    await control.removeScreen(screenId);
-    expect(control.getPanelHours(screenId)).toBeUndefined();
-    expect(control.listPanelHours()).toEqual([]);
+    const other = await control.createMural("Atrium");
+    await control.placeScreen("screen-1", other.id, 0, 0);
+    panelPower.applyMuralPower(other.id, "off", "After hours"); // B says off too — it stays asleep
+    expect(sent).toEqual([]);
+  });
+
+  /**
+   * The tension the move-wake must not break: `panels === null` means "leave the wall exactly as it
+   * is", so a screen an operator slept BY HAND stays asleep. A manual sleep never writes the memory,
+   * so there is nothing recorded to wake from — and an ungoverned tick on the screen's OWN mural (a
+   * window the operator just disabled) is "leave it alone" too, not a wake.
+   */
+  test("an ungoverned mural leaves a hand-slept screen asleep", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 12 * 60 });
+    panelPower.send("screen-1", false, "requested by an operator");
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, "outside its scheduled windows");
+    panelPower.applyMuralPower(muralId, null, "outside its scheduled windows");
+    expect(sent).toEqual([]);
+  });
+
+  test("disabling the window that slept a wall leaves it asleep — it has not moved", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, ""); // the operator switched the window off
+    expect(sent).toEqual([]);
+  });
+
+  test("an UNPLACED screen belongs to no mural, so no window governs it", async () => {
+    const { control, panelPower, sent } = await makePanelFixture({ nowMinutes: 21 * 60 });
+    await control.unplaceScreen("screen-1");
+    expect(panelPower.desiredFor("screen-1")).toBeNull();
+    panelPower.reconcileMachine("machine-1");
+    expect(sent).toEqual([]);
+  });
+
+  test("desiredFor reads the mural's window: asleep at 21:00, awake at noon", async () => {
+    const night = await makePanelFixture({ nowMinutes: 21 * 60 });
+    expect(night.panelPower.desiredFor("screen-1")).toBe(false);
+    night.setNowMinutes(12 * 60);
+    expect(night.panelPower.desiredFor("screen-1")).toBe(true); // the gap on a governed mural is ON
+  });
+
+  /**
+   * A DISABLED SCHEDULER CANNOT DARKEN A WALL. It holds because the shared resolver answers
+   * `panels: null` when the scheduler is off — but that is a guarantee living one package away, and
+   * this seam is the last thing between a resolver verdict and a dark panel in a lobby. Pin it HERE,
+   * so a future change to the resolver's disabled branch fails on the file whose job it is to care.
+   */
+  test("a disabled scheduler cannot darken a wall — deep inside the off window", async () => {
+    const { control, panelPower, sent } = await makePanelFixture({ nowMinutes: 21 * 60 });
+    expect(panelPower.desiredFor("screen-1")).toBe(false); // …while it is switched ON
+
+    await control.updateSchedulerSettings({ enabled: false });
+    expect(panelPower.desiredFor("screen-1")).toBeNull(); // ungoverned: nobody has an opinion
+    panelPower.reconcileMachine("machine-1"); // a box rebooting at 21:00 with the scheduler off
+    expect(sent).toEqual([]); // nothing goes down the wire, so nothing goes dark
   });
 });

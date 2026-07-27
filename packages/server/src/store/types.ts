@@ -272,14 +272,19 @@ export interface PersistedDaypart {
   end: string;
 }
 
-/** POL-89 — a scene bound to a daypart on a recurrence, at a priority. The scheduler's unit. */
+/** POL-89 — a scene bound to a daypart on a recurrence, at a priority. The scheduler's unit.
+ *  POL-186 — `sceneId` is nullable (a POWER-ONLY window: don't change what plays, only set the
+ *  panels) and `muralId` names which mural the window governs (`null` = every mural). */
 export interface PersistedSchedule {
   id: string;
-  sceneId: string;
+  sceneId: string | null;
+  muralId: string | null;
   daypartId: string;
   /** Weekdays the window is armed on (0=Sun…6=Sat). */
   days: number[];
   priority: number;
+  /** POL-186 — what the panels do while this window is on air. */
+  panels: "on" | "off";
   enabled: boolean;
   /** Inclusive date range (`YYYY-MM-DD`), tested against the window's START date. */
   from: string | null;
@@ -483,29 +488,14 @@ export interface PersistedBootOrderPolicy {
   reassert: boolean;
 }
 
-/**
- * Panel power (POL-101): the deployment's timezone plus each screen's daily on/off window. ONE row,
- * because that is genuinely all this is — a per-screen window and the zone to read it in. Kept
- * deliberately small: the full recurrence machinery belongs to the scene scheduler, and the two are
- * meant to converge (D100), so this must not grow a private calendar in the meantime.
- *
- * Absent until an operator first sets panel hours; a deployment that never does keeps its walls on
- * 24/7, exactly as before POL-101.
- */
-export interface PersistedPanelPower {
-  /** IANA zone the windows are read in ("Europe/London"). Explicit — never the server's own TZ. */
-  timezone: string;
-  /** screenId → its daily window. A screen with no entry is never touched by the scheduler. */
-  hours: Record<string, { enabled: boolean; on: string; off: string }>;
-}
-
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
-  /** POL-95 — the scene the wall is currently on (null = none / diverged). Persisted with the
-   *  revision in the single-row `meta` table: the active scene is desired state, not a UI hint, so a
-   *  server restart must not lose it. */
-  activeSceneId: string | null;
+  /** POL-95/POL-186 — the scene each mural is currently on: muralId → sceneId. A mural absent from
+   *  this map has none (diverged). Which scene a mural is on is desired state, not a UI hint, so a
+   *  server restart must not lose it — POL-186 moved this from one global value to one per mural,
+   *  since scheduling now resolves per mural. */
+  activeScenes: Record<string, string>;
   machines: PersistedMachine[];
   screens: PersistedScreen[];
   content: PersistedContent[];
@@ -572,9 +562,9 @@ export interface Store {
   deleteContent(screenId: string): Promise<void>;
   /** Persist the global revision counter. */
   setRevision(revision: number): Promise<void>;
-  /** POL-95 — persist the ACTIVE scene (null = none / the wall has diverged). Single-row, alongside
-   *  the revision: which scene the wall is on is desired state, and must survive a restart. */
-  setActiveSceneId(sceneId: string | null): Promise<void>;
+  /** POL-95/POL-186 — persist the ACTIVE scene for ONE mural (`null` clears it — none / diverged).
+   *  Which scene a mural is on is desired state, and must survive a restart. */
+  setActiveSceneId(muralId: string, sceneId: string | null): Promise<void>;
 
   // ── Murals & placement (Phase 3) ──────────────────────────────────────────
   /** Insert-or-update a mural row (id + name). */
@@ -751,12 +741,6 @@ export interface Store {
   getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined>;
   /** Persist the fleet-wide boot-order policy (single row). */
   setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void>;
-
-  // ── Panel power (POL-101) ──────────────────────────────────────────────────
-  /** The persisted panel-power config (timezone + per-screen hours). Undefined until first set. */
-  getPanelPower(): Promise<PersistedPanelPower | undefined>;
-  /** Replace the panel-power config (single row). */
-  setPanelPower(power: PersistedPanelPower): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

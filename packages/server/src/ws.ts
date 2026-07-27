@@ -92,7 +92,7 @@ interface WsDeps {
   health: SourceHealthTracker;
   /** Remote-DevTools relay (POL-67) — bridges an operator's DevTools frontend to a wall's Chrome. */
   devtoolsRelay: DevtoolsRelay;
-  /** POL-101 — panel-hours scheduler; reconciles a box's panels to their window when it says hello. */
+  /** POL-101 — panel power; reconciles a box's panels to its mural's schedule when it says hello. */
   panelPower: PanelPowerScheduler;
   log: FastifyBaseLogger;
   /** Allowed browser origins for the /admin WS upgrade (anti-CSWSH); from CORS_ORIGIN. */
@@ -559,8 +559,8 @@ function handleAgent(
           // this is what actually gets the new agent onto the fleet — no manual full rebuild, no reboot.
           maybeOfferUpdate(msg.agentVersion, msg.hardware?.arch, msg.machineId);
           // POL-101 — the box is back and its panels are LIT (the compositor asserts `dpms on` at
-          // startup). If a screen is outside its panel hours right now, sleep it again; in hours,
-          // this does nothing at all — a wall that should be showing content is never blanked.
+          // startup). If a screen's mural is inside an off window right now, sleep it again; in
+          // hours, this does nothing at all — a wall that should be showing content is never blanked.
           panelPower.reconcileMachine(msg.machineId);
           log.info(
             {

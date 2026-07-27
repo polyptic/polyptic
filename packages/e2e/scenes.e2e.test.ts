@@ -26,7 +26,7 @@
  *   - POST   /api/v1/scenes/:id/apply  RESTORES it: admin/state placements + videoWalls match the
  *            snapshot AND the affected players get a fresh `server/render` with the restored content
  *            (A,B → a SPAN surface at the source's url again; C → its single-screen surface, no span);
- *            DesiredState.activeSceneId becomes the applied scene;
+ *            DesiredState.activeScenes[muralId] becomes the applied scene;
  *   - PATCH  /api/v1/scenes/:id {name}  renames it (and a scene carries NO time of its own);
  *   - POST   /api/v1/scenes/:id/apply for an UNKNOWN scene → 404;
  *   - DELETE /api/v1/scenes/:id  removes it from admin/state.scenes.
@@ -595,7 +595,7 @@ describe("phase 3d scenes (saved wall snapshots)", () => {
   );
 
   test(
-    "POST /scenes/:id/apply restores layout + grouping + content and sets activeSceneId",
+    "POST /scenes/:id/apply restores layout + grouping + content and sets the mural's active scene",
     async () => {
       // Fence: only renders with a HIGHER revision than this can be the result of the apply.
       const preRevision = await currentRevision();
@@ -617,9 +617,9 @@ describe("phase 3d scenes (saved wall snapshots)", () => {
       expect(walls[0].memberScreenIds).toContain(screenA);
       expect(walls[0].memberScreenIds).toContain(screenB);
 
-      // DesiredState.activeSceneId points at the applied scene.
+      // DesiredState.activeScenes points at the applied scene, keyed by the mural it belongs to.
       const desired = await (await fetch(`${BASE}/api/v1/state`)).json();
-      expect((desired as Frame).activeSceneId).toBe(sceneId);
+      expect((desired as Frame).activeScenes[wallMuralId]).toBe(sceneId);
 
       // ── players: the restored content lands live ────────────────────────────
       // A + B → a SPAN surface at the LIBRARY source's url (the source resolved to its current url).

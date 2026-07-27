@@ -6,19 +6,18 @@
  * bricked that wall. Every field this ticket adds is therefore OPTIONAL on the wire, and these tests
  * are what stop someone quietly making one required later.
  *
- * The other half is the shape of the schedule itself: "HH:MM", validated at the edge, because a
- * malformed time that reaches the scheduler is a wall that sleeps at the wrong hour — or never wakes.
+ * The other half is POL-186's deletion: the per-screen calendar this ticket once shipped is gone,
+ * and the tests below are what stop it — and its second timezone — creeping back in.
  */
 import { describe, expect, test } from "bun:test";
 
+import * as protocol from "../src/index";
 import {
   AgentHello,
   AgentMessage,
   AgentPowerAck,
   MachineView,
   PROTOCOL_VERSION,
-  PanelHours,
-  PanelPowerConfig,
   ScreenView,
   ServerToAgentDisplayPower,
   ServerToAgentMessage,
@@ -55,7 +54,6 @@ describe("POL-101 back-compat", () => {
       surfaceCount: 1,
     });
     expect(view.asleep).toBeUndefined();
-    expect(view.panelHours).toBeUndefined();
     expect(view.powerMethods).toBeUndefined();
   });
 
@@ -76,7 +74,7 @@ describe("POL-101 back-compat", () => {
       t: "server/display-power",
       connector: "DP-1",
       on: false,
-      reason: "panel hours",
+      reason: "schedule: After hours",
     });
     expect(power.t).toBe("server/display-power");
 
@@ -103,31 +101,54 @@ describe("POL-101 back-compat", () => {
   });
 });
 
-describe("POL-101 schedule shape", () => {
-  test("panel hours are 24-hour HH:MM — a malformed time is refused AT THE EDGE", () => {
-    expect(PanelHours.parse({ enabled: true, on: "07:30", off: "19:15" })).toEqual({
-      enabled: true,
-      on: "07:30",
-      off: "19:15",
+/**
+ * POL-186 — the per-screen calendar is GONE. A wall's waking hours are a schedule window
+ * (`Schedule.panels`) aimed at a mural, read on the scheduler's one timezone. These tests exist so
+ * that nobody quietly reintroduces the second calendar: an export that comes back is a second clock
+ * coming back with it.
+ */
+describe("per-screen panel hours are gone", () => {
+  test("the schemas no longer exist", () => {
+    expect("PanelHours" in protocol).toBe(false);
+    expect("PanelHoursBody" in protocol).toBe(false);
+    expect("PanelPowerConfig" in protocol).toBe(false);
+    expect("UpdatePanelPowerBody" in protocol).toBe(false);
+  });
+
+  test("manual wake/sleep survives untouched — it is a different feature", () => {
+    const msg = protocol.ServerToAgentDisplayPower.parse({
+      t: "server/display-power",
+      connector: "HDMI-1",
+      on: false,
+      reason: "requested by an operator",
     });
-    for (const bad of ["7:30", "25:00", "19:60", "19h00", "", "0730"]) {
-      expect(() => PanelHours.parse({ enabled: true, on: bad, off: "19:00" })).toThrow();
-    }
+    expect(msg.on).toBe(false);
+    // What a box CAN do is not the same question as WHEN it does it: these stay.
+    expect(protocol.PanelPowerMethod.parse("cec")).toBe("cec");
+    expect(protocol.PowerCapabilities.parse({ dpms: true, cec: false })).toEqual({
+      dpms: true,
+      cec: false,
+    });
+    // …as does the manual body the wake/sleep buttons POST.
+    expect(protocol.PanelPowerBody.parse({ on: true }).on).toBe(true);
   });
 
-  test("a window whose on === off is meaningless, and is rejected", () => {
-    expect(() => PanelHours.parse({ enabled: true, on: "09:00", off: "09:00" })).toThrow();
+  test("a screen view no longer carries a window of its own", () => {
+    const view = ScreenView.parse({
+      id: "scr-1",
+      friendlyName: "Atrium",
+      machineId: "wall-1",
+      connector: "DP-1",
+      online: true,
+      revision: 3,
+      surfaceCount: 1,
+      panelHours: { enabled: true, on: "07:00", off: "19:00" },
+    } as never);
+    expect("panelHours" in view).toBe(false); // stripped, not honoured — one calendar only
   });
+});
 
-  test("a window that WRAPS midnight is legal (a 24-hour operations wall)", () => {
-    expect(PanelHours.parse({ enabled: true, on: "20:00", off: "06:00" }).on).toBe("20:00");
-  });
-
-  test("the panel-power config carries an explicit zone", () => {
-    expect(PanelPowerConfig.parse({ timezone: "Europe/London" }).timezone).toBe("Europe/London");
-    expect(() => PanelPowerConfig.parse({ timezone: "" })).toThrow();
-  });
-
+describe("POL-101 the power frame itself", () => {
   test("`server/display-power` demands a connector and a boolean — no ambiguity reaches a wall", () => {
     expect(() => ServerToAgentDisplayPower.parse({ t: "server/display-power", on: false })).toThrow();
     expect(() =>

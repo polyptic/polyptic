@@ -13,7 +13,7 @@ Region    { id, screenId, rect: {x,y,w,h} }                     # arbitrary; not
 Scene     { id, name, version, immutable, surfaces: Surface[] } # named snapshot
 Surface   { id, regionId, type, source, opts }                  # typed (see below)
 Source    { kind, ref, adapter, auth }                          # resolved by a content adapter
-FleetState{ desiredRevision, scenes, activeSceneId }
+FleetState{ desiredRevision, scenes, activeScenes }             # activeScenes: muralId → sceneId (POL-186)
 ```
 
 **Surface types:** `web | dashboard | image | video | stream | playlist | page` (the `Surface` discriminated union in `protocol`). All render in the player; a framing-blocked `web`/`dashboard` surface carries `placement: "window"` and the agent places a top-level browser window over its region via `swaymsg` instead. `deck` is a content *kind*, not a surface: it resolves to a playlist of page images.

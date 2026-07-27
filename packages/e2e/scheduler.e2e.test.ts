@@ -15,7 +15,8 @@
  *   - BEFORE the boundary the scheduled scene has NOT been applied (the window is shut);
  *   - AT the boundary the ticker applies it, and the fake player receives a `server/render` carrying
  *     that scene's content, within a tick of the boundary instant;
- *   - the wall's `activeSceneId` follows.
+ *   - the mural's entry in `activeScenes` follows (per-mural since POL-186: the badge is a map from
+ *     muralId to the scene that wall is on).
  *
  * Also covered: REST CRUD for dayparts + schedules + settings (including the 409 that stops an
  * operator silently unscheduling a wall by tidying its daypart library, and the 400 that stops a
@@ -388,7 +389,7 @@ describe("POL-89 — the scene scheduler", () => {
       expect(render.slice.screenId).toBe(screenId);
 
       const state = await body(await fetch(`${BASE}/api/v1/state`));
-      expect(state.activeSceneId).toBe(dayScene);
+      expect(state.activeScenes[muralId]).toBe(dayScene);
     },
     TEST_TIMEOUT,
   );
@@ -424,7 +425,7 @@ describe("POL-89 — the scene scheduler", () => {
       await sleep(TICK_MS * 2);
       expect(player.seen((m) => m.t === "server/render" && m.slice?.surfaces?.[0]?.url === NIGHT_URL)).toBe(false);
       const preState = await body(await fetch(`${BASE}/api/v1/state`));
-      expect(preState.activeSceneId).toBe(dayScene);
+      expect(preState.activeScenes[muralId]).toBe(dayScene);
 
       // The boundary. The ticker resolves the new window and applies the scene through the ORDINARY
       // apply path — so the proof is a `server/render` on the player's own socket.
@@ -442,7 +443,7 @@ describe("POL-89 — the scene scheduler", () => {
       expect(arrivedAt - BOUNDARY_REAL).toBeLessThan(TICK_MS + 3_000);
 
       const state = await body(await fetch(`${BASE}/api/v1/state`));
-      expect(state.activeSceneId).toBe(nightScene);
+      expect(state.activeScenes[muralId]).toBe(nightScene);
       expect(state.slices[screenId].surfaces[0].url).toBe(NIGHT_URL);
     },
     40_000,
