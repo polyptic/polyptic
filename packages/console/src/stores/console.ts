@@ -200,11 +200,12 @@ export interface ConsoleState {
    *  admin/state.activity. The field is OPTIONAL on the wire (back-compat), so it defaults to []
    *  when a server omits it. */
   activity: ActivityEvent[];
-  /** The scene the WALL IS ON, mirrored from admin/state (POL-95). Server-authoritative: the control
-   *  plane persists it, sets it on apply and clears it the moment a manual change diverges the wall,
-   *  so a reload and a second operator always agree. The console never sets it itself — it used to
-   *  (optimistically, on apply), which is exactly why the badge could lie. */
-  activeSceneId: string | null;
+  /** muralId → the scene THAT MURAL IS ON, mirrored from admin/state (POL-95, per-mural since
+   *  POL-186). Server-authoritative: the control plane persists it, sets it on apply and drops the
+   *  mural from the map the moment a manual change diverges that wall, so a reload and a second
+   *  operator always agree. The console never sets it itself — it used to (optimistically, on
+   *  apply), which is exactly why the badge could lie. A mural absent from the map is on no scene. */
+  activeScenes: Record<string, string>;
   activeMuralId: string | null;
   selectedScreenIds: string[];
   /** A combined surface selected on the canvas (mutually exclusive with selectedScreenIds). */
@@ -249,7 +250,7 @@ export const useConsoleStore = defineStore("console", {
     schedules: [],
     scheduler: null,
     activity: [],
-    activeSceneId: null,
+    activeScenes: {},
     activeMuralId: null,
     selectedScreenIds: [],
     selectedWallId: null,
@@ -577,11 +578,16 @@ export const useConsoleStore = defineStore("console", {
       return (id: string) => this.scenes.find((sc) => sc.id === id);
     },
 
-    /** The scene the wall is currently on, per the SERVER (POL-95), if it still exists. */
+    /** Whether a scene is the one ITS OWN mural is currently on — what the Active badge reads. A
+     *  scene can only be active on the mural it snapshots, so the badge is per mural, not global. */
+    isSceneActive(state): (scene: Scene) => boolean {
+      return (scene: Scene) => state.activeScenes[scene.muralId] === scene.id;
+    },
+
+    /** The scene the currently switched-to mural is on, per the SERVER, if it still exists. */
     activeScene(state): Scene | undefined {
-      return state.activeSceneId
-        ? state.scenes.find((sc) => sc.id === state.activeSceneId)
-        : undefined;
+      const sceneId = state.activeMuralId ? state.activeScenes[state.activeMuralId] : undefined;
+      return sceneId ? state.scenes.find((sc) => sc.id === sceneId) : undefined;
     },
 
     /** A short "N screens · M walls" summary of what a scene captures, for the list rows. */
@@ -964,9 +970,9 @@ export const useConsoleStore = defineStore("console", {
         // POL-114 — document conversions + what this server can convert. Both optional on the wire.
         this.documentJobs = msg.documentJobs ?? [];
         if (msg.capabilities) this.capabilities = msg.capabilities;
-        // POL-95 — the ACTIVE scene comes from the server's desired state. Optional on the wire
-        // (an older server omits it) → no badge rather than a guessed one.
-        this.activeSceneId = msg.activeSceneId ?? null;
+        // POL-95/POL-186 — the ACTIVE scene per mural comes from the server's desired state.
+        // Optional on the wire (an older server omits it) → no badge rather than a guessed one.
+        this.activeScenes = msg.activeScenes ?? {};
         // POL-89 — the scene scheduler. Optional on the wire (back-compat): an older server simply
         // has no scheduler, and the Scenes view says so rather than painting an empty week.
         this.dayparts = msg.dayparts ?? [];
@@ -2151,7 +2157,9 @@ export const useConsoleStore = defineStore("console", {
     async deleteScene(id: string): Promise<void> {
       this.scenes = this.scenes.filter((sc) => sc.id !== id); // optimistic
       this.schedules = this.schedules.filter((s) => s.sceneId !== id);
-      if (this.activeSceneId === id) this.activeSceneId = null;
+      this.activeScenes = Object.fromEntries(
+        Object.entries(this.activeScenes).filter(([, sceneId]) => sceneId !== id),
+      );
       try {
         await api.deleteScene(id);
       } catch (err) {

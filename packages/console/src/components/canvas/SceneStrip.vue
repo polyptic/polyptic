@@ -73,7 +73,7 @@ async function confirmSave() {
         v-for="s in scenes"
         :key="s.id"
         class="pill"
-        :class="{ active: s.id === store.activeSceneId }"
+        :class="{ active: store.isSceneActive(s) }"
         :title="`Apply ${s.name}`"
         @click="apply(s.id)"
         @mouseenter="previewSoon(s.id)"

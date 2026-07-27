@@ -38,10 +38,17 @@ const scenes = computed(() => store.activeMuralScenes);
 const dayparts = computed(() => store.dayparts);
 const scheduler = computed(() => store.scheduler);
 
-/** The exact set the server's ticker resolves from — it rides `admin/state`. */
+/** The exact set the server's ticker resolves from — it rides `admin/state`. Resolution runs once
+ *  per mural (POL-186), so the set carries the mural ids and which mural each scene snapshots. */
 const scheduleSet = computed<ScheduleSet | null>(() =>
   scheduler.value
-    ? { dayparts: store.dayparts, schedules: store.schedules, settings: scheduler.value }
+    ? {
+        dayparts: store.dayparts,
+        schedules: store.schedules,
+        settings: scheduler.value,
+        murals: store.murals.map((m) => m.id),
+        sceneMurals: Object.fromEntries(store.scenes.map((s) => [s.id, s.muralId])),
+      }
     : null,
 );
 
@@ -49,6 +56,9 @@ const sceneName = (id: string | null): string =>
   id ? (store.scenes.find((s) => s.id === id)?.name ?? "(deleted scene)") : "";
 const daypartName = (id: string): string =>
   dayparts.value.find((d) => d.id === id)?.name ?? "(deleted daypart)";
+/** A power-only window's target: one mural by name, or every mural in the deployment. */
+const muralTargetName = (id: string | null): string =>
+  id ? (store.murals.find((m) => m.id === id)?.name ?? "(deleted mural)") : "Every mural";
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
@@ -72,6 +82,14 @@ const schedulesForScene = (sceneId: string): Schedule[] =>
   store.schedules
     .filter((s) => s.sceneId === sceneId)
     .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
+
+/** POWER-ONLY windows (POL-186) — a schedule with no scene: it sets the panels and leaves what
+ *  plays alone. They belong to no scene row, so they get their own list. */
+const powerWindows = computed<Schedule[]>(() =>
+  store.schedules
+    .filter((s) => s.sceneId === null)
+    .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id)),
+);
 
 // A stable colour per scene, so the week strip and the scene rows agree at a glance.
 function sceneHue(sceneId: string): number {
@@ -169,7 +187,13 @@ async function removeDaypart(id: string) {
 
 // ── the per-scene recurrence editor ───────────────────────────────────────────
 
-const editorSceneId = ref<string | null>(null);
+const editorOpen = ref(false);
+/** The scene the window carries, or null for a POWER-ONLY window (POL-186). */
+const edSceneId = ref<string | null>(null);
+/** The mural a power-only window governs; null = every mural. A scene-bearing window sends null and
+ *  the server stamps the mural from the scene, so the operator never picks it. */
+const edMuralId = ref<string | null>(null);
+const edPanels = ref<"on" | "off">("on");
 const edDaypartId = ref("");
 const edDays = ref<number[]>([...ALL_DAYS]);
 const edPriority = ref(0);
@@ -178,8 +202,11 @@ const edUntil = ref("");
 const edError = ref("");
 const edBusy = ref(false);
 
-function openEditor(sceneId: string) {
-  editorSceneId.value = sceneId;
+function openEditor(sceneId: string | null) {
+  editorOpen.value = true;
+  edSceneId.value = sceneId;
+  edMuralId.value = sceneId ? null : (store.activeMuralId ?? null);
+  edPanels.value = "on";
   edDaypartId.value = dayparts.value[0]?.id ?? "";
   edDays.value = [...ALL_DAYS];
   edPriority.value = 0;
@@ -188,7 +215,7 @@ function openEditor(sceneId: string) {
   edError.value = "";
 }
 function closeEditor() {
-  editorSceneId.value = null;
+  editorOpen.value = false;
   edBusy.value = false;
 }
 function toggleDay(day: number) {
@@ -197,8 +224,7 @@ function toggleDay(day: number) {
     : [...edDays.value, day].sort((a, b) => a - b);
 }
 async function saveSchedule() {
-  const sceneId = editorSceneId.value;
-  if (!sceneId || edBusy.value) return;
+  if (edBusy.value) return;
   if (!edDaypartId.value) {
     edError.value = "add a daypart first";
     return;
@@ -210,10 +236,12 @@ async function saveSchedule() {
   edBusy.value = true;
   edError.value =
     (await store.createSchedule({
-      sceneId,
+      sceneId: edSceneId.value,
+      muralId: edMuralId.value,
       daypartId: edDaypartId.value,
       days: edDays.value,
       priority: edPriority.value,
+      panels: edPanels.value,
       enabled: true,
       from: edFrom.value || null,
       until: edUntil.value || null,
@@ -304,6 +332,9 @@ async function remove(id: string) {
             <span v-if="activeMural" class="mural-tag">· {{ activeMural.name }}</span>
           </p>
         </div>
+        <button v-if="store.canAuthor" class="save-btn ghost inline" @click="openEditor(null)">
+          + Power window
+        </button>
         <button v-if="store.canAuthor" class="save-btn" :disabled="!store.activeMuralId" @click="openSave">
           + Save current wall
         </button>
@@ -419,6 +450,40 @@ async function remove(id: string) {
         <div v-if="dpError" class="error">{{ dpError }}</div>
       </section>
 
+      <!-- ── power windows (POL-186) ───────────────────────────────────────────── -->
+      <section v-if="powerWindows.length" class="card">
+        <div class="card-head">
+          <h2 class="card-title">Power windows</h2>
+          <span class="card-sub">Windows that carry no scene: they set the panels and leave what plays alone.</span>
+        </div>
+        <div class="sched-list flush">
+          <div v-for="sc in powerWindows" :key="sc.id" class="sched-row" :class="{ off: !sc.enabled }">
+            <span class="sched-daypart">{{ daypartName(sc.daypartId) }}</span>
+            <span class="sched-rec">
+              {{ recurrenceLabel(sc) }} · {{ muralTargetName(sc.muralId) }}
+            </span>
+            <span
+              class="sched-panels"
+              :class="{ lit: sc.panels === 'on' }"
+              :title="
+                sc.panels === 'off'
+                  ? 'The screens sleep while this window is on air'
+                  : 'The screens stay lit while this window is on air'
+              "
+            >
+              {{ sc.panels === "off" ? "Panels off" : "Panels on" }}
+            </span>
+            <span class="prio">
+              <button class="prio-btn" title="Lower priority" @click="bumpPriority(sc, -1)">−</button>
+              <span class="prio-value" title="Higher priority wins an overlap">p{{ sc.priority }}</span>
+              <button class="prio-btn" title="Raise priority" @click="bumpPriority(sc, 1)">+</button>
+            </span>
+            <button class="sched-toggle" @click="toggleSchedule(sc)">{{ sc.enabled ? "On" : "Off" }}</button>
+            <button class="del-btn small" title="Delete power window" @click="removeSchedule(sc.id)">✕</button>
+          </div>
+        </div>
+      </section>
+
       <!-- ── scenes ────────────────────────────────────────────────────────────── -->
       <div v-if="scenes.length" class="list">
         <div v-for="s in scenes" :key="s.id" class="row">
@@ -431,7 +496,7 @@ async function remove(id: string) {
               @keyup.enter="($event.target as HTMLInputElement).blur()"
             />
             <span class="summary">{{ store.sceneSummary(s.id) }}</span>
-            <span v-if="s.id === store.activeSceneId" class="active-badge">Active</span>
+            <span v-if="store.isSceneActive(s)" class="active-badge">Active</span>
             <span v-if="s.id === scheduler?.defaultSceneId" class="default-badge">Default</span>
             <button v-if="store.canAuthor" class="apply-btn" @click="openEditor(s.id)">+ Schedule</button>
             <!-- POL-107: Apply is the ONE mutation a viewer holds — recalling a layout someone else
@@ -457,6 +522,13 @@ async function remove(id: string) {
             <div v-for="sc in schedulesForScene(s.id)" :key="sc.id" class="sched-row" :class="{ off: !sc.enabled }">
               <span class="sched-daypart">{{ daypartName(sc.daypartId) }}</span>
               <span class="sched-rec">{{ recurrenceLabel(sc) }}</span>
+              <span
+                v-if="sc.panels === 'off'"
+                class="sched-panels"
+                title="The screens sleep while this window is on air"
+              >
+                Panels off
+              </span>
               <span class="prio">
                 <button class="prio-btn" title="Lower priority" @click="bumpPriority(sc, -1)">−</button>
                 <span class="prio-value" title="Higher priority wins an overlap">p{{ sc.priority }}</span>
@@ -484,13 +556,36 @@ async function remove(id: string) {
     </div>
 
     <!-- ── recurrence editor ───────────────────────────────────────────────────── -->
-    <div v-if="editorSceneId" class="scrim" @mousedown.self="closeEditor">
+    <div v-if="editorOpen" class="scrim" @mousedown.self="closeEditor">
       <div class="modal wide" role="dialog" aria-modal="true">
-        <div class="modal-title">Schedule “{{ sceneName(editorSceneId) }}”</div>
-        <div class="modal-sub">
-          The scene plays inside a daypart, on the days you pick. Where two windows overlap, the
-          higher priority wins.
+        <div class="modal-title">
+          {{ edSceneId ? `Schedule “${sceneName(edSceneId)}”` : "Power window" }}
         </div>
+        <div class="modal-sub">
+          <template v-if="edSceneId">
+            The scene plays inside a daypart, on the days you pick. Where two windows overlap, the
+            higher priority wins.
+          </template>
+          <template v-else>
+            This window carries no scene: it sets the panels inside a daypart and leaves what plays
+            alone. Where two windows overlap, the higher priority wins.
+          </template>
+        </div>
+
+        <label v-if="!edSceneId" class="field-row">
+          <span class="field-label">Mural</span>
+          <select
+            class="input"
+            :value="edMuralId ?? ''"
+            @change="edMuralId = ($event.target as HTMLSelectElement).value || null"
+          >
+            <option v-if="store.activeMuralId" :value="store.activeMuralId">
+              This mural ({{ activeMural?.name }})
+            </option>
+            <option value="">Every mural</option>
+          </select>
+          <span class="hint">Every mural applies this window to every wall in the deployment.</span>
+        </label>
 
         <label class="field-row">
           <span class="field-label">Daypart</span>
@@ -516,6 +611,24 @@ async function remove(id: string) {
             <button class="day-preset" @click="edDays = [...ALL_DAYS]">Every day</button>
             <button class="day-preset" @click="edDays = [...WEEKDAYS]">Weekdays</button>
           </div>
+        </div>
+
+        <!-- POL-186 — panel power is a property of the window, on the same clock as everything else
+             on this dialog: this scene, in that daypart, on these days, at this priority, panels
+             on or off. -->
+        <div class="field-row">
+          <span class="field-label">Panels</span>
+          <div class="days">
+            <button class="day-btn" :class="{ on: edPanels === 'on' }" @click="edPanels = 'on'">On</button>
+            <button class="day-btn" :class="{ on: edPanels === 'off' }" @click="edPanels = 'off'">Off</button>
+          </div>
+          <span class="hint">
+            {{
+              edPanels === "off"
+                ? "While this window is on air the screens sleep. A higher-priority window keeps them lit."
+                : "While this window is on air the screens stay lit. A higher-priority window can still put them to sleep."
+            }}
+          </span>
         </div>
 
         <label class="field-row">
@@ -625,6 +738,9 @@ async function remove(id: string) {
   border: 1px solid var(--line2);
   color: var(--fg2);
   margin-top: 4px;
+}
+.save-btn.ghost.inline {
+  margin-top: 0;
 }
 
 /* cards */
@@ -1020,8 +1136,27 @@ async function remove(id: string) {
   align-items: center;
   gap: 10px;
 }
+.sched-list.flush {
+  margin: 0;
+  padding-left: 0;
+  border-left: none;
+}
 .sched-row.off {
   opacity: 0.55;
+}
+.sched-panels {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 20px;
+  white-space: nowrap;
+  background: var(--muted-bg);
+  color: var(--fg2);
+}
+.sched-panels.lit {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
 }
 .sched-daypart {
   font-size: 12.5px;
