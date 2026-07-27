@@ -118,14 +118,19 @@ const todayInZone = computed<string>(() => {
 
 const weekOffset = ref(0);
 const weekStart = computed(() => shiftDate(startOfWeek(todayInZone.value), weekOffset.value * 7));
+/** Resolution is per mural (POL-186), so the strip resolves for the mural on screen. */
 const week = computed(() =>
-  scheduleSet.value ? resolveWeek(weekStart.value, scheduleSet.value) : [],
+  scheduleSet.value && store.activeMuralId
+    ? resolveWeek(weekStart.value, scheduleSet.value, store.activeMuralId)
+    : [],
 );
 const HOUR_TICKS = [0, 6, 12, 18];
 
 const segmentTitle = (seg: ScheduleSegment): string => {
   const window = `${timeOfDay(seg.startMinutes)}–${timeOfDay(seg.endMinutes)}`;
-  if (seg.source === "none") return `${window} · nothing scheduled`;
+  // POL-186 — a dark stretch is the headline of its segment, so it leads the title.
+  const power = seg.panels === "off" ? " · panels off" : "";
+  if (seg.source === "none") return `${window} · nothing scheduled${power}`;
   const who = seg.source === "default" ? `${sceneName(seg.sceneId)} (default scene)` : sceneName(seg.sceneId);
   const beaten = seg.overriddenScheduleIds.length
     ? ` · outranks ${seg.overriddenScheduleIds
@@ -135,7 +140,7 @@ const segmentTitle = (seg: ScheduleSegment): string => {
         })
         .join(", ")}`
     : "";
-  return `${window} · ${who}${beaten}`;
+  return `${window} · ${who}${beaten}${power}`;
 };
 
 // ── scheduler settings ────────────────────────────────────────────────────────
@@ -408,16 +413,21 @@ async function remove(id: string) {
                 v-for="seg in day.segments"
                 :key="`${day.date}-${seg.startMinutes}`"
                 class="seg"
-                :class="{ empty: seg.source === 'none', conflict: seg.overriddenScheduleIds.length > 0 }"
+                :class="{
+                  empty: seg.source === 'none' && seg.panels !== 'off',
+                  dark: seg.panels === 'off',
+                  conflict: seg.overriddenScheduleIds.length > 0,
+                }"
                 :style="{
                   top: `${(seg.startMinutes / 1440) * 100}%`,
                   height: `${((seg.endMinutes - seg.startMinutes) / 1440) * 100}%`,
-                  background: seg.sceneId ? sceneColor(seg.sceneId) : undefined,
+                  background:
+                    seg.panels === 'off' ? undefined : seg.sceneId ? sceneColor(seg.sceneId) : undefined,
                 }"
                 :title="segmentTitle(seg)"
               >
                 <span v-if="seg.endMinutes - seg.startMinutes >= 75" class="seg-label">
-                  {{ seg.source === "none" ? "—" : sceneName(seg.sceneId) }}
+                  {{ seg.panels === "off" ? "Off" : seg.source === "none" ? "—" : sceneName(seg.sceneId) }}
                 </span>
               </div>
             </div>
@@ -425,6 +435,7 @@ async function remove(id: string) {
         </div>
         <div class="legend">
           <span class="legend-item"><span class="swatch conflict-swatch"></span> striped = a lower-priority window is being outranked here</span>
+          <span class="legend-item"><span class="swatch dark-swatch"></span> dark = the screens are asleep</span>
           <span v-if="!scheduler?.enabled" class="legend-item warn">The scheduler is OFF. This strip shows what it would play.</span>
         </div>
       </section>
@@ -915,6 +926,19 @@ async function remove(id: string) {
   background: transparent;
   border-top-color: transparent;
 }
+/* POL-186 — a scheduled OFF window. The strip's promise is that it cannot show the operator
+   something the wall will not do, so a dark window has to read as dark. It is a fixed night ink in
+   BOTH themes — a token that inverts (`--fg`) would paint the sleeping stretch WHITE in the dark
+   theme — with a hairline ring so it still separates from the dark theme's near-black surface. */
+.seg.dark {
+  background: #0b0b0e;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+  border-top-color: rgba(255, 255, 255, 0.28);
+}
+.seg.dark .seg-label {
+  color: #e4e4e7;
+  text-shadow: none;
+}
 .seg.conflict {
   background-image: repeating-linear-gradient(
     45deg,
@@ -953,6 +977,10 @@ async function remove(id: string) {
   height: 10px;
   border-radius: 3px;
   background: var(--muted2);
+}
+.dark-swatch {
+  background: #0b0b0e;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
 }
 .conflict-swatch {
   background-image: repeating-linear-gradient(
