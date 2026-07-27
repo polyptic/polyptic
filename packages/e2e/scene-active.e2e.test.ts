@@ -2,15 +2,16 @@
  * @polyptic/e2e — POL-95: the ACTIVE scene is SERVER-AUTHORITATIVE, and the apply-preview diff, both
  * against the REAL control plane.
  *
- * Before POL-95 the console's "Active" badge was a client-side fiction: `activeSceneId` was set
+ * Before POL-95 the console's "Active" badge was a client-side fiction: the active scene was set
  * optimistically when THAT console clicked Apply and never came from the server — so a reloaded tab,
  * or a second operator watching the same wall, saw no badge (or a stale one). That breaks the project's
  * first principle: one global desired-state, reconciled; the control plane is the brain.
  *
  * This suite pins the fix end-to-end, with TWO admin sockets open at once (operator 1 and operator 2)
  * plus a FRESH connection standing in for a reloaded tab:
- *   - `admin/state` carries `activeSceneId`, and it starts null;
- *   - POST /scenes/:id/apply → BOTH live consoles are pushed the new activeSceneId (no refetch, no
+ *   - `admin/state` carries `activeScenes` (muralId → sceneId since POL-186), and this mural is
+ *     absent from it until an apply;
+ *   - POST /scenes/:id/apply → BOTH live consoles are pushed the new active scene (no refetch, no
  *     reload — it rides the same broadcast as the re-laid wall), and a freshly-connected console's
  *     first snapshot agrees;
  *   - a MANUAL content change (the kind a second operator makes) CLEARS it on both consoles;
@@ -183,10 +184,12 @@ async function freshSnapshot(label: string): Promise<Frame> {
   return state;
 }
 
-/** The next admin/state on a LIVE console whose activeSceneId is `expected` (pushed, never polled). */
+/** The next admin/state on a LIVE console where THIS mural's active scene is `expected` (pushed,
+ *  never polled). Per-mural since POL-186: two walls are on different scenes at the same moment, so
+ *  the badge is a map, and reading it means naming the wall you are asking about. */
 function waitForActive(client: WsClient, expected: string | null, label: string): Promise<Frame> {
   return client.waitFor(
-    (m) => m.t === "admin/state" && (m.activeSceneId ?? null) === expected,
+    (m) => m.t === "admin/state" && (m.activeScenes?.[muralId] ?? null) === expected,
     label,
     6_000,
   );
@@ -308,10 +311,10 @@ afterAll(async () => {
 
 describe("POL-95 — the active scene is server-authoritative", () => {
   test(
-    "admin/state carries activeSceneId, and nothing is active before an apply",
+    "admin/state carries activeScenes, and nothing is active before an apply",
     async () => {
       const state = await freshSnapshot("admin/state before any apply");
-      expect(state.activeSceneId ?? null).toBeNull();
+      expect(state.activeScenes?.[muralId] ?? null).toBeNull();
 
       // Save the current wall as a scene — SAVING does not make it active (the wall was photographed,
       // not applied).
@@ -320,7 +323,7 @@ describe("POL-95 — the active scene is server-authoritative", () => {
       sceneId = ((await res.json()) as Frame).scene.id;
 
       const after = await freshSnapshot("admin/state after saving the scene");
-      expect(after.activeSceneId ?? null).toBeNull();
+      expect(after.activeScenes?.[muralId] ?? null).toBeNull();
     },
     TEST_TIMEOUT,
   );
@@ -339,11 +342,11 @@ describe("POL-95 — the active scene is server-authoritative", () => {
 
       // A reloaded tab (a brand-new connection) agrees — the badge is not session state.
       const reloaded = await freshSnapshot("a reloaded console");
-      expect(reloaded.activeSceneId).toBe(sceneId);
+      expect(reloaded.activeScenes[muralId]).toBe(sceneId);
 
       // ...and so does the desired state itself.
       const desired = (await (await fetch(`${BASE}/api/v1/state`)).json()) as Frame;
-      expect(desired.activeSceneId).toBe(sceneId);
+      expect(desired.activeScenes[muralId]).toBe(sceneId);
     },
     TEST_TIMEOUT,
   );
@@ -359,8 +362,9 @@ describe("POL-95 — the active scene is server-authoritative", () => {
       await waitForActive(operator1, null, "operator 1's badge goes out");
       await waitForActive(operator2, null, "operator 2's badge goes out");
 
+      // A diverged mural DROPS OUT of the map rather than mapping to null — same reading either way.
       const reloaded = await freshSnapshot("a console reloaded after the divergence");
-      expect(reloaded.activeSceneId ?? null).toBeNull();
+      expect(reloaded.activeScenes?.[muralId] ?? null).toBeNull();
     },
     TEST_TIMEOUT,
   );
