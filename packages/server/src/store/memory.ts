@@ -15,7 +15,6 @@ import type {
   PersistedBootOrderPolicy,
   PersistedDaypart,
   PersistedDisplaySettings,
-  PersistedPanelPower,
   PersistedSchedule,
   PersistedSchedulerSettings,
   PersistedImageRollout,
@@ -569,18 +568,6 @@ export class MemoryStore implements Store {
 
   async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
     this.bootOrderPolicy = clone(policy);
-  }
-
-  // ── Panel power (POL-101) ────────────────────────────────────────────────────
-
-  private panelPower: PersistedPanelPower | undefined;
-
-  async getPanelPower(): Promise<PersistedPanelPower | undefined> {
-    return this.panelPower ? clone(this.panelPower) : undefined;
-  }
-
-  async setPanelPower(power: PersistedPanelPower): Promise<void> {
-    this.panelPower = clone(power);
   }
 
   async close(): Promise<void> {

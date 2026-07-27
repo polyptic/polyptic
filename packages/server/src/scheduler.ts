@@ -179,10 +179,14 @@ export class SceneScheduler {
       // POWER, resolved and handed off independently of content, UNCONDITIONALLY — no gate here.
       // Edge-triggering for power belongs to the seam, keyed per SCREEN (a mural-level gate would
       // miss a screen that joins or moves onto this mural without the mural's own verdict changing).
+      // The name below is the second half of an operator-facing activity line ("Atrium woke — …"),
+      // so it has to say something. A GAP between windows has no candidates at all, and that is the
+      // 07:00 wake: nothing is scheduled over this hour, which is precisely why the wall is lit.
+      // Naming that beats "a scheduled window", which points at a window that does not exist.
       this.deps.panelPower?.applyMuralPower(
         muralId,
         resolution.panels,
-        resolution.candidates[0]?.daypartName ?? "a scheduled window",
+        resolution.candidates[0]?.daypartName ?? "outside its scheduled windows",
       );
 
       // CONTENT.

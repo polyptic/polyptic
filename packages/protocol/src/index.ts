@@ -178,36 +178,12 @@ export const PowerCapabilities = z.object({
 export type PowerCapabilities = z.infer<typeof PowerCapabilities>;
 
 /** A time of day on the box's wall clock, "HH:MM" (24h). The zone is the deployment's, not the
- *  browser's — see `PanelPowerConfig.timezone`. */
+ *  browser's — see `SchedulerSettings.timezone`, which is now the ONE clock this system reads (the
+ *  per-screen panel-hours config that used to carry a second zone died at POL-186). */
 export const TimeOfDay = z
   .string()
   .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'expected a 24-hour "HH:MM" time');
 export type TimeOfDay = z.infer<typeof TimeOfDay>;
-
-/** A daily panel-hours window for ONE screen: wake at `on`, sleep at `off`, every day, in the
- *  deployment's timezone. Deliberately the simplest thing that pays the power/panel-life bill — the
- *  full recurrence machinery (weekdays, holidays, exceptions) belongs to the scene scheduler, and the
- *  two are meant to converge (see D100). A window that wraps midnight (on 20:00 / off 06:00) is a
- *  legal overnight window. `on === off` is rejected: it means nothing. */
-export const PanelHours = z
-  .object({
-    /** Off = this screen is never slept or woken by the schedule (manual control still works). */
-    enabled: z.boolean(),
-    /** Wake the panel at this time, every day. */
-    on: TimeOfDay,
-    /** Sleep the panel at this time, every day. */
-    off: TimeOfDay,
-  })
-  .refine((h) => h.on !== h.off, { message: "panel hours must have a start and an end that differ" });
-export type PanelHours = z.infer<typeof PanelHours>;
-
-/** Deployment-wide panel-power config. The timezone is EXPLICIT — a wall in a lobby keeps local
- *  hours, and neither the server's TZ nor the operator's browser is allowed to decide that silently. */
-export const PanelPowerConfig = z.object({
-  /** An IANA zone ("Europe/London"). Validated against the runtime's own tz database. */
-  timezone: z.string().min(1),
-});
-export type PanelPowerConfig = z.infer<typeof PanelPowerConfig>;
 
 /** Enrollment lifecycle of a machine (Phase 2b). New machines arrive `pending`; an operator
  * approves them. Existing/auto-registered machines default to `approved`. */
@@ -1525,7 +1501,7 @@ export const ServerToAgentInspect = z.object({
 
 /**
  * POL-101 — put ONE panel to sleep, or wake it. Sent on an explicit operator action or when a
- * panel-hours boundary passes; NEVER on idleness, and never as a side effect of anything else. The
+ * schedule window's panel boundary passes; NEVER on idleness, and never as a side effect of anything else. The
  * agent drives its display backend (`swaymsg output <connector> dpms off|on`, `xset dpms force off`
  * on the x11-i3 fallback) and, if the box has a CEC adapter, also tells the display itself to stand
  * by — the only rung that actually powers a TV down.
@@ -1540,7 +1516,7 @@ export const ServerToAgentDisplayPower = z.object({
   connector: z.string(),
   /** true = wake, false = sleep. */
   on: z.boolean(),
-  /** Advisory, logged on the box ("panel hours", "requested by an operator"). */
+  /** Advisory, logged on the box ("schedule: After hours", "requested by an operator"). */
   reason: z.string().optional(),
 });
 
@@ -1905,8 +1881,6 @@ export const ScreenView = Screen.extend({
   /** POL-101 — why the box last refused a power request. Same role as `inspectError`: a refusal
    *  leaves `asleep` unchanged, so this is the only edge the console can see. */
   powerError: z.string().optional(),
-  /** POL-101 — this screen's daily panel-hours window, when one is set. */
-  panelHours: PanelHours.optional(),
   /** POL-119 — a cast (AirPlay) session is live on this panel NOW: the box's receiver owns a visible
    *  window (mirror or PIN prompt). Ephemeral, agent-reported via `agent/status.screens[].casting`,
    *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
@@ -2697,7 +2671,6 @@ export const ServerToAdminState = z.object({
    *  Optional on the wire = back-compat with an older server (the console then shows no badge). */
   activeScenes: z.record(z.string(), z.string()).optional(),
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
-  panelPower: PanelPowerConfig.optional(), // POL-101 — the deployment's panel-hours timezone
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat
   /** POL-114 — document conversions in flight (and the recently finished ones). This IS the progress
@@ -2756,21 +2729,16 @@ export const InspectBody = z.object({ on: z.boolean() });
 export type InspectBody = z.infer<typeof InspectBody>;
 
 /** POL-101 — wake (`on: true`) or sleep (`on: false`) a panel: one screen, or every screen a machine
- *  drives. A manual action overrides that screen's panel-hours until the NEXT boundary — an operator
- *  who wakes a wall for an evening visit gets their evening, not a fight with the scheduler. */
+ *  drives. A manual action overrides the schedule's opinion for that screen until the NEXT boundary —
+ *  an operator who wakes a wall for an evening visit gets their evening, not a fight with the
+ *  scheduler. */
 export const PanelPowerBody = z.object({ on: z.boolean() });
 export type PanelPowerBody = z.infer<typeof PanelPowerBody>;
 
-/** POL-101 — set (or clear) one screen's daily panel-hours window. `null` clears it: the screen is
- *  then never touched by the scheduler and runs 24/7 unless an operator sleeps it by hand. */
-export const PanelHoursBody = z.object({ hours: PanelHours.nullable() });
-export type PanelHoursBody = z.infer<typeof PanelHoursBody>;
-
-/** POL-101 — the deployment's panel-hours timezone (an IANA zone). Explicit by design: the server's
- *  own TZ is an accident of where it is hosted, and the operator's browser is an accident of where
- *  they happen to be standing. */
-export const UpdatePanelPowerBody = PanelPowerConfig;
-export type UpdatePanelPowerBody = z.infer<typeof UpdatePanelPowerBody>;
+// POL-186 — `PanelHoursBody` and `UpdatePanelPowerBody` are gone. A wall's waking hours are a
+// SCHEDULE WINDOW now (`Schedule.panels`), targeted at a mural and read on the scheduler's one
+// timezone (`SchedulerSettings.timezone`). Two calendars and two clocks was the worst of both
+// worlds; there is now one of each.
 
 // ── Tags + selector-targeted bulk operations (POL-103) ───────────────────────
 //

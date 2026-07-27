@@ -38,8 +38,6 @@ import type {
   Mural,
   NetbootInfo,
   OperatorRole,
-  PanelHours,
-  PanelPowerConfig,
   Placement,
   PreRegistration,
   Scene,
@@ -163,9 +161,6 @@ export interface ConsoleState {
   /** The fleet's UEFI boot-order policy (POL-115) — may a box put its own entry back at the head of
    *  BootOrder when firmware displaces it? Null until Settings fetches it; the safe read is `false`. */
   bootOrder: BootOrderPolicy | null;
-  /** POL-101 — the deployment's panel-hours timezone, mirrored from admin/state.panelPower. Optional
-   *  on the wire (an older server omits it) → null until the first snapshot that carries it. */
-  panelPower: PanelPowerConfig | null;
   connected: boolean;
   /** True once the FIRST admin/state snapshot has been folded in — the difference between "the
    *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
@@ -237,7 +232,6 @@ export const useConsoleStore = defineStore("console", {
     imageUpdates: null,
     settings: null,
     bootOrder: null,
-    panelPower: null,
     connected: false,
     stateReceived: false,
     revision: 0,
@@ -984,8 +978,6 @@ export const useConsoleStore = defineStore("console", {
         // POL-6 — fleet-wide display settings (badge toggle). Optional on the wire (back-compat); keep
         // the last known value when a snapshot omits it rather than clobbering the toggle to null.
         if (msg.settings) this.settings = msg.settings;
-        // POL-101 — the panel-hours timezone; same back-compat rule as settings above.
-        if (msg.panelPower) this.panelPower = msg.panelPower;
 
         // Disarm a click-to-assign pick whose source the server no longer knows (e.g. deleted).
         if (this.pickedSourceId && !this.contentSources.some((s) => s.id === this.pickedSourceId)) {
@@ -1574,35 +1566,8 @@ export const useConsoleStore = defineStore("console", {
       }
     },
 
-    /** POL-101 — set (or clear, with `null`) a screen's daily panel-hours window. */
-    async setScreenPanelHours(screenId: string, hours: PanelHours | null): Promise<string | null> {
-      try {
-        await api.setScreenPanelHours(screenId, hours);
-        return null;
-      } catch (err) {
-        console.error("[console] setScreenPanelHours failed", err);
-        const detail =
-          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
-            ? (err.payload as { error: string }).error
-            : null;
-        return detail ?? "Could not save those panel hours.";
-      }
-    },
-
-    /** POL-101 — the deployment's panel-hours timezone (Settings). */
-    async setPanelTimezone(timezone: string): Promise<string | null> {
-      try {
-        this.panelPower = await api.setPanelPowerTimezone(timezone);
-        return null;
-      } catch (err) {
-        console.error("[console] setPanelTimezone failed", err);
-        const detail =
-          err instanceof api.ApiError && typeof (err.payload as { error?: unknown })?.error === "string"
-            ? (err.payload as { error: string }).error
-            : null;
-        return detail ?? "Could not save that timezone.";
-      }
-    },
+    // POL-186 — `setScreenPanelHours` and `setPanelTimezone` are gone with the per-screen calendar.
+    // Waking hours are a schedule window on a mural; the one timezone is the scheduler's.
 
     /**
      * Permanently forget a single screen (POL-14): drop it from its machine, plus its placement, any

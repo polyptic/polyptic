@@ -90,7 +90,7 @@ export interface DisplayBackend {
    * POL-101 — sleep (`on: false`) or wake (`on: true`) the panel driven by `connector`, returning the
    * rungs that were actually applied (`["dpms"]`, or `["dpms","cec"]` on a box with a CEC adapter).
    *
-   * ONLY ever called for an explicit operator action or a panel-hours boundary the operator set —
+   * ONLY ever called for an explicit operator action or a schedule window's boundary —
    * never on idleness. The player underneath is left running, so waking puts the existing content back
    * on the glass with no reload. Throws when the panel could not be powered (a dev backend, no
    * compositor, a connector nothing is placed on), and the reason reaches the operator on the ack.

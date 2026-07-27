@@ -166,7 +166,7 @@ If a screen's machine is offline the button is disabled because the request ride
 | autologin via greetd `initial_session` | greetd config | no login prompt, no typed password on cold boot |
 
 > **Panel power does not weaken the two rows above.** A panel can be slept, by an operator or by a
-> daily *panel-hours* window they set, but **only** on an explicit `server/display-power` from the
+> *schedule window* they set on the wall (Scenes → schedules), but **only** on an explicit `server/display-power` from the
 > control plane. There is no idle timeout anywhere in the stack. The sway config keeps asserting
 > `output * dpms on` at every session start (so a box that reboots comes back **lit**, and the
 > scheduler re-sleeps it on `agent/hello` if it is still out of hours), and the x11-i3 fallback pins every

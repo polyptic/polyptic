@@ -174,17 +174,10 @@ export class PanelPowerScheduler {
     }
   }
 
-  /**
-   * Record that the schedule's current opinion has just been applied by someone else (the panel-hours
-   * REST route, which brings a screen to its new window immediately). Without this, the next tick
-   * would see a stale previous value, call it an edge, and send a redundant second frame.
-   *
-   * Deliberately NOT called for a manual wake/sleep: an operator's override must leave the schedule's
-   * memory untouched, which is exactly what lets the override hold until the next boundary.
-   */
-  noteScheduleApplied(screenId: string, desired: boolean): void {
-    this.lastDesired.set(screenId, desired);
-  }
+  // POL-186 — `noteScheduleApplied` lived here, for the one caller that applied the schedule's
+  // opinion out of band: the panel-hours PUT route. That route is gone, and with it the only way an
+  // edit could stamp this memory behind an operator's back. The memory now has exactly two writers,
+  // both in this file: `applyMuralPower` and `reconcileMachine`.
 
   /** Send one `server/display-power`. Returns how many agents took it (0 = the box is offline). */
   send(screenId: string, on: boolean, reason: string): number {

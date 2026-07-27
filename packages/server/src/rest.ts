@@ -63,7 +63,6 @@ import {
   ServerToAgentInstall,
   machineHasName,
   MoveTargetsBody,
-  PanelHoursBody,
   PanelPowerBody,
   PlaceScreenBody,
   UnplaceScreensBody,
@@ -78,7 +77,6 @@ import {
   ServerToAgentApply,
   ServerToAgentInspect,
   ServerToAgentPending,
-  UpdatePanelPowerBody,
   ServerToAgentReboot,
   ServerToAgentRejected,
   ServerToAgentIdent,
@@ -1085,11 +1083,12 @@ export function registerRestRoutes(
 
   // ── Panel power (POL-101) ─────────────────────────────────────────────────────
   //
-  // Manual wake/sleep (per screen, and per machine for a whole box's panels) + the daily panel-hours
-  // window. The non-negotiable, restated where it can be violated: a screen that SHOULD be showing
-  // content is never blanked. Nothing below runs on a timer over the wall's state, nothing infers
-  // idleness — a panel goes dark only because an operator said so, or because a window an operator
-  // set says the day is over.
+  // Manual wake/sleep, per screen and per machine (a whole box's panels at once). The SCHEDULED half
+  // lives in the scene schedule now (POL-186) — see panel-power.ts and schedule-routes.ts. The
+  // non-negotiable, restated where it can be violated: a screen that SHOULD be showing content is
+  // never blanked. Nothing below runs on a timer over the wall's state, nothing infers idleness — a
+  // panel goes dark only because an operator said so, or because a window an operator set says the
+  // day is over.
   //
   // 202, not 200, for the power routes: the request is DELIVERED, not applied. The agent's
   // `agent/power-ack` (ws.ts) is what marks a screen asleep, because only the box knows whether the
@@ -1182,81 +1181,10 @@ export function registerRestRoutes(
     return reply.code(202).send({ ok: true, machineId: machine.id, on: body.data.on, delivered });
   });
 
-  // PUT /api/v1/screens/:screenId/panel-hours  { hours | null }  -> set/clear a screen's daily window
-  //
-  // 200, not 202: this one IS applied here — it changes stored config, not the glass. The window takes
-  // effect at its next boundary, and a screen with NO window (the default, and what every existing
-  // deployment has) is never touched by the scheduler at all.
-  fastify.put("/api/v1/screens/:screenId/panel-hours", async (request, reply) => {
-    const params = ScreenParams.safeParse(request.params);
-    if (!params.success) {
-      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
-    }
-    const body = PanelHoursBody.safeParse(request.body ?? {});
-    if (!body.success) {
-      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
-    }
-    const screen = control.getScreen(params.data.screenId);
-    if (!screen) {
-      return reply.code(404).send({ error: `unknown screen: ${params.data.screenId}` });
-    }
-
-    await control.setPanelHours(screen.id, body.data.hours);
-    const hours = body.data.hours;
-    activity.push(
-      "info",
-      hours && hours.enabled
-        ? `Panel hours for ${screen.friendlyName}: ${hours.on}–${hours.off} (${control.getPanelPowerConfig().timezone})`
-        : `Panel hours cleared for ${screen.friendlyName} — it runs 24/7`,
-    );
-    // Bring the screen to where its NEW window says it should be, now, rather than making the operator
-    // wait until tonight to discover whether they typed what they meant. Only when the two disagree:
-    // `desired === asleep` is exactly the mismatch (want-awake-but-asleep, or want-asleep-but-awake).
-    const desired = panelPower.desiredFor(screen.id);
-    if (desired !== null) {
-      if (desired === presence.isScreenAsleep(screen.id)) {
-        panelPower.send(screen.id, desired, "panel hours updated");
-      }
-      // Record the schedule's opinion either way, so the next tick doesn't mistake a stale value for
-      // a boundary and send a redundant frame.
-      panelPower.noteScheduleApplied(screen.id, desired);
-    }
-    broadcaster.broadcast();
-    fastify.log.info(
-      { event: "screen.panel_hours", screenId: screen.id, hours },
-      "panel hours updated",
-    );
-    return { ok: true, screenId: screen.id, hours: control.getPanelHours(screen.id) ?? null };
-  });
-
-  // GET /api/v1/settings/panel-power -> PanelPowerConfig { timezone }
-  fastify.get("/api/v1/settings/panel-power", async () => control.getPanelPowerConfig());
-
-  // PUT /api/v1/settings/panel-power  { timezone }  -> PanelPowerConfig
-  //
-  // The zone is EXPLICIT by design: the server's own TZ is an accident of where it is hosted, and the
-  // operator's browser is an accident of where they are standing. A wall keeps ITS building's hours.
-  fastify.put("/api/v1/settings/panel-power", async (request, reply) => {
-    const body = UpdatePanelPowerBody.safeParse(request.body);
-    if (!body.success) {
-      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
-    }
-    // Validate the zone against the runtime's own tz database — a typo must fail HERE, loudly, not
-    // silently degrade the scheduler to UTC at 19:00 six weeks from now.
-    try {
-      new Intl.DateTimeFormat("en-GB", { timeZone: body.data.timezone });
-    } catch {
-      return reply
-        .code(400)
-        .send({ error: `unknown timezone: ${body.data.timezone} (expected an IANA zone, e.g. Europe/London)` });
-    }
-
-    const config = await control.setPanelTimezone(body.data.timezone);
-    activity.push("info", `Panel-hours timezone set to ${config.timezone}`);
-    broadcaster.broadcast();
-    fastify.log.info({ event: "settings.panel_power.set", timezone: config.timezone }, "panel-power timezone updated");
-    return config;
-  });
+  // POL-186 — the per-screen panel-hours route and the deployment's second timezone setting used to
+  // live here. Both are gone: a wall's waking hours are a SCHEDULE WINDOW aimed at a mural
+  // (`Schedule.panels`, schedule-routes.ts), read on the scheduler's one clock. What is left below is
+  // manual wake/sleep, which is a different feature and always was.
 
   // POST /api/v1/screens/:screenId/cast  { enabled }  -> enable/disable casting (POL-119)
   //

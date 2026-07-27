@@ -249,7 +249,7 @@ ${swayOutputLines(p.outputs)}
 # compositor start, so a box that reboots comes back showing content — never dark.
 #
 # POL-101 did NOT weaken this. Panel power is now drivable (an operator can sleep a screen, and a
-# panel-hours schedule can sleep it out of hours), but ONLY ever by an explicit \`swaymsg output …
+# schedule window can sleep it out of hours), but ONLY ever by an explicit \`swaymsg output …
 # dpms off\` from the agent, on the control plane's say-so. Nothing below blanks anything on a timer,
 # and idleness remains meaningless to this wall: a screen that should be showing content must never
 # blank, which is precisely why there is still no swayidle and no lock.

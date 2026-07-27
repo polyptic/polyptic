@@ -46,7 +46,6 @@ import type {
   PersistedDaypart,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
-  PersistedPanelPower,
   PersistedImageRollout,
   PersistedMachine,
   PersistedSchedule,
@@ -306,11 +305,6 @@ interface BootOrderPolicyRow {
   reassert: boolean;
 }
 
-/** POL-101 — panel power: the deployment timezone + a jsonb map of screenId → daily window. */
-interface PanelPowerRow {
-  timezone: string;
-  hours: Record<string, { enabled: boolean; on: string; off: string }>;
-}
 
 interface CountRow {
   count: string; // count(*) comes back as a bigint string
@@ -759,10 +753,10 @@ export class PostgresStore implements Store {
         reassert boolean NOT NULL
       )
     `;
-    // Panel power (POL-101): a single row — the deployment's timezone plus every screen's daily
-    // on/off window as jsonb. One row rather than a table per screen because that is all the shape
-    // this has, and because the whole thing is read on every scheduler tick. Absent until an operator
-    // first sets panel hours, at which point walls that have no window keep running 24/7.
+    // Panel power (POL-101), VESTIGIAL since POL-186: a wall's waking hours are a schedule window
+    // now, so nothing reads or writes this row any more. The table is created and left alone rather
+    // than dropped — this migration path only ever adds, and an operator who rolls a deployment back
+    // one release must find their data where they left it.
     await sql`
       CREATE TABLE IF NOT EXISTS panel_power (
         id       int PRIMARY KEY DEFAULT 1,
@@ -2048,27 +2042,6 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO boot_order_policy (id, reassert) VALUES (1, ${policy.reassert})
       ON CONFLICT (id) DO UPDATE SET reassert = EXCLUDED.reassert
-    `;
-  }
-
-  // ── Panel power (POL-101) ──────────────────────────────────────────────────
-
-  async getPanelPower(): Promise<PersistedPanelPower | undefined> {
-    const sql = this.sql;
-    const rows = await sql<PanelPowerRow[]>`
-      SELECT timezone, hours FROM panel_power WHERE id = 1 LIMIT 1
-    `;
-    const row = rows[0];
-    if (!row) return undefined;
-    return { timezone: row.timezone, hours: row.hours ?? {} };
-  }
-
-  async setPanelPower(power: PersistedPanelPower): Promise<void> {
-    const sql = this.sql;
-    await sql`
-      INSERT INTO panel_power (id, timezone, hours)
-      VALUES (1, ${power.timezone}, ${sql.json(power.hours)})
-      ON CONFLICT (id) DO UPDATE SET timezone = EXCLUDED.timezone, hours = EXCLUDED.hours
     `;
   }
 

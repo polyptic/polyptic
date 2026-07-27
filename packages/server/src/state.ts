@@ -83,8 +83,6 @@ import type {
   PageFeedData,
   PageImageResolution,
   PageWeatherData,
-  PanelHours,
-  PanelPowerConfig,
   Placement,
   PowerCapabilities,
   PreRegistration,
@@ -134,20 +132,6 @@ const DEFAULT_SHOW_BADGES = process.env.NODE_ENV !== "production";
 
 /** POL-57 — an unzoomed page: 100%, the same scale a browser opens a tab at. */
 const DEFAULT_ZOOM = 1;
-
-/**
- * POL-101 — the zone panel hours START in, before an operator has said anything. This is the server's
- * own zone (or UTC if the runtime won't say), and it is a SEED, not a policy: the console shows it,
- * the operator confirms or changes it, and from then on the deployment's choice is explicit and
- * persisted. A wall in a lobby keeps the lobby's hours, not the datacentre's.
- */
-function defaultTimezone(): string {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  } catch {
-    return "UTC";
-  }
-}
 
 /**
  * POL-89 — the scheduler's defaults until the operator first touches Settings. The TIMEZONE defaults
@@ -586,13 +570,6 @@ export class ControlPlane {
    *  that never touches this setting NEVER writes a firmware boot variable. `init()` loads the override. */
   private bootOrderPolicy: BootOrderPolicy = { reassert: false };
 
-  /** POL-101 — the zone every panel-hours window is read in. Defaults to the SERVER's zone purely so
-   *  the console's picker opens somewhere sane; an operator's save makes it explicit and persisted. */
-  private panelTimezone: string = defaultTimezone();
-  /** POL-101 — screenId → its daily on/off window. A screen with no entry is never touched by the
-   *  scheduler (it runs 24/7, the pre-POL-101 behaviour, which stays the default for every screen). */
-  private readonly panelHours = new Map<string, PanelHours>();
-
   /**
    * @param store    the durable backing store.
    * @param activity OPTIONAL Live Activity feed (D25). When present, notable mutations push a short
@@ -984,66 +961,6 @@ export class ControlPlane {
     // POL-115 — absent an operator opt-in, boxes report boot-order drift and write nothing.
     const persistedBootOrder = await this.store.getBootOrderPolicy();
     if (persistedBootOrder) this.bootOrderPolicy = { reassert: persistedBootOrder.reassert };
-
-    // POL-101 — panel hours. Absent until an operator sets one, in which case every wall runs 24/7,
-    // exactly as it did before this feature existed. The default zone is the server's own only as a
-    // starting value for the console's picker; the moment an operator saves, the choice is explicit.
-    const persistedPower = await this.store.getPanelPower();
-    if (persistedPower) {
-      this.panelTimezone = persistedPower.timezone;
-      this.panelHours.clear();
-      for (const [screenId, hours] of Object.entries(persistedPower.hours)) {
-        this.panelHours.set(screenId, { ...hours });
-      }
-    }
-  }
-
-  // ── Panel power (POL-101) ────────────────────────────────────────────────────
-
-  /** The deployment's panel-hours timezone (an IANA zone). Read on every scheduler tick. */
-  getPanelPowerConfig(): PanelPowerConfig {
-    return { timezone: this.panelTimezone };
-  }
-
-  /** One screen's daily window, or undefined when it has none (→ the scheduler never touches it). */
-  getPanelHours(screenId: string): PanelHours | undefined {
-    const hours = this.panelHours.get(screenId);
-    return hours ? { ...hours } : undefined;
-  }
-
-  /** Every screen that HAS a window, for the scheduler. Screens without one are simply absent. */
-  listPanelHours(): Array<{ screenId: string; hours: PanelHours }> {
-    return [...this.panelHours.entries()].map(([screenId, hours]) => ({
-      screenId,
-      hours: { ...hours },
-    }));
-  }
-
-  /** Set (or, with `null`, clear) one screen's panel hours. Persisted; no revision bump — panel hours
-   *  are not part of any render slice, so nothing on the glass changes when they are edited. */
-  async setPanelHours(screenId: string, hours: PanelHours | null): Promise<void> {
-    if (hours) this.panelHours.set(screenId, { ...hours });
-    else this.panelHours.delete(screenId);
-    await this.persistPanelPower();
-  }
-
-  /** Set the deployment's panel-hours timezone. */
-  async setPanelTimezone(timezone: string): Promise<PanelPowerConfig> {
-    this.panelTimezone = timezone;
-    await this.persistPanelPower();
-    return this.getPanelPowerConfig();
-  }
-
-  private async persistPanelPower(): Promise<void> {
-    const hours: Record<string, { enabled: boolean; on: string; off: string }> = {};
-    for (const [screenId, h] of this.panelHours) hours[screenId] = { ...h };
-    await this.store.setPanelPower({ timezone: this.panelTimezone, hours });
-  }
-
-  /** Forget a removed screen's panel hours, so a re-created screen doesn't inherit a ghost schedule. */
-  private async forgetPanelHours(screenId: string): Promise<void> {
-    if (!this.panelHours.delete(screenId)) return;
-    await this.persistPanelPower();
   }
 
   private nextMuralId(): string {
@@ -1715,7 +1632,6 @@ export class ControlPlane {
       const idx = this.state.screens.findIndex((s) => s.id === id);
       if (idx >= 0) this.state.screens.splice(idx, 1);
       await this.forgetZooms(id);
-      await this.forgetPanelHours(id); // POL-101 — a screen that no longer exists keeps no schedule
     }
 
     // Drop the machine itself (+ its off-band credential). deleteMachine cascades screens/content/placements.
@@ -2256,7 +2172,6 @@ export class ControlPlane {
     await this.store.deletePlacement(screenId);
     await this.store.deleteScreen(screenId);
     await this.forgetZooms(screenId);
-    await this.forgetPanelHours(screenId); // POL-101 — no screen, no schedule
 
     this.bumpRevision();
     // Persist the cleared content of SURVIVING screens only — the removed one's row is already gone.

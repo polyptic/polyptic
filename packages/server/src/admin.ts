@@ -388,7 +388,7 @@ export class Presence {
    * has LIT panels (the compositor asserts `output * dpms on` at startup), so keeping "asleep" across
    * a drop would strand the console showing a dark wall that is, in fact, showing content. The
    * scheduler re-applies the desired state on the box's next hello, which is what re-sleeps a screen
-   * that rebooted outside its panel hours.
+   * that rebooted inside a schedule window that says its panels are off.
    */
   clearScreensPower(screenIds: readonly string[]): void {
     for (const id of screenIds) {
@@ -516,7 +516,6 @@ export function buildAdminState(
           asleep: presence.isScreenAsleep(s.id),
           powerMethods: presence.screenPowerMethods(s.id),
           powerError: presence.screenPowerError(s.id),
-          panelHours: control.getPanelHours(s.id),
           castEnabled: s.castEnabled, // POL-119 — the persistent operator toggle
           castActive: presence.isScreenCasting(s.id), // POL-119 — a session is live NOW
           interactive: s.interactive, // POL-181 — pointer events reach this screen's web content
@@ -614,7 +613,6 @@ export function buildAdminState(
     activeScenes: control.state.activeScenes,
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
-    panelPower: control.getPanelPowerConfig(), // POL-101 — the panel-hours timezone
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
     // POL-114 — document conversions in flight: THIS is the progress channel (no new socket, no
     // polling — the console watches the job it started on the broadcast it already receives).

@@ -145,13 +145,6 @@ const powerLabel = computed(() => {
 /** The chip's tooltip: which rung slept it (DPMS-only vs CEC) — an operator standing at a still-lit
  *  panel deserves to know that is expected, not broken. */
 const asleepDetail = computed(() => powerMethodLabel(props.screen.powerMethods));
-/** A screen with a daily window shows it, so "why did that go dark at 19:00?" answers itself. */
-const hoursSummary = computed(() => {
-  const h = props.screen.panelHours;
-  if (!h || !h.enabled) return null;
-  return `${h.on}–${h.off}`;
-});
-
 // ── Per-screen interactivity (POL-181) ────────────────────────────────────────
 // Wall content ignores pointer events by default (the player's `pointer-events: none`); this toggle
 // lets them through for THIS screen's web surfaces — a touch kiosk, or a panel being driven through
@@ -234,9 +227,6 @@ function remove(): void {
         <!-- POL-101: a sleeping panel is HEALTHY. Calm, deliberate, its own chip — never the red of a
              fault, and never mistakable for the offline dot beside it. -->
         <span v-if="asleep" class="chip chip-asleep" :title="asleepDetail">☾ Asleep</span>
-        <span v-if="hoursSummary" class="chip chip-hours" :title="`Panel hours. This screen sleeps and wakes on a daily schedule`">
-          {{ hoursSummary }}
-        </span>
         <!-- POL-119 — cast-enabled indicator (the toggle itself lives in the canvas Inspector) -->
         <span
           v-if="screen.castEnabled"
@@ -582,10 +572,6 @@ function remove(): void {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent-fg, var(--fg2));
   font-weight: 600;
-  white-space: nowrap;
-}
-.chip-hours {
-  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .power-btn {
