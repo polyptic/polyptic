@@ -84,10 +84,13 @@ const schedulesForScene = (sceneId: string): Schedule[] =>
     .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
 
 /** POWER-ONLY windows (POL-186) — a schedule with no scene: it sets the panels and leaves what
- *  plays alone. They belong to no scene row, so they get their own list. */
+ *  plays alone. They belong to no scene row, so they get their own list. Scoped to the mural on
+ *  screen, like everything else on this page: a window governing only mural B is mural B's to
+ *  re-prioritise and delete. A fleet-wide window (`muralId === null`) governs this mural too, so it
+ *  shows on every one. */
 const powerWindows = computed<Schedule[]>(() =>
   store.schedules
-    .filter((s) => s.sceneId === null)
+    .filter((s) => s.sceneId === null && (s.muralId === null || s.muralId === store.activeMuralId))
     .sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id)),
 );
 
@@ -206,7 +209,9 @@ function openEditor(sceneId: string | null) {
   editorOpen.value = true;
   edSceneId.value = sceneId;
   edMuralId.value = sceneId ? null : (store.activeMuralId ?? null);
-  edPanels.value = "on";
+  // A scene window shows something, so its panels start on. A power window is opened to turn
+  // something off — starting it on would save a window whose only effect is keeping lit screens lit.
+  edPanels.value = sceneId ? "on" : "off";
   edDaypartId.value = dayparts.value[0]?.id ?? "";
   edDays.value = [...ALL_DAYS];
   edPriority.value = 0;
@@ -584,7 +589,7 @@ async function remove(id: string) {
             </option>
             <option value="">Every mural</option>
           </select>
-          <span class="hint">Every mural applies this window to every wall in the deployment.</span>
+          <span class="hint">Every mural holds this window on murals the console is not showing.</span>
         </label>
 
         <label class="field-row">
@@ -626,7 +631,7 @@ async function remove(id: string) {
             {{
               edPanels === "off"
                 ? "While this window is on air the screens sleep. A higher-priority window keeps them lit."
-                : "While this window is on air the screens stay lit. A higher-priority window can still put them to sleep."
+                : "While this window is on air the screens stay lit. A higher-priority Off window puts them to sleep."
             }}
           </span>
         </div>
