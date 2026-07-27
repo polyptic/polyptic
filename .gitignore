@@ -35,3 +35,7 @@ profiles/
 packages/server/media/
 /media/
 deploy/dist/test-depot/
+
+# Agent-Native local plan bridge token (never commit)
+.plan-url
+comments.json
