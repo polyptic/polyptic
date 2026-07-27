@@ -54,6 +54,13 @@ export type CalendarDate = z.infer<typeof CalendarDate>;
 export const Weekday = z.number().int().min(0).max(6);
 
 /**
+ * POL-186 — what the panels do while a window is on air. `"on"` is the default on every schema, so
+ * a schedule written before this existed keeps behaving exactly as it did.
+ */
+export const PanelState = z.enum(["on", "off"]);
+export type PanelState = z.infer<typeof PanelState>;
+
+/**
  * A named window of the day. `end <= start` WRAPS past midnight (18:00–08:00 = "after hours");
  * `start === end` is the all-day window (a 24h daypart). Dayparts are a library — several schedules
  * reuse "Opening hours" and moving it moves everything bound to it.
@@ -66,15 +73,23 @@ export const Daypart = z.object({
 });
 export type Daypart = z.infer<typeof Daypart>;
 
-/** A scene bound to a daypart on a recurrence, at a priority. The unit the ticker resolves. */
+/** A daypart window at a priority, optionally carrying a scene and a panel state. The unit the
+ *  ticker resolves. */
 export const Schedule = z.object({
   id: z.string(),
-  sceneId: z.string(),
+  /** The scene this window puts up, or `null` for a POWER-ONLY window: don't change what plays,
+   *  only set the panels. */
+  sceneId: z.string().nullable(),
+  /** Which mural the window governs. Stamped from the scene for scene-bearing windows (a scene
+   *  cannot move mural); the operator's explicit target for a power-only one. `null` = every mural. */
+  muralId: z.string().nullable(),
   daypartId: z.string(),
   /** Weekdays the window is armed on (0=Sun…6=Sat). All seven = "daily". */
   days: z.array(Weekday).min(1),
   /** Higher wins an overlap. Ties resolve deterministically (see the module header). */
   priority: z.number().int().min(0).max(999),
+  /** While this window is on air, the panels are this. */
+  panels: PanelState.default("on"),
   enabled: z.boolean(),
   /** Optional date range, INCLUSIVE both ends, tested against the window's START date. */
   from: CalendarDate.nullable(),
@@ -105,6 +120,10 @@ export interface ScheduleSet {
   dayparts: Daypart[];
   schedules: Schedule[];
   settings: SchedulerSettings;
+  /** Every mural id in the deployment — resolution runs once per mural. */
+  murals: string[];
+  /** scene id → the mural it snapshots. The default-scene floor is scoped through this. */
+  sceneMurals: Record<string, string>;
 }
 
 // ── REST bodies ──────────────────────────────────────────────────────────────
@@ -124,10 +143,12 @@ export const UpdateDaypartBody = z.object({
 export type UpdateDaypartBody = z.infer<typeof UpdateDaypartBody>;
 
 export const CreateScheduleBody = z.object({
-  sceneId: z.string().min(1),
+  sceneId: z.string().min(1).nullable().default(null),
+  muralId: z.string().min(1).nullable().default(null),
   daypartId: z.string().min(1),
   days: z.array(Weekday).min(1),
   priority: z.number().int().min(0).max(999).default(0),
+  panels: PanelState.default("on"),
   enabled: z.boolean().default(true),
   from: CalendarDate.nullable().default(null),
   until: CalendarDate.nullable().default(null),
@@ -135,10 +156,12 @@ export const CreateScheduleBody = z.object({
 export type CreateScheduleBody = z.infer<typeof CreateScheduleBody>;
 
 export const UpdateScheduleBody = z.object({
-  sceneId: z.string().min(1).optional(),
+  sceneId: z.string().min(1).nullable().optional(),
+  muralId: z.string().min(1).nullable().optional(),
   daypartId: z.string().min(1).optional(),
   days: z.array(Weekday).min(1).optional(),
   priority: z.number().int().min(0).max(999).optional(),
+  panels: PanelState.optional(),
   enabled: z.boolean().optional(),
   from: CalendarDate.nullable().optional(),
   until: CalendarDate.nullable().optional(),
