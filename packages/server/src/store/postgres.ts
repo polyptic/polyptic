@@ -572,14 +572,22 @@ export class PostgresStore implements Store {
     await sql`UPDATE schedules s SET mural_id = sc.mural_id
                 FROM scenes sc WHERE sc.id = s.scene_id AND s.mural_id IS NULL`;
     // The single global "active scene" (meta.active_scene_id) becomes per-mural, since the ticker now
-    // resolves each mural independently. `meta.active_scene_id` is left in place (never dropped) as a
-    // fallback read path for a rolled-back deploy.
+    // resolves each mural independently. `meta.active_scene_id` is left in place, UNTOUCHED (never
+    // cleared, never dropped) as a fallback read path for a rolled-back deploy.
     await sql`ALTER TABLE murals ADD COLUMN IF NOT EXISTS active_scene_id text`;
+    // The backfill below must run EXACTLY ONCE, on a dedicated marker — not on `active_scene_id IS
+    // NULL`. `migrate()` runs unconditionally on every boot, and `meta.active_scene_id` is never
+    // updated after this point (the write path moved to `murals`), so a NULL-guarded backfill would
+    // silently resurrect a scene an operator (or the ticker) deliberately cleared at runtime, on the
+    // very next restart. The marker makes "already backfilled" its own fact, independent of whatever
+    // value `active_scene_id` holds right now.
+    await sql`ALTER TABLE meta ADD COLUMN IF NOT EXISTS active_scene_backfilled boolean NOT NULL DEFAULT false`;
     // Carry the single global active scene onto whichever mural owned it, then stop writing meta.
     await sql`UPDATE murals m SET active_scene_id = meta.active_scene_id
                 FROM meta, scenes sc
-                WHERE meta.id = 1 AND sc.id = meta.active_scene_id AND sc.mural_id = m.id
-                  AND m.active_scene_id IS NULL`;
+                WHERE meta.id = 1 AND meta.active_scene_backfilled = false
+                  AND sc.id = meta.active_scene_id AND sc.mural_id = m.id`;
+    await sql`UPDATE meta SET active_scene_backfilled = true WHERE id = 1`;
     // Deployment-wide scheduler settings (one row): master switch, the ONE timezone every window is
     // evaluated in, and the default scene (the always-on floor). Absent until first changed — the
     // control plane defaults to the server's own zone.
