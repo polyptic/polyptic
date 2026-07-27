@@ -4865,7 +4865,9 @@ export class ControlPlane {
    * Every mural carrying a badge is re-judged, not just one: a mutator has no single mural to name (a
    * move takes a screen OFF one mural and ON to another; a lost machine can strip screens from
    * several). Each verdict is still purely per mural — `diffScene` only ever looks at that scene's own
-   * mural — so a change on one wall can never clear another's badge.
+   * mural — so a change on one wall can never clear another's badge. One action CAN therefore clear
+   * two badges; it gets one line per wall it actually changed, each naming its mural, and none at all
+   * for the walls it left alone.
    */
   private async reconcileActiveScene(): Promise<void> {
     if (this.applyingScene) return;
@@ -4881,8 +4883,10 @@ export class ControlPlane {
       const diff = this.diffScene(activeId);
       if (diff !== null && diff.identical) continue;
 
+      // The badge is non-null here (it came out of the map), so this always clears it — the line only
+      // ever narrates a wall that actually changed, and it names which one.
       await this.setActiveScene(muralId, null);
-      this.emit("info", `The wall no longer matches scene ${scene.name}`);
+      this.emit("info", `${this.murals.get(muralId)?.name ?? muralId} no longer matches scene ${scene.name}`);
     }
   }
 
@@ -4964,12 +4968,21 @@ export class ControlPlane {
     // apply's own place/combine/content calls (the apply is what makes the wall the scene).
     this.suppressEmit = true;
     this.applyingScene = true;
+    let result: { scene: Scene; slices: ScreenSlice[] };
     try {
-      return await this.applySceneInner(scene, muralId);
+      result = await this.applySceneInner(scene, muralId);
     } finally {
       this.suppressEmit = false;
       this.applyingScene = false;
     }
+
+    // POL-186 — an apply can move a wall it never names. Step 2 places every screen the scene
+    // captured onto THIS mural, so a screen that has since been dragged onto another mural is yanked
+    // back, leaving that other mural changed — and its reconcile was swallowed by the fence. So
+    // re-judge the badges once, with the fence down. Idempotent for the mural just applied: its own
+    // diff is `identical` by construction, which is exactly what makes a re-apply keep its badge.
+    await this.reconcileActiveScene();
+    return result;
   }
 
   private async applySceneInner(

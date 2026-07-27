@@ -14,6 +14,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import type { Output } from "@polyptic/protocol";
+import { ActivityLog } from "../src/activity";
 import { ControlPlane, type RegisterMachineInput } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 
@@ -28,13 +29,20 @@ function hello(machineId: string, ...connectors: string[]): RegisterMachineInput
 }
 
 let store: MemoryStore;
+let activity: ActivityLog;
 let cp: ControlPlane;
 
 beforeEach(async () => {
   store = new MemoryStore();
-  cp = new ControlPlane(store);
+  activity = new ActivityLog();
+  cp = new ControlPlane(store, activity);
   await cp.init();
 });
+
+/** The divergence lines in the feed — what an operator is told when a badge is pulled. */
+function divergenceLines(): string[] {
+  return activity.recent().map((e) => e.text).filter((t) => t.includes("no longer matches scene"));
+}
 
 /** One screen placed on a fresh mural — the smallest thing a scene can photograph. */
 async function muralWithScreen(name: string, machineId: string, connector: string): Promise<string> {
@@ -232,6 +240,66 @@ describe("the Active badge is per mural (POL-186)", () => {
     await revived.init();
     expect(revived.getActiveSceneId(lobby)).toBe(morning!.id);
     expect(revived.getActiveSceneId(atrium)).toBe(evening!.id);
+  });
+
+  test("an apply that DRAGS A SCREEN OFF another mural clears that mural's badge too", async () => {
+    // Lobby holds both screens when "Morning" is photographed; one of them is then moved to Atrium,
+    // which gets a scene of its own and an apply. Re-applying Morning yanks that screen back — so
+    // Atrium is now empty, and its badge has to go with it. The apply's own fence swallows the
+    // reconcile its primitives would have triggered, which is exactly why the apply re-judges after.
+    await cp.registerMachine(hello("m1", "HDMI-1", "HDMI-2"));
+    const [one, two] = cp.getScreens();
+    const lobby = (await cp.createMural("Lobby")).id;
+    const atrium = (await cp.createMural("Atrium")).id;
+    await cp.placeScreen(one!.id, lobby, 0, 0, 1920, 1080);
+    await cp.placeScreen(two!.id, lobby, 1920, 0, 1920, 1080);
+    const morning = await cp.snapshotScene("Morning", lobby);
+
+    await cp.placeScreen(two!.id, atrium, 0, 0, 1920, 1080);
+    const evening = await cp.snapshotScene("Evening", atrium);
+    await cp.applyScene(evening!.id);
+    expect(cp.getActiveSceneId(atrium)).toBe(evening!.id);
+
+    await cp.applyScene(morning!.id);
+    expect(cp.getActiveSceneId(lobby)).toBe(morning!.id); // the applied mural IS its scene
+    expect(cp.diffScene(evening!.id)?.identical).toBe(false); // Atrium is empty now…
+    expect(cp.getActiveSceneId(atrium)).toBeNull(); // …so its badge cannot stand
+
+    // And the operator is TOLD which wall lost its badge — once.
+    expect(divergenceLines()).toEqual(["Atrium no longer matches scene Evening"]);
+  });
+
+  test("an apply that touches nothing else leaves every other badge — and the feed — alone", async () => {
+    const lobby = await muralWithScreen("Lobby", "m1", "HDMI-1");
+    const atrium = await muralWithScreen("Atrium", "m2", "HDMI-1");
+    const morning = await cp.snapshotScene("Morning", lobby);
+    const evening = await cp.snapshotScene("Evening", atrium);
+    await cp.applyScene(evening!.id);
+
+    await cp.applyScene(morning!.id);
+    expect(cp.getActiveSceneId(lobby)).toBe(morning!.id);
+    expect(cp.getActiveSceneId(atrium)).toBe(evening!.id);
+    expect(divergenceLines()).toEqual([]);
+  });
+
+  test("each divergence line names ITS wall, and one change narrates only one wall", async () => {
+    const lobby = await muralWithScreen("Lobby", "m1", "HDMI-1");
+    const atrium = await muralWithScreen("Atrium", "m2", "HDMI-1");
+    const lobbyScreen = cp.getScreens().find((s) => s.machineId === "m1")!;
+    const atriumScreen = cp.getScreens().find((s) => s.machineId === "m2")!;
+    const morning = await cp.snapshotScene("Morning", lobby);
+    const evening = await cp.snapshotScene("Evening", atrium);
+    await cp.applyScene(morning!.id);
+    await cp.applyScene(evening!.id);
+
+    await cp.setScreenContent(lobbyScreen.id, { url: "https://example.test/one" });
+    expect(divergenceLines()).toEqual(["Lobby no longer matches scene Morning"]);
+
+    await cp.setScreenContent(atriumScreen.id, { url: "https://example.test/two" });
+    expect(divergenceLines().sort()).toEqual([
+      "Atrium no longer matches scene Evening",
+      "Lobby no longer matches scene Morning",
+    ]);
   });
 
   test("deleting a mural takes its badge with it", async () => {
