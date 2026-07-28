@@ -190,6 +190,30 @@ uploads survive `helm uninstall`); set it `false` to use an ephemeral `emptyDir`
 (uploads lost on restart — dev only), or point `media.persistence.existingClaim` at a
 PVC you manage yourself.
 
+### Fleet logs (POL-187)
+
+Every box streams its log lines to the control plane over its existing agent WebSocket
+and keeps them spooled locally until this server acknowledges them — so a box shipping
+into a socket that dies loses nothing. The server writes them as NDJSON under `LOG_DIR`,
+one directory per machine, one file per UTC day, swept on an **age cap and a per-machine
+size cap** (whichever bites first; both in Console ▸ Settings ▸ Log retention). Reading
+them back is Console ▸ **Logs**, admin-only.
+
+`logs.persistence.enabled=true` (default) backs `LOG_DIR` with a **PersistentVolumeClaim**
+(annotated `resource-policy: keep`). Leave it on: with an `emptyDir`, a pod restart erases
+the fleet's history, which is the exact failure this feature exists to fix.
+
+**Point `logs.persistence.storageClass` at an encrypted class.** At-rest encryption is a
+storage-layer concern by design — encrypting the files in the application would break the
+property that makes this cheap (you can `grep` them), create a key-management problem the
+deployment does not otherwise have, and would not address the real exposure, which is the
+export button. That is answered instead by redacting content URLs at the emitter (a
+send-time credential never reaches a log line) and by gating the routes to `admin`.
+
+In transit, a box ships only over an **encrypted** channel. mTLS is on by default
+(POL-134), so this is normally automatic; a stack with no TLS at all ships nothing and
+says so in each box's own journal rather than silently downgrading.
+
 ```sh
 # Example: 50Gi media PVC on a named StorageClass, public origin set.
 helm install polyptic deploy/helm/polyptic \
@@ -547,6 +571,9 @@ The bundled Service is also named `polyptic-db` for a release called `polyptic`,
 | `media.maxBytes` | `209715200` | `MEDIA_MAX_BYTES` — max upload size (~200MB). |
 | `media.persistence.enabled` | `true` | Back `MEDIA_DIR` with a PVC (else ephemeral emptyDir). |
 | `media.persistence.size` / `.storageClass` / `.existingClaim` | `20Gi` / `""` / `""` | Media PVC sizing/class, or bring your own claim. |
+| `logs.dir` | `/var/lib/polyptic/logs` | `LOG_DIR` — fleet-log dir + logs volumeMount path (POL-187). |
+| `logs.persistence.enabled` | `true` | Back `LOG_DIR` with a PVC (an emptyDir loses the fleet's history on restart). |
+| `logs.persistence.size` / `.storageClass` / `.existingClaim` | `10Gi` / `""` / `""` | Log PVC sizing/class — point it at an **encrypted** class. |
 | `postgresql.enabled` | **`true`** | Deploy the bundled Postgres StatefulSet (POL-123/D108). |
 | `postgresql.image.repository` / `.tag` | `postgres` / `16-alpine` | Bundled database image. |
 | `postgresql.auth.username` / `.database` / `.password` | `polyptic` / `polyptic` / `""` (generated + preserved) | Bundled DB credentials. |

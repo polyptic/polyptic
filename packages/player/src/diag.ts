@@ -9,15 +9,28 @@
  *   1. `console.info` — for anyone who does have DevTools open.
  *   2. A localStorage ring buffer — so the story of a page-life SURVIVES the refresh that ends it.
  *      On boot, the tail of the previous life is replayed to the server tagged `[previous page-life]`.
- *   3. The player WS, as `player/diag` frames — landing in the server's pod log, where a failed boot
- *      is diagnosable with `kubectl logs` alone. Lines queue while the socket is down and flush when
- *      it opens; sends are rate-capped so a pathological loop can never flood the control plane.
+ *   3. The player WS — landing in the fleet log sink, where a failed boot is diagnosable from the
+ *      console alone. Lines queue while the socket is down and flush when it opens; sends are
+ *      rate-capped so a pathological loop can never flood the control plane.
+ *
+ * POL-187 re-homed (3) onto the shared `LogEvent` envelope (`player/log`, replacing `player/diag`),
+ * so the glass writes into the SAME merged timeline as the agent under it and the control plane
+ * above it — one place to read "what happened to that screen last night" instead of three. The
+ * mechanism here was already store-and-forward, which is why it needed no redesign: the localStorage
+ * ring survives the refresh that ends a page-life, the queue survives a dropped socket, and the rate
+ * cap was the model the agent's spool copied.
  *
  * Content URLs may carry auth tokens the server stamped at send time (POL-24) — log them through
- * `redactUrl()` only, never raw.
+ * `redactUrl()` only, never raw. (`redactUrl` now lives in `@polyptic/protocol` so ONE
+ * implementation serves the player, the agent and the server; it is re-exported here so this
+ * module's existing callers are unchanged.)
  */
+import type { LogLevel } from "@polyptic/protocol";
+import { redactUrl } from "@polyptic/protocol";
 
-export type DiagLine = { at: string; msg: string };
+export { redactUrl };
+
+export type DiagLine = { at: string; msg: string; level?: LogLevel };
 
 /** Sends one line over the player WS. Returns false when the socket is down (the line stays queued). */
 export type DiagSender = (line: DiagLine) => boolean;
@@ -101,8 +114,8 @@ export function initDiag(): void {
 }
 
 /** Write one diagnostic line: console + localStorage ring + (when the WS is up) the server log. */
-export function diag(msg: string): void {
-  const line: DiagLine = { at: new Date().toISOString(), msg: msg.slice(0, LINE_CAP) };
+export function diag(msg: string, level: LogLevel = "info"): void {
+  const line: DiagLine = { at: new Date().toISOString(), msg: msg.slice(0, LINE_CAP), level };
   console.info(`[player] ${line.msg}`);
   sessionLines.push(line);
   if (sessionLines.length > STORE_CAP) sessionLines.splice(0, sessionLines.length - STORE_CAP);
@@ -121,15 +134,3 @@ export function flushDiag(): void {
   drain();
 }
 
-/**
- * A content URL safe to put in a log line: origin + path only. The query is where the server stamps
- * auth tokens at send time (POL-24), so it is never logged — only whether one was present.
- */
-export function redactUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    return `${u.origin}${u.pathname}${u.search ? "?…" : ""}`;
-  } catch {
-    return (url.split("?")[0] ?? url).slice(0, 80);
-  }
-}

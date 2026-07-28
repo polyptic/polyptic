@@ -35,3 +35,46 @@ spec:
   {{- end }}
   {{- end }}
 {{- end }}
+---
+{{- /*
+PersistentVolumeClaim for the fleet's logs (POL-187).
+
+Boxes ship their log lines to the control plane and hold them locally until this
+server acknowledges them; the server writes them under LOG_DIR as NDJSON, one
+directory per machine, one file per UTC day, swept on an age cap AND a
+per-machine size cap.
+
+This volume MUST be durable — the whole point of the feature is that a night's
+evidence outlives the reboot that used to erase it, and an emptyDir here would
+reproduce exactly the failure being fixed.
+
+Point `logs.persistence.storageClass` at an ENCRYPTED class: at-rest encryption
+is a storage-layer concern by design (see values.yaml).
+
+resource-policy: keep prevents `helm uninstall` from deleting an investigation
+someone is in the middle of.
+*/ -}}
+{{- if and .Values.logs.persistence.enabled (not .Values.logs.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "polyptic.logs.pvcName" . }}
+  labels:
+    {{- include "polyptic.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.logs.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.logs.persistence.size | quote }}
+  {{- if .Values.logs.persistence.storageClass }}
+  {{- if (eq "-" .Values.logs.persistence.storageClass) }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.logs.persistence.storageClass | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

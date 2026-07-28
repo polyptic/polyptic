@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { imageDistribution, OperatorRole } from "@polyptic/protocol";
-import type { AgentSecurityInfo, EnrollmentTokenView, HttpsInfo, ImageBuild, ImageRing, Operator } from "@polyptic/protocol";
+import type { AgentSecurityInfo, EnrollmentTokenView, HttpsInfo, ImageBuild, ImageRing, LogSinkInfo, Operator } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { ApiError } from "../api";
+import { ApiError, fetchLogSettings, updateLogSettings } from "../api";
 import * as auth from "../auth";
 import Toggle from "../components/Toggle.vue";
 import { useConsoleStore } from "../stores/console";
@@ -26,6 +26,7 @@ onMounted(() => {
   void loadHttps();
   void loadOperators();
   void loadAgentSecurity();
+  void loadLogSettings();
   document.addEventListener("keydown", onKeydown);
 });
 onBeforeUnmount(() => document.removeEventListener("keydown", onKeydown));
@@ -74,6 +75,69 @@ async function setBadges(show: boolean): Promise<void> {
   } finally {
     badgesSaving.value = false;
   }
+}
+
+// ── Fleet log retention (POL-187) ─────────────────────────────────────────────
+// Two numbers, and deliberately only two: an AGE cap and a per-machine SIZE cap, whichever bites
+// first. Age alone lets one crash-looping box fill the volume; size alone lets a quiet fleet hoard
+// months of noise. The size cap is PER MACHINE so a chatty box evicts its own history and never the
+// fleet's. Saving sweeps immediately, so an operator who shortens retention watches it take effect.
+const logSink = ref<LogSinkInfo | null>(null);
+const logDays = ref("");
+const logMegabytes = ref("");
+const logSaving = ref(false);
+const logError = ref<string | null>(null);
+
+function fillLogFields(info: LogSinkInfo): void {
+  logSink.value = info;
+  logDays.value = String(Math.max(1, Math.round(info.retention.maxAgeHours / 24)));
+  logMegabytes.value = String(Math.round(info.retention.maxBytesPerMachine / (1024 * 1024)));
+}
+
+async function loadLogSettings(): Promise<void> {
+  try {
+    fillLogFields(await fetchLogSettings());
+  } catch {
+    // Non-admin, or a server without the route yet. The card simply does not render.
+  }
+}
+
+async function saveLogSettings(): Promise<void> {
+  if (logSaving.value) return;
+  const days = Number(logDays.value);
+  const megabytes = Number(logMegabytes.value);
+  if (!Number.isFinite(days) || days < 1 || !Number.isFinite(megabytes) || megabytes < 1) {
+    logError.value = "Give a whole number of days and megabytes, both at least 1.";
+    return;
+  }
+  logSaving.value = true;
+  logError.value = null;
+  try {
+    fillLogFields(
+      await updateLogSettings({
+        maxAgeHours: Math.round(days * 24),
+        maxBytesPerMachine: Math.round(megabytes) * 1024 * 1024,
+      }),
+    );
+    showToast("Log retention saved");
+  } catch (err) {
+    logError.value = err instanceof ApiError ? err.message : (err as Error).message;
+  } finally {
+    logSaving.value = false;
+  }
+}
+
+/** Human bytes for the "currently holding" line. */
+function humanBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }
 
 // ── UEFI boot order (POL-115) ──────────────────────────────────────────────────
@@ -1206,6 +1270,50 @@ async function onSignOut(): Promise<void> {
               : "Report only. No box writes a firmware boot variable. Drift shows up in Live Activity."
           }}
         </p>
+      </section>
+
+      <!-- Fleet log retention (POL-187) — admin-only ------------------------------ -->
+      <section v-if="store.isAdmin && logSink" id="sec-logs" class="card">
+        <h2 class="card-title">Log retention</h2>
+        <p class="card-sub gap">
+          Boxes stream their logs here and keep them locally until this server acknowledges them.
+          Both limits apply — whichever is reached first. The size limit is per machine, so one noisy
+          box discards its own history rather than the fleet's. Read them under
+          <router-link class="link" :to="{ name: 'logs' }">Logs</router-link>.
+        </p>
+
+        <div v-if="!logSink.writable" class="hint-warn">
+          The server's log volume is not writable, so nothing is being stored. Boxes are keeping their
+          logs spooled locally. Check <span class="code">LOG_DIR</span> and its mount.
+        </div>
+
+        <div class="log-grid">
+          <div>
+            <label class="field-label" for="log-days">Keep for</label>
+            <div class="field-row">
+              <input id="log-days" v-model="logDays" class="input" inputmode="numeric" :disabled="logSaving" />
+              <span class="unit">days</span>
+            </div>
+          </div>
+          <div>
+            <label class="field-label" for="log-mb">Keep per machine</label>
+            <div class="field-row">
+              <input id="log-mb" v-model="logMegabytes" class="input" inputmode="numeric" :disabled="logSaving" />
+              <span class="unit">MB</span>
+            </div>
+          </div>
+        </div>
+
+        <p class="hint log-hint">
+          Holding {{ humanBytes(logSink.bytes) }} across {{ logSink.machines }}
+          {{ logSink.machines === 1 ? "machine" : "machines" }}<span v-if="logSink.oldestDay">, back to {{ logSink.oldestDay }}</span>.
+        </p>
+
+        <div v-if="logError" class="hint-warn">{{ logError }}</div>
+
+        <button type="button" class="btn btn-primary" :disabled="logSaving" @click="saveLogSettings">
+          {{ logSaving ? "Saving…" : "Save retention" }}
+        </button>
       </section>
 
       <!-- Enrolment tokens (POL-104) — admin-only (POL-107) ---------------------- -->
@@ -2343,6 +2451,29 @@ async function onSignOut(): Promise<void> {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* Log retention (POL-187): two numbers, side by side. */
+.log-hint {
+  margin: 10px 0 16px;
+}
+.log-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 16px;
+  margin-bottom: 4px;
+}
+.unit {
+  font-size: 12.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.link {
+  color: var(--accent-fg);
+  text-decoration: none;
+  font-weight: 500;
+}
+.link:hover {
+  text-decoration: underline;
 }
 .field-label {
   display: block;

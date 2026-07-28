@@ -74,6 +74,16 @@ function isActive(name: string): boolean {
       <span class="label">Scenes</span>
     </button>
 
+    <button class="nav" :class="{ active: isActive('logs') }" title="Logs" @click="go('logs')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 5h16" />
+        <path d="M4 10h16" />
+        <path d="M4 15h11" />
+        <path d="M4 20h7" />
+      </svg>
+      <span class="label">Logs</span>
+    </button>
+
     <div class="spacer"></div>
 
     <button class="theme-toggle" title="Toggle theme" @click="store.toggleTheme()">{{ themeIcon }}</button>

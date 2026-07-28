@@ -34,6 +34,7 @@ import { access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { run, which } from "./proc";
 import type { RunResult } from "./proc";
+import { logLine } from "../logger";
 
 /** The process/filesystem seam. Real backends pass the `proc` helpers; tests pass stubs. */
 export interface PowerExec {
@@ -58,7 +59,9 @@ export const systemPowerExec: PowerExec = {
       return false;
     }
   },
-  log: (msg) => console.log(`[${new Date().toISOString()}] [power] ${msg}`),
+  // POL-187 — panel power is the subsystem this whole logging ticket exists to read back: "we left
+  // them asleep and working, and in the morning some were dark". Its lines ship.
+  log: (msg) => logLine("info", "power", msg),
 };
 
 /** The kernel CEC device nodes we look for, in order. A box with several adapters uses the first. */

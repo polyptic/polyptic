@@ -30,6 +30,7 @@ import { SourceHealthTracker } from "../src/source-health";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 import { attachWebSockets } from "../src/ws";
+import { LogSink } from "../src/logs";
 import type { AgentMtlsChannel } from "../src/ws";
 import { AgentUpdateService } from "../src/agent-update";
 import type { AuthService } from "../src/auth-local";
@@ -262,6 +263,9 @@ async function buildStack(require_: boolean): Promise<Stack> {
     allowedOrigins: [],
     agentMtls,
     agentUpdate: new AgentUpdateService("/nonexistent-agent-dist", "0.0.0", noopLog),
+    // POL-187 — see the note in https-native.test.ts: an un-init'd sink refuses batches, which is
+    // the behaviour under test here (this suite is about the mTLS listener, not the log volume).
+    logs: new LogSink({ dir: "/nonexistent-log-dir" }),
   });
 
   return {

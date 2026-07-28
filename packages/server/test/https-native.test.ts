@@ -35,6 +35,7 @@ import { AgentUpdateService } from "../src/agent-update";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 import { attachWebSockets } from "../src/ws";
+import { LogSink } from "../src/logs";
 import type { AuthService } from "../src/auth-local";
 
 const x509 = await import("@peculiar/x509");
@@ -121,6 +122,10 @@ describe("native TLS on the main listener (POL-70/D89)", () => {
       log: noopLog,
       allowedOrigins: [],
       agentUpdate: new AgentUpdateService("/nonexistent-agent-dist", "0.0.0", noopLog),
+      // POL-187 — un-init'd on purpose: this suite is about the TLS listener, and a sink that was
+      // never given a writable dir REFUSES batches rather than storing them, which is exactly the
+      // behaviour a box must see when the server cannot keep its logs.
+      logs: new LogSink({ dir: "/nonexistent-log-dir" }),
     });
 
     await fastify.listen({ port: 0, host: "127.0.0.1" });

@@ -60,6 +60,15 @@ export * from "./refresh";
 // Structured source addresses (POL-175): proto + address + passthrough query + Grafana display
 // controls, with the compose/parse pair the console's dialog and the server share.
 export * from "./grafana-url";
+
+// POL-187 — fleet logging: the ONE `LogEvent` envelope every emitter (agent, player, server) writes,
+// the store-and-forward frames that carry it, and the query contract the Logs place reads back with.
+export * from "./logs";
+import { AgentLogs, PlayerLog, ServerToAgentLogsAck } from "./logs";
+
+// POL-187 — redaction, shared by all three emitters. A send-time credential (POL-24) lives in a
+// URL's query; a log line must never carry one, on either side of the wire.
+export * from "./redact";
 import { SourceComposition } from "./grafana-url";
 
 export const PROTOCOL_VERSION = 1;
@@ -1370,6 +1379,9 @@ export const AgentMessage = z.discriminatedUnion("t", [
   AgentDevtoolsOpened,
   AgentDevtoolsData,
   AgentDevtoolsClosed,
+  // POL-187 — a batch from the on-box log spool. Answered with `server/logs-ack`; the agent only
+  // drops the batch once that ack says the lines are durable.
+  AgentLogs,
 ]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
 
@@ -1671,6 +1683,8 @@ export const ServerToAgentMessage = z.discriminatedUnion("t", [
   ServerToAgentDevtoolsOpen,
   ServerToAgentDevtoolsData,
   ServerToAgentDevtoolsClose,
+  // POL-187 — the ack that makes log shipping store-and-FORWARD.
+  ServerToAgentLogsAck,
 ]);
 export type ServerToAgentMessage = z.infer<typeof ServerToAgentMessage>;
 
@@ -1743,8 +1757,14 @@ export type PlayerSurfaceHealth = z.infer<typeof PlayerSurfaceHealth>;
 export const PlayerMessage = z.discriminatedUnion("t", [
   PlayerHello,
   PlayerAck,
+  // POL-86's original line. Kept in the union AFTER POL-187 re-homed the player onto `player/log`,
+  // because a browser holding a cached bundle from before the migration still speaks it — and the
+  // whole point of this ticket is that a box mid-upgrade must not go silent. The server folds it
+  // into the same envelope on arrival.
   PlayerDiag,
   PlayerSurfaceHealth,
+  // POL-187 — the player on the shared `LogEvent` envelope.
+  PlayerLog,
 ]);
 export type PlayerMessage = z.infer<typeof PlayerMessage>;
 

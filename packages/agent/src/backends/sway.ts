@@ -24,7 +24,7 @@
  */
 import type { ChildProcess } from "node:child_process";
 import { hostname as osHostname } from "node:os";
-import type { KioskBrowser, PanelPowerMethod, PowerCapabilities, WindowPlacement } from "@polyptic/protocol";
+import type { KioskBrowser, LogLevel, PanelPowerMethod, PowerCapabilities, WindowPlacement } from "@polyptic/protocol";
 import type { DisplayBackend } from "./types";
 import { PanelPower, swayDpmsArgs } from "./power";
 import { openInspectorOnFocusedWindow, requireXdotool } from "./inspector";
@@ -69,6 +69,7 @@ import {
 import type { CastTarget } from "./cast";
 import { captureStdout, makeJsonStreamSplitter, run, spawnChild, which } from "./proc";
 import type { BrowserProbe } from "../vitals";
+import { logLine } from "../logger";
 
 /** How long to wait for the freshly-launched browser window to appear on the sway tree. */
 const PLACE_TIMEOUT_MS = 8_000;
@@ -81,10 +82,6 @@ const APP_ID_GRACE_MS = 600;
 const PLACE_VERIFY_ATTEMPTS = 5;
 /** POL-152 — pause between a placement command and reading the geometry back (and between retries). */
 const PLACE_VERIFY_DELAY_MS = 120;
-
-function ts(): string {
-  return new Date().toISOString();
-}
 
 /** A short awaitable pause (POL-152 placement self-verify). */
 function delay(ms: number): Promise<void> {
@@ -352,8 +349,21 @@ export class SwayBackend implements DisplayBackend {
     this.log(`panel ${on ? "woken" : "slept"} on ${output} (dpms ${on ? "on" : "off"})`);
   });
 
+  /** POL-187 — through the shared logger: stdout exactly as before, plus the shipped spool. The
+   *  logger redacts, which is what de-fangs this backend's URL lines (they carried POL-24's
+   *  send-time credential in the query, raw, for as long as the journal was the only reader). */
   private log(msg: string): void {
-    console.log(`[${ts()}] [sway] ${msg}`);
+    logLine("info", "sway", msg);
+  }
+
+  /** A line worth waking someone for: a browser that would not start, a panel that would not sleep. */
+  private logWarn(msg: string): void {
+    logLine("warn", "sway", msg);
+  }
+
+  /** Log at an explicit level — the browser pipe decides per line whether it is shipworthy. */
+  private logLevel(level: LogLevel, msg: string): void {
+    logLine(level, "sway", msg);
   }
 
   /**
@@ -407,7 +417,17 @@ export class SwayBackend implements DisplayBackend {
             continue;
           }
           emitted += 1;
-          this.log(`[${browser}:${connector}:${stream}] ${line.slice(0, 500)}`);
+          // POL-187 — WHICH of these lines leaves the box. A line that matched `interesting` is the
+          // kind that explains a broken wall (it is how surf's `DRI3 error` — the whole POL-67
+          // finding — would have been read from a desk), so it SHIPS, at warn. Everything else is
+          // only here because someone deliberately set `POLYPTIC_BROWSER_LOG=all` for a lab
+          // session: it goes to the journal at debug and stays on the box, because shipping
+          // Chrome's raw stdout fleet-wide is a No-Go, not a feature.
+          const shipworthy = interesting.test(line);
+          this.logLevel(
+            shipworthy ? "warn" : "debug",
+            `[${browser}:${connector}:${stream}] ${line.slice(0, 500)}`,
+          );
         }
       };
 
@@ -452,7 +472,7 @@ export class SwayBackend implements DisplayBackend {
     try {
       return await this.getOutputs();
     } catch (err) {
-      this.log(`discoverOutputs: ${(err as Error).message}`);
+      this.logWarn(`discoverOutputs: ${(err as Error).message}`);
       return null;
     }
   }
@@ -703,7 +723,7 @@ export class SwayBackend implements DisplayBackend {
       this.playerConIds.set(connector, conId);
       this.log(`placed ${browser} (con_id=${conId}) on ${output}`);
     } catch (err) {
-      this.log(`placement on ${output} failed: ${(err as Error).message} (left on default output)`);
+      this.logWarn(`placement on ${output} failed: ${(err as Error).message} (left on default output)`);
     } finally {
       sub.close();
     }
@@ -735,7 +755,7 @@ export class SwayBackend implements DisplayBackend {
     } catch (err) {
       const reason = (err as Error).message;
       this.inspectErrors.set(connector, reason);
-      this.log(`inspector on ${connector} not opened: ${reason}`);
+      this.logWarn(`inspector on ${connector} not opened: ${reason}`);
     }
   }
 
@@ -954,7 +974,7 @@ export class SwayBackend implements DisplayBackend {
       await this.placeWindowSurface(id, conId);
       this.log(`placed web-window ${id} (con_id=${conId}) over ${spec.connectors.join("+")}`);
     } catch (err) {
-      this.log(`web-window ${id} placement failed: ${(err as Error).message}`);
+      this.logWarn(`web-window ${id} placement failed: ${(err as Error).message}`);
     } finally {
       sub.close();
     }
@@ -1365,7 +1385,7 @@ export class SwayBackend implements DisplayBackend {
     // older grim builds that lack `-t jpeg`.
     let buf = await captureStdout("grim", ["-t", "jpeg", "-q", "80", "-o", target, "-"]);
     if (!buf) buf = await captureStdout("grim", ["-o", target, "-"]);
-    if (!buf) this.log(`capture(${connector}): grim produced no data`);
+    if (!buf) this.logWarn(`capture(${connector}): grim produced no data`);
     return buf;
   }
 }

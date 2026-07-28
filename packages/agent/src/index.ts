@@ -65,7 +65,7 @@ import {
   parseMessage,
   PROTOCOL_VERSION,
 } from "@polyptic/protocol";
-import type { KioskBrowser, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
+import type { KioskBrowser, LogEvent, LogLevel, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
 import { readFile, rm, stat } from "node:fs/promises";
 import { hostname as osHostname } from "node:os";
@@ -75,6 +75,7 @@ import { selectBackend } from "./backends/select";
 import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
 import { readHostIdentity } from "./hardware";
+import { AgentLogger, logLine, setAgentLogger } from "./logger";
 import { DevtoolsManager } from "./devtools";
 import {
   certNeedsRenewal,
@@ -138,12 +139,22 @@ const REJECT_BACKOFF_MS = 60_000;
  *  (heals a rotated CA / a server whose mTLS moved) before going back to the mTLS target. */
 const MTLS_FALLBACK_AFTER = 3;
 
+/**
+ * POL-187 — every agent line now goes through the shared logger: stdout exactly as before (the
+ * journal is unchanged), PLUS a bounded on-box spool that ships to the control plane and is only
+ * dropped on an ack. Redaction lives inside it, so a content URL's send-time credential (POL-24)
+ * can never reach a shipped line.
+ */
 function log(msg: string): void {
-  console.log(`[${new Date().toISOString()}] [agent] ${msg}`);
+  logLine("info", "agent", msg);
+}
+
+function logWarn(msg: string): void {
+  logLine("warn", "agent", msg);
 }
 
 function logError(msg: string): void {
-  console.error(`[${new Date().toISOString()}] [agent] ERROR: ${msg}`);
+  logLine("error", "agent", msg);
 }
 
 /**
@@ -172,6 +183,12 @@ function readBootstrapToken(): string | undefined {
 
 function readAgentVersion(): string {
   return agentVersion();
+}
+
+/** POL-187 — the minimum level SHIPPED to the control plane. stdout always gets everything. */
+function readShipLevel(): LogLevel {
+  const raw = process.env.POLYPTIC_LOG_SHIP_LEVEL?.trim().toLowerCase();
+  return raw === "debug" || raw === "info" || raw === "warn" || raw === "error" ? raw : "info";
 }
 
 /** POL-183 — the `placed` dedupe signature for one connector: every LAUNCH input, so a scrollbar
@@ -298,6 +315,8 @@ class Agent {
     /** POL-101 — what this box can do about panel power (DPMS / CEC), probed once at startup. */
     private readonly power: PowerCapabilities,
     mtls: MtlsBundleFile | null = null,
+    /** POL-187 — the shared logger whose spool this connection ships. */
+    private readonly logger: AgentLogger | null = null,
   ) {
     this.credential = credential;
     this.mtls = mtls;
@@ -379,7 +398,7 @@ class Agent {
         dialFailureCounted = true;
         this.mtlsFailStreak += 1;
         this.mtlsDialFailuresTotal += 1;
-        log(`mTLS dial failed (${this.mtlsFailStreak}/${MTLS_FALLBACK_AFTER} before a plain-channel retry)`);
+        logWarn(`mTLS dial failed (${this.mtlsFailStreak}/${MTLS_FALLBACK_AFTER} before a plain-channel retry)`);
       }
     };
 
@@ -399,6 +418,7 @@ class Agent {
       // listening — the OOM-killed-mid-install case — pick the story back up.
       void this.sendHello().then(() => this.resumeInstallNarration());
       this.startHeartbeat();
+      this.startLogShipping(target);
     });
 
     ws.on("message", (raw) => {
@@ -411,7 +431,7 @@ class Agent {
     });
 
     ws.on("error", (err: Error) => {
-      log(`ws error: ${err.message}`);
+      logWarn(`ws error: ${err.message}`);
       // A handshake-stage error may not be followed by a close on every runtime; count it and make
       // sure a reconnect is queued (scheduleReconnect() no-ops when one already is).
       countDialFailure();
@@ -426,7 +446,58 @@ class Agent {
       // it drops so a session can never outlive the socket that carried it (POL-59, POL-67).
       this.shell?.closeAll();
       this.devtools?.closeAll();
+      // POL-187 — unwire the shipper. Anything in flight is re-queued: an unacked batch is by
+      // definition a batch we cannot prove landed, so it stays spooled and goes again on reconnect
+      // (where the server's `(machineId, seq)` dedupe makes a genuine duplicate a no-op).
+      this.logger?.setShipper(null);
       if (!this.closing) this.scheduleReconnect();
+    });
+  }
+
+  /**
+   * POL-187 — arm log shipping for this connection, or refuse it.
+   *
+   * THE REFUSAL IS THE POINT. A log line is the box's whole story — what it launched, which panel
+   * it slept, which URL (redacted, but its origin and path all the same) it was pointed at. Shipping
+   * that over an unencrypted socket would be a downgrade nobody asked for, so a cleartext channel
+   * ships NOTHING and says so once in the journal, where the operator who goes looking will find it.
+   * The lines are not lost — they stay spooled, and the moment the box has an encrypted channel
+   * (mTLS by default since POL-134, or a TLS-terminated ingress) they go.
+   *
+   * `POLYPTIC_LOG_SHIP_CLEARTEXT=1` is the deliberate escape hatch for a lab or dev stack that has
+   * no TLS at all. It is opt-IN, and it names what it is.
+   */
+  private startLogShipping(target: string): void {
+    const logger = this.logger;
+    if (!logger) return;
+    const encrypted = target.startsWith("wss://");
+    const allowCleartext = process.env.POLYPTIC_LOG_SHIP_CLEARTEXT?.trim() === "1";
+    if (!encrypted && !allowCleartext) {
+      logger.setShipper(null);
+      logger.announceRefusal(
+        `the agent channel at ${target} is not encrypted — set POLYPTIC_LOG_SHIP_CLEARTEXT=1 to ship anyway`,
+      );
+      return;
+    }
+    logger.setShipper((batchId, events) => {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try {
+        ws.send(
+          JSON.stringify(
+            AgentMessage.parse({
+              t: "agent/logs",
+              machineId: this.machineId,
+              batchId,
+              events,
+            }),
+          ),
+        );
+        return true;
+      } catch {
+        // A frame we could not put on the wire is a frame that never left — nothing is dropped.
+        return false;
+      }
     });
   }
 
@@ -457,7 +528,7 @@ class Agent {
     try {
       msg = parseMessage(ServerToAgentMessage, text);
     } catch (err) {
-      log(`dropping invalid server frame: ${(err as Error).message}`);
+      logWarn(`dropping invalid server frame: ${(err as Error).message}`);
       return;
     }
 
@@ -485,6 +556,14 @@ class Agent {
         break;
       case "server/display-power":
         await this.onDisplayPower(msg);
+        break;
+      case "server/logs-ack":
+        // POL-187 — the batch is durable (or was refused, and stays spooled). This one line is the
+        // difference between store-and-forward and fire-and-forget.
+        this.logger?.onAck(msg.batchId, msg.status === "accepted");
+        if (msg.status === "refused") {
+          this.logger?.announceRefusal(msg.reason ?? "the server would not take the batch");
+        }
         break;
       case "server/enrolled":
         this.onEnrolled(msg);
@@ -1286,7 +1365,7 @@ class Agent {
   private send(msg: AgentMessage): void {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      log(`cannot send ${msg.t}: socket not open`);
+      logWarn(`cannot send ${msg.t}: socket not open`);
       return;
     }
     // Validate against the contract before it leaves the process.
@@ -1395,6 +1474,13 @@ async function main(): Promise<void> {
   }
 
   const machineId = readMachineId();
+  // POL-187 — install the process-wide logger as soon as the machine id is known (a log line is
+  // addressed BY machine), and before anything else narrates. Everything from here on writes stdout
+  // exactly as it always did AND spools for shipping. `POLYPTIC_LOG_SHIP_LEVEL=debug` raises what
+  // gets shipped for a lab session; the default is info-and-above, so Chrome's filtered firehose
+  // (POL-67's `POLYPTIC_BROWSER_LOG=all`) stays on the box unless deliberately asked for.
+  const logger = new AgentLogger({ machineId, shipMinLevel: readShipLevel() });
+  setAgentLogger(logger);
   const connector = resolveConnector();
   const agentVersion = readAgentVersion();
   // POL-160 — before dialling: if we are a binary that just self-updated, either let it prove itself
@@ -1441,6 +1527,7 @@ async function main(): Promise<void> {
     browser,
     power,
     mtlsBundle,
+    logger,
   );
   agent.start();
 
@@ -1448,6 +1535,9 @@ async function main(): Promise<void> {
     process.on(sig, () => {
       log(`received ${sig} — shutting down`);
       agent.stop();
+      // Flush the spool before we go: the lines describing a shutdown are exactly the ones you want
+      // when the box comes back up wrong.
+      logger.stop();
       process.exit(0);
     });
   }
