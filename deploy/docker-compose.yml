@@ -79,15 +79,28 @@ services:
       # Hard upload ceiling, in bytes (streamed; the request is rejected past this).
       # Default ~200MB.
       MEDIA_MAX_BYTES: "209715200"
+      # ── POL-187 — FLEET LOGS ─────────────────────────────────────────────────
+      # Boxes ship their log lines over the agent WS and keep them spooled locally
+      # until this server acknowledges them; the server writes NDJSON under
+      # LOG_DIR, one directory per machine, one file per UTC day, swept on an age
+      # cap AND a per-machine size cap (Console ▸ Settings ▸ Log retention).
+      # In prod, back this with an ENCRYPTED volume.
+      LOG_DIR: /var/lib/polyptic/logs
     ports:
       - "8080:8080"
     volumes:
       # Named volume for uploaded media; survives `docker compose down`
       # (use `down -v` to wipe). Mounted at MEDIA_DIR inside the container.
       - polyptic-media:/var/lib/polyptic/media
+      # The fleet's logs. Durable on purpose: the point of the feature is that a
+      # night's evidence outlives the restart that used to erase it.
+      - polyptic-logs:/var/lib/polyptic/logs
 
 volumes:
   pgdata:
   # Durable store for uploaded images/videos (Phase 7). A plain disk volume —
   # Polyptic deliberately does NOT depend on object storage.
   polyptic-media:
+  # Durable store for the fleet's shipped logs (POL-187). Files, not a database
+  # and not a search engine — append-heavy, read rarely, swept on a schedule.
+  polyptic-logs:

@@ -27,6 +27,9 @@ const routes: RouteRecordRaw[] = [
       // a new, unsaved page; with :id it edits that library source.
       { path: "studio/:id?", name: "studio", component: () => import("./views/Studio.vue") },
       { path: "scenes", name: "scenes", component: () => import("./views/Scenes.vue") },
+      // POL-187 — the place you go the morning after: one merged timeline over the boxes, the
+      // screens and the control plane. Admin-only server-side (the route table is deny-by-default).
+      { path: "logs", name: "logs", component: () => import("./views/Logs.vue") },
       { path: "settings", name: "settings", component: () => import("./views/Settings.vue") },
     ],
   },

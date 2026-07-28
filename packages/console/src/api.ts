@@ -47,6 +47,7 @@ import {
   UpdateDaypartBody,
   UpdateSceneBody,
   UpdateScheduleBody,
+  UpdateLogRetentionBody,
   UpdateSchedulerSettingsBody,
 } from "@polyptic/protocol";
 import type {
@@ -59,6 +60,9 @@ import type {
   CredentialProfileView,
   Daypart,
   DocumentJob,
+  LogQuery,
+  LogQueryResult,
+  LogSinkInfo,
   Scene,
   SceneDiff,
   Schedule,
@@ -906,4 +910,40 @@ export async function updateSchedulerSettings(body: UpdateSchedulerSettingsBody)
     UpdateSchedulerSettingsBody.parse(body),
   );
   return res.scheduler;
+}
+
+// ── Fleet logs (POL-187) ─────────────────────────────────────────────────────
+
+/** The query params the Logs place sends, as a URL query string (empty filters are dropped). */
+function logQueryString(query: LogQuery): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === "") continue;
+    params.set(key, String(value));
+  }
+  return params.toString();
+}
+
+/**
+ * GET /api/v1/logs — the merged timeline. ALWAYS time-bounded server-side (an absent `since` means
+ * the last hour) and always capped, so a fleet-wide query prunes to a handful of day partitions
+ * instead of scanning the volume.
+ */
+export function fetchLogs(query: LogQuery): Promise<LogQueryResult> {
+  return send<LogQueryResult>("GET", `/logs?${logQueryString(query)}`);
+}
+
+/** The Download link for EXACTLY the view on screen — same query, rendered as plain text. */
+export function logsExportUrl(query: LogQuery): string {
+  return apiUrl(`/logs/export?${logQueryString(query)}`);
+}
+
+/** GET /api/v1/settings/logs — retention plus what the log volume currently holds. */
+export function fetchLogSettings(): Promise<LogSinkInfo> {
+  return send<LogSinkInfo>("GET", "/settings/logs");
+}
+
+/** PUT /api/v1/settings/logs — the two retention numbers (age cap, per-machine size cap). */
+export function updateLogSettings(body: UpdateLogRetentionBody): Promise<LogSinkInfo> {
+  return send<LogSinkInfo>("PUT", "/settings/logs", UpdateLogRetentionBody.parse(body));
 }

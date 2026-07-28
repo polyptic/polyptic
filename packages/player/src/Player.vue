@@ -660,7 +660,24 @@ onMounted(() => {
     },
     playerToken,
   );
-  bindDiagSender((line) => socket?.send({ t: "player/diag", screenId, ...line }) ?? false);
+  // POL-187 — the player's lines on the shared `LogEvent` envelope. Same queue, same rate cap, same
+  // previous-page-life replay; they now land in the fleet log sink beside the agent's and the
+  // control plane's, keyed by screen, instead of only in the server's pod log.
+  bindDiagSender(
+    (line) =>
+      socket?.send({
+        t: "player/log",
+        screenId,
+        event: {
+          source: "player",
+          level: line.level ?? "info",
+          subsystem: "player",
+          at: line.at,
+          screenId,
+          msg: line.msg,
+        },
+      }) ?? false,
+  );
   socket.start();
 });
 

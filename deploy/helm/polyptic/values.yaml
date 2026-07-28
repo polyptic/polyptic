@@ -338,6 +338,41 @@ config:
   captureIntervalMs: ""
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fleet logs (POL-187).
+#   Every box ships its log lines to the control plane over its existing agent
+#   WebSocket and keeps them spooled locally until this server acknowledges them
+#   (store-and-forward — a box shipping into a dropped socket loses nothing). The
+#   server writes them as NDJSON under LOG_DIR, one directory per machine, one
+#   file per UTC day, and sweeps them on an age cap AND a per-machine size cap
+#   (both settable in Console ▸ Settings ▸ Log retention).
+#
+#   USE AN ENCRYPTED VOLUME. Log lines are a box's account of itself; at-rest
+#   encryption is deliberately a storage-layer concern here rather than an
+#   application one (encrypting the files in the app would break the property
+#   that makes this cheap — you can grep them — and would not address the real
+#   exposure, which is the export button; that is answered by redacting URLs at
+#   the emitter and gating the routes to admin).
+# ─────────────────────────────────────────────────────────────────────────────
+logs:
+  # Directory the server writes NDJSON log partitions to. Also the volumeMount
+  # path for the volume below — keep them identical.
+  dir: /var/lib/polyptic/logs
+
+  persistence:
+    # When true, back LOG_DIR with a PersistentVolumeClaim. Strongly recommended:
+    # with an emptyDir, a pod restart takes the fleet's history with it, which is
+    # the exact failure this feature exists to fix.
+    enabled: true
+    # Use a pre-existing PVC instead of letting the chart create one.
+    existingClaim: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+    # StorageClass for the PVC. "" uses the cluster default; "-" disables dynamic
+    # provisioning (bind to a pre-created PV). Point this at an ENCRYPTED class.
+    storageClass: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Media uploads (Phase 7).
 #   Operators can UPLOAD images/videos (POST /api/v1/media, gated) on top of
 #   LINKING external media URLs (Phase 3c). Uploads are streamed to a disk volume

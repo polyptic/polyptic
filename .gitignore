@@ -34,6 +34,10 @@ profiles/
 # runtime media (dev MEDIA_DIR default = packages/server/media) + uploaded files
 packages/server/media/
 /media/
+
+# runtime fleet logs (dev LOG_DIR default = ./logs, POL-187) — NDJSON per machine per UTC day
+packages/server/logs/
+/logs/
 deploy/dist/test-depot/
 
 # Agent-Native local plan bridge token (never commit)

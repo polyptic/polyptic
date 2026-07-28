@@ -65,6 +65,8 @@ import type { AdminBroadcaster, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import type { AgentHub } from "./hub";
 import type { ControlPlane } from "./state";
+import { serverEvent } from "./logs";
+import type { FleetLogger } from "./logs";
 
 export interface PanelPowerDeps {
   control: ControlPlane;
@@ -73,6 +75,14 @@ export interface PanelPowerDeps {
   activity: ActivityLog;
   broadcaster: AdminBroadcaster;
   log: FastifyBaseLogger;
+  /**
+   * POL-187 — the fleet log sink. For THE bug this logging ticket exists to explain ("we left them
+   * asleep and working, and in the morning some were dark"), these are the highest-value lines in
+   * the whole system: what the schedule decided, what we sent, and whether the box was there to
+   * take it. They cost almost nothing and they file beside the box's own account of the same
+   * moment. Optional so a test can build a scheduler without a log volume.
+   */
+  logs?: FleetLogger;
   /** Injected so schedule evaluation is testable without waiting for a wall clock to reach 19:00. */
   now?: () => Date;
 }
@@ -244,12 +254,35 @@ export class PanelPowerScheduler {
       },
       on ? "pushed panel wake to agent" : "pushed panel sleep to agent",
     );
+    this.deps.logs?.record(
+      serverEvent(
+        "info",
+        "panel-power",
+        `${on ? "wake" : "sleep"} sent to ${screen.friendlyName} on ${screen.connector} — ${reason}`,
+        {
+          machineId: machine.id,
+          screenId,
+          fields: { connector: screen.connector, on, reason: reason.slice(0, 300), delivered },
+        },
+      ),
+    );
     if (delivered === 0) {
       // An offline box cannot be slept, and pretending otherwise would leave the console showing a
       // dark screen that is, in fact, unreachable. It reconciles on its next hello.
       this.deps.log.warn(
         { event: "panel.power.undelivered", screenId, machineId: machine.id, on },
         "panel power not delivered — the machine is offline (it will reconcile when it reconnects)",
+      );
+      // The morning-after question is "did anything even reach that box?". This is the line that
+      // answers it, and it is a WARN because a command that reached nobody is a wall that did not
+      // do what the schedule said.
+      this.deps.logs?.record(
+        serverEvent(
+          "warn",
+          "panel-power",
+          `${on ? "wake" : "sleep"} for ${screen.friendlyName} reached NO agent — the machine is offline (it reconciles on its next hello)`,
+          { machineId: machine.id, screenId, fields: { connector: screen.connector, on } },
+        ),
       );
     }
     return delivered;

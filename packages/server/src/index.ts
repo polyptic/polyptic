@@ -46,6 +46,8 @@ import { initSelfSignedTls, registerHttpsRoutes, requiredSans, resolveTlsEnv } f
 import type { ServerTlsRuntime, TlsEnvConfig } from "./server-tls";
 import { PageDataService } from "./page-data";
 import { registerRestRoutes } from "./rest";
+import { LogSink } from "./logs";
+import { registerLogRoutes } from "./logs-routes";
 import { registerScheduleRoutes } from "./schedule-routes";
 import { DEFAULT_TICK_MS, SceneScheduler } from "./scheduler";
 import { DevtoolsRelay } from "./devtools-relay";
@@ -126,6 +128,15 @@ const AGENT_MTLS_PUBLIC_URL = agentMtlsEnv.publicUrl;
 // URL baked into each upload's ContentSource is `${MEDIA_PUBLIC_BASE}/media/<id>`, so a player on
 // ANOTHER host can fetch it — it must be the server's externally reachable base, not localhost in prod.
 const MEDIA_DIR = process.env.MEDIA_DIR?.trim() || "./media";
+
+// ── Fleet logs (POL-187): the boxes' shipped lines, the players' lines and the control plane's own
+// decisions land as NDJSON on a disk VOLUME (LOG_DIR), partitioned per machine per UTC day. Files,
+// not Postgres, and not a search engine: append-heavy, read rarely, swept on a schedule, greppable.
+// LOG_DIR wants an ENCRYPTED volume — at-rest encryption is a storage-layer concern, solved at the
+// storage layer, because encrypting these files in the app would break the grep property and give us
+// a key-management problem in exchange for nothing (the real exposure is the export button, which is
+// answered by redacting at the emitter and gating the route to admin).
+const LOG_DIR = process.env.LOG_DIR?.trim() || "./logs";
 const MEDIA_MAX_BYTES = Number(process.env.MEDIA_MAX_BYTES ?? 200 * 1024 * 1024);
 const MEDIA_PUBLIC_BASE = (
   process.env.MEDIA_PUBLIC_BASE?.trim() ||
@@ -365,6 +376,20 @@ await fastify.register(multipart, {
 const media = new MediaStore(MEDIA_DIR);
 await media.init();
 
+// ── The fleet log sink (POL-187). `init()` never throws: a server whose LOG_DIR is unwritable must
+// still serve walls — it says so loudly, refuses the boxes' batches (so they keep their only copy
+// spooled rather than dropping it into a hole), and the console's Logs place reports it instead of
+// showing an empty list that reads as a quiet fleet. ──
+const logs = new LogSink({ dir: LOG_DIR, log: fastify.log });
+await logs.init();
+logs.start();
+fastify.log.info(
+  { event: "logs.sink", dir: LOG_DIR, writable: logs.isWritable(), ...logs.currentRetention },
+  logs.isWritable()
+    ? "fleet log sink ready — boxes ship here and Console ▸ Logs reads it back"
+    : "fleet log sink DISABLED — LOG_DIR is not writable; boxes will keep their logs spooled locally",
+);
+
 // ── Media ingest (POL-109 / D129): probe → validate → poster, behind the `MediaProber` seam. The
 // external toolchain is optional BY DESIGN: with none installed the prober reports itself unavailable,
 // uploads are still accepted (with a warning on the source) and the wall behaves as it always did.
@@ -453,6 +478,8 @@ const panelPower = new PanelPowerScheduler({
   presence,
   activity,
   broadcaster,
+  // POL-187 — panel power's decisions are the durable record this ticket exists to produce.
+  logs,
   log: fastify.log,
 });
 
@@ -634,6 +661,7 @@ const shellRelay = attachWebSockets({
   allowedOrigins: CORS_ORIGIN,
   agentMtls: agentMtlsChannel,
   agentUpdate,
+  logs,
 });
 shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
 registerRestRoutes(
@@ -661,6 +689,8 @@ registerRestRoutes(
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);
+// POL-187 — the Logs place + its retention settings. Admin-only via the gate's deny-by-default.
+registerLogRoutes(fastify, logs);
 
 // ── The scene scheduler (POL-89/D93): dayparts + priorities, resolved on a ticker. ──
 // It applies scenes through the EXISTING applyScene path — the same code the operator's Apply button
@@ -670,6 +700,8 @@ const scheduler = new SceneScheduler({
   control,
   log: fastify.log,
   activity,
+  // POL-187 — what the schedule decided, durably, beside what the boxes did about it.
+  logs,
   // POL-186 — the ticker is now the only clock behind panel power too: it hands each mural's
   // resolved `panels` verdict straight through (`null` = ungoverned, leave that wall alone), and the
   // seam does the edge-triggering per screen.

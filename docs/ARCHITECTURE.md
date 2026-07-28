@@ -80,10 +80,14 @@ GET/PUT /api/v1/settings/scheduler           # master switch · THE deployment t
 GET    /api/v1/screens/:screenId/thumbnail    # latest grim thumbnail
 POST   /api/v1/screens/:screenId/inspect {on} # chrome: arm the remote-DevTools tunnel · surf: pop the on-panel inspector
 GET    /api/v1/screens/:screenId/devtools[/**] # remote DevTools entry + proxied frontend/CDP (armed screens only)
+GET    /api/v1/logs                           # fleet logs, merged (admin) — always time-bounded + capped
+GET    /api/v1/logs/export                    # the same view as plain text (the ticket attachment)
+GET/PUT /api/v1/settings/logs                 # retention: age cap AND per-machine size cap
 GET    /metrics                               # Prometheus: process gauges + PER-MACHINE fleet gauges
                                               #   (polyptic_machine_up / _cpu_percent / _gpu_accelerated / …;
                                               #    sample rules: deploy/prometheus-alerts.example.yaml)
-WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack, reboot
+WS     /agent      (agent → server, outbound)  register, lease, status, apply-ack, reboot,
+                                               agent/logs → server/logs-ack (store-and-forward)
 WS     /admin      (browser → server)          live layout, thumbnails, health
 WS     /player?screen=<id>  (browser → server)  desired surfaces for this screen
 ```
@@ -129,7 +133,56 @@ Ad-hoc mirroring from a presenter's iPhone/Mac onto one physical panel: generic 
 - **Session signal:** receiver windows appear at **sender-connect** time (the PIN prompt is a window too), so sway keeps a **persistent** pid-matched window watch per receiver (vs. the launch-time `waitForWindow`). Every appearance is moved and fullscreened onto the connector, and window presence is level-reported as `agent/status.screens[].casting` (heartbeat plus immediately on change) → `Presence` → `ScreenView.castActive` → console "Casting now" (tile badge, Inspector state, Machines chip). The player badge shows a static cast glyph (`castEnabled` stamped on `server/render` like the name).
 - **Image:** apt set `cast: uxplay avahi-daemon gstreamer1.0-plugins-bad` (wayland backend only) plus `systemctl enable avahi-daemon` in setup. Discovery needs mDNS on the sender's L2, so cross-VLAN plumbing is the operator's problem. FairPlay-DRM apps will not mirror to any third-party receiver.
 
+## Fleet logs (POL-187)
+
+A wall left asleep and working had dark panels in the morning, and there was nothing to look at. The
+boxes were not silent — they narrated themselves into a systemd **user** journal on a diskless box,
+which the reboot in the middle of the story took with it. So every line the fleet writes now goes
+somewhere durable, on ONE envelope.
+
+```
+BOX (agent)                  BOX (player)          SERVER (control plane)
+ shared logger                diag → player/log     scheduler verdict · power sent
+   ├→ stdout (journald,          (localStorage        · power acked / undelivered
+   │   UNCHANGED)                 ring, replays       · machine admitted / dropped
+   └→ 0600 spool                  a previous                    │
+        │                         page-life)                    │
+        └─ agent/logs (≤200) ──────────┴──── player channel ────┤
+                │        (encrypted channels only)              │
+           server/logs-ack ──────────────────────────────→  LOG_DIR/<machineId>/<UTC day>.ndjson
+        (drop the batch on `accepted`, and                       │
+         on nothing else — this ONE frame is                retention sweeper
+         what makes it store-and-FORWARD)             (age cap AND per-machine size cap)
+                                                                 │
+                                                      Console ▸ Logs (admin only)
+```
+
+- **One `LogEvent` schema, not one per event kind.** Level · subsystem · box-clock `at` · machineId ·
+  optional screenId · message · a bounded `fields` bag. A typed contract per event explodes the
+  protocol and still correlates through a string.
+- **The ack is load-bearing.** A box drops a batch when the server says the lines are durable, and at
+  no other time — so shipping into a socket that dies loses nothing. A per-machine monotonic `seq`
+  makes the re-send after a lost ack land nowhere.
+- **stdout is unchanged.** Shipping is additional: `journalctl --user -u polyptic-agent` reads exactly
+  as before, and a box with no server to talk to still narrates itself.
+- **Ordering is the SERVER's clock.** See the gotcha below.
+
 ## Gotchas (don't relearn these)
+- **A cold-booting box's clock is a liar, so never order logs by it.** POL-148 disciplines box clocks
+  via timesyncd, but there is a convergence window at cold boot — which is exactly when the failures
+  worth reading happen. A box writing `at: 1970-01-01` sorts to the beginning of time, so partition
+  or range on it and "show me last night" comes back EMPTY, which reads identically to a quiet fleet.
+  Every log query therefore ranges, partitions and orders on the server's `receivedAt`; the box's own
+  clock is kept beside it and the console FLAGS a disagreement, because a box that thinks it is 1970
+  is a box whose schedule fired at the wrong time.
+- **A log line can carry a live credential.** POL-24 stamps auth tokens into content URLs at send
+  time, and `sway.ts` logged `spawned … → ${target.url}` raw for as long as `journalctl` was the only
+  reader. Redaction (`redactUrl` / `redactMessage`, in `@polyptic/protocol`) therefore runs INSIDE the
+  emitter's logger, not on the way out — a redaction applied at read time leaves the secret on disk.
+- **The on-box spool survives a reboot only on an installed-to-disk box.** `$HOME/.polyptic` is the
+  RAM overlay on a netbooted box, so a reboot takes the spool with it. It survives an agent crash or
+  restart everywhere; the mitigation for the rest is eager shipping, which keeps an online box's
+  exposure to seconds. Do not write copy that promises more than that.
 - **Wayland forbids client self-positioning.** `--window-position` is a no-op natively, so placement goes through `sway` (config or `swaymsg` IPC). X11 + i3 is the fallback if a GPU/app misbehaves.
 - **surf is an X11 client**, so under sway it renders through **XWayland**, which sway starts lazily and only if the `xwayland` binary exists. Without the package the fallback browser never opens and the wall sits black. The sway config must also import `DISPLAY` into the systemd user environment, or surf dies with `Can't open default display`. Worse, XWayland's GPU path is **DRI3**, and where DRI3 is broken (real amdgpu wall hardware) every surf silently **software-renders** and pegs the CPU, which is why Chrome native Wayland is the default browser. Check `/proc/<pid>/fd` for a `/dev/dri` handle to tell which path a browser is on.
 - **Two Chrome launches sharing a `--user-data-dir` dedupe into ONE process.** The second "launch" just opens a window in the first, which breaks per-output supervision AND (Chrome 136+) the default data dir refuses `--remote-debugging-port` outright. Hence the per-connector data dir.

@@ -52,6 +52,8 @@ import type { FastifyBaseLogger } from "fastify";
 
 import type { ActivityLog } from "./activity";
 import type { ControlPlane } from "./state";
+import { serverEvent } from "./logs";
+import type { FleetLogger } from "./logs";
 
 /** How often the ticker re-resolves. A scene lands within this of its window boundary (DoD: seconds). */
 export const DEFAULT_TICK_MS = 10_000;
@@ -75,6 +77,12 @@ export interface SceneSchedulerDeps {
   panelPower?: {
     applyMuralPower(muralId: string, panels: PanelState | null, daypartName: string): void;
   };
+  /**
+   * POL-187 — the fleet log sink. The ticker's verdicts are the control plane's account of what a
+   * wall was SUPPOSED to be doing at 03:00, which is the other half of every "why was that panel
+   * dark" investigation. Optional so a test builds a scheduler without a log volume.
+   */
+  logs?: FleetLogger;
   /** Injected clock (tests drive it; production passes `Date.now`). */
   now?: () => number;
   tickMs?: number;
@@ -214,6 +222,11 @@ export class SceneScheduler {
           { event: "scheduler.missing_scene", muralId, sceneId: target, scheduleId: resolution.scheduleId },
           "the schedule resolves to a scene that no longer exists — nothing applied",
         );
+        this.deps.logs?.record(
+          serverEvent("warn", "scheduler", "the schedule resolves to a scene that no longer exists — nothing applied", {
+            fields: { muralId, sceneId: target },
+          }),
+        );
         reasons[muralId] = "missing-scene";
         continue;
       }
@@ -232,6 +245,11 @@ export class SceneScheduler {
         this.deps.log.warn(
           { event: "scheduler.apply_failed", muralId, sceneId: target },
           "the scheduled scene could not be applied",
+        );
+        this.deps.logs?.record(
+          serverEvent("warn", "scheduler", "a scheduled scene could not be applied", {
+            fields: { muralId, sceneId: target },
+          }),
         );
         reasons[muralId] = "missing-scene";
         continue;
@@ -254,6 +272,16 @@ export class SceneScheduler {
           timezone: set.settings.timezone,
         },
         "scene scheduler applied a scene",
+      );
+      this.deps.logs?.record(
+        serverEvent("info", "scheduler", `applied scene "${scene.name}" to a mural — ${window}`, {
+          fields: {
+            muralId,
+            sceneId: target,
+            source: resolution.source,
+            timezone: set.settings.timezone,
+          },
+        }),
       );
       // applyScene already pushes its own "Applied scene X" line; this one says WHY it happened.
       this.deps.activity?.push("info", `Schedule: ${scene.name} — ${window}`);

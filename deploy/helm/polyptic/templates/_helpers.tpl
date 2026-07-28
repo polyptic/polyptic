@@ -190,6 +190,19 @@ supplied existingClaim when set, otherwise the chart-managed "<fullname>-media".
 {{- end }}
 
 {{/*
+The fleet-log volume's claim name (POL-187). LOG_DIR holds the boxes' shipped logs as NDJSON, one
+directory per machine, one file per UTC day. Durable by default: the whole point of the feature is
+that a night's evidence survives the reboot that used to erase it.
+*/}}
+{{- define "polyptic.logs.pvcName" -}}
+{{- if .Values.logs.persistence.existingClaim -}}
+{{- .Values.logs.persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-logs" (include "polyptic.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Resolve the COOKIE_SECRET value used at install time. Precedence:
   1. explicit .Values.secrets.cookieSecret
   2. the value already stored in the chart-managed Secret (preserve on upgrade)

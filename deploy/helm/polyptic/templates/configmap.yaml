@@ -85,6 +85,9 @@ data:
   # the PVC/volumeMount in deployment.yaml) and served back, ungated, from the
   # top-level GET /media/:id so players on other hosts can fetch them.
   MEDIA_DIR: {{ .Values.media.dir | quote }}
+  # POL-187 — where the fleet's shipped logs land (NDJSON, per machine per UTC day).
+  # Backed by the logs volume; see values.yaml for why it wants an encrypted class.
+  LOG_DIR: {{ .Values.logs.dir | quote }}
   MEDIA_PUBLIC_BASE: {{ include "polyptic.mediaPublicBase" . | quote }}
   MEDIA_MAX_BYTES: {{ .Values.media.maxBytes | quote }}
   # ── Netboot depot (POL-33…41) ───────────────────────────────────────────────

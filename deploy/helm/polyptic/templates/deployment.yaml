@@ -130,6 +130,9 @@ spec:
             # Phase 7: uploaded media lives on a disk volume mounted at MEDIA_DIR.
             - name: media
               mountPath: {{ .Values.media.dir | quote }}
+            # POL-187: the fleet's logs land on a disk volume mounted at LOG_DIR.
+            - name: logs
+              mountPath: {{ .Values.logs.dir | quote }}
             # Netboot depot (POL-33…41): the live image + loaders the server
             # serves and the rebuild Jobs write. Shared with the Jobs via PVC.
             - name: depot
@@ -168,6 +171,16 @@ spec:
           {{- if .Values.media.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "polyptic.media.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        # POL-187 fleet logs. Persistent by default — with an emptyDir a pod
+        # restart erases the fleet's history, which is the failure this feature
+        # exists to fix.
+        - name: logs
+          {{- if .Values.logs.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "polyptic.logs.pvcName" . }}
           {{- else }}
           emptyDir: {}
           {{- end }}

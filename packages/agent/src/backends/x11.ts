@@ -23,6 +23,7 @@ import { browserProbesFrom, sanitizeConnector, SupervisedBrowser } from "./super
 import type { LaunchTarget } from "./supervise";
 import type { BrowserProbe } from "../vitals";
 import { captureStdout, delay, run, spawnChild, which } from "./proc";
+import { logLine } from "../logger";
 
 /** How long to wait for the freshly-launched browser window to be mapped + named. */
 const PLACE_TIMEOUT_MS = 8_000;
@@ -30,10 +31,6 @@ const WINDOW_POLL_MS = 150;
 
 /** surf's WM class, used only as a fallback when the pid lookup finds nothing. */
 const SURF_WM_CLASS = "surf";
-
-function ts(): string {
-  return new Date().toISOString();
-}
 
 /** A connected+enabled output's geometry, in root-window pixels. */
 export interface OutputGeometry {
@@ -123,8 +120,9 @@ export class X11Backend implements DisplayBackend {
     );
   });
 
+  /** POL-187 — through the shared logger (stdout unchanged, plus the shipped spool + redaction). */
   private log(msg: string): void {
-    console.log(`[${ts()}] [x11] ${msg}`);
+    logLine("info", "x11", msg);
   }
 
   private async ensureBin(): Promise<string> {

@@ -141,6 +141,7 @@ ENV PORT=8080 \
     CONSOLE_DIR=/app/packages/console/dist \
     PLAYER_DIR=/app/packages/player/dist \
     MEDIA_DIR=/var/lib/polyptic/media \
+    LOG_DIR=/var/lib/polyptic/logs \
     AGENT_DIST_DIR=/app/deploy/dist \
     POLYPTIC_VERSION=${POLYPTIC_VERSION} \
     POLYPTIC_REVISION=${POLYPTIC_REVISION}

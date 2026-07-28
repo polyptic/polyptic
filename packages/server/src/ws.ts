@@ -42,11 +42,12 @@ import {
   ServerToAgentRejected,
   ServerToAgentUpdateAvailable,
   ServerToPlayerCastPin,
+  ServerToAgentLogsAck,
   ServerToPlayerRender,
   ServerToPlayerSettings,
   parseMessage,
 } from "@polyptic/protocol";
-import type { MtlsBundle, OperatorRole, ServerToAdminShellMessage } from "@polyptic/protocol";
+import type { AgentLogs, MtlsBundle, OperatorRole, ServerToAdminShellMessage } from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
 import type { IncomingMessage, Server } from "node:http";
 import type { Server as HttpsServer } from "node:https";
@@ -68,6 +69,8 @@ import type { SourceHealthTracker } from "./source-health";
 import { powerAckLine } from "./panel-power";
 import type { PanelPowerScheduler } from "./panel-power";
 import type { AgentUpdateService } from "./agent-update";
+import { serverEvent } from "./logs";
+import type { LogSink } from "./logs";
 
 interface WsDeps {
   /** The main listener the three channels' upgrades hang off — plain HTTP, or the native-TLS
@@ -101,6 +104,13 @@ interface WsDeps {
   agentMtls?: AgentMtlsChannel;
   /** POL-160 — decides whether a hello'd box should self-update to the bundled agent binary. */
   agentUpdate: AgentUpdateService;
+  /** POL-187 — the fleet log sink: where `agent/logs` batches and the players' lines are stored. */
+  logs: LogSink;
+}
+
+/** The machine a screen hangs off, for filing a player's lines under the same partition as its box. */
+function machineIdForScreen(control: ControlPlane, screenId: string): string | undefined {
+  return control.getScreen(screenId)?.machineId;
 }
 
 /**
@@ -168,7 +178,7 @@ function peerAddress(req: IncomingMessage): string | undefined {
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls, agentUpdate } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls, agentUpdate, logs } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -297,7 +307,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   });
 
   agentWss.on("connection", (ws: WebSocket, channel: AgentChannel, remoteAddress?: string) =>
-    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, agentUpdate, log),
+    handleAgent(ws, channel ?? "plain", remoteAddress, agentMtls, control, enrollment, agentHub, hub, presence, broadcaster, activity, capture, shellRelay, devtoolsRelay, panelPower, agentUpdate, logs, log),
   );
 
   // POL-25 — the mTLS agent channel: a second listener whose TLS handshake already rejected any
@@ -322,7 +332,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
     });
   }
   playerWss.on("connection", (ws: WebSocket) =>
-    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, health, log),
+    handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, health, logs, log),
   );
   adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
     handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, log),
@@ -350,6 +360,8 @@ function handleAgent(
   devtoolsRelay: DevtoolsRelay,
   panelPower: PanelPowerScheduler,
   agentUpdate: AgentUpdateService,
+  /** POL-187 — where this box's shipped log batches land. */
+  logs: LogSink,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "agent.connected", channel }, "agent socket opened");
@@ -579,6 +591,21 @@ function handleAgent(
               changed,
             },
             "agent admitted",
+          );
+          // POL-187 — the durable counterpart. A box that came back at 03:12 running an older agent
+          // on a different backend, with two outputs instead of three, is the whole answer to a
+          // morning of dark panels — and none of it survived in anything but a pod log.
+          logs.record(
+            serverEvent("info", "presence", `machine admitted on the ${channel} channel`, {
+              machineId: msg.machineId,
+              fields: {
+                agentVersion: msg.agentVersion ?? "unknown",
+                backend: msg.backend,
+                outputs: msg.outputs.length,
+                screens: assignments.length,
+                revision: control.state.revision,
+              },
+            }),
           );
           break;
         }
@@ -985,6 +1012,24 @@ function handleAgent(
         }
         broadcaster.broadcast();
       }
+      // POL-187 — the other half of the panel-power story. `panel-power.ts` records what we SENT;
+      // this records what the box did with it. Read together, a dark panel in the morning is either
+      // "no command was sent", "the command reached nobody", or "the box refused, and said why" —
+      // three different bugs that used to look identical from a desk.
+      logs.record(
+        serverEvent(
+          msg.ok ? "info" : "warn",
+          "panel-power",
+          msg.ok
+            ? `box acked ${msg.on ? "wake" : "sleep"} on ${msg.connector} via ${msg.methods.join("+") || "no method"}`
+            : `box REFUSED ${msg.on ? "wake" : "sleep"} on ${msg.connector}: ${msg.reason ?? "no reason given"}`,
+          {
+            machineId: msg.machineId,
+            ...(screen ? { screenId: screen.id } : {}),
+            fields: { connector: msg.connector, on: msg.on, ok: msg.ok, methods: msg.methods.join("+") },
+          },
+        ),
+      );
       log.info(
         {
           event: "agent.power_ack",
@@ -1041,12 +1086,70 @@ function handleAgent(
         },
         msg.ok ? "agent applied inspector state" : "agent could not apply inspector state",
       );
+    } else if (msg.t === "agent/logs") {
+      // POL-187 — a batch from the box's spool. THE ACK IS THE FEATURE: the agent drops these lines
+      // only when we say they are durable, so a box shipping into a socket that dies loses nothing.
+      // A frame that arrives before an admitted hello, or claiming another machine's id, is refused:
+      // a log line is attributed evidence, and one box must never be able to write another's history.
+      void ingestAgentLogs(msg, machineId, channel);
     } else {
       // agent/thumbnail — the frame is already AgentMessage-validated; hand it to the coordinator,
       // which resolves connector→screenId, decodes the payload and stores the latest preview (Phase 5).
       capture.ingest(msg);
     }
   });
+
+  /**
+   * Take one `agent/logs` batch and answer it. Never throws: a log batch we cannot store must be
+   * REFUSED (so the box keeps it) rather than silently swallowed, and neither outcome may disturb
+   * the socket that also carries applies, acks and the remote shell.
+   */
+  async function ingestAgentLogs(
+    msg: AgentLogs,
+    boundMachineId: string | null,
+    onChannel: AgentChannel,
+  ): Promise<void> {
+    const ack = (status: "accepted" | "refused", written: number, reason?: string): void => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(
+        JSON.stringify(
+          ServerToAgentLogsAck.parse({ t: "server/logs-ack", batchId: msg.batchId, status, written, ...(reason ? { reason } : {}) }),
+        ),
+      );
+    };
+
+    if (boundMachineId === null || msg.machineId !== boundMachineId) {
+      log.warn(
+        { event: "agent.logs.unbound", boundMachineId, claimedMachineId: msg.machineId },
+        "refused a log batch — no admitted hello for that machine on this socket",
+      );
+      ack("refused", 0, "this socket has no admitted hello for that machine");
+      return;
+    }
+    if (!logs.isWritable()) {
+      // Be honest and REFUSE. Accepting into a hole would tell the box to drop the only copy.
+      ack("refused", 0, "the server's log volume is not writable");
+      return;
+    }
+    try {
+      // Stamp the sender's own id over whatever each line claims: the socket is authenticated, the
+      // line's field is not, and this is what keeps a partition attributable.
+      const written = await logs.write(
+        msg.events.map((e) => ({ ...e, machineId: boundMachineId })),
+      );
+      ack("accepted", written);
+      log.debug(
+        { event: "agent.logs.ingested", machineId: boundMachineId, batch: msg.events.length, written, channel: onChannel },
+        "stored a log batch from a box",
+      );
+    } catch (err) {
+      log.warn(
+        { event: "agent.logs.failed", machineId: boundMachineId, err: String(err) },
+        "could not store a log batch — refusing so the box keeps it spooled",
+      );
+      ack("refused", 0, "the server could not write the batch");
+    }
+  }
 
   ws.on("close", (code) => {
     if (machineId) shellRelay.agentDisconnected(machineId);
@@ -1064,6 +1167,18 @@ function handleAgent(
         if (!presence.isMachineRebooting(machineId)) {
           activity.push("bad", `${machine.label} went unreachable`);
         }
+        // POL-187 — the durable version of the same line. The Live Activity feed is a deliberately
+        // ephemeral 50-event ring wiped by a server restart; "when did that box drop, and did it
+        // come back" is exactly the question a morning-after investigation opens with, so it also
+        // goes somewhere that survives the night.
+        logs.record(
+          serverEvent(
+            "warn",
+            "presence",
+            `machine ${machine.label} went offline (socket closed, code ${code})`,
+            { machineId, fields: { code, rebooting: presence.isMachineRebooting(machineId) } },
+          ),
+        );
         // POL-50 — the box is gone, so its panels are no longer showing an inspector. Drop the flag,
         // or a reboot-while-inspecting leaves the console badging a wall that came back sealed.
         const droppedScreens = control.getScreens().filter((s) => s.machineId === machineId);
@@ -1108,6 +1223,8 @@ function handlePlayer(
   broadcaster: AdminBroadcaster,
   activity: ActivityLog,
   health: SourceHealthTracker,
+  /** POL-187 — the fleet log sink; the glass writes into the same timeline as the box under it. */
+  logs: LogSink,
   log: FastifyBaseLogger,
 ): void {
   log.info({ event: "player.connected" }, "player socket opened");
@@ -1203,14 +1320,43 @@ function handlePlayer(
         { event: "player.frame.unbound", boundScreenId: screenId, claimedScreenId: msg.screenId, t: msg.t },
         "dropped player frame — no admitted hello for that screen on this socket",
       );
+    } else if (msg.t === "player/log") {
+      // POL-187 — the player on the shared envelope. Same lines POL-86 always wrote (probe failures,
+      // aborted loads, heals), now landing in the SAME merged timeline as the agent under the glass
+      // and the control plane above it, instead of only in the pod log. The screen id is stamped
+      // from the BOUND socket, never from the frame.
+      log.info({ event: "player.log", screenId, playerAt: msg.event.at }, `player: ${msg.event.msg}`);
+      const owner = machineIdForScreen(control, screenId);
+      logs.record({
+        source: "player",
+        level: msg.event.level,
+        subsystem: msg.event.subsystem,
+        at: msg.event.at,
+        screenId,
+        // Filed under the BOX the screen hangs off, so "show me this machine's last night" gets the
+        // glass and the agent under it in one timeline — which is the whole point of one envelope.
+        ...(owner ? { machineId: owner } : {}),
+        msg: msg.event.msg,
+        ...(msg.event.fields ? { fields: msg.event.fields } : {}),
+        // Deliberately NO `seq`: a player's store-and-forward is the localStorage ring, whose
+        // replay of a previous page-life is a legitimate repeat. The dedupe is keyed on a counter
+        // only the agent maintains, and a player must not be able to collide with it.
+      });
     } else if (msg.t === "player/diag") {
-      // POL-86: the player's own account of what happened on the glass — probe failures, aborted
-      // loads, heals — with the box's timestamps. This line in the pod log is how a broken boot is
-      // diagnosed without SSH or DevTools. The player rate-caps itself; we just record it.
-      log.info(
-        { event: "player.diag", screenId, playerAt: msg.at },
-        `player diag: ${msg.msg}`,
-      );
+      // POL-86's original frame, folded onto the POL-187 envelope on arrival. A browser still
+      // holding a bundle from before the re-home speaks this — and a box mid-upgrade going silent
+      // is exactly the failure this whole ticket exists to prevent, so it keeps working.
+      log.info({ event: "player.diag", screenId, playerAt: msg.at }, `player diag: ${msg.msg}`);
+      const diagOwner = machineIdForScreen(control, screenId);
+      logs.record({
+        source: "player",
+        level: "info",
+        subsystem: "player",
+        at: msg.at,
+        screenId,
+        ...(diagOwner ? { machineId: diagOwner } : {}),
+        msg: msg.msg,
+      });
     } else if (msg.t === "player/surface-health") {
       // POL-94: the box's verdict on a surface's URL — the POL-86 prober's knowledge, addressed by
       // library source instead of buried in the diag trail. Sent only on a state CHANGE (and re-sent
