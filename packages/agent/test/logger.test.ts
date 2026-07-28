@@ -185,13 +185,15 @@ describe("the spool file", () => {
   test("is bounded and drops the OLDEST — the recent lines are the ones you are reading", async () => {
     // Far more than the cap: a box that cannot reach its server for a week must not fill its own
     // RAM overlay, and when it does have to discard, the lines it discards are the stale ones.
-    const logger = new AgentLogger({ machineId: "box-a", spoolPath });
+    // The cap is injected so this pins the BEHAVIOUR, not whatever the shipped default happens to
+    // be (it moved from 2 000 to 20 000 when POL-189's host-log tail landed).
+    const logger = new AgentLogger({ machineId: "box-a", spoolPath, spoolCap: 500 });
     for (let i = 0; i < 5000; i += 1) logger.info("power", `line ${i}`);
     logger.stop();
 
     const raw = await readFile(spoolPath, "utf8");
     const lines = raw.split("\n").filter((l) => l.trim());
-    expect(lines.length).toBeLessThanOrEqual(2000);
+    expect(lines.length).toBe(500);
     expect(raw).toContain("line 4999");
     expect(raw).not.toContain('"msg":"line 0"');
   });

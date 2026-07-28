@@ -18,7 +18,7 @@ import { mkdtemp, readdir, rm, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { LogSink, clockSkewMs, renderLogText, sanitize } from "../src/logs";
+import { LogSink, clockSkewMs, matchesLogFilter, renderLogText, sanitize } from "../src/logs";
 import type { LogEvent } from "@polyptic/protocol";
 
 let dir: string;
@@ -287,5 +287,93 @@ describe("export", () => {
     expect(rows[1]).toContain("WARN");
     expect(rows[1]).toContain("connector=HDMI-1");
     expect(rows[1]).toContain("box clock 1970-01-01T00:00:05.000Z");
+  });
+});
+
+describe("the live tail (POL-188)", () => {
+  test("tells listeners about lines only AFTER they are stored", async () => {
+    const sink = new LogSink({ dir });
+    await sink.init();
+
+    const seen: string[] = [];
+    sink.onWrite((written) => seen.push(...written.map((l) => l.msg)));
+
+    await sink.write([line({ seq: 1, msg: "first" }), line({ seq: 2, msg: "second" })]);
+    expect(seen).toEqual(["first", "second"]);
+
+    // What the follower saw must be exactly what a query returns — server clock and all, or the
+    // tail and the range would tell two different stories about the same moment.
+    const queried = (await sink.query({ since: "2000-01-01T00:00:00.000Z" })).lines.map((l) => l.msg);
+    expect(new Set(queried)).toEqual(new Set(seen));
+  });
+
+  test("a deduped re-send is not re-announced — a follower must not see the line twice", async () => {
+    const sink = new LogSink({ dir });
+    await sink.init();
+    const seen: string[] = [];
+    sink.onWrite((written) => seen.push(...written.map((l) => l.msg)));
+
+    const batch = [line({ seq: 1, msg: "only once" })];
+    await sink.write(batch);
+    await sink.write(batch); // the ack was lost; the box re-sent
+    expect(seen).toEqual(["only once"]);
+  });
+
+  test("unsubscribing stops the flow", async () => {
+    const sink = new LogSink({ dir });
+    await sink.init();
+    const seen: string[] = [];
+    const off = sink.onWrite((written) => seen.push(...written.map((l) => l.msg)));
+
+    await sink.write([line({ seq: 1, msg: "heard" })]);
+    off();
+    await sink.write([line({ seq: 2, msg: "not heard" })]);
+    expect(seen).toEqual(["heard"]);
+  });
+
+  test("a listener that throws cannot take down the write path every box depends on", async () => {
+    const sink = new LogSink({ dir });
+    await sink.init();
+    sink.onWrite(() => {
+      throw new Error("a broken console");
+    });
+    expect(await sink.write([line({ seq: 1 })])).toBe(1);
+    expect((await sink.query({ since: "2000-01-01T00:00:00.000Z" })).lines).toHaveLength(1);
+  });
+});
+
+describe("the shared filter (POL-188)", () => {
+  const stored = {
+    source: "agent" as const,
+    level: "warn" as const,
+    subsystem: "power",
+    at: "2026-07-28T03:00:00.000Z",
+    receivedAt: "2026-07-28T03:00:00.000Z",
+    machineId: "box-a",
+    screenId: "screen-1",
+    msg: "panel would not sleep",
+    fields: { connector: "HDMI-1" },
+  };
+
+  test("matches the same things the static query does — Follow cannot change the result set", () => {
+    expect(matchesLogFilter(stored, {})).toBe(true);
+    expect(matchesLogFilter(stored, { minLevel: "warn" })).toBe(true);
+    expect(matchesLogFilter(stored, { minLevel: "error" })).toBe(false);
+    expect(matchesLogFilter(stored, { machineId: "box-a" })).toBe(true);
+    expect(matchesLogFilter(stored, { machineId: "box-b" })).toBe(false);
+    expect(matchesLogFilter(stored, { source: "agent" })).toBe(true);
+    expect(matchesLogFilter(stored, { source: "player" })).toBe(false);
+    expect(matchesLogFilter(stored, { subsystem: "power" })).toBe(true);
+    expect(matchesLogFilter(stored, { screenId: "screen-1" })).toBe(true);
+    // Search covers the fields' values, exactly as the static view's does.
+    expect(matchesLogFilter(stored, { search: "HDMI-1" })).toBe(true);
+    expect(matchesLogFilter(stored, { search: "hdmi-1" })).toBe(true);
+    expect(matchesLogFilter(stored, { search: "nothing like it" })).toBe(false);
+  });
+
+  test("a control-plane line is addressed as `server`, matching how it is partitioned", () => {
+    const serverLine = { ...stored, machineId: undefined, source: "server" as const };
+    expect(matchesLogFilter(serverLine, { machineId: "server" })).toBe(true);
+    expect(matchesLogFilter(serverLine, { machineId: "box-a" })).toBe(false);
   });
 });

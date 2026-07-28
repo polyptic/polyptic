@@ -42,12 +42,21 @@ import {
   ServerToAgentRejected,
   ServerToAgentUpdateAvailable,
   ServerToPlayerCastPin,
+  ServerToAdminLogLines,
   ServerToAgentLogsAck,
   ServerToPlayerRender,
   ServerToPlayerSettings,
   parseMessage,
 } from "@polyptic/protocol";
-import type { AgentLogs, MtlsBundle, OperatorRole, ServerToAdminShellMessage } from "@polyptic/protocol";
+import { LOG_LIVE_BATCH_MAX } from "@polyptic/protocol";
+import type {
+  AgentLogs,
+  LogQuery,
+  MtlsBundle,
+  OperatorRole,
+  ServerToAdminShellMessage,
+  StoredLogEvent,
+} from "@polyptic/protocol";
 import type { FastifyBaseLogger } from "fastify";
 import type { IncomingMessage, Server } from "node:http";
 import type { Server as HttpsServer } from "node:https";
@@ -69,8 +78,12 @@ import type { SourceHealthTracker } from "./source-health";
 import { powerAckLine } from "./panel-power";
 import type { PanelPowerScheduler } from "./panel-power";
 import type { AgentUpdateService } from "./agent-update";
-import { serverEvent } from "./logs";
+import { matchesLogFilter, serverEvent } from "./logs";
 import type { LogSink } from "./logs";
+
+/** POL-188 — how often a follower's buffer is flushed to its console. Short enough to feel live,
+ *  long enough that a booting box's burst is one frame instead of forty. */
+const LOG_FOLLOW_FLUSH_MS = 400;
 
 interface WsDeps {
   /** The main listener the three channels' upgrades hang off — plain HTTP, or the native-TLS
@@ -335,7 +348,7 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
     handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, health, logs, log),
   );
   adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
-    handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, log),
+    handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, logs, log),
   );
 
   return shellRelay;
@@ -1426,6 +1439,8 @@ function handleAdmin(
   broadcaster: AdminBroadcaster,
   control: ControlPlane,
   shellRelay: ShellRelay,
+  /** POL-188 — the sink this socket may follow live. */
+  logs: LogSink,
   log: FastifyBaseLogger,
 ): void {
   adminHub.add(ws);
@@ -1434,6 +1449,62 @@ function handleAdmin(
   // On connect: push the current registry snapshot straight away.
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(broadcaster.snapshot()));
+  }
+
+  // ── POL-188: the live log tail, per socket ─────────────────────────────────
+  //
+  // Opt-in and filtered SERVER-side, because the alternative is shipping every line every box in the
+  // fleet writes to every console that happens to be open. Buffered and flushed on a tick so a burst
+  // (a box booting, a rollout) is ONE frame rather than one per line, and capped so a console that
+  // cannot keep up drops the oldest lines and is TOLD how many — a tail that silently skips is worse
+  // than one that admits it.
+
+  /** Non-time filter this socket is following with, or null when it is not following. */
+  let followFilter: Omit<LogQuery, "since" | "until" | "limit"> | null = null;
+  let unsubscribeSink: (() => void) | null = null;
+  let followBuffer: StoredLogEvent[] = [];
+  let followDropped = 0;
+  let followTimer: ReturnType<typeof setInterval> | null = null;
+
+  function flushFollow(): void {
+    if (followBuffer.length === 0 && followDropped === 0) return;
+    const lines = followBuffer;
+    const dropped = followDropped;
+    followBuffer = [];
+    followDropped = 0;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(ServerToAdminLogLines.parse({ t: "server/log-lines", lines, dropped })));
+  }
+
+  function startFollowing(filter: Omit<LogQuery, "since" | "until" | "limit">): void {
+    // Re-subscribing REPLACES the filter, so changing a dropdown mid-follow needs no round trip
+    // through unsubscribe (and cannot leave two listeners racing on one socket).
+    followFilter = filter;
+    if (unsubscribeSink) return;
+    unsubscribeSink = logs.onWrite((written) => {
+      if (followFilter === null) return;
+      for (const line of written) {
+        if (!matchesLogFilter(line, followFilter)) continue;
+        if (followBuffer.length >= LOG_LIVE_BATCH_MAX) {
+          followBuffer.shift(); // oldest out — the newest lines are the ones being watched for
+          followDropped += 1;
+          continue;
+        }
+        followBuffer.push(line);
+      }
+    });
+    followTimer = setInterval(flushFollow, LOG_FOLLOW_FLUSH_MS);
+    log.info({ event: "admin.logs.follow" }, "an operator is following the fleet logs live");
+  }
+
+  function stopFollowing(): void {
+    followFilter = null;
+    unsubscribeSink?.();
+    unsubscribeSink = null;
+    if (followTimer) clearInterval(followTimer);
+    followTimer = null;
+    followBuffer = [];
+    followDropped = 0;
   }
 
   ws.on("message", (data: RawData) => {
@@ -1451,6 +1522,22 @@ function handleAdmin(
         ws.send(JSON.stringify(broadcaster.snapshot()));
       }
       log.info({ event: "admin.hello" }, "admin registered");
+      return;
+    }
+
+    // POL-188 — follow the fleet's logs live. ADMIN-ONLY, matching `/api/v1/logs`: the static view
+    // and the live tail show the same thing, so they must be gated the same way or the socket is a
+    // way around the route table.
+    if (msg.t === "admin/log-subscribe" || msg.t === "admin/log-unsubscribe") {
+      if (role !== "admin") {
+        log.warn({ event: "admin.logs.forbidden", role, frame: msg.t }, "refused a log-follow frame — role is not admin");
+        return;
+      }
+      if (msg.t === "admin/log-unsubscribe") {
+        stopFollowing();
+        return;
+      }
+      startFollowing(msg.filter ?? {});
       return;
     }
 
@@ -1491,6 +1578,9 @@ function handleAdmin(
 
   ws.on("close", (code) => {
     shellRelay.adminDisconnected(ws);
+    // POL-188 — drop the sink listener and its timer with the socket. A follower that outlived its
+    // console would buffer the fleet's logs into a closed socket forever.
+    stopFollowing();
     adminHub.remove(ws);
     log.info({ event: "admin.disconnected", code, admins: adminHub.count() }, "admin socket closed");
   });

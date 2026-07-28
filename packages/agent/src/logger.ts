@@ -36,15 +36,24 @@
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { LOG_BATCH_MAX, LogEvent, levelAtLeast, redactMessage } from "@polyptic/protocol";
+import { LOG_BATCH_MAX, LogEvent, levelAtLeast, redactMessage, sanitizeLogText } from "@polyptic/protocol";
 import type { LogFields, LogLevel } from "@polyptic/protocol";
 
 import { stateDir } from "./credential";
 
-/** Spool ceiling. ~2000 lines is several boots' worth of narration; past it the oldest go. */
-const SPOOL_CAP = Number(process.env.POLYPTIC_LOG_SPOOL_CAP?.trim() || 2000);
-/** Ceiling on lines SHIPPED per minute (the stdout copy is never capped — the journal is local). */
-const SEND_CAP_PER_MIN = 300;
+/** Spool ceiling. Sized so a whole boot's host journal (POL-189) survives an offline stretch;
+ *  past it the oldest go, because the recent lines are the ones being read for. */
+const SPOOL_CAP = Number(process.env.POLYPTIC_LOG_SPOOL_CAP?.trim() || 20_000);
+/**
+ * Ceiling on lines SHIPPED per minute (the stdout copy is never capped — the journal is local).
+ *
+ * Sized for POL-189's host-log tail, not just the agent's own narration: a boot is a few thousand
+ * journald entries, and at the original 300/min a single boot took ten minutes to drain — so the
+ * most interesting minutes of a box's life arrived last. Nothing is lost either way (the spool
+ * holds and the cap only defers), but "why was it dark this morning" should not have to wait.
+ * `POLYPTIC_LOG_SEND_CAP` tunes it for a constrained link.
+ */
+const SEND_CAP_PER_MIN = Number(process.env.POLYPTIC_LOG_SEND_CAP?.trim() || 1200);
 /** How often the shipper drains the spool. Eager on purpose: on a RAM box, seconds of exposure. */
 const SHIP_INTERVAL_MS = 3_000;
 
@@ -67,6 +76,8 @@ export interface LoggerOptions {
   shipMinLevel?: LogLevel;
   /** Override the spool file location (tests). Defaults to the agent state dir. */
   spoolPath?: string;
+  /** Override the drop-oldest ceiling (tests, and a constrained box). Defaults to SPOOL_CAP. */
+  spoolCap?: number;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -75,6 +86,7 @@ export class AgentLogger {
   private readonly machineId: string;
   private readonly shipMinLevel: LogLevel;
   private readonly spoolPath: string;
+  private readonly spoolCap: number;
   /** Lines written but not yet acked, oldest first. THE spool, mirrored to disk. */
   private spool: LogEvent[] = [];
   /** Batches on the wire awaiting an ack. Re-queued wholesale if the socket drops. */
@@ -93,6 +105,7 @@ export class AgentLogger {
     this.shipMinLevel = opts.shipMinLevel ?? "info";
     this.spoolPath =
       opts.spoolPath ?? join(stateDir(opts.env ?? process.env), `log-spool-${opts.machineId}`);
+    this.spoolCap = opts.spoolCap ?? SPOOL_CAP;
     this.loadSpool();
   }
 
@@ -114,15 +127,35 @@ export class AgentLogger {
   /**
    * One line. Written to stdout in the agent's long-standing format (so `journalctl` reads exactly
    * as it always has), redacted, then spooled for shipping if it clears the ship level.
+   *
+   * `opts.at` overrides the timestamp — REQUIRED for POL-189's host-log tail, whose entries carry
+   * journald's own clock. Stamping them "now" would file a whole replayed boot at the moment the
+   * agent happened to start, which destroys the ordering that makes a boot log readable and makes
+   * the console's clock-skew flag meaningless.
+   *
+   * `opts.echo: false` suppresses the stdout copy — also for the host tail, and not an optimisation:
+   * those lines CAME from journald, so echoing them puts a second copy of every host line back into
+   * the journal we are reading. On a box with a size-capped journal that is a slow way to evict the
+   * very history we are trying to preserve.
    */
-  write(level: LogLevel, subsystem: string, msg: string, fields?: LogFields): void {
-    const at = new Date().toISOString();
-    const clean = redactMessage(msg).slice(0, 1000);
+  write(
+    level: LogLevel,
+    subsystem: string,
+    msg: string,
+    fields?: LogFields,
+    opts: { at?: string; echo?: boolean } = {},
+  ): void {
+    const at = opts.at ?? new Date().toISOString();
+    // Redact secrets, THEN strip control bytes — the host journal and a browser's stderr are not
+    // required to be clean text, and a NUL in the middle of a sentence eats the word before it.
+    const clean = sanitizeLogText(redactMessage(msg)).slice(0, 1000);
 
     // 1. stdout — unchanged behaviour, deliberately. Errors keep going to stderr.
-    const line = `[${at}] [${subsystem}] ${level === "error" ? "ERROR: " : level === "warn" ? "WARN: " : ""}${clean}`;
-    if (level === "error") console.error(line);
-    else console.log(line);
+    if (opts.echo !== false) {
+      const line = `[${at}] [${subsystem}] ${level === "error" ? "ERROR: " : level === "warn" ? "WARN: " : ""}${clean}`;
+      if (level === "error") console.error(line);
+      else console.log(line);
+    }
 
     // 2. the spool — but only at or above the ship level. The browser firehose (POL-67's
     //    `POLYPTIC_BROWSER_LOG=all`) is debug-level and therefore stays on the box unless someone
@@ -146,7 +179,7 @@ export class AgentLogger {
     if (!parsed.success) return;
 
     this.spool.push(parsed.data);
-    if (this.spool.length > SPOOL_CAP) this.spool.splice(0, this.spool.length - SPOOL_CAP);
+    if (this.spool.length > this.spoolCap) this.spool.splice(0, this.spool.length - this.spoolCap);
     this.queueWrite();
     // Eager: a line worth shipping goes as soon as the channel will take it, so the window in which
     // a reboot could take it with the RAM overlay is seconds.
@@ -285,7 +318,7 @@ export class AgentLogger {
       // load is a box that will not boot.
       return;
     }
-    if (this.spool.length > SPOOL_CAP) this.spool.splice(0, this.spool.length - SPOOL_CAP);
+    if (this.spool.length > this.spoolCap) this.spool.splice(0, this.spool.length - this.spoolCap);
     // Continue the sequence where the previous process left off, so a restart cannot re-use a seq
     // the server already stored under a different line.
     this.seq = this.spool.reduce((max, e) => Math.max(max, e.seq ?? 0), 0);
@@ -335,7 +368,7 @@ function redactFields(fields: LogFields): LogFields {
     if (keys >= 12) break;
     keys += 1;
     out[key.slice(0, 40)] =
-      typeof value === "string" ? redactMessage(value).slice(0, 300) : value;
+      typeof value === "string" ? sanitizeLogText(redactMessage(value)).slice(0, 300) : value;
   }
   return out;
 }

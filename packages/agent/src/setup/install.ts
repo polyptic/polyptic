@@ -267,8 +267,10 @@ function ensureKioskUser(
     state.createdUser = true;
   }
 
-  // Groups the compositor/seat/GPU need. Only add those that exist on this distro.
-  const wanted = ["video", "input", "render", "audio", "tty", "seat", "plugdev"];
+  // Groups the compositor/seat/GPU need — plus `systemd-journal` (POL-189), without which the agent
+  // can read only its OWN journal entries and host-log shipping silently returns a thin, wrong view
+  // of the box (journalctl exits 0 either way, which is what makes it dangerous).
+  const wanted = ["video", "input", "render", "audio", "tty", "seat", "plugdev", "systemd-journal"];
   const have = wanted.filter((g) => sys.probe("getent", ["group", g]).code === 0);
   if (have.length > 0) {
     sys.exec("usermod", ["-aG", have.join(","), opts.user], {
@@ -277,7 +279,7 @@ function ensureKioskUser(
     });
   }
   assumptions.push(
-    "systemd-logind provides seat management for the compositor (no seatd installed); kiosk added to video/input/render.",
+    "systemd-logind provides seat management for the compositor (no seatd installed); kiosk added to video/input/render, and to systemd-journal so host logs (POL-189) see the whole system journal, not just this user's.",
   );
 
   // Home + per-machine state dir (where the durable credential is persisted), owned by kiosk.

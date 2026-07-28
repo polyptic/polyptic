@@ -20,7 +20,7 @@
   back what already happened. Refresh is a button, deliberately.
 -->
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import type { LogLevel, LogQuery, LogSource, StoredLogEvent } from "@polyptic/protocol";
 
 import { fetchLogs, logsExportUrl } from "../api";
@@ -44,12 +44,32 @@ const RANGES = [
 ] as const;
 type RangeId = (typeof RANGES)[number]["id"];
 
-const range = ref<RangeId>("night");
+// The last hour is where an investigation actually starts — you have just done something and want
+// to see it. "Last night" is one dropdown away for the morning-after case this feature was built for.
+const range = ref<RangeId>("1h");
 const machineId = ref("");
 const minLevel = ref<LogLevel | "">("");
 const source = ref<LogSource | "">("");
 const search = ref("");
 const limit = ref(500);
+
+/**
+ * FOLLOW (POL-188) — the live tail.
+ *
+ * On, the server pushes newly-stored lines matching these same filters over the existing admin
+ * socket and they land at the top of the list as they happen. The time range stops meaning anything
+ * while following (a tail is unbounded by definition), so the control is disabled and says so.
+ *
+ * Turning it on does NOT clear what is on screen: you keep the range you were reading and the live
+ * lines accumulate above it, which is what "follow" means when you are watching a box you just
+ * rebooted come back.
+ */
+const following = ref(false);
+/** Lines the server dropped to keep up. Shown rather than hidden — a tail that silently skips is
+ *  worse than one that admits it. */
+const droppedWhileFollowing = ref(0);
+/** Cap on what the tail accumulates in the DOM, so an overnight follow cannot grow without bound. */
+const FOLLOW_CAP = 2000;
 
 const lines = ref<StoredLogEvent[]>([]);
 const machines = ref<string[]>([]);
@@ -93,6 +113,14 @@ const query = computed<LogQuery>(() => {
 
 const downloadUrl = computed(() => logsExportUrl(query.value));
 
+/** The non-time half of the query — what a live subscription filters on. */
+const followFilter = computed(() => ({
+  ...(machineId.value ? { machineId: machineId.value } : {}),
+  ...(minLevel.value ? { minLevel: minLevel.value } : {}),
+  ...(source.value ? { source: source.value } : {}),
+  ...(search.value.trim() ? { search: search.value.trim() } : {}),
+}));
+
 async function load(): Promise<void> {
   loading.value = true;
   errorMsg.value = null;
@@ -109,9 +137,48 @@ async function load(): Promise<void> {
   }
 }
 
+let stopListening: (() => void) | null = null;
+
+function startFollowing(): void {
+  if (!store.followLogs(followFilter.value)) {
+    errorMsg.value = "The console's live connection is down, so the log tail cannot start.";
+    following.value = false;
+    return;
+  }
+  following.value = true;
+  droppedWhileFollowing.value = 0;
+  stopListening = store.onLogLines((frame) => {
+    if (frame.dropped > 0) droppedWhileFollowing.value += frame.dropped;
+    // The frame carries lines oldest-first; the list is newest-first, so reverse as we prepend.
+    lines.value = [...[...frame.lines].reverse(), ...lines.value].slice(0, FOLLOW_CAP);
+    loaded.value = true;
+  });
+}
+
+function stopFollowing(): void {
+  following.value = false;
+  stopListening?.();
+  stopListening = null;
+  store.unfollowLogs();
+}
+
+function toggleFollow(): void {
+  if (following.value) stopFollowing();
+  else startFollowing();
+}
+
 onMounted(load);
 // Re-run on any filter change EXCEPT the free-text box, which would fire a query per keystroke.
-watch([range, machineId, minLevel, source, limit], () => void load());
+// While following, the same change is pushed to the server instead — re-subscribing REPLACES the
+// filter, so the tail narrows without a round trip through unsubscribe.
+watch([range, machineId, minLevel, source, limit], () => {
+  if (following.value) store.followLogs(followFilter.value);
+  else void load();
+});
+// Never leave a subscription behind on a socket the view no longer owns.
+onUnmounted(() => {
+  if (following.value) stopFollowing();
+});
 
 /** "Load older" widens the cap rather than paging — the range is the real bound, the cap is a guard. */
 function loadMore(): void {
@@ -183,7 +250,16 @@ function fieldPairs(line: StoredLogEvent): string {
           </p>
         </div>
         <div class="head-actions">
-          <button class="btn ghost" :disabled="loading" @click="load">
+          <button
+            class="btn follow"
+            :class="{ live: following }"
+            :title="following ? 'Stop following' : 'Watch new lines arrive as they happen'"
+            @click="toggleFollow"
+          >
+            <span class="follow-dot" :class="{ live: following }" />
+            {{ following ? "Following" : "Follow" }}
+          </button>
+          <button class="btn ghost" :disabled="loading || following" @click="load">
             {{ loading ? "Loading…" : "Refresh" }}
           </button>
           <a class="btn" :href="downloadUrl" download>Download this view</a>
@@ -192,7 +268,7 @@ function fieldPairs(line: StoredLogEvent): string {
 
       <!-- ── filters ─────────────────────────────────────────────────────── -->
       <div class="filters">
-        <select v-model="range" class="field">
+        <select v-model="range" class="field" :disabled="following" :title="following ? 'A live tail has no time range — it starts now' : ''">
           <option v-for="r in RANGES" :key="r.id" :value="r.id">{{ r.label }}</option>
         </select>
 
@@ -226,6 +302,14 @@ function fieldPairs(line: StoredLogEvent): string {
 
       <div v-if="errorMsg" class="query-error">⚠ {{ errorMsg }}</div>
 
+      <div v-if="following" class="following-strip">
+        <span class="follow-dot live" />
+        <span>Following live. New lines arrive at the top as the fleet writes them.</span>
+        <span v-if="droppedWhileFollowing > 0" class="dropped">
+          {{ droppedWhileFollowing }} line{{ droppedWhileFollowing === 1 ? "" : "s" }} skipped to keep up
+        </span>
+      </div>
+
       <!-- ── the timeline ────────────────────────────────────────────────── -->
       <div v-if="lines.length" class="lines">
         <div v-for="(line, i) in lines" :key="`${line.receivedAt}-${i}`" class="line" :class="line.level">
@@ -246,6 +330,15 @@ function fieldPairs(line: StoredLogEvent): string {
         </div>
       </div>
 
+      <div v-else-if="following" class="empty">
+        <span class="empty-glyph">☰</span>
+        <span class="empty-title">Waiting for the fleet to say something</span>
+        <span class="empty-sub">
+          Following live with these filters. Lines appear here the moment a box, a screen or the
+          control plane writes one.
+        </span>
+      </div>
+
       <div v-else-if="loaded && !loading" class="empty">
         <span class="empty-glyph">☰</span>
         <span class="empty-title">Nothing in this range</span>
@@ -255,7 +348,7 @@ function fieldPairs(line: StoredLogEvent): string {
         </span>
       </div>
 
-      <div v-if="truncated" class="more">
+      <div v-if="truncated && !following" class="more">
         <span class="more-text">Showing the newest {{ lines.length }} lines in this range.</span>
         <button class="btn ghost" :disabled="limit >= 2000" @click="loadMore">Load older</button>
       </div>
@@ -335,6 +428,68 @@ function fieldPairs(line: StoredLogEvent): string {
   cursor: not-allowed;
 }
 
+/* Follow (POL-188) — a live tail over the admin socket. */
+.btn.follow {
+  gap: 7px;
+  background: var(--muted-bg);
+  color: var(--fg2);
+  border: 1px solid var(--line2);
+}
+.btn.follow:hover {
+  background: var(--muted-bg2);
+  opacity: 1;
+}
+.btn.follow.live {
+  background: var(--ok-soft);
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.follow-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted2);
+  flex: 0 0 auto;
+}
+.follow-dot.live {
+  background: var(--ok);
+  /* A steady dot reads as "connected"; the pulse is what says lines are still arriving. Kept to
+     opacity so it costs nothing — and the wall-UI ban on transform/filter animation (POL-67) is a
+     habit worth keeping even in the console. */
+  animation: follow-pulse 1.6s ease-in-out infinite;
+}
+@keyframes follow-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .follow-dot.live {
+    animation: none;
+  }
+}
+.following-strip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 13px;
+  margin-bottom: 12px;
+  border: 1px solid var(--ok);
+  background: var(--ok-soft);
+  border-radius: 9px;
+  font-size: 12.5px;
+  color: var(--fg2);
+}
+.dropped {
+  margin-left: auto;
+  color: var(--warn);
+  font-weight: 600;
+}
+
 .filters {
   display: flex;
   flex-wrap: wrap;
@@ -353,6 +508,10 @@ function fieldPairs(line: StoredLogEvent): string {
 .field.grow {
   flex: 1;
   min-width: 200px;
+}
+.field:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* The failed-query banner. Named `query-error` and NOT `error`, because the level classes on each
