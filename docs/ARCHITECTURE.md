@@ -166,6 +166,12 @@ BOX (agent)                  BOX (player)          SERVER (control plane)
 - **stdout is unchanged.** Shipping is additional: `journalctl --user -u polyptic-agent` reads exactly
   as before, and a box with no server to talk to still narrates itself.
 - **Ordering is the SERVER's clock.** See the gotcha below.
+- **The HOST's logs ride the same envelope** (POL-189). The agent tails
+  `journalctl --output=json --follow` and writes each entry through the same logger, so greetd,
+  sway, the kernel and the OOM killer land in the same timeline as the agent and the control plane.
+  A cold start begins at `--boot=0`, so a bad boot ships its own story.
+- **Follow** (POL-188) pushes newly-stored lines over the existing `/admin` socket — opt-in per
+  socket, filtered server-side with the SAME predicate the static query uses, batched on a tick.
 
 ## Gotchas (don't relearn these)
 - **A cold-booting box's clock is a liar, so never order logs by it.** POL-148 disciplines box clocks
@@ -179,6 +185,15 @@ BOX (agent)                  BOX (player)          SERVER (control plane)
   time, and `sway.ts` logged `spawned … → ${target.url}` raw for as long as `journalctl` was the only
   reader. Redaction (`redactUrl` / `redactMessage`, in `@polyptic/protocol`) therefore runs INSIDE the
   emitter's logger, not on the way out — a redaction applied at read time leaves the secret on disk.
+- **Tailing the journal you also write to is a loop.** The agent's stdout goes to journald, so
+  re-logging what the tail reads makes every shipped line a new journal entry, which is read and
+  shipped again — an exponential amplifier pointed at the control plane. journalctl has no
+  `--exclude-unit`, so the guard is entirely ours (drop our own unit on the way in), and host lines
+  skip the stdout echo because they came from the journal that echo would write into.
+- **A journal you cannot fully read fails SILENTLY.** Without `systemd-journal` group membership,
+  `journalctl` exits 0 and returns only the calling user's own entries. No error, no warning — just
+  a thin log that looks complete. `setup` adds the kiosk user to the group and the agent probes for
+  it at startup, because "looks complete but isn't" is the worst thing a log can be.
 - **The on-box spool survives a reboot only on an installed-to-disk box.** `$HOME/.polyptic` is the
   RAM overlay on a netbooted box, so a reboot takes the spool with it. It survives an agent crash or
   restart everywhere; the mitigation for the rest is eager shipping, which keeps an online box's

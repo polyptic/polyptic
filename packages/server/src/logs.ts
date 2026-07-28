@@ -43,6 +43,7 @@ import {
   LogRetention as LogRetentionSchema,
   StoredLogEvent,
   levelAtLeast,
+  sanitizeLogText,
 } from "@polyptic/protocol";
 import type {
   LogEvent,
@@ -134,6 +135,8 @@ export class LogSink {
   /** False when LOG_DIR could not be created — the console says so rather than showing an empty
    *  Logs place, which reads as a quiet fleet and is the one lie this feature cannot afford. */
   private writable = false;
+  /** POL-188 — who wants to be told about newly-stored lines (the live tail's fan-out). */
+  private readonly listeners = new Set<(lines: StoredLogEventType[]) => void>();
 
   constructor(opts: LogSinkOptions) {
     this.dir = resolve(opts.dir);
@@ -159,6 +162,19 @@ export class LogSink {
         "LOG_DIR is not writable — fleet logs will NOT be stored (the boxes keep spooling theirs)",
       );
     }
+  }
+
+  /**
+   * POL-188 — be told about lines as they are STORED. Every emitter's path (agent batches, player
+   * frames, the control plane's own decisions) funnels through `write`, so this one seam sees the
+   * whole fleet with no second plumbing. Returns an unsubscribe.
+   *
+   * Called with the lines EXACTLY as stored — server clock stamped, already deduped — so a follower
+   * sees what a later query would return, not a hopeful copy of it.
+   */
+  onWrite(listener: (lines: StoredLogEventType[]) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   /** Is the sink able to store anything? Surfaced to operators; also gates the agent's ack. */
@@ -240,18 +256,27 @@ export class LogSink {
 
     /** partition path → the lines to append there. */
     const byPartition = new Map<string, string[]>();
+    /** The same lines as objects, for the POL-188 live tail (emitted only once the append lands). */
+    const stored: StoredLogEventType[] = [];
     let written = 0;
 
     for (const event of events) {
       const machine = event.machineId ?? SERVER_PARTITION;
       if (event.seq !== undefined && this.alreadySeen(machine, event.seq)) continue;
-      const stored: StoredLogEventType = { ...event, receivedAt };
-      const parsed = StoredLogEvent.safeParse(stored);
+      // Defence in depth (POL-189): control bytes are stripped at the emitter, but the sink is the
+      // ONE choke point every source funnels through, and nothing binary should ever reach a
+      // partition regardless of which emitter — or which future emitter — wrote it.
+      const parsed = StoredLogEvent.safeParse({
+        ...event,
+        msg: sanitizeLogText(event.msg),
+        receivedAt,
+      });
       if (!parsed.success) continue; // never let one malformed line reject a whole batch
       const path = this.partitionPath(machine, day);
       const lines = byPartition.get(path);
       if (lines) lines.push(JSON.stringify(parsed.data));
       else byPartition.set(path, [JSON.stringify(parsed.data)]);
+      stored.push(parsed.data);
       written += 1;
     }
 
@@ -267,6 +292,17 @@ export class LogSink {
     });
     this.writeChain = task.catch(() => {}); // a failed write must not poison the chain
     await task;
+    // Only AFTER the append lands: a follower must never be shown a line that failed to store, or
+    // the tail and the range would disagree about what happened.
+    if (this.listeners.size > 0 && stored.length > 0) {
+      for (const listener of this.listeners) {
+        try {
+          listener(stored);
+        } catch {
+          // A broken follower must never take down the write path that every box depends on.
+        }
+      }
+    }
     return written;
   }
 
@@ -329,11 +365,7 @@ export class LogSink {
         for (const line of found) {
           const at = Date.parse(line.receivedAt);
           if (!Number.isFinite(at) || at < since || at > until) continue; // both ends inclusive
-          if (q.screenId && line.screenId !== q.screenId) continue;
-          if (q.minLevel && !levelAtLeast(line.level, q.minLevel)) continue;
-          if (q.subsystem && line.subsystem !== q.subsystem) continue;
-          if (q.source && line.source !== q.source) continue;
-          if (search && !matchesSearch(line, search)) continue;
+          if (!matchesLogFilter(line, q)) continue;
           lines.push(line);
         }
       }
@@ -535,6 +567,24 @@ async function readPartition(path: string): Promise<StoredLogEventType[]> {
     }
   }
   return out;
+}
+
+/**
+ * Does one stored line match a query's NON-TIME filters?
+ *
+ * Exported and shared with the live tail (POL-188) on purpose: "Follow" and the static list must
+ * agree about what the operator's filters mean, or turning Follow on would quietly change the
+ * result set under them. Time bounds are deliberately NOT here — the static view ranges on them and
+ * the live tail is unbounded by definition.
+ */
+export function matchesLogFilter(line: StoredLogEventType, q: Omit<LogQuery, "since" | "until" | "limit">): boolean {
+  if (q.machineId && (line.machineId ?? SERVER_PARTITION) !== sanitize(q.machineId)) return false;
+  if (q.screenId && line.screenId !== q.screenId) return false;
+  if (q.minLevel && !levelAtLeast(line.level, q.minLevel)) return false;
+  if (q.subsystem && line.subsystem !== q.subsystem) return false;
+  if (q.source && line.source !== q.source) return false;
+  if (q.search && !matchesSearch(line, q.search.toLowerCase())) return false;
+  return true;
 }
 
 /** Case-insensitive match over the message, subsystem and the fields' values. */

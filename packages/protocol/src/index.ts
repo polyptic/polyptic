@@ -64,7 +64,7 @@ export * from "./grafana-url";
 // POL-187 — fleet logging: the ONE `LogEvent` envelope every emitter (agent, player, server) writes,
 // the store-and-forward frames that carry it, and the query contract the Logs place reads back with.
 export * from "./logs";
-import { AgentLogs, PlayerLog, ServerToAgentLogsAck } from "./logs";
+import { AdminLogSubscribe, AdminLogUnsubscribe, AgentLogs, PlayerLog, ServerToAgentLogsAck } from "./logs";
 
 // POL-187 — redaction, shared by all three emitters. A send-time credential (POL-24) lives in a
 // URL's query; a log line must never carry one, on either side of the wire.
@@ -2522,6 +2522,9 @@ export const AdminShellClose = z.object({
 });
 
 export const AdminMessage = z.discriminatedUnion("t", [
+  // POL-188 — follow the fleet's logs live over this socket. Opt-in per socket; admin-only.
+  AdminLogSubscribe,
+  AdminLogUnsubscribe,
   AdminHello,
   AdminShellOpen,
   AdminShellData,

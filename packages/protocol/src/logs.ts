@@ -242,3 +242,55 @@ export const LogSinkInfo = z.object({
   writable: z.boolean(),
 });
 export type LogSinkInfo = z.infer<typeof LogSinkInfo>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Following the logs live (POL-188) — the admin channel's tail
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The static Logs place answers "what happened last night". This answers "what is happening right
+// now, while I stand here and watch" — following a box through a reboot, a rollout, a wall you are
+// power-cycling by hand.
+//
+// It rides the EXISTING /admin socket rather than polling, for the reason every other live path in
+// this system does: a poll is a choice between stale and wasteful, and the console already holds
+// this socket open. It is OPT-IN per socket — a console sitting on the Wall view must not be fed
+// the fleet's log firehose — and the server applies the operator's own filter BEFORE sending, so
+// "errors on wall-3" costs a handful of frames rather than everything the fleet says.
+
+/** Admin → server: start following. The filter is the same contract the static query uses, minus
+ *  the time bounds (following is unbounded by definition — it starts now and runs until you stop).
+ *  Re-sending replaces the filter, so changing a dropdown while following does not need a round
+ *  trip through unsubscribe. */
+export const AdminLogSubscribe = z.object({
+  t: z.literal("admin/log-subscribe"),
+  filter: LogQuery.omit({ since: true, until: true, limit: true }).optional(),
+});
+export type AdminLogSubscribe = z.infer<typeof AdminLogSubscribe>;
+
+/** Admin → server: stop following (also implied by the socket closing). */
+export const AdminLogUnsubscribe = z.object({ t: z.literal("admin/log-unsubscribe") });
+export type AdminLogUnsubscribe = z.infer<typeof AdminLogUnsubscribe>;
+
+/** Most lines one live frame carries. A burst is batched into one frame rather than one frame per
+ *  line; past this the oldest are dropped and counted, because a console that cannot keep up must
+ *  say so rather than lag further and further behind reality. */
+export const LOG_LIVE_BATCH_MAX = 200;
+
+/**
+ * Server → admin: newly-stored lines matching this socket's filter, newest LAST (they are appended
+ * to a running tail, so they arrive in the order they happened).
+ */
+export const ServerToAdminLogLines = z.object({
+  t: z.literal("server/log-lines"),
+  lines: z.array(StoredLogEvent).max(LOG_LIVE_BATCH_MAX),
+  /** Lines that matched but were dropped to keep up. Non-zero is worth showing: the tail is not
+   *  complete, and pretending otherwise is the same lie as an empty range. */
+  dropped: z.number().int().nonnegative().default(0),
+});
+export type ServerToAdminLogLines = z.infer<typeof ServerToAdminLogLines>;
+
+/** The server→admin LOG channel, kept out of `ServerToAdminMessage` for the same reason the shell
+ *  frames are: the console peeks at `t` and routes these to the Logs view, leaving the strict
+ *  admin-state parse (and every existing client) untouched. */
+export const ServerToAdminLogMessage = z.discriminatedUnion("t", [ServerToAdminLogLines]);
+export type ServerToAdminLogMessage = z.infer<typeof ServerToAdminLogMessage>;

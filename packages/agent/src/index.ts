@@ -76,6 +76,7 @@ import type { DisplayBackend } from "./backends/types";
 import { credentialPath, loadCredential, saveCredential } from "./credential";
 import { readHostIdentity } from "./hardware";
 import { AgentLogger, logLine, setAgentLogger } from "./logger";
+import { JournalTailer, probeJournalAccess } from "./journal";
 import { DevtoolsManager } from "./devtools";
 import {
   certNeedsRenewal,
@@ -183,6 +184,50 @@ function readBootstrapToken(): string | undefined {
 
 function readAgentVersion(): string {
   return agentVersion();
+}
+
+/**
+ * POL-189 — start tailing the host journal, unless it is switched off.
+ *
+ * Returns null when host logs are disabled or unavailable. The access PROBE runs first and its
+ * answer is logged either way, because the dangerous outcome is not "no host logs" — it is host
+ * logs that look complete and are silently only this user's own entries (see probeJournalAccess).
+ */
+function startHostLogs(logger: AgentLogger, machineId: string): JournalTailer | null {
+  const mode = process.env.POLYPTIC_HOST_LOGS?.trim().toLowerCase();
+  if (mode === "off" || mode === "0" || mode === "false") {
+    logger.info("host-logs", "host journal shipping is OFF (POLYPTIC_HOST_LOGS)");
+    return null;
+  }
+  // 0–7, syslog. Default 6 = everything journald carries except debug.
+  const priority = Number.parseInt(process.env.POLYPTIC_HOST_LOG_PRIORITY?.trim() ?? "6", 10);
+  const boots = Number.parseInt(process.env.POLYPTIC_HOST_LOG_BOOTS?.trim() ?? "1", 10);
+
+  void probeJournalAccess(async (cmd, args) => {
+    const proc = Bun.spawn([cmd, ...args], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    return { code: await proc.exited, stdout, stderr };
+  }).then((probe) => {
+    if (probe.ok) logger.info("host-logs", `host journal: ${probe.detail}`);
+    // WARN, not info: a half-visible journal is a log that will lie to whoever reads it next.
+    else logger.warn("host-logs", `host journal is only PARTLY readable — ${probe.detail}`);
+  });
+
+  const tailer = new JournalTailer({
+    logger,
+    machineId,
+    maxPriority: Number.isFinite(priority) ? priority : 6,
+    boots: Number.isFinite(boots) ? boots : 1,
+  });
+  tailer.start();
+  logger.info(
+    "host-logs",
+    `shipping the host journal (priority <= ${priority}, ${boots === 1 ? "this boot" : `${boots} boots`})`,
+  );
+  return tailer;
 }
 
 /** POL-187 — the minimum level SHIPPED to the control plane. stdout always gets everything. */
@@ -301,6 +346,10 @@ class Agent {
    *  in-process reconnect never re-replays a finished outcome into a duplicate feed line. A process
    *  restart resets it — exactly the case (the OOM-killed agent) the replay exists for. */
   private installOutcomeReported = false;
+  /** POL-187 — the URL this connection dialled, for the log-shipping cleartext check. */
+  private currentTarget = "";
+  /** POL-187 — true once this connection has armed log shipping (on its first apply). */
+  private logShippingArmed = false;
 
   constructor(
     private readonly url: string,
@@ -418,7 +467,9 @@ class Agent {
       // listening — the OOM-killed-mid-install case — pick the story back up.
       void this.sendHello().then(() => this.resumeInstallNarration());
       this.startHeartbeat();
-      this.startLogShipping(target);
+      // NOT here: log shipping is armed on ADMISSION (the first `server/apply`), not on the socket
+      // opening. See startLogShipping.
+      this.currentTarget = target;
     });
 
     ws.on("message", (raw) => {
@@ -450,12 +501,21 @@ class Agent {
       // definition a batch we cannot prove landed, so it stays spooled and goes again on reconnect
       // (where the server's `(machineId, seq)` dedupe makes a genuine duplicate a no-op).
       this.logger?.setShipper(null);
+      this.logShippingArmed = false;
       if (!this.closing) this.scheduleReconnect();
     });
   }
 
   /**
    * POL-187 — arm log shipping for this connection, or refuse it.
+   *
+   * ARMED ON ADMISSION, NOT ON CONNECT. The first version armed this in the socket's `open` handler,
+   * next to the hello — and the logger ships eagerly, so a batch raced the hello down the wire and
+   * the server refused it ("no admitted hello for that machine"). Nothing was lost (a refusal leaves
+   * the lines spooled, and they went on the next drain), but every single connect produced a scary
+   * WARN in the operator's own log about the logging not working, which is a poor first impression
+   * for a feature whose whole job is to be trustworthy. A box has no business writing into the
+   * fleet's partitions before the control plane has admitted it anyway.
    *
    * THE REFUSAL IS THE POINT. A log line is the box's whole story — what it launched, which panel
    * it slept, which URL (redacted, but its origin and path all the same) it was pointed at. Shipping
@@ -467,9 +527,12 @@ class Agent {
    * `POLYPTIC_LOG_SHIP_CLEARTEXT=1` is the deliberate escape hatch for a lab or dev stack that has
    * no TLS at all. It is opt-IN, and it names what it is.
    */
-  private startLogShipping(target: string): void {
+  private startLogShipping(): void {
     const logger = this.logger;
     if (!logger) return;
+    if (this.logShippingArmed) return; // idempotent: every apply calls this, only the first arms
+    this.logShippingArmed = true;
+    const target = this.currentTarget;
     const encrypted = target.startsWith("wss://");
     const allowCleartext = process.env.POLYPTIC_LOG_SHIP_CLEARTEXT?.trim() === "1";
     if (!encrypted && !allowCleartext) {
@@ -607,6 +670,10 @@ class Agent {
       return;
     }
     this.lastAppliedRevision = msg.revision;
+    // POL-187 — an apply IS admission: the control plane only sends one to a machine it has
+    // accepted. Arming here (rather than on the socket opening) is what stops the first batch
+    // racing the hello and coming back refused. Idempotent, so every later apply is a no-op.
+    this.startLogShipping();
     log(`apply revision ${msg.revision} — ${msg.screens.length} screen(s)`);
 
     const wanted = new Set<string>();
@@ -1531,10 +1598,16 @@ async function main(): Promise<void> {
   );
   agent.start();
 
+  // POL-189 — the HOST's own logs. The agent explains the agent; journald explains everything under
+  // it (greetd, sway, the kernel, the NIC, the OOM killer) — including the boots where the agent
+  // never got far enough to say anything at all. Off with POLYPTIC_HOST_LOGS=off.
+  const journal = startHostLogs(logger, machineId);
+
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
       log(`received ${sig} — shutting down`);
       agent.stop();
+      journal?.stop();
       // Flush the spool before we go: the lines describing a shutdown are exactly the ones you want
       // when the box comes back up wrong.
       logger.stop();

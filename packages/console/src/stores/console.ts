@@ -10,7 +10,7 @@
  * The wall view (owned by console-wall) reads exclusively through this store's getters/actions.
  */
 import { defineStore } from "pinia";
-import { PROTOCOL_VERSION, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
+import { PROTOCOL_VERSION, ServerToAdminLogMessage, ServerToAdminMessage, parseMessage } from "@polyptic/protocol";
 import type {
   BootOrderPolicy,
   ActivityEvent,
@@ -96,6 +96,9 @@ let socket: WebSocket | null = null;
 // `admin/shell-*` frames back over the same socket.
 type ShellFrame = { t: string; machineId?: string; sessionId?: string; ok?: boolean; reason?: string; dataBase64?: string };
 const shellListeners = new Set<(f: ShellFrame) => void>();
+/** POL-188 — the Logs view's live-tail subscribers (module scope, like the shell's, so every
+ *  caller shares the one socket rather than each opening its own). */
+const logListeners = new Set<(f: ServerToAdminLogMessage) => void>();
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let backoffMs = RECONNECT_MIN_MS;
 let stopped = false;
@@ -925,6 +928,13 @@ export const useConsoleStore = defineStore("console", {
           for (const cb of shellListeners) cb(raw);
           return;
         }
+        // POL-188 — live log lines go straight to the Logs view, for the same reason the shell
+        // frames bypass the strict admin-state parse: they are a stream, not registry state.
+        if (raw && raw.t === "server/log-lines") {
+          const parsed = ServerToAdminLogMessage.safeParse(raw);
+          if (parsed.success) for (const cb of logListeners) cb(parsed.data);
+          return;
+        }
         let msg: ServerToAdminMessage;
         try {
           msg = parseMessage(ServerToAdminMessage, ev.data as string);
@@ -1161,6 +1171,29 @@ export const useConsoleStore = defineStore("console", {
         if (machine) machine.shellEnabled = !enabled; // revert
         console.error("[console] setMachineShell failed", err);
       }
+    },
+
+    /**
+     * POL-188 — start (or re-filter) following the fleet's logs live over the admin socket.
+     * Re-calling REPLACES the filter server-side, so changing a dropdown while following costs one
+     * frame and no unsubscribe. Returns false when the socket is down (the caller stays static).
+     */
+    followLogs(filter: Record<string, unknown>): boolean {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+      socket.send(JSON.stringify({ t: "admin/log-subscribe", filter }));
+      return true;
+    },
+
+    /** POL-188 — stop following. Safe to call when already stopped, or when the socket is gone. */
+    unfollowLogs(): void {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ t: "admin/log-unsubscribe" }));
+    },
+
+    /** POL-188 — subscribe to live log frames. Returns an unsubscribe. */
+    onLogLines(cb: (f: ServerToAdminLogMessage) => void): () => void {
+      logListeners.add(cb);
+      return () => logListeners.delete(cb);
     },
 
     /** Send an `admin/shell-*` frame over the live admin socket (the terminal component's uplink). */

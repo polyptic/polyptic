@@ -44,3 +44,27 @@ export function redactMessage(msg: string): string {
     return redactUrl(bare) + (trailing ? trailing[0] : "");
   });
 }
+
+/**
+ * Strip control characters from text destined for a log line.
+ *
+ * Not paranoia — this was found in the wild the moment POL-189 started ingesting the host's own
+ * journal: a Bun error message arrived carrying `\t\x00\x00\x00\n\x00\x00\x00` in the middle
+ * of a sentence, which rendered in the console as `— le not found in $PATH` (the NULs having eaten
+ * the preceding word). Once the logger's input includes journald, Chrome's stderr and OS error
+ * strings, "the message is clean UTF-8 text" stops being an assumption anyone gets to make.
+ *
+ * NUL in particular is the dangerous one: it survives JSON round-trips intact and then truncates at
+ * whatever C-string boundary it eventually meets. Newlines and tabs go too — a log LINE is one
+ * line, and an embedded newline in a rendered view or a `grep` of the NDJSON reads as two records.
+ *
+ * Kept separate from `redactUrl`/`redactMessage` because the concerns are different: redaction is
+ * about secrets and MUST happen at the emitter; this is about well-formedness and is applied both
+ * there and at the sink, so nothing binary can reach a partition whatever wrote it.
+ */
+export function sanitizeLogText(text: string): string {
+  // C0 controls, DEL, and the C1 range. Replaced with a space rather than removed, so a mangled
+  // word stays visibly mangled instead of silently closing up into a plausible different word.
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/ {3,}/g, "  ");
+}

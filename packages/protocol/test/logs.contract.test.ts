@@ -21,6 +21,7 @@ import {
   levelAtLeast,
   redactMessage,
   redactUrl,
+  sanitizeLogText,
 } from "../src/index";
 
 const line = {
@@ -127,5 +128,34 @@ describe("redaction", () => {
 
   test("a non-URL string does not throw", () => {
     expect(redactUrl("not a url at all")).toBe("not a url at all");
+  });
+});
+
+describe("control characters (POL-189)", () => {
+  /** Built from escapes rather than pasted, so the fixture itself stays readable in a diff. */
+  const NUL = String.fromCharCode(0);
+
+  test("strips the control bytes that ate a word in the wild", () => {
+    // The exact shape found the moment the host journal started arriving: a Bun error message
+    // carrying tabs and NULs mid-sentence, which rendered in the console as "— le not found in
+    // $PATH" because the control bytes had swallowed the word before them.
+    const raw = `host journal is only PARTLY readable — \t${NUL}${NUL}${NUL}\n${NUL}${NUL}${NUL}le not found in $PATH`;
+    const clean = sanitizeLogText(raw);
+
+    expect(clean).not.toContain(NUL);
+    expect(clean).not.toContain("\n");
+    expect(clean).not.toContain("\t");
+    // The damage stays VISIBLE rather than closing up into a plausible different word.
+    expect(clean).toContain("le not found in $PATH");
+  });
+
+  test("a log LINE stays one line — an embedded newline would read as two records", () => {
+    expect(sanitizeLogText("first\nsecond")).toBe("first second");
+  });
+
+  test("ordinary text is untouched, including non-ASCII", () => {
+    expect(sanitizeLogText("panel slept on HDMI-1 — dpms off · ok")).toBe(
+      "panel slept on HDMI-1 — dpms off · ok",
+    );
   });
 });
