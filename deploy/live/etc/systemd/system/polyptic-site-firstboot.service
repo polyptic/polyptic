@@ -1,0 +1,21 @@
+[Unit]
+Description=Polyptic, run the site layer's boot hooks with this box's site secrets (POL-190)
+Documentation=file:///usr/local/lib/polyptic/site-firstboot.sh
+# Registration talks to the organisation's cloud, so it needs a route and working DNS.
+After=network-online.target polyptic-agent-env.service
+Wants=network-online.target
+# DELIBERATELY NOT ordered before greetd. A site hook that hangs or fails must not delay or block the
+# wall coming up (D65, and the zero-click cold-boot promise): the session and the registration race
+# each other and the screen always wins. The hook script is time-boxed and always exits 0.
+ConditionPathExists=/usr/local/lib/polyptic/site-firstboot.sh
+ConditionPathIsDirectory=/etc/polyptic/site/firstboot.d
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/polyptic/site-firstboot.sh
+# The secrets live in /run (tmpfs) for the life of the boot and die with it. Nothing here writes to the
+# read-only image, and nothing persists to a published artifact.
+
+[Install]
+WantedBy=multi-user.target

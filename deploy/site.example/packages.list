@@ -1,0 +1,14 @@
+# One package per line. Installed at BUILD time with --no-install-recommends, from either the Ubuntu
+# archive or a repo you added in apt/. A package that does not exist for the architecture being built
+# is skipped loudly rather than failing the build, because vendor coverage on arm64 rarely matches
+# amd64 and a mixed fleet still has to build.
+#
+# Recommends are declined deliberately. A vendor agent's Recommends can drag a desktop stack into an
+# image that streams into RAM on every boot, and that shows up as a hardware requirement on every box.
+#
+# Examples of the kinds of thing that belong here:
+#
+# rsyslog          forward logs to your SIEM (configure it via rootfs/)
+# ca-certificates  already in the base image, listed here only as a reminder that CA files go in rootfs/
+#
+# Your endpoint agent probably ships as a download rather than a repo. Put that in debs/ instead.
