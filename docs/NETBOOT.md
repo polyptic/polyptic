@@ -494,6 +494,10 @@ identically), and the local menu points `set theme=` at that copy, guarded, so a
 theme-less medium still boots to a plain menu on the correct dark background. An installed box's ESP
 (and a legacy offloaded ESP) carries the theme too.
 
+> The medium carries **site secrets** too, at `polyptic/site.conf`, if your organisation injects its own
+> endpoint or compliance tooling into the image. Same trust model as the Wi-Fi credentials, same place,
+> read into RAM at boot and never written to the image. See [`SITE-LAYER.md`](SITE-LAYER.md).
+
 ### The credentials file: `polyptic/wifi.conf`
 
 Plain `KEY=value`, one per line. Values run from the first `=` to the end of the line, so SSIDs and

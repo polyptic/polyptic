@@ -10,6 +10,8 @@ cp -r deploy/site.example deploy/site
 
 Everything here is vendor-neutral by design. Polyptic knows nothing about what you put in it.
 
+**The full guide, with a worked example, the secrets format, verification and troubleshooting, is [`docs/SITE-LAYER.md`](../../docs/SITE-LAYER.md).** This file is the quick contract reference that sits next to the template.
+
 ## The one rule
 
 **Packages install at build time. Registration happens on the box, at boot.**
