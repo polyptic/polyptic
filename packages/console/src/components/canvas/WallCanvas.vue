@@ -93,6 +93,13 @@ function showNotice(message: string): void {
   noticeTimer = setTimeout(() => (notice.value = ""), 5000);
 }
 
+// POL-191 — no murals at all. For a FLEET role (operator/admin) that genuinely means the deployment
+// has none yet, and "create one" is the right prompt. For anyone else it means none have been shared
+// with them — a permission problem, which a Create button would not fix and should not imply.
+const noMuralsAtAll = computed(() => store.stateReceived && store.murals.length === 0);
+const hasFleetAccess = computed(
+  () => store.currentUser?.role === "admin" || store.currentUser?.role === "operator",
+);
 const hasPlaced = computed(() =>
   store.activeMuralId ? store.placedScreens(store.activeMuralId).length > 0 : false,
 );
@@ -694,7 +701,22 @@ const guideTop = computed(() => (guideY.value === null ? 0 : guideY.value * SCAL
 
     <div v-if="notice" class="canvas-notice">{{ notice }}</div>
 
-    <div v-if="!hasPlaced" class="empty-canvas">
+    <!-- POL-191 — no murals. Which sentence is true depends on whether this account has fleet
+         access: an empty deployment and an empty share list look identical and are not. -->
+    <div v-if="noMuralsAtAll" class="empty-canvas">
+      <div class="empty-card">
+        <div class="empty-glyph">◍</div>
+        <template v-if="hasFleetAccess">
+          <div class="empty-title">No murals yet</div>
+          <div class="empty-sub">Create one from the mural menu to start placing screens.</div>
+        </template>
+        <template v-else>
+          <div class="empty-title">No murals are shared with you</div>
+          <div class="empty-sub">Ask whoever runs your walls to give you access to one.</div>
+        </template>
+      </div>
+    </div>
+    <div v-else-if="!hasPlaced" class="empty-canvas">
       <div class="empty-card">
         <div class="empty-glyph">▦</div>
         <div class="empty-title">No screens on this mural yet</div>

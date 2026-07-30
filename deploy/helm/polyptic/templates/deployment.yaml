@@ -97,6 +97,14 @@ spec:
                   name: {{ include "polyptic.secretName" . }}
                   key: POLYPTIC_ADMIN_PASSWORD
                   optional: true
+            # POL-191/D174 — the OIDC client secret. Optional: a public client has none, and a
+            # deployment with no IdP at all simply never reads it.
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "polyptic.secretName" . }}
+                  key: OIDC_CLIENT_SECRET
+                  optional: true
             {{- if include "polyptic.postgresql.deployed" . }}
             # ── Bundled Postgres (POL-123/D108) ────────────────────────────────────────────────
             # The password arrives from the Secret and the kubelet expands it into DATABASE_URL via

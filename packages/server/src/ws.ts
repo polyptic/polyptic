@@ -70,7 +70,7 @@ import type { CaptureCoordinator } from "./capture";
 import { pendingUrlFor } from "./state";
 import type { ControlPlane, RegisterMachineInput, ScreenAssignment } from "./state";
 import type { AgentHub, PlayerHub } from "./hub";
-import type { AdminBroadcaster, AdminHub, Presence } from "./admin";
+import type { AdminBroadcaster, AdminHub, AdminViewer, Presence } from "./admin";
 import type { ActivityLog } from "./activity";
 import { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
@@ -117,6 +117,10 @@ interface WsDeps {
   agentMtls?: AgentMtlsChannel;
   /** POL-160 — decides whether a hello'd box should self-update to the bundled agent binary. */
   agentUpdate: AgentUpdateService;
+  /** POL-191 — the grant index. Read at the /admin upgrade to resolve WHICH MURALS that account may
+   *  see, once, for the life of the socket. Optional: absent means everyone sees everything, which is
+   *  `open` visibility and the pre-POL-191 behaviour. */
+  grants?: { visibleMuralIds(subject: { id: string; role: OperatorRole; groups: string[] }): Set<string> | "all" };
   /** POL-187 — the fleet log sink: where `agent/logs` batches and the players' lines are stored. */
   logs: LogSink;
 }
@@ -191,7 +195,7 @@ function peerAddress(req: IncomingMessage): string | undefined {
 }
 
 export function attachWebSockets(deps: WsDeps): ShellRelay {
-  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls, agentUpdate, logs } =
+  const { server, control, enrollment, auth, playerAuth, hub, agentHub, adminHub, presence, broadcaster, activity, capture, health, devtoolsRelay, panelPower, log, allowedOrigins, agentMtls, agentUpdate, logs, grants } =
     deps;
 
   // The remote-shell relay (POL-59) bridges an operator's /admin socket to a machine's /agent socket.
@@ -241,8 +245,14 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
       // a viewer receives state at all — read access), but the frames that DO something (the POL-59
       // remote shell) are re-checked against that role in `handleAdmin`. With auth disabled there is no
       // session and nothing is enforced anywhere, so the socket runs as `admin` — same as /auth/me.
+      //
+      // POL-191: it also carries WHICH MURALS that account may see, resolved once here from the
+      // grant index. Under `open` visibility (the default) that is always "all", so this changes
+      // nothing; under `scoped` it is what narrows every state push on this socket.
       if (!auth.enabled) {
-        adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, "admin"));
+        adminWss.handleUpgrade(req, socket, head, (ws) =>
+          adminWss.emit("connection", ws, "admin", { visible: "all" } satisfies AdminViewer),
+        );
         return;
       }
       void auth
@@ -254,7 +264,14 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
             socket.destroy();
             return;
           }
-          adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit("connection", ws, user.role));
+          const viewer: AdminViewer = {
+            visible: grants
+              ? grants.visibleMuralIds({ id: user.id, role: user.role, groups: user.groups })
+              : "all",
+          };
+          adminWss.handleUpgrade(req, socket, head, (ws) =>
+            adminWss.emit("connection", ws, user.role, viewer),
+          );
         })
         .catch((err) => {
           log.warn({ event: "admin.ws.error", err: String(err) }, "error gating /admin upgrade");
@@ -347,8 +364,18 @@ export function attachWebSockets(deps: WsDeps): ShellRelay {
   playerWss.on("connection", (ws: WebSocket) =>
     handlePlayer(ws, playerAuth, control, hub, presence, broadcaster, activity, health, logs, log),
   );
-  adminWss.on("connection", (ws: WebSocket, role: OperatorRole) =>
-    handleAdmin(ws, role ?? "admin", adminHub, broadcaster, control, shellRelay, logs, log),
+  adminWss.on("connection", (ws: WebSocket, role: OperatorRole, viewer?: AdminViewer) =>
+    handleAdmin(
+      ws,
+      role ?? "admin",
+      viewer ?? { visible: "all" },
+      adminHub,
+      broadcaster,
+      control,
+      shellRelay,
+      logs,
+      log,
+    ),
   );
 
   return shellRelay;
@@ -1435,6 +1462,9 @@ function handleAdmin(
   ws: WebSocket,
   /** The role of the operator who opened this socket (POL-107) — fixed for its lifetime. */
   role: OperatorRole,
+  /** POL-191 — which murals this socket may see, resolved at upgrade and fixed for its lifetime too.
+   *  A grant handed out mid-session reaches that console on its next connect. */
+  viewer: AdminViewer,
   adminHub: AdminHub,
   broadcaster: AdminBroadcaster,
   control: ControlPlane,
@@ -1443,12 +1473,21 @@ function handleAdmin(
   logs: LogSink,
   log: FastifyBaseLogger,
 ): void {
-  adminHub.add(ws);
-  log.info({ event: "admin.connected", role, admins: adminHub.count() }, "admin socket opened");
+  adminHub.add(ws, viewer);
+  log.info(
+    {
+      event: "admin.connected",
+      role,
+      admins: adminHub.count(),
+      // How much of the fleet this socket will be shown — `null` for all of it.
+      visibleMurals: viewer.visible === "all" ? null : viewer.visible.size,
+    },
+    "admin socket opened",
+  );
 
-  // On connect: push the current registry snapshot straight away.
+  // On connect: push the current registry snapshot straight away — this socket's slice of it.
   if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(broadcaster.snapshot()));
+    ws.send(JSON.stringify(broadcaster.snapshot(viewer)));
   }
 
   // ── POL-188: the live log tail, per socket ─────────────────────────────────
@@ -1517,9 +1556,10 @@ function handleAdmin(
     }
 
     if (msg.t === "admin/hello") {
-      // Re-send a fresh snapshot so the client has state regardless of connect/hello timing.
+      // Re-send a fresh snapshot so the client has state regardless of connect/hello timing. Same
+      // slice as the greeting — a client cannot widen its own view by saying hello again.
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(broadcaster.snapshot()));
+        ws.send(JSON.stringify(broadcaster.snapshot(viewer)));
       }
       log.info({ event: "admin.hello" }, "admin registered");
       return;

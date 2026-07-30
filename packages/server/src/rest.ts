@@ -35,6 +35,9 @@
  */
 import { z } from "zod";
 
+import { toMuralGrantView } from "./grants";
+import type { GrantService } from "./grants";
+import type { AuthService } from "./auth-local";
 import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
 import { probeFraming } from "./framing";
@@ -63,8 +66,10 @@ import {
   ServerToAgentInstall,
   machineHasName,
   MoveTargetsBody,
+  MuralGrantSubjectKind,
   PanelPowerBody,
   PlaceScreenBody,
+  PutMuralGrantBody,
   UnplaceScreensBody,
   PreRegistration,
   RebootBody,
@@ -95,8 +100,8 @@ import {
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
-import type { FastifyInstance } from "fastify";
-import type { BulkMachineResult, Screen, ScreenSlice } from "@polyptic/protocol";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { BulkMachineResult, MuralGrant, Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { appliedCount, fanOut, resolveTarget, unknownIdResults } from "./bulk";
 
@@ -139,6 +144,14 @@ const MachineParams = z.object({ machineId: z.string().min(1) });
 /** POL-104 — a pre-registration record id. */
 const PreRegistrationParams = z.object({ id: z.string().min(1) });
 const MuralParams = z.object({ id: z.string().min(1) });
+
+/** POL-191 — a grant is addressed by its mural and its subject, all three in the path so a revoke is
+ *  an ordinary DELETE on the thing it removes. */
+const MuralGrantParams = z.object({
+  id: z.string().min(1),
+  subjectKind: MuralGrantSubjectKind,
+  subjectId: z.string().min(1).max(200),
+});
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
 const ContentSourceParams = z.object({ id: z.string().min(1) });
@@ -187,6 +200,10 @@ export function registerRestRoutes(
   /** POL-94 — per-source content health; a deleted source's reports are dropped with it. */
   health: SourceHealthTracker,
   panelPower: PanelPowerScheduler,
+  /** POL-191 — who holds what on each mural. The gate reads it to authorize; these routes edit it. */
+  grants: GrantService,
+  /** POL-191 — for labelling `user` grants with an email in the People panel. */
+  auth: AuthService,
 ): void {
   // POL-18 — machines whose placed windows the agent may still be holding. A content change on such
   // a machine must push a fresh apply even when the new state has none (so the agent tears the
@@ -340,11 +357,56 @@ export function registerRestRoutes(
 
   // ── Phase 1 routes (unchanged behaviour) ────────────────────────────────────
 
+  // ── POL-191: the REST reads are narrowed the same way the admin socket is ────
+  //
+  // The WS broadcast is what the console actually lives on, but these are the same data over a
+  // different door — and access control that only covers the front one is not access control.
+  // `visibleTo(request)` answers "all" for every FLEET role, so a deployment run by operators and
+  // admins short-circuits every filter below.
+
+  /** Which murals this request's caller may see. `"all"` short-circuits every filter that follows. */
+  function visibleTo(request: FastifyRequest): Set<string> | "all" {
+    const user = request.authUser;
+    if (!user) return "all"; // auth disabled — the gate enforces nothing, so neither does this
+    return grants.visibleMuralIds({ id: user.id, role: user.role, groups: user.groups });
+  }
+
+  /** The screens on murals this caller may see. An UNPLACED screen belongs to no canvas, so it is
+   *  fleet plumbing and appears only for the fleet roles that get `"all"`. */
+  function visibleScreenIds(visible: Set<string> | "all"): Set<string> | "all" {
+    if (visible === "all") return "all";
+    return new Set(
+      control.getPlacements().filter((p) => visible.has(p.muralId)).map((p) => p.screenId),
+    );
+  }
+
   // GET /api/v1/state -> DesiredState
-  fastify.get("/api/v1/state", async () => control.state);
+  //
+  // DesiredState is the RENDER contract — screens and the slice each one is showing — so narrowing it
+  // is narrowing `slices` above all. A slice is the actual content on a wall (URLs, and POL-24
+  // credential-stamped ones at that), which makes this the most sensitive read of the lot.
+  fastify.get("/api/v1/state", async (request) => {
+    const visible = visibleTo(request);
+    if (visible === "all") return control.state;
+    const screenIds = visibleScreenIds(visible);
+    const state = control.state;
+    const mine = (id: string): boolean => screenIds === "all" || screenIds.has(id);
+    return {
+      ...state,
+      screens: state.screens.filter((screen) => mine(screen.id)),
+      slices: Object.fromEntries(Object.entries(state.slices).filter(([id]) => mine(id))),
+      activeScenes: Object.fromEntries(
+        Object.entries(state.activeScenes).filter(([muralId]) => visible.has(muralId)),
+      ),
+    };
+  });
 
   // GET /api/v1/screens -> Screen[]
-  fastify.get("/api/v1/screens", async () => control.getScreens());
+  fastify.get("/api/v1/screens", async (request) => {
+    const screenIds = visibleScreenIds(visibleTo(request));
+    const screens = control.getScreens();
+    return screenIds === "all" ? screens : screens.filter((s) => screenIds.has(s.id));
+  });
 
   // ── Phase 5 — live preview ──────────────────────────────────────────────────
 
@@ -460,7 +522,18 @@ export function registerRestRoutes(
   // ── Phase 2a routes ─────────────────────────────────────────────────────────
 
   // GET /api/v1/machines -> Machine[]
-  fastify.get("/api/v1/machines", async () => control.getMachines());
+  //
+  // A machine is visible when it carries a visible screen. A PENDING box carries none yet, so it is
+  // shown to fleet roles only — which is right: approving one is an admin verb either way.
+  fastify.get("/api/v1/machines", async (request) => {
+    const screenIds = visibleScreenIds(visibleTo(request));
+    const machines = control.getMachines();
+    if (screenIds === "all") return machines;
+    const machineIds = new Set(
+      control.getScreens().filter((s) => screenIds.has(s.id)).map((s) => s.machineId),
+    );
+    return machines.filter((m) => machineIds.has(m.id));
+  });
 
   // POST /api/v1/screens/:screenId/rename  { friendlyName }
   fastify.post("/api/v1/screens/:screenId/rename", async (request, reply) => {
@@ -1651,7 +1724,11 @@ export function registerRestRoutes(
   // broadcast a fresh admin/state (which carries murals[] + placements[]).
 
   // GET /api/v1/murals -> Mural[]
-  fastify.get("/api/v1/murals", async () => control.getMurals());
+  fastify.get("/api/v1/murals", async (request) => {
+    const visible = visibleTo(request);
+    const murals = control.getMurals();
+    return visible === "all" ? murals : murals.filter((m) => visible.has(m.id));
+  });
 
   // POST /api/v1/murals  { name }  -> Mural
   fastify.post("/api/v1/murals", async (request, reply) => {
@@ -1661,6 +1738,9 @@ export function registerRestRoutes(
     }
 
     const mural = await control.createMural(body.data.name);
+    // POL-191 — whoever made it owns it. A team that stands up its own wall can then staff it (add
+    // colleagues, hand out levels) without going back to a fleet admin for every change.
+    if (request.authUser) await grants.grantOwner(mural.id, request.authUser.id);
     fastify.log.info({ event: "mural.create", muralId: mural.id, name: mural.name }, "mural created");
     broadcaster.broadcast();
     return reply.code(201).send({ ok: true, mural });
@@ -1699,11 +1779,110 @@ export function registerRestRoutes(
       return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
     }
 
+    // POL-191 — the grants go with it, so nothing is left pointing at a mural that no longer exists.
+    await grants.removeForMural(params.data.id);
     fastify.log.info({ event: "mural.delete", muralId: params.data.id }, "mural deleted");
     broadcaster.broadcast();
     // A deleted mural dissolves its video walls — push the cleared slices to those members' players.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
     return { ok: true, muralId: params.data.id };
+  });
+
+  // ── POL-191: mural grants — who may drive this wall ──────────────────────────
+  //
+  // The gate has already checked the caller's role ON THIS MURAL before any of these run (operator to
+  // read the list, admin to change it — see ROUTE_POLICY), so the handlers below do not re-check it.
+  // They validate the SUBJECT instead, which the gate has no opinion about.
+
+  /** Decorate grants with the account email behind each `user` subject, for the People panel. */
+  async function muralGrantViews(muralId: string): Promise<MuralGrant[]> {
+    const operators = await auth.listOperators();
+    const emails = new Map(operators.map((o) => [o.id, o.email] as const));
+    return grants.listForMural(muralId).map((g) => toMuralGrantView(g, (id) => emails.get(id)));
+  }
+
+  // GET /api/v1/murals/:id/grants -> { grants: MuralGrant[] }
+  fastify.get("/api/v1/murals/:id/grants", async (request, reply) => {
+    const params = MuralParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    if (!control.getMural(params.data.id)) {
+      return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
+    }
+    return { grants: await muralGrantViews(params.data.id) };
+  });
+
+  // PUT /api/v1/murals/:id/grants  { subjectKind, subjectId, role }  -> create or re-level one grant
+  fastify.put("/api/v1/murals/:id/grants", async (request, reply) => {
+    const params = MuralParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = PutMuralGrantBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    if (!control.getMural(params.data.id)) {
+      return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
+    }
+    // A USER subject must exist — a typo'd id would otherwise sit in the list looking like a granted
+    // permission forever. It may be named by ID or by EMAIL, and the email is what the console sends:
+    // listing every account in the deployment is an admin-only right, so a mural admin who is only a
+    // global viewer has no directory to pick from and must be able to type an address instead.
+    //
+    // A GROUP is deliberately NOT checked. That is the whole point of a group grant: it names a group
+    // the DIRECTORY owns, which may well have no member who has ever signed in here.
+    let subjectId = body.data.subjectId;
+    if (body.data.subjectKind === "user") {
+      const wanted = subjectId.trim().toLowerCase();
+      const operators = await auth.listOperators();
+      const match = operators.find((o) => o.id === subjectId || o.email.toLowerCase() === wanted);
+      if (!match) {
+        return reply.code(404).send({ error: `no account here matches ${body.data.subjectId}` });
+      }
+      // Store the ID, never the email: an account that changes address keeps its permissions.
+      subjectId = match.id;
+    }
+
+    const grant = await grants.put(params.data.id, body.data.subjectKind, subjectId, body.data.role);
+    fastify.log.info(
+      {
+        event: "mural.grant.put",
+        muralId: grant.muralId,
+        subjectKind: grant.subjectKind,
+        subjectId: grant.subjectId,
+        role: grant.role,
+        byUserId: request.authUser?.id,
+      },
+      "mural grant set",
+    );
+    return { ok: true, grants: await muralGrantViews(params.data.id) };
+  });
+
+  // DELETE /api/v1/murals/:id/grants/:subjectKind/:subjectId  -> revoke one grant
+  fastify.delete("/api/v1/murals/:id/grants/:subjectKind/:subjectId", async (request, reply) => {
+    const params = MuralGrantParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const removed = await grants.remove(
+      params.data.id,
+      params.data.subjectKind,
+      params.data.subjectId,
+    );
+    if (!removed) return reply.code(404).send({ error: "no such grant" });
+    fastify.log.info(
+      {
+        event: "mural.grant.revoke",
+        muralId: params.data.id,
+        subjectKind: params.data.subjectKind,
+        subjectId: params.data.subjectId,
+        byUserId: request.authUser?.id,
+      },
+      "mural grant revoked",
+    );
+    return { ok: true, grants: await muralGrantViews(params.data.id) };
   });
 
   // PUT /api/v1/screens/:screenId/placement  { muralId, x, y, w?, h? }  -> place or move a screen
@@ -1801,7 +1980,11 @@ export function registerRestRoutes(
   // instant path) and broadcast a fresh admin/state (which now carries videoWalls[]).
 
   // GET /api/v1/walls -> VideoWall[]
-  fastify.get("/api/v1/walls", async () => control.getVideoWalls());
+  fastify.get("/api/v1/walls", async (request) => {
+    const visible = visibleTo(request);
+    const walls = control.getVideoWalls();
+    return visible === "all" ? walls : walls.filter((w) => visible.has(w.muralId));
+  });
 
   // POST /api/v1/murals/:muralId/walls  { muralId, memberScreenIds }  -> combine into a VideoWall (201)
   fastify.post("/api/v1/murals/:muralId/walls", async (request, reply) => {
@@ -2982,7 +3165,11 @@ export function registerRestRoutes(
   // (POL-89): dayparts + schedules, resolved by a ticker that calls this same apply path.
 
   // GET /api/v1/scenes -> Scene[]
-  fastify.get("/api/v1/scenes", async () => control.getScenes());
+  fastify.get("/api/v1/scenes", async (request) => {
+    const visible = visibleTo(request);
+    const scenes = control.getScenes();
+    return visible === "all" ? scenes : scenes.filter((s) => visible.has(s.muralId));
+  });
 
   // POST /api/v1/scenes  { name, muralId }  -> snapshot the mural's CURRENT wall as a new Scene (201)
   fastify.post("/api/v1/scenes", async (request, reply) => {

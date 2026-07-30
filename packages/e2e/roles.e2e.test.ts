@@ -336,12 +336,63 @@ describe("POL-107 — a VIEWER", () => {
   );
 
   test(
-    "CAN apply a saved scene — the one mutation it holds (reaches the handler: 404, not 403)",
+    "CANNOT apply a scene on a mural nobody granted it — access, not just power (POL-191)",
     async () => {
+      // POL-107 let ANY viewer invoke ANY saved scene, fleet-wide. POL-191/D176 ended that: applying
+      // a scene REPAINTS a wall, so it is measured on that scene's mural, and a viewer holds nothing
+      // on a mural it was not granted. An unknown scene resolves to no mural at all, which for a
+      // non-fleet account is the same answer — the tray and the unknown both belong to the fleet.
       const res = await req("POST", "/api/v1/scenes/no-such-scene/apply", { jar: viewer.jar! });
-      // The scene id is deliberately unknown, so the HANDLER answers 404. What matters is that the
-      // gate let it through: a 403 here would mean a viewer can never invoke anything.
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(403);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "…and CAN apply one once it holds a grant on that scene's mural (reaches the handler)",
+    async () => {
+      // The positive half, end to end: an admin creates a mural, snapshots a scene on it, and grants
+      // the viewer `viewer` THERE. The same route that just 403'd now reaches its handler.
+      const mural = await reqJson<{ mural: { id: string } }>("POST", "/api/v1/murals", {
+        jar: admin.jar!,
+        body: { name: "Granted mural" },
+      });
+      expect(mural.status).toBe(201);
+      const muralId = mural.json.mural.id;
+
+      const scene = await reqJson<{ scene: { id: string } }>("POST", "/api/v1/scenes", {
+        jar: admin.jar!,
+        body: { name: "Granted scene", muralId },
+      });
+      expect(scene.status).toBe(201);
+      const sceneId = scene.json.scene.id;
+
+      // Still refused BEFORE the grant — the scene exists, the access does not.
+      expect(
+        (await req("POST", `/api/v1/scenes/${sceneId}/apply`, { jar: viewer.jar! })).status,
+      ).toBe(403);
+
+      const granted = await req("PUT", `/api/v1/murals/${muralId}/grants`, {
+        jar: admin.jar!,
+        body: { subjectKind: "user", subjectId: VIEWER_EMAIL, role: "viewer" },
+      });
+      expect(granted.status).toBe(200);
+
+      // Now the gate lets it through. 200 (it applies) — what matters is that it is no longer 403.
+      const applied = await req("POST", `/api/v1/scenes/${sceneId}/apply`, { jar: viewer.jar! });
+      expect(applied.status).not.toBe(403);
+
+      // …and REVOKING it closes the door again, with no re-login involved.
+      expect(
+        (
+          await req("DELETE", `/api/v1/murals/${muralId}/grants/user/${viewer.id}`, {
+            jar: admin.jar!,
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (await req("POST", `/api/v1/scenes/${sceneId}/apply`, { jar: viewer.jar! })).status,
+      ).toBe(403);
     },
     TEST_TIMEOUT,
   );

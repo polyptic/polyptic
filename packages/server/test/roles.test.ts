@@ -215,7 +215,19 @@ describe("AuthService — operator management", () => {
     const view = created as Record<string, unknown>;
     expect(view.role).toBe("viewer");
     expect(view.passwordHash).toBeUndefined();
-    expect(Object.keys(view).sort()).toEqual(["createdAt", "email", "id", "role"]);
+    // The key set is pinned so a field can never join the view by accident — POL-191 added three
+    // (provider/displayName/groups) and a locally-created account carries the local answer to each.
+    expect(Object.keys(view).sort()).toEqual([
+      "createdAt",
+      "displayName",
+      "email",
+      "groups",
+      "id",
+      "provider",
+      "role",
+    ]);
+    expect(view.provider).toBe("local");
+    expect(view.groups).toEqual([]);
   });
 
   test("an admin password RESET revokes that operator's live sessions", async () => {

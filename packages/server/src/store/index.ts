@@ -20,6 +20,7 @@ export type {
   PersistedMachine,
   PersistedMtlsCa,
   PersistedMural,
+  PersistedMuralGrant,
   PersistedPlacement,
   PersistedScene,
   PersistedScreen,

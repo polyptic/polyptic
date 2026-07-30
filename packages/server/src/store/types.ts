@@ -23,6 +23,8 @@ import type {
   ImageRing,
   MachineBootPath,
   MachineDisk,
+  MuralGrantSubjectKind,
+  OperatorProvider,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -309,10 +311,28 @@ export interface PersistedSchedulerSettings {
 export interface PersistedUser {
   id: string;
   email: string;
-  /** argon2id hash (Bun.password). The plaintext password is never stored or logged. */
-  passwordHash: string;
+  /**
+   * argon2id hash (Bun.password). The plaintext password is never stored or logged.
+   *
+   * POL-191 — NULL for a brokered (`oidc`) account, and that is load-bearing rather than merely tidy:
+   * the local login path treats a null hash as "this account has no password" and refuses BEFORE it
+   * verifies anything, so no string a caller supplies can ever authenticate a brokered identity.
+   */
+  passwordHash: string | null;
   /** ISO-8601 creation timestamp. */
   createdAt: string;
+  /** POL-191 — `local` (email+password here) or `oidc` (brokered). Pre-POL-191 rows are `local`. */
+  provider: OperatorProvider;
+  /** POL-191 — the issuer that vouched for an `oidc` account, and the IdP's stable subject id for it.
+   *  The account is keyed on this PAIR, never on the email: an IdP may recycle an address, and matching
+   *  on one would silently hand a new person an old account. Both null for a `local` account. */
+  issuer: string | null;
+  subject: string | null;
+  /** The IdP's human name for the account (`name` claim), when it gave one. */
+  displayName: string | null;
+  /** POL-191 — groups asserted at the LAST sign-in. Refreshed on every sign-in, so a directory removal
+   *  takes effect the next time they log in. Group mural-grants resolve through this. */
+  groups: string[];
   /**
    * POL-107 — what this account may do (`admin` | `operator` | `viewer`). A row written before
    * POL-107 has no role column value; the Postgres migration back-fills `admin` (that single account
@@ -333,6 +353,21 @@ export interface PersistedSession {
   createdAt: string;
   /** ISO-8601 expiry. A session past this instant is treated as absent and swept. */
   expiresAt: string;
+}
+
+/**
+ * POL-191 — one persisted mural grant. The row is the whole grant: (mural, subject) is its identity,
+ * and `role` is what that subject may do there. There is no cascade FROM the user table for a `group`
+ * grant, because a group has no row anywhere — it exists only as a claim the IdP asserts.
+ */
+export interface PersistedMuralGrant {
+  muralId: string;
+  subjectKind: MuralGrantSubjectKind;
+  /** A user id, or a group name stored LOWER-CASED (group claims are matched case-insensitively —
+   *  directories are inconsistent about case and a permission that depends on it is a trap). */
+  subjectId: string;
+  role: OperatorRole;
+  createdAt: string;
 }
 
 /** Enrollment mode for the agent bootstrap token (mirrors the protocol `EnrollmentInfo.mode`). */
@@ -652,6 +687,21 @@ export interface Store {
   getUserByEmail(email: string): Promise<PersistedUser | undefined>;
   /** Look up a user by id. Used when resolving a session back to its operator. */
   getUserById(id: string): Promise<PersistedUser | undefined>;
+  /** POL-191 — look up a BROKERED account by the (issuer, subject) pair the IdP asserted. The only
+   *  way an OIDC sign-in resolves an existing account; an email match is deliberately not enough. */
+  getUserBySubject(issuer: string, subject: string): Promise<PersistedUser | undefined>;
+  /** POL-191 — refresh what the IdP said about a brokered account at this sign-in: its email, name,
+   *  groups and mapped global role. Called on EVERY OIDC sign-in, so the directory stays the
+   *  authority and a group removal demotes at the next login. No-op if absent. */
+  updateUserIdentity(
+    id: string,
+    identity: {
+      email: string;
+      displayName: string | null;
+      groups: string[];
+      role: OperatorRole;
+    },
+  ): Promise<void>;
   /** How many users exist — drives "seed an admin on first boot if none exist". */
   countUsers(): Promise<number>;
   /** Insert a new user row (id + email + argon2id hash + created_at + role). */
@@ -677,6 +727,20 @@ export interface Store {
   deleteSessionsForUser(userId: string): Promise<void>;
   /** Sweep sessions whose expires_at is at or before `nowIso`. */
   deleteExpiredSessions(nowIso: string): Promise<void>;
+
+  // ── Mural grants (POL-191) ─────────────────────────────────────────────────
+  /** Every grant in the deployment. Read ONCE at boot into the in-memory index the gate consults —
+   *  the gate runs on every API call and must never wait on a database round-trip to authorize one. */
+  listMuralGrants(): Promise<PersistedMuralGrant[]>;
+  /** Insert-or-replace one grant, keyed on (mural, subject_kind, subject_id). */
+  upsertMuralGrant(grant: PersistedMuralGrant): Promise<void>;
+  /** Revoke one grant. No-op if absent. */
+  deleteMuralGrant(muralId: string, subjectKind: MuralGrantSubjectKind, subjectId: string): Promise<void>;
+  /** Drop every grant on a mural — called when the mural itself is deleted, so a recycled id can
+   *  never inherit the permissions of the mural that used to hold it. */
+  deleteMuralGrantsForMural(muralId: string): Promise<void>;
+  /** Drop every grant held by a user — called when the account is deleted, same reasoning. */
+  deleteMuralGrantsForUser(userId: string): Promise<void>;
 
   // ── Enrollment bootstrap token (Phase 3f) ──────────────────────────────────
   /** The persisted enrollment bootstrap (mode + token). Undefined before first seed. */
