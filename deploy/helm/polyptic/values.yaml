@@ -668,6 +668,25 @@ imageUpdates:
   tolerations: []
 
 # ─────────────────────────────────────────────────────────────────────────────
+# How much of the deployment each account SEES (POL-191/D175).
+#
+#   open   — the DEFAULT, and the pre-POL-191 world. Everyone signed in sees the
+#            whole fleet; mural grants only ever ADD to what they may change.
+#            A single-team deployment wants this, and an upgrade never becomes
+#            the other one by accident.
+#   scoped — a SHARED deployment. A global `viewer` sees only the murals they
+#            hold a grant on, and holds no role at all on the rest — sight and
+#            power narrow together, so there is no wall they can repaint but not
+#            see. `operator` and `admin` are fleet-wide roles and are unchanged:
+#            they keep seeing everything, because hiding a wall from someone who
+#            can still reconfigure it would be the worse lie.
+#
+# The shape a hosted deployment wants is therefore: everyone lands on `viewer`
+# (which oidc.defaultRole already does), and murals are handed out with grants.
+# A viewer with no grants sees an empty console that says so.
+visibility: open
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Brokered sign-in over OIDC (POL-191/D173) — how an organisation's own people
 # get in, without anyone hand-minting a local account for each of them.
 #

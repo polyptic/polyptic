@@ -40,8 +40,15 @@ import type { OperatorRole } from "@polyptic/protocol";
 /** Rank: a role may do anything at or below its own rank. */
 const RANK: Record<OperatorRole, number> = { viewer: 0, operator: 1, admin: 2 };
 
-/** Does `have` satisfy `need`? (viewer < operator < admin) */
-export function roleAllows(have: OperatorRole, need: OperatorRole): boolean {
+/**
+ * Does `have` satisfy `need`? (viewer < operator < admin)
+ *
+ * POL-191 — `null` is NO ROLE AT ALL, which only `scoped` visibility can produce: a viewer on a mural
+ * nobody gave them. It satisfies nothing, including `viewer`, which is the point — a role floor that
+ * quietly reappeared underneath a scoped account would make the scoping decorative.
+ */
+export function roleAllows(have: OperatorRole | null, need: OperatorRole): boolean {
+  if (have === null) return false;
   return RANK[have] >= RANK[need];
 }
 
@@ -105,9 +112,14 @@ export const ROUTE_POLICY: RoutePolicy[] = [
   // Views only — the profile's secret is never in the payload (POL-24). A viewer sees which profile a
   // source uses; it cannot create, edit, test or delete one (those fall through to admin).
   { method: "GET", pattern: seg("/credential-profiles"), role: "viewer" },
-  { method: "GET", pattern: seg("/screens/:seg/thumbnail"), role: "viewer" },
+  // POL-191 — a thumbnail IS the wall's content, so it is measured on the screen's mural. In `open`
+  // mode a global viewer satisfies that everywhere and nothing changes; in `scoped` mode a live
+  // picture of a wall you cannot see would be the biggest hole in the whole feature.
+  { method: "GET", pattern: seg("/screens/:id/thumbnail"), role: "viewer", scope: VIA("screen") },
   // ── viewer: INVOKE a saved scene — the "staff invoke" half of the split ───────
-  { method: "POST", pattern: seg("/scenes/:seg/apply"), role: "viewer" },
+  // Scoped to the scene's own mural for the same reason: applying a scene REPAINTS a wall, and a
+  // scoped viewer must not be able to repaint one they were never given.
+  { method: "POST", pattern: seg("/scenes/:id/apply"), role: "viewer", scope: VIA("scene") },
 
   // ── operator: the content library + media — fleet-wide surfaces a mural owner needs ──
   // `any-mural`: holding operator on ANY mural is enough to add to the shared library. See RouteScope.

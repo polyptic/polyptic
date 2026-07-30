@@ -2677,10 +2677,32 @@ export const UpdateBootOrderPolicyBody = z.object({
 });
 export type UpdateBootOrderPolicyBody = z.infer<typeof UpdateBootOrderPolicyBody>;
 
+/**
+ * POL-191 — how much of the deployment a signed-in account is shown.
+ *
+ *   - `open`   — the DEFAULT, and exactly the pre-POL-191 world: everyone signed in sees the whole
+ *                fleet, and mural grants only ever ADD to what they may change. A single-team
+ *                deployment wants this, and an upgrade must never silently become the other one.
+ *   - `scoped` — a shared deployment. A global `viewer` sees ONLY the murals they hold a grant on,
+ *                and holds no role at all on the rest — so sight and power stay the same shape, which
+ *                is the only version of this that does not lie. Global `operator` and `admin` are
+ *                fleet-wide roles and keep seeing everything, because hiding a wall someone can still
+ *                reconfigure would be a worse falsehood than showing it.
+ *
+ * The intended shape for a hosted deployment is therefore: everyone lands on `viewer` (which is what
+ * `OIDC_DEFAULT_ROLE` already does), and murals are handed out with grants.
+ */
+export const VisibilityMode = z.enum(["open", "scoped"]);
+export type VisibilityMode = z.infer<typeof VisibilityMode>;
+
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
   t: z.literal("admin/state"),
   revision: z.number().int().nonnegative(),
+  /** POL-191 — whether what follows is the WHOLE deployment or only this account's slice of it. The
+   *  console needs it to tell "nothing here yet" apart from "nothing here that is yours", which are
+   *  the same empty canvas and completely different problems. Defaulted for a pre-POL-191 server. */
+  visibility: VisibilityMode.default("open"),
   machines: z.array(MachineView),
   murals: z.array(Mural), // Phase 3
   placements: z.array(Placement), // Phase 3 — which screen sits where on which mural

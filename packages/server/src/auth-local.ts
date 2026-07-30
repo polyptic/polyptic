@@ -508,7 +508,9 @@ export class AuthService {
       await reply.code(403).send({
         error: "forbidden",
         requiredRole: requirement.role,
-        role: have,
+        // `none` rather than null: under scoped visibility the honest answer is that the caller holds
+        // no role here at all, and a null in a JSON error reads as "we did not work it out".
+        role: have ?? "none",
         ...(muralId ? { muralId } : {}),
       });
       return;
@@ -532,7 +534,7 @@ export class AuthService {
     user: AuthUser,
     requirement: RouteRequirement,
     request: FastifyRequest,
-  ): { role: OperatorRole; muralId: string | null } {
+  ): { role: OperatorRole | null; muralId: string | null } {
     const grants = this.grants;
     if (!grants || requirement.scope.kind === "global") return { role: user.role, muralId: null };
 
@@ -545,7 +547,14 @@ export class AuthService {
       requirement.scope.via === "body"
         ? muralIdFromBody(request.body)
         : (this.muralLookup?.(requirement.scope.via, requirement.id ?? "") ?? null);
-    if (!muralId) return { role: user.role, muralId: null };
+    if (!muralId) {
+      // No mural to measure against — an unplaced screen, an unknown wall, a body that named none.
+      // In `open` mode that is the caller's global role (the conservative fallback: a grant only ever
+      // widens, so losing the mural can refuse but never admit). In `scoped` mode it is NOTHING for a
+      // non-fleet account, because a thing on no mural is fleet plumbing and a scoped viewer holds
+      // exactly what they were handed — which is never the tray.
+      return { role: grants.unscopedFallbackRole(subject), muralId: null };
+    }
     return { role: grants.effectiveRole(subject, muralId), muralId };
   }
 

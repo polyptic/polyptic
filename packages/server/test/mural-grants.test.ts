@@ -409,3 +409,183 @@ describe("requireAuth — a grant carries a request through, and only the right 
     expect(await attempt(op, "POST", "/api/v1/machines/box1/reboot")).toBe(403);
   });
 });
+
+/**
+ * POL-191/D175 — SCOPED VISIBILITY: `VISIBILITY=scoped`.
+ *
+ * Two properties carry the whole feature, and both are about what must NOT happen:
+ *
+ *   1. **Turning it on is the only way to get it.** Every assertion in this file above this point is
+ *      `open` mode, and none of them changes. An upgrade cannot silently hide a deployment from its
+ *      own operators.
+ *   2. **Sight and power narrow TOGETHER.** A scoped viewer who could still apply a scene, read a
+ *      thumbnail, or reach a wall through a REST list would be scoped in name only — so the floor
+ *      that used to give every account `viewer` everywhere is removed, not just filtered out of the
+ *      broadcast.
+ */
+describe("scoped visibility — a viewer holds only what they were handed", () => {
+  let grants: GrantService;
+
+  beforeEach(async () => {
+    grants = new GrantService(new MemoryStore(), "scoped");
+    await grants.load();
+    await grants.put(ATRIUM, "user", "user_alex", "operator");
+  });
+
+  test("no implicit floor: a viewer holds NOTHING on a mural nobody gave them", () => {
+    expect(grants.effectiveRole(subject("viewer"), FOYER)).toBeNull();
+  });
+
+  test("…and exactly what they were given on the one they hold", () => {
+    expect(grants.effectiveRole(subject("viewer"), ATRIUM)).toBe("operator");
+  });
+
+  test("a grant is still not lowered by the global role, nor raised past what it says", async () => {
+    await grants.put(FOYER, "user", "user_alex", "viewer");
+    expect(grants.effectiveRole(subject("viewer"), FOYER)).toBe("viewer");
+  });
+
+  test("FLEET ROLES ARE UNCHANGED — an operator and an admin keep every mural", () => {
+    expect(grants.effectiveRole(subject("operator"), FOYER)).toBe("operator");
+    expect(grants.effectiveRole(subject("admin"), FOYER)).toBe("admin");
+    expect(grants.visibleMuralIds(subject("operator"))).toBe("all");
+    expect(grants.visibleMuralIds(subject("admin"))).toBe("all");
+  });
+
+  test("visibleMuralIds is exactly the granted set, by user and by group", async () => {
+    await grants.put(FOYER, "group", "wall-team", "viewer");
+    expect(grants.visibleMuralIds(subject("viewer"))).toEqual(new Set([ATRIUM]));
+    expect(grants.visibleMuralIds(subject("viewer", ["wall-team"]))).toEqual(
+      new Set([ATRIUM, FOYER]),
+    );
+    expect(grants.visibleMuralIds(subject("viewer", [], "user_nobody"))).toEqual(new Set());
+  });
+
+  test("a thing on NO mural (the tray) is fleet plumbing — a scoped viewer holds nothing on it", () => {
+    expect(grants.unscopedFallbackRole(subject("viewer"))).toBeNull();
+    // …and a fleet role still falls back to its own global role, as it always did.
+    expect(grants.unscopedFallbackRole(subject("operator"))).toBe("operator");
+  });
+
+  test("OPEN MODE IS UNTOUCHED: the same grants, the same questions, the old answers", async () => {
+    const open = new GrantService(new MemoryStore(), "open");
+    await open.load();
+    await open.put(ATRIUM, "user", "user_alex", "operator");
+    expect(open.effectiveRole(subject("viewer"), FOYER)).toBe("viewer");
+    expect(open.visibleMuralIds(subject("viewer"))).toBe("all");
+    expect(open.unscopedFallbackRole(subject("viewer"))).toBe("viewer");
+  });
+
+  test("the default mode is `open` — scoping is never inferred", async () => {
+    const dflt = new GrantService(new MemoryStore());
+    await dflt.load();
+    expect(dflt.mode).toBe("open");
+    expect(dflt.visibleMuralIds(subject("viewer"))).toBe("all");
+  });
+});
+
+describe("scoped visibility, through the gate — sight and power narrow together", () => {
+  const log = {
+    info() {},
+    warn() {},
+    error() {},
+    debug() {},
+    trace() {},
+    fatal() {},
+    child() {
+      return log;
+    },
+  } as unknown as FastifyBaseLogger;
+
+  const MURAL_OF = new Map<string, string>([
+    ["mural:mural_atrium", ATRIUM],
+    ["mural:mural_foyer", FOYER],
+    ["screen:scr_atrium", ATRIUM],
+    ["screen:scr_foyer", FOYER],
+    ["scene:scene_atrium", ATRIUM],
+    ["scene:scene_foyer", FOYER],
+  ]);
+
+  let auth: AuthService;
+  let grants: GrantService;
+
+  beforeEach(async () => {
+    const store = new MemoryStore();
+    auth = new AuthService({
+      store,
+      fastify: {} as unknown as FastifyInstance,
+      config: authConfigFromEnv({ AUTH_ENABLED: "true" }),
+      log,
+    });
+    grants = new GrantService(store, "scoped");
+    await grants.load();
+    await grants.put(ATRIUM, "user", "user_alex", "operator");
+    auth.useGrants(grants, (via, id) => MURAL_OF.get(`${via}:${id}`) ?? null);
+  });
+
+  async function attempt(
+    user: { id: string; role: "viewer" | "operator" | "admin"; groups?: string[] },
+    method: string,
+    path: string,
+  ): Promise<number | null> {
+    let status: number | null = null;
+    (auth as unknown as { verifyRequest: () => Promise<unknown> }).verifyRequest = async () => ({
+      id: user.id,
+      email: `${user.id}@polyptic.test`,
+      role: user.role,
+      provider: "local" as const,
+      displayName: null,
+      groups: user.groups ?? [],
+    });
+    const request = { method, url: path, cookies: {} } as unknown as FastifyRequest;
+    const reply = {
+      code(value: number) {
+        status = value;
+        return this;
+      },
+      async send() {
+        return undefined;
+      },
+    } as unknown as FastifyReply;
+    await auth.requireAuth(request, reply, path);
+    return status;
+  }
+
+  const ALEX = { id: "user_alex", role: "viewer" as const };
+
+  test("APPLYING A SCENE is refused on a mural they were not given", async () => {
+    // The hole this closes: scene-apply was viewer-level and GLOBAL, so a scoped viewer could have
+    // repainted any wall in the building while being unable to see it.
+    expect(await attempt(ALEX, "POST", "/api/v1/scenes/scene_foyer/apply")).toBe(403);
+    expect(await attempt(ALEX, "POST", "/api/v1/scenes/scene_atrium/apply")).toBeNull();
+  });
+
+  test("A THUMBNAIL is refused too — a live picture of a wall you cannot see is the same leak", async () => {
+    expect(await attempt(ALEX, "GET", "/api/v1/screens/scr_foyer/thumbnail")).toBe(403);
+    expect(await attempt(ALEX, "GET", "/api/v1/screens/scr_atrium/thumbnail")).toBeNull();
+  });
+
+  test("an UNPLACED screen's thumbnail is refused: the tray is fleet plumbing", async () => {
+    expect(await attempt(ALEX, "GET", "/api/v1/screens/scr_tray/thumbnail")).toBe(403);
+  });
+
+  test("the content verbs narrow the same way", async () => {
+    expect(await attempt(ALEX, "PUT", "/api/v1/screens/scr_atrium/content")).toBeNull();
+    expect(await attempt(ALEX, "PUT", "/api/v1/screens/scr_foyer/content")).toBe(403);
+  });
+
+  test("a fleet OPERATOR is unaffected — scoping never narrows a fleet role", async () => {
+    const op = { id: "user_op", role: "operator" as const };
+    expect(await attempt(op, "POST", "/api/v1/scenes/scene_foyer/apply")).toBeNull();
+    expect(await attempt(op, "GET", "/api/v1/screens/scr_foyer/thumbnail")).toBeNull();
+    expect(await attempt(op, "GET", "/api/v1/screens/scr_tray/thumbnail")).toBeNull();
+  });
+
+  test("reading the fleet registry is still open to any signed-in account", async () => {
+    // /state, /murals, /screens etc. stay reachable and are FILTERED rather than refused — a 403 on
+    // the console's own bootstrap read would just be a broken app.
+    expect(await attempt(ALEX, "GET", "/api/v1/state")).toBeNull();
+    expect(await attempt(ALEX, "GET", "/api/v1/murals")).toBeNull();
+    expect(await attempt(ALEX, "GET", "/api/v1/screens")).toBeNull();
+  });
+});

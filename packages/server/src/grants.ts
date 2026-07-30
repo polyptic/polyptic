@@ -36,7 +36,12 @@
  * write. The store is still the authority — this is a cache that is written through, never a
  * second source of truth.
  */
-import type { MuralGrant, MuralGrantSubjectKind, OperatorRole } from "@polyptic/protocol";
+import type {
+  MuralGrant,
+  MuralGrantSubjectKind,
+  OperatorRole,
+  VisibilityMode,
+} from "@polyptic/protocol";
 
 import { roleAllows } from "./roles";
 import type { PersistedMuralGrant, Store } from "./store";
@@ -64,13 +69,26 @@ function key(muralId: string, kind: MuralGrantSubjectKind, subjectId: string): s
   return `${muralId}\u0000${kind}\u0000${subjectId}`;
 }
 
+/**
+ * POL-191 — is this account a FLEET role? `operator` and `admin` are deployment-wide by construction
+ * (POL-107 gave the operator every wall and the admin every machine), so in `scoped` mode they keep
+ * seeing everything. Scoping SIGHT without scoping POWER would show someone less than they can still
+ * change, which is the one outcome worse than showing them too much.
+ */
+function isFleetRole(role: OperatorRole): boolean {
+  return role === "operator" || role === "admin";
+}
+
 export class GrantService {
   private readonly store: Store;
   /** key() → grant. The whole table; it is one row per (mural, subject) and stays small. */
   private readonly grants = new Map<string, PersistedMuralGrant>();
+  /** POL-191 — `open` (the default, and the pre-POL-191 world) or `scoped`. See {@link VisibilityMode}. */
+  readonly mode: VisibilityMode;
 
-  constructor(store: Store) {
+  constructor(store: Store, mode: VisibilityMode = "open") {
     this.store = store;
+    this.mode = mode;
   }
 
   /** Load the table once at boot. Called before the gate is registered. */
@@ -88,18 +106,71 @@ export class GrantService {
   }
 
   /**
-   * The role `subject` holds ON `muralId`: their global role, raised by their best grant there.
-   * Never lower than the global role — see the additive-only rule above.
+   * The role `subject` holds ON `muralId`, or **null** for no role there at all.
+   *
+   * In `open` mode this is the additive rule and nothing else — the global role, raised by the best
+   * matching grant, never lowered, never null. That is the whole of POL-191 as first shipped.
+   *
+   * In `scoped` mode the FLOOR moves. A fleet role (`operator`, `admin`) is still fleet-wide and
+   * unchanged. A `viewer` no longer carries an implicit viewer-everywhere: on a mural they hold no
+   * grant on they hold **nothing**, and the gate refuses them. That is what makes scoping honest —
+   * a viewer who could still apply scenes on a wall they cannot see would be scoped in name only.
    */
-  effectiveRole(subject: GrantSubject, muralId: string): OperatorRole {
-    let best = subject.role;
+  effectiveRole(subject: GrantSubject, muralId: string): OperatorRole | null {
+    const granted = this.bestGrantOn(subject, muralId);
+    if (this.mode === "scoped" && !isFleetRole(subject.role)) {
+      // No implicit floor: their role here is exactly what they were given, or nothing.
+      return granted;
+    }
+    return granted ? pickHigher(subject.role, granted) : subject.role;
+  }
+
+  /** The best grant matching this subject on one mural, ignoring their global role. Null if none. */
+  private bestGrantOn(subject: GrantSubject, muralId: string): OperatorRole | null {
+    let best: OperatorRole | null = null;
     const direct = this.grants.get(key(muralId, "user", subject.id));
-    if (direct) best = pickHigher(best, direct.role);
+    if (direct) best = direct.role;
     for (const group of subject.groups) {
       const grant = this.grants.get(key(muralId, "group", normalizeSubjectId("group", group)));
-      if (grant) best = pickHigher(best, grant.role);
+      if (grant) best = best ? pickHigher(best, grant.role) : grant.role;
     }
     return best;
+  }
+
+  /**
+   * The role to measure a mural-scoped route by when its mural CANNOT be resolved — an unplaced
+   * screen, an unknown wall, a body that named no mural.
+   *
+   * `open`: the caller's global role, the conservative fallback (a grant only widens, so losing the
+   * mural can refuse someone who would have been allowed, and can never admit one who would not).
+   * `scoped`: nothing at all for a non-fleet account. A thing on no mural is fleet plumbing, and a
+   * scoped viewer holds exactly what they were handed — which is never the tray.
+   */
+  unscopedFallbackRole(subject: GrantSubject): OperatorRole | null {
+    if (this.mode === "scoped" && !isFleetRole(subject.role)) return null;
+    return subject.role;
+  }
+
+  /**
+   * WHICH MURALS this account is shown — `"all"`, or the exact set.
+   *
+   * `"all"` is not a convenience: it is what keeps `open` mode (and every fleet role) on the single
+   * shared, serialized-once state broadcast, so the deployment that never asked for any of this pays
+   * nothing for it.
+   *
+   * Everything else in the console follows from this set rather than being filtered on its own terms:
+   * a screen is visible because it is PLACED on a visible mural, a wall because it sits on one, a
+   * scene because it snapshots one. There is exactly one question, asked once.
+   */
+  visibleMuralIds(subject: GrantSubject): Set<string> | "all" {
+    if (this.mode === "open" || isFleetRole(subject.role)) return "all";
+    const groups = new Set(subject.groups.map((g) => normalizeSubjectId("group", g)));
+    const visible = new Set<string>();
+    for (const grant of this.grants.values()) {
+      if (grant.subjectKind === "user" && grant.subjectId === subject.id) visible.add(grant.muralId);
+      else if (grant.subjectKind === "group" && groups.has(grant.subjectId)) visible.add(grant.muralId);
+    }
+    return visible;
   }
 
   /**
@@ -114,6 +185,9 @@ export class GrantService {
    * a model that is shared everywhere else.
    */
   bestRoleAnywhere(subject: GrantSubject): OperatorRole {
+    // The global role IS the floor here even in `scoped` mode, and deliberately: this answers "may
+    // you touch the shared library", not "may you touch a particular wall". A `viewer` floor grants
+    // nothing anyway (every any-mural route asks for operator), so there is no hole to close.
     let best = subject.role;
     const groups = new Set(subject.groups.map((g) => normalizeSubjectId("group", g)));
     for (const grant of this.grants.values()) {

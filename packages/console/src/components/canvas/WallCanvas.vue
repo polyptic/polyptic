@@ -93,6 +93,11 @@ function showNotice(message: string): void {
   noticeTimer = setTimeout(() => (notice.value = ""), 5000);
 }
 
+// POL-191 — a scoped account with no grants at all. Distinct from "this mural is empty": there is no
+// mural, and no button here would help.
+const noMuralsVisible = computed(
+  () => store.stateReceived && store.visibility === "scoped" && store.murals.length === 0,
+);
 const hasPlaced = computed(() =>
   store.activeMuralId ? store.placedScreens(store.activeMuralId).length > 0 : false,
 );
@@ -694,7 +699,18 @@ const guideTop = computed(() => (guideY.value === null ? 0 : guideY.value * SCAL
 
     <div v-if="notice" class="canvas-notice">{{ notice }}</div>
 
-    <div v-if="!hasPlaced" class="empty-canvas">
+    <!-- POL-191 — under scoped visibility, no murals means none were given to you. Saying "create
+         one" there would send someone off to fix a permission problem with the wrong tool. -->
+    <div v-if="noMuralsVisible" class="empty-canvas">
+      <div class="empty-card">
+        <div class="empty-glyph">◍</div>
+        <div class="empty-title">No murals are shared with you</div>
+        <div class="empty-sub">
+          Ask whoever runs your walls to give you access to one.
+        </div>
+      </div>
+    </div>
+    <div v-else-if="!hasPlaced" class="empty-canvas">
       <div class="empty-card">
         <div class="empty-glyph">▦</div>
         <div class="empty-title">No screens on this mural yet</div>

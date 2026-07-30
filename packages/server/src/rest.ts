@@ -100,7 +100,7 @@ import {
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { BulkMachineResult, MuralGrant, Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { appliedCount, fanOut, resolveTarget, unknownIdResults } from "./bulk";
@@ -357,11 +357,56 @@ export function registerRestRoutes(
 
   // ── Phase 1 routes (unchanged behaviour) ────────────────────────────────────
 
+  // ── POL-191: the REST reads are narrowed the same way the admin socket is ────
+  //
+  // The WS broadcast is what the console actually lives on, but these are the same data over a
+  // different door — and a scoping feature that only covers the front one is not a scoping feature.
+  // `visibleTo(request)` answers "all" for `open` mode and every fleet role, so nothing below costs
+  // an existing deployment anything.
+
+  /** Which murals this request's caller may see. `"all"` short-circuits every filter that follows. */
+  function visibleTo(request: FastifyRequest): Set<string> | "all" {
+    const user = request.authUser;
+    if (!user) return "all"; // auth disabled — the gate enforces nothing, so neither does this
+    return grants.visibleMuralIds({ id: user.id, role: user.role, groups: user.groups });
+  }
+
+  /** The screens on murals this caller may see. An UNPLACED screen belongs to no canvas, so it is
+   *  fleet plumbing and appears only for the fleet roles that get `"all"`. */
+  function visibleScreenIds(visible: Set<string> | "all"): Set<string> | "all" {
+    if (visible === "all") return "all";
+    return new Set(
+      control.getPlacements().filter((p) => visible.has(p.muralId)).map((p) => p.screenId),
+    );
+  }
+
   // GET /api/v1/state -> DesiredState
-  fastify.get("/api/v1/state", async () => control.state);
+  //
+  // DesiredState is the RENDER contract — screens and the slice each one is showing — so narrowing it
+  // is narrowing `slices` above all. A slice is the actual content on a wall (URLs, and POL-24
+  // credential-stamped ones at that), which makes this the most sensitive read of the lot.
+  fastify.get("/api/v1/state", async (request) => {
+    const visible = visibleTo(request);
+    if (visible === "all") return control.state;
+    const screenIds = visibleScreenIds(visible);
+    const state = control.state;
+    const mine = (id: string): boolean => screenIds === "all" || screenIds.has(id);
+    return {
+      ...state,
+      screens: state.screens.filter((screen) => mine(screen.id)),
+      slices: Object.fromEntries(Object.entries(state.slices).filter(([id]) => mine(id))),
+      activeScenes: Object.fromEntries(
+        Object.entries(state.activeScenes).filter(([muralId]) => visible.has(muralId)),
+      ),
+    };
+  });
 
   // GET /api/v1/screens -> Screen[]
-  fastify.get("/api/v1/screens", async () => control.getScreens());
+  fastify.get("/api/v1/screens", async (request) => {
+    const screenIds = visibleScreenIds(visibleTo(request));
+    const screens = control.getScreens();
+    return screenIds === "all" ? screens : screens.filter((s) => screenIds.has(s.id));
+  });
 
   // ── Phase 5 — live preview ──────────────────────────────────────────────────
 
@@ -477,7 +522,18 @@ export function registerRestRoutes(
   // ── Phase 2a routes ─────────────────────────────────────────────────────────
 
   // GET /api/v1/machines -> Machine[]
-  fastify.get("/api/v1/machines", async () => control.getMachines());
+  //
+  // A machine is visible when it carries a visible screen. A PENDING box carries none yet, so it is
+  // shown to fleet roles only — which is right: approving one is an admin verb either way.
+  fastify.get("/api/v1/machines", async (request) => {
+    const screenIds = visibleScreenIds(visibleTo(request));
+    const machines = control.getMachines();
+    if (screenIds === "all") return machines;
+    const machineIds = new Set(
+      control.getScreens().filter((s) => screenIds.has(s.id)).map((s) => s.machineId),
+    );
+    return machines.filter((m) => machineIds.has(m.id));
+  });
 
   // POST /api/v1/screens/:screenId/rename  { friendlyName }
   fastify.post("/api/v1/screens/:screenId/rename", async (request, reply) => {
@@ -1668,7 +1724,11 @@ export function registerRestRoutes(
   // broadcast a fresh admin/state (which carries murals[] + placements[]).
 
   // GET /api/v1/murals -> Mural[]
-  fastify.get("/api/v1/murals", async () => control.getMurals());
+  fastify.get("/api/v1/murals", async (request) => {
+    const visible = visibleTo(request);
+    const murals = control.getMurals();
+    return visible === "all" ? murals : murals.filter((m) => visible.has(m.id));
+  });
 
   // POST /api/v1/murals  { name }  -> Mural
   fastify.post("/api/v1/murals", async (request, reply) => {
@@ -1920,7 +1980,11 @@ export function registerRestRoutes(
   // instant path) and broadcast a fresh admin/state (which now carries videoWalls[]).
 
   // GET /api/v1/walls -> VideoWall[]
-  fastify.get("/api/v1/walls", async () => control.getVideoWalls());
+  fastify.get("/api/v1/walls", async (request) => {
+    const visible = visibleTo(request);
+    const walls = control.getVideoWalls();
+    return visible === "all" ? walls : walls.filter((w) => visible.has(w.muralId));
+  });
 
   // POST /api/v1/murals/:muralId/walls  { muralId, memberScreenIds }  -> combine into a VideoWall (201)
   fastify.post("/api/v1/murals/:muralId/walls", async (request, reply) => {
@@ -3101,7 +3165,11 @@ export function registerRestRoutes(
   // (POL-89): dayparts + schedules, resolved by a ticker that calls this same apply path.
 
   // GET /api/v1/scenes -> Scene[]
-  fastify.get("/api/v1/scenes", async () => control.getScenes());
+  fastify.get("/api/v1/scenes", async (request) => {
+    const visible = visibleTo(request);
+    const scenes = control.getScenes();
+    return visible === "all" ? scenes : scenes.filter((s) => visible.has(s.muralId));
+  });
 
   // POST /api/v1/scenes  { name, muralId }  -> snapshot the mural's CURRENT wall as a new Scene (201)
   fastify.post("/api/v1/scenes", async (request, reply) => {

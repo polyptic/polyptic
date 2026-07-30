@@ -278,6 +278,17 @@ const documentJobs = new DocumentJobs(() => broadcaster.broadcast());
 // (POL-86's SurfaceProber). Live-only, like Presence: a restart starts blank and the players
 // re-report on reconnect.
 const sourceHealth = new SourceHealthTracker();
+// ── Mural grants (POL-191). Built HERE, before the broadcaster, because the broadcaster stamps
+// the visibility mode onto every state push and the admin hub projects each socket's slice.
+// The gate is wired to it later (`auth.useGrants`), once auth and the control plane both exist.
+// VISIBILITY (POL-191/D175): `open` is the default and the pre-POL-191 world — everyone signed in
+// sees the whole fleet and grants only ADD power. `scoped` is for a shared deployment: a global
+// `viewer` sees only the murals they hold a grant on, and holds no role on the rest. Anything other
+// than a deliberate "scoped" reads as open, because the failure mode of guessing wrong here is a
+// deployment that silently hides itself from its own operators after an upgrade.
+const visibility = process.env.VISIBILITY?.trim().toLowerCase() === "scoped" ? "scoped" : "open";
+const grants = new GrantService(store, visibility);
+await grants.load();
 const broadcaster = new AdminBroadcaster({
   control,
   playerHub: hub,
@@ -288,6 +299,7 @@ const broadcaster = new AdminBroadcaster({
   enrollment,
   documents: { jobs: documentJobs, capabilities: documentCapabilities },
   health: sourceHealth,
+  grants,
 });
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted
@@ -447,8 +459,6 @@ await auth.seedAdmin();
 //
 // The gate also needs to know which mural a wall / screen / scene belongs to, which is the control
 // plane's business rather than the auth layer's, so it is handed in as a lookup.
-const grants = new GrantService(store);
-await grants.load();
 auth.useGrants(grants, (via, id) => {
   switch (via) {
     case "mural":
@@ -463,11 +473,18 @@ auth.useGrants(grants, (via, id) => {
   }
 });
 fastify.log.info(
-  { event: "auth.grants.loaded", grants: grants.size },
+  { event: "auth.grants.loaded", grants: grants.size, visibility },
   grants.size > 0
     ? `loaded ${grants.size} mural grant(s) — some accounts hold more on a mural than their global role`
     : "no mural grants — every route is measured against the global role (the pre-POL-191 behaviour)",
 );
+if (visibility === "scoped") {
+  fastify.log.info(
+    { event: "auth.visibility.scoped" },
+    "VISIBILITY=scoped — a viewer sees ONLY the murals they hold a grant on, and holds no role on " +
+      "the rest. Operators and admins remain fleet-wide. A viewer with no grants sees an empty console.",
+  );
+}
 
 const oidcConfig = oidcConfigFromEnv(process.env, fastify.log);
 const oidc = oidcConfig
@@ -710,6 +727,7 @@ const shellRelay = attachWebSockets({
   agentMtls: agentMtlsChannel,
   agentUpdate,
   logs,
+  grants,
 });
 shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
 registerRestRoutes(

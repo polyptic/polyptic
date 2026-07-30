@@ -26,6 +26,7 @@ import type {
   ScreenView,
   ServerCapabilities,
   ServerToAdminMessage,
+  VisibilityMode,
 } from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
@@ -47,12 +48,27 @@ export function clockOffsetMs(sampleAt: string | undefined, nowMs: number): numb
   return at - nowMs;
 }
 
+/**
+ * POL-191 — who is on the other end of an admin socket, as far as visibility is concerned.
+ *
+ * The socket carries the identity for its whole lifetime (like its role, which POL-107 already
+ * fixed at upgrade). A grant handed out mid-session therefore reaches that console on its next
+ * connect, not this one — the same latency a role change has always had.
+ */
+export interface AdminViewer {
+  /** Which murals to show, or `"all"`. Resolved once at upgrade from the grant index. */
+  visible: Set<string> | "all";
+}
+
+/** Everyone sees everything — `open` mode, and every fleet role. */
+const SEES_EVERYTHING: AdminViewer = { visible: "all" };
+
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
 export class AdminHub {
-  private readonly sockets = new Set<WebSocket>();
+  private readonly sockets = new Map<WebSocket, AdminViewer>();
 
-  add(socket: WebSocket): void {
-    this.sockets.add(socket);
+  add(socket: WebSocket, viewer: AdminViewer = SEES_EVERYTHING): void {
+    this.sockets.set(socket, viewer);
   }
 
   remove(socket: WebSocket): void {
@@ -63,16 +79,36 @@ export class AdminHub {
     return this.sockets.size;
   }
 
-  /** Send a validated server→admin message to every open admin socket. Returns count delivered. */
-  broadcast(message: ServerToAdminMessage): number {
+  /** What this socket may see. Absent (or never registered) reads as everything, matching `open`. */
+  viewerFor(socket: WebSocket): AdminViewer {
+    return this.sockets.get(socket) ?? SEES_EVERYTHING;
+  }
+
+  /**
+   * Send a validated server→admin message to every open admin socket, each seeing only its own slice.
+   *
+   * The projection is memoized on the viewer's mural set for the duration of one broadcast, so N
+   * consoles showing the same murals cost ONE projection and ONE `JSON.stringify` between them — and
+   * an `open` deployment, where every viewer is `"all"`, costs exactly the single serialization it
+   * always did. Returns the count delivered.
+   */
+  broadcast(message: ServerToAdminMessage, mode: VisibilityMode = "open"): number {
     if (this.sockets.size === 0) return 0;
-    const data = JSON.stringify(message);
+    const encoded = new Map<string, string>();
     let delivered = 0;
-    for (const socket of this.sockets) {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(data);
-        delivered += 1;
+    for (const [socket, viewer] of this.sockets) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      // JSON, not a joined string: this key decides who shares a payload, so two DIFFERENT mural
+      // sets colliding on it would hand one tenant another's walls. A separator that "cannot appear
+      // in an id" is an assumption; an encoding that cannot be ambiguous is not.
+      const key = viewer.visible === "all" ? "all" : JSON.stringify([...viewer.visible].sort());
+      let data = encoded.get(key);
+      if (data === undefined) {
+        data = JSON.stringify(projectAdminState(message, viewer.visible, mode));
+        encoded.set(key, data);
       }
+      socket.send(data);
+      delivered += 1;
     }
     return delivered;
   }
@@ -637,6 +673,84 @@ export function buildAdminState(
   });
 }
 
+/**
+ * POL-191 — narrow a full `admin/state` to the murals one account may see.
+ *
+ * Called with `"all"` this returns the snapshot UNTOUCHED, by identity — which is what keeps `open`
+ * mode, and every fleet role, on the single shared object the broadcaster serializes once.
+ *
+ * Everything follows from the mural set rather than being filtered on its own terms: a placement is
+ * visible because its mural is, a wall because it sits on one, a screen because it is PLACED on one, a
+ * machine because it carries such a screen. There is one question, asked once, and no second list to
+ * fall out of step with the first.
+ *
+ * What is deliberately NOT narrowed:
+ *
+ *   - **The content library** (`contentSources`, `sourceStatus`, `credentialProfiles`,
+ *     `documentJobs`). It is shared by construction — D174 already lets a mural owner add to it — so
+ *     hiding half of it would break the very thing they need it for. Note that `sourceStatus.usage`
+ *     names screens, so it IS narrowed to visible ones; the sources themselves stay.
+ *   - **`settings`, `capabilities`, `scheduler`** — deployment-wide facts, not anybody's property.
+ *
+ * A machine is included when it carries a visible screen, and then carries ONLY those screens: a
+ * scoped account sees the box behind its own panel, not the other tenant's panels on the same box.
+ */
+export function projectAdminState(
+  state: ServerToAdminMessage,
+  visible: Set<string> | "all",
+  mode: VisibilityMode,
+): ServerToAdminMessage {
+  if (state.t !== "admin/state") return state;
+  if (visible === "all") return mode === state.visibility ? state : { ...state, visibility: mode };
+
+  const murals = state.murals.filter((m) => visible.has(m.id));
+  const placements = state.placements.filter((p) => visible.has(p.muralId));
+  const videoWalls = state.videoWalls.filter((w) => visible.has(w.muralId));
+  const scenes = state.scenes.filter((s) => visible.has(s.muralId));
+  // A screen is visible exactly when it is placed on a visible mural. An UNPLACED screen (the tray)
+  // is fleet plumbing and belongs to nobody's canvas — it is shown to fleet roles only, which is the
+  // same line the gate draws for it.
+  const visibleScreenIds = new Set(placements.map((p) => p.screenId));
+
+  const machines = state.machines
+    .map((machine) => ({
+      ...machine,
+      screens: machine.screens.filter((s) => visibleScreenIds.has(s.id)),
+    }))
+    .filter((machine) => machine.screens.length > 0);
+
+  const activeScenes = Object.fromEntries(
+    Object.entries(state.activeScenes ?? {}).filter(([muralId]) => visible.has(muralId)),
+  );
+
+  return {
+    ...state,
+    visibility: mode,
+    machines,
+    murals,
+    placements,
+    videoWalls,
+    scenes,
+    activeScenes,
+    // The activity feed narrates the FLEET — enrolments, reboots, roll-outs, other tenants' walls. It
+    // is dropped wholesale rather than filtered: its entries are prose, not rows with a mural id to
+    // match on, and guessing which sentences are safe is exactly how a leak gets written.
+    activity: [],
+    // Schedules target a mural (`null` = every mural, which a scoped account must not be shown either:
+    // it is a fleet-wide window). Dayparts are the named times themselves and carry no wall.
+    schedules: (state.schedules ?? []).filter((s) => s.muralId !== null && visible.has(s.muralId)),
+    sourceStatus: (state.sourceStatus ?? []).map((entry) => ({
+      ...entry,
+      usage: {
+        ...entry.usage,
+        screenIds: entry.usage.screenIds.filter((id) => visibleScreenIds.has(id)),
+        wallIds: entry.usage.wallIds.filter((id) => videoWalls.some((w) => w.id === id)),
+      },
+      unreachableScreenIds: entry.unreachableScreenIds.filter((id) => visibleScreenIds.has(id)),
+    })),
+  };
+}
+
 interface BroadcasterDeps {
   control: ControlPlane;
   playerHub: PlayerHub;
@@ -650,6 +764,10 @@ interface BroadcasterDeps {
   documents?: DocumentStateSource;
   /** POL-104 — the live enrolment policy (which token a machine came in on, and whether it is revoked). */
   enrollment?: { list(): { id: string; revokedAt: string | null }[] };
+  /** POL-191 — the grant index, read ONLY for its visibility mode here (the per-socket mural set is
+   *  resolved at upgrade and lives on the socket). Optional: a unit test needs no grants to broadcast,
+   *  and its absence means `open`, which is the pre-POL-191 behaviour. */
+  grants?: { mode: VisibilityMode };
 }
 
 /**
@@ -662,9 +780,14 @@ export class AdminBroadcaster {
 
   constructor(private readonly deps: BroadcasterDeps) {}
 
-  /** Current `admin/state` for a single recipient (e.g. on connect). */
-  snapshot(): ServerToAdminMessage {
-    return buildAdminState(
+  /**
+   * Current `admin/state` for a single recipient (e.g. on connect).
+   *
+   * `viewer` narrows it to that account's murals (POL-191). Omitted — or `"all"` — returns the whole
+   * deployment, which is what `open` mode and every fleet role get.
+   */
+  snapshot(viewer?: AdminViewer): ServerToAdminMessage {
+    const full = buildAdminState(
       this.deps.control,
       this.deps.playerHub,
       this.deps.presence,
@@ -673,6 +796,13 @@ export class AdminBroadcaster {
       this.deps.health,
       this.deps.enrollment,
     );
+    return projectAdminState(full, viewer?.visible ?? "all", this.visibility);
+  }
+
+  /** The deployment's visibility mode, stamped onto every snapshot so the console can tell "nothing
+   *  here yet" from "nothing here that is yours". */
+  get visibility(): VisibilityMode {
+    return this.deps.grants?.mode ?? "open";
   }
 
   /** Schedule a coalesced broadcast of the latest state to all admin sockets. */
@@ -682,8 +812,10 @@ export class AdminBroadcaster {
     queueMicrotask(() => {
       this.scheduled = false;
       if (this.deps.adminHub.count() === 0) return;
+      // Build the FULL state once; the hub projects it per socket and memoizes by mural set, so an
+      // `open` deployment still does exactly one projection and one serialization.
       const message = this.snapshot();
-      const delivered = this.deps.adminHub.broadcast(message);
+      const delivered = this.deps.adminHub.broadcast(message, this.visibility);
       this.deps.log.debug(
         {
           event: "admin.state.broadcast",
