@@ -11,6 +11,7 @@
  * wire. No secret (password or hash) is ever sent back by these routes or logged here.
  */
 import {
+  AuthProviders,
   AuthUser,
   BootOrderPolicy,
   ChangePasswordBody,
@@ -31,6 +32,7 @@ import {
   UpdateOperatorBody,
 } from "@polyptic/protocol";
 import type {
+  AuthProviders as AuthProvidersT,
   BootOrderPolicy as BootOrderPolicyT,
   ChangePasswordBody as ChangePasswordBodyT,
   CreateEnrollmentTokenBody as CreateEnrollmentTokenBodyT,
@@ -109,6 +111,31 @@ export async function fetchMe(): Promise<AuthUser> {
  */
 export async function changePassword(body: ChangePasswordBodyT): Promise<void> {
   await send<unknown>("POST", `${BASE_AUTH}/change-password`, ChangePasswordBody.parse(body));
+}
+
+/**
+ * GET /api/v1/auth/providers → which sign-in methods this deployment offers (POL-191).
+ *
+ * Read by the sign-in page BEFORE anyone is authenticated, so it is a public route and its 401 path
+ * must never bounce the browser anywhere. It carries no secret — only whether to draw the
+ * single-sign-on button, and what to write on it.
+ */
+export async function fetchAuthProviders(): Promise<AuthProvidersT> {
+  const raw = await send<unknown>("GET", `${BASE_AUTH}/providers`, undefined, {
+    suppressAuthRedirect: true,
+  });
+  return AuthProviders.parse(raw);
+}
+
+/**
+ * Where to send the browser to begin brokered sign-in (POL-191).
+ *
+ * A full page NAVIGATION, not a fetch: the flow is a chain of redirects between this server and the
+ * identity provider, and only the browser's address bar can follow it. `next` comes back as the
+ * landing path afterwards; the server refuses anything that is not same-origin.
+ */
+export function oidcSignInUrl(next: string): string {
+  return apiUrl(`${BASE_AUTH}/oidc/start?next=${encodeURIComponent(next)}`);
 }
 
 // ── Operator accounts (POL-107) — admin-only; every call 403s for an operator/viewer. ───────────

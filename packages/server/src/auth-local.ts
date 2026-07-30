@@ -26,14 +26,40 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { AuthUser, Operator, OperatorRole } from "@polyptic/protocol";
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { requiredRoleFor, roleAllows } from "./roles";
+import { requirementFor, roleAllows } from "./roles";
+import type { RouteRequirement } from "./roles";
+import type { GrantService, GrantSubject } from "./grants";
 import type { EnrollmentMode, PersistedBootstrap, PersistedUser, Store } from "./store/types";
 
 /** Make the resolved operator available to handlers after the auth gate runs. */
 declare module "fastify" {
   interface FastifyRequest {
     authUser?: AuthUser;
+    /** POL-191 — the mural this request was authorized AGAINST, when it was scoped to one. Null for a
+     *  global route, and for a scoped route whose mural could not be resolved. */
+    authMuralId?: string | null;
   }
+}
+
+/**
+ * POL-191 — how the gate turns an id in a path into the mural it belongs to.
+ *
+ * An interface rather than a direct import of the control plane, because `auth-local.ts` must not
+ * depend on the state machine it protects: the auth layer answers "who are you and what may you do",
+ * and knowing that a wall sits on a mural is the control plane's business, wired in at boot.
+ */
+export type MuralLookup = (
+  via: "mural" | "wall" | "screen" | "scene",
+  id: string,
+) => string | null;
+
+/** Read a `muralId` out of a parsed request body, for the two routes whose job is to name one. The
+ *  body is `unknown` here on purpose — the gate runs before any handler's schema has parsed it, so it
+ *  must treat the shape as untrusted and take only what it recognises. */
+function muralIdFromBody(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return null;
+  const value = (body as { muralId?: unknown }).muralId;
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 /** Name of the session cookie. */
@@ -69,13 +95,30 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
 
 /** The public (secret-free) identity of a stored account, as handed to the console + the gate. */
 function toAuthUser(user: PersistedUser): AuthUser {
-  return { id: user.id, email: user.email, role: user.role };
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    provider: user.provider,
+    displayName: user.displayName,
+    // POL-191 — the gate resolves GROUP mural-grants against this on every request, so it must ride
+    // along with the identity rather than be looked up separately.
+    groups: user.groups,
+  };
 }
 
 /** The admin-facing listing of an account. Deliberately built field-by-field: it must be impossible
  *  to leak `passwordHash` by spreading the row. */
 function toOperator(user: PersistedUser): Operator {
-  return { id: user.id, email: user.email, role: user.role, createdAt: user.createdAt };
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    createdAt: user.createdAt,
+    provider: user.provider,
+    displayName: user.displayName,
+    groups: user.groups,
+  };
 }
 
 /** Normalize an email for storage + lookup: trim + lower-case (so logins are case-insensitive). */
@@ -178,6 +221,12 @@ export class AuthService {
   private readonly log: FastifyBaseLogger;
   readonly config: AuthConfig;
 
+  /** POL-191 — the mural-grant index, and the lookup that turns a wall/screen/scene id into its
+   *  mural. Both are wired AFTER construction (`useGrants`), because the control plane they read is
+   *  built after auth. Until they are, every route is measured globally — the POL-107 behaviour. */
+  private grants: GrantService | null = null;
+  private muralLookup: MuralLookup | null = null;
+
   /** Per-(email,IP) failed-attempt records (in-memory; per-process). */
   private readonly fails = new Map<string, FailRecord>();
   /** A precomputed argon2id hash used to equalize timing on the no-such-user path. */
@@ -193,6 +242,13 @@ export class AuthService {
   /** Whether auth is enforced. When false the gate + admin-WS check are no-ops. */
   get enabled(): boolean {
     return this.config.enabled;
+  }
+
+  /** POL-191 — hand the gate its mural-grant index and the control plane's mural lookup. Called once
+   *  at boot, before the gate is registered. */
+  useGrants(grants: GrantService, muralLookup: MuralLookup): void {
+    this.grants = grants;
+    this.muralLookup = muralLookup;
   }
 
   /** Cookie options for the signed, http-only session cookie. */
@@ -244,6 +300,13 @@ export class AuthService {
       passwordHash,
       createdAt: new Date().toISOString(),
       role: "admin",
+      // The seeded admin is deliberately LOCAL even on a deployment that brokers everyone else: it is
+      // the account that still works when the IdP does not.
+      provider: "local",
+      issuer: null,
+      subject: null,
+      displayName: null,
+      groups: [],
     });
 
     if (usingDefaults) {
@@ -289,8 +352,13 @@ export class AuthService {
 
     const user = await this.store.getUserByEmail(email);
     let valid = false;
-    if (user) {
+    if (user?.passwordHash) {
       valid = await verifyPassword(password, user.passwordHash);
+    } else if (user) {
+      // POL-191 — a BROKERED account has no password hash, so there is nothing here that could ever
+      // match. Burn the same time as a real verify so the local login page cannot be used to
+      // enumerate which of an organisation's addresses are federated.
+      await verifyPassword(password, await this.dummyHash());
     } else {
       // Equalize timing so an absent account can't be distinguished from a wrong password.
       await verifyPassword(password, await this.dummyHash());
@@ -355,6 +423,9 @@ export class AuthService {
   ): Promise<boolean> {
     const user = await this.store.getUserById(userId);
     if (!user) return false;
+    // POL-191 — a brokered account has no password to change, and giving it one here would quietly
+    // create a way in that bypasses the IdP entirely. Their password lives at the directory.
+    if (!user.passwordHash) return false;
     const ok = await verifyPassword(currentPassword, user.passwordHash);
     if (!ok) return false;
     const newHash = await hashPassword(newPassword);
@@ -410,16 +481,73 @@ export class AuthService {
     }
     request.authUser = user;
 
-    const needed = requiredRoleFor(request.method, path ?? request.url.split("?")[0] ?? "");
-    if (needed && !roleAllows(user.role, needed)) {
+    const requirement = requirementFor(request.method, path ?? request.url.split("?")[0] ?? "");
+    if (!requirement) return;
+
+    // POL-191 — the role the caller holds WHERE this route is measured. With no grants configured (or
+    // no mural resolvable) this is their global role, so the check below is bit-for-bit the POL-107
+    // one. `muralId` is carried into the log line and onto the request: a handler that needs to know
+    // which mural authorized the call should not have to work it out a second time.
+    const { role: have, muralId } = this.resolveScopedRole(user, requirement, request);
+    request.authMuralId = muralId;
+
+    if (!roleAllows(have, requirement.role)) {
       this.log.warn(
-        { event: "auth.forbidden", userId: user.id, role: user.role, needed, method: request.method },
+        {
+          event: "auth.forbidden",
+          userId: user.id,
+          role: user.role,
+          effectiveRole: have,
+          scope: requirement.scope.kind,
+          muralId,
+          needed: requirement.role,
+          method: request.method,
+        },
         "refused an operator action — role too low",
       );
-      await reply.code(403).send({ error: "forbidden", requiredRole: needed, role: user.role });
+      await reply.code(403).send({
+        error: "forbidden",
+        requiredRole: requirement.role,
+        role: have,
+        ...(muralId ? { muralId } : {}),
+      });
       return;
     }
   };
+
+  /**
+   * POL-191 — what role does this caller hold for THIS request?
+   *
+   *   - `global`    → their global role, unchanged.
+   *   - `any-mural` → their best role across every mural they hold a grant on.
+   *   - `mural`     → their role on the one mural the request names, resolved through the lookup the
+   *                   server wired in (a wall / screen / scene id becomes the mural it sits on).
+   *
+   * When a mural-scoped route names a mural that cannot be resolved — an unplaced screen, an unknown
+   * wall, a body with no `muralId` — this falls back to the GLOBAL role. Grants only ever widen, so
+   * the fallback can refuse someone who would have been allowed, and can never admit someone who
+   * would not have been.
+   */
+  private resolveScopedRole(
+    user: AuthUser,
+    requirement: RouteRequirement,
+    request: FastifyRequest,
+  ): { role: OperatorRole; muralId: string | null } {
+    const grants = this.grants;
+    if (!grants || requirement.scope.kind === "global") return { role: user.role, muralId: null };
+
+    const subject: GrantSubject = { id: user.id, role: user.role, groups: user.groups };
+    if (requirement.scope.kind === "any-mural") {
+      return { role: grants.bestRoleAnywhere(subject), muralId: null };
+    }
+
+    const muralId =
+      requirement.scope.via === "body"
+        ? muralIdFromBody(request.body)
+        : (this.muralLookup?.(requirement.scope.via, requirement.id ?? "") ?? null);
+    if (!muralId) return { role: user.role, muralId: null };
+    return { role: grants.effectiveRole(subject, muralId), muralId };
+  }
 
   // ── Operator management (POL-107, admin-only; the routes enforce the role) ─────
 
@@ -445,9 +573,70 @@ export class AuthService {
       passwordHash: await hashPassword(password),
       createdAt: new Date().toISOString(),
       role,
+      provider: "local",
+      issuer: null,
+      subject: null,
+      displayName: null,
+      groups: [],
     };
     await this.store.createUser(user);
     return toOperator(user);
+  }
+
+  /**
+   * POL-191 — resolve a BROKERED sign-in to an account, provisioning one on first contact.
+   *
+   * Look-up is on the (issuer, subject) pair and nothing else. Matching on email instead would be the
+   * classic account-takeover: an IdP that recycles an address — or an admin who edits one — would hand
+   * a new person the old account, silently, at the moment they first sign in.
+   *
+   * On every sign-in (not just the first) the account's email, name, groups and GLOBAL ROLE are
+   * re-stamped from what the IdP just said. The directory stays the authority: taking someone out of
+   * an LDAP group demotes them at their next login, with nothing to do here.
+   *
+   * A collision on the email of an existing LOCAL account is refused rather than merged. Silently
+   * folding a local admin into a brokered identity would transfer that admin's power to whoever the
+   * IdP says owns the address — and that is a decision for a human, not an inference.
+   */
+  async resolveOidcUser(
+    identity: { issuer: string; subject: string; email: string; displayName: string | null; groups: string[] },
+    role: OperatorRole,
+  ): Promise<AuthUser | "email-taken"> {
+    const email = normalizeEmail(identity.email);
+    const existing = await this.store.getUserBySubject(identity.issuer, identity.subject);
+    if (existing) {
+      await this.store.updateUserIdentity(existing.id, {
+        email,
+        displayName: identity.displayName,
+        groups: identity.groups,
+        role,
+      });
+      const refreshed = await this.store.getUserById(existing.id);
+      return toAuthUser(refreshed ?? { ...existing, email, role, groups: identity.groups });
+    }
+
+    const byEmail = await this.store.getUserByEmail(email);
+    if (byEmail) return "email-taken";
+
+    const user: PersistedUser = {
+      id: `user_${randomUUID()}`,
+      email,
+      // No password, ever — the login path refuses a null hash outright.
+      passwordHash: null,
+      createdAt: new Date().toISOString(),
+      role,
+      provider: "oidc",
+      issuer: identity.issuer,
+      subject: identity.subject,
+      displayName: identity.displayName,
+      groups: identity.groups,
+    };
+    await this.store.createUser(user);
+    this.log.info(
+      { event: "auth.oidc.provisioned", userId: user.id, email: user.email, role: user.role },
+      "provisioned an account from the identity provider",
+    );
+    return toAuthUser(user);
   }
 
   /**
@@ -459,9 +648,15 @@ export class AuthService {
   async updateOperator(
     id: string,
     patch: { role?: OperatorRole; password?: string },
-  ): Promise<Operator | "not-found" | "last-admin"> {
+  ): Promise<Operator | "not-found" | "last-admin" | "brokered"> {
     const user = await this.store.getUserById(id);
     if (!user) return "not-found";
+
+    // POL-191 — a brokered account has no password here to reset, and minting one would create a way
+    // past the IdP. Its ROLE is refused for a different reason: the next sign-in re-derives it from
+    // the directory's groups, so a change made here would be silently undone, which is worse than a
+    // refusal that says so. Both are changed at the directory.
+    if (user.provider === "oidc") return "brokered";
 
     if (patch.role && patch.role !== user.role && user.role === "admin") {
       if ((await this.store.countAdmins()) <= 1) return "last-admin";

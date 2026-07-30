@@ -3145,6 +3145,87 @@ export type LoginBody = z.infer<typeof LoginBody>;
 export const OperatorRole = z.enum(["admin", "operator", "viewer"]);
 export type OperatorRole = z.infer<typeof OperatorRole>;
 
+/**
+ * POL-191 — where an account's identity comes from, and therefore how it authenticates.
+ *
+ *   - `local` — an email + argon2id password in our own table. The pre-POL-191 world, unchanged.
+ *   - `oidc`  — brokered by an OIDC provider (Dex, Keycloak, Entra, …). The account is provisioned on
+ *               first sign-in and holds NO password hash, so `/auth/login` can never authenticate it
+ *               however many passwords are guessed at it.
+ *
+ * The two coexist: turning OIDC on never disables local sign-in, because locking the seeded admin out
+ * of a deployment whose IdP is misconfigured is exactly the failure nobody can recover from.
+ */
+export const OperatorProvider = z.enum(["local", "oidc"]);
+export type OperatorProvider = z.infer<typeof OperatorProvider>;
+
+/** Which sign-in methods this deployment offers, read by the sign-in page BEFORE anyone is
+ *  authenticated (so it is a public route). Carries no secret: it reports only whether the button
+ *  should exist and what to write on it. */
+export const AuthProviders = z.object({
+  /** Local email+password sign-in. */
+  local: z.boolean(),
+  /** Present only when an OIDC provider is configured AND its discovery document was fetched. */
+  oidc: z
+    .object({
+      /** What the button says, e.g. "AMRC SSO". `OIDC_LABEL`, defaulted to "single sign-on". */
+      label: z.string(),
+    })
+    .nullable(),
+});
+export type AuthProviders = z.infer<typeof AuthProviders>;
+
+/**
+ * POL-191 — WHO a mural grant is for.
+ *
+ *   - `user`  — one account, by its id. Precise, and survives an email change.
+ *   - `group` — a group NAME as the IdP asserts it (an LDAP group, via Dex). It matches anyone whose
+ *               last sign-in carried that group, with no account to create in advance. This is the
+ *               reason grants exist at all in a brokered deployment: an org already keeps the
+ *               membership list, in the directory, and does not want to keep a second one here.
+ */
+export const MuralGrantSubjectKind = z.enum(["user", "group"]);
+export type MuralGrantSubjectKind = z.infer<typeof MuralGrantSubjectKind>;
+
+/**
+ * POL-191 — one grant: a subject holds `role` ON `muralId`.
+ *
+ * Grants are **ADDITIVE ONLY**. The effective role for a request that touches a mural is the HIGHER of
+ * the account's global role and its best grant on that mural — a grant can raise what someone may do
+ * and can never lower it. Two consequences, both deliberate:
+ *
+ *   - Upgrading is a no-op. A deployment with no grants behaves exactly as it did before POL-191.
+ *   - `viewer` becomes the right global default for a brokered account: they read the whole fleet and
+ *     can change only the murals they were actually given.
+ *
+ * Grants govern POWER, not VISIBILITY — `GET /state` is one fleet-wide document and still shows
+ * everything to anyone signed in.
+ */
+export const MuralGrant = z.object({
+  muralId: z.string(),
+  subjectKind: MuralGrantSubjectKind,
+  /** A user id for `user`; the group name verbatim for `group` (matched case-insensitively). */
+  subjectId: z.string().min(1).max(200),
+  role: OperatorRole,
+  createdAt: z.string(),
+  /** For a `user` grant, the account's email at read time — so the console can list a person without
+   *  cross-referencing every operator. Null for a group, or for a user id that no longer resolves. */
+  subjectLabel: z.string().nullable().default(null),
+});
+export type MuralGrant = z.infer<typeof MuralGrant>;
+
+/** Create or change one grant on a mural (idempotent — a PUT on an existing subject re-levels it). */
+export const PutMuralGrantBody = z.object({
+  subjectKind: MuralGrantSubjectKind,
+  /** For `user`: an account id OR its email address — the console sends the email, because listing
+   *  every account is an admin-only right and a mural admin may have no directory to pick from. The
+   *  server resolves it and stores the ID, so a change of address never drops someone's permissions.
+   *  For `group`: the group name as the IdP asserts it. */
+  subjectId: z.string().min(1).max(200),
+  role: OperatorRole,
+});
+export type PutMuralGrantBody = z.infer<typeof PutMuralGrantBody>;
+
 /** The signed-in operator, as returned by /auth/login and /auth/me (never any secret). `role` is what
  *  the console keys its affordances off; the server enforces the same role on every route. Defaulted
  *  to `admin` so a pre-POL-107 payload (or an upgraded single-admin deployment) parses as the admin it
@@ -3153,6 +3234,15 @@ export const AuthUser = z.object({
   id: z.string(),
   email: z.string().email(),
   role: OperatorRole.default("admin"),
+  /** POL-191 — where this identity came from. A `local` account has a password; an `oidc` one never
+   *  does. Defaulted so a pre-POL-191 payload parses as the local account it was. */
+  provider: OperatorProvider.default("local"),
+  /** The IdP's human name for the account, when it gave one. The console prefers it over the email. */
+  displayName: z.string().nullable().default(null),
+  /** POL-191 — the groups the IdP asserted at the last sign-in, verbatim. Read by the mural-grant
+   *  resolver so a GROUP grant applies with no per-user account to create. Always empty for a local
+   *  account (a local deployment has no group authority to ask). */
+  groups: z.array(z.string()).default([]),
 });
 export type AuthUser = z.infer<typeof AuthUser>;
 
@@ -3162,6 +3252,9 @@ export const Operator = z.object({
   email: z.string().email(),
   role: OperatorRole,
   createdAt: z.string(),
+  provider: OperatorProvider.default("local"),
+  displayName: z.string().nullable().default(null),
+  groups: z.array(z.string()).default([]),
 });
 export type Operator = z.infer<typeof Operator>;
 

@@ -9,9 +9,13 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useConsoleStore } from "../../stores/console";
+import MuralPeople from "./MuralPeople.vue";
 
 const store = useConsoleStore();
 const open = ref(false);
+// POL-191 — the access sheet for the ACTIVE mural. Opened from the menu; the server refuses the read
+// with a 403 for anyone who is not an admin on this mural, and the sheet says so plainly.
+const peopleOpen = ref(false);
 
 const active = computed(() => store.activeMural);
 const murals = computed(() => store.murals);
@@ -25,6 +29,11 @@ function create() {
   open.value = false;
   const name = window.prompt("Name the new mural", "New mural");
   if (name && name.trim()) store.createMural(name.trim());
+}
+
+function people() {
+  open.value = false;
+  if (active.value) peopleOpen.value = true;
 }
 
 function rename() {
@@ -73,9 +82,17 @@ function remove() {
         <div class="divider"></div>
         <button class="menu-item" @click="create"><span class="tick">＋</span>New mural…</button>
         <button class="menu-item" @click="rename"><span class="tick">✎</span>Rename current…</button>
+        <button class="menu-item" @click="people"><span class="tick">◍</span>Access…</button>
         <button class="menu-item danger" @click="remove"><span class="tick">✕</span>Delete current…</button>
       </div>
     </template>
+
+    <MuralPeople
+      v-if="peopleOpen && active"
+      :mural-id="active.id"
+      :mural-name="active.name"
+      @close="peopleOpen = false"
+    />
   </div>
 </template>
 

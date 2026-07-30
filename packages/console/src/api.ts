@@ -29,8 +29,10 @@ import {
   InspectBody,
   InteractiveBody,
   MoveTargetsBody,
+  MuralGrant,
   PanelPowerBody,
   PlaceScreenBody,
+  PutMuralGrantBody,
   UnplaceScreensBody,
   PreRegistration,
   RenameMuralBody,
@@ -63,12 +65,16 @@ import type {
   LogQuery,
   LogQueryResult,
   LogSinkInfo,
+  MuralGrant as MuralGrantT,
+  MuralGrantSubjectKind as MuralGrantSubjectKindT,
+  PutMuralGrantBody as PutMuralGrantBodyT,
   Scene,
   SceneDiff,
   Schedule,
   SchedulerSettings,
   VideoWall,
 } from "@polyptic/protocol";
+import { z } from "zod";
 
 /** Dev runs the console on Vite (:5175) against the server on :8080 (CORS_ORIGIN covers it).
  *  A production build is served BY the server itself (single image, D28/D31), so the API is
@@ -221,6 +227,53 @@ export function renameMural(muralId: string, name: string): Promise<unknown> {
 /** DELETE /api/v1/murals/:muralId. */
 export function deleteMural(muralId: string): Promise<unknown> {
   return send("DELETE", `/murals/${encodeURIComponent(muralId)}`);
+}
+
+// ── Mural grants (POL-191) — who may drive this wall ─────────────────────────
+//
+// Every one of these is measured on the MURAL, not on the deployment: reading the list takes operator
+// there, changing it takes admin there. A console that cannot call them gets a 403 and hides the
+// panel — the server is what enforces it.
+
+/** GET /api/v1/murals/:muralId/grants → every grant on that mural. */
+export async function fetchMuralGrants(muralId: string): Promise<MuralGrantT[]> {
+  const raw = await send<unknown>("GET", `/murals/${encodeURIComponent(muralId)}/grants`);
+  return unwrapGrants(raw);
+}
+
+/** PUT /api/v1/murals/:muralId/grants { subjectKind, subjectId, role } → create or re-level one. */
+export async function putMuralGrant(
+  muralId: string,
+  body: PutMuralGrantBodyT,
+): Promise<MuralGrantT[]> {
+  const raw = await send<unknown>(
+    "PUT",
+    `/murals/${encodeURIComponent(muralId)}/grants`,
+    PutMuralGrantBody.parse(body),
+  );
+  return unwrapGrants(raw);
+}
+
+/** DELETE /api/v1/murals/:muralId/grants/:subjectKind/:subjectId → revoke one. */
+export async function deleteMuralGrant(
+  muralId: string,
+  subjectKind: MuralGrantSubjectKindT,
+  subjectId: string,
+): Promise<MuralGrantT[]> {
+  const raw = await send<unknown>(
+    "DELETE",
+    `/murals/${encodeURIComponent(muralId)}/grants/${encodeURIComponent(subjectKind)}/${encodeURIComponent(subjectId)}`,
+  );
+  return unwrapGrants(raw);
+}
+
+/** The three grant routes all answer `{ grants }`; validate at the edge like every other payload. */
+function unwrapGrants(raw: unknown): MuralGrantT[] {
+  const candidate =
+    raw && typeof raw === "object" && "grants" in (raw as Record<string, unknown>)
+      ? (raw as Record<string, unknown>).grants
+      : raw;
+  return z.array(MuralGrant).parse(candidate);
 }
 
 // ── Placement ───────────────────────────────────────────────────────────────

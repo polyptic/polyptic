@@ -6,7 +6,12 @@
  * deep-cloned on the way in and out so callers can never mutate the store's copy by reference —
  * mirroring the isolation a real database gives you.
  */
-import type { EnrollmentStatus, MachineBootPath, OperatorRole } from "@polyptic/protocol";
+import type {
+  EnrollmentStatus,
+  MachineBootPath,
+  MuralGrantSubjectKind,
+  OperatorRole,
+} from "@polyptic/protocol";
 import type {
   PersistedBootstrap,
   PersistedContent,
@@ -25,6 +30,7 @@ import type {
   PersistedPreRegistration,
   PersistedServerTls,
   PersistedMural,
+  PersistedMuralGrant,
   PersistedPlacement,
   PersistedScene,
   PersistedScreen,
@@ -45,6 +51,12 @@ function clone<T>(value: T): T {
  *  The separator can't appear in an id, so no pair can collide with another. */
 function zoomKey(targetId: string, sourceKey: string): string {
   return `${targetId}\u0000${sourceKey}`;
+}
+
+/** Composite key for a mural grant — (mural, kind, subject) is the row's identity (POL-191). Same
+ *  NUL separator as `zoomKey`, and for the same reason: it cannot appear in an id or a group name. */
+function grantKey(muralId: string, kind: MuralGrantSubjectKind, subjectId: string): string {
+  return `${muralId}\u0000${kind}\u0000${subjectId}`;
 }
 
 export class MemoryStore implements Store {
@@ -76,6 +88,8 @@ export class MemoryStore implements Store {
   private readonly users = new Map<string, PersistedUser>();
   /** Keyed by session id (sha256 of the cookie token) — server-side sessions (Phase 3f). */
   private readonly sessions = new Map<string, PersistedSession>();
+  /** Keyed by `grantKey` — who may do what on which mural (POL-191). */
+  private readonly muralGrants = new Map<string, PersistedMuralGrant>();
   /** The enrollment bootstrap (mode + token), seeded on first boot. */
   private bootstrap: PersistedBootstrap | undefined;
   /** Keyed by token id — the POL-104 enrolment tokens (insertion-ordered). */
@@ -398,6 +412,27 @@ export class MemoryStore implements Store {
     return user ? clone(user) : undefined;
   }
 
+  async getUserBySubject(issuer: string, subject: string): Promise<PersistedUser | undefined> {
+    for (const user of this.users.values()) {
+      if (user.provider === "oidc" && user.issuer === issuer && user.subject === subject) {
+        return clone(user);
+      }
+    }
+    return undefined;
+  }
+
+  async updateUserIdentity(
+    id: string,
+    identity: { email: string; displayName: string | null; groups: string[]; role: OperatorRole },
+  ): Promise<void> {
+    const user = this.users.get(id);
+    if (!user) return;
+    user.email = identity.email;
+    user.displayName = identity.displayName;
+    user.groups = [...identity.groups];
+    user.role = identity.role;
+  }
+
   async countUsers(): Promise<number> {
     return this.users.size;
   }
@@ -425,6 +460,7 @@ export class MemoryStore implements Store {
   async deleteUser(id: string): Promise<void> {
     this.users.delete(id);
     await this.deleteSessionsForUser(id);
+    await this.deleteMuralGrantsForUser(id);
   }
 
   async countAdmins(): Promise<number> {
@@ -456,6 +492,36 @@ export class MemoryStore implements Store {
     const cutoff = Date.parse(nowIso);
     for (const [id, session] of this.sessions) {
       if (Date.parse(session.expiresAt) <= cutoff) this.sessions.delete(id);
+    }
+  }
+
+  // ── Mural grants (POL-191) ───────────────────────────────────────────────────
+
+  async listMuralGrants(): Promise<PersistedMuralGrant[]> {
+    return [...this.muralGrants.values()].map(clone);
+  }
+
+  async upsertMuralGrant(grant: PersistedMuralGrant): Promise<void> {
+    this.muralGrants.set(grantKey(grant.muralId, grant.subjectKind, grant.subjectId), clone(grant));
+  }
+
+  async deleteMuralGrant(
+    muralId: string,
+    subjectKind: MuralGrantSubjectKind,
+    subjectId: string,
+  ): Promise<void> {
+    this.muralGrants.delete(grantKey(muralId, subjectKind, subjectId));
+  }
+
+  async deleteMuralGrantsForMural(muralId: string): Promise<void> {
+    for (const [key, grant] of this.muralGrants) {
+      if (grant.muralId === muralId) this.muralGrants.delete(key);
+    }
+  }
+
+  async deleteMuralGrantsForUser(userId: string): Promise<void> {
+    for (const [key, grant] of this.muralGrants) {
+      if (grant.subjectKind === "user" && grant.subjectId === userId) this.muralGrants.delete(key);
     }
   }
 

@@ -667,6 +667,51 @@ imageUpdates:
   nodeSelector: {}
   tolerations: []
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Brokered sign-in over OIDC (POL-191/D173) — how an organisation's own people
+# get in, without anyone hand-minting a local account for each of them.
+#
+# Leave `issuer` empty (the default) and single sign-on is simply OFF: the
+# sign-in page offers local accounts only, and nothing below is rendered. That
+# is the right shape for a self-hosted single-team deployment.
+#
+# Point it at your broker (Dex, Keycloak, Entra…) and the sign-in page grows a
+# "Sign in with <label>" button. Where Dex fronts LDAP, this reaches the
+# directory without Polyptic holding a bind DN or a service password — it
+# speaks OIDC and nothing else (see D173 for why there is no direct LDAP path).
+#
+# The redirect URI is derived from PUBLIC_BASE_URL, so register
+# `https://<your host>/api/v1/auth/oidc/callback` with the provider.
+#
+# Local sign-in stays enabled alongside it, deliberately: the seeded admin is
+# the account that still works on the day the IdP does not.
+oidc:
+  # The issuer URL, e.g. https://dex.example.org/dex. Empty = single sign-on off.
+  issuer: ""
+  clientId: "polyptic"
+  # For a CONFIDENTIAL client (what Dex issues). Goes into the chart's Secret.
+  # Use secrets.existingSecret with an OIDC_CLIENT_SECRET key for GitOps.
+  clientSecret: ""
+  # Override only if the callback is not on PUBLIC_BASE_URL.
+  redirectUri: ""
+  # What the sign-in button says, e.g. "AMRC SSO".
+  label: "single sign-on"
+  # `groups` is what makes the role mapping below possible — the client must be
+  # allowed to ask for it (in Dex, the connector must be configured to emit it).
+  scopes: "openid profile email groups"
+  # The claim carrying group membership. `groups` for Dex/Keycloak.
+  groupsClaim: "groups"
+  # Directory group → GLOBAL role, re-derived on EVERY sign-in (so removing
+  # somebody from a group demotes them the next time they log in). Most powerful
+  # wins where several match.
+  adminGroups: []
+  operatorGroups: []
+  viewerGroups: []
+  # Anyone in none of the mapped groups. `viewer` reads the whole fleet and
+  # changes nothing — per-mural grants (POL-191/D174) are what give them more,
+  # which is the intended way to run this: map nobody, and hand out murals.
+  defaultRole: "viewer"
+
 secrets:
   # COOKIE_SECRET — signs the http-only session cookies. MUST be a long random
   # value in production. If left empty AND existingSecret is unset, the chart
@@ -686,7 +731,8 @@ secrets:
 
   # Use a pre-existing Secret instead of letting the chart create one. When set,
   # the chart references keys from it: COOKIE_SECRET, POLYPTIC_BOOTSTRAP_TOKEN,
-  # POLYPTIC_ADMIN_EMAIL, POLYPTIC_ADMIN_PASSWORD, DATABASE_URL.
+  # POLYPTIC_ADMIN_EMAIL, POLYPTIC_ADMIN_PASSWORD, DATABASE_URL and (POL-191)
+  # OIDC_CLIENT_SECRET.
   existingSecret: ""
 
 # ─────────────────────────────────────────────────────────────────────────────

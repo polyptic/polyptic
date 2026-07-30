@@ -29,6 +29,8 @@ import {
   MachineBootPath,
   MachineDisk,
   MachineTags,
+  MuralGrantSubjectKind,
+  OperatorProvider,
   OperatorRole,
   Output,
   PlaylistItem,
@@ -55,6 +57,7 @@ import type {
   PersistedPreRegistration,
   PersistedServerTls,
   PersistedMural,
+  PersistedMuralGrant,
   PersistedPlacement,
   PersistedScene,
   PersistedScreen,
@@ -279,10 +282,25 @@ interface SchedulerSettingsRow {
 interface UserRow {
   id: string;
   email: string;
-  password_hash: string;
+  /** POL-191 — NULL for a brokered account, which has no password to hash. */
+  password_hash: string | null;
   created_at: Date;
   /** POL-107. Nullable in the type on purpose: a pre-POL-107 row read by a mid-migration replica. */
   role: string | null;
+  /** POL-191. Nullable for the same reason — a pre-POL-191 row read mid-migration is `local`. */
+  provider: string | null;
+  issuer: string | null;
+  subject: string | null;
+  display_name: string | null;
+  groups: unknown;
+}
+
+interface MuralGrantRow {
+  mural_id: string;
+  subject_kind: string;
+  subject_id: string;
+  role: string;
+  created_at: Date;
 }
 
 interface SessionRow {
@@ -607,6 +625,29 @@ export class PostgresStore implements Store {
     // row with 'admin', so the configured admin keeps every capability it had — an upgrade is never a
     // lockout, and it needs no operator action. New rows are written with an explicit role.
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'admin'`;
+    // POL-191 — brokered (OIDC) accounts live in the SAME table as local ones, because everything
+    // downstream of sign-in (sessions, the role gate, mural grants) should not care how someone got
+    // here. Four columns and one relaxation carry the difference:
+    //
+    //   - `provider` defaults to 'local', which is exactly right for every pre-POL-191 row.
+    //   - (`issuer`, `subject`) is how a brokered account is FOUND — uniquely, and never by email.
+    //     The partial unique index enforces that without constraining local rows, which hold NULLs
+    //     in both columns (and NULLs do not collide in a b-tree anyway; the WHERE makes it explicit).
+    //   - `groups` is the IdP's last word on membership, re-stamped at every sign-in.
+    //   - `password_hash` DROPS NOT NULL: a brokered account has no password, and storing a
+    //     placeholder hash instead would be a password-shaped thing sitting in a password column.
+    //     The login path refuses a NULL hash outright rather than verifying against it.
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'local'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS issuer text`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subject text`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name text`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS groups jsonb NOT NULL DEFAULT '[]'::jsonb`;
+    await sql`ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL`;
+    await sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS users_issuer_subject_idx
+        ON users (issuer, subject)
+        WHERE issuer IS NOT NULL AND subject IS NOT NULL
+    `;
     // Server-side sessions (Phase 3f). `id` is sha256(cookieToken) so a DB read never yields a usable
     // token. Sessions are revocable (delete the row) and expire at expires_at.
     await sql`
@@ -619,6 +660,25 @@ export class PostgresStore implements Store {
     `;
     await sql`CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions (user_id)`;
     await sql`CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at)`;
+    // POL-191 — mural grants: (mural, subject) holds a role ON that mural. The primary key IS the
+    // grant's identity, which makes "change someone's level" an ordinary upsert rather than a
+    // delete-then-insert that can lose a race with itself.
+    //
+    // No foreign key to `users`: half these rows name a GROUP, which has no row anywhere — it is only
+    // ever a claim the IdP asserts. The two cascades a foreign key would have given us (the mural is
+    // deleted, the account is deleted) are done explicitly by the store instead, so a recycled id can
+    // never inherit permissions from whatever held it before.
+    await sql`
+      CREATE TABLE IF NOT EXISTS mural_grants (
+        mural_id     text NOT NULL,
+        subject_kind text NOT NULL,
+        subject_id   text NOT NULL,
+        role         text NOT NULL,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (mural_id, subject_kind, subject_id)
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS mural_grants_subject_idx ON mural_grants (subject_kind, subject_id)`;
     // Enrollment bootstrap (Phase 3f): a single row holding the agent enrollment mode + token,
     // seeded on first boot from POLYPTIC_BOOTSTRAP_TOKEN and mutated by the Settings "regenerate".
     await sql`
@@ -1190,6 +1250,9 @@ export class PostgresStore implements Store {
     // also unplaces each screen and deletes each wall individually so memory + broadcasts stay correct).
     await sql`DELETE FROM placements WHERE mural_id = ${id}`;
     await sql`DELETE FROM video_walls WHERE mural_id = ${id}`;
+    // POL-191 — and its grants. A mural id is not reused today, but a grant that outlived its mural
+    // would be a permission with nothing to point at, waiting for one that is.
+    await sql`DELETE FROM mural_grants WHERE mural_id = ${id}`;
     await sql`DELETE FROM murals WHERE id = ${id}`;
   }
 
@@ -1575,7 +1638,8 @@ export class PostgresStore implements Store {
   async getUserByEmail(email: string): Promise<PersistedUser | undefined> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at, role FROM users WHERE email = ${email} LIMIT 1
+      SELECT id, email, password_hash, created_at, role, provider, issuer, subject, display_name, groups
+      FROM users WHERE email = ${email} LIMIT 1
     `;
     const row = rows[0];
     return row ? this.toUser(row) : undefined;
@@ -1584,10 +1648,40 @@ export class PostgresStore implements Store {
   async getUserById(id: string): Promise<PersistedUser | undefined> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at, role FROM users WHERE id = ${id} LIMIT 1
+      SELECT id, email, password_hash, created_at, role, provider, issuer, subject, display_name, groups
+      FROM users WHERE id = ${id} LIMIT 1
     `;
     const row = rows[0];
     return row ? this.toUser(row) : undefined;
+  }
+
+  async getUserBySubject(issuer: string, subject: string): Promise<PersistedUser | undefined> {
+    const sql = this.sql;
+    // Both halves of the pair, and `provider` too: a local row can never be reached through this path
+    // even if some future migration were to leave an issuer sitting on one.
+    const rows = await sql<UserRow[]>`
+      SELECT id, email, password_hash, created_at, role, provider, issuer, subject, display_name, groups
+      FROM users
+      WHERE provider = 'oidc' AND issuer = ${issuer} AND subject = ${subject}
+      LIMIT 1
+    `;
+    const row = rows[0];
+    return row ? this.toUser(row) : undefined;
+  }
+
+  async updateUserIdentity(
+    id: string,
+    identity: { email: string; displayName: string | null; groups: string[]; role: OperatorRole },
+  ): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      UPDATE users SET
+        email        = ${identity.email},
+        display_name = ${identity.displayName},
+        groups       = ${JSON.stringify(identity.groups)}::jsonb,
+        role         = ${identity.role}
+      WHERE id = ${id}
+    `;
   }
 
   async countUsers(): Promise<number> {
@@ -1599,8 +1693,21 @@ export class PostgresStore implements Store {
   async createUser(user: PersistedUser): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO users (id, email, password_hash, created_at, role)
-      VALUES (${user.id}, ${user.email}, ${user.passwordHash}, ${new Date(user.createdAt)}, ${user.role})
+      INSERT INTO users (
+        id, email, password_hash, created_at, role, provider, issuer, subject, display_name, groups
+      )
+      VALUES (
+        ${user.id},
+        ${user.email},
+        ${user.passwordHash},
+        ${new Date(user.createdAt)},
+        ${user.role},
+        ${user.provider},
+        ${user.issuer},
+        ${user.subject},
+        ${user.displayName},
+        ${JSON.stringify(user.groups)}::jsonb
+      )
     `;
   }
 
@@ -1612,7 +1719,8 @@ export class PostgresStore implements Store {
   async listUsers(): Promise<PersistedUser[]> {
     const sql = this.sql;
     const rows = await sql<UserRow[]>`
-      SELECT id, email, password_hash, created_at, role FROM users ORDER BY created_at ASC, id ASC
+      SELECT id, email, password_hash, created_at, role, provider, issuer, subject, display_name, groups
+      FROM users ORDER BY created_at ASC, id ASC
     `;
     return rows.map((row) => this.toUser(row));
   }
@@ -1626,6 +1734,8 @@ export class PostgresStore implements Store {
     const sql = this.sql;
     // Sessions first: a deleted account must not keep a live cookie for the length of its TTL.
     await sql`DELETE FROM sessions WHERE user_id = ${id}`;
+    // POL-191 — and its grants, so a re-created account (or a recycled id) starts with none.
+    await sql`DELETE FROM mural_grants WHERE subject_kind = 'user' AND subject_id = ${id}`;
     await sql`DELETE FROM users WHERE id = ${id}`;
   }
 
@@ -1685,13 +1795,88 @@ export class PostgresStore implements Store {
     // An absent/unknown role reads as `admin` — see the migration note: a row that predates POL-107
     // belonged to the deployment's ONLY account, which was an admin in all but name.
     const parsed = OperatorRole.safeParse(row.role);
+    // POL-191 — an absent/unknown provider reads as `local`, the only thing a row could have been
+    // before brokered accounts existed. Groups are jsonb; anything that is not an array of strings is
+    // read as NO groups, because a half-understood membership list must not grant anything.
+    const provider = OperatorProvider.safeParse(row.provider);
+    const groups = Array.isArray(row.groups)
+      ? row.groups.filter((g): g is string => typeof g === "string")
+      : [];
     return {
       id: row.id,
       email: row.email,
       passwordHash: row.password_hash,
       createdAt: row.created_at.toISOString(),
       role: parsed.success ? parsed.data : "admin",
+      provider: provider.success ? provider.data : "local",
+      issuer: row.issuer,
+      subject: row.subject,
+      displayName: row.display_name,
+      groups,
     };
+  }
+
+  // ── Mural grants (POL-191) ───────────────────────────────────────────────────
+
+  async listMuralGrants(): Promise<PersistedMuralGrant[]> {
+    const sql = this.sql;
+    const rows = await sql<MuralGrantRow[]>`
+      SELECT mural_id, subject_kind, subject_id, role, created_at
+      FROM mural_grants ORDER BY created_at ASC
+    `;
+    const grants: PersistedMuralGrant[] = [];
+    for (const row of rows) {
+      const kind = MuralGrantSubjectKind.safeParse(row.subject_kind);
+      const role = OperatorRole.safeParse(row.role);
+      // A row we cannot fully understand grants NOTHING — it is dropped rather than coerced. This is
+      // the one place in the store where the safe default is to lose data instead of guess at it.
+      if (!kind.success || !role.success) continue;
+      grants.push({
+        muralId: row.mural_id,
+        subjectKind: kind.data,
+        subjectId: row.subject_id,
+        role: role.data,
+        createdAt: row.created_at.toISOString(),
+      });
+    }
+    return grants;
+  }
+
+  async upsertMuralGrant(grant: PersistedMuralGrant): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO mural_grants (mural_id, subject_kind, subject_id, role, created_at)
+      VALUES (
+        ${grant.muralId},
+        ${grant.subjectKind},
+        ${grant.subjectId},
+        ${grant.role},
+        ${new Date(grant.createdAt)}
+      )
+      ON CONFLICT (mural_id, subject_kind, subject_id) DO UPDATE SET role = EXCLUDED.role
+    `;
+  }
+
+  async deleteMuralGrant(
+    muralId: string,
+    subjectKind: MuralGrantSubjectKind,
+    subjectId: string,
+  ): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      DELETE FROM mural_grants
+      WHERE mural_id = ${muralId} AND subject_kind = ${subjectKind} AND subject_id = ${subjectId}
+    `;
+  }
+
+  async deleteMuralGrantsForMural(muralId: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM mural_grants WHERE mural_id = ${muralId}`;
+  }
+
+  async deleteMuralGrantsForUser(userId: string): Promise<void> {
+    const sql = this.sql;
+    await sql`DELETE FROM mural_grants WHERE subject_kind = 'user' AND subject_id = ${userId}`;
   }
 
   // ── Enrollment bootstrap token (Phase 3f) ────────────────────────────────────

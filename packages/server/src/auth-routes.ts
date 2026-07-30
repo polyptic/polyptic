@@ -7,6 +7,9 @@
  *   GET  /api/v1/auth/me               {user} for a valid session, else 401 (self-reports; public).
  *   POST /api/v1/auth/change-password  ChangePasswordBody → verify current → re-hash; re-issues the
  *                                      session cookie (all old sessions are revoked). 401/400.
+ *   GET  /api/v1/auth/providers        POL-191 — which sign-in methods exist (public; no secret).
+ *   GET  /api/v1/auth/oidc/start       POL-191 — 302 to the IdP, transaction parked in a signed cookie.
+ *   GET  /api/v1/auth/oidc/callback    POL-191 — exchange + provision + mint THE SAME session cookie.
  *   GET    /api/v1/settings/enrollment                EnrollmentInfo {mode, token, tokens[]} (gated).
  *   POST   /api/v1/settings/enrollment/regenerate     rotate the bake token (grace window) → EnrollmentInfo.
  *   POST   /api/v1/settings/enrollment/tokens         POL-104 — cut a batch token.
@@ -27,6 +30,7 @@
  * ids and names, never the value itself.
  */
 import {
+  AuthProviders,
   ChangePasswordBody,
   CreateEnrollmentTokenBody,
   CreateOperatorBody,
@@ -41,6 +45,8 @@ import { z } from "zod";
 
 import { SESSION_COOKIE } from "./auth-local";
 import type { AuthService } from "./auth-local";
+import { OIDC_TX_COOKIE, safeReturnPath } from "./auth-oidc";
+import type { OidcService } from "./auth-oidc";
 import { toTokenView } from "./enroll";
 import type { Enrollment } from "./enroll";
 
@@ -54,7 +60,79 @@ export function registerAuthRoutes(
   fastify: FastifyInstance,
   auth: AuthService,
   enrollment: Enrollment,
+  /** POL-191 — null when no OIDC provider is configured, which is the normal self-hosted case. */
+  oidc: OidcService | null,
 ): void {
+  // ── POL-191: which sign-in methods exist. PUBLIC — the sign-in page reads it before anyone is
+  // authenticated, and it carries no secret, only whether to draw the button and what to write on it.
+  fastify.get("/api/v1/auth/providers", async () => {
+    const providers: AuthProviders = {
+      local: true,
+      oidc: oidc ? { label: oidc.config.label } : null,
+    };
+    return AuthProviders.parse(providers);
+  });
+
+  // ── POL-191: the brokered sign-in round-trip. Both routes are PUBLIC (they are how you become
+  // authenticated) and both are GETs, because a browser redirect is the only thing that can drive
+  // them. See auth-oidc.ts for the flow and why userinfo is trusted without a signature check.
+
+  // GET /api/v1/auth/oidc/start?next=/some/path -> 302 to the identity provider
+  fastify.get("/api/v1/auth/oidc/start", async (request, reply) => {
+    if (!oidc) return reply.code(404).send({ error: "single sign-on is not configured" });
+    const next = safeReturnPath((request.query as { next?: unknown } | undefined)?.next);
+    try {
+      const begun = await oidc.begin(next, auth.config.secureCookies);
+      reply.setCookie(OIDC_TX_COOKIE, begun.cookie, begun.cookieOptions);
+      return reply.redirect(begun.redirectTo, 302);
+    } catch (err) {
+      fastify.log.error(
+        { event: "auth.oidc.start.failed", err: String(err) },
+        "could not start single sign-on — the identity provider's discovery document is unreadable",
+      );
+      return reply.code(503).send({ error: "the identity provider is unreachable, so try again" });
+    }
+  });
+
+  // GET /api/v1/auth/oidc/callback?code=…&state=… -> mint a session, land back in the console
+  fastify.get("/api/v1/auth/oidc/callback", async (request, reply) => {
+    if (!oidc) return reply.code(404).send({ error: "single sign-on is not configured" });
+    // The transaction cookie is spent either way — a failed round-trip must not leave a live
+    // state/verifier sitting in the browser for a second attempt to replay.
+    const raw = request.cookies?.[OIDC_TX_COOKIE];
+    reply.clearCookie(OIDC_TX_COOKIE, { path: "/" });
+
+    const result = await oidc.complete(
+      (request.query ?? {}) as Record<string, unknown>,
+      raw,
+    );
+    if (!result.ok) {
+      fastify.log.warn({ event: "auth.oidc.failed", reason: result.reason }, "single sign-on failed");
+      return reply.redirect(`/signin?error=${encodeURIComponent(result.reason)}`, 302);
+    }
+
+    const user = await auth.resolveOidcUser(result.identity, result.role);
+    if (user === "email-taken") {
+      fastify.log.warn(
+        { event: "auth.oidc.email.taken", email: result.identity.email },
+        "refused a brokered sign-in — a LOCAL account already holds that email. Remove or rename the " +
+          "local account to let the identity provider own the address.",
+      );
+      return reply.redirect(
+        `/signin?error=${encodeURIComponent("a local account already uses that email address")}`,
+        302,
+      );
+    }
+
+    const token = await auth.issueSession(user.id);
+    reply.setCookie(SESSION_COOKIE, token, auth.cookieOptions());
+    fastify.log.info(
+      { event: "auth.login", userId: user.id, provider: "oidc", role: user.role },
+      "operator signed in through the identity provider",
+    );
+    return reply.redirect(result.returnTo, 302);
+  });
+
   // POST /api/v1/auth/login  { email, password }
   fastify.post("/api/v1/auth/login", async (request, reply) => {
     const body = LoginBody.safeParse(request.body);
@@ -216,6 +294,12 @@ export function registerAuthRoutes(
     if (updated === "not-found") return reply.code(404).send({ error: "no such operator" });
     if (updated === "last-admin") {
       return reply.code(409).send({ error: "the last admin cannot be demoted" });
+    }
+    if (updated === "brokered") {
+      return reply.code(409).send({
+        error:
+          "this account signs in through the identity provider, so its password and role are set there",
+      });
     }
     fastify.log.info(
       { event: "auth.operator.updated", userId: updated.id, role: updated.role, passwordReset: Boolean(body.data.password) },

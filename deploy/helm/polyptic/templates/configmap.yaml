@@ -38,6 +38,25 @@ data:
   {{- if ne (toString .Values.config.captureIntervalMs) "" }}
   CAPTURE_INTERVAL_MS: {{ .Values.config.captureIntervalMs | quote }}
   {{- end }}
+  {{- if .Values.oidc.issuer }}
+  # ── Brokered sign-in (POL-191/D173) ─────────────────────────────────────────
+  # Everything here is PUBLIC by construction in an authorization-code flow — the issuer, the client
+  # id and the group names are all visible to the browser mid-round-trip. The client SECRET is the
+  # one exception and lives in the Secret, not here. The redirect URI is derived from
+  # PUBLIC_BASE_URL unless overridden, so a correctly-configured ingress needs nothing extra.
+  OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}
+  OIDC_CLIENT_ID: {{ .Values.oidc.clientId | quote }}
+  {{- if .Values.oidc.redirectUri }}
+  OIDC_REDIRECT_URI: {{ .Values.oidc.redirectUri | quote }}
+  {{- end }}
+  OIDC_LABEL: {{ .Values.oidc.label | quote }}
+  OIDC_SCOPES: {{ .Values.oidc.scopes | quote }}
+  OIDC_GROUPS_CLAIM: {{ .Values.oidc.groupsClaim | quote }}
+  OIDC_DEFAULT_ROLE: {{ .Values.oidc.defaultRole | quote }}
+  OIDC_ADMIN_GROUPS: {{ join "," .Values.oidc.adminGroups | quote }}
+  OIDC_OPERATOR_GROUPS: {{ join "," .Values.oidc.operatorGroups | quote }}
+  OIDC_VIEWER_GROUPS: {{ join "," .Values.oidc.viewerGroups | quote }}
+  {{- end }}
   {{- if .Values.agentMtls.enabled }}
   # ── mTLS agent identity (POL-25, default-on since POL-134) ──────────────────
   # The dedicated TLS agent listener. Reaches the pod as raw TCP (see values.yaml:

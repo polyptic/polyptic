@@ -27,6 +27,8 @@ import { ActivityLog } from "./activity";
 import { AdminBroadcaster, AdminHub, Presence } from "./admin";
 import { SourceHealthTracker } from "./source-health";
 import { AuthService, authConfigFromEnv } from "./auth-local";
+import { OidcService, oidcConfigFromEnv } from "./auth-oidc";
+import { GrantService } from "./grants";
 import { PlayerAuth } from "./player-auth";
 import { registerAuthRoutes } from "./auth-routes";
 import { CaptureCoordinator, ThumbnailStore } from "./capture";
@@ -70,6 +72,14 @@ const AUTH_PUBLIC_PATHS = new Set([
   "/api/v1/auth/login",
   "/api/v1/auth/logout",
   "/api/v1/auth/me",
+  // POL-191 — the sign-in page reads this BEFORE anyone is authenticated, to know whether to draw the
+  // single-sign-on button. It reports a boolean and a label, never a secret.
+  "/api/v1/auth/providers",
+  // POL-191 — the brokered round-trip IS how you become authenticated, so it cannot require a session.
+  // Both ends defend themselves: `start` mints the transaction, `callback` refuses anything whose
+  // state does not match the signed cookie that transaction lives in.
+  "/api/v1/auth/oidc/start",
+  "/api/v1/auth/oidc/callback",
 ]);
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -429,6 +439,44 @@ const auth = new AuthService({ store, fastify, config: authConfig, log: fastify.
 await store.deleteExpiredSessions(new Date().toISOString());
 await auth.seedAdmin();
 
+// ── POL-191: mural grants + brokered sign-in. ────────────────────────────────────────────────────
+//
+// The grant table is loaded ONCE, here, into an in-memory index the gate consults on every API call —
+// authorization must never wait on a database round-trip. It is written through on every change, so
+// the store stays the authority.
+//
+// The gate also needs to know which mural a wall / screen / scene belongs to, which is the control
+// plane's business rather than the auth layer's, so it is handed in as a lookup.
+const grants = new GrantService(store);
+await grants.load();
+auth.useGrants(grants, (via, id) => {
+  switch (via) {
+    case "mural":
+      return control.getMural(id) ? id : null;
+    case "wall":
+      return control.getVideoWall(id)?.muralId ?? null;
+    // An UNPLACED screen has no mural, and says so — the gate then measures the caller's GLOBAL role.
+    case "screen":
+      return control.getPlacementMuralId(id);
+    case "scene":
+      return control.getScene(id)?.muralId ?? null;
+  }
+});
+fastify.log.info(
+  { event: "auth.grants.loaded", grants: grants.size },
+  grants.size > 0
+    ? `loaded ${grants.size} mural grant(s) — some accounts hold more on a mural than their global role`
+    : "no mural grants — every route is measured against the global role (the pre-POL-191 behaviour)",
+);
+
+const oidcConfig = oidcConfigFromEnv(process.env, fastify.log);
+const oidc = oidcConfig
+  ? new OidcService({ config: oidcConfig, fastify, log: fastify.log })
+  : null;
+// Probe the issuer at boot so a broken IdP configuration is loud NOW rather than at the first
+// person's first sign-in. A failure is not fatal — local sign-in is unaffected either way.
+if (oidc) await oidc.probe();
+
 // ── Player-channel auth (POL-54): a per-deployment secret (persisted, like the mTLS CA) derives a
 // bearer token per screen; the token is minted into every playerUrl handed to an agent and verified
 // on `player/hello`. Enforcement rides AUTH_ENABLED — the same switch as REST + the /admin WS — so a
@@ -460,7 +508,7 @@ fastify.addHook("preHandler", async (request: FastifyRequest, reply: FastifyRepl
   await auth.requireAuth(request, reply, path);
 });
 
-registerAuthRoutes(fastify, auth, enrollment);
+registerAuthRoutes(fastify, auth, enrollment, oidc);
 // The remote-DevTools relay (POL-67) bridges an operator's DevTools frontend to a wall's Chrome over
 // the agent WS — the POL-59 shell pattern. Built before the WS channels (agent frames route into it)
 // and handed to REST so disarming a screen closes its live sessions instantly.
@@ -686,6 +734,8 @@ registerRestRoutes(
   devtoolsRelay,
   sourceHealth,
   panelPower,
+  grants,
+  auth,
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);

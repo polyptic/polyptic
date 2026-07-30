@@ -35,6 +35,9 @@
  */
 import { z } from "zod";
 
+import { toMuralGrantView } from "./grants";
+import type { GrantService } from "./grants";
+import type { AuthService } from "./auth-local";
 import type { ShellRelay } from "./shell-relay";
 import type { DevtoolsRelay } from "./devtools-relay";
 import { probeFraming } from "./framing";
@@ -63,8 +66,10 @@ import {
   ServerToAgentInstall,
   machineHasName,
   MoveTargetsBody,
+  MuralGrantSubjectKind,
   PanelPowerBody,
   PlaceScreenBody,
+  PutMuralGrantBody,
   UnplaceScreensBody,
   PreRegistration,
   RebootBody,
@@ -96,7 +101,7 @@ import {
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance } from "fastify";
-import type { BulkMachineResult, Screen, ScreenSlice } from "@polyptic/protocol";
+import type { BulkMachineResult, MuralGrant, Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { appliedCount, fanOut, resolveTarget, unknownIdResults } from "./bulk";
 
@@ -139,6 +144,14 @@ const MachineParams = z.object({ machineId: z.string().min(1) });
 /** POL-104 — a pre-registration record id. */
 const PreRegistrationParams = z.object({ id: z.string().min(1) });
 const MuralParams = z.object({ id: z.string().min(1) });
+
+/** POL-191 — a grant is addressed by its mural and its subject, all three in the path so a revoke is
+ *  an ordinary DELETE on the thing it removes. */
+const MuralGrantParams = z.object({
+  id: z.string().min(1),
+  subjectKind: MuralGrantSubjectKind,
+  subjectId: z.string().min(1).max(200),
+});
 const MuralIdParams = z.object({ muralId: z.string().min(1) });
 const WallParams = z.object({ wallId: z.string().min(1) });
 const ContentSourceParams = z.object({ id: z.string().min(1) });
@@ -187,6 +200,10 @@ export function registerRestRoutes(
   /** POL-94 — per-source content health; a deleted source's reports are dropped with it. */
   health: SourceHealthTracker,
   panelPower: PanelPowerScheduler,
+  /** POL-191 — who holds what on each mural. The gate reads it to authorize; these routes edit it. */
+  grants: GrantService,
+  /** POL-191 — for labelling `user` grants with an email in the People panel. */
+  auth: AuthService,
 ): void {
   // POL-18 — machines whose placed windows the agent may still be holding. A content change on such
   // a machine must push a fresh apply even when the new state has none (so the agent tears the
@@ -1661,6 +1678,9 @@ export function registerRestRoutes(
     }
 
     const mural = await control.createMural(body.data.name);
+    // POL-191 — whoever made it owns it. A team that stands up its own wall can then staff it (add
+    // colleagues, hand out levels) without going back to a fleet admin for every change.
+    if (request.authUser) await grants.grantOwner(mural.id, request.authUser.id);
     fastify.log.info({ event: "mural.create", muralId: mural.id, name: mural.name }, "mural created");
     broadcaster.broadcast();
     return reply.code(201).send({ ok: true, mural });
@@ -1699,11 +1719,110 @@ export function registerRestRoutes(
       return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
     }
 
+    // POL-191 — the grants go with it, so nothing is left pointing at a mural that no longer exists.
+    await grants.removeForMural(params.data.id);
     fastify.log.info({ event: "mural.delete", muralId: params.data.id }, "mural deleted");
     broadcaster.broadcast();
     // A deleted mural dissolves its video walls — push the cleared slices to those members' players.
     for (const slice of result.slices) pushRender(slice.screenId, slice);
     return { ok: true, muralId: params.data.id };
+  });
+
+  // ── POL-191: mural grants — who may drive this wall ──────────────────────────
+  //
+  // The gate has already checked the caller's role ON THIS MURAL before any of these run (operator to
+  // read the list, admin to change it — see ROUTE_POLICY), so the handlers below do not re-check it.
+  // They validate the SUBJECT instead, which the gate has no opinion about.
+
+  /** Decorate grants with the account email behind each `user` subject, for the People panel. */
+  async function muralGrantViews(muralId: string): Promise<MuralGrant[]> {
+    const operators = await auth.listOperators();
+    const emails = new Map(operators.map((o) => [o.id, o.email] as const));
+    return grants.listForMural(muralId).map((g) => toMuralGrantView(g, (id) => emails.get(id)));
+  }
+
+  // GET /api/v1/murals/:id/grants -> { grants: MuralGrant[] }
+  fastify.get("/api/v1/murals/:id/grants", async (request, reply) => {
+    const params = MuralParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    if (!control.getMural(params.data.id)) {
+      return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
+    }
+    return { grants: await muralGrantViews(params.data.id) };
+  });
+
+  // PUT /api/v1/murals/:id/grants  { subjectKind, subjectId, role }  -> create or re-level one grant
+  fastify.put("/api/v1/murals/:id/grants", async (request, reply) => {
+    const params = MuralParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const body = PutMuralGrantBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    if (!control.getMural(params.data.id)) {
+      return reply.code(404).send({ error: `unknown mural: ${params.data.id}` });
+    }
+    // A USER subject must exist — a typo'd id would otherwise sit in the list looking like a granted
+    // permission forever. It may be named by ID or by EMAIL, and the email is what the console sends:
+    // listing every account in the deployment is an admin-only right, so a mural admin who is only a
+    // global viewer has no directory to pick from and must be able to type an address instead.
+    //
+    // A GROUP is deliberately NOT checked. That is the whole point of a group grant: it names a group
+    // the DIRECTORY owns, which may well have no member who has ever signed in here.
+    let subjectId = body.data.subjectId;
+    if (body.data.subjectKind === "user") {
+      const wanted = subjectId.trim().toLowerCase();
+      const operators = await auth.listOperators();
+      const match = operators.find((o) => o.id === subjectId || o.email.toLowerCase() === wanted);
+      if (!match) {
+        return reply.code(404).send({ error: `no account here matches ${body.data.subjectId}` });
+      }
+      // Store the ID, never the email: an account that changes address keeps its permissions.
+      subjectId = match.id;
+    }
+
+    const grant = await grants.put(params.data.id, body.data.subjectKind, subjectId, body.data.role);
+    fastify.log.info(
+      {
+        event: "mural.grant.put",
+        muralId: grant.muralId,
+        subjectKind: grant.subjectKind,
+        subjectId: grant.subjectId,
+        role: grant.role,
+        byUserId: request.authUser?.id,
+      },
+      "mural grant set",
+    );
+    return { ok: true, grants: await muralGrantViews(params.data.id) };
+  });
+
+  // DELETE /api/v1/murals/:id/grants/:subjectKind/:subjectId  -> revoke one grant
+  fastify.delete("/api/v1/murals/:id/grants/:subjectKind/:subjectId", async (request, reply) => {
+    const params = MuralGrantParams.safeParse(request.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "invalid params", issues: params.error.issues });
+    }
+    const removed = await grants.remove(
+      params.data.id,
+      params.data.subjectKind,
+      params.data.subjectId,
+    );
+    if (!removed) return reply.code(404).send({ error: "no such grant" });
+    fastify.log.info(
+      {
+        event: "mural.grant.revoke",
+        muralId: params.data.id,
+        subjectKind: params.data.subjectKind,
+        subjectId: params.data.subjectId,
+        byUserId: request.authUser?.id,
+      },
+      "mural grant revoked",
+    );
+    return { ok: true, grants: await muralGrantViews(params.data.id) };
   });
 
   // PUT /api/v1/screens/:screenId/placement  { muralId, x, y, w?, h? }  -> place or move a screen

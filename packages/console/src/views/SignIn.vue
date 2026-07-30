@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useConsoleStore } from "../stores/console";
 import { ApiError, serverHealth } from "../api";
+import { fetchAuthProviders, oidcSignInUrl } from "../auth";
 import Logo from "../components/Logo.vue";
 
 // Real local-account sign-in (Phase 3f — D29). Credentials POST to /auth/login over the credentialed
@@ -24,6 +25,17 @@ const themeIcon = computed(() => (store.theme === "light" ? "☾ Dark" : "☼ Li
 // The REAL deployed version (was a hardcoded "v3.0" leftover from the Console-v2 design adoption).
 // /healthz is ungated so this works pre-auth; dev builds ("0.0.0") show no number at all.
 const version = ref<string | null>(null);
+
+// POL-191 — single sign-on, when the deployment brokers one. The label comes from the server so a
+// site can put its own name on the button ("AMRC SSO") rather than a generic one.
+const ssoLabel = ref<string | null>(null);
+// Where to land after signing in. The same value drives both paths — the local form routes to it, and
+// the brokered round-trip carries it to the IdP and back (the server refuses anything off-origin).
+const redirectTo = computed(() =>
+  typeof route.query.redirect === "string" ? route.query.redirect : "/wall",
+);
+const ssoUrl = computed(() => oidcSignInUrl(redirectTo.value));
+
 onMounted(() => {
   void serverHealth()
     .then((h) => {
@@ -31,7 +43,27 @@ onMounted(() => {
       if (v && v !== "0.0.0") version.value = v;
     })
     .catch(() => {});
+
+  // A deployment with no IdP configured simply gets no button — this is not an error state, so a
+  // failure here is swallowed and the local form stands alone.
+  void fetchAuthProviders()
+    .then((providers) => {
+      if (providers.oidc) ssoLabel.value = providers.oidc.label;
+    })
+    .catch(() => {});
+
+  // A brokered sign-in that failed comes back as a redirect carrying its reason — the server has
+  // already decided what is safe to say, so it is shown verbatim.
+  if (typeof route.query.error === "string" && route.query.error.length > 0) {
+    errorMessage.value = route.query.error;
+  }
 });
+
+/** Begin the brokered round-trip. A full page navigation, not a fetch: only the address bar can
+ *  follow a redirect chain to the identity provider and back. */
+function onSsoSignIn(): void {
+  window.location.assign(ssoUrl.value);
+}
 
 async function onSignIn(): Promise<void> {
   if (loading.value) return;
@@ -43,8 +75,7 @@ async function onSignIn(): Promise<void> {
   errorMessage.value = null;
   try {
     await store.login({ email: email.value.trim(), password: password.value });
-    const redirect = typeof route.query.redirect === "string" ? route.query.redirect : "/wall";
-    await router.replace(redirect);
+    await router.replace(redirectTo.value);
   } catch (err) {
     if (err instanceof ApiError && err.status === 429) {
       // Lockout after too many failed attempts (server-side rate limit). Surface the cooldown.
@@ -72,6 +103,15 @@ async function onSignIn(): Promise<void> {
 
       <div class="heading">Sign in to the console</div>
       <div class="sub">Operator access to your display fleet.</div>
+
+      <!-- POL-191 — the brokered path goes FIRST: where an organisation has an IdP, it is the way in
+           for everyone except the break-glass local admin underneath. -->
+      <template v-if="ssoLabel">
+        <button class="btn sso" :disabled="loading" @click="onSsoSignIn">
+          Sign in with {{ ssoLabel }}
+        </button>
+        <div class="divider"><span>or sign in with a local account</span></div>
+      </template>
 
       <label class="field-label">Email</label>
       <input
@@ -166,6 +206,28 @@ async function onSignIn(): Promise<void> {
 }
 .field {
   margin-bottom: 14px;
+}
+.sso {
+  width: 100%;
+  padding: 11px;
+  font-size: 13.5px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 18px;
+  font-size: 11.5px;
+  color: var(--muted2);
+}
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
 }
 .error {
   display: flex;
