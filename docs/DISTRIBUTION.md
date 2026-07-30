@@ -251,6 +251,56 @@ If you want the registry **entirely under your control** (air-gapped, on your ow
 
 ---
 
+## (e) The site layer: your organisation's own tooling in the image
+
+A self-hosted fleet sits on a network that has a security function, and that function will want its own software on every box. Endpoint detection, a vulnerability scanner, an inventory agent, internal CA trust, log forwarding. The **site layer** is the one generic seam for all of it, so nobody has to fork the build.
+
+Copy the template, fill it in, build:
+
+```bash
+cp -r deploy/site.example deploy/site      # deploy/site is gitignored
+$EDITOR deploy/site/packages.list
+sudo deploy/build-live-image.sh amd64      # step 6 picks it up
+```
+
+An absent or empty `deploy/site` is an exact no-op. `SITE_DIR` overrides the location. Full contract in `deploy/site.example/README.md`; the short version is a directory of `packages.list`, `apt/`, `debs/`, `rootfs/`, `units.wants`, plus three optional hooks (`configure.sh` at build, `seal.sh` at seal, `firstboot.d/*` on the box).
+
+### The rule that shapes everything: install at build, register at boot
+
+Packages, config and trust go into the image. The **registration** that turns an installed package into an enrolled agent runs on the box, at boot, from `firstboot.d/`.
+
+That split is forced, not stylistic. Registration writes a bearer credential to disk, and the image is served **without authentication** at `GET /dist/image/<arch>/rootfs.squashfs` (see (b2) above), because a box has no session before it has booted. Anyone who can reach the control plane can download the image and unpack it. Register during the build and you have published your own credential.
+
+So secrets ride the **boot medium** as `polyptic/site.conf`, next to `polyptic/wifi.conf`, and reach your hooks in RAM (environment variables plus 0600 files under `$POLYPTIC_SITE_SECRETS_DIR`). On an installed box the medium is that box's ESP, so one mechanism covers both kinds of box. Template in `deploy/site.example/site.conf.example`. The file is parsed and never sourced, so a value containing `$(...)` stays literal.
+
+### Clear the agent identity before sealing, or the fleet becomes one host
+
+Endpoint agents mint a host identity the first time they register and then decline to register again. Bake an image with one already registered and every box claims to be the same machine. Vendors publish a golden-image procedure for exactly this, and `seal.sh` is where you run it.
+
+Every Polyptic boot is a golden-image first boot, because the writable layer is discarded at power-off (netboot boxes overlay in RAM, installed boxes carry `rd.live.overlay.reset=1`). The honest consequence: your boxes register fresh on every boot, so your security function has to expect that host-record turnover and agree retention. In exchange, no box can drift from its build.
+
+### What this model does and does not give a security function
+
+Met, and more strongly than on a managed laptop. Configuration drift is structurally zero. Attacker persistence is close to impossible, since the filesystem is read-only, the kernel is signed and verified at load, and any foothold is gone at the next reboot. There are no credentials on the box to steal, because no interactive login ever happens and the image ships neither `sudo` nor `polkit`. In the default diskless mode nothing is written to a disk at all. Userspace patching reaches the whole fleet within about a day of a fix landing in Ubuntu, with no per-host success rate to chase.
+
+Not met, and worth saying out loud. The boxes log in automatically and never lock, which is deliberate and is what makes a wall come back after a power cut with nobody present. The kernel is pinned in the nightly refresh and only moves on a full rebuild, so kernel fixes are not on the same clock as everything else. And nothing can be remediated on a host that will not exist in eight hours, so every fix is a change to the image build and your containment action is a reboot, which restores a filesystem with a published checksum.
+
+### Things that do not belong in the image
+
+Anything that manages durable per-machine state or assumes a human signs in. Directory joins create a fresh computer object per power cycle, because a machine account secret cannot survive the boot. Local-admin password rotation targets an account that does not exist. Per-user network drives mount for nobody. TPM-sealed disk encryption fights the A/B slot layout and protects a filesystem that is already downloadable. Interactive-login MFA inserts a prompt in front of an autologin session and can leave a public screen blank.
+
+### Using your own Ubuntu mirror
+
+`MIRROR` points the build at an internal mirror or proxy instead of the public archive, which is often the same host your organisation already runs for its other Linux estate:
+
+```bash
+MIRROR=http://mirror.internal.example/ubuntu sudo deploy/build-live-image.sh amd64
+```
+
+Check it carries the suite you build against, not just the one your desktops run.
+
+---
+
 ## See also
 
 - `docs/DEPLOY.md`: the on-device guide (making a box a display, backends, troubleshooting, VM walkthrough).

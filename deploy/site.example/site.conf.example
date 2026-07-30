@@ -1,0 +1,26 @@
+# Site secrets. This file does NOT belong in the image and does NOT belong in git.
+#
+# Copy it onto the BOOT MEDIUM as `polyptic/site.conf`, alongside `polyptic/wifi.conf`. That is the
+# same place, and the same trust model, as the Wi-Fi credentials: readable by anyone holding the USB
+# stick, and never published anywhere. On a box that has been installed to its own disk the medium is
+# that box's EFI system partition, so one mechanism covers both kinds of box.
+#
+# WHY NOT IN THE IMAGE. `rootfs.squashfs` is served without authentication, because a box has no
+# session before it boots and the boot chain cannot present one. Anyone who can reach the control plane
+# can download the image and unpack it. A token baked into it is a published token.
+#
+# FORMAT. One `SITE_<NAME>=<value>` per line. Names are A-Z, 0-9 and underscore. The value is taken
+# verbatim from the first `=` to the end of the line, so spaces, quotes, `=` and `$` all need no
+# escaping and cannot execute anything: this file is parsed, never sourced. `#` starts a comment. A key
+# with an empty value counts as unset, so a template can ship blank keys. The first occurrence of a key
+# wins.
+#
+# A key without the SITE_ prefix is a hard error rather than a silent skip. A typo'd credential that is
+# quietly ignored gives you a box that boots, renders perfectly and is enrolled in nothing, which
+# nobody notices until an audit.
+#
+# These reach your firstboot.d/ hooks as environment variables and as files under
+# $POLYPTIC_SITE_SECRETS_DIR.
+
+# SITE_EXAMPLE_TENANT=
+# SITE_EXAMPLE_ENROL_TOKEN=

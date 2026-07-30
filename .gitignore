@@ -43,3 +43,8 @@ deploy/dist/test-depot/
 # Agent-Native local plan bridge token (never commit)
 .plan-url
 comments.json
+
+# The SITE LAYER (POL-190): an organisation's own endpoint/compliance bundle. Never committed — it
+# names internal repos and hosts, and a careless copy of the boot medium's site.conf into it would put
+# a bearer credential in git. `deploy/site.example/` is the committed template.
+deploy/site/

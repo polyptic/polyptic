@@ -1,0 +1,10 @@
+# One systemd unit name per line, enabled under multi-user.target at build time.
+#
+# Only list units that EXIST in the image: either something a package you installed provides, or one
+# of your own shipped via rootfs/etc/systemd/system/. A name with no unit behind it produces a dangling
+# symlink and a failed boot job.
+#
+# You usually do NOT need to list a vendor agent's own service. Its package almost certainly enables
+# itself through the normal Debian preset machinery during install.
+#
+# example-log-forwarder.service
