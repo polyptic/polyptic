@@ -74,6 +74,7 @@ Once a machine dials in, approve it, ident the panels to name them, place them o
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | The device side: backends, crash hardening, troubleshooting |
 | [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md) | Packaging: the server image, Helm, releases |
 | [`docs/NETBOOT.md`](docs/NETBOOT.md) | The network-boot chain |
+| [`docs/SITE-LAYER.md`](docs/SITE-LAYER.md) | Putting your organisation's own endpoint/compliance tooling in the image |
 | [`docs/DEV.md`](docs/DEV.md) | Running the stack locally and working on it |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | The design narrative |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Data model, API, technical gotchas |
