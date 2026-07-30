@@ -360,9 +360,9 @@ export function registerRestRoutes(
   // ── POL-191: the REST reads are narrowed the same way the admin socket is ────
   //
   // The WS broadcast is what the console actually lives on, but these are the same data over a
-  // different door — and a scoping feature that only covers the front one is not a scoping feature.
-  // `visibleTo(request)` answers "all" for `open` mode and every fleet role, so nothing below costs
-  // an existing deployment anything.
+  // different door — and access control that only covers the front one is not access control.
+  // `visibleTo(request)` answers "all" for every FLEET role, so a deployment run by operators and
+  // admins short-circuits every filter below.
 
   /** Which murals this request's caller may see. `"all"` short-circuits every filter that follows. */
   function visibleTo(request: FastifyRequest): Set<string> | "all" {

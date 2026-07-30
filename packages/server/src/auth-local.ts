@@ -549,10 +549,9 @@ export class AuthService {
         : (this.muralLookup?.(requirement.scope.via, requirement.id ?? "") ?? null);
     if (!muralId) {
       // No mural to measure against — an unplaced screen, an unknown wall, a body that named none.
-      // In `open` mode that is the caller's global role (the conservative fallback: a grant only ever
-      // widens, so losing the mural can refuse but never admit). In `scoped` mode it is NOTHING for a
-      // non-fleet account, because a thing on no mural is fleet plumbing and a scoped viewer holds
-      // exactly what they were handed — which is never the tray.
+      // A thing on NO mural is fleet plumbing: it belongs to the fleet roles, which fall back to
+      // their own deployment-wide role, and to nobody else, because everyone else holds exactly what
+      // they were handed and the tray is never handed to anyone.
       return { role: grants.unscopedFallbackRole(subject), muralId: null };
     }
     return { role: grants.effectiveRole(subject, muralId), muralId };

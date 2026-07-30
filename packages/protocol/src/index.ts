@@ -2677,32 +2677,10 @@ export const UpdateBootOrderPolicyBody = z.object({
 });
 export type UpdateBootOrderPolicyBody = z.infer<typeof UpdateBootOrderPolicyBody>;
 
-/**
- * POL-191 — how much of the deployment a signed-in account is shown.
- *
- *   - `open`   — the DEFAULT, and exactly the pre-POL-191 world: everyone signed in sees the whole
- *                fleet, and mural grants only ever ADD to what they may change. A single-team
- *                deployment wants this, and an upgrade must never silently become the other one.
- *   - `scoped` — a shared deployment. A global `viewer` sees ONLY the murals they hold a grant on,
- *                and holds no role at all on the rest — so sight and power stay the same shape, which
- *                is the only version of this that does not lie. Global `operator` and `admin` are
- *                fleet-wide roles and keep seeing everything, because hiding a wall someone can still
- *                reconfigure would be a worse falsehood than showing it.
- *
- * The intended shape for a hosted deployment is therefore: everyone lands on `viewer` (which is what
- * `OIDC_DEFAULT_ROLE` already does), and murals are handed out with grants.
- */
-export const VisibilityMode = z.enum(["open", "scoped"]);
-export type VisibilityMode = z.infer<typeof VisibilityMode>;
-
 /** Full registry snapshot, pushed to admin clients on connect and on every change. */
 export const ServerToAdminState = z.object({
   t: z.literal("admin/state"),
   revision: z.number().int().nonnegative(),
-  /** POL-191 — whether what follows is the WHOLE deployment or only this account's slice of it. The
-   *  console needs it to tell "nothing here yet" apart from "nothing here that is yours", which are
-   *  the same empty canvas and completely different problems. Defaulted for a pre-POL-191 server. */
-  visibility: VisibilityMode.default("open"),
   machines: z.array(MachineView),
   murals: z.array(Mural), // Phase 3
   placements: z.array(Placement), // Phase 3 — which screen sits where on which mural
@@ -3147,19 +3125,28 @@ export const LoginBody = z.object({
 export type LoginBody = z.infer<typeof LoginBody>;
 
 /**
- * What an operator account is ALLOWED to do (POL-107). Three roles, ordered — each one strictly
- * contains the one below it:
+ * An account's FLEET role (POL-107, redefined by POL-191/D175). Three, ordered — each strictly
+ * contains the one below it — but read the first one carefully, because it is not what its name
+ * suggests and it is the default every brokered account lands on:
  *
- *   - `viewer`   — read the whole registry, and INVOKE a saved scene (`POST /scenes/:id/apply`).
- *                  The "staff invoke" half of the author/invoke split: a receptionist can recall a
- *                  layout the wall's owner authored, and can change nothing else.
- *   - `operator` — everything a viewer can do, plus the CONTENT + LAYOUT verbs: the content library,
+ *   - `viewer`   — **no fleet-wide access at all.** They see and touch exactly the murals they hold a
+ *                  GRANT on, at the level that grant names, and nothing else in the deployment. With
+ *                  no grants they sign in to an empty console. This is the default, and the only
+ *                  correct one: an account nobody has given anything to should have nothing.
+ *   - `operator` — the whole fleet's CONTENT + LAYOUT verbs, on every mural: the content library,
  *                  murals/placements/walls, per-screen + per-wall content and zoom, scenes CRUD,
- *                  ident, capture, casting, screen renames.
- *   - `admin`    — everything, plus the FLEET + SECRETS verbs: machines (approve/reject/reboot/remove),
- *                  the remote shell and the DevTools tunnel, every `/settings/**` route (enrolment
- *                  token, image builds, display settings, HTTPS, credential profiles) and operator
- *                  management itself.
+ *                  ident, capture, casting, screen renames. A fleet role, so they see every wall.
+ *   - `admin`    — everything an operator can do, plus the FLEET + SECRETS verbs: machines
+ *                  (approve/reject/reboot/remove), the remote shell and the DevTools tunnel, every
+ *                  `/settings/**` route (enrolment token, image builds, display settings, HTTPS,
+ *                  credential profiles), operator management, and handing out grants anywhere.
+ *
+ * So the model has two axes, and they compose: the fleet role says whether you have DEPLOYMENT-WIDE
+ * access, and grants say which individual murals you have access to. Access is what decides sight —
+ * a wall you cannot use is a wall you are not shown, over REST and over the admin socket alike.
+ *
+ * `viewer` keeps its name because it is still the least-privileged rank and the ordering below
+ * depends on it; what changed at POL-191 is that its reach is no longer "everything, read-only".
  *
  * The ordering is the whole contract: a role may do anything its rank allows, and the SERVER decides
  * (a console that hides a button is a nicety, not a permission system).
@@ -3212,16 +3199,14 @@ export type MuralGrantSubjectKind = z.infer<typeof MuralGrantSubjectKind>;
 /**
  * POL-191 — one grant: a subject holds `role` ON `muralId`.
  *
- * Grants are **ADDITIVE ONLY**. The effective role for a request that touches a mural is the HIGHER of
- * the account's global role and its best grant on that mural — a grant can raise what someone may do
- * and can never lower it. Two consequences, both deliberate:
+ * A grant IS the access. For a `viewer` — the "no fleet access" rank, and the default a brokered
+ * account lands on — the grant is the only thing it holds on that mural; with none it holds nothing
+ * and, because ACCESS DECIDES SIGHT, is never shown the mural at all. For a FLEET role (`operator`,
+ * `admin`) a grant can only raise what they already hold everywhere.
  *
- *   - Upgrading is a no-op. A deployment with no grants behaves exactly as it did before POL-191.
- *   - `viewer` becomes the right global default for a brokered account: they read the whole fleet and
- *     can change only the murals they were actually given.
- *
- * Grants govern POWER, not VISIBILITY — `GET /state` is one fleet-wide document and still shows
- * everything to anyone signed in.
+ * Sight and power are the same shape, deliberately: a wall you cannot use is a wall you are not sent,
+ * over the admin socket and over REST alike. Showing somebody a wall they have no access to, and then
+ * refusing them when they touch it, is a locked door with the contents on display.
  */
 export const MuralGrant = z.object({
   muralId: z.string(),

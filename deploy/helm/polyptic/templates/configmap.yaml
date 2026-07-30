@@ -38,9 +38,6 @@ data:
   {{- if ne (toString .Values.config.captureIntervalMs) "" }}
   CAPTURE_INTERVAL_MS: {{ .Values.config.captureIntervalMs | quote }}
   {{- end }}
-  # POL-191/D175 — `open` (default) or `scoped`. See values.yaml; anything the server does not
-  # recognise as "scoped" reads as open, so a typo cannot hide a deployment from its own operators.
-  VISIBILITY: {{ .Values.visibility | quote }}
   {{- if .Values.oidc.issuer }}
   # ── Brokered sign-in (POL-191/D173) ─────────────────────────────────────────
   # Everything here is PUBLIC by construction in an authorization-code flow — the issuer, the client

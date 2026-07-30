@@ -26,7 +26,6 @@ import type {
   ScreenView,
   ServerCapabilities,
   ServerToAdminMessage,
-  VisibilityMode,
 } from "@polyptic/protocol";
 import { WebSocket } from "ws";
 
@@ -60,7 +59,7 @@ export interface AdminViewer {
   visible: Set<string> | "all";
 }
 
-/** Everyone sees everything — `open` mode, and every fleet role. */
+/** Sees everything — what a fleet role (`operator`, `admin`) gets. */
 const SEES_EVERYTHING: AdminViewer = { visible: "all" };
 
 /** Tracks connected admin sockets and fans `admin/state` out to all of them. */
@@ -79,7 +78,8 @@ export class AdminHub {
     return this.sockets.size;
   }
 
-  /** What this socket may see. Absent (or never registered) reads as everything, matching `open`. */
+  /** What this socket may see. Absent (or never registered) reads as everything — only the server's
+   *  own internal callers register without a viewer, and they are not a tenant. */
   viewerFor(socket: WebSocket): AdminViewer {
     return this.sockets.get(socket) ?? SEES_EVERYTHING;
   }
@@ -89,10 +89,10 @@ export class AdminHub {
    *
    * The projection is memoized on the viewer's mural set for the duration of one broadcast, so N
    * consoles showing the same murals cost ONE projection and ONE `JSON.stringify` between them — and
-   * an `open` deployment, where every viewer is `"all"`, costs exactly the single serialization it
-   * always did. Returns the count delivered.
+   * a deployment run entirely by operators and admins, where every viewer is `"all"`, costs exactly
+   * one serialization. Returns the count delivered.
    */
-  broadcast(message: ServerToAdminMessage, mode: VisibilityMode = "open"): number {
+  broadcast(message: ServerToAdminMessage): number {
     if (this.sockets.size === 0) return 0;
     const encoded = new Map<string, string>();
     let delivered = 0;
@@ -104,7 +104,7 @@ export class AdminHub {
       const key = viewer.visible === "all" ? "all" : JSON.stringify([...viewer.visible].sort());
       let data = encoded.get(key);
       if (data === undefined) {
-        data = JSON.stringify(projectAdminState(message, viewer.visible, mode));
+        data = JSON.stringify(projectAdminState(message, viewer.visible));
         encoded.set(key, data);
       }
       socket.send(data);
@@ -676,8 +676,8 @@ export function buildAdminState(
 /**
  * POL-191 — narrow a full `admin/state` to the murals one account may see.
  *
- * Called with `"all"` this returns the snapshot UNTOUCHED, by identity — which is what keeps `open`
- * mode, and every fleet role, on the single shared object the broadcaster serializes once.
+ * Called with `"all"` this returns the snapshot UNTOUCHED, by identity — which is what keeps every
+ * fleet role on the single shared object the broadcaster serializes once.
  *
  * Everything follows from the mural set rather than being filtered on its own terms: a placement is
  * visible because its mural is, a wall because it sits on one, a screen because it is PLACED on one, a
@@ -698,10 +698,9 @@ export function buildAdminState(
 export function projectAdminState(
   state: ServerToAdminMessage,
   visible: Set<string> | "all",
-  mode: VisibilityMode,
 ): ServerToAdminMessage {
   if (state.t !== "admin/state") return state;
-  if (visible === "all") return mode === state.visibility ? state : { ...state, visibility: mode };
+  if (visible === "all") return state;
 
   const murals = state.murals.filter((m) => visible.has(m.id));
   const placements = state.placements.filter((p) => visible.has(p.muralId));
@@ -725,7 +724,6 @@ export function projectAdminState(
 
   return {
     ...state,
-    visibility: mode,
     machines,
     murals,
     placements,
@@ -764,10 +762,6 @@ interface BroadcasterDeps {
   documents?: DocumentStateSource;
   /** POL-104 — the live enrolment policy (which token a machine came in on, and whether it is revoked). */
   enrollment?: { list(): { id: string; revokedAt: string | null }[] };
-  /** POL-191 — the grant index, read ONLY for its visibility mode here (the per-socket mural set is
-   *  resolved at upgrade and lives on the socket). Optional: a unit test needs no grants to broadcast,
-   *  and its absence means `open`, which is the pre-POL-191 behaviour. */
-  grants?: { mode: VisibilityMode };
 }
 
 /**
@@ -784,7 +778,7 @@ export class AdminBroadcaster {
    * Current `admin/state` for a single recipient (e.g. on connect).
    *
    * `viewer` narrows it to that account's murals (POL-191). Omitted — or `"all"` — returns the whole
-   * deployment, which is what `open` mode and every fleet role get.
+   * deployment, which is what a fleet role gets.
    */
   snapshot(viewer?: AdminViewer): ServerToAdminMessage {
     const full = buildAdminState(
@@ -796,13 +790,7 @@ export class AdminBroadcaster {
       this.deps.health,
       this.deps.enrollment,
     );
-    return projectAdminState(full, viewer?.visible ?? "all", this.visibility);
-  }
-
-  /** The deployment's visibility mode, stamped onto every snapshot so the console can tell "nothing
-   *  here yet" from "nothing here that is yours". */
-  get visibility(): VisibilityMode {
-    return this.deps.grants?.mode ?? "open";
+    return projectAdminState(full, viewer?.visible ?? "all");
   }
 
   /** Schedule a coalesced broadcast of the latest state to all admin sockets. */
@@ -815,7 +803,7 @@ export class AdminBroadcaster {
       // Build the FULL state once; the hub projects it per socket and memoizes by mural set, so an
       // `open` deployment still does exactly one projection and one serialization.
       const message = this.snapshot();
-      const delivered = this.deps.adminHub.broadcast(message, this.visibility);
+      const delivered = this.deps.adminHub.broadcast(message);
       this.deps.log.debug(
         {
           event: "admin.state.broadcast",

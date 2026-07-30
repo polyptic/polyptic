@@ -18,8 +18,8 @@
  *
  * Every entry now also says WHERE its role is measured. Before POL-191 there was one answer — the
  * deployment — and it stayed implicit. Now a route can be measured against a single mural, and the
- * caller's role there is their global role RAISED by any grant they hold on it (see `grants.ts`; the
- * raise is one-way, so this table's meaning is unchanged for a deployment with no grants).
+ * caller's role THERE is what counts: a fleet role (`operator`, `admin`) everywhere, and for anyone
+ * else exactly the grant they hold on that mural, or nothing at all (see `grants.ts`).
  *
  *   - `global`    — measured across the deployment, exactly as before. Fleet + secrets verbs.
  *   - `mural`     — measured on ONE mural, named by the request: directly in the path (`/murals/:id`),
@@ -32,8 +32,8 @@
  *                   create one.
  *
  * A `mural`-scoped route whose mural CANNOT be resolved (an unplaced screen, an unknown wall, a body
- * with no muralId) falls back to the GLOBAL role. That is the conservative direction: a grant only
- * ever widens, so failing to find the mural can refuse someone but never admit them.
+ * with no muralId) belongs to the FLEET: the fleet roles fall back to their own deployment-wide role
+ * and everyone else gets nothing, because a thing on no canvas was never granted to anybody.
  */
 import type { OperatorRole } from "@polyptic/protocol";
 
@@ -43,9 +43,9 @@ const RANK: Record<OperatorRole, number> = { viewer: 0, operator: 1, admin: 2 };
 /**
  * Does `have` satisfy `need`? (viewer < operator < admin)
  *
- * POL-191 — `null` is NO ROLE AT ALL, which only `scoped` visibility can produce: a viewer on a mural
- * nobody gave them. It satisfies nothing, including `viewer`, which is the point — a role floor that
- * quietly reappeared underneath a scoped account would make the scoping decorative.
+ * POL-191 — `null` is NO ROLE AT ALL: a non-fleet account on a mural nobody granted it. It satisfies
+ * nothing, including `viewer`, which is the point — a role floor that quietly reappeared underneath
+ * an ungranted account would make the whole access model decorative.
  */
 export function roleAllows(have: OperatorRole | null, need: OperatorRole): boolean {
   if (have === null) return false;
@@ -78,8 +78,8 @@ interface RoutePolicy {
   pattern: RegExp;
   /** The MINIMUM role that may call it. Absent from the table ⇒ admin (deny by default). */
   role: OperatorRole;
-  /** Where that role is measured. Omitted ⇒ `global`, so an entry that says nothing about scope means
-   *  exactly what it meant before POL-191. */
+  /** Where that role is measured. Omitted ⇒ `global`: a deployment-wide verb, judged on the fleet
+   *  role alone. */
   scope?: RouteScope;
 }
 
@@ -112,13 +112,12 @@ export const ROUTE_POLICY: RoutePolicy[] = [
   // Views only — the profile's secret is never in the payload (POL-24). A viewer sees which profile a
   // source uses; it cannot create, edit, test or delete one (those fall through to admin).
   { method: "GET", pattern: seg("/credential-profiles"), role: "viewer" },
-  // POL-191 — a thumbnail IS the wall's content, so it is measured on the screen's mural. In `open`
-  // mode a global viewer satisfies that everywhere and nothing changes; in `scoped` mode a live
-  // picture of a wall you cannot see would be the biggest hole in the whole feature.
+  // POL-191 — a thumbnail IS the wall's content, so it is measured on the screen's mural. A live
+  // picture of a wall you have no access to would be the biggest hole in the whole feature.
   { method: "GET", pattern: seg("/screens/:id/thumbnail"), role: "viewer", scope: VIA("screen") },
   // ── viewer: INVOKE a saved scene — the "staff invoke" half of the split ───────
-  // Scoped to the scene's own mural for the same reason: applying a scene REPAINTS a wall, and a
-  // scoped viewer must not be able to repaint one they were never given.
+  // Scoped to the scene's own mural for the same reason: applying a scene REPAINTS a wall, and an
+  // account must not be able to repaint one it was never given.
   { method: "POST", pattern: seg("/scenes/:id/apply"), role: "viewer", scope: VIA("scene") },
 
   // ── operator: the content library + media — fleet-wide surfaces a mural owner needs ──
@@ -158,8 +157,8 @@ export const ROUTE_POLICY: RoutePolicy[] = [
   { method: "POST", pattern: seg("/walls/:id/ident"), role: "operator", scope: VIA("wall") },
 
   // ── operator: screens — scoped by the mural the screen is PLACED on ───────────
-  // An UNPLACED screen resolves to no mural and therefore falls back to the global role. That is the
-  // honest answer: a screen in the tray belongs to nobody's canvas yet.
+  // An UNPLACED screen resolves to no mural, so it belongs to the FLEET roles and to nobody else:
+  // a screen in the tray is on nobody's canvas, so nobody was granted it.
   { method: "PUT", pattern: seg("/screens/:id/content"), role: "operator", scope: VIA("screen") },
   { method: "PUT", pattern: seg("/screens/:id/zoom"), role: "operator", scope: VIA("screen") },
   // Placement is the exception that reads the BODY: the request's whole purpose is to name the mural

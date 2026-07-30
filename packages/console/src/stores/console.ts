@@ -36,7 +36,6 @@ import type {
   LoginBody,
   MachineView,
   Mural,
-  VisibilityMode,
   NetbootInfo,
   OperatorRole,
   Placement,
@@ -170,10 +169,6 @@ export interface ConsoleState {
    *  registry is empty" and "we haven't heard yet" (deep links must not act on the latter). */
   stateReceived: boolean;
   revision: number;
-  /** POL-191 — whether the server sent the WHOLE deployment or only this account's slice of it.
-   *  `scoped` + an empty canvas means "nothing here is yours", which is a completely different
-   *  problem from "nothing here yet" and must not read as the same blank page. */
-  visibility: VisibilityMode;
   machines: MachineView[];
   murals: Mural[];
   placements: Placement[];
@@ -244,7 +239,6 @@ export const useConsoleStore = defineStore("console", {
     connected: false,
     stateReceived: false,
     revision: 0,
-    visibility: "open",
     machines: [],
     murals: [],
     placements: [],
@@ -973,8 +967,6 @@ export const useConsoleStore = defineStore("console", {
       if (msg.t === "admin/state") {
         this.stateReceived = true;
         this.revision = msg.revision;
-        // Optional on the wire (a pre-POL-191 server omits it) → `open`, which is what it was.
-        this.visibility = msg.visibility ?? "open";
         this.machines = msg.machines;
         this.murals = msg.murals;
         this.placements = msg.placements;

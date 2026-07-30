@@ -13,21 +13,22 @@
  *
  * ── The rule ────────────────────────────────────────────────────────────────────────────────────
  *
- *     effectiveRole(user, mural) = MAX(user.globalRole, best grant matching that user on that mural)
+ *     a FLEET role (operator, admin) → that role on every mural, raised by any grant it holds
+ *     anything else (viewer)         → exactly the grant it holds there, or NOTHING
  *
- * **Additive only.** A grant raises what someone may do and can never lower it. Two things follow, and
- * both are the reason it is built this way:
+ * There is no third mode and no switch. **Access decides sight**: a mural you hold nothing on is a
+ * mural you are not shown — not over the admin socket, not over REST, not as a thumbnail, and not as
+ * a scene you could apply. Showing somebody a wall they have no access to, and then refusing them
+ * when they touch it, is not access control; it is a locked door with the contents on display.
  *
- *   - Upgrading to POL-191 is a no-op. No grants exist, every max() is the global role, and every
- *     existing deployment behaves exactly as it did. A permission change that silently takes power
- *     away during an upgrade is how an operator discovers the feature at the worst possible moment.
- *   - `viewer` becomes a genuinely useful default for a brokered account: they read the whole fleet and
- *     can change only the murals someone deliberately handed them.
+ * So the model has two axes and they compose. The FLEET role says whether you have deployment-wide
+ * access at all; GRANTS say which individual murals you have access to, and at what depth. `viewer`
+ * is the "no fleet access" rank, which is why it is the right default for a brokered account: an
+ * account nobody has given anything to signs in and sees an empty console, which is correct.
  *
- * Grants govern POWER, not VISIBILITY. `GET /state` is one fleet-wide document pushed over one admin
- * WS, and slicing it per-viewer is a different piece of work (see the ticket's out-of-scope list). A
- * grant-holder therefore SEES the whole deployment and can act on their own murals — which is the same
- * shape the global `viewer` role already had, one mural at a time.
+ * Fleet roles are NOT scoped, deliberately: `operator` and `admin` are deployment-wide by
+ * construction, and hiding a wall from someone who can still reconfigure it would be a worse lie than
+ * showing it. Their sight matches their power exactly, like everyone else's.
  *
  * ── Why this is an in-memory index ──────────────────────────────────────────────────────────────
  *
@@ -36,12 +37,7 @@
  * write. The store is still the authority — this is a cache that is written through, never a
  * second source of truth.
  */
-import type {
-  MuralGrant,
-  MuralGrantSubjectKind,
-  OperatorRole,
-  VisibilityMode,
-} from "@polyptic/protocol";
+import type { MuralGrant, MuralGrantSubjectKind, OperatorRole } from "@polyptic/protocol";
 
 import { roleAllows } from "./roles";
 import type { PersistedMuralGrant, Store } from "./store";
@@ -71,9 +67,8 @@ function key(muralId: string, kind: MuralGrantSubjectKind, subjectId: string): s
 
 /**
  * POL-191 — is this account a FLEET role? `operator` and `admin` are deployment-wide by construction
- * (POL-107 gave the operator every wall and the admin every machine), so in `scoped` mode they keep
- * seeing everything. Scoping SIGHT without scoping POWER would show someone less than they can still
- * change, which is the one outcome worse than showing them too much.
+ * (POL-107 gave the operator every wall and the admin every machine), so they reach and see every
+ * mural. Everyone else reaches exactly what they were granted.
  */
 function isFleetRole(role: OperatorRole): boolean {
   return role === "operator" || role === "admin";
@@ -83,12 +78,9 @@ export class GrantService {
   private readonly store: Store;
   /** key() → grant. The whole table; it is one row per (mural, subject) and stays small. */
   private readonly grants = new Map<string, PersistedMuralGrant>();
-  /** POL-191 — `open` (the default, and the pre-POL-191 world) or `scoped`. See {@link VisibilityMode}. */
-  readonly mode: VisibilityMode;
 
-  constructor(store: Store, mode: VisibilityMode = "open") {
+  constructor(store: Store) {
     this.store = store;
-    this.mode = mode;
   }
 
   /** Load the table once at boot. Called before the gate is registered. */
@@ -108,21 +100,20 @@ export class GrantService {
   /**
    * The role `subject` holds ON `muralId`, or **null** for no role there at all.
    *
-   * In `open` mode this is the additive rule and nothing else — the global role, raised by the best
-   * matching grant, never lowered, never null. That is the whole of POL-191 as first shipped.
-   *
-   * In `scoped` mode the FLOOR moves. A fleet role (`operator`, `admin`) is still fleet-wide and
-   * unchanged. A `viewer` no longer carries an implicit viewer-everywhere: on a mural they hold no
-   * grant on they hold **nothing**, and the gate refuses them. That is what makes scoping honest —
-   * a viewer who could still apply scenes on a wall they cannot see would be scoped in name only.
+   * A FLEET role holds its own role on every mural, raised by any grant it also happens to hold
+   * there. Anything else holds exactly what it was granted — and `null` is the ordinary answer, not
+   * an error case: it is what an account with no access to this wall has, and `roleAllows` refuses it
+   * for everything including `viewer`.
    */
   effectiveRole(subject: GrantSubject, muralId: string): OperatorRole | null {
     const granted = this.bestGrantOn(subject, muralId);
-    if (this.mode === "scoped" && !isFleetRole(subject.role)) {
-      // No implicit floor: their role here is exactly what they were given, or nothing.
-      return granted;
+    // A FLEET role reaches every mural, and a grant can still raise it there (a `viewer`-turned-
+    // mural-admin case does not arise for these, but an operator granted admin on one wall is real).
+    if (isFleetRole(subject.role)) {
+      return granted ? pickHigher(subject.role, granted) : subject.role;
     }
-    return granted ? pickHigher(subject.role, granted) : subject.role;
+    // Everyone else holds exactly what they were given here, or nothing at all.
+    return granted;
   }
 
   /** The best grant matching this subject on one mural, ignoring their global role. Null if none. */
@@ -141,29 +132,27 @@ export class GrantService {
    * The role to measure a mural-scoped route by when its mural CANNOT be resolved — an unplaced
    * screen, an unknown wall, a body that named no mural.
    *
-   * `open`: the caller's global role, the conservative fallback (a grant only widens, so losing the
-   * mural can refuse someone who would have been allowed, and can never admit one who would not).
-   * `scoped`: nothing at all for a non-fleet account. A thing on no mural is fleet plumbing, and a
-   * scoped viewer holds exactly what they were handed — which is never the tray.
+   * A thing on no mural is FLEET PLUMBING: it belongs to nobody's canvas, so it belongs to the fleet
+   * roles. Everyone else gets nothing, because they hold exactly what they were handed and the tray
+   * is never handed to anyone.
    */
   unscopedFallbackRole(subject: GrantSubject): OperatorRole | null {
-    if (this.mode === "scoped" && !isFleetRole(subject.role)) return null;
-    return subject.role;
+    return isFleetRole(subject.role) ? subject.role : null;
   }
 
   /**
    * WHICH MURALS this account is shown — `"all"`, or the exact set.
    *
-   * `"all"` is not a convenience: it is what keeps `open` mode (and every fleet role) on the single
-   * shared, serialized-once state broadcast, so the deployment that never asked for any of this pays
-   * nothing for it.
+   * `"all"` is not a convenience: it is what keeps every fleet role on the single shared,
+   * serialized-once state broadcast, so a deployment run entirely by operators and admins — the
+   * ordinary single-team case — pays nothing for any of this.
    *
    * Everything else in the console follows from this set rather than being filtered on its own terms:
    * a screen is visible because it is PLACED on a visible mural, a wall because it sits on one, a
    * scene because it snapshots one. There is exactly one question, asked once.
    */
   visibleMuralIds(subject: GrantSubject): Set<string> | "all" {
-    if (this.mode === "open" || isFleetRole(subject.role)) return "all";
+    if (isFleetRole(subject.role)) return "all";
     const groups = new Set(subject.groups.map((g) => normalizeSubjectId("group", g)));
     const visible = new Set<string>();
     for (const grant of this.grants.values()) {
@@ -185,9 +174,9 @@ export class GrantService {
    * a model that is shared everywhere else.
    */
   bestRoleAnywhere(subject: GrantSubject): OperatorRole {
-    // The global role IS the floor here even in `scoped` mode, and deliberately: this answers "may
-    // you touch the shared library", not "may you touch a particular wall". A `viewer` floor grants
-    // nothing anyway (every any-mural route asks for operator), so there is no hole to close.
+    // The fleet role IS the floor here, deliberately: this answers "may you touch the shared
+    // library", not "may you touch a particular wall". A `viewer` floor grants nothing anyway (every
+    // any-mural route asks for operator), so there is no hole to close.
     let best = subject.role;
     const groups = new Set(subject.groups.map((g) => normalizeSubjectId("group", g)));
     for (const grant of this.grants.values()) {

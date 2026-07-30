@@ -1,5 +1,5 @@
 /**
- * POL-191/D175 — what the SERVER ACTUALLY SENDS under scoped visibility.
+ * POL-191/D175 — what the SERVER ACTUALLY SENDS to an account with partial access.
  *
  * `mural-grants.test.ts` pins the decision (who may see which murals). This pins the CONSEQUENCE: the
  * bytes on the admin socket. They are different failures — a perfect permission table still leaks if
@@ -26,7 +26,6 @@ function fullState(): ServerToAdminMessage {
   return {
     t: "admin/state",
     revision: 7,
-    visibility: "open",
     machines: [
       {
         id: "box1",
@@ -83,20 +82,13 @@ function fullState(): ServerToAdminMessage {
 
 /** Narrow to the Atrium tenant. */
 function atriumOnly(): ServerToAdminMessage {
-  return projectAdminState(fullState(), new Set([ATRIUM]), "scoped");
+  return projectAdminState(fullState(), new Set([ATRIUM]));
 }
 
-describe("projectAdminState — `all` is the identity, and costs nothing", () => {
-  test("an `all` viewer in open mode gets the SAME OBJECT back, untouched", () => {
+describe("projectAdminState — `all` is the identity, and costs a fleet role nothing", () => {
+  test("an `all` viewer gets the SAME OBJECT back, untouched — no copy, no walk", () => {
     const state = fullState();
-    expect(projectAdminState(state, "all", "open")).toBe(state);
-  });
-
-  test("an `all` viewer under scoped mode still sees everything — only the label changes", () => {
-    const projected = projectAdminState(fullState(), "all", "scoped") as Record<string, unknown>;
-    expect(projected.visibility).toBe("scoped");
-    expect((projected.murals as unknown[]).length).toBe(2);
-    expect((projected.machines as unknown[]).length).toBe(2);
+    expect(projectAdminState(state, "all")).toBe(state);
   });
 });
 
@@ -138,17 +130,12 @@ describe("projectAdminState — one tenant's slice", () => {
     const s = projectAdminState(
       { ...fullState(), contentSources: [{ id: "src1" }] } as unknown as ServerToAdminMessage,
       new Set([ATRIUM]),
-      "scoped",
     );
     expect(s.contentSources).toHaveLength(1);
   });
 
-  test("the snapshot says it is scoped, so an empty canvas can explain itself", () => {
-    expect(atriumOnly().visibility).toBe("scoped");
-  });
-
   test("a viewer with NO murals gets a coherent, empty deployment — not a broken one", () => {
-    const s = projectAdminState(fullState(), new Set(), "scoped");
+    const s = projectAdminState(fullState(), new Set());
     expect(s.murals).toEqual([]);
     expect(s.machines).toEqual([]);
     expect(s.scenes).toEqual([]);
@@ -177,7 +164,7 @@ describe("AdminHub — each socket gets its own slice, and shared ones are seria
     hub.add(a as never, { visible: new Set([ATRIUM]) });
     hub.add(b as never, { visible: new Set([FOYER]) });
 
-    expect(hub.broadcast(fullState(), "scoped")).toBe(2);
+    expect(hub.broadcast(fullState())).toBe(2);
     const seenByA = JSON.parse(a.sent[0]!) as ServerToAdminMessage;
     const seenByB = JSON.parse(b.sent[0]!) as ServerToAdminMessage;
     expect(seenByA.murals.map((m) => m.id)).toEqual([ATRIUM]);
@@ -193,15 +180,15 @@ describe("AdminHub — each socket gets its own slice, and shared ones are seria
     const b = socket();
     hub.add(a as never, { visible: new Set([ATRIUM]) });
     hub.add(b as never, { visible: new Set([ATRIUM]) });
-    hub.broadcast(fullState(), "scoped");
+    hub.broadcast(fullState());
     expect(a.sent[0]).toBe(b.sent[0]);
   });
 
-  test("a socket registered with no viewer sees everything — the open-mode default", () => {
+  test("a socket registered with no viewer sees everything — what a fleet role gets", () => {
     const hub = new AdminHub();
     const a = socket();
     hub.add(a as never);
-    hub.broadcast(fullState(), "open");
+    hub.broadcast(fullState());
     const seen = JSON.parse(a.sent[0]!) as ServerToAdminMessage;
     expect(seen.murals).toHaveLength(2);
   });
@@ -211,7 +198,7 @@ describe("AdminHub — each socket gets its own slice, and shared ones are seria
     const dead = socket();
     dead.readyState = 3; // CLOSED
     hub.add(dead as never);
-    expect(hub.broadcast(fullState(), "open")).toBe(0);
+    expect(hub.broadcast(fullState())).toBe(0);
     expect(dead.sent).toHaveLength(0);
   });
 });
