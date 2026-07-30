@@ -687,7 +687,7 @@ export function buildAdminState(
  * What is deliberately NOT narrowed:
  *
  *   - **The content library** (`contentSources`, `sourceStatus`, `credentialProfiles`,
- *     `documentJobs`). It is shared by construction — D174 already lets a mural owner add to it — so
+ *     `documentJobs`). It is shared by construction — D175 already lets a mural owner add to it — so
  *     hiding half of it would break the very thing they need it for. Note that `sourceStatus.usage`
  *     names screens, so it IS narrowed to visible ones; the sources themselves stay.
  *   - **`settings`, `capabilities`, `scheduler`** — deployment-wide facts, not anybody's property.

@@ -39,7 +39,7 @@ data:
   CAPTURE_INTERVAL_MS: {{ .Values.config.captureIntervalMs | quote }}
   {{- end }}
   {{- if .Values.oidc.issuer }}
-  # ── Brokered sign-in (POL-191/D173) ─────────────────────────────────────────
+  # ── Brokered sign-in (POL-191/D175) ─────────────────────────────────────────
   # Everything here is PUBLIC by construction in an authorization-code flow — the issuer, the client
   # id and the group names are all visible to the browser mid-round-trip. The client SECRET is the
   # one exception and lives in the Secret, not here. The redirect URI is derived from

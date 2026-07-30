@@ -97,7 +97,7 @@ spec:
                   name: {{ include "polyptic.secretName" . }}
                   key: POLYPTIC_ADMIN_PASSWORD
                   optional: true
-            # POL-191/D173 — the OIDC client secret. Optional: a public client has none, and a
+            # POL-191/D174 — the OIDC client secret. Optional: a public client has none, and a
             # deployment with no IdP at all simply never reads it.
             - name: OIDC_CLIENT_SECRET
               valueFrom:

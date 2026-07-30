@@ -338,7 +338,7 @@ describe("POL-107 — a VIEWER", () => {
   test(
     "CANNOT apply a scene on a mural nobody granted it — access, not just power (POL-191)",
     async () => {
-      // POL-107 let ANY viewer invoke ANY saved scene, fleet-wide. POL-191/D175 ended that: applying
+      // POL-107 let ANY viewer invoke ANY saved scene, fleet-wide. POL-191/D176 ended that: applying
       // a scene REPAINTS a wall, so it is measured on that scene's mural, and a viewer holds nothing
       // on a mural it was not granted. An unknown scene resolves to no mural at all, which for a
       // non-fleet account is the same answer — the tray and the unknown both belong to the fleet.

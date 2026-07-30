@@ -413,7 +413,7 @@ describe("requireAuth — a grant carries a request through, and only the right 
 });
 
 /**
- * POL-191/D175 — VISIBILITY follows ACCESS, and there is no mode to turn on.
+ * POL-191/D176 — VISIBILITY follows ACCESS, and there is no mode to turn on.
  *
  * The one property that carries the whole feature: sight and power narrow TOGETHER. A viewer who
  * could still apply a scene, read a thumbnail, or reach a wall through a REST list would be

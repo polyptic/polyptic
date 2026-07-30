@@ -668,7 +668,7 @@ imageUpdates:
   tolerations: []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Brokered sign-in over OIDC (POL-191/D173) — how an organisation's own people
+# Brokered sign-in over OIDC (POL-191/D175) — how an organisation's own people
 # get in, without anyone hand-minting a local account for each of them.
 #
 # Leave `issuer` empty (the default) and single sign-on is simply OFF: the
@@ -709,7 +709,7 @@ oidc:
   viewerGroups: []
   # Anyone in none of the mapped groups. `viewer` means NO FLEET ACCESS: they
   # sign in and see only the murals someone has granted them — an empty console
-  # until then (POL-191/D175). That is the intended way to run a shared
+  # until then (POL-191/D176). That is the intended way to run a shared
   # deployment: map nobody to operator/admin, and hand out murals as grants.
   defaultRole: "viewer"
 

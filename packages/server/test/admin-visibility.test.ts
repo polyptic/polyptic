@@ -1,5 +1,5 @@
 /**
- * POL-191/D175 — what the SERVER ACTUALLY SENDS to an account with partial access.
+ * POL-191/D176 — what the SERVER ACTUALLY SENDS to an account with partial access.
  *
  * `mural-grants.test.ts` pins the decision (who may see which murals). This pins the CONSEQUENCE: the
  * bytes on the admin socket. They are different failures — a perfect permission table still leaks if
