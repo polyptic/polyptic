@@ -13,6 +13,9 @@ import type { SetupOptions } from "./args";
 import type { SetupResult } from "./install";
 import {
   AGENT_SERVICE,
+  AGENT_UPDATE_PATH_UNIT,
+  AGENT_UPDATE_SCRIPT,
+  AGENT_UPDATE_SERVICE,
   COMPOSITOR_LAUNCHER,
   REBOOT_PATH_UNIT,
   REBOOT_SERVICE,
@@ -73,6 +76,17 @@ export function runUninstall(sys: Sys, opts: SetupOptions, log: Logger): SetupRe
   sys.remove(`${SYSTEM_UNIT_DIR}/${REBOOT_PATH_UNIT}`);
   sys.remove(`${SYSTEM_UNIT_DIR}/${REBOOT_SERVICE}`);
   sys.remove(REBOOT_TMPFILES_PATH);
+  sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
+
+  // 3bb ─ disarm + remove the privileged agent-update helper (POL-160), on the same terms.
+  log.step("remove the privileged agent-update helper");
+  sys.exec("systemctl", ["disable", "--now", AGENT_UPDATE_PATH_UNIT], {
+    desc: `disable ${AGENT_UPDATE_PATH_UNIT}`,
+    allowFail: true,
+  });
+  sys.remove(`${SYSTEM_UNIT_DIR}/${AGENT_UPDATE_PATH_UNIT}`);
+  sys.remove(`${SYSTEM_UNIT_DIR}/${AGENT_UPDATE_SERVICE}`);
+  sys.remove(AGENT_UPDATE_SCRIPT);
   sys.exec("systemctl", ["daemon-reload"], { desc: "reload systemd manager", allowFail: true });
 
   // 3c ─ remove the HDMI-CEC udev rule (POL-101). The device node reverts to its stock ownership on
