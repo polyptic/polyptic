@@ -16,7 +16,7 @@ import { useScreenThumbnail } from "./useThumbnails";
 import { kindLabel } from "../../content";
 import { useConsoleStore } from "../../stores/console";
 
-type ScreenStatus = "live" | "empty" | "offline" | "error";
+type ScreenStatus = "live" | "empty" | "offline" | "error" | "no-connector";
 
 interface ScreenNodeData {
   screenId: string;
@@ -47,10 +47,15 @@ const thumbUrl = useScreenThumbnail(
 // Only paint a preview when we actually have a frame AND the screen is reachable. An offline screen
 // keeps its "Screen dark" treatment; identing wins over everything (handled below).
 const hasThumb = computed(
-  () => !!thumbUrl.value && props.data.status !== "offline" && !props.data.identing,
+  () =>
+    !!thumbUrl.value &&
+    props.data.status !== "offline" &&
+    props.data.status !== "no-connector" &&
+    !props.data.identing,
 );
 
 const dotColor = computed(() => {
+  if (props.data.status === "no-connector") return "var(--bad)";
   if (props.data.status === "offline") return "var(--bad)";
   if (props.data.status === "error") return "var(--warn)";
   return "var(--ok)";
@@ -58,6 +63,10 @@ const dotColor = computed(() => {
 
 const bgBorder = computed<Record<string, string>>(() => {
   switch (props.data.status) {
+    // A screen with no output behind it is a FAULT, and the tile carries the fault treatment — not
+    // the dim, calm grey of a box that is merely unreachable.
+    case "no-connector":
+      return { background: "var(--scr-bad-bg)", border: "1px solid var(--scr-bad-line)" };
     case "offline":
       return { background: "var(--scr-off-bg)", border: "1px solid var(--line)" };
     case "error":
@@ -165,6 +174,14 @@ function onDrop(e: DragEvent) {
         </div>
         <span class="kind-label">{{ kindText }}</span>
       </template>
+
+      <!-- the box is not reporting this connector: there is no output behind this tile -->
+      <div v-else-if="data.status === 'no-connector'" class="state error-state">
+        <span class="err-glyph">⚠</span>
+        <span class="err-text">
+          No output on the box<br />{{ data.machineLabel }} is not reporting {{ data.connector }}
+        </span>
+      </div>
 
       <!-- error (not reachable from the 3a contract; kept for parity) -->
       <div v-else-if="data.status === 'error'" class="state error-state">

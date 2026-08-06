@@ -331,6 +331,9 @@ const statusLabel = computed(() => {
   const s = single.value;
   if (!s) return "";
   if (identingSingle.value) return "Identing…";
+  // The box is not reporting this screen's connector — there is no output behind this screen, so
+  // neither "Asleep" nor "Unreachable" describes it, and both send an operator somewhere useless.
+  if (s.connectorMissing) return "No output on the box";
   // POL-101 — asleep is a THIRD status, between connected and unreachable, and it is not a fault: the
   // player is still connected and still holding its content; the glass is dark on purpose. An operator
   // who reads "Unreachable" here goes and checks a cable that is fine.
@@ -341,6 +344,7 @@ const statusLabel = computed(() => {
 const statusColor = computed(() => {
   const s = single.value;
   if (!s) return "var(--ok)";
+  if (s.connectorMissing) return "var(--bad)";
   if (s.asleep) return "var(--accent)";
   if (castingSingle.value) return "var(--accent)";
   return s.online ? "var(--ok)" : "var(--bad)";
@@ -434,6 +438,7 @@ const powerTarget = computed<PowerTarget | undefined>(() => {
 });
 const {
   asleep,
+  connectorMissing,
   pending: powerPending,
   supported: powerSupported,
   disabled: powerDisabled,
@@ -721,7 +726,10 @@ function selectOne(id: string) {
         </button>
         <!-- The honest half: DPMS alone leaves plenty of panels lit-but-black. An operator standing
              in front of one should know that is expected, not a fault. -->
-        <p v-if="asleep" class="power-detail">{{ powerDetail }}</p>
+        <p v-if="connectorMissing" class="power-detail power-detail-bad">
+          {{ machineName }} is not reporting connector {{ single?.connector }}
+        </p>
+        <p v-else-if="asleep" class="power-detail">{{ powerDetail }}</p>
 
       </template>
 
@@ -1176,6 +1184,10 @@ function selectOne(id: string) {
 .power-glyph {
   font-size: 13px;
 }
+.power-detail-bad {
+  color: var(--bad);
+}
+
 .power-detail {
   margin: 6px 0 0;
   font-size: 11px;

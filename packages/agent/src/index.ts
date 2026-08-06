@@ -101,7 +101,12 @@ import type { BootFacts, InstallStatusLine } from "./install";
 import { ShellManager } from "./shell";
 import { diffWindows } from "./windows";
 import type { PlacedWindow } from "./windows";
-import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
+import {
+  hasExplicitOutputOverride,
+  rediscoveryVerdict,
+  resolveAdvertisedOutputs,
+  resolveConnector,
+} from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
 import { describeAgentRuntime } from "./runtime";
 import { agentVersion } from "./version";
@@ -138,6 +143,8 @@ applyConfigFileToEnv();
 
 const SERVER_URL = process.env.POLYPTIC_SERVER_URL ?? "ws://localhost:8080/agent";
 const HEARTBEAT_MS = 10_000;
+/** How many heartbeat ticks between compositor output re-discoveries (~30s at a 10s heartbeat). */
+const REDISCOVER_EVERY_TICKS = 3;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 10_000;
 /** After a `server/rejected`, retry slowly so a rejected/unapproved machine never hammers. */
@@ -274,6 +281,8 @@ type UpdateAvailableMsg = Extract<ServerToAgentMessage, { t: "server/update-avai
 class Agent {
   private ws: WebSocket | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Heartbeat ticks since this connection opened — paces the output hotplug check. */
+  private heartbeatTicks = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
   private closing = false;
@@ -362,7 +371,9 @@ class Agent {
     private readonly machineId: string,
     private readonly agentVersion: string,
     private readonly backend: DisplayBackend,
-    private readonly outputs: Output[],
+    /** The outputs this agent advertises. NOT readonly: a panel switched off (or plugged back in)
+     *  changes the compositor's output list under us, and `maybeRediscoverOutputs` re-advertises. */
+    private outputs: Output[],
     private readonly bootstrapToken: string | undefined,
     credential: string | null,
     /** Which kiosk browser this box drives (POL-67); undefined on dev-open (no kiosk browser). */
@@ -1464,12 +1475,75 @@ class Agent {
     ws.send(JSON.stringify(valid));
   }
 
+  // ── output hotplug ───────────────────────────────────────────────────────────
+
+  /**
+   * Re-ask the compositor which outputs exist, and re-advertise if the answer changed.
+   *
+   * Outputs used to be resolved ONCE, at process start. A DisplayPort panel switched off drops its
+   * link and its connector leaves the compositor's output list — and because the agent kept
+   * advertising the set it discovered at boot, the control plane went on addressing an output that no
+   * longer existed, and the box refused every frame ("DP-1 is not a known sway output"). When the
+   * panel came back the agent still said nothing new, so nothing rebound until the box was restarted.
+   * Two production screens sat dark for days on exactly that.
+   *
+   * The POL-9 rule is kept intact, and it is the reason for the shape of this:
+   *   - an EMPTY discovery is silence, never "the outputs are gone". The compositor may be restarting.
+   *     We re-advertise only a NON-EMPTY set that differs from what we last said.
+   *   - an explicit `POLYPTIC_OUTPUTS`/`POLYPTIC_CONNECTOR` override is honoured verbatim, so a box
+   *     that pinned its outputs is never re-discovered behind the operator's back.
+   *   - `dev-open` has no compositor to ask.
+   * One `discoverOutputs()` call, no retry loop: this runs on a heartbeat tick, and a compositor that
+   * cannot answer in one go is answered again 30 seconds later.
+   */
+  private async maybeRediscoverOutputs(): Promise<void> {
+    if (this.backend.id === "dev-open" || hasExplicitOutputOverride()) return;
+    let names: string[] | null = null;
+    try {
+      names = await this.backend.discoverOutputs();
+    } catch (err) {
+      log(`output re-discovery failed (keeping the advertised set): ${(err as Error).message}`);
+      return;
+    }
+    const verdict = rediscoveryVerdict(this.outputs, names);
+    if (!verdict.changed) return;
+    const { gone, arrived } = verdict;
+    this.outputs = verdict.outputs;
+    // A connector that left and came back is a NEW output object in the compositor: whatever we last
+    // placed on it is gone with it. Drop the dedupe signature for every changed connector, or the
+    // next apply would see "already pointed at this URL" and leave the panel showing nothing.
+    for (const connector of [...gone, ...arrived]) {
+      this.placed.delete(connector);
+      this.status.delete(connector);
+      this.casting.delete(connector);
+      this.castPins.delete(connector);
+    }
+    log(
+      `advertised outputs changed — ${verdict.outputs.length} now: ${verdict.outputs
+        .map((o) => o.connector)
+        .join(", ")}` +
+        (gone.length > 0 ? ` (gone: ${gone.join(", ")})` : "") +
+        (arrived.length > 0 ? ` (new: ${arrived.join(", ")})` : ""),
+    );
+    // Re-advertise on the open socket. The server re-registers this machine, replies with a fresh
+    // `server/apply` carrying every screen's content, and reconciles the power of any screen whose
+    // connector just came back.
+    await this.sendHello();
+  }
+
   // ── heartbeat ────────────────────────────────────────────────────────────────
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.heartbeatTicks = 0;
     void this.sendStatus();
-    this.heartbeatTimer = setInterval(() => void this.sendStatus(), HEARTBEAT_MS);
+    this.heartbeatTimer = setInterval(() => {
+      this.heartbeatTicks += 1;
+      void this.sendStatus();
+      // Hotplug check, on a slower cadence than the heartbeat: one compositor query every ~30s is
+      // nothing, and a panel coming back is worth noticing within half a minute.
+      if (this.heartbeatTicks % REDISCOVER_EVERY_TICKS === 0) void this.maybeRediscoverOutputs();
+    }, HEARTBEAT_MS);
   }
 
   private stopHeartbeat(): void {
