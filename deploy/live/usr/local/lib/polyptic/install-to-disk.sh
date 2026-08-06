@@ -370,6 +370,53 @@ fetch "$base/dist/boot/shim$efiarch.efi" "$tmpd/shim.efi" \
 fetch "$base/dist/boot/grub$efiarch.efi" "$tmpd/grub.efi" \
   || fail no-loaders "the depot at $hostport would not serve grub$efiarch.efi (nothing was erased)"
 
+# ─── POL-194: take back anything holding a partition on the target ──────────────────────────────────
+# The live image and the INSTALLED image are the same rootfs, so this box is already carrying the
+# installed system's `/etc/crypttab`:
+#
+#   polyptic-swap /dev/disk/by-partlabel/POLYPTIC-SWAP /dev/urandom swap,...,nofail
+#
+# On a box that has been installed before, systemd opened and swapped that partition on at boot —
+# doing exactly what it is there to do, against a disk we are about to erase. On a first install the
+# same unit is sitting armed, waiting for the partlabel that `sgdisk -c 4:POLYPTIC-SWAP` is about to
+# create. Either way the partition is held by dm-crypt when `mkswap` reaches it, and the install
+# aborts a step after the disk has already been wiped.
+#
+# So the installer takes it back BEFORE the point of no return: swapoff (an active swap holds the
+# mapper, which holds the partition), close the mapping, and runtime-mask the unit so udev cannot
+# re-open it mid-install. A --runtime mask lives in /run and evaporates at reboot, so the INSTALLED
+# system still gets its ephemeral encrypted swap on first boot — that privacy property is untouched.
+release_target() {
+  swapoff "$DEV_DIR/mapper/polyptic-swap" >/dev/null 2>&1 || true
+  # Escaped exactly as systemd names the unit for crypttab's `polyptic-swap` (- becomes \x2d).
+  systemctl mask --runtime 'systemd-cryptsetup@polyptic\x2dswap.service' >/dev/null 2>&1 || true
+  systemctl stop 'systemd-cryptsetup@polyptic\x2dswap.service' >/dev/null 2>&1 || true
+  cryptsetup close polyptic-swap >/dev/null 2>&1 || true
+  udevadm settle >/dev/null 2>&1 || true
+  return 0
+}
+release_target
+
+# Then VERIFY, rather than assume the release worked (POL-58's law, on the destructive path where it
+# matters most). A holder left on any partition of the target means something we did not anticipate
+# is using this disk — refuse while "nothing was erased" is still true, and NAME it, because the
+# operator can only act on a holder they can see.
+for _part in "$SYS_BLOCK/$name"?*; do
+  # Only this disk's OWN partitions: `sda` must not sweep up `sdaa`, which is a real device name on
+  # a big enough box. A partition is the disk's name plus digits, or plus `p` and digits (nvme).
+  case "${_part##*/}" in
+    "$name"[0-9]*|"$name"p[0-9]*) ;;
+    *) continue ;;
+  esac
+  for _holder in "$_part/holders"/*; do
+    [ -e "$_holder" ] || continue
+    # A device-mapper holder is `dm-0` in sysfs and `polyptic-swap` to a human; say the second.
+    _hname="${_holder##*/}"
+    [ -r "$_holder/dm/name" ] && IFS= read -r _hname < "$_holder/dm/name" 2>/dev/null
+    fail install-bad-target "${_part##*/} on $target is in use by $_hname and could not be released. Stop whatever is using it and install again (nothing was erased)"
+  done
+done
+
 # ─── THE POINT OF NO RETURN: wipe + partition + mkfs ────────────────────────────────────────────────
 say "wiping $target and laying down the Polyptic disk layout ..."
 progress wiping 25 "erasing $target"
