@@ -129,6 +129,7 @@ const powerTarget = computed<PowerTarget>(() => ({
 }));
 const {
   asleep,
+  connectorMissing,
   pending: powerPending,
   supported: powerSupported,
   disabled: powerDisabled,
@@ -227,6 +228,16 @@ function remove(): void {
         <!-- POL-101: a sleeping panel is HEALTHY. Calm, deliberate, its own chip — never the red of a
              fault, and never mistakable for the offline dot beside it. -->
         <span v-if="asleep" class="chip chip-asleep" :title="asleepDetail">☾ Asleep</span>
+        <!-- The box has no such output. NOT a sleeping panel and NOT an offline player: the connector
+             this screen is bound to is absent from the machine's output list, so nothing addressed to
+             it can land — not content, not DPMS, not CEC. This reading as "Asleep" is what cost days. -->
+        <span
+          v-if="connectorMissing"
+          class="chip chip-no-connector"
+          :title="`${machineLabel} is not reporting connector ${screen.connector}. Nothing can reach this screen until the connector comes back`"
+        >
+          ⚠ {{ machineLabel }} is not reporting {{ screen.connector }}
+        </span>
         <!-- POL-119 — cast-enabled indicator (the toggle itself lives in the canvas Inspector) -->
         <span
           v-if="screen.castEnabled"
@@ -568,6 +579,14 @@ function remove(): void {
   color: var(--fg2);
   opacity: 0.85;
 }
+/* The connector is GONE from the box. This is a fault, and it is dressed as one — the deliberate
+   opposite of the calm indigo asleep chip directly above it. */
+.chip-no-connector {
+  border-color: color-mix(in srgb, var(--bad) 55%, transparent);
+  background: color-mix(in srgb, var(--bad) 14%, transparent);
+  color: var(--bad);
+}
+
 .chip-asleep {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent-fg, var(--fg2));

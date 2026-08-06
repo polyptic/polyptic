@@ -251,6 +251,24 @@ export function machineHasName(machine: { id: string; label: string }): boolean 
 }
 
 /**
+ * POL-160 — one spelling for an agent version. The two ends of this feature disagree on the `v`:
+ * the server's `BUILD_VERSION` is the release TAG (`v0.6.0`, straight off `POLYPTIC_VERSION`) while
+ * the binary bakes the stripped form (`server.Dockerfile` compiles with `${POLYPTIC_VERSION#v}`), so
+ * a box reports `0.3.6` against an offer of `v0.6.0`. Left un-normalised that drift is silent and
+ * dangerous in two places: `v1.0.0` parses its major as 0 (a non-numeric segment counts as 0), which
+ * mis-orders a comparison, and the swap's `--version` self-check compares the two strings literally,
+ * which would fail EVERY update the moment the versions were otherwise fine. Normalise both ends.
+ */
+export function normalizeAgentVersion(version: string): string {
+  return version.trim().replace(/^[vV]/, "");
+}
+
+/** True when two version strings name the same agent build, `v` prefix or not. */
+export function sameAgentVersion(a: string, b: string): boolean {
+  return normalizeAgentVersion(a) === normalizeAgentVersion(b);
+}
+
+/**
  * POL-160 — is `candidate` a STRICTLY NEWER agent version than `current`? The single shared answer
  * for "should this box self-update", used by the SERVER (to decide whether to offer an update at all)
  * and the AGENT (to refuse ever installing an older-or-equal binary — the core safety guard). A
@@ -259,8 +277,7 @@ export function machineHasName(machine: { id: string; label: string }): boolean 
  * the update path must be a no-op when the fleet already matches the server.
  */
 function agentVersionParts(v: string): number[] {
-  return v
-    .trim()
+  return normalizeAgentVersion(v)
     .split(/[.\-+]/)
     .map((s) => {
       const n = Number.parseInt(s, 10);
@@ -278,6 +295,38 @@ export function isNewerAgentVersion(candidate: string, current: string): boolean
   }
   return false; // equal — nothing to do
 }
+
+/**
+ * POL-192 — HOW the agent is running, and whether it can replace itself.
+ *
+ * POL-160 gave a box the ability to self-update and a voice to narrate it (`agent/update-status`).
+ * What it never gave the console was the STANDING answer: every box on the production wall sat on
+ * agent 0.3.6 through five releases while the server offered v0.6.0, said "skipped: not running as an
+ * updatable binary (dev/source run)" on every single reconnect, and threw that into a pod log. The
+ * console showed a healthy fleet. The box knew. Nobody could see it.
+ *
+ * So the agent now reports its updatability as a FACT about itself, on every hello, rather than only
+ * as an event when an offer arrives — and it reports the same `reason` string the skip line carries,
+ * because there is one answer to "why is this box stuck" and it must not be phrased twice.
+ *
+ * Every field except `launch`/`updatable` is optional, and the whole object is optional on the wire:
+ * the boxes that most need this are the ones running the OLD agent, which reports none of it. An
+ * absent `runtime` means NOT REPORTED — never "fine".
+ */
+export const AgentRuntime = z.object({
+  /** `binary` = a compiled single-file agent, which is the only kind that can swap itself; `source` =
+   *  a dev run (`bun src/index.ts`), which has no binary to replace. */
+  launch: z.enum(["binary", "source"]),
+  /** The absolute path of the binary this agent would REPLACE on a self-update. Absent on a source
+   *  run (there is nothing to replace) — the console then says so rather than printing a blank. */
+  binaryPath: z.string().optional(),
+  /** Does this agent consider itself able to install a newer binary offered by the server? */
+  updatable: z.boolean(),
+  /** Why not, when `updatable` is false — verbatim the reason that goes into `agent/update-status`,
+   *  so the console sentence and the log line are the same sentence. */
+  reason: z.string().optional(),
+});
+export type AgentRuntime = z.infer<typeof AgentRuntime>;
 
 /** POL-171 — which boot chain a machine last came up through, as its live root self-reported on
  *  `POST /boot/report`. `local-fallback` is the loud one: a wired-capable box that booted the
@@ -327,6 +376,10 @@ export const Machine = z.object({
   /** POL-101 — what the box can do about panel power, as probed on the box and reported on hello.
    *  Absent for a pre-POL-101 agent; the console then offers it no wake/sleep affordance. */
   power: PowerCapabilities.optional(),
+  /** POL-192 — how the box's agent is running and whether it can replace itself, as reported on its
+   *  last hello. Memory-only for the same reason as `browser` and `power`: it describes the process
+   *  that is connected right now. Absent for a pre-POL-192 agent. */
+  runtime: AgentRuntime.optional(),
   outputs: z.array(Output).default([]),
   status: EnrollmentStatus.default("approved"),
   /** POL-103 — free-form operator tags ("atrium", "floor:2", "canary"). Flat and opaque: a selector
@@ -1006,6 +1059,11 @@ export const AgentHello = z.object({
   /** POL-104 — the box's physical identity (MACs / DMI serial / arch). Optional: a pre-POL-104 agent
    *  sends none, and a pending card then simply says less. */
   hardware: HostIdentity.optional(),
+  /** POL-192 — how this agent was LAUNCHED and whether it can replace itself, with the reason when it
+   *  cannot. Reported on every hello because it is a standing fact, not an event: a box that will
+   *  never self-update says so the moment it connects, not only when an offer it declines arrives.
+   *  Optional — a pre-POL-192 agent reports nothing, which the console shows as "not reported". */
+  runtime: AgentRuntime.optional(),
   /** First contact only: the operator-configured enrollment secret. The server validates it,
    * creates the machine as `pending`, and replies `server/enrolled` with a durable credential. */
   bootstrapToken: z.string().optional(),
@@ -1906,6 +1964,22 @@ export const ScreenView = Screen.extend({
    *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
    *  toggle — is inherited from `Screen`.) */
   castActive: z.boolean().optional(),
+  /**
+   * The box is NOT reporting this screen's connector. Its machine is online and advertised an output
+   * list that does not contain `connector` — so on that box this screen's output does not exist, and
+   * nothing addressed to it can land: not content, not DPMS, not CEC. A DisplayPort panel switched
+   * off drops its link and the connector leaves the compositor's output list, which is exactly how
+   * two production screens sat dark for days reading as "asleep".
+   *
+   * This is NOT `asleep` and NOT `online: false`. Asleep is healthy and reversible from the console;
+   * this is a screen identity with no output behind it, and the console must say so rather than
+   * offering a Wake button that can only ever be refused.
+   *
+   * Live-only, like `ip` and `vitals`: an offline box's last output list describes a moment that has
+   * passed, and "the box is not reporting DP-1" is a claim only a connected box can support.
+   * Optional = back-compat.
+   */
+  connectorMissing: z.boolean().optional(),
   /** POL-111 — placeholders the content on this screen uses that resolve to NOTHING in its scope
    *  (neither a built-in nor one of its own `variables`). They render as EMPTY on the glass — never as
    *  literal braces — so the only way an operator learns about a typo'd `{{lien}}` is this list, which
@@ -1920,6 +1994,12 @@ export const MachineView = z.object({
   id: z.string(),
   label: z.string(),
   agentVersion: z.string().optional(),
+  /** POL-192 — how this box's agent is running and whether it can replace itself, as IT reported on
+   *  its last hello. Live-only (memory, like `browser` and `power`): it describes the PROCESS that is
+   *  connected, so a stale copy from a box that has since gone dark would be a claim about a process
+   *  that no longer exists. Absent = the box has not reported it — an older agent, or offline — and
+   *  the console says exactly that rather than reading it as healthy. */
+  agentRuntime: AgentRuntime.optional(),
   backend: DisplayBackend.optional(),
   /** POL-67 — the box's kiosk browser: `chrome` = the console's Inspect action opens REMOTE
    *  DevTools; `surf` (or absent, e.g. an older agent) = the on-panel inspector (POL-50). */
@@ -2693,6 +2773,11 @@ export const ServerToAdminState = z.object({
    *  never because it guessed. Per mural since POL-186, because scheduling resolves per mural.
    *  Optional on the wire = back-compat with an older server (the console then shows no badge). */
   activeScenes: z.record(z.string(), z.string()).optional(),
+  /** POL-192 — the agent version this server OFFERS: the binary it serves at `/dist/agent/<arch>`,
+   *  which is what every box is measured against ("running 0.3.6, offered 0.6.0"). Absent on a dev
+   *  server (which serves `0.0.0` and offers nothing) and on an older server — the console then shows
+   *  each box's version without a comparison, and claims no verdict it cannot support. */
+  agentRelease: z.object({ version: z.string() }).optional(),
   activity: z.array(ActivityEvent).optional(), // Live Activity feed (newest first); optional = back-compat
   settings: DisplaySettings.optional(), // POL-6 — fleet-wide display settings (badge toggle); optional = back-compat
   credentialProfiles: z.array(CredentialProfileView).optional(), // POL-24 — content auth profiles; optional = back-compat

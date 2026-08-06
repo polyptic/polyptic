@@ -1202,6 +1202,19 @@ export function registerRestRoutes(
       });
     }
 
+    // The box is connected and its output list does not contain this connector — the output does not
+    // exist on that box, so the frame would come back refused ("DP-1 is not a known sway output").
+    // "is offline" below would be a lie, and a lie an operator acts on: they go and check a box that
+    // is fine. Name the condition instead.
+    if (
+      presence.isMachineOnline(machine.id) &&
+      !control.isConnectorAdvertised(machine.id, screen.connector)
+    ) {
+      return reply
+        .code(409)
+        .send({ error: `${machine.label} is not reporting connector ${screen.connector}` });
+    }
+
     const delivered = pushScreenPower(screen.id, body.data.on);
     if (delivered === 0) {
       return reply
@@ -1241,9 +1254,13 @@ export function registerRestRoutes(
     let delivered = 0;
     for (const screen of screens) delivered += pushScreenPower(screen.id, body.data.on);
     if (delivered === 0) {
-      return reply
-        .code(409)
-        .send({ error: `${machine.label} is offline, so there is nothing to ${body.data.on ? "wake" : "sleep"}` });
+      // Same distinction as the per-screen route: a CONNECTED box that took none of these frames is
+      // reporting none of these connectors, which is a different fact from a box that is not there.
+      return reply.code(409).send({
+        error: presence.isMachineOnline(machine.id)
+          ? `${machine.label} is reporting none of its screens' connectors`
+          : `${machine.label} is offline, so there is nothing to ${body.data.on ? "wake" : "sleep"}`,
+      });
     }
 
     broadcaster.broadcast();

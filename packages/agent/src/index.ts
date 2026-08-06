@@ -67,7 +67,7 @@ import {
 } from "@polyptic/protocol";
 import type { KioskBrowser, LogEvent, LogLevel, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
-import { readFile, rm, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { hostname as osHostname } from "node:os";
 import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
@@ -101,14 +101,25 @@ import type { BootFacts, InstallStatusLine } from "./install";
 import { ShellManager } from "./shell";
 import { diffWindows } from "./windows";
 import type { PlacedWindow } from "./windows";
-import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
+import {
+  hasExplicitOutputOverride,
+  rediscoveryVerdict,
+  resolveAdvertisedOutputs,
+  resolveConnector,
+} from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
+import { describeAgentRuntime } from "./runtime";
 import { agentVersion } from "./version";
 import { VitalsSampler } from "./vitals";
 import {
   applyUpdate,
   clearMarker,
   decideStartupAction,
+  detectSwapMode,
+  directSwapPlan,
+  dropBackup,
+  helperSwapPlan,
+  isCompiledBinary,
   planUpdate,
   readMarker,
   realUpdateIO,
@@ -132,6 +143,8 @@ applyConfigFileToEnv();
 
 const SERVER_URL = process.env.POLYPTIC_SERVER_URL ?? "ws://localhost:8080/agent";
 const HEARTBEAT_MS = 10_000;
+/** How many heartbeat ticks between compositor output re-discoveries (~30s at a 10s heartbeat). */
+const REDISCOVER_EVERY_TICKS = 3;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 10_000;
 /** After a `server/rejected`, retry slowly so a rejected/unapproved machine never hammers. */
@@ -268,6 +281,8 @@ type UpdateAvailableMsg = Extract<ServerToAgentMessage, { t: "server/update-avai
 class Agent {
   private ws: WebSocket | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Heartbeat ticks since this connection opened — paces the output hotplug check. */
+  private heartbeatTicks = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
   private closing = false;
@@ -356,7 +371,9 @@ class Agent {
     private readonly machineId: string,
     private readonly agentVersion: string,
     private readonly backend: DisplayBackend,
-    private readonly outputs: Output[],
+    /** The outputs this agent advertises. NOT readonly: a panel switched off (or plugged back in)
+     *  changes the compositor's output list under us, and `maybeRediscoverOutputs` re-advertises. */
+    private outputs: Output[],
     private readonly bootstrapToken: string | undefined,
     credential: string | null,
     /** Which kiosk browser this box drives (POL-67); undefined on dev-open (no kiosk browser). */
@@ -1009,10 +1026,16 @@ class Agent {
       return;
     }
 
+    const io = realUpdateIO(log);
+    const binaryPath = selfBinaryPath();
+    // Which route this box has for replacing its binary: it writes its own (dev/root), or the
+    // root-owned helper does (a kiosk box, where /usr/local/bin is root-owned and the agent is not).
+    const swapMode = binaryPath ? await detectSwapMode(binaryPath, io) : { kind: "none" as const, reason: "" };
     const plan = planUpdate({
       currentVersion: this.agentVersion,
       offerVersion: msg.version,
-      binaryPath: selfBinaryPath(),
+      binaryPath,
+      swapMode,
       attemptedVersions: this.attemptedUpdates,
     });
     if (plan.action === "skip") {
@@ -1026,20 +1049,26 @@ class Agent {
     this.updating = true;
     this.attemptedUpdates.add(msg.version);
     const url = resolveUpdateUrl(this.url, msg.url);
-    log(`self-update: server offers agent ${this.agentVersion} → ${msg.version}; pulling ${url}`);
-    report("downloading");
+    const swapPlan =
+      plan.swap.kind === "direct"
+        ? directSwapPlan(plan.binaryPath, io)
+        : helperSwapPlan({ targetVersion: msg.version, ...(msg.sha256 ? { sha256: msg.sha256 } : {}) }, io);
+    log(
+      `self-update: server offers agent ${this.agentVersion} → ${msg.version}; pulling ${url} ` +
+        `(${swapPlan.kind === "helper" ? "the privileged helper installs it" : "this process installs it"})`,
+    );
 
     try {
-      report("verifying");
       const result = await applyUpdate(
         {
-          binaryPath: plan.binaryPath,
           url,
           targetVersion: msg.version,
           ...(msg.sha256 ? { sha256: msg.sha256 } : {}),
           ...(msg.sizeBytes !== undefined ? { sizeBytes: msg.sizeBytes } : {}),
         },
-        realUpdateIO(log),
+        io,
+        swapPlan,
+        { onPhase: (phase) => report(phase) },
       );
       if (!result.ok) {
         logError(`self-update to ${msg.version} FAILED (staying on ${this.agentVersion}): ${result.reason}`);
@@ -1050,7 +1079,7 @@ class Agent {
 
       // The new binary is on disk and passed its self-check. Record a crash-loop marker so the
       // relaunched binary can roll itself back if it boots but won't stay up, then exit for systemd.
-      await writeMarker(plan.binaryPath, {
+      await writeMarker({
         targetVersion: msg.version,
         previousVersion: this.agentVersion,
         swappedAt: new Date().toISOString(),
@@ -1376,6 +1405,12 @@ class Agent {
       // server uses it to match a pre-registration (after the token gate) and to make a pending
       // approval card readable. Sampled per hello so a re-cabled box re-reports honestly.
       hardware: readHostIdentity(),
+      // POL-192 — how this agent is RUNNING: a compiled binary or a source run, the binary it would
+      // replace, and whether it can self-update at all (with the reason it cannot, in the same words
+      // the `agent/update-status` skip line uses). Sent on every hello because it is a standing fact:
+      // a box that will never take an update must say so when it connects, not only when it declines
+      // one into a log. Sampled per hello, so a box that gets swapped onto a real binary re-reports.
+      runtime: await describeAgentRuntime(this.agentVersion, realUpdateIO(log)),
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,
@@ -1440,12 +1475,75 @@ class Agent {
     ws.send(JSON.stringify(valid));
   }
 
+  // ── output hotplug ───────────────────────────────────────────────────────────
+
+  /**
+   * Re-ask the compositor which outputs exist, and re-advertise if the answer changed.
+   *
+   * Outputs used to be resolved ONCE, at process start. A DisplayPort panel switched off drops its
+   * link and its connector leaves the compositor's output list — and because the agent kept
+   * advertising the set it discovered at boot, the control plane went on addressing an output that no
+   * longer existed, and the box refused every frame ("DP-1 is not a known sway output"). When the
+   * panel came back the agent still said nothing new, so nothing rebound until the box was restarted.
+   * Two production screens sat dark for days on exactly that.
+   *
+   * The POL-9 rule is kept intact, and it is the reason for the shape of this:
+   *   - an EMPTY discovery is silence, never "the outputs are gone". The compositor may be restarting.
+   *     We re-advertise only a NON-EMPTY set that differs from what we last said.
+   *   - an explicit `POLYPTIC_OUTPUTS`/`POLYPTIC_CONNECTOR` override is honoured verbatim, so a box
+   *     that pinned its outputs is never re-discovered behind the operator's back.
+   *   - `dev-open` has no compositor to ask.
+   * One `discoverOutputs()` call, no retry loop: this runs on a heartbeat tick, and a compositor that
+   * cannot answer in one go is answered again 30 seconds later.
+   */
+  private async maybeRediscoverOutputs(): Promise<void> {
+    if (this.backend.id === "dev-open" || hasExplicitOutputOverride()) return;
+    let names: string[] | null = null;
+    try {
+      names = await this.backend.discoverOutputs();
+    } catch (err) {
+      log(`output re-discovery failed (keeping the advertised set): ${(err as Error).message}`);
+      return;
+    }
+    const verdict = rediscoveryVerdict(this.outputs, names);
+    if (!verdict.changed) return;
+    const { gone, arrived } = verdict;
+    this.outputs = verdict.outputs;
+    // A connector that left and came back is a NEW output object in the compositor: whatever we last
+    // placed on it is gone with it. Drop the dedupe signature for every changed connector, or the
+    // next apply would see "already pointed at this URL" and leave the panel showing nothing.
+    for (const connector of [...gone, ...arrived]) {
+      this.placed.delete(connector);
+      this.status.delete(connector);
+      this.casting.delete(connector);
+      this.castPins.delete(connector);
+    }
+    log(
+      `advertised outputs changed — ${verdict.outputs.length} now: ${verdict.outputs
+        .map((o) => o.connector)
+        .join(", ")}` +
+        (gone.length > 0 ? ` (gone: ${gone.join(", ")})` : "") +
+        (arrived.length > 0 ? ` (new: ${arrived.join(", ")})` : ""),
+    );
+    // Re-advertise on the open socket. The server re-registers this machine, replies with a fresh
+    // `server/apply` carrying every screen's content, and reconciles the power of any screen whose
+    // connector just came back.
+    await this.sendHello();
+  }
+
   // ── heartbeat ────────────────────────────────────────────────────────────────
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.heartbeatTicks = 0;
     void this.sendStatus();
-    this.heartbeatTimer = setInterval(() => void this.sendStatus(), HEARTBEAT_MS);
+    this.heartbeatTimer = setInterval(() => {
+      this.heartbeatTicks += 1;
+      void this.sendStatus();
+      // Hotplug check, on a slower cadence than the heartbeat: one compositor query every ~30s is
+      // nothing, and a panel coming back is worth noticing within half a minute.
+      if (this.heartbeatTicks % REDISCOVER_EVERY_TICKS === 0) void this.maybeRediscoverOutputs();
+    }, HEARTBEAT_MS);
   }
 
   private stopHeartbeat(): void {
@@ -1473,17 +1571,20 @@ class Agent {
 async function reconcileSelfUpdateAtStartup(currentVersion: string): Promise<void> {
   const binaryPath = selfBinaryPath();
   if (!binaryPath) return; // dev/source run — nothing self-updates
+  const io = realUpdateIO(log);
   try {
-    const existing = await readMarker(binaryPath);
+    const existing = await readMarker();
+    if (!existing) return; // the overwhelmingly common boot: nothing was ever swapped
     // Count THIS boot before deciding, so the crash-loop budget is measured across relaunches.
-    const marker = existing ? { ...existing, boots: existing.boots + 1 } : null;
+    const marker = { ...existing, boots: existing.boots + 1 };
+    const swapMode = await detectSwapMode(binaryPath, io);
     const action = decideStartupAction(marker, currentVersion);
     if (action.kind === "rollback") {
       logError(
         `self-update to ${action.marker.targetVersion} has booted ${action.marker.boots} times without staying up — rolling back to ${action.marker.previousVersion}`,
       );
-      const rolledBack = await rollbackToBackup(binaryPath);
-      await clearMarker(binaryPath);
+      const rolledBack = await rollbackToBackup(binaryPath, swapMode, io);
+      await clearMarker();
       if (rolledBack) {
         log(`rolled back to the previous agent binary; exiting for systemd to relaunch it`);
         setTimeout(() => process.exit(0), 100);
@@ -1496,21 +1597,21 @@ async function reconcileSelfUpdateAtStartup(currentVersion: string): Promise<voi
     }
     if (action.kind === "commit") {
       // Persist the incremented boot count now, so a crash before the stable timer still counts.
-      await writeMarker(binaryPath, action.marker).catch(() => {});
+      await writeMarker(action.marker).catch(() => {});
       log(
         `running freshly self-updated agent ${currentVersion} (boot ${action.marker.boots}/${MAX_UNSTABLE_BOOTS}); will commit after ${Math.round(STABLE_UPTIME_MS / 1000)}s uptime`,
       );
       setTimeout(() => {
-        void writeMarker(binaryPath, { ...action.marker, committed: true })
-          .then(() => clearMarker(binaryPath)) // committed: drop the marker AND the backup below
-          .then(() => rm(`${binaryPath}.bak`, { force: true }).catch(() => {}))
+        void writeMarker({ ...action.marker, committed: true })
+          .then(() => clearMarker()) // committed: drop the marker AND the backup below
+          .then(() => dropBackup(binaryPath, swapMode, io))
           .then(() => log(`self-update to ${currentVersion} committed — stable for ${Math.round(STABLE_UPTIME_MS / 1000)}s`))
           .catch(() => {});
       }, STABLE_UPTIME_MS).unref?.();
       return;
     }
     // kind "none": a stale marker (already committed, or for a version we are not running) — clear it.
-    if (existing) await clearMarker(binaryPath);
+    await clearMarker();
   } catch (err) {
     logError(`self-update startup reconcile failed (continuing): ${(err as Error).message}`);
   }
@@ -1522,6 +1623,27 @@ async function main(): Promise<void> {
   // binary cannot get here, which is exactly what makes the check a real gate on the swap.
   if (process.argv[2] === "--version" || process.argv[2] === "version") {
     process.stdout.write(`${readAgentVersion()}\n`);
+    process.exit(0);
+  }
+
+  // POL-160 — what this process would tell the server about its own updatability, printed as one
+  // JSON line. A compiled binary that says `"updatable": false` is the bug that let a production
+  // fleet decline 176 update offers in 48h while correctly reporting its baked version, so it is now
+  // answerable from a box (and asserted against a REAL compiled binary in the test suite).
+  if (process.argv[2] === "--updatable" || process.argv[2] === "updatable") {
+    const binaryPath = selfBinaryPath();
+    const io = realUpdateIO(() => {});
+    const swap = binaryPath ? await detectSwapMode(binaryPath, io) : null;
+    process.stdout.write(
+      `${JSON.stringify({
+        version: readAgentVersion(),
+        compiled: isCompiledBinary(),
+        updatable: binaryPath !== null && swap !== null && swap.kind !== "none",
+        binaryPath,
+        swap: swap ? swap.kind : "none",
+        ...(swap && swap.kind === "none" ? { reason: swap.reason } : {}),
+      })}\n`,
+    );
     process.exit(0);
   }
 

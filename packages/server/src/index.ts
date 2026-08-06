@@ -40,7 +40,7 @@ import { createMediaProber } from "./media-probe";
 import { createDocumentConverter } from "./document-convert";
 import { DocumentJobs } from "./documents";
 import { DEFAULT_RETAIN_BUILDS, ImageUpdates } from "./image-updates";
-import { AgentUpdateService } from "./agent-update";
+import { AgentUpdateService, offeredAgentVersion } from "./agent-update";
 import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
@@ -294,6 +294,9 @@ const broadcaster = new AdminBroadcaster({
   enrollment,
   documents: { jobs: documentJobs, capabilities: documentCapabilities },
   health: sourceHealth,
+  // POL-192 — the agent binary this server serves. Every machine card reads its own reported version
+  // against it, so "running 0.3.6, offered 0.6.0" is on the screen an operator already looks at.
+  agentRelease: offeredAgentVersion(BUILD_VERSION),
 });
 
 // ── Content auth (POL-24): the OAuth client-credentials token cache. Seeded from the persisted

@@ -33,7 +33,12 @@ ARCH_IN="${1:-arm64}"
 case "$ARCH_IN" in
   amd64|x86_64|x64)  ARCH=amd64; BUN_TARGET=bun-linux-x64   ;;
   arm64|aarch64)     ARCH=arm64; BUN_TARGET=bun-linux-arm64 ;;
-  *) echo "build-agent: unknown arch '$ARCH_IN' (expected amd64 or arm64)" >&2; exit 2 ;;
+  # `host` compiles for THIS machine instead of a wall box. It is not a depot artifact: it exists so
+  # the test suite can compile a real binary through this exact script and assert that the compiled
+  # agent knows its baked version AND reports itself updatable (POL-160 shipped with a binary that
+  # did the first and not the second, and no test could tell, because none ever compiled anything).
+  host|native)       ARCH=host;  BUN_TARGET=""              ;;
+  *) echo "build-agent: unknown arch '$ARCH_IN' (expected amd64, arm64 or host)" >&2; exit 2 ;;
 esac
 
 # ── Version: explicit override, else parse packages/agent/package.json (no node/jq needed) ───────
@@ -48,11 +53,11 @@ fi
 # ── Prereq checks ────────────────────────────────────────────────────────────────────────────────
 command -v bun  >/dev/null 2>&1 || { echo "build-agent: 'bun' not found. See https://bun.sh" >&2; exit 1; }
 
-OUT_DIR="deploy/dist"
+OUT_DIR="${OUT_DIR:-deploy/dist}"
 mkdir -p "$OUT_DIR"
 BIN_OUT="$OUT_DIR/polyptic-agent-$ARCH"
 
-echo "==> Building polyptic-agent v$VERSION for $ARCH ($BUN_TARGET)"
+echo "==> Building polyptic-agent v$VERSION for $ARCH (${BUN_TARGET:-this host})"
 
 # ── Resolve workspace deps (@polyptic/protocol, ws, zod) before compiling ───────────────────────
 if [ -z "${SKIP_INSTALL:-}" ]; then
@@ -70,12 +75,18 @@ echo "==> build @polyptic/protocol (exports point at ./dist)"
 # Bake the version in at compile time: the standalone binary cannot read package.json off disk (bun
 # compiles sources into a virtual FS), so packages/agent/src/version.ts reads this define instead —
 # which is what the boot splash (POL-7) and `agent/hello` report.
+#
+# The define substitutes ONE literal expression — `process.env.POLYPTIC_BUILD_VERSION`, written once
+# in packages/agent/src/version.ts. Any other spelling of that lookup (a property access on a
+# parameter, a destructured env) is a different expression, is never substituted, and reads an
+# environment that has never had this variable set. That is how the fleet ran binaries that knew
+# their version and still declined every update as a "dev/source run".
 echo "==> bun build --compile -> $BIN_OUT  (POLYPTIC_BUILD_VERSION=$VERSION)"
 bun build \
   --compile \
   --minify \
   --define "process.env.POLYPTIC_BUILD_VERSION=\"$VERSION\"" \
-  --target="$BUN_TARGET" \
+  ${BUN_TARGET:+--target="$BUN_TARGET"} \
   --outfile "$BIN_OUT" \
   packages/agent/src/index.ts
 chmod 0755 "$BIN_OUT"

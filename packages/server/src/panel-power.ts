@@ -259,7 +259,7 @@ export class PanelPowerScheduler {
    * cannot act, so there is nothing to reconcile TO yet: skip it and wait. The agent hellos again
    * once its outputs are up, and that hello is the one that can do the work.
    */
-  reconcileMachine(machineId: string): void {
+  reconcileMachine(machineId: string, reassertScreenIds?: ReadonlySet<string>): void {
     const machine = this.deps.control.getMachine(machineId);
     if (!machine) return;
     if (machine.outputs.length === 0) {
@@ -281,6 +281,22 @@ export class PanelPowerScheduler {
     }
     const screens = this.deps.control.getScreens().filter((s) => s.machineId === machineId);
     for (const screen of screens) {
+      // A screen whose connector the box had STOPPED reporting and is reporting again: the output was
+      // destroyed and re-created underneath us, so nothing has asserted the desired state onto it and
+      // "it booted lit" is not a promise anyone made. Send BOTH halves for these — this is the only
+      // caller that may send a WAKE from a reconcile, and it is deliberately the narrow case.
+      // `null` still means UNGOVERNED and is still left alone — a re-created output comes up lit
+      // (the compositor asserts `dpms on`), so there is nothing for a wake to fix and an operator's
+      // hand-slept panel keeps the state they chose.
+      if (reassertScreenIds?.has(screen.id)) {
+        const desired = this.desiredFor(screen.id);
+        if (desired === null) continue;
+        const muralId = this.deps.control.getPlacementMuralId(screen.id);
+        if (muralId === null) continue;
+        this.lastDesired.set(screen.id, { muralId, desired });
+        this.send(screen.id, desired, "the box is reporting this connector again");
+        continue;
+      }
       const desired = this.desiredFor(screen.id);
       // `desiredFor` only answers non-null for a PLACED screen, so the mural is there to record — and
       // it must be, or the next tick would read this as "a verdict from another wall" and wake it.
@@ -334,6 +350,47 @@ export class PanelPowerScheduler {
     if (!screen) return 0;
     const machine = this.deps.control.getMachine(screen.machineId);
     if (!machine || machine.status !== "approved") return 0;
+
+    // Never address a connector the box is not reporting. A DisplayPort panel switched off drops its
+    // link and its connector leaves the compositor's output list; from that moment the box refuses
+    // every frame aimed at it ("DP-1 is not a known sway output") and the console reads a screen that
+    // "will not wake" instead of a screen with no output behind it. Say the true thing instead — and
+    // only when the box is CONNECTED, because a stale output list from an offline box proves nothing
+    // (that case falls through to the offline branch below, which already has the right words).
+    if (
+      this.deps.presence.isMachineOnline(machine.id) &&
+      !this.deps.control.isConnectorAdvertised(machine.id, screen.connector)
+    ) {
+      this.deps.log.warn(
+        {
+          event: "panel.power.connector_absent",
+          screenId,
+          machineId: machine.id,
+          connector: screen.connector,
+          on,
+          reason,
+        },
+        "panel power not sent — the box is not reporting that connector",
+      );
+      this.deps.logs?.record(
+        serverEvent(
+          "warn",
+          "panel-power",
+          `${on ? "wake" : "sleep"} for ${screen.friendlyName} was not sent — ${machine.label} is not reporting connector ${screen.connector}`,
+          {
+            machineId: machine.id,
+            screenId,
+            fields: {
+              connector: screen.connector,
+              on,
+              reason: reason.slice(0, 300),
+              advertised: machine.outputs.map((o) => o.connector).join(",") || "none",
+            },
+          },
+        ),
+      );
+      return 0;
+    }
 
     const delivered = this.deps.agentHub.send(
       machine.id,

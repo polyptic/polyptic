@@ -11,7 +11,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { DisplayBackend as BackendId } from "@polyptic/protocol";
 import type { DisplayBackend } from "../src/backends/types";
-import { resolveAdvertisedOutputs, resolveConnector } from "../src/outputs";
+import { rediscoveryVerdict, resolveAdvertisedOutputs, resolveConnector } from "../src/outputs";
 
 /** A backend test double: `id` + a scripted `discoverOutputs`; the placement methods are inert. */
 function fakeBackend(
@@ -100,5 +100,49 @@ describe("resolveAdvertisedOutputs", () => {
     });
     expect(outputs.map((o) => o.connector)).toEqual(["Virtual-1"]);
     expect(backend.calls).toBe(3);
+  });
+});
+
+/**
+ * Re-discovery — the agent noticing that the compositor's output list has changed UNDER it.
+ *
+ * The field failure this exists for: a DisplayPort panel is switched off, its link drops, and its
+ * connector leaves sway's output list. The agent resolved its outputs once at process start, so it
+ * kept advertising the vanished connector and the control plane kept addressing an output that was
+ * not there ("DP-1 is not a known sway output"). When the panel came back, the agent still said
+ * nothing new — the screen only worked again after the box was restarted.
+ */
+describe("output re-discovery (a panel switched off, and switched back on)", () => {
+  const advertised = (...connectors: string[]) =>
+    connectors.map((connector) => ({ connector, width: 1920, height: 1080 }));
+
+  test("the same set, in any order, is not a change — no re-advertise", () => {
+    const verdict = rediscoveryVerdict(advertised("DP-1", "DP-2"), ["DP-2", "DP-1"]);
+    expect(verdict.changed).toBe(false);
+  });
+
+  test("POL-9: an EMPTY discovery is silence, never 'the outputs are gone'", () => {
+    expect(rediscoveryVerdict(advertised("DP-1"), []).changed).toBe(false);
+    expect(rediscoveryVerdict(advertised("DP-1"), null).changed).toBe(false);
+  });
+
+  test("a connector that vanished is re-advertised away, and named", () => {
+    const verdict = rediscoveryVerdict(advertised("DP-1", "DP-2"), ["DP-2"]);
+    expect(verdict.changed).toBe(true);
+    expect(verdict.gone).toEqual(["DP-1"]);
+    expect(verdict.outputs.map((o) => o.connector)).toEqual(["DP-2"]);
+  });
+
+  test("a connector that came back is named, and keeps the geometry we already knew", () => {
+    const current = [
+      { connector: "DP-2", width: 3840, height: 2160 },
+      { connector: "DP-1", width: 1280, height: 1024 },
+    ];
+    const verdict = rediscoveryVerdict([current[1]!], ["DP-1", "DP-2"]);
+    expect(verdict.arrived).toEqual(["DP-2"]);
+    expect(verdict.outputs).toEqual([
+      { connector: "DP-1", width: 1280, height: 1024 },
+      { connector: "DP-2", width: 1920, height: 1080 },
+    ]);
   });
 });

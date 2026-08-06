@@ -120,6 +120,60 @@ export async function discoverOutputsWithRetry(
   return null;
 }
 
+/** What a re-discovery found: whether to re-advertise, and which connectors moved. */
+export interface RediscoveryVerdict {
+  /** Re-advertise? Only ever true for a NON-EMPTY discovery that differs from what we last said. */
+  changed: boolean;
+  /** The set to advertise now — geometry carried over for connectors we already knew. */
+  outputs: Output[];
+  /** Connectors we were advertising and the compositor no longer reports (a panel switched off). */
+  gone: string[];
+  /** Connectors the compositor now reports and we were not advertising (a panel plugged back in). */
+  arrived: string[];
+}
+
+/**
+ * Compare a fresh `discoverOutputs()` answer against what this agent is currently advertising.
+ *
+ * Outputs were resolved once, at process start — so a DisplayPort panel switched off (its link drops,
+ * its connector leaves the compositor's output list) went on being advertised, and the control plane
+ * went on addressing an output that no longer existed. When the panel came back, nothing re-advertised
+ * and nothing rebound until the box was restarted.
+ *
+ * The POL-9 rule survives intact and shapes the whole function: an EMPTY (or failed) discovery is
+ * SILENCE — the compositor may be restarting — never "the outputs are gone". Only a non-empty set
+ * that differs is worth a fresh hello.
+ */
+export function rediscoveryVerdict(
+  current: Output[],
+  discovered: string[] | null,
+): RediscoveryVerdict {
+  const unchanged: RediscoveryVerdict = { changed: false, outputs: current, gone: [], arrived: [] };
+  if (!discovered || discovered.length === 0) return unchanged; // POL-9 — no info ≠ "they're gone"
+
+  const before = new Set(current.map((o) => o.connector));
+  const after = new Set(discovered);
+  const gone = [...before].filter((c) => !after.has(c));
+  const arrived = [...after].filter((c) => !before.has(c));
+  if (gone.length === 0 && arrived.length === 0) return unchanged;
+
+  return {
+    changed: true,
+    // Geometry is carried over for a connector we already knew, so a re-advertise never silently
+    // resizes a screen that has not moved.
+    outputs: discovered.map(
+      (connector) =>
+        current.find((o) => o.connector === connector) ?? {
+          connector,
+          width: DISCOVERED_OUTPUT_WIDTH,
+          height: DISCOVERED_OUTPUT_HEIGHT,
+        },
+    ),
+    gone,
+    arrived,
+  };
+}
+
 /**
  * The outputs to advertise on `agent/hello`, in priority order (see the module header for the full
  * rationale):

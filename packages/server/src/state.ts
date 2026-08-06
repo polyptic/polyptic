@@ -50,7 +50,7 @@ import {
   packRects,
   rectsAreAdjacent,
 } from "@polyptic/protocol";
-import type { BootMode, MachineBootPath, MachineDisk, Rect } from "@polyptic/protocol";
+import type { AgentRuntime, BootMode, MachineBootPath, MachineDisk, Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
   CreateDaypartBody,
@@ -277,6 +277,11 @@ export interface RegisterMachineInput {
    *  for the same reason as `browser`: it is re-reported on every hello, and a box that is offline
    *  has no panels to power anyway. A pre-POL-101 agent reports nothing and gets no power affordance. */
   power?: PowerCapabilities;
+  /** POL-192 — how the agent is running and whether it can replace itself, as IT reported on this
+   *  hello. Memory-only like `browser`/`power`, and deliberately NOT merged with what an earlier
+   *  session said: it describes the process that is connected now, so a box that came back on a
+   *  different launch reports the truth and an agent too old to report anything reports nothing. */
+  runtime?: AgentRuntime;
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
@@ -303,6 +308,12 @@ export interface RegisterMachineResult {
   /** True if registration changed desired state (new screen(s) created) and bumped the revision. */
   changed: boolean;
   assignments: ScreenAssignment[];
+  /** Screens whose connector the box had STOPPED reporting and is reporting again — a panel that was
+   *  switched off at the wall and is back. Empty on a first hello and on every ordinary reconnect. */
+  reboundScreenIds: string[];
+  /** Screens whose connector the box reported last time and does NOT report now. Nothing addressed to
+   *  them can land until it returns. */
+  unadvertisedScreenIds: string[];
 }
 
 /**
@@ -480,6 +491,12 @@ interface EnsureScreensResult {
   touchedSlices: ScreenSlice[];
   /** Ids of stale UNUSED screens pruned because the machine no longer advertises their connector. */
   prunedScreenIds: string[];
+  /** Ids of EXISTING screens whose connector is advertised again after the machine stopped reporting
+   *  it — a panel that was switched off (DP link dropped, connector left the compositor) and is back. */
+  reboundScreenIds: string[];
+  /** Ids of surviving screens whose connector the machine advertised last time and does NOT now.
+   *  Nothing can reach these screens until the connector returns; the caller narrates it. */
+  unadvertisedScreenIds: string[];
   changed: boolean;
 }
 
@@ -988,12 +1005,19 @@ export class ControlPlane {
    * memory: the caller is responsible for write-through. `changed` is true if a screen or slice was
    * created/healed (so the caller bumps + persists the revision).
    */
-  private ensureScreens(machineId: string, outputs: Output[]): EnsureScreensResult {
+  private ensureScreens(
+    machineId: string,
+    outputs: Output[],
+    /** What this machine advertised on its PREVIOUS hello, or undefined if we never heard one. A
+     *  connector absent there and present here is a panel that came back (see `reboundScreenIds`). */
+    previouslyAdvertised?: ReadonlySet<string>,
+  ): EnsureScreensResult {
     let changed = false;
     const assignments: ScreenAssignment[] = [];
     const newScreens: Screen[] = [];
     const touchedSlices: ScreenSlice[] = [];
     const prunedScreenIds: string[] = [];
+    const reboundScreenIds: string[] = [];
 
     for (const output of outputs) {
       let screen = this.state.screens.find(
@@ -1033,6 +1057,19 @@ export class ControlPlane {
         this.state.slices[screen.id] = slice;
         touchedSlices.push(slice);
         changed = true;
+      }
+
+      // A connector THIS box was not reporting a moment ago and is reporting now. The screen record
+      // survived (POL-9 never prunes a used screen), so the identity is intact and the assignment
+      // below already carries its content — but the box has re-created that output from scratch, so
+      // its power state is whatever the compositor decided and nothing has re-asserted the desired
+      // state onto it. The caller reconciles the screens named here; that is the rebind.
+      if (
+        !newScreens.includes(screen) &&
+        previouslyAdvertised !== undefined &&
+        !previouslyAdvertised.has(output.connector)
+      ) {
+        reboundScreenIds.push(screen.id);
       }
 
       // POL-18 — a screen may already hold windowed content (persisted across a restart / an agent
@@ -1076,7 +1113,32 @@ export class ControlPlane {
       }
     }
 
-    return { assignments, newScreens, touchedSlices, prunedScreenIds, changed };
+    // The other edge: a connector this box WAS reporting and is not any more. The screen record stays
+    // (POL-9 keeps a used screen; a panel switched off overnight must not delete an operator's work),
+    // but nothing addressed to it can land until the connector comes back, so the caller says so
+    // rather than leaving the console to read it as a healthy sleeping screen.
+    const advertisedNow = new Set(outputs.map((o) => o.connector));
+    const unadvertisedScreenIds =
+      previouslyAdvertised === undefined
+        ? []
+        : this.state.screens
+            .filter(
+              (s) =>
+                s.machineId === machineId &&
+                !advertisedNow.has(s.connector) &&
+                previouslyAdvertised.has(s.connector),
+            )
+            .map((s) => s.id);
+
+    return {
+      assignments,
+      newScreens,
+      touchedSlices,
+      prunedScreenIds,
+      reboundScreenIds,
+      unadvertisedScreenIds,
+      changed,
+    };
   }
 
   /**
@@ -1143,6 +1205,11 @@ export class ControlPlane {
     if (credentialHash) this.credentialHashes.set(input.machineId, credentialHash);
 
     const existing = this.machines.get(input.machineId);
+    // Captured BEFORE the machine row is overwritten: the connectors this box reported last time is
+    // the only way to tell a panel that came back from one that was never away.
+    const previouslyAdvertised = existing
+      ? new Set(existing.outputs.map((o) => o.connector))
+      : undefined;
     const machine: Machine = {
       id: input.machineId,
       // An operator rename wins; a MEANINGFUL box hostname is adopted otherwise (POL-117 — see
@@ -1152,6 +1219,11 @@ export class ControlPlane {
       backend: input.backend,
       browser: input.browser,
       power: input.power,
+      // POL-192 — how the agent on this box is running and whether it can replace itself. Taken from
+      // THIS hello only (never inherited from `existing`): the answer describes the live process, and
+      // an agent too old to report it must read as "not reported", not as whatever a newer binary
+      // once said before someone rolled the box back.
+      runtime: input.runtime,
       outputs: input.outputs,
       status: "approved",
       lastSeen: new Date().toISOString(),
@@ -1190,14 +1262,19 @@ export class ControlPlane {
     };
     this.machines.set(input.machineId, machine);
 
-    const ensured = this.ensureScreens(input.machineId, input.outputs);
+    const ensured = this.ensureScreens(input.machineId, input.outputs, previouslyAdvertised);
     if (ensured.changed) this.bumpRevision();
 
     await this.store.upsertMachine(this.toPersistedMachine(machine));
     await this.persistScreens(ensured);
     if (ensured.changed) await this.store.setRevision(this.state.revision);
 
-    return { changed: ensured.changed, assignments: ensured.assignments };
+    return {
+      changed: ensured.changed,
+      assignments: ensured.assignments,
+      reboundScreenIds: ensured.reboundScreenIds,
+      unadvertisedScreenIds: ensured.unadvertisedScreenIds,
+    };
   }
 
   /**
@@ -1217,6 +1294,11 @@ export class ControlPlane {
       backend: input.backend,
       browser: input.browser,
       power: input.power,
+      // POL-192 — how the agent on this box is running and whether it can replace itself. Taken from
+      // THIS hello only (never inherited from `existing`): the answer describes the live process, and
+      // an agent too old to report it must read as "not reported", not as whatever a newer binary
+      // once said before someone rolled the box back.
+      runtime: input.runtime,
       outputs: input.outputs,
       status: "pending",
       lastSeen: new Date().toISOString(),
@@ -1394,7 +1476,12 @@ export class ControlPlane {
     if (ensured.changed) await this.store.setRevision(this.state.revision);
 
     this.emit("good", `${machine.label} approved`);
-    return { changed: ensured.changed, assignments: ensured.assignments };
+    return {
+      changed: ensured.changed,
+      assignments: ensured.assignments,
+      reboundScreenIds: ensured.reboundScreenIds,
+      unadvertisedScreenIds: ensured.unadvertisedScreenIds,
+    };
   }
 
   /**
@@ -1674,6 +1761,21 @@ export class ControlPlane {
 
   getMachine(machineId: string): Machine | undefined {
     return this.machines.get(machineId);
+  }
+
+  /**
+   * Is this connector in the output list the machine last advertised? False when the box reports an
+   * output list without it, AND when it reports none at all — a box advertising zero outputs has no
+   * display the control plane can address (POL-9 says zero means "the compositor told us nothing",
+   * which is precisely why nothing addressed to a connector can be expected to land).
+   *
+   * The truth here is only as fresh as the last hello. Callers that act on it (refusing to send into
+   * a connector, painting a console badge) pair it with the machine being ONLINE.
+   */
+  isConnectorAdvertised(machineId: string, connector: string): boolean {
+    const machine = this.machines.get(machineId);
+    if (!machine) return false;
+    return machine.outputs.some((o) => o.connector === connector);
   }
 
   /** The stored credential hash for a machine, if it has ever been issued one. */
