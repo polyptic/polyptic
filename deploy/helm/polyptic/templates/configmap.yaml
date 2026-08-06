@@ -99,6 +99,14 @@ data:
   # i.e. the bundled chrony server. Set to point the fleet at a site's own NTP.
   POLYPTIC_NTP_HOST: {{ .Values.ntp.clientHost | quote }}
   {{- end }}
+  {{- with include "polyptic.bootBase" . }}
+  # POL-193 — the address /boot/grub.cfg tells boxes to come back to, stated outright
+  # instead of derived from the request. Needed whenever the request cannot carry the
+  # truth: a boot depot on a non-default port is the case, because GRUB sends `Host:`
+  # WITHOUT a port and Traefik computes X-Forwarded-Port FROM that header, reporting
+  # the scheme default. Defaults to imageUpdates.bakeBase so the address is said once.
+  POLYPTIC_BOOT_BASE: {{ . | quote }}
+  {{- end }}
   # ── Phase 7 — MEDIA ─────────────────────────────────────────────────────────
   # Uploads (POST /api/v1/media) are streamed to MEDIA_DIR (a mounted volume, see
   # the PVC/volumeMount in deployment.yaml) and served back, ungated, from the

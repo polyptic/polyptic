@@ -399,3 +399,16 @@ origin that already ends in /player is left alone.
 {{- printf "%s/player" $base -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+POL-193 — the boot base the server stamps into /boot/grub.cfg, resolved from the values:
+explicit netboot.bootBase, else imageUpdates.bakeBase, else "" (the server derives it from the
+request, which is what heals a moved control plane on the next boot).
+
+Defaulting to bakeBase is deliberate: both name the SAME plain-http address boxes reach the depot
+at — one at bake time, one at request time — and a deployment where they disagree is a deployment
+where the stick and the menu it chains send the box to different places.
+*/}}
+{{- define "polyptic.bootBase" -}}
+{{- trimSuffix "/" (.Values.netboot.bootBase | default .Values.imageUpdates.bakeBase | default "") -}}
+{{- end }}

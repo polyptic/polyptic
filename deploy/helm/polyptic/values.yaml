@@ -552,6 +552,21 @@ netboot:
   # Mount path of the depot volume; IMAGE_DIST_DIR/BOOT_DIST_DIR derive from it
   # (<depotDir>/image and <depotDir>/boot).
   depotDir: /var/lib/polyptic/depot
+  # POL-193 — the plain-http address the SERVED boot menu (/boot/grub.cfg) tells
+  # boxes to fetch the kernel, initrd and squashfs from. Empty (the default)
+  # derives it from the request, which is what lets a moved control plane heal
+  # every box on its next boot — leave it empty unless you must not.
+  #
+  # You must when the request cannot carry the truth, and a boot depot on a
+  # NON-DEFAULT PORT is that case: GRUB and dracut send `Host:` WITHOUT a port,
+  # and Traefik computes X-Forwarded-Port FROM that header, so it reports the
+  # scheme default (80) and the real port is never transmitted. The box then
+  # fetches the kernel from :80, gets whatever answers there — an http->https
+  # redirect body, typically — and dies with "bad shim signature".
+  #
+  # Empty here falls back to imageUpdates.bakeBase, so a deployment that already
+  # states its address for the baked media says it once and is done.
+  bootBase: ""
   # Build the downloadable boot medium (polyptic-boot.img + its manifest + the
   # signed loaders) onto the depot via a per-revision Job, so the console's
   # bootloader download works as soon as there is an image to bake into it.

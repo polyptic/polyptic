@@ -215,6 +215,7 @@ describe("the server tells the truth about what it published", () => {
       bootDistDir,
       publicBaseUrl: "",
       ntpHost: "",
+      bootBase: "",
     });
     expect((await provisionBootSummary(cfg(empty))).bootMedium).toBe("none");
 

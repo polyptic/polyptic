@@ -77,6 +77,17 @@ export interface ProvisionConfig {
    * bundled server off (`ntp.enabled=false`): the client is decoupled from the server.
    */
   ntpHost: string;
+  /**
+   * POL-193 — the address `/boot/grub.cfg` tells boxes to come back to, stated outright instead of
+   * derived from the request. Empty (the default) keeps the derivation, which is what lets a moved
+   * control plane heal every box on its next boot.
+   *
+   * Set it when the request cannot carry the truth. A boot depot published on a non-default port is
+   * the case that forces it: GRUB and dracut send `Host:` WITHOUT a port, and Traefik computes
+   * `X-Forwarded-Port` FROM that header — so it reports the scheme default (80) and the real port is
+   * never transmitted at all. No amount of header-reading recovers it; the address has to be said.
+   */
+  bootBase: string;
 }
 
 /** Resolve provisioning config from the environment, with sensible repo-relative defaults. */
@@ -87,7 +98,44 @@ export function provisionConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
     bootDistDir: env.BOOT_DIST_DIR?.trim() || resolve(REPO_ROOT, "deploy/dist/boot"),
     publicBaseUrl: (env.PUBLIC_BASE_URL?.trim() || "http://localhost:8080").replace(/\/+$/, ""),
     ntpHost: env.POLYPTIC_NTP_HOST?.trim() || "",
+    bootBase: parseBootBase(env.POLYPTIC_BOOT_BASE),
   };
+}
+
+/**
+ * Validate `POLYPTIC_BOOT_BASE` into a bare `scheme://authority`, or "" when unset.
+ *
+ * A malformed value is FATAL, for the same reason `AGENT_MTLS_ADVERTISE_PORT` is: this string is the
+ * only address a diskless box is given, so a wrong one strands the whole fleet at the kernel fetch.
+ * Failing at deploy — before any box has read it — is the cheap end of that trade. The boot depot
+ * lives at the server root, so a path is a mistake worth naming rather than silently dropping
+ * (`build-boot-medium.sh` rejects one on the baking side too).
+ */
+function parseBootBase(raw: string | undefined): string {
+  const value = raw?.trim();
+  if (!value) return "";
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(
+      `POLYPTIC_BOOT_BASE is not a URL: ${JSON.stringify(value)} — expected http://host[:port]`,
+    );
+  }
+  // Covers both a wrong scheme and a missing one: `boot.example:8081` PARSES, as a URL whose scheme
+  // is `boot.example:` — so "you picked the wrong protocol" would be the wrong thing to say. Name
+  // the form we want instead, which is the answer either way.
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(
+      `POLYPTIC_BOOT_BASE must be http://host[:port], GRUB having no TLS stack: ${JSON.stringify(value)}`,
+    );
+  }
+  if (url.pathname !== "/" || url.search || url.hash) {
+    throw new Error(
+      `POLYPTIC_BOOT_BASE must carry no path — the boot depot lives at the server root: ${JSON.stringify(value)}`,
+    );
+  }
+  return `${url.protocol}//${url.host}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -790,7 +838,7 @@ export function registerProvisionRoutes(
    *  fallback warning). Returns whether `machineId` named a machine the registry knows. */
   noteBootPath?: (machineId: string, path: MachineBootPath, detail: string) => boolean | Promise<boolean>,
 ): void {
-  const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl, ntpHost } = config;
+  const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl, ntpHost, bootBase } = config;
 
   // ── GET /dist/agent/:arch — the prebuilt agent binary. 404 when not bundled. ──
   fastify.get("/dist/agent/:arch", async (request, reply) => {
@@ -826,7 +874,10 @@ export function registerProvisionRoutes(
   //    an HTTP-booted grubnet instead resolves its baked $prefix to (http,host:port)/grub at the SERVER
   //    ROOT and probes the per-arch paths first, hence the three aliases (same handler, same body). ──
   const serveBootConfig = async (request: FastifyRequest, reply: FastifyReply): Promise<string> => {
-    const base = computeBaseUrl(request, publicBaseUrl);
+    // POL-193 — an explicit boot base wins over the request. ONLY here: this is the one response
+    // whose reader is a box on the boot path. The console-facing routes below stay request-derived,
+    // because their reader is a browser on the https host and must never be sent to the depot.
+    const base = bootBase || computeBaseUrl(request, publicBaseUrl);
     const config = buildBootGrubCfg(base, enrollment.currentToken, ntpHost);
     reply.header("Cache-Control", "no-store");
     reply.header("X-Content-Type-Options", "nosniff");
