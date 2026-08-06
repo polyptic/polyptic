@@ -662,6 +662,14 @@ imageUpdates:
   # when the IngressRoute is enabled; with no address at all the Jobs skip the
   # media and only publish the netboot image. The live ISO additionally needs a
   # non-empty secrets.bootstrapToken (the ISO bakes the enrolment token).
+  #
+  # INCLUDE THE PORT when the boot depot is not on :80 — http://host:8081 (POL-192).
+  # Media are baked at build time and have no request to derive it from, so this
+  # string is taken literally all the way into GRUB's `(http,HOST:PORT)` device.
+  # A site lands on a non-default port whenever its :80 entrypoint carries a
+  # global :80 → :443 redirect, which GRUB (no TLS) cannot follow, so boot
+  # traffic needs an entrypoint of its own. Routes serving that port must also
+  # pass X-Forwarded-Port through — the per-request /boot/grub.cfg reads it.
   bakeBase: ""
   # Extra scheduling constraints for the rebuild Jobs (merged with the arch selector).
   nodeSelector: {}

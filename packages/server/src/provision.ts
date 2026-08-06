@@ -162,14 +162,46 @@ function headerFirst(value: string | string[] | undefined): string {
   return first.trim();
 }
 
+/** Does this authority already carry an explicit `:port`? IPv6 literals are bracketed, so their
+ *  inner colons don't count — only a `]:port` suffix does. */
+function hasExplicitPort(authority: string): boolean {
+  return authority.startsWith("[") ? /\]:\d+$/.test(authority) : authority.includes(":");
+}
+
+/** A port number from a header (or a socket), or undefined when the value isn't one. Headers are
+ *  attacker-shaped input on any request that didn't come through the proxy, so anything that isn't
+ *  a plain in-range number is dropped rather than pasted into a URL boxes will fetch. */
+function parsePort(raw: string | number | undefined): number | undefined {
+  const port = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+  if (typeof raw === "string" && !/^\d{1,5}$/.test(raw)) return undefined;
+  return port;
+}
+
+/** Append `:port` to an authority that carries none — unless it is the scheme's default, which
+ *  belongs in a URL only as noise. */
+function withPort(authority: string, port: number | undefined, proto: string): string {
+  if (!port || hasExplicitPort(authority)) return authority;
+  return port === (proto === "https" ? 443 : 80) ? authority : `${authority}:${port}`;
+}
+
 /**
- * Compute the control-plane base URL the box should target — the exact host it curled. Prefer the
- * reverse-proxy's X-Forwarded-Proto/Host, else the Host header, else the configured PUBLIC_BASE_URL.
- * Always scheme://authority with no trailing slash.
+ * Compute the control-plane base URL the box should target — the exact host:port it curled. Prefer
+ * the reverse-proxy's X-Forwarded-Proto/Host/Port, else the Host header, else the configured
+ * PUBLIC_BASE_URL. Always scheme://authority with no trailing slash.
+ *
+ * The PORT half is load-bearing and easy to lose (POL-192/D185). Minimal HTTP clients — GRUB's, and
+ * dracut's — send `Host:` WITHOUT the port, and a reverse proxy copies that portless value into
+ * X-Forwarded-Host while reporting the real one separately in X-Forwarded-Port. Ignoring that header
+ * meant a boot depot published on a non-default port (a plain-http entrypoint kept off the :80
+ * → :443 redirect, which is how a site runs one) baked port-80 URLs into `/boot/grub.cfg`: the box
+ * fetched the menu fine and then died fetching the kernel. curl hides the whole class of bug because
+ * it always sends the port in `Host:`.
  */
 export function computeBaseUrl(request: FastifyRequest, fallback: string): string {
   const fwdHost = headerFirst(request.headers["x-forwarded-host"]);
   const fwdProto = headerFirst(request.headers["x-forwarded-proto"]).toLowerCase();
+  const fwdPort = parsePort(headerFirst(request.headers["x-forwarded-port"]));
   const host = headerFirst(request.headers.host);
   // With no proxy header, the socket's own protocol decides — "https" when the server itself
   // terminates TLS (TLS_CERT_FILE/TLS_KEY_FILE, POL-70/D89), "http" on the plain listener. This is
@@ -179,25 +211,21 @@ export function computeBaseUrl(request: FastifyRequest, fallback: string): strin
 
   if (fwdHost) {
     const proto = fwdProto || socketProto;
-    return `${proto}://${fwdHost}`.replace(/\/+$/, "");
+    // The proxy's own port, never the listener's: behind a proxy the bind port (8080) is an internal
+    // detail, and the box must be told the port the PROXY answers on.
+    return `${proto}://${withPort(fwdHost, fwdPort, proto)}`.replace(/\/+$/, "");
   }
   if (host) {
     const proto = fwdProto || socketProto;
-    // GRUB's http client (and other minimal fetchers) sends `Host:` WITHOUT the port. Trusting it
-    // verbatim baked port-80 URLs into /boot/grub.cfg, so the very netboot menu we served over
-    // :8080 pointed the kernel fetch at :80 — "connection refused" at the box (found live in the
-    // POL-39 VM netboot; curl masks the bug because it always sends the port). When the header
-    // carries no port and the accepted socket's port is not the protocol default, restore it.
-    let authority = host;
-    const hasPort = authority.startsWith("[") ? /\]:\d+$/.test(authority) : authority.includes(":");
-    // The bound port comes from the listener (Bun's http sockets don't reliably expose localPort).
+    // Direct hit, no proxy in front: restore the port from the socket we were accepted on, since the
+    // client may not have sent one (see above — this is the POL-39 VM netboot bug). A proxy that
+    // forwards Port but not Host still wins, its number being the reachable one.
     const addr = request.server.server.address();
-    const listenPort =
-      (addr && typeof addr === "object" ? addr.port : undefined) ?? request.socket?.localPort;
-    if (!hasPort && listenPort && listenPort !== (proto === "https" ? 443 : 80)) {
-      authority = `${authority}:${listenPort}`;
-    }
-    return `${proto}://${authority}`.replace(/\/+$/, "");
+    // The bound port comes from the listener (Bun's http sockets don't reliably expose localPort).
+    const listenPort = parsePort(
+      (addr && typeof addr === "object" ? addr.port : undefined) ?? request.socket?.localPort,
+    );
+    return `${proto}://${withPort(host, fwdPort ?? listenPort, proto)}`.replace(/\/+$/, "");
   }
   return fallback.replace(/\/+$/, "");
 }
