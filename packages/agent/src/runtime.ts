@@ -13,7 +13,8 @@
  * There is one definition of "can this box update itself" and one wording for why not — fix the gate
  * and this report follows it, with no second copy of the rule to drift.
  */
-import { planUpdate, selfBinaryPath } from "./update";
+import { detectSwapMode, planUpdate, selfBinaryPath } from "./update";
+import type { SelfBinaryProbe, UpdateIO } from "./update";
 
 import type { AgentRuntime } from "@polyptic/protocol";
 
@@ -32,15 +33,24 @@ const NO_ATTEMPTS: ReadonlySet<string> = new Set<string>();
  * it stays honest even if the plan refuses for some other reason; `reason` is {@link planUpdate}'s own
  * sentence, so the console and the `agent/update-status` skip line say the same thing.
  */
-export function describeAgentRuntime(
+export async function describeAgentRuntime(
   currentVersion: string,
-  env: NodeJS.ProcessEnv = process.env,
-): AgentRuntime {
-  const binaryPath = selfBinaryPath(env);
+  io: UpdateIO,
+  probe: SelfBinaryProbe = {},
+): Promise<AgentRuntime> {
+  const binaryPath = selfBinaryPath(probe);
+  // Being a compiled binary is only HALF of "can this box update itself" — it must also have a route
+  // to write that binary. A kiosk agent is unprivileged and its binary lives in a root-owned
+  // directory, so without the helper it is a real binary that still cannot replace itself. Reporting
+  // only the first half would put a green tick on exactly the fleet this report exists to catch.
+  const swapMode = binaryPath
+    ? await detectSwapMode(binaryPath, io)
+    : ({ kind: "none", reason: "" } as const);
   const plan = planUpdate({
     currentVersion,
     offerVersion: PROBE_VERSION,
     binaryPath,
+    swapMode,
     attemptedVersions: NO_ATTEMPTS,
   });
   const launch = binaryPath ? "binary" : "source";

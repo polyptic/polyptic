@@ -1399,7 +1399,7 @@ class Agent {
       // the `agent/update-status` skip line uses). Sent on every hello because it is a standing fact:
       // a box that will never take an update must say so when it connects, not only when it declines
       // one into a log. Sampled per hello, so a box that gets swapped onto a real binary re-reports.
-      runtime: describeAgentRuntime(this.agentVersion),
+      runtime: await describeAgentRuntime(this.agentVersion, realUpdateIO(log)),
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,
