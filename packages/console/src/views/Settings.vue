@@ -1,6 +1,13 @@
 <script setup lang="ts">
-import { imageDistribution, OperatorRole } from "@polyptic/protocol";
-import type { AgentSecurityInfo, EnrollmentTokenView, HttpsInfo, ImageBuild, ImageRing, LogSinkInfo, Operator } from "@polyptic/protocol";
+import {
+  BOOT_BRAND_WORDMARK_MAX,
+  imageDistribution,
+  logoSvg,
+  OperatorRole,
+  SPLASH_COLORS,
+  validateBrandMark,
+} from "@polyptic/protocol";
+import type { AgentSecurityInfo, BootBrand, EnrollmentTokenView, HttpsInfo, ImageBuild, ImageRing, LogSinkInfo, Operator } from "@polyptic/protocol";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
@@ -22,6 +29,7 @@ onMounted(() => {
   void store.fetchNetboot();
   void store.fetchDisplaySettings();
   void store.fetchBootOrderPolicy();
+  if (store.isAdmin) void loadBrand();
   void store.fetchImageUpdates();
   void loadHttps();
   void loadOperators();
@@ -159,6 +167,100 @@ async function setBootOrderReassert(reassert: boolean): Promise<void> {
     /* the store already reverted the optimistic value; the switch reflects the true state */
   } finally {
     bootOrderSaving.value = false;
+  }
+}
+
+// ── Boot branding (POL-194) ────────────────────────────────────────────────────
+//
+// Every screen a customer owns powers on into a logo. Until now it was ours, on the GRUB menu and
+// then on the Plymouth splash, for half a minute at every power-on and again at every restart. This
+// card puts THEIR mark and THEIR word in that lockup.
+//
+// SVG only, and the refusals are named: an uploaded file is checked here with the same
+// `validateBrandMark` the server enforces, so an operator learns what is wrong with a brand asset
+// they did not author before a round trip rather than after it. The server stays the authority.
+const brand = ref<BootBrand | null>(null);
+const brandMark = ref<string | null>(null);
+const brandWordmark = ref("");
+const brandError = ref("");
+const brandSaving = ref(false);
+const brandSaved = ref(false);
+const brandFileInput = ref<HTMLInputElement | null>(null);
+
+/** True once the fields differ from what the control plane has stored. */
+const brandDirty = computed(
+  () =>
+    brand.value !== null &&
+    (brandMark.value !== brand.value.markSvg || brandWordmark.value.trim() !== brand.value.wordmark),
+);
+const brandCustom = computed(() => brandMark.value !== null || brandWordmark.value.trim() !== "");
+
+/**
+ * The preview, as a data URI on an `<img>` rather than inline markup.
+ *
+ * It is the REAL lockup — `logoSvg()` is the one function the GRUB raster, the Plymouth theme and
+ * this preview all render, so what the operator sees here is what a wall shows. An `<img>` because
+ * the source is a file a stranger handed us: a data-URI image cannot run script even if something
+ * slipped past the validator, and inline markup could.
+ */
+const brandPreview = computed(() => {
+  const svg = logoSvg({
+    markSvg: brandMark.value,
+    wordmark: brandWordmark.value,
+    background: SPLASH_COLORS.bg,
+  });
+  return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
+});
+
+async function onBrandFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  brandError.value = "";
+  brandSaved.value = false;
+  const source = await file.text();
+  const check = validateBrandMark(source);
+  if (!check.ok) {
+    brandError.value = check.reason;
+    input.value = "";
+    return;
+  }
+  brandMark.value = source;
+  input.value = "";
+}
+
+async function saveBrand(): Promise<void> {
+  if (brandSaving.value) return;
+  brandSaving.value = true;
+  brandError.value = "";
+  try {
+    brand.value = await auth.updateBootBrand(brandMark.value, brandWordmark.value.trim());
+    brandMark.value = brand.value.markSvg;
+    brandWordmark.value = brand.value.wordmark;
+    brandSaved.value = true;
+    showToast(brandCustom.value ? "Boot branding saved" : "Boot branding removed");
+  } catch (err) {
+    brandError.value = err instanceof ApiError ? err.message : "Could not save the branding";
+  } finally {
+    brandSaving.value = false;
+  }
+}
+
+/** Back to the Polyptic lockup. Clears the fields; the operator still presses Save. */
+function clearBrand(): void {
+  brandMark.value = null;
+  brandWordmark.value = "";
+  brandError.value = "";
+  brandSaved.value = false;
+}
+
+async function loadBrand(): Promise<void> {
+  try {
+    brand.value = await auth.getBootBrand();
+    brandMark.value = brand.value.markSvg;
+    brandWordmark.value = brand.value.wordmark;
+  } catch {
+    /* admin-only; a non-admin console simply does not render the card */
   }
 }
 
@@ -1270,6 +1372,89 @@ async function onSignOut(): Promise<void> {
               : "Report only. No box writes a firmware boot variable. Drift shows up in Live Activity."
           }}
         </p>
+      </section>
+
+      <!-- Boot branding (POL-194) — admin-only ------------------------------------ -->
+      <section v-if="store.isAdmin" id="sec-branding" class="card">
+        <h2 class="card-title">Branding</h2>
+        <p class="card-sub gap">
+          The mark every screen powers on into — on the boot menu, then on the splash, and again on
+          the way down at every restart. Upload your own and it replaces ours.
+        </p>
+
+        <div class="brand-grid">
+          <div class="brand-fields">
+            <label class="field">
+              <span class="field-label">Mark</span>
+              <input
+                ref="brandFileInput"
+                type="file"
+                accept=".svg,image/svg+xml"
+                class="file-input"
+                @change="onBrandFile"
+              />
+              <span class="hint">
+                SVG only, with a viewBox and no live text — the boot chain has no fonts of yours and
+                no network to fetch anything with. Ask for it with the text converted to paths.
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">Wordmark</span>
+              <input
+                v-model="brandWordmark"
+                type="text"
+                class="input"
+                placeholder="Polyptic"
+                :maxlength="BOOT_BRAND_WORDMARK_MAX"
+                spellcheck="false"
+              />
+              <span class="hint">Stands in for "Polyptic". "DISPLAY NODE" below it stays.</span>
+            </label>
+
+            <p v-if="brandError" class="hint-warn">{{ brandError }}</p>
+            <p v-else-if="brand?.note" class="hint-warn">{{ brand.note }}</p>
+
+            <div class="brand-actions">
+              <button
+                type="button"
+                class="btn btn-primary"
+                :disabled="brandSaving || !brandDirty"
+                @click="saveBrand"
+              >
+                {{ brandSaving ? "Saving…" : "Save" }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost"
+                :disabled="brandSaving || !brandCustom"
+                @click="clearBrand"
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+
+          <div class="brand-preview">
+            <div class="brand-screen"><img :src="brandPreview" alt="Boot screen preview" /></div>
+            <span class="hint">Boot screen, at its real proportions.</span>
+          </div>
+        </div>
+
+        <div v-if="brandSaved && !brandDirty" class="brand-saved">
+          <p class="hint">
+            Boot menus are showing this now. Media and installed disks pick it up within a poll
+            cycle. The boot splash shows it after the next image rebuild.
+          </p>
+          <button
+            type="button"
+            class="btn"
+            :disabled="rebuilding || !store.imageUpdates?.fullRebuildConfigured"
+            @click="rebuildNow('full')"
+          >
+            {{ rebuilding ? "Rebuilding…" : "Rebuild the image now" }}
+          </button>
+        </div>
       </section>
 
       <!-- Fleet log retention (POL-187) — admin-only ------------------------------ -->
@@ -2682,6 +2867,87 @@ async function onSignOut(): Promise<void> {
 }
 
 /* ── Badges ────────────────────────────────────────────────────────────────── */
+/* Branding (POL-194): the fields on the left, the real lockup on the right. */
+.brand-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(260px, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .brand-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.brand-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.field {
+  display: block;
+}
+.field .hint {
+  display: block;
+  margin-top: 8px;
+}
+.file-input {
+  display: block;
+  width: 100%;
+  font-size: 12.5px;
+  color: var(--fg2);
+}
+.file-input::file-selector-button {
+  font: inherit;
+  font-weight: 500;
+  color: var(--fg);
+  background: var(--muted-bg);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 12px;
+  margin-right: 10px;
+  cursor: pointer;
+}
+.brand-actions {
+  display: flex;
+  gap: 8px;
+}
+/* The splash dark is not a theme colour: it is the exact background a booting box paints, so the
+   preview shows the logo against the field it will actually sit on in both console themes. */
+.brand-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* The panel: the splash dark, at 16:9, with the lockup floating in it the way a wall shows it. */
+.brand-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: 380px;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #0b0b0d;
+}
+.brand-preview img {
+  width: 62%;
+}
+.brand-actions .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.brand-saved {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
 .badge-preview {
   display: flex;
   align-items: center;

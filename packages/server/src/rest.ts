@@ -96,12 +96,14 @@ import {
   Surface,
   UpdateContentSourceBody,
   UpdateCredentialProfileBody,
+  UpdateBootBrandBody,
   UpdateBootOrderPolicyBody,
+  validateBrandMark,
   UpdateDisplaySettingsBody,
   UpdateSceneBody,
 } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { BulkMachineResult, MuralGrant, Screen, ScreenSlice } from "@polyptic/protocol";
+import type { BootBrand, BulkMachineResult, MuralGrant, Screen, ScreenSlice } from "@polyptic/protocol";
 
 import { appliedCount, fanOut, resolveTarget, unknownIdResults } from "./bulk";
 
@@ -110,6 +112,7 @@ import { NO_CONVERTER_MESSAGE, documentExtForMime, documentFormatLabel } from ".
 import { DEFAULT_DWELL_SECONDS, deckDisplayName, ingestDocument } from "./documents";
 import { parsePreRegistrationCsv } from "./preregistration";
 
+import type { BootLogoRenderer } from "./boot-brand";
 import type { DocumentConverter } from "./document-convert";
 import type { DocumentJobs } from "./documents";
 import type { ActivityLog } from "./activity";
@@ -204,6 +207,9 @@ export function registerRestRoutes(
   grants: GrantService,
   /** POL-191 — for labelling `user` grants with an email in the People panel. */
   auth: AuthService,
+  /** POL-194 — the boot-logo rasteriser, so a save can invalidate its cache and report back whether
+   *  this control plane could actually render the brand it just accepted. */
+  bootLogo: BootLogoRenderer,
 ): void {
   // POL-18 — machines whose placed windows the agent may still be holding. A content change on such
   // a machine must push a fresh apply even when the new state has none (so the agent tears the
@@ -1733,6 +1739,54 @@ export function registerRestRoutes(
     broadcaster.broadcast();
     return policy;
   });
+
+  // ── Boot branding (POL-194) ───────────────────────────────────────────────────
+  //
+  // ONE brand per control plane: an SVG mark and a wordmark, drawn into the lockup every boot screen
+  // paints. Reaching four surfaces costs almost no code here, because three of them already pull
+  // from routes that exist — the GRUB menu fetches `/boot/logo.png` per boot, offline media and
+  // installed ESPs re-pull the theme's three files on their own update poll (POL-80's
+  // `heal_boot_theme`), and the image build curls `/boot/brand/` before it runs `polyptic-agent
+  // setup` in the chroot. Only the Plymouth splash needs a rebuild, and the console OFFERS one.
+
+  // GET /api/v1/settings/boot-brand -> BootBrand { markSvg, wordmark, updatedAt, note }
+  fastify.get("/api/v1/settings/boot-brand", async () => withRenderNote(control.getBootBrand()));
+
+  // PUT /api/v1/settings/boot-brand  { markSvg, wordmark } -> BootBrand
+  fastify.put("/api/v1/settings/boot-brand", async (request, reply) => {
+    const body = UpdateBootBrandBody.safeParse(request.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "invalid body", issues: body.error.issues });
+    }
+    // The mark is validated HERE, at the edge, and refused BY NAME. `rsvg-convert` resolves external
+    // references, so an uploaded `<image href="https://…">` would make this server fetch an
+    // attacker-chosen URL from inside the cluster — and would make a box fetch something that cannot
+    // exist on an offline boot. See `validateBrandMark` for the full rule set and the reasoning.
+    const markSvg = body.data.markSvg?.trim() ? body.data.markSvg : null;
+    if (markSvg) {
+      const check = validateBrandMark(markSvg);
+      if (!check.ok) return reply.code(400).send({ error: check.reason });
+    }
+    const wordmark = body.data.wordmark.trim();
+    const brand = await control.setBootBrand({ markSvg, wordmark });
+    // The cached render is of the OLD brand; drop it so the next `/boot/logo.png` rasterises this one.
+    bootLogo.invalidate();
+    const withNote = await withRenderNote(brand);
+    fastify.log.info(
+      { event: "settings.boot-brand.set", hasMark: markSvg !== null, wordmark, note: withNote.note },
+      "boot branding updated",
+    );
+    broadcaster.broadcast();
+    return withNote;
+  });
+
+  /** Render the brand once so the console learns, in the same round trip, whether this control plane
+   *  could actually produce the PNG — a missing rasteriser or unrenderable artwork is a sentence on
+   *  the settings card, not a silent fallback nobody sees (D115). */
+  async function withRenderNote(brand: BootBrand): Promise<BootBrand> {
+    const { note } = await bootLogo.render(brand);
+    return { ...brand, note };
+  }
 
   // ── Phase 3 routes (murals & placement) ───────────────────────────────────────
   //

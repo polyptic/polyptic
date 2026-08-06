@@ -52,6 +52,10 @@
 #                          and docs/DISTRIBUTION.md. Packages install here; registration happens on the
 #                          box at boot, because a registration writes a credential and this image is
 #                          served ungated (POL-190).
+#          POLYPTIC_BRAND_BASE  (default unset = the Polyptic lockup) a control-plane base URL to pull
+#                          the operator's boot branding from before the chroot's `polyptic-agent
+#                          setup` runs, so the Plymouth splash carries their mark (POL-194). The
+#                          rebuild Job passes the in-cluster service. Unreachable = skipped, never fatal.
 #          OUT_DIR CACHE_DIR
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO_ROOT"
@@ -243,8 +247,34 @@ install -m0755 "$AGENT_BIN" "$ROOTFS/usr/local/bin/polyptic-agent"
 # The cast substrate (uxplay/avahi/gstreamer + the POL-144/D120 VA hardware-decode driver) also
 # lands here, via corePackages()'s `cast` set — so a change to those packages needs a FULL IMAGE
 # REBUILD (this script) before it can be re-tested on a box; the running fleet won't have them.
+#
+# BRANDING (POL-194): the operator's mark + wordmark are pulled off the control plane HERE, before
+# setup runs, because the Plymouth theme is BAKED into the squashfs — it is the one boot surface that
+# cannot be healed over HTTP the way the GRUB theme is (update-poll.sh re-pulls that every poll).
+# Two plain files over curl, no JSON and no parser: this script runs in a bare ubuntu container.
+# Every failure here is a skip, never a build failure — an unreachable control plane, a deployment
+# with no brand saved, or a build run from a laptop all bake the Polyptic lockup, which is exactly
+# what this script did before the flags existed.
+BRAND_ARGS=()
+if [ -n "${POLYPTIC_BRAND_BASE:-}" ]; then
+  brand_dir="$WORK/brand"; mkdir -p "$brand_dir"
+  if curl -fsS --max-time 30 -o "$brand_dir/mark.svg" "$POLYPTIC_BRAND_BASE/boot/brand/mark.svg" 2>/dev/null \
+     && [ -s "$brand_dir/mark.svg" ]; then
+    install -m0644 "$brand_dir/mark.svg" "$ROOTFS/tmp/polyptic-brand-mark.svg"
+    BRAND_ARGS+=(--brand-mark /tmp/polyptic-brand-mark.svg)
+    echo "    branding: baking the operator's mark from $POLYPTIC_BRAND_BASE"
+  else
+    echo "    branding: no custom mark published (keeping the Polyptic mark)"
+  fi
+  wordmark="$(curl -fsS --max-time 30 "$POLYPTIC_BRAND_BASE/boot/brand/wordmark.txt" 2>/dev/null || true)"
+  if [ -n "$wordmark" ]; then
+    BRAND_ARGS+=(--brand-wordmark "$wordmark")
+    echo "    branding: wordmark '$wordmark'"
+  fi
+fi
 chroot "$ROOTFS" /usr/local/bin/polyptic-agent setup \
-  --backend wayland-sway --user kiosk --render auto
+  --backend wayland-sway --user kiosk --render auto "${BRAND_ARGS[@]}"
+rm -f "$ROOTFS/tmp/polyptic-brand-mark.svg"
 chroot "$ROOTFS" /bin/sh -c 'apt-get clean'
 
 echo '==> [5/9] overlay diskless identity + install layer'

@@ -46,6 +46,10 @@ export interface SetupOptions {
   installDeps: boolean;
   /** Configure the Plymouth boot splash (default true; `--no-splash` to skip). POL-7. */
   splash: boolean;
+  /** POL-194 — path to the operator's mark (SVG) to draw in the splash lockup instead of ours. */
+  brandMark?: string;
+  /** POL-194 — the word that stands in for "Polyptic" in the splash lockup. */
+  brandWordmark?: string;
   /** uninstall: also remove /etc/polyptic and the kiosk user. */
   purge: boolean;
 }
@@ -172,6 +176,14 @@ export function parseArgs(argv: string[]): SetupOptions {
       case "--no-splash":
         opts.splash = false;
         break;
+      case "--brand-mark":
+        opts.brandMark = need(i, a);
+        i++;
+        break;
+      case "--brand-wordmark":
+        opts.brandWordmark = need(i, a);
+        i++;
+        break;
       case "--purge":
         opts.purge = true;
         break;
@@ -220,6 +232,10 @@ OPTIONS
   --no-enable                       write configs but do not enable services / swap the display manager.
   --skip-deps                       do not install OS packages (pre-baked image).
   --no-splash                       do not configure the Plymouth boot splash (POL-7).
+  --brand-mark <file.svg>           draw this mark in the boot splash instead of the Polyptic one
+                                    (POL-194). SVG only, and it must carry a viewBox and no live
+                                    <text>. The image build pulls it off the control plane.
+  --brand-wordmark <name>           the word beside the mark, in place of "Polyptic" (POL-194).
   --purge                           (uninstall) also remove /etc/polyptic and the kiosk user.
   -n, --dry-run                     print the plan; make no changes (safe to run as non-root).
   -h, --help                        this help.

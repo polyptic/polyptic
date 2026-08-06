@@ -66,6 +66,11 @@ export * from "./grafana-url";
 export * from "./logs";
 import { AdminLogSubscribe, AdminLogUnsubscribe, AgentLogs, PlayerLog, ServerToAgentLogsAck } from "./logs";
 
+// POL-7/POL-47/POL-194 — the boot lockup: the ONE `logoSvg()` every branded boot screen renders
+// from (the agent's Plymouth theme, the GRUB PNG, the console's preview), the splash palette they
+// share, and the operator's custom mark + wordmark with the validator that admits one.
+export * from "./boot-brand";
+
 // POL-187 — redaction, shared by all three emitters. A send-time credential (POL-24) lives in a
 // URL's query; a log line must never carry one, on either side of the wire.
 export * from "./redact";

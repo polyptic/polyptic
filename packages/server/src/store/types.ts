@@ -523,6 +523,24 @@ export interface PersistedBootOrderPolicy {
   reassert: boolean;
 }
 
+/**
+ * The fleet's boot branding (POL-194): the mark and the word every boot screen paints instead of
+ * ours. Absent until an operator uploads one, and the fallback is the Polyptic lockup.
+ *
+ * The SVG SOURCE lives in this row rather than on a volume. It is a few kilobytes of text that has
+ * to be readable by every server replica at once (the chart ships an HPA), and the one thing derived
+ * from it — the rasterised `boot-logo.png` — is a cache the control plane can rebuild from the row
+ * at any time. A ReadWriteOnce volume would have made the brand a single-replica feature.
+ */
+export interface PersistedBootBrand {
+  /** The operator's mark, as SVG source. Null = the Polyptic mark. */
+  markSvg: string | null;
+  /** The word standing in for "Polyptic". "" = the default. */
+  wordmark: string;
+  /** ISO timestamp of the last save. */
+  updatedAt: string;
+}
+
 /** The full snapshot returned by `load()` — everything needed to rebuild the in-memory state. */
 export interface PersistedState {
   revision: number;
@@ -805,6 +823,12 @@ export interface Store {
   getBootOrderPolicy(): Promise<PersistedBootOrderPolicy | undefined>;
   /** Persist the fleet-wide boot-order policy (single row). */
   setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void>;
+
+  // ── Boot branding (POL-194) ────────────────────────────────────────────────
+  /** The persisted boot branding. Undefined until an operator first saves one (default: Polyptic). */
+  getBootBrand(): Promise<PersistedBootBrand | undefined>;
+  /** Persist the fleet-wide boot branding (single row). */
+  setBootBrand(brand: PersistedBootBrand): Promise<void>;
 
   /** Release any underlying resources (DB pool). */
   close(): Promise<void>;

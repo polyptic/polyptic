@@ -19,7 +19,10 @@
  *                                                   its baked prefix resolves to (http,host:port)/grub
  *                                                   at the server root, not next to the shim URL.
  *   GET /boot/{theme.txt,logo.png,bg.png}         → the GRUB theme that makes that menu the Polyptic
- *                                                   splash rather than a text console (POL-47).
+ *                                                   splash rather than a text console (POL-47), with
+ *                                                   the operator's own brand on it (POL-194).
+ *   GET /boot/brand/{mark.svg,wordmark.txt}       → that brand as source, for the image build to bake
+ *                                                   into the Plymouth splash (POL-194).
  *   GET /dist/image/:arch/{vmlinuz,initrd,rootfs.squashfs} → the live-image artifacts, Range-streamed to RAM.
  *   GET /dist/boot/:file                          → the dd-able universal dongle (polyptic-boot.img) and
  *                                                   the four signed loaders (shim + GRUB .efi), TOKENLESS
@@ -39,9 +42,10 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BootMediumInfo, BootMediumManifest, BootReportBody, NetbootInfo } from "@polyptic/protocol";
-import type { BootOrderPolicy, BootReportBody as BootReport, BootReportCode, MachineBootPath } from "@polyptic/protocol";
+import type { BootBrand, BootOrderPolicy, BootReportBody as BootReport, BootReportCode, MachineBootPath } from "@polyptic/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { BootLogoRenderer } from "./boot-brand";
 import { bootBgPng, bootGfxPreamble, buildBootThemeTxt } from "./boot-theme";
 import { constantTimeEqual } from "./enroll";
 import type { Enrollment } from "./enroll";
@@ -821,6 +825,16 @@ export interface ImageManifestSource {
   ensureActiveBuild(arch: string): Promise<void>;
 }
 
+/**
+ * The operator's boot branding, as the depot routes see it (POL-194): the saved brand, and the
+ * renderer that turns it into the one PNG GRUB draws. Both live on the control plane rather than in
+ * this module because the brand is registry state and the render is a cache over it.
+ */
+export interface BrandingSource {
+  brand(): BootBrand | Promise<BootBrand>;
+  renderer: BootLogoRenderer;
+}
+
 export function registerProvisionRoutes(
   fastify: FastifyInstance,
   config: ProvisionConfig,
@@ -837,6 +851,9 @@ export function registerProvisionRoutes(
   /** POL-171 — record which boot chain a machine came up through (persisted; drives the Machines-tab
    *  fallback warning). Returns whether `machineId` named a machine the registry knows. */
   noteBootPath?: (machineId: string, path: MachineBootPath, detail: string) => boolean | Promise<boolean>,
+  /** POL-194 — the operator's boot branding + the rasteriser that turns it into `/boot/logo.png`.
+   *  Absent, every boot screen paints the committed Polyptic lockup exactly as it did before. */
+  branding?: BrandingSource,
 ): void {
   const { agentDistDir, imageDistDir, bootDistDir, publicBaseUrl, ntpHost, bootBase } = config;
 
@@ -904,11 +921,21 @@ export function registerProvisionRoutes(
   });
 
   fastify.get("/boot/logo.png", async (_request, reply) => {
-    let png: Buffer;
-    try {
-      png = await readFile(BOOT_LOGO_PATH);
-    } catch {
-      return reply.code(404).send({ error: "boot logo not bundled" });
+    // POL-194 — the operator's brand, rasterised and gated through grub-png-check, wins. Anything
+    // that stops that happening (no brand saved, no rasteriser, a render GRUB would refuse) falls
+    // back to the committed lockup: this is a boot path, and a wall with a Polyptic logo on it is a
+    // wholly better outcome than a wall stuck on "Press any key to continue".
+    let png: Buffer | null = null;
+    if (branding) {
+      const rendered = await branding.renderer.render(await branding.brand());
+      png = rendered.png;
+    }
+    if (!png) {
+      try {
+        png = await readFile(BOOT_LOGO_PATH);
+      } catch {
+        return reply.code(404).send({ error: "boot logo not bundled" });
+      }
     }
     reply.header("Cache-Control", "no-store");
     reply.header("X-Content-Type-Options", "nosniff");
@@ -916,6 +943,37 @@ export function registerProvisionRoutes(
     reply.header("Content-Length", String(png.length));
     reply.type("image/png");
     return reply.send(png);
+  });
+
+  // ── GET /boot/brand/{mark.svg,wordmark.txt} — what the IMAGE BUILD pulls (POL-194).
+  //
+  //    The Plymouth splash is baked into the squashfs, so it cannot be healed over HTTP the way the
+  //    GRUB theme is: `polyptic-agent setup` has to know the brand while it runs in the build
+  //    chroot. The rebuild Job curls these two paths in `build-live-image.sh` and passes them on as
+  //    --brand-mark / --brand-wordmark.
+  //
+  //    TWO PLAIN FILES, NOT ONE JSON. Everything downstream of here is POSIX sh with curl and no
+  //    parser: the initramfs, the update poll, the build chroot. A 404 (no mark) and an empty body
+  //    (no wordmark) are the whole protocol, and both are the "keep the Polyptic lockup" answer.
+  //    Ungated like the rest of the depot, and secret-free — it is the customer's own logo, already
+  //    on every screen they own.
+  fastify.get("/boot/brand/mark.svg", async (_request, reply) => {
+    const brand = branding ? await branding.brand() : null;
+    if (!brand?.markSvg) return reply.code(404).send({ error: "no custom boot mark" });
+    const body = Buffer.from(brand.markSvg, "utf8");
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Content-Length", String(body.length));
+    reply.type("image/svg+xml");
+    return reply.send(body);
+  });
+
+  fastify.get("/boot/brand/wordmark.txt", async (_request, reply) => {
+    const brand = branding ? await branding.brand() : null;
+    reply.header("Cache-Control", "no-store");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.type("text/plain; charset=utf-8");
+    return brand?.wordmark ?? "";
   });
 
   // The theme's desktop-image (POL-130): a tiny solid-dark PNG GRUB stretches over the panel. It is
