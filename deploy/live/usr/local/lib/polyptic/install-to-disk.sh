@@ -251,14 +251,26 @@ case "$target" in /dev/*) : ;; *) fail install-bad-target "'$target' is not a /d
 [ "$(cat "$SYS_BLOCK/$name/removable" 2>/dev/null || echo 0)" != "1" ] \
   || fail install-bad-target "$target is removable media. Install to an internal disk (nothing was erased)"
 # Never the disk this box BOOTED from: wiping the medium under a running boot chain strands the box.
+# The boot chain answers that, not a filesystem label — an already-installed box carries an ESP
+# labeled POLYPTIC-BT exactly like the USB stick it is being re-installed from, so `--booted-disk`
+# (find-boot-medium.sh: the live device dmsquash-live mounted, or the cmdline's live root spec) is
+# what decides. A box booted from the stick or from the network has no booted disk, and re-installing
+# the disk under it is precisely the operation the operator asked for.
+booted_disk="$(sh "$LIB_DIR/find-boot-medium.sh" --booted-disk 2>/dev/null || true)"
+if [ -n "$booted_disk" ] && [ "$booted_disk" = "$name" ]; then
+  fail install-bad-target "$target is the disk this box booted from — a running box cannot wipe its own boot chain. Boot this box from the Polyptic USB medium and install again (nothing was erased)"
+fi
 mnt_medium="$(mktemp -d)"
 medium_dev="$(sh "$LIB_DIR/find-boot-medium.sh" "$mnt_medium" ro 2>/dev/null || true)"
 medium_disk=""
 if [ -n "$medium_dev" ]; then
   medium_disk="$(lsblk -no PKNAME "$medium_dev" 2>/dev/null | head -n1 || true)"
 fi
-if [ -n "$medium_disk" ] && [ "$medium_disk" = "$name" ]; then
-  fail install-bad-target "$target carries the boot medium this box booted from (nothing was erased)"
+# The same rule from the medium's side, for a boot chain that names no disk (the fielded offloaded
+# ESP: netbooted, but its loaders live on this box's own disk). The device is NAMED so a refusal an
+# operator disagrees with is diagnosable at the console instead of mysterious.
+if [ -z "$booted_disk" ] && [ -n "$medium_disk" ] && [ "$medium_disk" = "$name" ]; then
+  fail install-bad-target "$target carries $medium_dev, the boot medium this box booted from (nothing was erased)"
 fi
 # Nothing on the target may be mounted anywhere: a mounted filesystem under a wipe is data loss the
 # operator did not ask for, and the kernel would fight the re-read anyway. /proc/mounts always

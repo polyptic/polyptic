@@ -208,13 +208,16 @@ shahex() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else sh
 new_case() {
   d="$ROOT/$1"
   mkdir -p "$d/dev" "$d/efi/efivars" "$d/run/requests" "$d/by-label" \
-           "$d/sysblock/sdb" "$d/sysblock/sda" "$d/sysblock/sda1"
+           "$d/sysblock/sdb" "$d/sysblock/sda/sda1"
   : > "$d/dev/sdb"; : > "$d/dev/sda"; : > "$d/dev/sda1"
   printf '0\n' > "$d/sysblock/sdb/removable"
   printf '134217728\n' > "$d/sysblock/sdb/size"      # 64 GiB in 512-byte sectors
   printf '0\n' > "$d/sysblock/sda/removable"
   printf '134217728\n' > "$d/sysblock/sda/size"
-  printf '1\n' > "$d/sysblock/sda1/partition"
+  # sysfs nests a partition under its disk and marks it with a `partition` file — how
+  # find-boot-medium.sh answers "which disk is this device on" with no lsblk in the initramfs.
+  printf '1\n' > "$d/sysblock/sda/sda1/partition"
+  ln -s "sda/sda1" "$d/sysblock/sda1"
   printf 'BOOT_IMAGE=/vmlinuz root=live:http://10.0.0.10/dist/image/amd64/rootfs.squashfs polyptic.base=http://10.0.0.10 polyptic.token=secret-fleet-token quiet splash\n' > "$d/cmdline"
   printf 'device=/dev/sdb\n' > "$d/run/requests/install"
   printf 'sda1 sda\n' > "$d/blockdevs"
@@ -332,7 +335,45 @@ d="$(new_case booted-medium)"; printf 'device=/dev/sda\n' > "$d/run/requests/ins
 out="$(install "$d")"
 eq  "booted medium: fails"                 "1" "$(exit_of "$out")"
 has "booted medium: names why"             "boot medium" "$out"
+has "booted medium: names the device taken to be the medium" "/dev/sda1" "$out"
 eq  "booted medium: nothing wiped"         "no" "$(wiped "$d")"
+
+# ─── 2b) RE-INSTALLING a box that already has an install ────────────────────────────────────────────
+# Both volumes are labeled POLYPTIC-BT and both carry a marker — the ESP by design, since after an
+# install the ESP IS the boot medium — so /dev/disk/by-label/POLYPTIC-BT is ambiguous and udev may
+# publish either. The boot chain decides: this box booted the USB stick, so the internal disk is a
+# legal target and the install must run.
+installed_esp() { # <case dir> — an existing install on the target /dev/sdb, ESP at sdb1
+  mkdir -p "$1/sysblock/sdb/sdb1" "$1/vol-sdb1/polyptic"
+  : > "$1/dev/sdb1"
+  printf '1\n' > "$1/sysblock/sdb/sdb1/partition"
+  ln -s "sdb/sdb1" "$1/sysblock/sdb1"
+  printf 'disk-esp-20260722T101500Z\n' > "$1/vol-sdb1/polyptic/medium-id"
+  printf 'sdb1 sdb\n' >> "$1/blockdevs"
+  printf '%s\n%s\n' "/dev/sdb1" "/dev/sda1" > "$1/vfat_devs"     # blkid's order: the ESP first
+  ln -sf "$1/dev/sdb1" "$1/by-label/POLYPTIC-BT"                 # udev resolved the label wrongly
+}
+
+d="$(new_case reinstall-from-usb)"; installed_esp "$d"
+out="$(install "$d")"
+eq  "re-install from the stick: succeeds"  "0" "$(exit_of "$out")"
+has "re-install from the stick: wiped the named disk" "--zap-all /dev/sdb" "$(cat "$d/sgdisk.log")"
+has "re-install from the stick: reported installed" '"code":"installed"' "$(posted "$d")"
+eq  "re-install from the stick: wifi.conf came off the STICK, not the old ESP" "WIFI_SSID=SiteNet" \
+    "$(head -n1 "$d/vol-sdb1/polyptic/wifi.conf" 2>/dev/null)"
+
+# The same two volumes, booted from the DISK: the ESP genuinely IS the boot medium, and a box cannot
+# wipe the disk it is running from.
+d="$(new_case reinstall-from-disk)"; installed_esp "$d"
+mkdir -p "$d/sysblock/sdb/sdb2"; : > "$d/dev/sdb2"
+printf '2\n' > "$d/sysblock/sdb/sdb2/partition"; ln -s "sdb/sdb2" "$d/sysblock/sdb2"
+ln -sf "$d/dev/sdb2" "$d/by-label/POLYPTIC-A"
+printf 'BOOT_IMAGE=/vmlinuz root=live:LABEL=POLYPTIC-A polyptic.base=http://10.0.0.10 polyptic.bootpath=disk quiet splash\n' > "$d/cmdline"
+out="$(install "$d")"
+eq  "installed box, same disk: fails"      "1" "$(exit_of "$out")"
+has "installed box, same disk: names the condition" "the disk this box booted from" "$out"
+has "installed box, same disk: names the remedy"    "Polyptic USB medium" "$out"
+eq  "installed box, same disk: nothing wiped"       "no" "$(wiped "$d")"
 
 d="$(new_case mounted-target)"
 printf '/dev/sdb1 /mnt/data ext4 rw 0 0\n' > "$d/mounts"
