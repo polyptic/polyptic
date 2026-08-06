@@ -198,6 +198,23 @@ BOX (agent)                  BOX (player)          SERVER (control plane)
   RAM overlay on a netbooted box, so a reboot takes the spool with it. It survives an agent crash or
   restart everywhere; the mitigation for the rest is eager shipping, which keeps an online box's
   exposure to seconds. Do not write copy that promises more than that.
+- **`bun build --define` substitutes one literal expression, not a variable.** `--define
+  "process.env.POLYPTIC_BUILD_VERSION=\"0.3.6\""` rewrites the text `process.env.POLYPTIC_BUILD_VERSION`
+  wherever it is written and nothing else. Read the same value through a parameter
+  (`env.POLYPTIC_BUILD_VERSION`) or a destructured `const { env } = process` and you get the real
+  runtime environment, which has never had that variable set. The agent shipped both spellings: the
+  version it reported was baked, and the self-update gate it read from a parameter was empty — so
+  every box in the field announced version `0.3.6` while declining each update as a "dev/source run".
+  The bake now lives in ONE module-level constant (`packages/agent/src/version.ts`), and "am I a
+  replaceable binary" is answered from the embedded filesystem (`/$bunfs/`), not from an env var.
+- **The agent cannot write its own binary, and must not be able to.** It runs as the unprivileged
+  kiosk user; `/usr/local/bin` is root-owned, so a self-update that `rename()`s over its own binary
+  is EACCES on every real box. Relocating the binary somewhere writable would hand the agent write
+  access to its own code path, so the swap goes through the same request-file seam as the reboot
+  (POL-55) and the disk install (POL-176): the agent stages and verifies, drops one request in
+  `/run/polyptic/requests`, and a root-owned path unit runs a fixed script that re-verifies and
+  installs by same-directory rename. The helper reaches a box only through a full image rebuild (the
+  same route the agent binary itself takes), so until it lands the update SKIPS and says why.
 - **Wayland forbids client self-positioning.** `--window-position` is a no-op natively, so placement goes through `sway` (config or `swaymsg` IPC). X11 + i3 is the fallback if a GPU/app misbehaves.
 - **surf is an X11 client**, so under sway it renders through **XWayland**, which sway starts lazily and only if the `xwayland` binary exists. Without the package the fallback browser never opens and the wall sits black. The sway config must also import `DISPLAY` into the systemd user environment, or surf dies with `Can't open default display`. Worse, XWayland's GPU path is **DRI3**, and where DRI3 is broken (real amdgpu wall hardware) every surf silently **software-renders** and pegs the CPU, which is why Chrome native Wayland is the default browser. Check `/proc/<pid>/fd` for a `/dev/dri` handle to tell which path a browser is on.
 - **Two Chrome launches sharing a `--user-data-dir` dedupe into ONE process.** The second "launch" just opens a window in the first, which breaks per-output supervision AND (Chrome 136+) the default data dir refuses `--remote-debugging-port` outright. Hence the per-connector data dir.

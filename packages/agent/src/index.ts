@@ -67,7 +67,7 @@ import {
 } from "@polyptic/protocol";
 import type { KioskBrowser, LogEvent, LogLevel, MachineVitals, Output, PowerCapabilities } from "@polyptic/protocol";
 import { readFileSync } from "node:fs";
-import { readFile, rm, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { hostname as osHostname } from "node:os";
 import { applyCastPinEvent } from "./backends/cast";
 import { selectKioskBrowser } from "./backends/chrome";
@@ -109,6 +109,11 @@ import {
   applyUpdate,
   clearMarker,
   decideStartupAction,
+  detectSwapMode,
+  directSwapPlan,
+  dropBackup,
+  helperSwapPlan,
+  isCompiledBinary,
   planUpdate,
   readMarker,
   realUpdateIO,
@@ -1009,10 +1014,16 @@ class Agent {
       return;
     }
 
+    const io = realUpdateIO(log);
+    const binaryPath = selfBinaryPath();
+    // Which route this box has for replacing its binary: it writes its own (dev/root), or the
+    // root-owned helper does (a kiosk box, where /usr/local/bin is root-owned and the agent is not).
+    const swapMode = binaryPath ? await detectSwapMode(binaryPath, io) : { kind: "none" as const, reason: "" };
     const plan = planUpdate({
       currentVersion: this.agentVersion,
       offerVersion: msg.version,
-      binaryPath: selfBinaryPath(),
+      binaryPath,
+      swapMode,
       attemptedVersions: this.attemptedUpdates,
     });
     if (plan.action === "skip") {
@@ -1026,20 +1037,26 @@ class Agent {
     this.updating = true;
     this.attemptedUpdates.add(msg.version);
     const url = resolveUpdateUrl(this.url, msg.url);
-    log(`self-update: server offers agent ${this.agentVersion} → ${msg.version}; pulling ${url}`);
-    report("downloading");
+    const swapPlan =
+      plan.swap.kind === "direct"
+        ? directSwapPlan(plan.binaryPath, io)
+        : helperSwapPlan({ targetVersion: msg.version, ...(msg.sha256 ? { sha256: msg.sha256 } : {}) }, io);
+    log(
+      `self-update: server offers agent ${this.agentVersion} → ${msg.version}; pulling ${url} ` +
+        `(${swapPlan.kind === "helper" ? "the privileged helper installs it" : "this process installs it"})`,
+    );
 
     try {
-      report("verifying");
       const result = await applyUpdate(
         {
-          binaryPath: plan.binaryPath,
           url,
           targetVersion: msg.version,
           ...(msg.sha256 ? { sha256: msg.sha256 } : {}),
           ...(msg.sizeBytes !== undefined ? { sizeBytes: msg.sizeBytes } : {}),
         },
-        realUpdateIO(log),
+        io,
+        swapPlan,
+        { onPhase: (phase) => report(phase) },
       );
       if (!result.ok) {
         logError(`self-update to ${msg.version} FAILED (staying on ${this.agentVersion}): ${result.reason}`);
@@ -1050,7 +1067,7 @@ class Agent {
 
       // The new binary is on disk and passed its self-check. Record a crash-loop marker so the
       // relaunched binary can roll itself back if it boots but won't stay up, then exit for systemd.
-      await writeMarker(plan.binaryPath, {
+      await writeMarker({
         targetVersion: msg.version,
         previousVersion: this.agentVersion,
         swappedAt: new Date().toISOString(),
@@ -1473,17 +1490,20 @@ class Agent {
 async function reconcileSelfUpdateAtStartup(currentVersion: string): Promise<void> {
   const binaryPath = selfBinaryPath();
   if (!binaryPath) return; // dev/source run — nothing self-updates
+  const io = realUpdateIO(log);
   try {
-    const existing = await readMarker(binaryPath);
+    const existing = await readMarker();
+    if (!existing) return; // the overwhelmingly common boot: nothing was ever swapped
     // Count THIS boot before deciding, so the crash-loop budget is measured across relaunches.
-    const marker = existing ? { ...existing, boots: existing.boots + 1 } : null;
+    const marker = { ...existing, boots: existing.boots + 1 };
+    const swapMode = await detectSwapMode(binaryPath, io);
     const action = decideStartupAction(marker, currentVersion);
     if (action.kind === "rollback") {
       logError(
         `self-update to ${action.marker.targetVersion} has booted ${action.marker.boots} times without staying up — rolling back to ${action.marker.previousVersion}`,
       );
-      const rolledBack = await rollbackToBackup(binaryPath);
-      await clearMarker(binaryPath);
+      const rolledBack = await rollbackToBackup(binaryPath, swapMode, io);
+      await clearMarker();
       if (rolledBack) {
         log(`rolled back to the previous agent binary; exiting for systemd to relaunch it`);
         setTimeout(() => process.exit(0), 100);
@@ -1496,21 +1516,21 @@ async function reconcileSelfUpdateAtStartup(currentVersion: string): Promise<voi
     }
     if (action.kind === "commit") {
       // Persist the incremented boot count now, so a crash before the stable timer still counts.
-      await writeMarker(binaryPath, action.marker).catch(() => {});
+      await writeMarker(action.marker).catch(() => {});
       log(
         `running freshly self-updated agent ${currentVersion} (boot ${action.marker.boots}/${MAX_UNSTABLE_BOOTS}); will commit after ${Math.round(STABLE_UPTIME_MS / 1000)}s uptime`,
       );
       setTimeout(() => {
-        void writeMarker(binaryPath, { ...action.marker, committed: true })
-          .then(() => clearMarker(binaryPath)) // committed: drop the marker AND the backup below
-          .then(() => rm(`${binaryPath}.bak`, { force: true }).catch(() => {}))
+        void writeMarker({ ...action.marker, committed: true })
+          .then(() => clearMarker()) // committed: drop the marker AND the backup below
+          .then(() => dropBackup(binaryPath, swapMode, io))
           .then(() => log(`self-update to ${currentVersion} committed — stable for ${Math.round(STABLE_UPTIME_MS / 1000)}s`))
           .catch(() => {});
       }, STABLE_UPTIME_MS).unref?.();
       return;
     }
     // kind "none": a stale marker (already committed, or for a version we are not running) — clear it.
-    if (existing) await clearMarker(binaryPath);
+    await clearMarker();
   } catch (err) {
     logError(`self-update startup reconcile failed (continuing): ${(err as Error).message}`);
   }
@@ -1522,6 +1542,27 @@ async function main(): Promise<void> {
   // binary cannot get here, which is exactly what makes the check a real gate on the swap.
   if (process.argv[2] === "--version" || process.argv[2] === "version") {
     process.stdout.write(`${readAgentVersion()}\n`);
+    process.exit(0);
+  }
+
+  // POL-160 — what this process would tell the server about its own updatability, printed as one
+  // JSON line. A compiled binary that says `"updatable": false` is the bug that let a production
+  // fleet decline 176 update offers in 48h while correctly reporting its baked version, so it is now
+  // answerable from a box (and asserted against a REAL compiled binary in the test suite).
+  if (process.argv[2] === "--updatable" || process.argv[2] === "updatable") {
+    const binaryPath = selfBinaryPath();
+    const io = realUpdateIO(() => {});
+    const swap = binaryPath ? await detectSwapMode(binaryPath, io) : null;
+    process.stdout.write(
+      `${JSON.stringify({
+        version: readAgentVersion(),
+        compiled: isCompiledBinary(),
+        updatable: binaryPath !== null && swap !== null && swap.kind !== "none",
+        binaryPath,
+        swap: swap ? swap.kind : "none",
+        ...(swap && swap.kind === "none" ? { reason: swap.reason } : {}),
+      })}\n`,
+    );
     process.exit(0);
   }
 

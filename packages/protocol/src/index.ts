@@ -251,6 +251,24 @@ export function machineHasName(machine: { id: string; label: string }): boolean 
 }
 
 /**
+ * POL-160 — one spelling for an agent version. The two ends of this feature disagree on the `v`:
+ * the server's `BUILD_VERSION` is the release TAG (`v0.6.0`, straight off `POLYPTIC_VERSION`) while
+ * the binary bakes the stripped form (`server.Dockerfile` compiles with `${POLYPTIC_VERSION#v}`), so
+ * a box reports `0.3.6` against an offer of `v0.6.0`. Left un-normalised that drift is silent and
+ * dangerous in two places: `v1.0.0` parses its major as 0 (a non-numeric segment counts as 0), which
+ * mis-orders a comparison, and the swap's `--version` self-check compares the two strings literally,
+ * which would fail EVERY update the moment the versions were otherwise fine. Normalise both ends.
+ */
+export function normalizeAgentVersion(version: string): string {
+  return version.trim().replace(/^[vV]/, "");
+}
+
+/** True when two version strings name the same agent build, `v` prefix or not. */
+export function sameAgentVersion(a: string, b: string): boolean {
+  return normalizeAgentVersion(a) === normalizeAgentVersion(b);
+}
+
+/**
  * POL-160 — is `candidate` a STRICTLY NEWER agent version than `current`? The single shared answer
  * for "should this box self-update", used by the SERVER (to decide whether to offer an update at all)
  * and the AGENT (to refuse ever installing an older-or-equal binary — the core safety guard). A
@@ -259,8 +277,7 @@ export function machineHasName(machine: { id: string; label: string }): boolean 
  * the update path must be a no-op when the fleet already matches the server.
  */
 function agentVersionParts(v: string): number[] {
-  return v
-    .trim()
+  return normalizeAgentVersion(v)
     .split(/[.\-+]/)
     .map((s) => {
       const n = Number.parseInt(s, 10);

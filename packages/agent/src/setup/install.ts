@@ -23,6 +23,9 @@ import { renderAgentToml } from "./config";
 import { agentVersion } from "../version";
 import {
   AGENT_SERVICE,
+  AGENT_UPDATE_PATH_UNIT,
+  AGENT_UPDATE_SCRIPT,
+  AGENT_UPDATE_SERVICE,
   CEC_UDEV_RULES_PATH,
   COMPOSITOR_LAUNCHER,
   REBOOT_PATH_UNIT,
@@ -32,6 +35,9 @@ import {
   SESSION_TARGET,
   SYSTEM_UNIT_DIR,
   agentServiceUnit,
+  agentUpdatePathUnit,
+  agentUpdateScript,
+  agentUpdateServiceUnit,
   cecUdevRules,
   compositorLauncher,
   greetdConfig,
@@ -148,7 +154,11 @@ export function runInstall(sys: Sys, opts: SetupOptions, log: Logger): SetupResu
   // has none, and this image ships neither sudo nor polkit. See templates.ts for why a path unit.
   writeRebootHelper(sys, opts, log, assumptions);
 
-  // 5c ─ HDMI-CEC device access (POL-101): the second rung of panel power, if this box has an adapter.
+  // 5c ─ the privileged agent-binary swap (POL-160): the agent verifies its own update, root installs
+  // it. Without this the agent downloads a binary it cannot write over its own root-owned file.
+  writeAgentUpdateHelper(sys, opts, log, assumptions);
+
+  // 5d ─ HDMI-CEC device access (POL-101): the second rung of panel power, if this box has an adapter.
   writeCecUdevRule(sys, log, assumptions);
 
   // 6 ─ /etc/polyptic/agent.toml
@@ -356,6 +366,34 @@ function writeRebootHelper(sys: Sys, opts: SetupOptions, log: Logger, assumption
   assumptions.push(
     `the agent reboots the box by creating ${REBOOT_REQUEST_DIR}/reboot, which ${REBOOT_PATH_UNIT} ` +
       `turns into a root \`systemctl reboot\` — no sudo, no polkit, and no command the agent can choose.`,
+  );
+}
+
+/**
+ * POL-160 — the root half of the agent's self-update: a fixed script plus the `.path`/`.service`
+ * pair that runs it, armed by the agent staging a verified binary and dropping one request in the
+ * same kiosk-writable directory the reboot uses. The agent stays unprivileged and never gains write
+ * access to its own binary; the script takes no path and no command from the request.
+ */
+function writeAgentUpdateHelper(sys: Sys, opts: SetupOptions, log: Logger, assumptions: string[]): void {
+  log.step("write the privileged agent-update helper (systemd path unit)");
+  sys.ensureDir("/usr/local/lib/polyptic", { mode: 0o755 });
+  sys.writeFile(AGENT_UPDATE_SCRIPT, agentUpdateScript({ agentBin: opts.agentBin, user: opts.user }), {
+    mode: 0o755,
+    desc: "agent-update swap script",
+  });
+  sys.writeFile(`${SYSTEM_UNIT_DIR}/${AGENT_UPDATE_PATH_UNIT}`, agentUpdatePathUnit(), {
+    mode: 0o644,
+    desc: AGENT_UPDATE_PATH_UNIT,
+  });
+  sys.writeFile(`${SYSTEM_UNIT_DIR}/${AGENT_UPDATE_SERVICE}`, agentUpdateServiceUnit(), {
+    mode: 0o644,
+    desc: AGENT_UPDATE_SERVICE,
+  });
+  assumptions.push(
+    `the agent installs a newer binary by staging it in ${REBOOT_REQUEST_DIR} and asking ` +
+      `${AGENT_UPDATE_PATH_UNIT} to swap it over ${opts.agentBin} — the agent itself never writes ` +
+      `there, and the script re-verifies the staged binary before it replaces anything.`,
   );
 }
 
@@ -840,6 +878,12 @@ function enableServices(sys: Sys, log: Logger, state: SetupState): void {
   // boot, and a chroot install (the live-image build) has no manager to start anything anyway.
   sys.exec("systemctl", ["enable", REBOOT_PATH_UNIT], {
     desc: `enable ${REBOOT_PATH_UNIT} (control-plane reboot)`,
+    allowFail: true,
+  });
+
+  // POL-160 — arm the agent-update watcher, on the same terms: enabled, not started.
+  sys.exec("systemctl", ["enable", AGENT_UPDATE_PATH_UNIT], {
+    desc: `enable ${AGENT_UPDATE_PATH_UNIT} (agent self-update swap)`,
     allowFail: true,
   });
 
