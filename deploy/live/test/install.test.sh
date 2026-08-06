@@ -36,6 +36,7 @@ EOF
 cat > "$BIN/sgdisk" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$STUB/sgdisk.log"
+printf 'sgdisk\n' >> "$STUB/order.log"
 [ -f "$STUB/sgdisk_fails" ] && exit 1
 case "$*" in
   *" -n "*|*"-n "*)
@@ -53,6 +54,14 @@ printf '#!/bin/sh\nexit 0\n' > "$BIN/udevadm"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/sync"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/sleep"
 printf '#!/bin/sh\nexit 1\n' > "$BIN/mountpoint"     # never "already mounted"
+# POL-194 — the three commands that take the swap partition back. Each logs its call so the tests can
+# pin BOTH that it ran and that it ran before the wipe; none of them has to exist on a real box (the
+# installer calls them best-effort), which is exactly why the log is the only proof available.
+# Each also stamps a shared order.log, because WHEN the release runs is the entire fix: doing it
+# after the wipe would still abort a disk that had already been erased.
+for t in swapoff cryptsetup systemctl; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$STUB/%s.log"\nprintf "%s\\n" >> "$STUB/order.log"\nexit 0\n' "$t" "$t" > "$BIN/$t"
+done
 
 # mkfs stubs: log the call and create the volume fixture the mount stub binds for that node.
 mkfs_stub() {
@@ -447,6 +456,46 @@ out="$(install "$d")"
 eq  "loader write blocked: still fails"    "1" "$(exit_of "$out")"
 has "loader write blocked: reported code"  '"code":"install-write-failed"' "$(posted "$d")"
 has "loader write blocked: failed status"  "failed|-|" "$(last_status "$d")"
+
+# ─── 5b) POL-194: the swap partition is taken back before the wipe, or the wipe does not happen ─────
+# The live rootfs IS the installed rootfs, so this box carries the installed system's crypttab entry
+# for POLYPTIC-SWAP. On a re-install systemd has already opened and swapped-on that partition; on a
+# first install the unit is armed and fires the moment `sgdisk -c 4:POLYPTIC-SWAP` creates the
+# partlabel. Either way mkswap met a busy device AFTER the disk was already wiped.
+
+# The release runs before anything destructive, and in the right order — swapoff before close, since
+# an active swap holds the mapper which holds the partition.
+d="$(new_case release-swap)"; out="$(install "$d")"
+eq  "release: still a clean install"       "0" "$(exit_of "$out")"
+has "release: swaps off the mapper"        "$d/dev/mapper/polyptic-swap" "$(cat "$d/swapoff.log" 2>/dev/null)"
+has "release: closes the mapping"          "close polyptic-swap" "$(cat "$d/cryptsetup.log" 2>/dev/null)"
+has "release: masks the unit at runtime"   "mask --runtime" "$(cat "$d/systemctl.log" 2>/dev/null)"
+has "release: masks the escaped unit name" 'systemd-cryptsetup@polyptic\x2dswap.service' "$(cat "$d/systemctl.log" 2>/dev/null)"
+# --runtime and nothing else: a persistent mask would follow the image onto the installed disk and
+# rob every future boot of its ephemeral encrypted swap, which is the whole privacy point.
+hasnt "release: never masks persistently"  "mask systemd" "$(cat "$d/systemctl.log" 2>/dev/null)"
+# Ordering is the fix, not decoration: releasing AFTER the wipe would still abort a wiped disk.
+eq  "release: swapoff is the FIRST of the two"  "swapoff" "$(grep -n -m1 -E '^(swapoff|sgdisk)$' "$d/order.log" | cut -d: -f2)"
+eq  "release: every release step precedes sgdisk" "yes" \
+    "$([ "$(grep -n -m1 '^sgdisk$' "$d/order.log" | cut -d: -f1)" -gt "$(grep -n '^cryptsetup$' "$d/order.log" | tail -n1 | cut -d: -f1)" ] && echo yes || echo no)"
+
+# A holder that survives the release stops the install while "nothing was erased" is still true.
+d="$(new_case held-partition)"
+mkdir -p "$d/sysblock/sdb4/holders/dm-0" "$d/sysblock/sdb4/holders/dm-0/dm"
+printf 'polyptic-swap\n' > "$d/sysblock/sdb4/holders/dm-0/dm/name"
+out="$(install "$d")"
+eq  "held: refuses"                        "1" "$(exit_of "$out")"
+eq  "held: NOTHING was erased"             "no" "$(wiped "$d")"
+has "held: reported code"                  '"code":"install-bad-target"' "$(posted "$d")"
+has "held: names the partition"            "sdb4" "$(posted "$d")"
+# `dm-0` is what sysfs calls it and `polyptic-swap` is what the operator can act on.
+has "held: names the holder, not dm-N"     "polyptic-swap" "$(posted "$d")"
+
+# A neighbouring disk's partitions are not this disk's: `sdb` must not sweep up `sdbb`.
+d="$(new_case held-other-disk)"
+mkdir -p "$d/sysblock/sdbb1/holders/dm-0"
+out="$(install "$d")"
+eq  "other disk held: install proceeds"    "0" "$(exit_of "$out")"
 
 # ─── 6) The token never leaks into a report body ────────────────────────────────────────────────────
 d="$(new_case token-hygiene)"; out="$(install "$d")"
