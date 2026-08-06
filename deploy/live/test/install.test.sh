@@ -48,7 +48,7 @@ case "$*" in
 esac
 exit 0
 EOF
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$STUB/wipefs.log"\nexit 0\n' > "$BIN/wipefs"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$STUB/wipefs.log"\nprintf "wipefs\\n" >> "$STUB/order.log"\nexit 0\n' > "$BIN/wipefs"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/partprobe"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/udevadm"
 printf '#!/bin/sh\nexit 0\n' > "$BIN/sync"
@@ -59,15 +59,30 @@ printf '#!/bin/sh\nexit 1\n' > "$BIN/mountpoint"     # never "already mounted"
 # installer calls them best-effort), which is exactly why the log is the only proof available.
 # Each also stamps a shared order.log, because WHEN the release runs is the entire fix: doing it
 # after the wipe would still abort a disk that had already been erased.
-for t in swapoff cryptsetup systemctl; do
+for t in cryptsetup systemctl; do
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$STUB/%s.log"\nprintf "%s\\n" >> "$STUB/order.log"\nexit 0\n' "$t" "$t" > "$BIN/$t"
 done
+# swapoff also DEACTIVATES: it drops the device from the swaps fixture, as the real one drops it from
+# /proc/swaps. Without that the installer would re-read a device it had just released and refuse.
+cat > "$BIN/swapoff" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$STUB/swapoff.log"
+printf 'swapoff\n' >> "$STUB/order.log"
+[ -f "$STUB/swapoff_fails" ] && exit 1
+for a in "$@"; do dev="$a"; done
+if [ -f "$STUB/swaps" ]; then
+  grep -v "^$dev " "$STUB/swaps" > "$STUB/swaps.tmp" 2>/dev/null || true
+  mv "$STUB/swaps.tmp" "$STUB/swaps"
+fi
+exit 0
+EOF
 
 # mkfs stubs: log the call and create the volume fixture the mount stub binds for that node.
 mkfs_stub() {
   cat > "$BIN/$1" <<'EOF'
 #!/bin/sh
 printf 'CMD %s\n' "$*" >> "$STUB/mkfs.log"
+printf 'mkfs\n' >> "$STUB/order.log"
 for a in "$@"; do dev="$a"; done
 mkdir -p "$STUB/vol-$(basename "$dev")"
 exit 0
@@ -231,6 +246,7 @@ new_case() {
   printf 'device=/dev/sdb\n' > "$d/run/requests/install"
   printf 'sda1 sda\n' > "$d/blockdevs"
   printf '' > "$d/mounts"
+  printf 'Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n' > "$d/swaps"
   printf 'Boot0000* ubuntu\nBoot0001* Polyptic Netboot\nBootOrder: 0001,0000\n' > "$d/nvram"
   printf '{"imageId":"new-1","urgent":false}\n' > "$d/manifest"
   printf 'FAKE-KERNEL\n' > "$d/new-vmlinuz"
@@ -256,6 +272,7 @@ install() {
   STUB="$d" PATH="$BIN:$PATH" \
   POLYPTIC_CMDLINE_FILE="$d/cmdline" POLYPTIC_EFI_DIR="$d/efi" POLYPTIC_SYS_BLOCK="$d/sysblock" \
   POLYPTIC_RUN_DIR="$d/run" POLYPTIC_DEV_DIR="$d/dev" POLYPTIC_MOUNTS_FILE="$d/mounts" \
+  POLYPTIC_SWAPS_FILE="$d/swaps" \
   POLYPTIC_INSTALL_REQUEST="$d/run/requests/install" POLYPTIC_INSTALL_STATUS="$d/run/install-status" \
   POLYPTIC_LIB_DIR="$LIB" POLYPTIC_CONSOLE="$d/console" POLYPTIC_BYLABEL_DIR="$d/by-label" \
   POLYPTIC_NET_WAIT_SECONDS=0 POLYPTIC_NET_STEP_SECONDS=0 POLYPTIC_NODE_WAIT_TRIES=1 \
@@ -496,6 +513,44 @@ d="$(new_case held-other-disk)"
 mkdir -p "$d/sysblock/sdbb1/holders/dm-0"
 out="$(install "$d")"
 eq  "other disk held: install proceeds"    "0" "$(exit_of "$out")"
+
+# ─── 5c) POL-196: a RAW active swap on the target, and stale signatures inside re-made partitions ───
+# A raw swap partition (no device-mapper in the way) is invisible to BOTH existing guards: swap is
+# not a mount, so /proc/mounts never names it, and with nothing layered on top it has no holders.
+# Formatting over a live swap corrupts a running system.
+d="$(new_case raw-swap)"
+printf '/dev/sdb4                               partition\t4194300\t0\t-2\n' >> "$d/swaps"
+out="$(install "$d")"
+has "raw swap: swapped off by device"      "/dev/sdb4" "$(cat "$d/swapoff.log" 2>/dev/null)"
+eq  "raw swap: install proceeds once off"  "0" "$(exit_of "$out")"
+
+# …and when it will not go, the install refuses while nothing has been erased, naming the remedy.
+d="$(new_case raw-swap-stuck)"
+printf '/dev/sdb4                               partition\n' >> "$d/swaps"
+: > "$d/swapoff_fails"
+out="$(install "$d")"
+eq  "stuck swap: refuses"                  "1" "$(exit_of "$out")"
+eq  "stuck swap: NOTHING was erased"       "no" "$(wiped "$d")"
+has "stuck swap: reported code"            '"code":"install-bad-target"' "$(posted "$d")"
+has "stuck swap: names the device"         "/dev/sdb4" "$(posted "$d")"
+has "stuck swap: names the remedy"         "swapoff /dev/sdb4" "$(posted "$d")"
+
+# Swap on a DIFFERENT disk is none of our business.
+d="$(new_case swap-elsewhere)"
+printf '/dev/sdc2                               partition\n' >> "$d/swaps"
+out="$(install "$d")"
+eq  "swap elsewhere: install proceeds"     "0" "$(exit_of "$out")"
+hasnt "swap elsewhere: left alone"         "/dev/sdc2" "$(cat "$d/swapoff.log" 2>/dev/null)"
+
+# Stale signatures: --zap-all and the disk-level wipefs destroy the TABLE, not the filesystems inside
+# the partitions it described. The layout is deterministic, so a re-install re-creates each partition
+# at the same LBA, on top of the last install's superblocks.
+d="$(new_case stale-signatures)"; out="$(install "$d")"
+eq  "stale sigs: every partition wiped"    "5" "$(grep -c 'dev/sdb[1-5]$' "$d/wipefs.log" 2>/dev/null | tr -d ' ')"
+has "stale sigs: the disk itself too"      "dev/sdb" "$(cat "$d/wipefs.log")"
+# Wiping AFTER mkfs would erase the filesystem we just made — the order is the whole point.
+eq  "stale sigs: every wipe precedes every mkfs" "yes" \
+    "$([ "$(grep -n '^mkfs$' "$d/order.log" | head -n1 | cut -d: -f1)" -gt "$(grep -n '^wipefs$' "$d/order.log" | tail -n1 | cut -d: -f1)" ] && echo yes || echo no)"
 
 # ─── 6) The token never leaks into a report body ────────────────────────────────────────────────────
 d="$(new_case token-hygiene)"; out="$(install "$d")"
