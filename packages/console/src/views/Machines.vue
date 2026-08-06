@@ -40,6 +40,14 @@
   "Unnamed box · <id tail>". Pending cards also get an Ident button — the box flashes its holding
   board so the operator knows which physical panel they're approving.
 
+  POL-192 answers "what is my fleet actually running, and is it updating itself?" on this screen. A
+  strip above the list carries the whole fleet's agent versions against the one the server offers; each
+  approved card carries its own version, a "No self-update" chip when the box says it cannot replace
+  its own binary, and — when it is BOTH behind and not going to fix itself — a warn strip with the
+  box's own reason. The healthy case is deliberately quiet: a uniform, current fleet is one neutral
+  line. This exists because every box on the production wall sat on agent 0.3.6 through five releases,
+  said so on every reconnect, and the only place that showed was a pod log.
+
   Every mutation goes through the Pinia store (approveMachine / rejectMachine / identMachine /
   setMachineTags / bulkAction / renameMachine, and via ScreenRow: identScreen / renameScreen /
   inspectScreen). No direct fetch.
@@ -57,6 +65,13 @@ import MachineStats from "../components/MachineStats.vue";
 import MachineTerminal from "../components/MachineTerminal.vue";
 import { machineCardName, machineDisplayName, machineIdTail } from "../machine-name";
 import {
+  agentChipTitle,
+  agentStandingFor,
+  fleetAgentHeadline,
+  stuckLine,
+  summarizeFleetAgents,
+} from "../agent-version";
+import {
   activeInstall,
   formatDiskSize,
   formatImageId,
@@ -68,6 +83,35 @@ import {
 const store = useConsoleStore();
 
 const hasAnyMachine = computed(() => store.machines.length > 0);
+
+// ── What the fleet is running (POL-192) ──────────────────────────────────────
+// Every approved box's agent version, together, read against the version this server offers. The
+// summary is over the WHOLE fleet, never the filtered list: "is anything behind?" is a question
+// about the fleet, and a filter that hid the stuck box would answer it wrongly.
+const offeredAgent = computed(() => store.agentRelease?.version ?? null);
+const fleetAgents = computed(() => summarizeFleetAgents(store.approvedMachines, offeredAgent.value));
+const fleetAgentLine = computed(() => fleetAgentHeadline(fleetAgents.value));
+
+/** The card chip: the version, and the offered one when this box is behind it. */
+function agentChipText(m: MachineView): string {
+  const standing = agentStandingFor(m, offeredAgent.value);
+  if (standing.state === "unknown") return "Agent not reported";
+  if (standing.state === "behind") return `Agent ${standing.version} → ${standing.offered}`;
+  return `Agent ${standing.version}`;
+}
+
+/** Amber for a box behind the offered release, muted for one that reported nothing, quiet otherwise. */
+function agentChipClass(m: MachineView): string {
+  const standing = agentStandingFor(m, offeredAgent.value);
+  if (standing.state === "behind") return "behind";
+  if (standing.state === "unknown") return "unreported";
+  return "";
+}
+
+/** The stale-box strip, or null when this box is not stale (which is most of them, most of the time). */
+function stuck(m: MachineView): string | null {
+  return stuckLine(m, offeredAgent.value);
+}
 
 // ── Tags, the filter, and bulk targeting (POL-103) ───────────────────────────
 // The filter box takes EITHER a selector (`tag=atrium`, or an AND: `tag=floor:2,tag=canary`) or plain
@@ -588,6 +632,38 @@ function showToast(message: string): void {
         </div>
         <div v-if="selectorError" class="selector-error">{{ selectorError }}</div>
 
+        <!-- POL-192 — what the fleet is RUNNING, in one line. A uniform, current, self-updating fleet
+             gets a quiet neutral strip; anything else (a box behind the offered release, a box that
+             says it cannot update itself, a box that has reported no version) turns it amber and
+             spells out the spread. The whole production wall sat five releases behind for months
+             with nothing on this screen to say so. -->
+        <div class="agent-fleet" :class="{ warn: !fleetAgents.quiet }">
+          <span class="agent-fleet-head">{{ fleetAgentLine }}</span>
+          <span v-if="fleetAgents.behind > 0 && fleetAgents.blocked > 0" class="agent-fleet-sub">
+            {{ fleetAgents.blocked }} cannot update the agent.
+          </span>
+          <!-- The spread earns its place only when there IS one: on a uniform fleet the headline has
+               already said the version, and `0.6.0 × 4` under "All 4 machines on agent 0.6.0" is the
+               same fact twice. -->
+          <span v-if="!fleetAgents.quiet" class="agent-fleet-spread">
+            <span
+              v-for="v in fleetAgents.versions"
+              :key="v.version"
+              class="agent-count"
+              :class="{ behind: v.behind }"
+            >
+              {{ v.version }} × {{ v.count }}
+            </span>
+            <span v-if="fleetAgents.unknown > 0" class="agent-count unreported">
+              not reported × {{ fleetAgents.unknown }}
+            </span>
+          </span>
+          <span class="agent-fleet-offered">
+            <template v-if="fleetAgents.offered">This server offers {{ fleetAgents.offered }}</template>
+            <template v-else>This server offers no agent binary</template>
+          </span>
+        </div>
+
         <!-- enrolment guidance -->
         <div class="card enrol">
           <div class="enrol-text">
@@ -797,6 +873,22 @@ function showToast(message: string): void {
                   class="chip-localboot"
                   title="This box boots Polyptic from its internal disk"
                 >Installed</span>
+                <!-- POL-192 — this box's agent version, on the row an operator already scans. Quiet
+                     while it matches what the server offers; amber, and reading `0.3.6 → 0.6.0`,
+                     the moment it does not. The hover carries how the agent was launched and which
+                     binary it would replace. -->
+                <span class="chip-agent" :class="agentChipClass(m)" :title="agentChipTitle(m, offeredAgent)">
+                  {{ agentChipText(m) }}
+                </span>
+                <!-- The box's own verdict on itself: it will never take an update, and here is why
+                     (hover). Shown when the box is CURRENT but unable — a box that is also behind
+                     gets the strip below instead, which says the same thing at more length, and one
+                     fact does not need saying twice on one card. -->
+                <span
+                  v-if="m.agentRuntime && !m.agentRuntime.updatable && !stuck(m)"
+                  class="chip-noupdate"
+                  :title="m.agentRuntime.reason ?? 'The agent gave no reason.'"
+                >No self-update</span>
                 <!-- POL-141 — the id tail, left of the Online pill: uniqueness stays checkable
                      without the full dmi-… UUID (which is on hover). -->
                 <span class="id-tail" :title="m.id">{{ machineIdTail(m.id) }}</span>
@@ -938,6 +1030,12 @@ function showToast(message: string): void {
                    persistent, not a feed line that scrolls away: the local menu PINS the image, so
                    rebuilds stop reaching this box until its wired chain is fixed. The strip clears
                    itself on the box's next wired-chain boot — no manual dismissal. -->
+              <!-- POL-192 — a box that is behind AND is not going to fix itself. One sentence with
+                   both versions and the box's own reason, in the same place the local-fallback strip
+                   lives, because it is the same class of fact: this box is quietly running stale
+                   software and nothing in flight will change that. -->
+              <div v-if="stuck(m)" class="agent-strip">{{ stuck(m) }}</div>
+
               <div v-if="m.bootPath === 'local-fallback'" class="fallback-strip">
                 <strong>Booted via local fallback</strong> — the wired boot chain failed.
                 {{ m.bootPathDetail || "The image this box renders is pinned by the local menu." }}
@@ -1357,7 +1455,9 @@ function showToast(message: string): void {
 }
 .machine-id {
   flex: 1;
-  min-width: 0;
+  /* POL-192 — a floor, not zero: the row grew a version chip, and a name squeezed out of existence
+     is worse than a wrapped row. The name is the identity; it never yields the last of the space. */
+  min-width: 120px;
 }
 .machine-id-line {
   display: flex;
@@ -1435,6 +1535,114 @@ function showToast(message: string): void {
    pending card's warn accents. Deliberately a strip, not a chip: this state means the box is
    quietly running a stale image, and it must read at a glance across the room. */
 .fallback-strip {
+  margin-top: 10px;
+  padding: 9px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+/* POL-192 — the fleet's agent versions. NEUTRAL by default: a fleet that is uniform, current and
+   self-updating states its version once and gets out of the way. The `warn` variant is the whole
+   feature — a band the eye lands on when something is behind, blocked, or silent. */
+.agent-fleet {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+  padding: 9px 14px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--muted-bg);
+  color: var(--fg2);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.agent-fleet.warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.agent-fleet-head {
+  font-weight: 600;
+}
+.agent-fleet-sub {
+  font-weight: 500;
+}
+.agent-fleet-spread {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.agent-count {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.agent-count.behind {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.agent-count.unreported {
+  font-family: inherit;
+}
+.agent-fleet-offered {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.agent-fleet.warn .agent-fleet-offered {
+  color: inherit;
+}
+/* POL-192 — the per-card agent chip. Muted (the same weight as the id tail) while the box matches
+   what the server offers, so a healthy row reads as one more fact; amber when the box is behind. */
+.chip-agent {
+  font-size: 11px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--muted-bg);
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: default;
+  flex: 0 0 auto;
+}
+.chip-agent.behind {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-weight: 600;
+}
+.chip-agent.unreported {
+  font-family: inherit;
+  font-style: italic;
+}
+/* The box's own verdict that it will never take an update: the reason a version stays stale, so it
+   wears the same amber as the version it explains. */
+.chip-noupdate {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  white-space: nowrap;
+  cursor: default;
+  flex: 0 0 auto;
+}
+/* POL-192 — the stale-agent strip, in the same warn band as the local-fallback one: this box is
+   running old software and nothing in flight will change that. */
+.agent-strip {
   margin-top: 10px;
   padding: 9px 13px;
   border-radius: 9px;
