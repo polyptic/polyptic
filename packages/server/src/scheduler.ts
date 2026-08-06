@@ -35,7 +35,10 @@
  *     `applyMuralPower` every ~10s per mural is one cheap in-memory sweep; the seam already does a
  *     sweep of this shape across the whole fleet every 30s. In hours, the only command this can ever
  *     produce is WAKE — nothing here infers power from idleness, load, or connectivity; that
- *     inference does not exist.
+ *     inference does not exist. A DISABLED tick still calls the seam, once per mural, with `null`:
+ *     switching the scheduler off governs nothing, and the seam is where a screen the schedule had
+ *     slept is woken on its way out of being governed. Returning before the seam — which is what
+ *     this used to do — made "turn the schedule off" the one action that could strand a wall dark.
  *   - on BOOT it asserts every mural's schedule once: the first tick applies what the schedule says
  *     for each mural (content) and sends each mural's power verdict (power), unless the right scene
  *     is already live. A control plane that restarts at 09:05 puts the morning wall back up by
@@ -69,13 +72,21 @@ export interface SceneSchedulerDeps {
   activity?: ActivityLog;
   /**
    * POL-186 — the panel-power seam (Task 7's `panel-power.ts` in production; a fake in tests). Called
-   * once per mural per tick with that mural's resolved panel state (`null` = ungoverned, leave the
-   * wall alone — pass it straight through, never coerce it) and the daypart name driving the verdict,
-   * for the seam's own log line. Optional so a deployment that hasn't wired power control yet keeps
-   * working exactly as before.
+   * once per mural per tick with that mural's resolved panel state (`null` = ungoverned — pass it
+   * straight through, never coerce it) and the daypart name driving the verdict, for the seam's own
+   * log line. Called for every mural on a DISABLED tick too, with `null`: the master switch is
+   * "no window governs anything" by another route, and the seam is where a screen the schedule slept
+   * gets woken on the way out. `ungovernedReason` names that route in the operator's activity line
+   * ("Atrium woke — the scheduler is switched off"); it is only ever read on a `null` verdict.
+   * Optional so a deployment that hasn't wired power control yet keeps working exactly as before.
    */
   panelPower?: {
-    applyMuralPower(muralId: string, panels: PanelState | null, daypartName: string): void;
+    applyMuralPower(
+      muralId: string,
+      panels: PanelState | null,
+      daypartName: string,
+      ungovernedReason?: string,
+    ): void;
   };
   /**
    * POL-187 — the fleet log sink. The ticker's verdicts are the control plane's account of what a
@@ -179,6 +190,15 @@ export class SceneScheduler {
       // re-asserts the schedule on every wall instead of trusting stale memory. Power has no
       // scheduler-side memory to forget — see below.
       this.lastVerdicts.clear();
+      // POWER STILL GOES THROUGH THE SEAM. Switching the scheduler off is "no window governs any
+      // mural" by another route, and it is exactly what an operator does when panels misbehave — so
+      // returning here, as this used to, meant the one action taken to stop the schedule darkening
+      // walls was the action that left them dark with nothing able to wake them. `null` for every
+      // mural is the truth of a disabled scheduler, and the seam already knows what a screen entering
+      // ungoverned deserves: a wake if the SCHEDULE slept it, silence if a human did.
+      for (const muralId of set.murals) {
+        this.deps.panelPower?.applyMuralPower(muralId, null, "the scheduler is switched off", "the scheduler is switched off");
+      }
       return { resolutions, applied, reasons };
     }
 
