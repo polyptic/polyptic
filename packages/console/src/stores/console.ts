@@ -170,6 +170,10 @@ export interface ConsoleState {
   stateReceived: boolean;
   revision: number;
   machines: MachineView[];
+  /** POL-192 — the agent version this server OFFERS the fleet, mirrored from admin/state. Null on a
+   *  dev server and against an older server, in which case the console shows each box's agent version
+   *  without comparing it to anything — it has nothing to compare it against. */
+  agentRelease: { version: string } | null;
   murals: Mural[];
   placements: Placement[];
   videoWalls: VideoWall[];
@@ -240,6 +244,7 @@ export const useConsoleStore = defineStore("console", {
     stateReceived: false,
     revision: 0,
     machines: [],
+    agentRelease: null,
     murals: [],
     placements: [],
     videoWalls: [],
@@ -968,6 +973,10 @@ export const useConsoleStore = defineStore("console", {
         this.stateReceived = true;
         this.revision = msg.revision;
         this.machines = msg.machines;
+        // POL-192 — the agent binary this server serves, the yardstick every machine card reads its
+        // own version against. Optional on the wire; absent means "this server offers nothing", so
+        // the console claims no verdict rather than inventing one.
+        this.agentRelease = msg.agentRelease ?? null;
         this.murals = msg.murals;
         this.placements = msg.placements;
         this.videoWalls = msg.videoWalls;
