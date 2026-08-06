@@ -366,6 +366,33 @@ describe("the ticker drives panel power per mural", () => {
     expect(calls).toContainEqual(["mural-2", "on"]);
   });
 
+  /**
+   * A DISABLED TICK STILL DRIVES THE SEAM. The master switch is "no window governs anything" by
+   * another route, and the ticker used to return before power was ever handed over — so switching
+   * the scheduler off, the very thing an operator does when panels misbehave, left every screen the
+   * schedule had slept with nothing able to wake it. Content is still untouched (`applied` empty,
+   * `reasons` empty); only power crosses the seam.
+   */
+  test("a DISABLED tick hands 'null' for every mural, so the seam can wake what it slept", async () => {
+    const calls: Array<[string, string | null, string, string | undefined]> = [];
+    const { scheduler: fixtureScheduler, cp: fixtureCp } = await makeSchedulerFixture({
+      panelPower: { applyMuralPower: (m, p, d, u) => { calls.push([m, p, d, u]); } },
+    });
+    await fixtureScheduler.tick(AT("21:00"));
+    expect(calls).toEqual([["mural-1", "off", "Night", undefined]]);
+
+    await fixtureCp.updateSchedulerSettings({ enabled: false });
+    const off = await fixtureScheduler.tick(AT("21:10"));
+    expect(off.applied).toEqual([]);
+    expect(off.reasons).toEqual({});
+    expect(calls[1]).toEqual([
+      "mural-1",
+      null,
+      "the scheduler is switched off",
+      "the scheduler is switched off",
+    ]);
+  });
+
   test("a mural with no enabled window hands 'null' — leave it exactly as it is", async () => {
     const calls: Array<[string, string | null]> = [];
     const { scheduler: fixtureScheduler } = await makeSchedulerFixture({
