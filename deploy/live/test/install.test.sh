@@ -551,6 +551,47 @@ has "stale sigs: the disk itself too"      "dev/sdb" "$(cat "$d/wipefs.log")"
 # Wiping AFTER mkfs would erase the filesystem we just made — the order is the whole point.
 eq  "stale sigs: every wipe precedes every mkfs" "yes" \
     "$([ "$(grep -n '^mkfs$' "$d/order.log" | head -n1 | cut -d: -f1)" -gt "$(grep -n '^wipefs$' "$d/order.log" | tail -n1 | cut -d: -f1)" ] && echo yes || echo no)"
+# ─── 5c) POL-195: a failing tool's OWN words reach the verdict ──────────────────────────────────────
+# "could not format the swap partition on /dev/nvme0n1" is a sentence about what we were trying to
+# do. `mkswap`'s "Device or resource busy" is what happened — and it used to go to /dev/null, which
+# is how a real install failure reached the operator carrying no reason at all.
+d="$(new_case stderr-carried)"; : > "$d/console"   # say() only writes to a console that exists
+cat > "$BIN/mkswap" <<'EOF'
+#!/bin/sh
+echo "mkswap: /dev/sdb4: Device or resource busy" >&2
+exit 1
+EOF
+chmod +x "$BIN/mkswap"
+out="$(install "$d")"
+eq  "stderr: still fails"                  "1" "$(exit_of "$out")"
+has "stderr: keeps our sentence"           "could not format the swap partition on /dev/sdb" "$(last_status "$d")"
+has "stderr: carries the tool's reason"    "Device or resource busy" "$(last_status "$d")"
+has "stderr: reason reaches the report"    "Device or resource busy" "$(posted "$d")"
+has "stderr: reason reaches the console"   "Device or resource busy" "$(cat "$d/console" 2>/dev/null)"
+mkfs_stub mkswap   # restore for any later case
+
+# A tool that fails SILENTLY leaves the sentence alone rather than trailing an empty separator.
+d="$(new_case stderr-silent)"
+printf '#!/bin/sh\nexit 1\n' > "$BIN/mkswap"; chmod +x "$BIN/mkswap"
+out="$(install "$d")"
+eq  "silent tool: still fails"             "1" "$(exit_of "$out")"
+has "silent tool: plain sentence"          "could not format the swap partition on /dev/sdb" "$(last_status "$d")"
+hasnt "silent tool: no dangling separator" "on /dev/sdb: " "$(last_status "$d")"
+mkfs_stub mkswap
+
+# Multi-line, noisy output is flattened to one line — the verdict travels through a status line, a
+# JSON body and the forensics log, none of which want a page of tool output.
+d="$(new_case stderr-noisy)"
+cat > "$BIN/mkswap" <<'EOF'
+#!/bin/sh
+printf 'line one\nline two\n\n   line three   \n' >&2
+exit 1
+EOF
+chmod +x "$BIN/mkswap"
+out="$(install "$d")"
+has "noisy tool: flattened to one line"    "line one line two line three" "$(last_status "$d")"
+eq  "noisy tool: verdict stays one line"   "1" "$(last_status "$d" | wc -l | tr -d ' ')"
+mkfs_stub mkswap
 
 # ─── 6) The token never leaks into a report body ────────────────────────────────────────────────────
 d="$(new_case token-hygiene)"; out="$(install "$d")"
