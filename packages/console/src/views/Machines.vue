@@ -404,6 +404,15 @@ async function powerAll(m: MachineView, on: boolean): Promise<void> {
   showToast(error ?? `${on ? "Waking" : "Sleeping"} ${m.label}'s panels…`);
 }
 
+/**
+ * A CONNECTED box reporting zero display outputs — the compositor told the agent about no outputs at
+ * all, so this box drives nothing. Gated on `online` for the same reason `connectorMissing` is: an
+ * output list from a box that has since gone dark describes a moment that has passed.
+ */
+function noOutputs(m: MachineView): boolean {
+  return m.online && m.status === "approved" && m.outputCount === 0;
+}
+
 /** Do ALL of this box's panels currently read asleep? Drives the single Sleep/Wake menu item. */
 function allAsleep(m: MachineView): boolean {
   return m.screens.length > 0 && m.screens.every((s) => s.asleep === true);
@@ -944,6 +953,19 @@ function showToast(message: string): void {
                 Rebuilds are not reaching this box.
               </div>
 
+              <!-- A connected box reporting NO display outputs at all. One of the two production
+                   boxes that went dark did this for 93 consecutive hellos while the console showed
+                   its screen as merely asleep. The box is talking; it just has no display behind it,
+                   and nothing addressed to any of its screens can land. -->
+              <div v-if="noOutputs(m)" class="no-output-strip">
+                <strong>No display outputs</strong> — {{ machineDisplayName(m) }} is connected and
+                reporting none.
+                <template v-if="m.screens.length">
+                  Its {{ m.screens.length === 1 ? "screen has" : "screens have" }} no output on this
+                  box.
+                </template>
+              </div>
+
               <!-- POL-176 — an install running RIGHT NOW: the latest phase line the agent forwarded
                    from the root installer, plus a bar when the phase carries a percentage. `failed`
                    and `done` get their own strips; the server drops the state after ~a minute. -->
@@ -1434,6 +1456,19 @@ function showToast(message: string): void {
 /* POL-171 — the local-fallback warning strip: a full-width band in the warn palette, matching the
    pending card's warn accents. Deliberately a strip, not a chip: this state means the box is
    quietly running a stale image, and it must read at a glance across the room. */
+/* A connected box with no outputs is a box with no display: the bad palette, not the amber of
+   something an operator may want to retire. */
+.no-output-strip {
+  margin-top: 10px;
+  padding: 9px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--bad);
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
 .fallback-strip {
   margin-top: 10px;
   padding: 9px 13px;

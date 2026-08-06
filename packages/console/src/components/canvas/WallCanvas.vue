@@ -104,7 +104,11 @@ const hasPlaced = computed(() =>
   store.activeMuralId ? store.placedScreens(store.activeMuralId).length > 0 : false,
 );
 
-function statusOf(screen: ScreenView): "live" | "empty" | "offline" {
+function statusOf(screen: ScreenView): "live" | "empty" | "offline" | "no-connector" {
+  // The box is not reporting this screen's connector: there is no output behind this tile, so
+  // nothing can reach it. It wins over "offline" — the player being gone is a CONSEQUENCE, and
+  // "Machine unreachable" would send an operator to check a box that is connected and talking.
+  if (screen.connectorMissing) return "no-connector";
   if (!screen.online) return "offline";
   return screen.surfaceCount > 0 ? "live" : "empty";
 }

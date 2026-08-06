@@ -59,16 +59,28 @@ export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: Power
   onScopeDispose(clearTimer);
 
   const asleep = computed(() => target.value?.screen.asleep === true);
+  /**
+   * The box is not reporting this screen's connector — the output does not exist on that box, so a
+   * wake can only ever be refused ("connector \"DP-1\" is not a known sway output"). Two production
+   * screens read as merely asleep for days on exactly this. The affordance is withdrawn and the
+   * title states the condition; the operator's next move is at the panel, not in the console.
+   */
+  const connectorMissing = computed(() => target.value?.screen.connectorMissing === true);
   const machineOnline = computed(() => target.value?.machineOnline === true);
   /** A box that reports no DPMS (dev-open, or a pre-POL-101 agent) has no panel to power. */
   const supported = computed(() => target.value?.power?.dpms === true);
   const hasCec = computed(() => target.value?.power?.cec === true);
-  const disabled = computed(() => !machineOnline.value || !supported.value || pending.value);
+  const disabled = computed(
+    () => !machineOnline.value || !supported.value || connectorMissing.value || pending.value,
+  );
 
   const title = computed(() => {
     const t = target.value;
     if (!t) return "";
     if (!t.machineOnline) return `${t.machineLabel} is offline`;
+    if (connectorMissing.value) {
+      return `${t.machineLabel} is not reporting connector ${t.screen.connector}`;
+    }
     if (!supported.value) {
       return `${t.machineLabel} can't turn its panels on or off from here`;
     }
@@ -106,7 +118,7 @@ export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: Power
 
   async function toggle(): Promise<void> {
     const t = target.value;
-    if (!t || pending.value || !t.machineOnline || !supported.value) return;
+    if (!t || pending.value || !t.machineOnline || !supported.value || connectorMissing.value) return;
     const on = asleep.value; // asleep → wake; awake → sleep
 
     pending.value = true;
@@ -125,5 +137,15 @@ export function useScreenPower(target: Ref<PowerTarget | undefined>, deps: Power
     }
   }
 
-  return { asleep, pending, supported, hasCec, machineOnline, disabled, title, toggle };
+  return {
+    asleep,
+    connectorMissing,
+    pending,
+    supported,
+    hasCec,
+    machineOnline,
+    disabled,
+    title,
+    toggle,
+  };
 }

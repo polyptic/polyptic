@@ -171,3 +171,30 @@ describe("POL-101 powerMethodLabel", () => {
     expect(powerMethodLabel(undefined)).toContain("may stay lit");
   });
 });
+
+/**
+ * A screen whose CONNECTOR the box is not reporting. The two production screens that went dark read
+ * as ordinary sleeping panels, and every wake an operator pressed was refused by the box. The
+ * affordance is withdrawn and the tooltip states the condition, so the console stops offering a
+ * button that cannot work and starts saying what is actually true.
+ */
+describe("a connector the box is not reporting", () => {
+  test("the toggle is disabled and sends nothing", async () => {
+    const h = harness({ screen: screen({ connectorMissing: true }) });
+    expect(h.api.connectorMissing.value).toBe(true);
+    expect(h.api.disabled.value).toBe(true);
+    await h.api.toggle();
+    expect(h.calls).toEqual([]); // nothing on the wire, so nothing to be refused
+  });
+
+  test("the tooltip names the box and the connector, not a guess about the screen", () => {
+    const h = harness({ screen: screen({ connectorMissing: true }) });
+    expect(h.api.title.value).toBe("wall-1 is not reporting connector DP-1");
+  });
+
+  test("an ordinary screen keeps its Wake/Sleep affordance", () => {
+    const h = harness();
+    expect(h.api.connectorMissing.value).toBe(false);
+    expect(h.api.disabled.value).toBe(false);
+  });
+});
