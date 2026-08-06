@@ -53,3 +53,7 @@ jobs:
         run: bun run test
         env:
           STORE: memory
+          # POL-160 — compile a real agent binary and assert it reports itself updatable. Skipped
+          # locally (a compile costs ~10-30s); CI runs it, because the version-baking bug it catches
+          # is invisible to every test that does not actually compile.
+          POLYPTIC_COMPILE_TEST: "1"
