@@ -7,7 +7,12 @@
  *     UNCONDITIONALLY, every mural, every ~10s, so this seam is the ONLY edge-trigger left: if it
  *     re-asserted, the wall an operator just woke would go back to sleep ten seconds later, which is
  *     the bug that makes people disable the feature;
- *   - an UNGOVERNED mural (`panels === null`) is left exactly as it is — not woken, not slept;
+ *   - an UNGOVERNED mural (`panels === null`) is never slept, and wakes only what the SCHEDULE had
+ *     slept. Deleting the last window, or switching the master switch off, must not leave a wall
+ *     dark with nothing in the system able to wake it — that is the move an operator makes when the
+ *     power feature misbehaves. A screen a HUMAN slept has no record here at all and stays asleep;
+ *   - a command the box did not take is not remembered as though it had. A hello that reports zero
+ *     outputs (the compositor is still coming up) is not reconciled at all;
  *   - a screen DRAGGED OFF the wall that slept it wakes. Power hangs on the wall, so the move changed
  *     the schedule's opinion of that screen without either mural's verdict moving, and nothing else
  *     re-asserts — miss it and the panel is dark until someone presses Wake;
@@ -22,6 +27,7 @@ import { AdminBroadcaster, AdminHub, Presence } from "../src/admin";
 import { ActivityLog } from "../src/activity";
 import { AgentHub, PlayerHub } from "../src/hub";
 import { PanelPowerScheduler } from "../src/panel-power";
+import { SceneScheduler } from "../src/scheduler";
 import { ControlPlane } from "../src/state";
 import { MemoryStore } from "../src/store/memory";
 
@@ -47,6 +53,8 @@ interface PanelFixture {
   sent: Array<[string, boolean]>;
   activity: ActivityLog;
   setNowMinutes: (minutes: number) => void;
+  /** Take the box off the network: every send is delivered to 0 agents, as `AgentHub` reports it. */
+  offline: (yes: boolean) => void;
 }
 
 /**
@@ -91,10 +99,13 @@ async function makePanelFixture(opts: { nowMinutes?: number } = {}): Promise<Pan
   if (!created.ok) throw new Error(`failed to create the schedule: ${created.error}`);
 
   const sent: PanelFixture["sent"] = [];
+  let isOffline = false;
   const agentHub = new AgentHub();
   // Stand in for a live agent socket: record what would have gone down the wire, by SCREEN (the
-  // wire carries a connector, and a connector on a machine is exactly one screen).
+  // wire carries a connector, and a connector on a machine is exactly one screen). An OFFLINE box
+  // records nothing and reports 0 sockets — the same answer the real hub gives.
   agentHub.send = ((machineId: string, msg: { connector: string; on: boolean }) => {
+    if (isOffline) return 0;
     const screen = control
       .getScreens()
       .find((s) => s.machineId === machineId && s.connector === msg.connector);
@@ -132,6 +143,9 @@ async function makePanelFixture(opts: { nowMinutes?: number } = {}): Promise<Pan
     activity,
     setNowMinutes: (minutes: number) => {
       now = new Date(Date.UTC(2026, 6, 15, 0, 0, 0) + minutes * 60_000);
+    },
+    offline: (yes: boolean) => {
+      isOffline = yes;
     },
   };
 }
@@ -283,13 +297,60 @@ describe("scheduled panel power", () => {
     expect(sent).toEqual([]);
   });
 
-  test("disabling the window that slept a wall leaves it asleep — it has not moved", async () => {
-    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+  /**
+   * DELETING THE WINDOWS MUST NOT STRAND THE WALL DARK. The operator whose panels are misbehaving
+   * disables the scheduler and deletes every window — the one move the feature invites — and every
+   * screen the schedule had slept used to stay asleep, with only the Wake button left to recover it.
+   * Losing its last window is an edge for that screen, and the schedule does not get to walk away
+   * from a wall it darkened.
+   */
+  test("deleting the last window wakes a screen the schedule slept", async () => {
+    const { panelPower, sent, activity, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // 19:00 — the wall sleeps
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, ""); // the operator deleted the window
+    expect(sent).toEqual([["screen-1", true]]);
+    expect(activity.recent().map((e) => e.text)).toContain(
+      "Screen 1 woke — no window governs its wall any more",
+    );
+
+    // …and exactly once: the memory is gone, so the ticks that follow have nothing to say.
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, "");
+    panelPower.applyMuralPower(muralId, null, "");
+    expect(sent).toEqual([]);
+  });
+
+  test("deleting the last window leaves a wall the schedule had AWAKE alone", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 12 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // records "awake"
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    sent.length = 0;
+    panelPower.applyMuralPower(muralId, null, "");
+    expect(sent).toEqual([]); // nothing slept it, so there is nothing to wake
+  });
+
+  /**
+   * The wake an OFFLINE box could not take must not be recorded as done. Delete the windows while a
+   * wall is off for the night and the box is unreachable, and the only record that the SCHEDULE slept
+   * that wall is this memory — drop it and the box comes back dark with nothing left to argue
+   * otherwise. So the record is kept, and the hello finishes the job.
+   */
+  test("a wake that reached no agent is retried on the box's hello", async () => {
+    const { control, panelPower, sent, muralId, offline } = await makePanelFixture({ nowMinutes: 20 * 60 });
     panelPower.applyMuralPower(muralId, "on", "Opening hours");
     panelPower.applyMuralPower(muralId, "off", "After hours");
     sent.length = 0;
-    panelPower.applyMuralPower(muralId, null, ""); // the operator switched the window off
-    expect(sent).toEqual([]);
+
+    offline(true); // the box drops off the network
+    await control.updateSchedulerSettings({ enabled: false }); // …and the operator gives up on the schedule
+    panelPower.applyMuralPower(muralId, null, "", "the scheduler is switched off");
+    expect(sent).toEqual([]); // an offline box takes nothing
+
+    offline(false);
+    panelPower.reconcileMachine("machine-1"); // it says hello, outputs and all
+    expect(sent).toEqual([["screen-1", true]]);
   });
 
   test("an UNPLACED screen belongs to no mural, so no window governs it", async () => {
@@ -321,5 +382,114 @@ describe("scheduled panel power", () => {
     expect(panelPower.desiredFor("screen-1")).toBeNull(); // ungoverned: nobody has an opinion
     panelPower.reconcileMachine("machine-1"); // a box rebooting at 21:00 with the scheduler off
     expect(sent).toEqual([]); // nothing goes down the wire, so nothing goes dark
+  });
+
+  /**
+   * THE MASTER SWITCH, END TO END, through the real ticker. Switching the scheduler off is "delete
+   * every window" by another route, and the ticker used to return before the seam was ever reached —
+   * so the operator who switched the feature off because their panels were misbehaving was left with
+   * a fleet nothing could wake. Driven here through `SceneScheduler` rather than by calling the seam
+   * directly, because the bug lived in the return, not in the seam.
+   */
+  test("switching the master switch off wakes what the schedule slept", async () => {
+    const { control, panelPower, sent, activity } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    const scheduler = new SceneScheduler({
+      control,
+      log,
+      apply: async () => true,
+      panelPower,
+      now: () => Date.UTC(2026, 6, 15, 20, 0, 0),
+    });
+
+    await scheduler.tick(Date.UTC(2026, 6, 15, 18, 30, 0)); // in hours: records "awake"
+    await scheduler.tick(Date.UTC(2026, 6, 15, 20, 0, 0)); // past 19:00: the wall sleeps
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
+
+    await control.updateSchedulerSettings({ enabled: false });
+    await scheduler.tick(Date.UTC(2026, 6, 15, 20, 0, 10));
+    expect(sent).toEqual([["screen-1", true]]);
+    expect(activity.recent().map((e) => e.text)).toContain(
+      "Screen 1 woke — the scheduler is switched off",
+    );
+
+    // Once, not every ten seconds: the memory is forgotten with the wake.
+    sent.length = 0;
+    await scheduler.tick(Date.UTC(2026, 6, 15, 20, 0, 20));
+    expect(sent).toEqual([]);
+  });
+
+  test("the master switch leaves a hand-slept screen asleep", async () => {
+    const { control, panelPower, sent } = await makePanelFixture({ nowMinutes: 12 * 60 });
+    const scheduler = new SceneScheduler({ control, log, apply: async () => true, panelPower });
+
+    panelPower.send("screen-1", false, "requested by an operator"); // a human slept it, mid-morning
+    sent.length = 0;
+    await control.updateSchedulerSettings({ enabled: false });
+    await scheduler.tick(Date.UTC(2026, 6, 15, 12, 0, 0));
+    await scheduler.tick(Date.UTC(2026, 6, 15, 12, 0, 10));
+    expect(sent).toEqual([]); // nothing recorded it, so nothing wakes it
+  });
+
+  /**
+   * A HELLO THAT REPORTS ZERO OUTPUTS. The agent is up before the compositor has finished bringing
+   * up its panels, so the first hello of a boot routinely carries no outputs at all — and a box with
+   * no outputs refuses every command it is sent ("connector is not a known sway output"). Reconciling
+   * into that box sent three refused commands and stamped the memory as though they had landed,
+   * leaving the panel wrong until the next boundary hours later. It must wait for the hello that can
+   * actually act.
+   */
+  test("a hello with zero outputs sends nothing and stamps nothing", async () => {
+    const { control, panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 21 * 60 });
+    // The box reboots and its agent hellos before sway has any outputs up.
+    await control.registerMachine({
+      machineId: "machine-1",
+      agentVersion: "test",
+      backend: "wayland-sway",
+      power: { dpms: true, cec: false },
+      outputs: [],
+    });
+    panelPower.reconcileMachine("machine-1");
+    expect(sent).toEqual([]);
+
+    // Nothing was stamped, so the next tick is a FIRST sight — it records and stays silent, rather
+    // than believing a sleep the box never took.
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([]);
+
+    // The outputs come up and the agent hellos again. THAT is the hello that does the work.
+    await control.registerMachine({
+      machineId: "machine-1",
+      agentVersion: "test",
+      backend: "wayland-sway",
+      power: { dpms: true, cec: false },
+      outputs: [{ connector: "DP-1", width: 1920, height: 1080 }],
+    });
+    panelPower.reconcileMachine("machine-1");
+    expect(sent).toEqual([["screen-1", false]]);
+  });
+
+  test("a sleep no agent took is not stamped — the next tick still sees the boundary", async () => {
+    const { panelPower, sent, muralId, offline } = await makePanelFixture({ nowMinutes: 21 * 60 });
+    offline(true);
+    panelPower.reconcileMachine("machine-1"); // the sleep reaches nobody
+    offline(false);
+    // Had the refused sleep been stamped, this tick would agree with itself and say nothing at all.
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([["screen-1", false]]);
+  });
+
+  test("a refused command drops the memory, so the next boundary is not skipped", async () => {
+    const { panelPower, sent, muralId } = await makePanelFixture({ nowMinutes: 20 * 60 });
+    panelPower.applyMuralPower(muralId, "on", "Opening hours");
+    panelPower.applyMuralPower(muralId, "off", "After hours");
+    expect(sent).toEqual([["screen-1", false]]);
+    sent.length = 0;
+
+    panelPower.noteRefused("screen-1"); // the box answered `ok: false` — it never went dark
+    panelPower.applyMuralPower(muralId, "off", "After hours"); // first sight again: record only
+    panelPower.applyMuralPower(muralId, "on", "Opening hours"); // 07:00 still wakes it
+    expect(sent).toEqual([["screen-1", true]]);
   });
 });

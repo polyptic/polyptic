@@ -754,15 +754,34 @@ describe("POL-186 scheduled panel power (a window on the mural)", () => {
     TEST_TIMEOUT,
   );
 
+  /**
+   * DELETING THE WINDOWS MUST NOT STRAND THE WALL DARK. The wall is asleep on this schedule's verdict
+   * (the test above put a rebooted box back inside the off window). Deleting the window is the move
+   * an operator makes when the power feature misbehaves, and it used to be the move that left the
+   * fleet dark with only the manual Wake button to recover it: nothing in the system asserted panel
+   * power for an ungoverned mural, on a tick or on a hello.
+   *
+   * Losing the last window is an edge, and the schedule wakes what IT slept on the way out. It is
+   * still not "wake everything" — a screen an operator slept BY HAND writes nothing to the schedule's
+   * memory and is never woken by this, which the server suite pins directly.
+   */
   test(
-    "deleting the window leaves the wall exactly as it is — ungoverned is not 'wake everything'",
+    "deleting the window WAKES the wall the schedule slept — and then says nothing more",
     async () => {
       const del = await req("DELETE", `/api/v1/schedules/${scheduleId}`);
       expect(del.status).toBe(200);
       await del.json();
 
-      // No enabled window targets the mural now, so nobody has an opinion about its panels. A screen
-      // asleep — by this schedule or by an operator's hand — stays asleep.
+      const frame = await agentB.waitFor(
+        (m) => m.t === "server/display-power" && m.on === true,
+        "the wake that follows the window's deletion",
+        6_000,
+      );
+      expect(frame.connector).toBe("HDMI-9");
+      expect(String(frame.reason)).toContain("no window governs its wall any more");
+
+      // Once, not every ten seconds: the memory goes with the wake, so the ticks that follow are
+      // silent — an ungoverned mural is not re-asserted.
       expect(await agentB.sawWithin((m) => m.t === "server/display-power", 800)).toBe(false);
     },
     TEST_TIMEOUT,

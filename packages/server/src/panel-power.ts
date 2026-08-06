@@ -45,9 +45,20 @@
  *     a mural mid-window would then never be recorded and would sit lit all night. So the seam below
  *     is the ONLY edge-trigger, keyed per SCREEN, and it must stay cheap enough to run every 10s and
  *     silent whenever the verdict is unchanged.
- *   - `null` PANELS MEAN UNGOVERNED. No enabled window targets that mural: leave the wall exactly as
- *     it is (a screen an operator slept by hand stays asleep), and FORGET the remembered state so
- *     re-enabling a window later starts fresh rather than firing off a stale edge.
+ *   - `null` PANELS MEAN UNGOVERNED, and ARRIVING there is an edge like any other. No enabled window
+ *     targets that mural, so the schedule stops having an opinion, and the remembered state is
+ *     FORGOTTEN — re-enabling a window later starts fresh rather than firing off a stale edge. But
+ *     the schedule does not get to walk away leaving a wall dark: a screen the SCHEDULE slept is
+ *     woken on the way out. That is the sequence an operator actually walks into — panels misbehave,
+ *     so they switch the scheduler off and delete the windows, and every screen those windows had put
+ *     to sleep stays asleep, with nothing left in the system able to wake it. What makes the wake
+ *     safe is the one thing `lastDesired` has always recorded: the SCHEDULE's opinion, and only that.
+ *     A screen an operator slept BY HAND has no entry at all, so it is left exactly as it is. Wake
+ *     what the schedule slept; leave what a human slept.
+ *   - THE MASTER SWITCH IS THE SAME EDGE. Switching the scheduler off is "delete every window" by
+ *     another route, so the ticker drives this seam with `null` for every mural on a disabled tick
+ *     instead of returning before it ever reaches here (`scheduler.ts`). Switching the feature off
+ *     must never be the thing that strands the fleet dark.
  *   - THE MEMORY REMEMBERS WHICH WALL SPOKE. Because the window belongs to the wall, a screen dragged
  *     from one mural to another has had the schedule's opinion OF IT changed even though neither
  *     mural's verdict moved — so `lastDesired` records the mural alongside the verdict, and a screen
@@ -145,32 +156,37 @@ export class PanelPowerScheduler {
    *     operator just woke back to sleep ten seconds later, over and over;
    *   - the memory it consults is the SCHEDULE's opinion (see `lastDesired`), which an operator's
    *     manual wake/sleep never touches — that is what lets an override hold to the next boundary;
-   *   - `panels === null` (nothing governs this mural) leaves the wall exactly as it is and FORGETS
-   *     the remembered state, so re-enabling a window later starts fresh instead of firing a stale
-   *     edge at a wall nobody asked to change. With ONE exception, below.
-   *   - a screen that ARRIVED FROM ANOTHER MURAL asleep is woken. Power hangs on the wall, so moving
-   *     the screen changed the schedule's opinion of it, and the memory (keyed per screen, and now
-   *     carrying the mural that spoke) is where that edge is visible. It cannot be a blanket "wake on
-   *     `null`": `null` also covers the operator who slept a screen by hand and the window they just
-   *     disabled, and both of those must be left exactly as they are. What separates them is the
-   *     RECORDED MURAL — a manual sleep writes nothing here at all, and a window switched off on the
-   *     screen's own wall recorded that same wall.
+   *   - `panels === null` (nothing governs this mural) FORGETS the remembered state, so re-enabling a
+   *     window later starts fresh instead of firing a stale edge at a wall nobody asked to change —
+   *     and on the way out it WAKES ANY SCREEN THE SCHEDULE HAD SLEPT. Three routes lead here and all
+   *     three are the same edge: the window that slept the wall was deleted, the screen was dragged
+   *     onto a wall no window governs, or the master switch was turned off. In every one of them the
+   *     wall is dark and nothing in the system still claims to want it dark.
+   *   - it is still NOT a blanket "wake on `null`", and must never become one. `null` also covers the
+   *     operator who slept a screen BY HAND, and that screen must stay asleep. What separates the two
+   *     is the memory itself: a manual sleep writes nothing here at all, so there is no recorded
+   *     sleep to wake from. The RECORDED MURAL then only picks the words — "the wall that slept it no
+   *     longer holds it" for a screen that moved, the caller's reason for a wall that lost its
+   *     windows — because the decision has already been made by whether an entry exists.
+   *   - a wake that reached NOBODY does not clear the memory. An offline box cannot be woken, so the
+   *     recorded sleep is kept and the wake is re-sent when the box says hello. Forgetting there was
+   *     the subtler half of the same hole: delete the windows while a wall is off for the night, and
+   *     the only record that the schedule had slept it is gone before the box is ever back.
    *
    * In hours the only command this can ever produce is WAKE. Nothing here infers power from
    * idleness, load or connectivity; that inference does not exist.
    */
-  applyMuralPower(muralId: string, panels: PanelState | null, daypartName: string): void {
+  applyMuralPower(
+    muralId: string,
+    panels: PanelState | null,
+    daypartName: string,
+    ungovernedReason = "no window governs its wall any more",
+  ): void {
     for (const screen of this.deps.control.getScreens()) {
       if (this.deps.control.getPlacementMuralId(screen.id) !== muralId) continue;
       const previous = this.lastDesired.get(screen.id);
       if (panels === null) {
-        // Ungoverned: leave the wall alone and forget — UNLESS the screen is asleep on a verdict from
-        // a mural it is no longer on. Then the wall that darkened it does not govern it any more, and
-        // a screen with nothing at all saying "sleep" must not sit dark.
-        if (previous && !previous.desired && previous.muralId !== muralId) {
-          this.wake(screen.id, screen.friendlyName, "the wall that slept it no longer holds it");
-        }
-        this.lastDesired.delete(screen.id);
+        this.releaseScreen(screen.id, screen.friendlyName, previous, muralId, ungovernedReason);
         continue;
       }
       const desired = panels === "on";
@@ -189,11 +205,42 @@ export class PanelPowerScheduler {
     }
   }
 
+  /**
+   * The screen has just become UNGOVERNED — no enabled window has an opinion about it any more,
+   * whichever route it took there (its wall's last window deleted, the master switch off, or the
+   * screen dragged onto a wall nothing governs).
+   *
+   * Wake what the SCHEDULE slept; leave what a human slept. The test is simply whether a recorded
+   * sleep exists: `lastDesired` is written only by this file's own two writers, so a hand-slept
+   * screen has no entry and is left exactly as it is. The recorded mural only chooses the words.
+   *
+   * A wake nobody took KEEPS the memory. An offline box cannot be woken, and if the record went
+   * anyway then nothing would remain to say the schedule had slept that wall — the box would come
+   * back dark with no one left to argue otherwise. Keeping it means `reconcileMachine` finishes the
+   * job on the next hello.
+   */
+  private releaseScreen(
+    screenId: string,
+    friendlyName: string,
+    previous: { muralId: string; desired: boolean } | undefined,
+    muralId: string,
+    ungovernedReason: string,
+  ): void {
+    if (previous && !previous.desired) {
+      const reason =
+        previous.muralId === muralId ? ungovernedReason : "the wall that slept it no longer holds it";
+      if (this.wake(screenId, friendlyName, reason) === 0) return; // offline: keep the record, retry on hello
+    }
+    this.lastDesired.delete(screenId);
+  }
+
   /** One WAKE with its activity line — the sleep half always has a daypart to name, this half
-   *  sometimes has only a reason (a screen that outlived the window that slept it). */
-  private wake(screenId: string, friendlyName: string, reason: string): void {
-    this.send(screenId, true, `schedule: ${reason}`);
+   *  sometimes has only a reason (a screen that outlived the window that slept it). Returns how many
+   *  agents took it, because a wake that reached nobody must not be recorded as done. */
+  private wake(screenId: string, friendlyName: string, reason: string): number {
+    const delivered = this.send(screenId, true, `schedule: ${reason}`);
     this.deps.activity.push("info", `${friendlyName} woke — ${reason}`);
+    return delivered;
   }
 
   /**
@@ -203,8 +250,35 @@ export class PanelPowerScheduler {
    *
    * Reconciling on hello also means the console's power state is never a guess: the box acks, and the
    * ack is what the operator sees.
+   *
+   * TIMING IS THE WHOLE PROBLEM HERE. A box says hello as soon as its agent is up, which is BEFORE
+   * the compositor has finished bringing up its outputs — the first hello of a boot routinely reports
+   * zero of them. Reconciling into that box refuses every command it is sent ("connector is not a
+   * known sway output"), and, worse, used to stamp the memory as though the commands had landed, so
+   * the panel was then wrong until the next real boundary hours later. A box advertising no outputs
+   * cannot act, so there is nothing to reconcile TO yet: skip it and wait. The agent hellos again
+   * once its outputs are up, and that hello is the one that can do the work.
    */
   reconcileMachine(machineId: string, reassertScreenIds?: ReadonlySet<string>): void {
+    const machine = this.deps.control.getMachine(machineId);
+    if (!machine) return;
+    if (machine.outputs.length === 0) {
+      // Not a fault, and not a wall to worry about: the compositor is still coming up. Say so plainly
+      // so the morning-after reading of the log does not show a silent gap where a reconcile was due.
+      this.deps.log.info(
+        { event: "panel.power.reconcile_deferred", machineId },
+        "panel power reconcile deferred — the machine advertises no outputs yet (it hellos again once they are up)",
+      );
+      this.deps.logs?.record(
+        serverEvent(
+          "info",
+          "panel-power",
+          "reconcile deferred — the box advertises no outputs yet, so no panel can take a command",
+          { machineId },
+        ),
+      );
+      return;
+    }
     const screens = this.deps.control.getScreens().filter((s) => s.machineId === machineId);
     for (const screen of screens) {
       // A screen whose connector the box had STOPPED reporting and is reporting again: the output was
@@ -224,23 +298,51 @@ export class PanelPowerScheduler {
         continue;
       }
       const desired = this.desiredFor(screen.id);
-      if (desired === null) continue;
       // `desiredFor` only answers non-null for a PLACED screen, so the mural is there to record — and
       // it must be, or the next tick would read this as "a verdict from another wall" and wake it.
       const muralId = this.deps.control.getPlacementMuralId(screen.id);
-      if (muralId === null) continue;
-      this.lastDesired.set(screen.id, { muralId, desired });
+      if (desired === null || muralId === null) {
+        // Ungoverned, by the same three routes `applyMuralPower` handles — and reached here when the
+        // tick's wake could not be delivered because this very box was offline. Same rule, same
+        // words: wake what the schedule slept, leave what a human slept.
+        this.releaseScreen(
+          screen.id,
+          screen.friendlyName,
+          this.lastDesired.get(screen.id),
+          muralId ?? "",
+          "no window governs its wall any more",
+        );
+        continue;
+      }
       // Only ever SEND the sleep half here. A box that just booted is already awake (the compositor
       // asserts `dpms on` at startup), so re-asserting "on" would be a wasted frame on every reconnect
       // of every box in the fleet — but a box that booted OUT of hours genuinely needs the sleep.
-      if (!desired) this.send(screen.id, false, "schedule (the box came back inside an off window)");
+      // Record only what actually went to an agent: a sleep nobody took leaves the memory absent, so
+      // the next tick treats this screen as first sight rather than believing a dark panel it has.
+      if (!desired && this.send(screen.id, false, "schedule (the box came back inside an off window)") === 0) {
+        continue;
+      }
+      this.lastDesired.set(screen.id, { muralId, desired });
     }
+  }
+
+  /**
+   * The box REFUSED a power command (`agent/power-ack` with `ok: false`), so whatever we believed
+   * about that panel is not true. Drop the record rather than carry a lie: an unrecorded screen is
+   * re-read from scratch on the next tick, where a real boundary re-sends, and no verdict is ever
+   * skipped on the strength of a command that never took.
+   */
+  noteRefused(screenId: string): void {
+    this.lastDesired.delete(screenId);
   }
 
   // POL-186 — `noteScheduleApplied` lived here, for the one caller that applied the schedule's
   // opinion out of band: the panel-hours PUT route. That route is gone, and with it the only way an
-  // edit could stamp this memory behind an operator's back. The memory now has exactly two writers,
-  // both in this file: `applyMuralPower` and `reconcileMachine`.
+  // edit could stamp this memory behind an operator's back. The memory is still only ever WRITTEN by
+  // this file's own two schedule paths, `applyMuralPower` and `reconcileMachine` — and only with a
+  // command an agent actually took. It is CLEARED by `releaseScreen` (the screen is ungoverned now)
+  // and by `noteRefused` (the box said the command did not take); a cleared screen is simply read
+  // afresh on the next tick. Nothing outside this file can put a value in.
 
   /** Send one `server/display-power`. Returns how many agents took it (0 = the box is offline). */
   send(screenId: string, on: boolean, reason: string): number {
