@@ -434,6 +434,173 @@ ExecStart=/usr/bin/systemctl --no-block reboot
 `;
 }
 
+// ── privileged agent-binary swap (POL-160) ─────────────────────────────────────
+//
+// The agent self-updates: it pulls the newer binary the control plane serves, verifies it, and
+// re-execs. The WRITE is the privileged part — the agent runs as the kiosk user and its binary lives
+// in root-owned /usr/local/bin, so `rename()` there fails EACCES on every real box (that is why 176
+// offers in 48h produced 176 declines). Moving the binary somewhere the agent can write would give
+// the agent write access to its own code path, so instead the swap takes the SAME shape as the
+// reboot escalation above:
+//
+//   /run/polyptic/requests/agent-update       one request: action=swap|rollback|commit (+ version)
+//   /run/polyptic/requests/agent-update.bin   the staged binary, at a FIXED path the request cannot
+//                                             redirect
+//   /run/polyptic/requests/agent-update.result the root side's answer: `ok` or `failed: <reason>`
+//   polyptic-agent-update.path / .service     root-owned, run the fixed script below
+//
+// The script chooses no path from the request and runs no command the agent names. It re-verifies
+// before it writes anything (the staged file runs `--version` AS THE KIOSK USER — never as root —
+// and must report the version the request asked for, and its sha256 must match when one was given),
+// then installs by same-directory rename, so the live binary is never momentarily absent and
+// `<bin>.bak` is always the binary that worked.
+
+export const AGENT_UPDATE_PATH_UNIT = "polyptic-agent-update.path";
+export const AGENT_UPDATE_SERVICE = "polyptic-agent-update.service";
+/** The root-owned script the service runs. Fixed path; the agent never names it. */
+export const AGENT_UPDATE_SCRIPT = "/usr/local/lib/polyptic/agent-update.sh";
+/** Must match `UPDATE_REQUEST_PATH` / `UPDATE_STAGE_PATH` / `UPDATE_RESULT_PATH` in ../update.ts. */
+export const AGENT_UPDATE_REQUEST_PATH = `${REBOOT_REQUEST_DIR}/agent-update`;
+export const AGENT_UPDATE_STAGE_PATH = `${REBOOT_REQUEST_DIR}/agent-update.bin`;
+export const AGENT_UPDATE_RESULT_PATH = `${REBOOT_REQUEST_DIR}/agent-update.result`;
+
+export function agentUpdatePathUnit(): string {
+  return `# ${SYSTEM_UNIT_DIR}/${AGENT_UPDATE_PATH_UNIT} — ${MANAGED}
+[Unit]
+Description=Polyptic — watch for the agent's staged self-update (POL-160)
+Documentation=https://github.com/polyptic/polyptic/blob/main/docs/ARCHITECTURE.md
+ConditionPathExists=${AGENT_UPDATE_SCRIPT}
+
+[Path]
+# PathExists, not PathChanged: the agent writes the request whole, only after the staged binary is
+# fully downloaded and verified, and the script deletes it first thing. Existence IS the request.
+PathExists=${AGENT_UPDATE_REQUEST_PATH}
+Unit=${AGENT_UPDATE_SERVICE}
+
+[Install]
+WantedBy=paths.target
+`;
+}
+
+export function agentUpdateServiceUnit(): string {
+  return `# ${SYSTEM_UNIT_DIR}/${AGENT_UPDATE_SERVICE} — ${MANAGED}
+[Unit]
+Description=Polyptic — install the agent binary the agent staged and verified (POL-160)
+Documentation=file://${AGENT_UPDATE_SCRIPT}
+ConditionPathExists=${AGENT_UPDATE_SCRIPT}
+
+[Service]
+Type=oneshot
+# A refused swap is a FAILED unit, so \`systemctl status ${AGENT_UPDATE_SERVICE}\` and the console's
+# update status say the same thing. Nothing Requires= this unit: the box keeps running the binary it
+# already has, and the wall never blinks.
+TimeoutStartSec=5min
+ExecStart=${AGENT_UPDATE_SCRIPT}
+`;
+}
+
+/**
+ * The whole privileged capability: install a staged agent binary, roll back to the previous one, or
+ * drop the backup. `user` is the unprivileged account the staged binary's `--version` self-check runs
+ * as — the script never executes it as root, because its content came from the kiosk side.
+ */
+export function agentUpdateScript(p: { agentBin: string; user: string }): string {
+  return `#!/bin/sh
+# ${AGENT_UPDATE_SCRIPT} — ${MANAGED}
+# The root half of the agent's self-update (POL-160). Started by ${AGENT_UPDATE_PATH_UNIT} when the
+# unprivileged agent drops ${AGENT_UPDATE_REQUEST_PATH}. Paths are fixed here, never taken from the
+# request: the agent can ask for one of three verbs and nothing else.
+set -eu
+
+BIN=${p.agentBin}
+RUN_AS=${p.user}
+REQ=${AGENT_UPDATE_REQUEST_PATH}
+STAGE=${AGENT_UPDATE_STAGE_PATH}
+RESULT=${AGENT_UPDATE_RESULT_PATH}
+
+answer() {
+  printf '%s\\n' "$1" > "$RESULT.part"
+  chmod 0644 "$RESULT.part" 2>/dev/null || true
+  mv -f "$RESULT.part" "$RESULT"
+}
+fail() {
+  answer "failed: $1"
+  rm -f "$REQ" "$STAGE"
+  echo "polyptic-agent-update: $1" >&2
+  exit 1
+}
+
+[ -f "$REQ" ] || exit 0
+
+action=""
+version=""
+want_sha=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    action) action="$value" ;;
+    version) version="$value" ;;
+    sha256) want_sha="$value" ;;
+  esac
+done < "$REQ"
+
+# Consume the request FIRST: a failure must not leave a file that re-arms the path unit into a loop.
+rm -f "$REQ"
+
+case "$version" in *[!0-9A-Za-z.+-]*) fail "the request named an implausible version" ;; esac
+case "$want_sha" in *[!0-9A-Fa-f]*) fail "the request named an implausible sha256" ;; esac
+
+case "$action" in
+  commit)
+    rm -f "$BIN.bak"
+    answer ok
+    exit 0
+    ;;
+  rollback)
+    [ -f "$BIN.bak" ] || fail "no $BIN.bak to roll back to"
+    cp -f "$BIN.bak" "$BIN.part"
+    chmod 0755 "$BIN.part"
+    mv -f "$BIN.part" "$BIN"
+    rm -f "$BIN.bak"
+    answer ok
+    exit 0
+    ;;
+  swap) ;;
+  *) fail "unknown action '$action'" ;;
+esac
+
+[ -s "$STAGE" ] || fail "no staged binary at $STAGE"
+[ -n "$version" ] || fail "the swap request named no version"
+chmod 0755 "$STAGE"
+
+# Re-verify before writing anything. The staged binary runs as $RUN_AS, never as root: its content
+# came from the unprivileged side, and installing it hands it to $RUN_AS anyway.
+if command -v runuser >/dev/null 2>&1; then
+  reported=$(runuser -u "$RUN_AS" -- "$STAGE" --version 2>/dev/null) || fail "the staged binary could not run --version"
+elif command -v setpriv >/dev/null 2>&1; then
+  reported=$(setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --clear-groups "$STAGE" --version 2>/dev/null) || fail "the staged binary could not run --version"
+else
+  fail "neither runuser nor setpriv is installed, so the staged binary cannot be self-checked unprivileged"
+fi
+reported=$(printf '%s' "$reported" | head -n1 | tr -d '[:space:]')
+# The server tags releases \`v0.6.0\` and the binary bakes \`0.6.0\` — one version, two spellings.
+[ "\${reported#v}" = "\${version#v}" ] || fail "the staged binary reports \\"$reported\\", the request asked for \\"$version\\""
+
+if [ -n "$want_sha" ] && command -v sha256sum >/dev/null 2>&1; then
+  got_sha=$(sha256sum "$STAGE" | cut -d' ' -f1)
+  [ "$got_sha" = "$want_sha" ] || fail "the staged binary's sha256 is $got_sha, the request asked for $want_sha"
+fi
+
+# Keep the binary that works, then install by same-directory rename: the live binary is never
+# momentarily absent, and a failure before the rename leaves it untouched.
+cp -f "$BIN" "$BIN.bak" 2>/dev/null || true
+cp -f "$STAGE" "$BIN.part"
+chmod 0755 "$BIN.part"
+mv -f "$BIN.part" "$BIN"
+rm -f "$STAGE"
+answer ok
+`;
+}
+
 // ── HDMI-CEC device access (POL-101) ───────────────────────────────────────────
 //
 // The kernel CEC API lives at /dev/cec* and, on a stock Ubuntu box, is root-owned with no group that

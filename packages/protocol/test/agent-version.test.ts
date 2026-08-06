@@ -5,7 +5,25 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { isNewerAgentVersion } from "../src/index";
+import { isNewerAgentVersion, normalizeAgentVersion, sameAgentVersion } from "../src/index";
+
+describe("normalizeAgentVersion / sameAgentVersion — the two ends spell a version differently", () => {
+  test("the release tag's `v` is stripped, so `v0.6.0` and `0.6.0` are one version", () => {
+    expect(normalizeAgentVersion("v0.6.0")).toBe("0.6.0");
+    expect(normalizeAgentVersion("  0.6.0  ")).toBe("0.6.0");
+    expect(sameAgentVersion("v0.6.0", "0.6.0")).toBe(true);
+    expect(sameAgentVersion("v0.6.0", "0.6.1")).toBe(false);
+  });
+
+  test("a tagged offer orders against a bare running version, in both directions", () => {
+    // The field case: the server offers the tag, the box reports the stripped form.
+    expect(isNewerAgentVersion("v0.6.0", "0.3.6")).toBe(true);
+    expect(isNewerAgentVersion("v0.3.6", "0.3.6")).toBe(false);
+    expect(isNewerAgentVersion("0.3.6", "v0.6.0")).toBe(false);
+    // Un-normalised, `v1` parsed as 0 and this said false — a box would never leave 0.9.9.
+    expect(isNewerAgentVersion("v1.0.0", "0.9.9")).toBe(true);
+  });
+});
 
 describe("isNewerAgentVersion (POL-160)", () => {
   test("a strictly newer version is newer", () => {
