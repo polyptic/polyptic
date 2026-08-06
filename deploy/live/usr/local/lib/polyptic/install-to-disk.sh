@@ -67,6 +67,7 @@ RUN_DIR="${POLYPTIC_RUN_DIR:-/run/polyptic}"
 REQUEST="${POLYPTIC_INSTALL_REQUEST:-$RUN_DIR/requests/install}"
 STATUS_FILE="${POLYPTIC_INSTALL_STATUS:-$RUN_DIR/install-status}"
 MOUNTS_FILE="${POLYPTIC_MOUNTS_FILE:-/proc/mounts}"
+SWAPS_FILE="${POLYPTIC_SWAPS_FILE:-/proc/swaps}"
 DEV_DIR="${POLYPTIC_DEV_DIR:-/dev}"
 LIB_DIR="${POLYPTIC_LIB_DIR:-$(CDPATH= cd "$(dirname "$0")" && pwd)}"
 CONSOLE="${POLYPTIC_CONSOLE:-/dev/console}"
@@ -294,6 +295,32 @@ part_node() {
   esac
 }
 
+# Every partition of the target that currently exists, by kernel name, one per line. /sys/class/block
+# is FLAT, so this matches by name rather than walking: a partition is the disk's name plus digits
+# (sda1), or plus `p` and digits (nvme0n1p1). Matched precisely so `sda` never sweeps up `sdaa`,
+# which is a real device name on a big enough box.
+target_partitions() {
+  for _tp in "$SYS_BLOCK/$name"?*; do
+    [ -e "$_tp" ] || continue
+    case "${_tp##*/}" in
+      "$name"[0-9]*|"$name"p[0-9]*) printf '%s\n' "${_tp##*/}" ;;
+    esac
+  done
+}
+
+# Active swap devices that live on the target, by /dev path. /proc/swaps names raw partitions
+# directly; a dm-backed swap appears as its mapper device instead and is caught by the holders walk.
+# The header line ("Filename Type Size ...") matches nothing here.
+swaps_on_target() {
+  [ -r "$SWAPS_FILE" ] || return 0
+  while read -r _sd _rest; do
+    case "$_sd" in
+      "$target"|"$target"[0-9]*|"$target"p[0-9]*) printf '%s\n' "$_sd" ;;
+    esac
+  done < "$SWAPS_FILE"
+  return 0
+}
+
 # ─── Depot pre-flight (POL-168): WAIT for the depot before deciding anything destructive ────────────
 # A fresh image is fetched from the depot, never copied from RAM — so the depot must be reachable
 # BEFORE the wipe, or a transient network wobble would leave a wiped, OS-less disk.
@@ -392,6 +419,14 @@ release_target() {
   systemctl mask --runtime 'systemd-cryptsetup@polyptic\x2dswap.service' >/dev/null 2>&1 || true
   systemctl stop 'systemd-cryptsetup@polyptic\x2dswap.service' >/dev/null 2>&1 || true
   cryptsetup close polyptic-swap >/dev/null 2>&1 || true
+  # POL-196 — and any OTHER swap on this disk, whatever opened it. A RAW swap partition (no
+  # device-mapper in the way) is invisible to both guards on this path: swap is not a mount, so
+  # /proc/mounts never mentions it, and with nothing layered on top the partition has no holders
+  # either. Formatting over a live swap is corruption on a running system, so it gets released here
+  # and refused below if it will not go.
+  for _sd in $(swaps_on_target); do
+    swapoff "$_sd" >/dev/null 2>&1 || true
+  done
   udevadm settle >/dev/null 2>&1 || true
   return 0
 }
@@ -401,13 +436,8 @@ release_target
 # matters most). A holder left on any partition of the target means something we did not anticipate
 # is using this disk — refuse while "nothing was erased" is still true, and NAME it, because the
 # operator can only act on a holder they can see.
-for _part in "$SYS_BLOCK/$name"?*; do
-  # Only this disk's OWN partitions: `sda` must not sweep up `sdaa`, which is a real device name on
-  # a big enough box. A partition is the disk's name plus digits, or plus `p` and digits (nvme).
-  case "${_part##*/}" in
-    "$name"[0-9]*|"$name"p[0-9]*) ;;
-    *) continue ;;
-  esac
+for _pname in $(target_partitions); do
+  _part="$SYS_BLOCK/$_pname"
   for _holder in "$_part/holders"/*; do
     [ -e "$_holder" ] || continue
     # A device-mapper holder is `dm-0` in sysfs and `polyptic-swap` to a human; say the second.
@@ -415,6 +445,9 @@ for _part in "$SYS_BLOCK/$name"?*; do
     [ -r "$_holder/dm/name" ] && IFS= read -r _hname < "$_holder/dm/name" 2>/dev/null
     fail install-bad-target "${_part##*/} on $target is in use by $_hname and could not be released. Stop whatever is using it and install again (nothing was erased)"
   done
+done
+for _sd in $(swaps_on_target); do
+  fail install-bad-target "$_sd on $target is still an active swap device and could not be swapped off. Run 'swapoff $_sd' and install again (nothing was erased)"
 done
 
 # ─── THE POINT OF NO RETURN: wipe + partition + mkfs ────────────────────────────────────────────────
@@ -447,6 +480,18 @@ done
   || fail install-write-failed "the new partitions on $target never appeared as device nodes"
 
 progress partitioning 40 "formatting the new partitions"
+# POL-196 — clear each new partition's first sectors before formatting it. `sgdisk --zap-all` and the
+# `wipefs -a` above both operate on the DISK: they destroy the partition table, not the filesystem
+# signatures sitting inside the partitions it described. This layout is deterministic, so a
+# re-install re-creates every partition at exactly the same LBA — and the previous install's
+# superblocks are still lying there, at the offset the new partition starts. mkfs writes its own,
+# but a partition that carried a DIFFERENT filesystem last time keeps both signatures, and then
+# `blkid` reports two and udev picks one. Standard hygiene, and cheap: five ioctls.
+_pn=1
+while [ "$_pn" -le 5 ]; do
+  wipefs -a "$(part_node "$_pn")" >/dev/null 2>&1 || true
+  _pn=$((_pn + 1))
+done
 # The ESP's FAT volume label is POLYPTIC-BT — the SAME label as the USB medium (find-boot-medium's
 # by-label fast path), because the ESP is the boot medium from now on. POLYPTIC-SCRATCH is exactly
 # 16 characters, ext4's label maximum — keep it exact.
