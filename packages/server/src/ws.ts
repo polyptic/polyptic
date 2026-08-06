@@ -1041,6 +1041,11 @@ function handleAgent(
         presence.setScreenAsleep(screen.id, msg.ok && !msg.on, msg.methods);
         presence.setScreenPowerError(screen.id, msg.ok ? null : (msg.reason ?? "the box did not say why"));
         if (!msg.ok) {
+          // The command did not take, so the scheduler's memory of this panel is a lie — drop it.
+          // Carrying it means the next tick sees no edge and stays silent about a panel that never
+          // did what it was told, which is how a refused sleep becomes a wall that is wrong until the
+          // next boundary hours later.
+          panelPower.noteRefused(screen.id);
           activity.push(
             "bad",
             `Could not ${msg.on ? "wake" : "sleep"} ${screen.friendlyName}: ${msg.reason ?? "no reason given"}`,
