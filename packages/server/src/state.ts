@@ -62,6 +62,7 @@ import type {
   PlaylistEntry,
   PlaylistItem,
   RefreshPolicy,
+  BootBrand,
   BootOrderPolicy,
   CreateCredentialProfileBody,
   CredentialProfileView,
@@ -586,6 +587,8 @@ export class ControlPlane {
   /** POL-115 — the fleet's UEFI boot-order policy. Report-only until an operator opts in, so a fleet
    *  that never touches this setting NEVER writes a firmware boot variable. `init()` loads the override. */
   private bootOrderPolicy: BootOrderPolicy = { reassert: false };
+  /** POL-194 — the fleet's boot branding. The Polyptic lockup until an operator saves their own. */
+  private bootBrand: BootBrand = { markSvg: null, wordmark: "", updatedAt: null, note: null };
 
   /**
    * @param store    the durable backing store.
@@ -978,6 +981,17 @@ export class ControlPlane {
     // POL-115 — absent an operator opt-in, boxes report boot-order drift and write nothing.
     const persistedBootOrder = await this.store.getBootOrderPolicy();
     if (persistedBootOrder) this.bootOrderPolicy = { reassert: persistedBootOrder.reassert };
+
+    // POL-194 — the operator's boot brand. Absent, every boot screen paints the Polyptic lockup.
+    const persistedBrand = await this.store.getBootBrand();
+    if (persistedBrand) {
+      this.bootBrand = {
+        markSvg: persistedBrand.markSvg,
+        wordmark: persistedBrand.wordmark,
+        updatedAt: persistedBrand.updatedAt,
+        note: null,
+      };
+    }
   }
 
   private nextMuralId(): string {
@@ -1838,6 +1852,39 @@ export class ControlPlane {
         : "Boxes will now only REPORT UEFI boot-order drift — no boot variable will be written",
     );
     return this.getBootOrderPolicy();
+  }
+
+  /** POL-194 — the fleet's boot branding, as saved. `note` is filled in by the caller that knows
+   *  whether the render succeeded (the provision route owns the rasteriser). */
+  getBootBrand(): BootBrand {
+    return { ...this.bootBrand };
+  }
+
+  /**
+   * Set + persist the fleet's boot branding (POL-194).
+   *
+   * Nothing is pushed to any box. The GRUB menu picks it up on its next fetch of `/boot/logo.png`;
+   * offline media and installed disks re-pull the same three theme files on their own update poll
+   * (POL-80's `heal_boot_theme`); the Plymouth splash changes at the next image rebuild, which the
+   * console OFFERS rather than fires — a 15-minute cluster Job should not be a side effect of a
+   * file upload.
+   */
+  async setBootBrand(next: { markSvg: string | null; wordmark: string }): Promise<BootBrand> {
+    const updatedAt = new Date().toISOString();
+    this.bootBrand = {
+      markSvg: next.markSvg,
+      wordmark: next.wordmark,
+      updatedAt,
+      note: null,
+    };
+    await this.store.setBootBrand({ markSvg: next.markSvg, wordmark: next.wordmark, updatedAt });
+    this.emit(
+      "accent",
+      next.markSvg || next.wordmark
+        ? `Boot branding saved${next.wordmark ? ` (${next.wordmark})` : ""} — GRUB menus show it now, the boot splash after the next image rebuild`
+        : "Boot branding removed — every boot screen is back on the Polyptic lockup",
+    );
+    return this.getBootBrand();
   }
 
   /**

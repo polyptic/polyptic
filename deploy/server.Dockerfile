@@ -83,6 +83,17 @@ ARG POLYPTIC_REVISION=dev
 #                    the console does not offer them. Everything else is unaffected.
 # The server never assumes any of this: it asks the adapter, and degrades with a sentence (D115).
 ARG DOCUMENT_TOOLCHAIN=full
+
+# ── SVG rasteriser (POL-194) ─────────────────────────────────────────────────
+# `librsvg2-bin` is `rsvg-convert`, and it is what turns an operator's uploaded mark into the one
+# PNG the GRUB boot menu draws (GET /boot/logo.png). ~10 MB, and unconditional: it is not part of
+# the document toolchain choice above, and a control plane without it can only ever serve the
+# Polyptic logo back to a customer who has just uploaded their own. Without it nothing breaks —
+# the route falls back to the committed lockup and the console says why — but that is a degradation
+# to be avoided in the image we ship, not a build option.
+RUN apt-get update && apt-get install -y --no-install-recommends librsvg2-bin \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN set -eux; \
     case "${DOCUMENT_TOOLCHAIN}" in \
       none) echo "document pipeline: no toolchain baked in (uploads of PDFs/slides will be refused)" ;; \

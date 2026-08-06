@@ -11,6 +11,8 @@
  * in the console. "apt = the box is a display; console = what it shows." (D26)
  */
 import { basename } from "node:path";
+import { BOOT_BRAND_WORDMARK_MAX, validateBrandMark } from "@polyptic/protocol";
+import type { BrandInputs } from "@polyptic/protocol";
 import type { Sys } from "./system";
 import type { Logger } from "./log";
 import type { RenderMode, SetupOptions } from "./args";
@@ -510,8 +512,9 @@ function configureSplash(
 
   // 2 ─ SVG sources + rasterised PNGs. The logo is the swappable vector asset (POL-7): replace
   // logo.svg with the final designed lockup and re-run setup. The stamp bakes host + build version.
+  const brand = resolveBrand(sys, opts, log, needsVerification);
   let rasterOk = true;
-  for (const asset of splashAssets({ hostname: host, version })) {
+  for (const asset of splashAssets({ hostname: host, version }, brand)) {
     const svgPath = `${PLYMOUTH_THEME_DIR}/${asset.base}.svg`;
     const pngPath = `${PLYMOUTH_THEME_DIR}/${asset.base}.png`;
     sys.writeFile(svgPath, asset.svg, { mode: 0o644, desc: `splash ${asset.base}.svg` });
@@ -557,6 +560,40 @@ function configureSplash(
       "shows continuously from early boot to the player AND through shutdown/reboot with no raw console " +
       "text (an OrbStack headless box cannot show it).",
   );
+}
+
+/**
+ * The operator's brand for this box's splash (POL-194), from `--brand-mark` / `--brand-wordmark`.
+ *
+ * The mark is re-validated HERE even though the control plane already refused a bad one on upload:
+ * this function's input is a path on the build host, and a truncated download or a hand-passed file
+ * is exactly the sort of thing that should not reach a rasteriser on a boot path. A mark that fails
+ * is DROPPED, loudly, and the box falls back to the Polyptic lockup — the splash is the last thing
+ * that should fail a whole image build, and a wrong-but-present logo is better than none.
+ */
+function resolveBrand(
+  sys: Sys,
+  opts: SetupOptions,
+  log: Logger,
+  needsVerification: string[],
+): BrandInputs {
+  const wordmark = opts.brandWordmark?.trim().slice(0, BOOT_BRAND_WORDMARK_MAX) || undefined;
+  if (!opts.brandMark) return { wordmark };
+
+  const source = sys.readText(opts.brandMark);
+  if (source === null) {
+    log.warn(`--brand-mark ${opts.brandMark} could not be read; keeping the Polyptic mark.`);
+    needsVerification.push(`Boot splash: the brand mark at ${opts.brandMark} was unreadable, so the box kept the Polyptic mark.`);
+    return { wordmark };
+  }
+  const check = validateBrandMark(source);
+  if (!check.ok) {
+    log.warn(`--brand-mark ${opts.brandMark} rejected: ${check.reason} Keeping the Polyptic mark.`);
+    needsVerification.push(`Boot splash: the brand mark was rejected (${check.reason}), so the box kept the Polyptic mark.`);
+    return { wordmark };
+  }
+  log.info(`boot splash: drawing the operator's mark from ${basename(opts.brandMark)}`);
+  return { markSvg: source, wordmark };
 }
 
 /**

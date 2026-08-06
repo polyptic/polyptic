@@ -19,6 +19,7 @@ import type {
   PersistedCredentialProfile,
   PersistedBootOrderPolicy,
   PersistedDaypart,
+  PersistedBootBrand,
   PersistedDisplaySettings,
   PersistedSchedule,
   PersistedSchedulerSettings,
@@ -105,6 +106,8 @@ export class MemoryStore implements Store {
   /** Fleet-wide display settings (POL-6), undefined until first changed. */
   private displaySettings: PersistedDisplaySettings | undefined;
   private bootOrderPolicy: PersistedBootOrderPolicy | undefined;
+  /** Fleet boot branding (POL-194), undefined until an operator saves one. */
+  private bootBrand: PersistedBootBrand | undefined;
   private revision = 0;
   /** POL-95/POL-186 — the scene each mural is on, keyed by mural id. A mural absent from the map has
    *  none (diverged). */
@@ -631,6 +634,14 @@ export class MemoryStore implements Store {
 
   async setBootOrderPolicy(policy: PersistedBootOrderPolicy): Promise<void> {
     this.bootOrderPolicy = clone(policy);
+  }
+
+  async getBootBrand(): Promise<PersistedBootBrand | undefined> {
+    return this.bootBrand ? clone(this.bootBrand) : undefined;
+  }
+
+  async setBootBrand(brand: PersistedBootBrand): Promise<void> {
+    this.bootBrand = clone(brand);
   }
 
   async close(): Promise<void> {

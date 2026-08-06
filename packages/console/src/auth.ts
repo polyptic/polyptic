@@ -13,6 +13,7 @@
 import {
   AuthProviders,
   AuthUser,
+  BootBrand,
   BootOrderPolicy,
   ChangePasswordBody,
   CreateEnrollmentTokenBody,
@@ -33,6 +34,7 @@ import {
 } from "@polyptic/protocol";
 import type {
   AuthProviders as AuthProvidersT,
+  BootBrand as BootBrandT,
   BootOrderPolicy as BootOrderPolicyT,
   ChangePasswordBody as ChangePasswordBodyT,
   CreateEnrollmentTokenBody as CreateEnrollmentTokenBodyT,
@@ -339,4 +341,17 @@ export async function getBootOrderPolicy(): Promise<BootOrderPolicyT> {
 export async function updateBootOrderPolicy(reassert: boolean): Promise<BootOrderPolicyT> {
   const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/boot-order`, { reassert });
   return BootOrderPolicy.parse(raw);
+}
+
+/** GET /api/v1/settings/boot-brand → the fleet's boot branding (POL-194). */
+export async function getBootBrand(): Promise<BootBrandT> {
+  const raw = await send<unknown>("GET", `${BASE_SETTINGS}/boot-brand`);
+  return BootBrand.parse(raw);
+}
+
+/** PUT /api/v1/settings/boot-brand { markSvg, wordmark } → the applied branding (POL-194). The body
+ *  is the whole desired state, so Remove is this call with a null mark and an empty wordmark. */
+export async function updateBootBrand(markSvg: string | null, wordmark: string): Promise<BootBrandT> {
+  const raw = await send<unknown>("PUT", `${BASE_SETTINGS}/boot-brand`, { markSvg, wordmark });
+  return BootBrand.parse(raw);
 }

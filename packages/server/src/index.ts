@@ -44,6 +44,7 @@ import { AgentUpdateService, offeredAgentVersion } from "./agent-update";
 import { CounterRegistry } from "./metrics";
 import { registerOpsRoutes } from "./ops";
 import { computeBaseUrl, provisionBootSummary, provisionConfigFromEnv, registerProvisionRoutes } from "./provision";
+import { BootLogoRenderer } from "./boot-brand";
 import { initSelfSignedTls, registerHttpsRoutes, requiredSans, resolveTlsEnv } from "./server-tls";
 import type { ServerTlsRuntime, TlsEnvConfig } from "./server-tls";
 import { PageDataService } from "./page-data";
@@ -721,6 +722,11 @@ const shellRelay = attachWebSockets({
   grants,
 });
 shellRelay.startArmingSweep(SHELL_ARM_TTL_MS);
+// POL-194 — one rasteriser for the whole process: the boot routes render through it and the REST
+// route invalidates it on save. `RSVG_CONVERT_BIN` is the substitution seam (D115); without the
+// binary the renderer reports that in a sentence and the depot keeps serving the committed lockup.
+const bootLogoRenderer = new BootLogoRenderer(process.env.RSVG_CONVERT_BIN?.trim() || "rsvg-convert");
+
 registerRestRoutes(
   fastify,
   control,
@@ -745,6 +751,7 @@ registerRestRoutes(
   panelPower,
   grants,
   auth,
+  bootLogoRenderer,
 );
 // The DevTools HTTP proxy (POL-67): the entry redirect + the frontend-file proxy, GATED under /api/v1.
 registerDevtoolsRoutes(fastify, devtoolsRelay);
@@ -874,6 +881,10 @@ registerProvisionRoutes(
     if (known) broadcaster.broadcast();
     return known;
   },
+  // POL-194 — the operator's boot branding. `GET /boot/logo.png` serves it rasterised (gated through
+  // grub-png-check, falling back to the committed lockup), and the image build pulls the source off
+  // /boot/brand/ to bake into the Plymouth splash.
+  { brand: () => control.getBootBrand(), renderer: bootLogoRenderer },
 );
 
 // TOP-LEVEL ops endpoints (/healthz, /metrics) — NOT /api/v1, so UNgated for scrapers/liveness.

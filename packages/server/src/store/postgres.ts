@@ -46,6 +46,7 @@ import type {
   PersistedCredentialProfile,
   PersistedBootOrderPolicy,
   PersistedDaypart,
+  PersistedBootBrand,
   PersistedDisplaySettings,
   PersistedEnrollmentToken,
   PersistedImageRollout,
@@ -321,6 +322,12 @@ interface DisplaySettingsRow {
 
 interface BootOrderPolicyRow {
   reassert: boolean;
+}
+
+interface BootBrandRow {
+  mark_svg: string | null;
+  wordmark: string;
+  updated_at: Date | string;
 }
 
 interface CountRow {
@@ -810,6 +817,19 @@ export class PostgresStore implements Store {
       CREATE TABLE IF NOT EXISTS boot_order_policy (
         id       int PRIMARY KEY DEFAULT 1,
         reassert boolean NOT NULL
+      )
+    `;
+    // Boot branding (POL-194): a single row holding the operator's mark (SVG source) and wordmark.
+    // Absent until an operator saves one — the control plane then paints the Polyptic lockup, which
+    // is also what the committed boot-logo.png falls back to. The SVG is TEXT in the row rather than
+    // bytes on a volume so every server replica reads the same brand and the rasterised PNG stays a
+    // rebuildable cache (see PersistedBootBrand).
+    await sql`
+      CREATE TABLE IF NOT EXISTS boot_brand (
+        id         int PRIMARY KEY DEFAULT 1,
+        mark_svg   text,
+        wordmark   text NOT NULL DEFAULT '',
+        updated_at timestamptz NOT NULL DEFAULT now()
       )
     `;
     // Panel power (POL-101), VESTIGIAL since POL-186: a wall's waking hours are a schedule window
@@ -2217,6 +2237,32 @@ export class PostgresStore implements Store {
     await sql`
       INSERT INTO boot_order_policy (id, reassert) VALUES (1, ${policy.reassert})
       ON CONFLICT (id) DO UPDATE SET reassert = EXCLUDED.reassert
+    `;
+  }
+
+  async getBootBrand(): Promise<PersistedBootBrand | undefined> {
+    const sql = this.sql;
+    const rows = await sql<BootBrandRow[]>`
+      SELECT mark_svg, wordmark, updated_at FROM boot_brand WHERE id = 1 LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    return {
+      markSvg: row.mark_svg,
+      wordmark: row.wordmark,
+      updatedAt: new Date(row.updated_at).toISOString(),
+    };
+  }
+
+  async setBootBrand(brand: PersistedBootBrand): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO boot_brand (id, mark_svg, wordmark, updated_at)
+      VALUES (1, ${brand.markSvg}, ${brand.wordmark}, ${brand.updatedAt})
+      ON CONFLICT (id) DO UPDATE SET
+        mark_svg = EXCLUDED.mark_svg,
+        wordmark = EXCLUDED.wordmark,
+        updated_at = EXCLUDED.updated_at
     `;
   }
 

@@ -13,6 +13,11 @@
  * The background is baked in (rather than left transparent, as Plymouth's copy is) so GRUB never has
  * to composite alpha over `desktop-color`; the two must be the same dark or the seam shows.
  *
+ * This bakes the DEFAULT lockup — the one a deployment with no branding saved serves, and the one
+ * `/boot/logo.png` falls back to when an operator's brand cannot be rendered (POL-194). An operator's
+ * own mark is rasterised by the control plane at save time, from this same `logoSvg()`; it never
+ * touches this file.
+ *
  * Re-run this whenever `logoSvg()` or the palette changes — `bun test` fails if the committed PNG
  * stops matching the source's declared dimensions, but it cannot see a stale drawing.
  *
@@ -22,7 +27,7 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { logoSvg, SPLASH_COLORS } from "../packages/agent/src/setup/plymouth.ts";
+import { logoSvg, SPLASH_COLORS } from "../packages/protocol/src/boot-brand.ts";
 import { BOOT_LOGO_HEIGHT, BOOT_LOGO_WIDTH } from "../packages/server/src/boot-theme.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
