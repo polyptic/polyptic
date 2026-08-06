@@ -1906,6 +1906,22 @@ export const ScreenView = Screen.extend({
    *  cleared when the machine drops. Optional = back-compat. (`castEnabled` — the persistent operator
    *  toggle — is inherited from `Screen`.) */
   castActive: z.boolean().optional(),
+  /**
+   * The box is NOT reporting this screen's connector. Its machine is online and advertised an output
+   * list that does not contain `connector` — so on that box this screen's output does not exist, and
+   * nothing addressed to it can land: not content, not DPMS, not CEC. A DisplayPort panel switched
+   * off drops its link and the connector leaves the compositor's output list, which is exactly how
+   * two production screens sat dark for days reading as "asleep".
+   *
+   * This is NOT `asleep` and NOT `online: false`. Asleep is healthy and reversible from the console;
+   * this is a screen identity with no output behind it, and the console must say so rather than
+   * offering a Wake button that can only ever be refused.
+   *
+   * Live-only, like `ip` and `vitals`: an offline box's last output list describes a moment that has
+   * passed, and "the box is not reporting DP-1" is a claim only a connected box can support.
+   * Optional = back-compat.
+   */
+  connectorMissing: z.boolean().optional(),
   /** POL-111 — placeholders the content on this screen uses that resolve to NOTHING in its scope
    *  (neither a built-in nor one of its own `variables`). They render as EMPTY on the glass — never as
    *  literal braces — so the only way an operator learns about a typo'd `{{lien}}` is this list, which

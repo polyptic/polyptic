@@ -532,6 +532,7 @@ export function buildAdminState(
   );
 
   const machines: MachineView[] = control.getMachines().map((machine) => {
+    const machineOnline = presence.isMachineOnline(machine.id);
     const machineScreens: ScreenView[] = screens
       .filter((s) => s.machineId === machine.id)
       .map((s) => {
@@ -550,6 +551,13 @@ export function buildAdminState(
           // POL-101 — asleep is NOT offline: the player is still connected, still holding its slice,
           // and the box is healthy. The console renders the two differently, deliberately.
           asleep: presence.isScreenAsleep(s.id),
+          // The box is CONNECTED and its output list does not contain this screen's connector — the
+          // output does not exist on that box, so nothing addressed to it lands. Live-only: a stale
+          // output list from a box that has since gone dark is not evidence of anything.
+          connectorMissing:
+            machineOnline && !control.isConnectorAdvertised(machine.id, s.connector)
+              ? true
+              : undefined,
           powerMethods: presence.screenPowerMethods(s.id),
           powerError: presence.screenPowerError(s.id),
           castEnabled: s.castEnabled, // POL-119 — the persistent operator toggle

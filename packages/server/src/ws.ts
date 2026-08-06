@@ -585,7 +585,8 @@ function handleAgent(
           // OPEN MODE auto-approve, OR an approved machine (re)connecting. If a credential is being
           // re-issued (token re-enrol of an approved machine), persist its hash + announce it first.
           const credentialHash = decision.credential ? hashCredential(decision.credential) : undefined;
-          const { changed, assignments } = await control.registerMachine(input, credentialHash);
+          const { changed, assignments, reboundScreenIds, unadvertisedScreenIds } =
+            await control.registerMachine(input, credentialHash);
           if (decision.credential || mtlsBundle) {
             sendEnrolled(msg.machineId, decision.credential, "approved", mtlsBundle);
           }
@@ -613,7 +614,77 @@ function handleAgent(
           // POL-101 — the box is back and its panels are LIT (the compositor asserts `dpms on` at
           // startup). If a screen's mural is inside an off window right now, sleep it again; in
           // hours, this does nothing at all — a wall that should be showing content is never blanked.
-          panelPower.reconcileMachine(msg.machineId);
+          //
+          // `reboundScreenIds` are the screens whose connector this box had STOPPED reporting and is
+          // reporting again — a panel switched off at the wall, its DP link dropped, its output gone
+          // from the compositor, and now back. The apply above has already restored their content;
+          // these also get their POWER re-asserted, because the output was destroyed and re-created
+          // and no earlier command survived that.
+          panelPower.reconcileMachine(msg.machineId, new Set(reboundScreenIds));
+          // The other edge, and the one that cost days in the field: a connector this box WAS
+          // reporting has gone. The screen record stays (a panel switched off overnight must not
+          // delete an operator's work), but nothing addressed to it can land until it returns —
+          // so the log says which connector, on which box, at what time.
+          for (const screenId of unadvertisedScreenIds) {
+            const screen = control.getScreen(screenId);
+            if (!screen) continue;
+            const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+            activity.push(
+              "bad",
+              `${label} is not reporting connector ${screen.connector} — ${screen.friendlyName} has no output on that box`,
+            );
+            log.warn(
+              {
+                event: "screen.connector.absent",
+                machineId: msg.machineId,
+                screenId,
+                connector: screen.connector,
+                advertised: msg.outputs.map((o) => o.connector),
+              },
+              "a screen's connector is no longer advertised by its machine",
+            );
+            logs.record(
+              serverEvent(
+                "warn",
+                "presence",
+                `${label} is not reporting connector ${screen.connector} — nothing can reach ${screen.friendlyName} until it comes back`,
+                {
+                  machineId: msg.machineId,
+                  screenId,
+                  fields: {
+                    connector: screen.connector,
+                    advertised: msg.outputs.map((o) => o.connector).join(",") || "none",
+                  },
+                },
+              ),
+            );
+          }
+          for (const screenId of reboundScreenIds) {
+            const screen = control.getScreen(screenId);
+            if (!screen) continue;
+            const label = control.getMachine(msg.machineId)?.label ?? msg.machineId;
+            activity.push(
+              "good",
+              `${screen.friendlyName} is back — ${label} is reporting ${screen.connector} again`,
+            );
+            log.info(
+              {
+                event: "screen.connector.rebound",
+                machineId: msg.machineId,
+                screenId,
+                connector: screen.connector,
+              },
+              "connector reported again — the screen is reconciled back to its desired state",
+            );
+            logs.record(
+              serverEvent(
+                "info",
+                "presence",
+                `${label} is reporting connector ${screen.connector} again — ${screen.friendlyName} is reconciled back to its desired state`,
+                { machineId: msg.machineId, screenId, fields: { connector: screen.connector } },
+              ),
+            );
+          }
           log.info(
             {
               event: "agent.hello",
