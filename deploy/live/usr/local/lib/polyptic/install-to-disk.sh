@@ -163,6 +163,26 @@ fail() {
   exit 1
 }
 
+# Run a command and, when it fails, carry ITS OWN words into the verdict (POL-195).
+#
+# Every step on the destructive path was `cmd >/dev/null 2>&1 || fail <code> "<sentence>"`, which
+# threw away the only half an operator can act on. "could not format the swap partition on
+# /dev/nvme0n1" is a sentence about what we were TRYING to do; `mkswap`'s own "Device or resource
+# busy" is what actually happened, and it was going to /dev/null. D65 puts technical detail on the
+# failure path and keeps it off the happy one — this IS the failure path, and it was the one place
+# in the installer carrying none.
+run_or_fail() {
+  _rf_code="$1"; _rf_what="$2"; shift 2
+  # `2>&1 >/dev/null` in this order captures stderr ONLY: stderr is duplicated onto the capturing
+  # stdout first, then stdout is sent to /dev/null. Reversing it captures nothing.
+  _rf_err="$("$@" 2>&1 >/dev/null)" && return 0
+  # One line, squeezed, clamped. The verdict travels through a console line, a status file, a JSON
+  # report and the on-medium forensics log; a page of tool output serves none of them.
+  _rf_err="$(printf '%s' "$_rf_err" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ *//; s/ *$//' | cut -c1-160)"
+  [ -z "$_rf_err" ] || _rf_what="$_rf_what: $_rf_err"
+  fail "$_rf_code" "$_rf_what"
+}
+
 cleanup() {
   for m in "$mnt_esp" "$mnt_slot" "$mnt_medium" "$mnt_scratch"; do
     [ -n "$m" ] || continue
@@ -453,20 +473,20 @@ done
 # ─── THE POINT OF NO RETURN: wipe + partition + mkfs ────────────────────────────────────────────────
 say "wiping $target and laying down the Polyptic disk layout ..."
 progress wiping 25 "erasing $target"
-sgdisk --zap-all "$target" >/dev/null 2>&1 \
-  || fail install-write-failed "could not erase the partition table on $target"
+run_or_fail install-write-failed "could not erase the partition table on $target" \
+  sgdisk --zap-all "$target"
 wipefs -a "$target" >/dev/null 2>&1 || true
 
 progress partitioning 30 "creating the ESP, A/B slots, swap and scratch on $target"
 # Types: ef00 = ESP, 8300 = Linux filesystem, 8200 = Linux swap. Partition 5 takes the rest.
-sgdisk \
+run_or_fail install-write-failed "could not partition $target" \
+  sgdisk \
   -n 1:0:+1536M -t 1:ef00 -c 1:POLYPTIC-ESP \
   -n 2:0:+4G    -t 2:8300 -c 2:POLYPTIC-A \
   -n 3:0:+4G    -t 3:8300 -c 3:POLYPTIC-B \
   -n 4:0:+4G    -t 4:8200 -c 4:POLYPTIC-SWAP \
   -n 5:0:0      -t 5:8300 -c 5:POLYPTIC-SCRATCH \
-  "$target" >/dev/null 2>&1 \
-  || fail install-write-failed "could not partition $target"
+  "$target"
 partprobe "$target" >/dev/null 2>&1 || true
 udevadm settle >/dev/null 2>&1 || true
 # The kernel re-reads the table asynchronously; wait (bounded) for the nodes to appear rather than
@@ -495,19 +515,19 @@ done
 # The ESP's FAT volume label is POLYPTIC-BT — the SAME label as the USB medium (find-boot-medium's
 # by-label fast path), because the ESP is the boot medium from now on. POLYPTIC-SCRATCH is exactly
 # 16 characters, ext4's label maximum — keep it exact.
-mkfs.vfat -F 32 -n POLYPTIC-BT "$(part_node 1)" >/dev/null 2>&1 \
-  || fail install-write-failed "could not format the ESP on $target"
-mkfs.ext4 -q -F -L POLYPTIC-A "$(part_node 2)" >/dev/null 2>&1 \
-  || fail install-write-failed "could not format slot A on $target"
-mkfs.ext4 -q -F -L POLYPTIC-B "$(part_node 3)" >/dev/null 2>&1 \
-  || fail install-write-failed "could not format slot B on $target"
+run_or_fail install-write-failed "could not format the ESP on $target" \
+  mkfs.vfat -F 32 -n POLYPTIC-BT "$(part_node 1)"
+run_or_fail install-write-failed "could not format slot A on $target" \
+  mkfs.ext4 -q -F -L POLYPTIC-A "$(part_node 2)"
+run_or_fail install-write-failed "could not format slot B on $target" \
+  mkfs.ext4 -q -F -L POLYPTIC-B "$(part_node 3)"
 # The swap header written here is ceremonial — /etc/crypttab re-keys and re-mkswaps the partition
 # with an ephemeral random key on every boot — but a formatted partition is self-describing to any
 # tool that looks before the first boot.
-mkswap "$(part_node 4)" >/dev/null 2>&1 \
-  || fail install-write-failed "could not format the swap partition on $target"
-mkfs.ext4 -q -F -L POLYPTIC-SCRATCH "$(part_node 5)" >/dev/null 2>&1 \
-  || fail install-write-failed "could not format the scratch partition on $target"
+run_or_fail install-write-failed "could not format the swap partition on $target" \
+  mkswap "$(part_node 4)"
+run_or_fail install-write-failed "could not format the scratch partition on $target" \
+  mkfs.ext4 -q -F -L POLYPTIC-SCRATCH "$(part_node 5)"
 
 # POL-179 — seed dracut's persistent-overlay layout on the fresh scratch fs. dmsquash-live only
 # treats the overlay device as persistent when the `overlayfs/` + `ovlwork/` pair exists ON it (the
@@ -516,10 +536,10 @@ mkfs.ext4 -q -F -L POLYPTIC-SCRATCH "$(part_node 5)" >/dev/null 2>&1 \
 # first real installed boot, 2026-07-23). The initramfs hook (polyptic-scratch-prep.sh) re-creates
 # the pair if it ever goes missing; seeding it here makes the FIRST boot clean too.
 mnt_scratch="$(mktemp -d)"
-mount "$(part_node 5)" "$mnt_scratch" \
-  || fail install-write-failed "could not mount the scratch partition on $target"
-mkdir -p "$mnt_scratch/overlayfs" "$mnt_scratch/ovlwork" \
-  || fail install-write-failed "could not create the overlay directories on the scratch partition"
+run_or_fail install-write-failed "could not mount the scratch partition on $target" \
+  mount "$(part_node 5)" "$mnt_scratch"
+run_or_fail install-write-failed "could not create the overlay directories on the scratch partition" \
+  mkdir -p "$mnt_scratch/overlayfs" "$mnt_scratch/ovlwork"
 sync 2>/dev/null || true
 umount "$mnt_scratch"; rmdir "$mnt_scratch" 2>/dev/null || true; mnt_scratch=""
 
@@ -528,8 +548,8 @@ umount "$mnt_scratch"; rmdir "$mnt_scratch" 2>/dev/null || true; mnt_scratch=""
 # whole root already lives in RAM). Fetched as .new then renamed after the sha256 check, so a torn
 # transfer can never look like an installed image.
 mnt_slot="$(mktemp -d)"
-mount "$(part_node 2)" "$mnt_slot" \
-  || fail install-write-failed "could not mount slot A on $target"
+run_or_fail install-write-failed "could not mount slot A on $target" \
+  mount "$(part_node 2)" "$mnt_slot"
 mkdir -p "$mnt_slot/LiveOS"
 progress fetching 50 "downloading the operating system image ($imgid)"
 fetch "$bsrc/rootfs.squashfs" "$mnt_slot/LiveOS/squashfs.img.new" 1800 \
@@ -537,16 +557,16 @@ fetch "$bsrc/rootfs.squashfs" "$mnt_slot/LiveOS/squashfs.img.new" 1800 \
 progress verifying 65 "verifying the operating system image"
 sum_ok "$mnt_slot/LiveOS/squashfs.img.new" rootfs.squashfs "$tmpd/SHA256SUMS" \
   || fail install-write-failed "rootfs.squashfs for image $imgid failed its sha256 check"
-mv "$mnt_slot/LiveOS/squashfs.img.new" "$mnt_slot/LiveOS/squashfs.img" \
-  || fail install-write-failed "could not commit the operating system image onto slot A"
+run_or_fail install-write-failed "could not commit the operating system image onto slot A" \
+  mv "$mnt_slot/LiveOS/squashfs.img.new" "$mnt_slot/LiveOS/squashfs.img"
 sync 2>/dev/null || true
 umount "$mnt_slot"; rmdir "$mnt_slot" 2>/dev/null || true; mnt_slot=""
 
 # ─── The ESP: loaders, kernel pair, credentials, theme, marker, GRUB config ─────────────────────────
 progress writing-loader 75 "installing the signed boot loaders"
 mnt_esp="$(mktemp -d)"
-mount "$(part_node 1)" "$mnt_esp" \
-  || fail install-write-failed "could not mount the new ESP on $target"
+run_or_fail install-write-failed "could not mount the new ESP on $target" \
+  mount "$(part_node 1)" "$mnt_esp"
 
 put() { mkdir -p "$(dirname "$2")"; cp "$1" "$2"; chmod 0644 "$2"; }
 
