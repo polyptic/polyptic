@@ -1546,8 +1546,8 @@ async function main(): Promise<void> {
   }
 
   // POL-160 — what this process would tell the server about its own updatability, printed as one
-  // JSON line. A compiled binary that says `"updatable": false` is the bug that let the AMRC fleet
-  // decline 176 update offers in 48h while correctly reporting its baked version, so it is now
+  // JSON line. A compiled binary that says `"updatable": false` is the bug that let a production
+  // fleet decline 176 update offers in 48h while correctly reporting its baked version, so it is now
   // answerable from a box (and asserted against a REAL compiled binary in the test suite).
   if (process.argv[2] === "--updatable" || process.argv[2] === "updatable") {
     const binaryPath = selfBinaryPath();
