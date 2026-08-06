@@ -562,6 +562,10 @@ function handleAgent(
       // POL-101 — what this box can do about panel power, as IT reports it (dpms / cec). Re-read on
       // every hello, so a box that grows a CEC adapter (or loses one) tells the truth after a restart.
       power: msg.power,
+      // POL-192 — the box's own account of whether it can ever take an agent update, and why not.
+      // The fleet sat five releases behind with this answer available on every reconnect; it now
+      // reaches the console instead of only the offer-time log line.
+      runtime: msg.runtime,
       outputs: msg.outputs,
       hostname: msg.hostname,
       // POL-105 — the image the box BOOTED, on its very first frame: an operator watching a canary
@@ -624,6 +628,11 @@ function handleAgent(
               issuedCert: Boolean(mtlsBundle),
               machineId: msg.machineId,
               agentVersion: msg.agentVersion,
+              // POL-192 — whether this box can ever take an agent update, on the line that already
+              // records what it is running. The console shows the same answer; this keeps the log
+              // self-contained for anyone reading a session after the fact.
+              agentUpdatable: msg.runtime?.updatable,
+              agentNotUpdatableReason: msg.runtime?.updatable === false ? msg.runtime.reason : undefined,
               backend: msg.backend,
               outputs: msg.outputs.length,
               screens: assignments.map((a) => a.screenId),

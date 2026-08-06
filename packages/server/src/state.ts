@@ -50,7 +50,7 @@ import {
   packRects,
   rectsAreAdjacent,
 } from "@polyptic/protocol";
-import type { BootMode, MachineBootPath, MachineDisk, Rect } from "@polyptic/protocol";
+import type { AgentRuntime, BootMode, MachineBootPath, MachineDisk, Rect } from "@polyptic/protocol";
 import type {
   ContentKind,
   CreateDaypartBody,
@@ -277,6 +277,11 @@ export interface RegisterMachineInput {
    *  for the same reason as `browser`: it is re-reported on every hello, and a box that is offline
    *  has no panels to power anyway. A pre-POL-101 agent reports nothing and gets no power affordance. */
   power?: PowerCapabilities;
+  /** POL-192 — how the agent is running and whether it can replace itself, as IT reported on this
+   *  hello. Memory-only like `browser`/`power`, and deliberately NOT merged with what an earlier
+   *  session said: it describes the process that is connected now, so a box that came back on a
+   *  different launch reports the truth and an agent too old to report anything reports nothing. */
+  runtime?: AgentRuntime;
   outputs: Output[];
   /** The box's os.hostname(), used as the human machine label on first registration. */
   hostname?: string;
@@ -1152,6 +1157,11 @@ export class ControlPlane {
       backend: input.backend,
       browser: input.browser,
       power: input.power,
+      // POL-192 — how the agent on this box is running and whether it can replace itself. Taken from
+      // THIS hello only (never inherited from `existing`): the answer describes the live process, and
+      // an agent too old to report it must read as "not reported", not as whatever a newer binary
+      // once said before someone rolled the box back.
+      runtime: input.runtime,
       outputs: input.outputs,
       status: "approved",
       lastSeen: new Date().toISOString(),
@@ -1217,6 +1227,11 @@ export class ControlPlane {
       backend: input.backend,
       browser: input.browser,
       power: input.power,
+      // POL-192 — how the agent on this box is running and whether it can replace itself. Taken from
+      // THIS hello only (never inherited from `existing`): the answer describes the live process, and
+      // an agent too old to report it must read as "not reported", not as whatever a newer binary
+      // once said before someone rolled the box back.
+      runtime: input.runtime,
       outputs: input.outputs,
       status: "pending",
       lastSeen: new Date().toISOString(),

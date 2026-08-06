@@ -103,6 +103,7 @@ import { diffWindows } from "./windows";
 import type { PlacedWindow } from "./windows";
 import { resolveAdvertisedOutputs, resolveConnector } from "./outputs";
 import { applyConfigFileToEnv } from "./setup/config";
+import { describeAgentRuntime } from "./runtime";
 import { agentVersion } from "./version";
 import { VitalsSampler } from "./vitals";
 import {
@@ -1376,6 +1377,12 @@ class Agent {
       // server uses it to match a pre-registration (after the token gate) and to make a pending
       // approval card readable. Sampled per hello so a re-cabled box re-reports honestly.
       hardware: readHostIdentity(),
+      // POL-192 — how this agent is RUNNING: a compiled binary or a source run, the binary it would
+      // replace, and whether it can self-update at all (with the reason it cannot, in the same words
+      // the `agent/update-status` skip line uses). Sent on every hello because it is a standing fact:
+      // a box that will never take an update must say so when it connects, not only when it declines
+      // one into a log. Sampled per hello, so a box that gets swapped onto a real binary re-reports.
+      runtime: describeAgentRuntime(this.agentVersion),
       bootstrapToken: this.bootstrapToken,
       credential: this.credential ?? undefined,
       csrPem,

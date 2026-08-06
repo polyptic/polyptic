@@ -525,6 +525,11 @@ export function buildAdminState(
   /** POL-104 — the enrolment policy, so a machine's card can say which token it came in on and whether
    *  that token has since been revoked. Optional: unit tests that build a view need no policy. */
   enrollment?: { list(): { id: string; revokedAt: string | null }[] },
+  /** POL-192 — the agent version this server OFFERS, when it offers one at all. Every box's reported
+   *  version is read against it ("running 0.3.6, offered 0.6.0"), so a fleet stuck five releases back
+   *  is a sentence in the console rather than a grep. Absent on a dev server and in unit tests, which
+   *  is exactly the case where no comparison should be claimed. */
+  agentRelease?: { version: string },
 ): ServerToAdminMessage {
   const screens = control.getScreens();
   const revokedTokenIds = new Set(
@@ -568,6 +573,11 @@ export function buildAdminState(
       id: machine.id,
       label: machine.label,
       agentVersion: machine.agentVersion,
+      // POL-192 — how the box's agent is running and whether it can replace itself. Live-only, like
+      // `vitals` and `ip`: it is a claim about the process on the other end of a socket, and the
+      // process on a dark box is not there to make it. Absent reads as "not reported" in the console,
+      // which is the truth for an offline box and for any agent older than this field.
+      agentRuntime: presence.isMachineOnline(machine.id) ? machine.runtime : undefined,
       backend: machine.backend,
       browser: machine.browser,
       online: presence.isMachineOnline(machine.id),
@@ -647,6 +657,9 @@ export function buildAdminState(
     // to invent this client-side (optimistic on apply), so a reload or a second operator saw a
     // wrong/absent badge. Per mural since POL-186: murals are on different scenes at the same moment.
     activeScenes: control.state.activeScenes,
+    // POL-192 — the agent binary this server serves. One value for the whole fleet, sent once, and
+    // the yardstick every machine card measures its own version against.
+    ...(agentRelease ? { agentRelease } : {}),
     activity: activity.recent(), // D25 — Live Activity feed (newest first, bounded)
     settings: control.getDisplaySettings(), // POL-6 — fleet-wide display settings (badge toggle)
     credentialProfiles: control.getCredentialProfileViews(), // POL-24 — content auth (never the secret)
@@ -762,6 +775,8 @@ interface BroadcasterDeps {
   documents?: DocumentStateSource;
   /** POL-104 — the live enrolment policy (which token a machine came in on, and whether it is revoked). */
   enrollment?: { list(): { id: string; revokedAt: string | null }[] };
+  /** POL-192 — the agent version this server offers the fleet (absent on a dev server). */
+  agentRelease?: { version: string };
 }
 
 /**
@@ -789,6 +804,7 @@ export class AdminBroadcaster {
       this.deps.documents,
       this.deps.health,
       this.deps.enrollment,
+      this.deps.agentRelease,
     );
     return projectAdminState(full, viewer?.visible ?? "all");
   }

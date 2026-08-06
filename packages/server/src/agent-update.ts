@@ -54,6 +54,18 @@ export interface AgentUpdateOffer {
   sizeBytes?: number;
 }
 
+/**
+ * POL-192 — the agent version this server OFFERS the fleet, or undefined when it offers none. A dev
+ * server stamps `0.0.0`, which is never newer than anything, so it advertises nothing at all — and
+ * the console, told nothing, claims no verdict about any box's version. Shared with
+ * {@link AgentUpdateService.configured} so "what we offer" has exactly one definition.
+ */
+export function offeredAgentVersion(servedVersion: string): { version: string } | undefined {
+  const v = servedVersion.trim();
+  if (!v || v === "0.0.0") return undefined;
+  return { version: v };
+}
+
 export class AgentUpdateService {
   /** sha256 cache keyed by `<arch>@<mtimeMs>:<size>`, so hashing a ~90 MB binary happens once per
    *  build, not once per hello — a rack of boxes re-hellos constantly. */
@@ -69,8 +81,7 @@ export class AgentUpdateService {
   /** True when we have a real version to advertise (a dev server stamps `0.0.0`, which is never
    *  newer than anything, so the whole feature is inert in dev without a single extra guard). */
   get configured(): boolean {
-    const v = this.servedVersion.trim();
-    return v.length > 0 && v !== "0.0.0";
+    return offeredAgentVersion(this.servedVersion) !== undefined;
   }
 
   /**
