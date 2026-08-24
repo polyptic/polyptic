@@ -85,6 +85,18 @@ const SERVER_WS_URL = `${window.location.protocol === "https:" ? "wss:" : "ws:"}
 // HTTP base for the same origin — where uploaded media (`/media/<id>`) is served (see `mediaSrc`).
 const SERVER_HTTP_BASE = `${window.location.protocol}//${SERVER_AUTHORITY}`;
 const DEFAULT_CANVAS: Geometry = { x: 0, y: 0, w: 1920, h: 1080 };
+/**
+ * POL-201 — a socket outage shorter than this is a BLIP, not "the network moved". The socket's own
+ * first reconnect delay is 500ms plus jitter, so anything back inside a few seconds returned on its
+ * first or second attempt: the route was there the whole time and something in the middle dropped
+ * the flow. Reloading every dashboard on the glass for that is the visible fault on a wall behind a
+ * flapping link, and it can recur every couple of minutes for hours.
+ *
+ * A blip still re-probes every surface — the console must never show stale health — it just spares a
+ * STEADY surface the reload when the probe passes (see `SurfaceProber.recheck`). A longer outage is
+ * a real network move and reloads everything, exactly as before.
+ */
+const BRIEF_OUTAGE_MS = 5_000;
 
 /** Read `?screen=<id>` from the URL — the one piece of identity this page is launched with. */
 function readScreenId(): string {
@@ -629,6 +641,8 @@ onMounted(() => {
   });
 
   let everOpen = false;
+  /** When the socket last STOPPED being open — the start of the current outage (POL-201). */
+  let lostAt: number | null = null;
   socket = new PlayerSocket(
     SERVER_WS_URL,
     screenId,
@@ -645,8 +659,20 @@ onMounted(() => {
         if (state === "open") {
           // A RECONNECT (not the first connect) means the socket dropped — itself evidence the network
           // moved under us, and therefore that content loaded before the drop may be broken.
-          if (everOpen) prober.recheck("player socket reconnected");
+          //
+          // POL-201 — how LONG it was down decides how much to believe that. A sub-blink outage that
+          // healed on the first retry is a dropped flow, not a moved network, and the content on the
+          // glass is almost certainly untouched; a longer one is worth a full reload. Both re-probe.
+          if (everOpen) {
+            const downMs = lostAt === null ? Number.POSITIVE_INFINITY : Date.now() - lostAt;
+            const brief = downMs < BRIEF_OUTAGE_MS;
+            prober.recheck(
+              `player socket reconnected${Number.isFinite(downMs) ? ` after ${Math.round(downMs)}ms` : ""}`,
+              { healthOnly: brief },
+            );
+          }
           everOpen = true;
+          lostAt = null;
           flushDiag();
           // POL-94 — the server forgets a screen's content health when it drops, so re-state what we
           // already know. Without this, a wall that reconnected while its dashboard was dead would
@@ -655,6 +681,9 @@ onMounted(() => {
           // POL-132 — server contact is the safe moment: revalidate the cached shell, and if a
           // newer build already finished installing, swap into it now (logged in the trail).
           shellServerContact();
+        } else if (everOpen && lostAt === null) {
+          // First non-open state since we were last open: the outage starts here, not at the retry.
+          lostAt = Date.now();
         }
       },
     },
