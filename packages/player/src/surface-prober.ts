@@ -31,6 +31,8 @@
  *   - `recheck()` — the browser's network hints, demoted from triggers-of-reloads to triggers-of-probes.
  *     If the probe passes, the element is reloaded in place anyway (in-flight loads may have been
  *     aborted); if it fails, we re-prove first. Either way the wall converges on working content.
+ *     POL-201: a caller that KNOWS the hint was a momentary blip passes `healthOnly`, which spares a
+ *     steady surface the reload when its probe still passes — see `recheck()`.
  *   - `elementError()` — media (`<img>`/`<video>`) tells us outright when its fetch failed; the
  *     element is cleared (a broken-image icon is a failed screen) and the URL re-proven, with its own
  *     backoff so a reachable-but-undecodable asset cannot spin.
@@ -261,14 +263,27 @@ export class SurfaceProber {
    * A browser hint that the network moved (online, WS reconnect, resource error). Debounced. Every
    * surface is re-probed: pass → reload in place (in-flight loads may have been aborted even though
    * the URL is reachable NOW); fail → back to proving until it passes.
+   *
+   * POL-201 — `healthOnly` softens ONLY the reload, never the probe. A wall on a flapping link
+   * reconnects its socket every couple of minutes; treating each blip as "the network moved" reloads
+   * every dashboard on the glass every couple of minutes, which is the visible fault even though the
+   * content was fine throughout. Under `healthOnly` a STEADY surface (painted, verified, nothing in
+   * flight) whose probe still passes is left alone — the console still learns its health, the glass
+   * just stops flashing. Everything else is unchanged: a surface still `verifying` (painted within
+   * the verify window, so a load really could have been aborted mid-flight) reloads as before, and a
+   * probe that FAILS drops back to the normal path, so recovery repaints. The caller decides what
+   * counts as a blip; the prober only honours the distinction.
    */
-  recheck(reason: string): void {
+  recheck(reason: string, opts: { healthOnly?: boolean } = {}): void {
     if (this.stopped || this.surfaces.size === 0) return;
     if (this.recheckTimer) return; // the burst collapses into the pending recheck
+    const healthOnly = opts.healthOnly === true;
     this.recheckTimer = setTimeout(() => {
       this.recheckTimer = null;
       if (this.stopped) return;
-      this.log(`network signal (${reason}) — re-probing ${this.surfaces.size} surface(s)`);
+      this.log(
+        `network signal (${reason}) — re-probing ${this.surfaces.size} surface(s)${healthOnly ? " (health only)" : ""}`,
+      );
       for (const [id, state] of this.surfaces) {
         if (state.phase === "proving") {
           // Already hunting. If it is waiting out a backoff, the network just changed — try NOW.
@@ -280,10 +295,13 @@ export class SurfaceProber {
           }
           // No timer → a probe is in flight; its result will land on its own.
         } else {
+          // Only a STEADY surface earns the quiet treatment. One still `verifying` was painted inside
+          // the verify window, which is exactly the case the reload exists for.
+          const quiet = healthOnly && state.phase === "steady";
           this.invalidate(state);
           state.phase = "proving";
           state.attempts = 0;
-          void this.prove(id, `network signal (${reason})`);
+          void this.prove(id, `network signal (${reason})`, !quiet);
         }
       }
     }, this.recheckDebounceMs);
@@ -363,8 +381,12 @@ export class SurfaceProber {
   }
 
   /** One probe of the surface's current URL: success paints (or reloads, if this URL is already
-   *  painted); failure retries with backoff, forever — a wall keeps trying, calmly. */
-  private async prove(id: string, why: string): Promise<void> {
+   *  painted); failure retries with backoff, forever — a wall keeps trying, calmly.
+   *
+   *  `reloadIfPainted: false` (POL-201, health-only recheck) suppresses ONLY the reload of an
+   *  already-painted surface whose probe passes. A probe that fails ignores the flag entirely: the
+   *  URL really is unreachable, so the retry — and the reload when it recovers — is warranted. */
+  private async prove(id: string, why: string, reloadIfPainted = true): Promise<void> {
     const state = this.surfaces.get(id);
     if (!state || this.stopped) return;
     const seq = state.seq;
@@ -391,6 +413,8 @@ export class SurfaceProber {
       this.setHealth(id, current, "unreachable", describeError(error).slice(0, 200));
       current.timer = setTimeout(() => {
         current.timer = null;
+        // Deliberately NOT `reloadIfPainted` — the probe failed, so the element is showing content we
+        // can no longer vouch for. Whatever the caller asked for, recovery repaints.
         void this.prove(id, why);
       }, delay);
       return;
@@ -404,6 +428,12 @@ export class SurfaceProber {
     // (a real, successful load) is what clears it.
     if (current.errorStreak === 0) this.setHealth(id, current, "reachable");
     if (current.paintedUrl === url) {
+      if (!reloadIfPainted) {
+        // Painted, still reachable, and nothing was in flight — the blip never touched the glass.
+        current.phase = "steady";
+        this.log(`${id}: still reachable — leaving the glass alone [${why}]`);
+        return;
+      }
       // The element already shows this URL; reachable again ≠ the element survived the outage.
       current.phase = "verifying";
       this.requestReload(id, why);

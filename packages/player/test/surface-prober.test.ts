@@ -191,6 +191,70 @@ describe("SurfaceProber", () => {
     h.prober.stop();
   });
 
+  test("POL-201: a BLIP re-probes a steady surface but does not reload it", async () => {
+    // The wall behind a flapping link reconnects its socket every couple of minutes. Reloading every
+    // dashboard each time IS the visible fault; the content was reachable throughout.
+    const { probe, calls } = scriptedProbe(() => Promise.resolve());
+    const h = harness({ probe });
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(10);
+    expect(h.painted.length).toBe(1);
+    expect(calls.length).toBe(1);
+
+    h.prober.recheck("player socket reconnected after 700ms", { healthOnly: true });
+    await sleep(20);
+    expect(calls.length).toBe(2); // still PROBED — the console must not show stale health
+    expect(h.reloaded).toEqual([]); // …but the glass was left alone
+    h.prober.stop();
+  });
+
+  test("POL-201: a blip whose probe FAILS still heals once the URL comes back", async () => {
+    // health-only softens the reload, never the safety property: if the URL really did go away, the
+    // element is showing content we cannot vouch for and must be reloaded on recovery.
+    let fail = false;
+    const h = harness({
+      probe: () => (fail ? Promise.reject(new Error("black-holed")) : Promise.resolve()),
+    });
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(10);
+    expect(h.painted.length).toBe(1); // painted and steady BEFORE the outage
+    fail = true; // …and the URL goes away during it
+
+    h.prober.recheck("player socket reconnected after 700ms", { healthOnly: true });
+    await sleep(20);
+    expect(h.reloaded).toEqual([]); // probe failing → still retrying, nothing to reload yet
+
+    fail = false;
+    await sleep(80);
+    expect(h.reloaded).toEqual(["s1"]); // recovered → reloaded despite healthOnly
+    h.prober.stop();
+  });
+
+  test("POL-201: a blip does NOT spare a surface still inside its verify window", async () => {
+    // `verifying` means it was painted moments ago — exactly the case where a load really could have
+    // been aborted mid-flight with no event we can see. Those still reload.
+    const h = harness({ verifyDelaysMs: [10_000] }); // painted → verifying, and stays there
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(10);
+    expect(h.painted.length).toBe(1);
+
+    h.prober.recheck("player socket reconnected after 700ms", { healthOnly: true });
+    await sleep(20);
+    expect(h.reloaded).toEqual(["s1"]);
+    h.prober.stop();
+  });
+
+  test("POL-201: a LONG outage still reloads a steady surface", async () => {
+    const h = harness();
+    h.prober.sync([{ id: "s1", url: "http://c/x" }]);
+    await sleep(10);
+
+    h.prober.recheck("player socket reconnected after 47000ms"); // no healthOnly = a real move
+    await sleep(20);
+    expect(h.reloaded).toEqual(["s1"]);
+    h.prober.stop();
+  });
+
   test("a burst of signals collapses into one recheck", async () => {
     const h = harness({ recheckDebounceMs: 10 });
     h.prober.sync([{ id: "s1", url: "http://c/x" }]);
