@@ -309,8 +309,6 @@ ln -sf "../polyptic-timesync-conf.service" "$ROOTFS/etc/systemd/system/sysinit.t
 for unit in multipathd.service multipathd.socket snapd.service snapd.socket snapd.seeded.service; do
   ln -sf /dev/null "$ROOTFS/etc/systemd/system/$unit"
 done
-# Empty machine-id so systemd mints a transient one each boot (the agent ignores it, our var wins).
-: > "$ROOTFS/etc/machine-id"; rm -f "$ROOTFS/var/lib/dbus/machine-id"
 # The image id (POL-41): a per-build identity the box carries at /etc/polyptic/image-id and the
 # server publishes in /dist/image/<arch>/manifest.json. The update-poll timer compares the two
 # every 5 minutes; a mismatch means "the server has a newer image than the one I booted".
@@ -553,6 +551,15 @@ if [ -n "$SITE_DIR" ] && [ -f "$SITE_DIR/seal.sh" ]; then
   POLYPTIC_ROOTFS="$ROOTFS" sh "$SITE_DIR/seal.sh" "$ROOTFS" \
     || { echo "site seal.sh FAILED — refusing to seal an image that may carry per-host state" >&2; exit 1; }
 fi
+# Empty machine-id so systemd mints a transient one each boot (the agent ignores it, our var wins).
+# This MUST be the last thing that touches the rootfs: it used to run in step 5, and the site layer's
+# apt-get (step 6) came after it — a postinst (systemd/dbus) found the file empty and re-minted it, so
+# every installed box shipped the SAME machine-id. networkd derives its DHCP DUID from the machine-id,
+# so the whole fleet presented one DUID, the DHCP failover pair matched on it, and two boxes were
+# leased one address (2026-08-26 outage: every socket on both boxes reset every ~2 minutes).
+: > "$ROOTFS/etc/machine-id"; rm -f "$ROOTFS/var/lib/dbus/machine-id"
+[ ! -s "$ROOTFS/etc/machine-id" ] && [ ! -e "$ROOTFS/var/lib/dbus/machine-id" ] \
+  || { echo "refusing to seal: $ROOTFS/etc/machine-id is non-empty or var/lib/dbus/machine-id exists — a baked machine-id means one DHCP DUID fleet-wide (duplicate leases)" >&2; exit 1; }
 # Drop the pre-D47/pre-POL-35 artifacts so a depot upgraded in place doesn't keep serving (or
 # retaining) an image the boot cmdline no longer knows how to use.
 rm -f "$OUT_DIR/squashfs" "$OUT_DIR/polyptic.iso" "$OUT_DIR/rootfs.squashfs"

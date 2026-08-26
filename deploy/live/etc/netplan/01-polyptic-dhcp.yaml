@@ -5,6 +5,11 @@
 # reach the control plane (found in the POL-38 UTM boot: enp0s1 DOWN, wait-online hanging ~2min).
 # DHCP every ethernet; `optional: true` so boot never blocks on link-up (the agent retries forever;
 # pairs with the wait-online --any drop-in).
+# `dhcp-identifier: mac` (2026-08-26 outage): networkd's default DUID derives from /etc/machine-id,
+# and a build that baked one machine-id into the squashfs put the SAME DUID on every box in the fleet.
+# The site's DHCP failover pair matched on the DUID and handed two boxes one address; every TCP socket
+# on both died every ~2 minutes. The MAC is the only identity a box is guaranteed to own; the netboot
+# initramfs (.network in 50polyptic-live) already keys on it, and the installed rootfs must too.
 network:
   version: 2
   ethernets:
@@ -12,11 +17,13 @@ network:
       match:
         name: "en*"
       dhcp4: true
+      dhcp-identifier: mac
       dhcp6: true
       optional: true
     polyptic-eth:
       match:
         name: "eth*"
       dhcp4: true
+      dhcp-identifier: mac
       dhcp6: true
       optional: true
