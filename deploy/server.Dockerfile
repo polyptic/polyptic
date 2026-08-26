@@ -24,7 +24,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 — build: install deps, compile the protocol, build both SPAs.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM oven/bun:1 AS build
+# Pinned: Bun 1.4.0 (picked up by the floating `oven/bun:1` tag in v0.10.1) breaks the /admin
+# WebSocket upgrade against a populated deployment ("undefined is not an object (evaluating
+# 'message')"), leaving the console empty after sign-in. Bump deliberately, with a smoke test.
+FROM oven/bun:1.3.14 AS build
 WORKDIR /app
 
 # Copy the whole bun workspace. (.dockerignore + deploy/server.Dockerfile.dockerignore
@@ -66,7 +69,7 @@ RUN mkdir -p /app/deploy/dist \
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — runtime: slim image with just what the server needs at run time.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM oven/bun:1-slim AS runtime
+FROM oven/bun:1.3.14-slim AS runtime
 WORKDIR /app
 
 # Optional provenance, surfaced by the server at /api/v1 + /metrics.
