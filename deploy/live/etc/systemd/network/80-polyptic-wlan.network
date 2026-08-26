@@ -4,6 +4,8 @@
 # (polyptic-wifi.service), and netplan's wifis: would try to own that supplicant config — one owner,
 # not two. networkd reads /etc/systemd/network alongside netplan's /run output, so the two coexist.
 # The higher route metric keeps a wired link preferred whenever a box has both.
+# ClientIdentifier=mac: same reason as the netplan file (a machine-id-derived DUID is shared fleet-wide
+# whenever the image bakes one; the MAC never is).
 [Match]
 Name=wl*
 
@@ -11,6 +13,7 @@ Name=wl*
 DHCP=yes
 
 [DHCPv4]
+ClientIdentifier=mac
 RouteMetric=600
 
 [IPv6AcceptRA]
