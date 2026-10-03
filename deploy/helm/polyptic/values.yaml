@@ -597,6 +597,10 @@ netboot:
     # 30Gi covers the default. Shrink it if you retain fewer builds or one arch.
     size: 30Gi
     storageClass: ""
+    # Extra labels for the depot PVC, e.g. `velero.io/exclude-from-backup: "true"`
+    # to keep the rebuildable depot out of cluster volume backups. Don't repeat a
+    # key the chart already sets (app.kubernetes.io/*, helm.sh/chart; POL-166).
+    labels: {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Automated image updates (POL-41/POL-43), Kubernetes-native.

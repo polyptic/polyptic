@@ -6,6 +6,9 @@ requirement — losing it means no box can netboot until a full rebuild finishes
 
 resource-policy: keep prevents `helm uninstall` from deleting a multi-gigabyte
 image an operator would otherwise have to rebuild.
+
+netboot.persistence.labels lets a cluster tag the claim for its own tooling, e.g.
+opting the rebuildable depot out of volume backups.
 */ -}}
 {{- if and .Values.netboot.persistence.enabled (not .Values.netboot.persistence.existingClaim) }}
 apiVersion: v1
@@ -15,6 +18,9 @@ metadata:
   labels:
     {{- include "polyptic.labels" . | nindent 4 }}
     app.kubernetes.io/component: server
+    {{- with .Values.netboot.persistence.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   annotations:
     helm.sh/resource-policy: keep
 spec:

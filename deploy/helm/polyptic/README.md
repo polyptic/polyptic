@@ -394,7 +394,8 @@ image rebuild + reboot for a `clientHost` change to take effect.
 
 The server serves the netboot artifacts — the live image (`GET /dist/image/<arch>/…`)
 and the signed boot loaders (`GET /dist/boot/<file>`) — from a **depot volume**
-(`netboot.persistence`, PVC by default, `helm.sh/resource-policy: keep`). shim and
+(`netboot.persistence`, PVC by default, `helm.sh/resource-policy: keep`;
+`netboot.persistence.labels` tags the claim, e.g. a backup opt-out). shim and
 GRUB speak **plain HTTP**: netbooting boxes must reach the server over `http://`
 (a LoadBalancer/NodePort on the management LAN), not the HTTPS Ingress. Console and
 players keep using HTTPS; only the boot path is http-by-contract.
